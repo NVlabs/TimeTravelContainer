@@ -15,6 +15,8 @@
 package boot
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net"
@@ -28,18 +30,24 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
@@ -232,6 +240,29 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 			file.DecRef(ctx)
 		}
 	}
+	pipeReader, pipeWriter, err := pipefs.NewConnectedPipeFDs(ctx, l.k.PipeMount(), linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("creating internal pipe: %v", err)
+	}
+	pipeFDs, err := l.k.GlobalInit().Leader().FDTable().NewFDs(ctx, 10, []*vfs.FileDescription{pipeReader, pipeWriter}, kernel.FDFlags{})
+	pipeReader.DecRef(ctx)
+	pipeWriter.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing internal pipe: %v", err)
+	}
+	parentReader := liveForkTestFD(t, l.k, pipeFDs[0])
+	parentWriter := liveForkTestFD(t, l.k, pipeFDs[1])
+	liveForkTestWrite(t, ctx, parentWriter, "seed")
+	eventFile, err := eventfd.New(ctx, l.k.VFS(), 7, false, linux.O_RDWR|linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("creating internal eventfd: %v", err)
+	}
+	eventFD, err := l.k.GlobalInit().Leader().FDTable().NewFD(ctx, 12, eventFile, kernel.FDFlags{})
+	eventFile.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing internal eventfd: %v", err)
+	}
+	parentEvent := liveForkTestFD(t, l.k, eventFD)
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -252,6 +283,53 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if parentPID != childPID {
 		t.Errorf("init PID changed: parent=%d child=%d", parentPID, childPID)
 	}
+	childCtx := child.k.SupervisorContext()
+	childReader := liveForkTestFD(t, child.k, pipeFDs[0])
+	childWriter := liveForkTestFD(t, child.k, pipeFDs[1])
+	childEvent := liveForkTestFD(t, child.k, eventFD)
+
+	// Pipe endpoints still alias one queue inside a branch, but queues and
+	// readiness are duplicated across branches.
+	liveForkTestRead(t, childCtx, childReader, "seed")
+	if got := childReader.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("child still readable after consuming seed: %#x", got)
+	}
+	if got := parentReader.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child read consumed parent's seed: parent readiness %#x", got)
+	}
+	liveForkTestRead(t, ctx, parentReader, "seed")
+	liveForkTestWrite(t, ctx, parentWriter, "parent")
+	if got := childReader.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent write made child readable: %#x", got)
+	}
+	liveForkTestWrite(t, childCtx, childWriter, "child")
+	liveForkTestRead(t, ctx, parentReader, "parent")
+	liveForkTestRead(t, childCtx, childReader, "child")
+	liveForkTestWouldBlock(t, ctx, parentReader)
+	liveForkTestWouldBlock(t, childCtx, childReader)
+
+	// Internal eventfd counters and readiness follow the same branch-local
+	// semantics as pipe queues.
+	liveForkEventRead(t, childCtx, childEvent, 7)
+	if got := parentEvent.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child eventfd read consumed parent counter: %#x", got)
+	}
+	liveForkEventRead(t, ctx, parentEvent, 7)
+	liveForkEventWrite(t, ctx, parentEvent, 3)
+	if got := childEvent.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent eventfd write made child readable: %#x", got)
+	}
+	liveForkEventWrite(t, childCtx, childEvent, 4)
+	liveForkEventRead(t, ctx, parentEvent, 3)
+	liveForkEventRead(t, childCtx, childEvent, 4)
+	liveForkEventWouldBlock(t, ctx, parentEvent)
+	liveForkEventWouldBlock(t, childCtx, childEvent)
+	parentReader.DecRef(ctx)
+	parentWriter.DecRef(ctx)
+	parentEvent.DecRef(ctx)
+	childReader.DecRef(childCtx)
+	childWriter.DecRef(childCtx)
+	childEvent.DecRef(childCtx)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -286,6 +364,70 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	l.k.Unpause()
 	l.k.WaitExited()
+}
+
+func liveForkTestFD(t *testing.T, k *kernel.Kernel, fd int32) *vfs.FileDescription {
+	t.Helper()
+	file, _ := k.GlobalInit().Leader().FDTable().Get(fd)
+	if file == nil {
+		t.Fatalf("FD %d is missing", fd)
+	}
+	return file
+}
+
+func liveForkTestWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value string) {
+	t.Helper()
+	n, err := file.Write(ctx, usermem.BytesIOSequence([]byte(value)), vfs.WriteOptions{})
+	if err != nil || n != int64(len(value)) {
+		t.Fatalf("Write(%q): got (%d, %v)", value, n, err)
+	}
+}
+
+func liveForkTestRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, want string) {
+	t.Helper()
+	buf := make([]byte, len(want))
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if err != nil || n != int64(len(want)) || !bytes.Equal(buf, []byte(want)) {
+		t.Fatalf("Read: got (%q, %d, %v), want %q", buf, n, err, want)
+	}
+}
+
+func liveForkTestWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
+	t.Helper()
+	buf := make([]byte, 1)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Fatalf("empty nonblocking Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkEventWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value uint64) {
+	t.Helper()
+	var buf [8]byte
+	binary.NativeEndian.PutUint64(buf[:], value)
+	n, err := file.Write(ctx, usermem.BytesIOSequence(buf[:]), vfs.WriteOptions{})
+	if err != nil || n != int64(len(buf)) {
+		t.Fatalf("eventfd Write(%d): got (%d, %v)", value, n, err)
+	}
+}
+
+func liveForkEventRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, want uint64) {
+	t.Helper()
+	var buf [8]byte
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf[:]), vfs.ReadOptions{})
+	got := binary.NativeEndian.Uint64(buf[:])
+	if err != nil || n != int64(len(buf)) || got != want {
+		t.Fatalf("eventfd Read: got (%d, %d, %v), want %d", got, n, err, want)
+	}
+}
+
+func liveForkEventWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
+	t.Helper()
+	var buf [8]byte
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf[:]), vfs.ReadOptions{})
+	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Fatalf("empty eventfd Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
 }
 
 // TestStartSignal tests that the controller Start message will cause
