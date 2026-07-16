@@ -2115,6 +2115,14 @@ func (s *Sandbox) WriteConsole(args *boot.ConsoleWriteArgs) (boot.ConsoleWriteRe
 	return result, nil
 }
 
+// CloseConsoleStdin closes a branch-local internal console's input stream.
+func (s *Sandbox) CloseConsoleStdin(args *boot.ConsoleCloseStdinArgs) error {
+	if err := s.call(boot.ContMgrConsoleCloseStdin, args, nil); err != nil {
+		return fmt.Errorf("closing internal console %q stdin in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

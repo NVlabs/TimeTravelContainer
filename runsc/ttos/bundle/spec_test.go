@@ -89,6 +89,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.overlay"]; got != "memory" {
 		t.Errorf("root overlay=%q, want memory", got)
 	}
+	if got := spec.Annotations["dev.timetravelos.internal-console"]; got != "init" {
+		t.Errorf("internal console=%q, want init", got)
+	}
 	wantVolumeAnnotations := map[string]string{
 		"dev.gvisor.spec.mount.ttos0.source":  "ttos-volume-cache",
 		"dev.gvisor.spec.mount.ttos0.share":   "container",

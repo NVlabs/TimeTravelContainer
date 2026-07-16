@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -1047,6 +1048,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, parentTask, shmAddr1, "prnt")
 	grandchildMemfd := liveForkTestFD(t, grandchild.k, memfdFD)
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
+	grandchildConsoleStdin := liveForkTestFD(t, grandchild.k, consoleBaseFD)
 	grandchildConsoleStdout := liveForkTestFD(t, grandchild.k, consoleBaseFD+1)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
@@ -1135,6 +1137,10 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, grandchildTask, grandchildManagedAlias, 0, "grnd")
 	liveForkTestWrite(t, grandchildTask, grandchildConsoleStdout, "survivor-output")
 	liveForkTestConsoleRead(t, grandchild.k, grandchildTask, internalConsoleID, kernel.InternalConsoleStdout, "survivor-output")
+	if err := grandchild.k.CloseInternalConsoleStdin(grandchildTask, internalConsoleID); err != nil {
+		t.Fatalf("closing grandchild internal console stdin: %v", err)
+	}
+	liveForkTestEOF(t, grandchildTask, grandchildConsoleStdin)
 	liveForkTestReadEventually(t, grandchildTask, grandchildTCPServer, "stay")
 	grandchildMemfd.DecRef(grandchildTask)
 	grandchildOverlayFile.DecRef(grandchildTask)
@@ -1144,6 +1150,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildTCPServer.DecRef(grandchildTask)
 	grandchildManagedVolume.DecRef(grandchildTask)
 	grandchildManagedAlias.DecRef(grandchildTask)
+	grandchildConsoleStdin.DecRef(grandchildTask)
 	grandchildConsoleStdout.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
@@ -1243,6 +1250,15 @@ func liveForkTestWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDes
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		t.Fatalf("empty nonblocking Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkTestEOF(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
+	t.Helper()
+	buf := make([]byte, 1)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("EOF Read: got (%d, %v), want (0, EOF)", n, err)
 	}
 }
 

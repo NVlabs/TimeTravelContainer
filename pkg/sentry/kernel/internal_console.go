@@ -185,11 +185,30 @@ func (k *Kernel) WriteInternalConsole(ctx context.Context, id string, data []byt
 	}
 	console.mu.Lock()
 	defer console.mu.Unlock()
+	if console.stdin == nil {
+		return 0, false, fmt.Errorf("internal console %q stdin is closed", id)
+	}
 	written, err := console.stdin.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
 	if linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return int(written), true, nil
 	}
 	return int(written), false, err
+}
+
+// CloseInternalConsoleStdin closes the control-side stdin writer. Guest reads
+// observe EOF after queued input is consumed. Closing twice is idempotent.
+func (k *Kernel) CloseInternalConsoleStdin(ctx context.Context, id string) error {
+	console, err := k.internalConsole(id)
+	if err != nil {
+		return err
+	}
+	console.mu.Lock()
+	defer console.mu.Unlock()
+	if console.stdin != nil {
+		console.stdin.DecRef(ctx)
+		console.stdin = nil
+	}
+	return nil
 }
 
 func (k *Kernel) releaseInternalConsoles(ctx context.Context) {
@@ -198,7 +217,9 @@ func (k *Kernel) releaseInternalConsoles(ctx context.Context) {
 	k.internalConsoles = nil
 	k.internalConsolesMu.Unlock()
 	for _, console := range consoles {
-		console.stdin.DecRef(ctx)
+		if console.stdin != nil {
+			console.stdin.DecRef(ctx)
+		}
 		console.stdout.DecRef(ctx)
 		console.stderr.DecRef(ctx)
 	}

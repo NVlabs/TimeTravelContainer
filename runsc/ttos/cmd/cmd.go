@@ -17,6 +17,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/runsc/flag"
@@ -218,10 +220,11 @@ Global options:
   --data-root PATH               image, bundle, and metadata directory
 
 Commands:
-  pull [OPTIONS] IMAGE           Pull and unpack an OCI/Docker image
+  pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
+  attach [OPTIONS] TARGET        Attach to a branch's init console
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
@@ -250,6 +253,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runCreate(args[1:], stdout, stderr, backend)
 	case "start":
 		err = runStart(args[1:], stdout, stderr, backend)
+	case "attach":
+		err = runAttach(args[1:], stderr, backend)
 	case "exec":
 		err = runExec(args[1:], stderr, backend)
 	case "inspect":
@@ -736,6 +741,31 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func runAttach(args []string, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	interactive := fs.Bool("interactive", false, "forward stdin")
+	fs.BoolVar(interactive, "i", false, "forward stdin")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos attach [-i] CONTAINER[@BRANCH]")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	status, err := backend.attach(target, *interactive)
+	if err != nil {
+		return err
+	}
+	if code := waitStatusExitCode(status); code != 0 {
+		return exitStatus{code: code}
+	}
+	return nil
+}
+
 func runExec(args []string, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -831,7 +861,7 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("pull", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	platform := fs.String("platform", "", "target platform, such as linux/amd64")
-	unpack := fs.Bool("unpack", true, "unpack the selected platform after pulling")
+	unpack := fs.Bool("unpack", false, "also unpack through a containerd snapshotter (may require mount privileges)")
 	snapshotter := fs.String("snapshotter", defaultSnapshotter(), "containerd snapshotter used for unpacking")
 	quiet := fs.Bool("quiet", false, "only print the pulled digest")
 	fs.BoolVar(quiet, "q", false, "only print the pulled digest")
@@ -1251,6 +1281,7 @@ type backend interface {
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
+	attach(target selector, interactive bool) (uint32, error)
 	exec(request execRequest) (int, error)
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
@@ -1367,6 +1398,158 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	return 0, nil
 }
 
+type consoleReadResult struct {
+	Data       []byte `json:"Data"`
+	EOF        bool   `json:"EOF"`
+	WouldBlock bool   `json:"WouldBlock"`
+}
+
+type consoleWriteResult struct {
+	N          int  `json:"N"`
+	WouldBlock bool `json:"WouldBlock"`
+}
+
+type attachWaitResult struct {
+	status uint32
+	err    error
+}
+
+func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, error) {
+	waitCh := make(chan attachWaitResult, 1)
+	go func() {
+		status, err := b.wait(target)
+		waitCh <- attachWaitResult{status: status, err: err}
+	}()
+	inputErrCh := make(chan error, 1)
+	if interactive {
+		go func() { inputErrCh <- b.pumpConsoleInput(target) }()
+	}
+	for {
+		progress, stdoutEOF, stderrEOF, err := b.drainConsole(target)
+		if err != nil {
+			return 0, err
+		}
+		select {
+		case result := <-waitCh:
+			if result.err != nil {
+				return 0, result.err
+			}
+			for !stdoutEOF || !stderrEOF {
+				progress, stdoutEOF, stderrEOF, err = b.drainConsole(target)
+				if err != nil {
+					return 0, err
+				}
+				if !progress && (!stdoutEOF || !stderrEOF) {
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+			return result.status, nil
+		case err := <-inputErrCh:
+			if err != nil {
+				return 0, err
+			}
+			inputErrCh = nil
+		default:
+		}
+		if !progress {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func (b *runtimeBackend) drainConsole(target selector) (progress, stdoutEOF, stderrEOF bool, err error) {
+	for _, stream := range []struct {
+		name string
+		out  io.Writer
+		eof  *bool
+	}{
+		{name: "stdout", out: b.stdout, eof: &stdoutEOF},
+		{name: "stderr", out: b.stderr, eof: &stderrEOF},
+	} {
+		result, err := b.readConsole(target, stream.name)
+		if err != nil {
+			return false, false, false, err
+		}
+		*stream.eof = result.EOF
+		if len(result.Data) != 0 {
+			progress = true
+			if stream.out != nil {
+				if _, err := stream.out.Write(result.Data); err != nil {
+					return false, false, false, fmt.Errorf("writing attached %s: %w", stream.name, err)
+				}
+			}
+		}
+	}
+	return progress, stdoutEOF, stderrEOF, nil
+}
+
+func (b *runtimeBackend) readConsole(target selector, stream string) (consoleReadResult, error) {
+	output, err := b.command("timetravel", "--console", "init", "--stream", stream, "--max-bytes", "65536", target.container, "console-read", target.branch)
+	if err != nil {
+		return consoleReadResult{}, err
+	}
+	var result consoleReadResult
+	if err := json.Unmarshal(output, &result); err != nil {
+		return consoleReadResult{}, fmt.Errorf("decoding %s console read: %w", stream, err)
+	}
+	return result, nil
+}
+
+func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWriteResult, error) {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	output, err := b.command("timetravel", "--console", "init", "--data-base64", encoded, target.container, "console-write", target.branch)
+	if err != nil {
+		return consoleWriteResult{}, err
+	}
+	var result consoleWriteResult
+	if err := json.Unmarshal(output, &result); err != nil {
+		return consoleWriteResult{}, fmt.Errorf("decoding console write: %w", err)
+	}
+	return result, nil
+}
+
+func (b *runtimeBackend) closeConsoleStdin(target selector) error {
+	_, err := b.command("timetravel", "--console", "init", target.container, "console-close-stdin", target.branch)
+	return err
+}
+
+func (b *runtimeBackend) pumpConsoleInput(target selector) error {
+	if b.stdin == nil {
+		return b.closeConsoleStdin(target)
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := b.stdin.Read(buf)
+		for written := 0; written < n; {
+			result, err := b.writeConsole(target, buf[written:n])
+			if err != nil {
+				return err
+			}
+			written += result.N
+			if result.WouldBlock || result.N == 0 {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return b.closeConsoleStdin(target)
+			}
+			return fmt.Errorf("reading attached stdin: %w", readErr)
+		}
+	}
+}
+
+func waitStatusExitCode(status uint32) int {
+	ws := syscall.WaitStatus(status)
+	if ws.Exited() {
+		return ws.ExitStatus()
+	}
+	if ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return 1
+}
+
 func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	state := "exited"
@@ -1438,16 +1621,10 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 		"--network=none",
 		"--directfs=false",
 		"--overlay2=all:memory",
-		"run", "--bundle", bundleDir,
-	}
-	if detach {
-		args = append(args, "--detach")
+		"run", "--detach", "--bundle", bundleDir,
 	}
 	args = append(args, name)
 	command := exec.Command(b.runsc, args...)
-	if interactive && !detach {
-		command.Stdin = b.stdin
-	}
 	command.Stdout = b.stdout
 	command.Stderr = b.stderr
 	if err := command.Run(); err != nil {
@@ -1457,7 +1634,14 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 		}
 		return 1, fmt.Errorf("starting runsc: %w", err)
 	}
-	return 0, nil
+	if detach {
+		return 0, nil
+	}
+	status, err := b.attach(selector{container: name, branch: defaultBranchID}, interactive)
+	if err != nil {
+		return 1, err
+	}
+	return waitStatusExitCode(status), nil
 }
 
 func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {

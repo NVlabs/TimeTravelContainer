@@ -127,6 +127,12 @@ type ConsoleWriteResult struct {
 	WouldBlock bool
 }
 
+// ConsoleCloseStdinArgs closes a branch-local internal console's stdin.
+type ConsoleCloseStdinArgs struct {
+	BranchID  string
+	ConsoleID string
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -643,6 +649,28 @@ func (f *SandboxFamily) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteRe
 	}
 	*out = ConsoleWriteResult{N: n, WouldBlock: wouldBlock}
 	return nil
+}
+
+// ConsoleCloseStdin closes input while serializing against branch lifecycle
+// operations and live fork.
+func (f *SandboxFamily) ConsoleCloseStdin(args *ConsoleCloseStdinArgs) error {
+	if args == nil {
+		return fmt.Errorf("missing internal console close arguments")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	return b.k.CloseInternalConsoleStdin(b.k.SupervisorContext(), args.ConsoleID)
 }
 
 // beginControl acquires a Kernel-lifetime lease for a branch-local operation.

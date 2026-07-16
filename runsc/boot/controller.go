@@ -123,6 +123,9 @@ const (
 	// ContMgrConsoleWrite writes branch-local internal console input.
 	ContMgrConsoleWrite = "containerManager.ConsoleWrite"
 
+	// ContMgrConsoleCloseStdin closes branch-local internal console input.
+	ContMgrConsoleCloseStdin = "containerManager.ConsoleCloseStdin"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -995,6 +998,11 @@ func (cm *containerManager) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadR
 // ConsoleWrite writes input to a branch-local internal console.
 func (cm *containerManager) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteResult) error {
 	return cm.l.family.ConsoleWrite(args, out)
+}
+
+// ConsoleCloseStdin closes input to a branch-local internal console.
+func (cm *containerManager) ConsoleCloseStdin(args *ConsoleCloseStdinArgs, _ *struct{}) error {
+	return cm.l.family.ConsoleCloseStdin(args)
 }
 
 // Wait waits for the init process in the given container.

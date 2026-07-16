@@ -59,7 +59,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-write <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -168,6 +168,11 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			BranchID:  f.Arg(2),
 			ConsoleID: t.consoleID,
 			Data:      data,
+		})
+	case "console-close-stdin":
+		err = cont.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
 		})
 	default:
 		f.Usage()

@@ -166,7 +166,7 @@ func TestPullNormalizesDockerReference(t *testing.T) {
 	if status := runCommand([]string{"pull", "ubuntu"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("pull status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.pullReference != "docker.io/library/ubuntu:latest" || b.pullSnapshotter != "native" || !b.pullUnpack {
+	if b.pullReference != "docker.io/library/ubuntu:latest" || b.pullSnapshotter != "native" || b.pullUnpack {
 		t.Errorf("pull call: reference=%q snapshotter=%q unpack=%t", b.pullReference, b.pullSnapshotter, b.pullUnpack)
 	}
 	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\n"
@@ -267,6 +267,18 @@ func TestCreateAndStart(t *testing.T) {
 	}
 	if stdout.String() != "demo\n" {
 		t.Errorf("start output=%q", stdout.String())
+	}
+}
+
+func TestAttach(t *testing.T) {
+	b := &fakeBackend{waitStatus: uint32(7 << 8)}
+	var stdout, stderr bytes.Buffer
+	status := runCommand([]string{"attach", "-i", "demo@child"}, &stdout, &stderr, b)
+	if status != 7 {
+		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.attached != (selector{container: "demo", branch: "child"}) || !b.attachInteractive {
+		t.Errorf("attach target=%+v interactive=%t", b.attached, b.attachInteractive)
 	}
 }
 
@@ -591,37 +603,39 @@ type signalCall struct {
 }
 
 type fakeBackend struct {
-	families         []Family
-	err              error
-	forkSource       selector
-	forkDestination  string
-	forkPaused       bool
-	paused           selector
-	resumed          selector
-	destroyed        selector
-	signals          []signalCall
-	waited           selector
-	waitStatus       uint32
-	waitRelease      chan struct{}
-	pullReference    string
-	pullPlatform     string
-	pullSnapshotter  string
-	pullUnpack       bool
-	pullInfo         ttosimages.Info
-	runRequest       runRequest
-	runStatus        int
-	created          bool
-	started          string
-	startDetach      bool
-	startInteractive bool
-	inspectInfo      InspectInfo
-	removed          string
-	removeForce      bool
-	execRequest      execRequest
-	execStatus       int
-	volumes          []ttosbundle.VolumeInfo
-	ensuredVolume    string
-	removedVolume    string
+	families          []Family
+	err               error
+	forkSource        selector
+	forkDestination   string
+	forkPaused        bool
+	paused            selector
+	resumed           selector
+	destroyed         selector
+	signals           []signalCall
+	waited            selector
+	waitStatus        uint32
+	waitRelease       chan struct{}
+	pullReference     string
+	pullPlatform      string
+	pullSnapshotter   string
+	pullUnpack        bool
+	pullInfo          ttosimages.Info
+	runRequest        runRequest
+	runStatus         int
+	created           bool
+	started           string
+	startDetach       bool
+	startInteractive  bool
+	attached          selector
+	attachInteractive bool
+	inspectInfo       InspectInfo
+	removed           string
+	removeForce       bool
+	execRequest       execRequest
+	execStatus        int
+	volumes           []ttosbundle.VolumeInfo
+	ensuredVolume     string
+	removedVolume     string
 }
 
 func (b *fakeBackend) create(request runRequest) error {
@@ -640,6 +654,12 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 	b.startDetach = detach
 	b.startInteractive = interactive
 	return b.runStatus, b.err
+}
+
+func (b *fakeBackend) attach(target selector, interactive bool) (uint32, error) {
+	b.attached = target
+	b.attachInteractive = interactive
+	return b.waitStatus, b.err
 }
 
 func (b *fakeBackend) exec(request execRequest) (int, error) {

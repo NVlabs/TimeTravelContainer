@@ -13,9 +13,12 @@ and a private devpts instance with `/dev/ptmx`. Existing host paths can be
 attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
 tmpfs volumes can be attached at one or more paths, and their state forks CoW
 with each live branch. An opt-in non-TTY internal-console substrate now provides
-branch-local Sentry pipes and nonblocking control RPCs. The `ttos` stream pump,
-`ttosd`, detached and TTY exec, attach, persistent managed-volume backing, and
-managed OverlayFS volumes remain TODO.
+branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
+An initial polling `ttos attach` stream pump supports stdout/stderr, optional
+stdin, process exit-status forwarding, and foreground `run`/`start` without
+placing host FDs in the guest resource graph. `ttosd`, attachment leases,
+detach keys, output retention, detached and TTY exec, persistent managed-volume
+backing, and managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -90,6 +93,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Normalize unqualified names to `docker.io/library/...`.
 - [x] Support OCI registries, tags, immutable digests, and multi-architecture
       manifest selection.
+- [x] Default rootless pulls to the containerd content store without requesting
+      snapshotter unpack; retain explicit `--unpack` for environments where the
+      selected snapshotter's mount requirements are available.
 - [ ] Integrate registry authentication and Docker-compatible credential
       helpers without storing plaintext credentials in the state database.
 - [ ] Show pull/unpack progress and content reuse.
@@ -168,12 +174,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### Attach and detach
 
-- [ ] `ttos attach CONTAINER[@BRANCH]` for the init console.
+- [x] Initial non-TTY `ttos attach CONTAINER[@BRANCH]` for the init console,
+      with stdout/stderr streaming, optional `-i`, and exit-status forwarding.
 - [ ] `ttos attach CONTAINER[@BRANCH] --exec EXEC_ID` for an exec session.
 - [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
-- [ ] Support Docker-like detach keys, terminal resize, signal forwarding, and
-      exit-status reporting.
-- [ ] Support noninteractive streaming suitable for pipelines.
+- [ ] Support Docker-like detach keys, terminal resize, and signal forwarding.
+- [x] Initial noninteractive streaming suitable for pipelines.
 - [ ] Define multiple-reader and single-stdin-owner semantics.
 - [ ] Define bounded output retention, backpressure, and log truncation while
       no client is attached.
@@ -225,9 +231,12 @@ host clients connect transiently through the control plane.
 - [x] Keep pipe peers in the branch-local Kernel console registry, not
       in a host `FileDescription`.
 - [x] Add branch-serialized nonblocking console read/write RPCs.
-- [ ] Add readiness waiting, resize, close, attachment leases, and cancellation.
-- [ ] Implement host-side stream pumping in `ttos`/`ttosd` without adding host
-      FDs to the guest resource graph.
+- [x] Add branch-serialized stdin close and verify that the guest observes EOF.
+- [ ] Add readiness waiting, resize, attachment leases, and cancellation.
+- [x] Implement the initial polling host-side stream pump directly in `ttos`
+      without adding host FDs to the guest resource graph.
+- [ ] Move stream ownership into `ttosd` and replace polling RPC processes with
+      readiness/event-driven long-lived transport.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
 - [ ] Clone PTY termios, foreground process group, window size, and hangup state.
@@ -411,7 +420,8 @@ grandchild branches without PID or wait-status crossover.
 ### Milestone C: detachable console
 
 - [x] Internal non-TTY console sessions and nonblocking branch RPC substrate.
-- [ ] Host-side streaming, attach leases, detach, and log retention.
+- [x] Initial direct-CLI non-TTY host-side streaming and attach command.
+- [ ] Attach leases, detach keys, daemon-owned transport, and log retention.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
 - [x] Non-TTY console state fork and branch-local I/O.

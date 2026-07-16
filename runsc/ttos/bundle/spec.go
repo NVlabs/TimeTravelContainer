@@ -136,7 +136,8 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 	}
 	annotations := map[string]string{
-		"dev.gvisor.spec.rootfs.overlay": "memory",
+		"dev.gvisor.spec.rootfs.overlay":    "memory",
+		"dev.timetravelos.internal-console": "init",
 	}
 	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes))
 	for _, mount := range mounts {
