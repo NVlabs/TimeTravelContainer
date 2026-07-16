@@ -18,8 +18,11 @@ inspection. Generated bundles include procfs, restricted read-only sysfs,
 tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
 `/dev/ptmx`. Existing host paths can be attached read-only with Docker-style
 `-v` or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
-more paths, and their state forks CoW
-with each live branch. An opt-in non-TTY internal-console substrate now provides
+more paths, and their state forks CoW with each live branch. Containers default
+to isolated `--network none`; Docker-style `--network/--net host` persists
+hostinet configuration across start/restart and is rejected by live-fork
+validation as an external resource. An opt-in non-TTY internal-console
+substrate now provides
 branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
 into a Docker-multiplexed host log with frame-safe bounded rotation (defaulting
@@ -137,6 +140,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       hosts that prohibit user namespaces; this runs Sentry/gofer as the
       caller without host namespaces or chroots while retaining Sentry guest
       namespaces and credentials.
+- [x] Support Docker-style `--network/--net none|host` on run/create, persist
+      the selected mode across start/restart, and report it through inspect.
+      `none` remains the fork-safe default. Host networking deliberately has no
+      port-publishing layer and is ineligible for live fork because it exposes
+      the external host network stack.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
 - [x] Support family-local named tmpfs volumes through `-v NAME:CONTAINER[:ro]`

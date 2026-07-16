@@ -63,6 +63,8 @@ LIFECYCLE="$PREFIX-lifecycle"
 CONSOLE_STRESS="$PREFIX-console-stress"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
+HOSTNET="$PREFIX-hostnet"
+HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
 
 ttos() {
@@ -87,7 +89,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$LIFECYCLE"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -136,6 +138,26 @@ echo "$MULTI_STARTED" | grep -qx "$MULTI_B" || fail "multi-start omitted $MULTI_
 MULTI_WAIT=$(ttos wait "$MULTI_A" "$MULTI_B")
 [ "$MULTI_WAIT" = "$(printf '3\n4')" ] || fail "multi-wait returned: $MULTI_WAIT"
 ttos container rm "$MULTI_A" "$MULTI_B"
+
+echo "== persisted host networking and fork rejection =="
+command -v curl >/dev/null 2>&1 || fail "curl is required for the host-network service probe"
+ttos container create --network host --name "$HOSTNET" "$BUSYBOX_IMAGE" sh -c \
+  "mkdir -p /tmp/www; echo hostnet-ok >/tmp/www/index.html; exec httpd -f -p $HOSTNET_PORT -h /tmp/www"
+ttos container start "$HOSTNET"
+deadline=$(( $(date +%s) + 15 ))
+HOSTNET_RESPONSE=
+while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "host-network BusyBox service did not become reachable"
+  HOSTNET_RESPONSE=$(curl -fsS --max-time 1 "http://127.0.0.1:$HOSTNET_PORT/" 2>/dev/null || true)
+  [ "$HOSTNET_RESPONSE" = hostnet-ok ] || sleep 1
+done
+[ "$(ttos inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
+  fail "inspect did not retain host network mode"
+if ttos fork --check "$HOSTNET" >/dev/null 2>&1; then
+  fail "host-network container was incorrectly eligible for a live fork"
+fi
+ttos stop --time 1 "$HOSTNET"
+ttos rm "$HOSTNET"
 
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'

@@ -62,6 +62,7 @@ type ContainerInfo struct {
 	BundleDir          string          `json:"bundle_dir"`
 	RootFS             string          `json:"rootfs"`
 	Volumes            []ManagedVolume `json:"volumes,omitempty"`
+	NetworkMode        string          `json:"network_mode,omitempty"`
 	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
 	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
 	State              string          `json:"state"`
@@ -92,6 +93,11 @@ type VolumeInfo struct {
 // Prepare pulls content, creates or reuses an immutable root, and writes a new
 // container bundle. Existing container names are rejected.
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
+	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
+	if err != nil {
+		return Prepared{}, err
+	}
+	opts.NetworkMode = networkMode
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
@@ -152,6 +158,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		BundleDir:          bundleDir,
 		RootFS:             rootfs,
 		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
+		NetworkMode:        networkMode,
 		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
 		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
 		State:              "created",
@@ -186,6 +193,11 @@ func (s Store) LoadContainer(name string) (ContainerInfo, error) {
 	if info.State == "" {
 		info.State = "created"
 	}
+	networkMode, err := normalizeNetworkMode(info.NetworkMode)
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", name, err)
+	}
+	info.NetworkMode = networkMode
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", name, err)
 	}

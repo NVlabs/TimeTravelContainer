@@ -521,14 +521,14 @@ func TestValidateImageRemovalRequiresForceWhenInUse(t *testing.T) {
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-d", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got := stdout.String(); got != "demo\n" {
 		t.Errorf("run output=%q, want demo", got)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -553,6 +553,22 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if b.runRequest.consoleLogMaxBytes != 1572864 || b.runRequest.consoleLogMaxFiles != 4 {
 		t.Errorf("log retention=(%d, %d), want (1572864, 4)", b.runRequest.consoleLogMaxBytes, b.runRequest.consoleLogMaxFiles)
+	}
+}
+
+func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--network", "bridge", "busybox"},
+		{"create", "--net", "sandbox", "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
 	}
 }
 
@@ -596,10 +612,10 @@ func TestRunForwardsContainerExitStatus(t *testing.T) {
 func TestCreateAndStart(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	stdout.Reset()
@@ -1089,7 +1105,7 @@ func TestBuildInspectInfo(t *testing.T) {
 	exit := 23
 	container := ttosbundle.ContainerInfo{
 		Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: false},
@@ -1132,6 +1148,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if got := info.HostConfig.Binds; !reflect.DeepEqual(got, []string{"/host/data:/data:ro"}) {
 		t.Errorf("binds=%q", got)
+	}
+	if info.HostConfig.NetworkMode != "host" {
+		t.Errorf("network mode=%q, want host", info.HostConfig.NetworkMode)
 	}
 	if _, ok := info.Config.Volumes["/cache"]; !ok {
 		t.Errorf("volumes=%v", info.Config.Volumes)
@@ -1434,6 +1453,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
+	}
+	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--overlay2=all:memory"}
+	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
+		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",

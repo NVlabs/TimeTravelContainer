@@ -99,6 +99,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got := spec.Annotations["dev.timetravelos.internal-console"]; got != "init" {
 		t.Errorf("internal console=%q, want init", got)
 	}
+	if got := spec.Annotations["dev.timetravelos.config.network"]; got != "none" {
+		t.Errorf("network annotation=%q, want none", got)
+	}
 	wantVolumeAnnotations := map[string]string{
 		"dev.gvisor.spec.mount.ttos0.source":  "ttos-volume-cache",
 		"dev.gvisor.spec.mount.ttos0.share":   "container",
@@ -121,6 +124,31 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 			t.Errorf("annotation %q=%q, want %q", key, got, want)
 		}
 	}
+	if !hasNamespace(spec, specs.NetworkNamespace) {
+		t.Error("default spec omitted isolated network namespace")
+	}
+	hostSpec, err := BuildSpec(image, SpecOptions{RootFS: root, NetworkMode: "host"})
+	if err != nil {
+		t.Fatalf("BuildSpec host network: %v", err)
+	}
+	if hasNamespace(hostSpec, specs.NetworkNamespace) {
+		t.Error("host-network spec retained an isolated network namespace")
+	}
+	if got := hostSpec.Annotations["dev.timetravelos.config.network"]; got != "host" {
+		t.Errorf("host network annotation=%q, want host", got)
+	}
+}
+
+func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
+	if spec.Linux == nil {
+		return false
+	}
+	for _, candidate := range spec.Linux.Namespaces {
+		if candidate.Type == namespace {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
@@ -153,6 +181,9 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "/data", Readonly: true}}, ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "/data"}}}); err == nil {
 		t.Error("BuildSpec accepted duplicate host/managed destination")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), NetworkMode: "bridge"}); err == nil {
+		t.Error("BuildSpec accepted unsupported network mode")
 	}
 }
 
@@ -203,6 +234,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
+	}
+	if containers[0].NetworkMode != "none" {
+		t.Errorf("legacy network mode=%q, want none", containers[0].NetworkMode)
 	}
 	paths, err := store.BranchConsolePaths("demo", "test-a")
 	if err != nil {

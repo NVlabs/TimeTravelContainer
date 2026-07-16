@@ -56,6 +56,7 @@ type SpecOptions struct {
 	User           string
 	Hostname       string
 	Terminal       bool
+	NetworkMode    string
 	Entrypoint     []string
 	HostMounts     []HostMount
 	ManagedVolumes []ManagedVolume
@@ -83,6 +84,10 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	rootfs, err := filepath.Abs(opts.RootFS)
 	if err != nil {
 		return nil, fmt.Errorf("resolving rootfs path: %w", err)
+	}
+	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
+	if err != nil {
+		return nil, err
 	}
 	cmd := image.Config.Cmd
 	if len(opts.Args) != 0 {
@@ -136,11 +141,21 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 	}
+	namespaces := []specs.LinuxNamespace{
+		{Type: specs.PIDNamespace},
+		{Type: specs.IPCNamespace},
+		{Type: specs.UTSNamespace},
+		{Type: specs.MountNamespace},
+	}
+	if networkMode == "none" {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+	}
 	annotations := map[string]string{
 		"dev.gvisor.spec.rootfs.source":     rootfs,
 		"dev.gvisor.spec.rootfs.type":       "bind",
 		"dev.gvisor.spec.rootfs.overlay":    "memory",
 		"dev.timetravelos.internal-console": "init",
+		"dev.timetravelos.config.network":   networkMode,
 	}
 	entrypointJSON, err := json.Marshal(entrypoint)
 	if err != nil {
@@ -246,19 +261,23 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 				Soft: 1024,
 			}},
 		},
-		Hostname: hostname,
-		Mounts:   mounts,
-		Linux: &specs.Linux{
-			Namespaces: []specs.LinuxNamespace{
-				{Type: specs.PIDNamespace},
-				{Type: specs.IPCNamespace},
-				{Type: specs.UTSNamespace},
-				{Type: specs.MountNamespace},
-				{Type: specs.NetworkNamespace},
-			},
-		},
+		Hostname:    hostname,
+		Mounts:      mounts,
+		Linux:       &specs.Linux{Namespaces: namespaces},
 		Annotations: annotations,
 	}, nil
+}
+
+func normalizeNetworkMode(mode string) (string, error) {
+	if mode == "" {
+		mode = "none"
+	}
+	switch mode {
+	case "none", "host":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported network mode %q; supported modes are none and host", mode)
+	}
 }
 
 func mergeEnv(imageEnv, overrides []string) ([]string, error) {

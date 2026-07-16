@@ -14,6 +14,9 @@ covers:
   `wait` with argument-ordered exit codes, restart of an exited container, and
   an explicitly forced running-family restart where in-memory managed-volume
   contents are expected to be recreated;
+- persisted `--network host` startup using an unmodified BusyBox HTTP server,
+  Docker inspect projection, host-loopback reachability, and live-fork
+  rejection for the externally shared network stack;
 - BusyBox process/procfs/sysfs startup;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;

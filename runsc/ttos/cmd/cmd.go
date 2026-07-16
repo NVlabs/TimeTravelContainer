@@ -640,6 +640,15 @@ func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.H
 	return ttosbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: true}, nil
 }
 
+func parseNetworkMode(value string) (string, error) {
+	switch value {
+	case "none", "host":
+		return value, nil
+	default:
+		return "", fmt.Errorf("unsupported network mode %q; supported modes are none and host", value)
+	}
+}
+
 func parseLogOptions(values []string) (int64, int, error) {
 	maxBytes := defaultConsoleLogMax
 	maxFiles := defaultConsoleLogFiles
@@ -721,6 +730,7 @@ type runRequest struct {
 	cwd                string
 	user               string
 	hostname           string
+	networkMode        string
 	entrypoint         []string
 	hostMounts         []ttosbundle.HostMount
 	consoleLogMaxBytes int64
@@ -759,6 +769,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	user := fs.String("user", "", "username or UID[:GID]")
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
+	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
 	var env stringSlice
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
@@ -781,6 +793,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *detach && *interactive {
 		return errors.New("detached interactive containers require the internal console, which is not implemented yet")
 	}
+	networkMode, err := parseNetworkMode(*networkModeValue)
+	if err != nil {
+		return err
+	}
 	parsedMounts, err := parseMountRequests(volumes, mounts)
 	if err != nil {
 		return err
@@ -802,6 +818,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		cwd:                *cwd,
 		user:               *user,
 		hostname:           *hostname,
+		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
 		managedVolumes:     parsedMounts.managed,
 		consoleLogMaxBytes: logMaxBytes,
@@ -840,6 +857,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	user := fs.String("user", "", "username or UID[:GID]")
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
+	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
 	var env stringSlice
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
@@ -855,6 +874,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
+	}
+	networkMode, err := parseNetworkMode(*networkModeValue)
+	if err != nil {
+		return err
 	}
 	parsedMounts, err := parseMountRequests(volumes, mounts)
 	if err != nil {
@@ -877,6 +900,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		cwd:                *cwd,
 		user:               *user,
 		hostname:           *hostname,
+		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
 		managedVolumes:     parsedMounts.managed,
 		consoleLogMaxBytes: logMaxBytes,
@@ -2805,6 +2829,7 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,
+			NetworkMode:    request.networkMode,
 			Entrypoint:     request.entrypoint,
 			ManagedVolumes: request.managedVolumes,
 			HostMounts:     request.hostMounts,
@@ -2817,7 +2842,7 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	status, err := b.launch(request.name, prepared.BundleDir, request.detach, request.interactive)
+	status, err := b.launch(request.name, prepared.BundleDir, request.networkMode, request.detach, request.interactive)
 	if err == nil {
 		b.recordLaunchState(request.name, request.detach, status)
 	}
@@ -2834,6 +2859,7 @@ func (b *runtimeBackend) create(request runRequest) error {
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,
+			NetworkMode:    request.networkMode,
 			Entrypoint:     request.entrypoint,
 			HostMounts:     request.hostMounts,
 			ManagedVolumes: request.managedVolumes,
@@ -2855,7 +2881,7 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err := b.removeStoppedRuntime(name); err != nil {
 		return 1, err
 	}
-	status, err := b.launch(name, info.BundleDir, detach, interactive)
+	status, err := b.launch(name, info.BundleDir, info.NetworkMode, detach, interactive)
 	if err == nil {
 		b.recordLaunchState(name, detach, status)
 	}
@@ -3805,7 +3831,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, NetworkMode: "none", ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
+			Binds: binds, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
@@ -3881,6 +3907,10 @@ func (b *runtimeBackend) remove(name string, force bool) error {
 }
 
 func (b *runtimeBackend) configuredRunscArgs() []string {
+	return b.configuredRunscArgsForNetwork("none")
+}
+
+func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []string {
 	args := []string{
 		"--root", b.root,
 	}
@@ -3890,14 +3920,18 @@ func (b *runtimeBackend) configuredRunscArgs() []string {
 		args = append(args, "--rootless=true")
 	}
 	args = append(args,
-		"--network=none",
+		"--network="+networkMode,
 		"--directfs=false",
 		"--overlay2=all:memory")
 	return args
 }
 
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
-	args = append(b.configuredRunscArgs(), args...)
+	return b.runConfiguredCommandForNetwork("none", args...)
+}
+
+func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args ...string) (int, error) {
+	args = append(b.configuredRunscArgsForNetwork(networkMode), args...)
 	command := exec.Command(b.runsc, args...)
 	command.Stdout = b.stdout
 	command.Stderr = b.stderr
@@ -3911,8 +3945,8 @@ func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
 	return 0, nil
 }
 
-func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool) (int, error) {
-	status, err := b.runConfiguredCommand("create", "--bundle", bundleDir, name)
+func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, interactive bool) (int, error) {
+	status, err := b.runConfiguredCommandForNetwork(networkMode, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
 	}
@@ -3924,7 +3958,7 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 		}
 		return 1, fmt.Errorf("starting console drain before container start: %w", err)
 	}
-	status, err = b.runConfiguredCommand("start", name)
+	status, err = b.runConfiguredCommandForNetwork(networkMode, "start", name)
 	if err != nil || status != 0 {
 		if err == nil {
 			err = fmt.Errorf("runsc start exited with status %d", status)
