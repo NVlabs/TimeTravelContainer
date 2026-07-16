@@ -451,8 +451,10 @@ Reject            unsupported, externally mutable, or host/device-backed
       lower that can be exposed to runsc through a read-only gofer.
 - [x] Cache content-addressed directory roots and construct the initial OCI
       spec from image config plus `ttos run` options.
-- [ ] Preserve distinct image UID/GID ownership in rootless materialization,
-      for example with an EROFS lower or an explicit ownership metadata scheme.
+- [x] Preserve distinct image UID/GID ownership in rootless materialization with
+      a versioned sidecar manifest served only by the immutable root gofer
+      connection. Physical files remain caller-owned; guest stat and Sentry
+      permission checks receive the OCI-layer IDs without subordinate ranges.
 - [ ] Construct the full mount manifest once allowed mount classes are
       implemented.
 - [x] Place an in-memory OverlayFS upper over the immutable image lower by
@@ -462,11 +464,11 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [ ] Keep branch-local mutable filesystem state owned by the Sentry, not by a
       host snapshotter that cannot participate in live fork.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
-      Python, and nginx images, covering rootless prerequisites, OCI startup,
+      Python, nginx, and Redis images, covering rootless prerequisites, OCI startup,
       Docker-like lifecycle commands and inspect across created, running,
       forked, paused, and exited states; live fork; managed-volume CoW;
-      read-only host binds; exact quick-exit console integrity; and the
-      explicit no-userns fallback.
+      read-only host binds; distinct Redis lower-layer ownership; exact quick-exit
+      console integrity; and the explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 
