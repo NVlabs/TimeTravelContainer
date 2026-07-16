@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,6 +133,8 @@ Commands:
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
+  kill [OPTIONS] TARGET...        Send a signal to branch init processes
+  stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
 
 Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
@@ -150,6 +153,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume":
 		err = runPauseResume(args[1:], stdout, backend, false)
+	case "kill":
+		err = runKill(args[1:], stdout, stderr, backend)
+	case "stop":
+		err = runStop(args[1:], stdout, stderr, backend)
 	case "branch":
 		err = runBranch(args[1:], stdout, backend)
 	case "help":
@@ -249,6 +256,129 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 	return nil
 }
 
+func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var signalName string
+	fs.StringVar(&signalName, "signal", "KILL", "signal name or number")
+	fs.StringVar(&signalName, "s", "KILL", "signal name or number")
+	all := fs.Bool("all", false, "signal every process in the selected branch")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos kill [--signal SIGNAL] TARGET...")
+	}
+	signal, err := parseSignal(signalName)
+	if err != nil {
+		return err
+	}
+	for _, arg := range fs.Args() {
+		target, err := parseSelector(arg)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", arg, err)
+		}
+		if err := backend.signal(target, signal, *all); err != nil {
+			return fmt.Errorf("signaling %s: %w", target, err)
+		}
+		fmt.Fprintln(stdout, target)
+	}
+	return nil
+}
+
+func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var timeout int
+	fs.IntVar(&timeout, "time", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "timeout", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "t", 10, "seconds to wait for graceful termination; -1 waits forever")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos stop [--time SECONDS] TARGET...")
+	}
+	if timeout < -1 {
+		return errors.New("stop timeout must be -1 or greater")
+	}
+	for _, arg := range fs.Args() {
+		target, err := parseSelector(arg)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", arg, err)
+		}
+		if err := stopBranch(target, timeout, backend); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, target)
+	}
+	return nil
+}
+
+type waitResult struct {
+	status uint32
+	err    error
+}
+
+func stopBranch(target selector, timeoutSeconds int, backend backend) error {
+	const (
+		signalKill = 9
+		signalTerm = 15
+	)
+	if err := backend.signal(target, signalTerm, false); err != nil {
+		return fmt.Errorf("stopping %s with SIGTERM: %w", target, err)
+	}
+	waited := make(chan waitResult, 1)
+	go func() {
+		status, err := backend.wait(target)
+		waited <- waitResult{status: status, err: err}
+	}()
+	if timeoutSeconds == -1 {
+		result := <-waited
+		if result.err != nil {
+			return fmt.Errorf("waiting for %s: %w", target, result.err)
+		}
+		return nil
+	}
+	timer := time.NewTimer(time.Duration(timeoutSeconds) * time.Second)
+	defer timer.Stop()
+	select {
+	case result := <-waited:
+		if result.err != nil {
+			return fmt.Errorf("waiting for %s: %w", target, result.err)
+		}
+		return nil
+	case <-timer.C:
+		if err := backend.signal(target, signalKill, false); err != nil {
+			return fmt.Errorf("stopping %s with SIGKILL: %w", target, err)
+		}
+		result := <-waited
+		if result.err != nil {
+			return fmt.Errorf("waiting for %s after SIGKILL: %w", target, result.err)
+		}
+		return nil
+	}
+}
+
+func parseSignal(value string) (int, error) {
+	if number, err := strconv.Atoi(value); err == nil {
+		if number < 1 || number > 64 {
+			return 0, fmt.Errorf("signal number %d is outside 1..64", number)
+		}
+		return number, nil
+	}
+	name := strings.TrimPrefix(strings.ToUpper(value), "SIG")
+	signals := map[string]int{
+		"HUP": 1, "INT": 2, "QUIT": 3, "KILL": 9, "USR1": 10,
+		"USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15, "CONT": 18,
+		"STOP": 19, "TSTP": 20, "TTIN": 21, "TTOU": 22,
+	}
+	if signal, ok := signals[name]; ok {
+		return signal, nil
+	}
+	return 0, fmt.Errorf("unknown signal %q", value)
+}
+
 func runBranch(args []string, stdout io.Writer, backend backend) error {
 	if len(args) < 2 || args[0] != "rm" {
 		return errors.New("usage: ttos branch rm TARGET...")
@@ -340,6 +470,8 @@ type backend interface {
 	pause(target selector) error
 	resume(target selector) error
 	destroy(target selector) error
+	signal(target selector, signal int, all bool) error
+	wait(target selector) (uint32, error)
 }
 
 type runtimeBackend struct {
@@ -461,6 +593,30 @@ func (b *runtimeBackend) resume(target selector) error {
 func (b *runtimeBackend) destroy(target selector) error {
 	_, err := b.command("timetravel", target.container, "destroy", target.branch)
 	return err
+}
+
+func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
+	args := []string{"timetravel", "--signal", strconv.Itoa(signal)}
+	if all {
+		args = append(args, "--all")
+	}
+	args = append(args, target.container, "signal", target.branch)
+	_, err := b.command(args...)
+	return err
+}
+
+func (b *runtimeBackend) wait(target selector) (uint32, error) {
+	output, err := b.command("timetravel", target.container, "wait", target.branch)
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		Status uint32 `json:"wait_status"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return 0, fmt.Errorf("decoding runsc wait result: %w", err)
+	}
+	return result.Status, nil
 }
 
 func writeTree(w io.Writer, families []Family) {

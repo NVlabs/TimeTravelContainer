@@ -92,8 +92,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Support foreground, `--detach`, and interactive `-i`/`-t` modes.
 - [ ] `ttos create`, even if initially implemented as `run` without `start`.
 - [ ] `ttos start CONTAINER` for created/stopped base containers.
-- [ ] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
-- [ ] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
+- [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
+- [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
 - [ ] `ttos rm CONTAINER` and explicit policy for live descendant branches.
 - [ ] `ttos inspect CONTAINER[@BRANCH]` exposing family, branch, process,
       resource-eligibility, timing, and mount information.

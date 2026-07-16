@@ -161,6 +161,61 @@ func TestListJSON(t *testing.T) {
 	}
 }
 
+func TestKillParsesSignalAndSelectsBranch(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"kill", "--signal", "SIGTERM", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("kill status=%d, stderr=%q", status, stderr.String())
+	}
+	if len(b.signals) != 1 || b.signals[0].target != (selector{container: "web", branch: "child"}) || b.signals[0].signal != 15 || b.signals[0].all {
+		t.Errorf("signal calls=%+v", b.signals)
+	}
+}
+
+func TestStopGraceful(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "--time", "1", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop status=%d, stderr=%q", status, stderr.String())
+	}
+	if len(b.signals) != 1 || b.signals[0].signal != 15 {
+		t.Errorf("signal calls=%+v, want SIGTERM only", b.signals)
+	}
+	if b.waited != (selector{container: "web", branch: "child"}) {
+		t.Errorf("wait target=%+v", b.waited)
+	}
+}
+
+func TestStopEscalatesToKill(t *testing.T) {
+	b := &fakeBackend{waitRelease: make(chan struct{})}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "--time", "0", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop status=%d, stderr=%q", status, stderr.String())
+	}
+	if len(b.signals) != 2 || b.signals[0].signal != 15 || b.signals[1].signal != 9 {
+		t.Errorf("signal calls=%+v, want SIGTERM then SIGKILL", b.signals)
+	}
+}
+
+func TestParseSignal(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int
+	}{
+		{value: "9", want: 9},
+		{value: "KILL", want: 9},
+		{value: "sigusr1", want: 10},
+	} {
+		got, err := parseSignal(test.value)
+		if err != nil || got != test.want {
+			t.Errorf("parseSignal(%q)=(%d, %v), want (%d, nil)", test.value, got, err, test.want)
+		}
+	}
+	if _, err := parseSignal("NOPE"); err == nil {
+		t.Error("parseSignal(NOPE) succeeded")
+	}
+}
+
 func TestRuntimeBackendUsesRunscCLI(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -179,6 +234,13 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$6" = "--paused" ] && [ "$7" = "web" ] && [ "$8" = "fork" ] && [ "$9" = "child" ]; then
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "wait" ] && [ "$6" = "child" ]; then
+	echo '{"wait_status":15}'
 	exit 0
 fi
 echo "unexpected command: $*" >&2
@@ -202,6 +264,19 @@ exit 2
 	if child.ID != "child" || child.ParentID != "main" || child.State != "paused" || child.ForkTotalNS != 3_000_000 || child.KernelForkNS != 2_000_000 {
 		t.Errorf("fork returned %+v", child)
 	}
+	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	status, err := b.wait(selector{container: "web", branch: "child"})
+	if err != nil || status != 15 {
+		t.Errorf("wait returned (%d, %v), want (15, nil)", status, err)
+	}
+}
+
+type signalCall struct {
+	target selector
+	signal int
+	all    bool
 }
 
 type fakeBackend struct {
@@ -213,6 +288,10 @@ type fakeBackend struct {
 	paused          selector
 	resumed         selector
 	destroyed       selector
+	signals         []signalCall
+	waited          selector
+	waitStatus      uint32
+	waitRelease     chan struct{}
 }
 
 func (b *fakeBackend) listFamilies() ([]Family, error) {
@@ -242,4 +321,20 @@ func (b *fakeBackend) resume(target selector) error {
 func (b *fakeBackend) destroy(target selector) error {
 	b.destroyed = target
 	return b.err
+}
+
+func (b *fakeBackend) signal(target selector, signal int, all bool) error {
+	b.signals = append(b.signals, signalCall{target: target, signal: signal, all: all})
+	if signal == 9 && b.waitRelease != nil {
+		close(b.waitRelease)
+	}
+	return b.err
+}
+
+func (b *fakeBackend) wait(target selector) (uint32, error) {
+	b.waited = target
+	if b.waitRelease != nil {
+		<-b.waitRelease
+	}
+	return b.waitStatus, b.err
 }
