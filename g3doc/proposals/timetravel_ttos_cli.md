@@ -14,11 +14,14 @@ attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
 tmpfs volumes can be attached at one or more paths, and their state forks CoW
 with each live branch. An opt-in non-TTY internal-console substrate now provides
 branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
-An initial polling `ttos attach` stream pump supports stdout/stderr, optional
-stdin, process exit-status forwarding, and foreground `run`/`start` without
-placing host FDs in the guest resource graph. `ttosd`, attachment leases,
-detach keys, output retention, detached and TTY exec, persistent managed-volume
-backing, and managed OverlayFS volumes remain TODO.
+A persistent, single-consumer `runsc console-follow` sidecar drains each branch
+into a Docker-multiplexed host log; `ttos attach` and `ttos logs [-f]` replay or
+follow it independently. This supports optional stdin, process exit-status
+forwarding, foreground `run`/`start`, detached output draining, and multiple
+output readers without placing host FDs in the guest resource graph. `ttosd`,
+exclusive stdin ownership, detach keys, bounded log rotation, detached and TTY
+exec, persistent managed-volume backing, and managed OverlayFS volumes remain
+TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -130,7 +133,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       the live family/branch tree when present.
 - [ ] Extend inspect with branch process, resource-eligibility, timing, and
       mount information.
-- [ ] `ttos logs CONTAINER[@BRANCH]` backed by branch-local console output.
+- [x] Initial `ttos logs CONTAINER[@BRANCH]` and `logs -f`, preserving separate
+      stdout/stderr streams and backed by branch-local persistent console logs.
+- [ ] Add Docker-compatible `--tail`, `--since`, `--until`, timestamps, details,
+      bounded rotation, and explicit logging-driver policy.
 - [ ] `ttos ps` for host-side container families and `ttos top` for processes
       inside a selected branch.
 
@@ -180,15 +186,19 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
 - [ ] Support Docker-like detach keys, terminal resize, and signal forwarding.
 - [x] Initial noninteractive streaming suitable for pipelines.
-- [ ] Define multiple-reader and single-stdin-owner semantics.
+- [x] Allow multiple independent stdout/stderr readers without consuming each
+      other's output; one locked sidecar is the sole Sentry-pipe reader.
+- [ ] Define and enforce single-stdin-owner semantics.
+- [x] Drain output while no client is attached so guest writers do not stop at
+      the Sentry pipe capacity; retain output in a persistent host log.
 - [ ] Define bounded output retention, backpressure, and log truncation while
       no client is attached.
-- [ ] Reject fork while a transient host attachment lease is active in the
-      first release.
-- [ ] Make the branch immediately fork-eligible after every host attachment is
-      detached, even if the guest process and internal console stay alive.
-- [ ] On fork, clone console queues and terminal state but inherit no host
-      attachment clients.
+- [x] Allow fork while output readers are attached: read RPCs serialize against
+      fork, readers follow a host log, and a new child sidecar starts afterward.
+- [x] Keep branches fork-eligible before, during, and after output attachment;
+      host readers never enter the guest resource graph.
+- [x] On fork, clone console queues and start a new branch-local drain while
+      inheriting no host attachment clients.
 
 ## Branch-aware process control
 
@@ -221,9 +231,13 @@ CLI detaches. Closing only the host CLI is therefore insufficient for live-fork
 eligibility. Guest processes must instead retain Sentry-internal endpoints;
 host clients connect transiently through the control plane.
 
+Persistent logs are host-side observations only. They are neither part of live
+branch state nor read during fork; process, kernel, console-queue, and filesystem
+state still forks entirely in memory.
+
 - [x] Define a saved branch-local non-TTY console object with a stable session
       ID and stdin/stdout/stderr queues.
-- [ ] Add terminal metadata, attachment leases, and detached exec-session IDs.
+- [ ] Add terminal metadata, stdin ownership, and detached exec-session IDs.
 - [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
 - [ ] For interactive processes, allocate a Sentry devpts PTY and install its
@@ -232,18 +246,21 @@ host clients connect transiently through the control plane.
       in a host `FileDescription`.
 - [x] Add branch-serialized nonblocking console read/write RPCs.
 - [x] Add branch-serialized stdin close and verify that the guest observes EOF.
-- [ ] Add readiness waiting, resize, attachment leases, and cancellation.
-- [x] Implement the initial polling host-side stream pump directly in `ttos`
-      without adding host FDs to the guest resource graph.
-- [ ] Move stream ownership into `ttosd` and replace polling RPC processes with
-      readiness/event-driven long-lived transport.
+- [ ] Add readiness waiting, resize, stdin ownership, and cancellation.
+- [x] Add a long-lived low-level multiplexed `console-follow` stream so one
+      process drains both outputs without spawning one `runsc` per read.
+- [x] Start one advisory-locked sidecar per branch, persist its stream, diagnose
+      premature failure, and let attach/log readers follow without guest FDs.
+- [ ] Move sidecar ownership into `ttosd`, add restart reconciliation, and
+      replace the sidecar's polling RPC loop with readiness-driven transport.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
 - [ ] Clone PTY termios, foreground process group, window size, and hangup state.
 - [x] Ensure post-fork non-TTY input and output cannot cross branches and that a
       descendant console survives deletion of its source branch.
-- [ ] Test detach caused by normal command, detach keys, client crash, daemon
-      restart, and network/socket failure.
+- [x] Keep output draining after an ordinary attach client exits.
+- [ ] Test detach keys, client crash during stdin, sidecar crash/restart, daemon
+      restart, and control-socket failure.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 
@@ -360,6 +377,9 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 - [x] Initial direct-CLI persistent base-container metadata with created,
       running, and exited reconciliation against `runsc list`.
+- [x] Initial per-branch console sidecars and logs survive the CLI process that
+      launched them; advisory locks prevent duplicate pipe consumers and log
+      readers diagnose premature sidecar exit.
 - [ ] Implement a local Unix-domain control service so console sessions,
       background pulls, event streams, and state survive individual CLI
       processes.
@@ -421,7 +441,10 @@ grandchild branches without PID or wait-status crossover.
 
 - [x] Internal non-TTY console sessions and nonblocking branch RPC substrate.
 - [x] Initial direct-CLI non-TTY host-side streaming and attach command.
-- [ ] Attach leases, detach keys, daemon-owned transport, and log retention.
+- [x] Persistent single-consumer branch sidecars, multi-reader log replay/follow,
+      and detached output draining without fork-inhibiting host FDs.
+- [ ] Bounded log rotation, detach keys, stdin ownership, and daemon-owned
+      transport/reconciliation.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
 - [x] Non-TTY console state fork and branch-local I/O.
@@ -446,10 +469,12 @@ bundle.
 ## Open semantic decisions
 
 - [ ] Exact `start` behavior for an exited in-memory branch.
-- [ ] Whether an active host attachment always rejects fork or can be routed to
-      one selected result branch.
-- [ ] Output buffering versus blocking when no console client is attached.
-- [ ] Multiple simultaneous attach clients and stdin ownership.
+- [x] Output attachment does not reject or migrate with fork: every branch owns
+      one drain, while host readers remain attached only to the selected log.
+- [x] Drain to a persistent host log instead of blocking guest output merely
+      because no console client is attached; bounded retention remains open.
+- [x] Support multiple simultaneous output readers.
+- [ ] Define exclusive stdin ownership and takeover behavior.
 - [ ] Host-mutation semantics and warnings for shared read-only binds.
 - [ ] Managed-volume sharing across unrelated families.
 - [ ] Whether stopped branch filesystem state may be retained without retaining

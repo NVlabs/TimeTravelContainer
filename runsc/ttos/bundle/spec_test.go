@@ -176,6 +176,23 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if len(containers) != 1 || containers[0].State != "exited" || containers[0].ExitStatus == nil || *containers[0].ExitStatus != 17 || containers[0].ExitedAt == nil {
 		t.Fatalf("containers=%+v", containers)
 	}
+	paths, err := store.BranchConsolePaths("demo", "test-a")
+	if err != nil {
+		t.Fatalf("BranchConsolePaths: %v", err)
+	}
+	wantBase := filepath.Join(containerDir, "console", "test-a")
+	if paths.Log != wantBase+".log" || paths.Lock != wantBase+".lock" || paths.Error != wantBase+".error.log" {
+		t.Errorf("console paths=%+v, want base %q", paths, wantBase)
+	}
+	if info, err := os.Stat(filepath.Dir(paths.Log)); err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+		t.Errorf("console directory: info=%v err=%v", info, err)
+	}
+	if _, err := store.BranchConsolePaths("demo", "../escape"); err == nil {
+		t.Fatal("BranchConsolePaths accepted invalid branch")
+	}
+	if _, err := store.BranchConsolePaths("missing", "main"); err == nil {
+		t.Fatal("BranchConsolePaths accepted missing container")
+	}
 	if err := store.RemoveContainer("demo"); err != nil {
 		t.Fatalf("RemoveContainer: %v", err)
 	}

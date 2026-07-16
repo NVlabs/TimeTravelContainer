@@ -33,6 +33,7 @@ import (
 
 	"gvisor.dev/gvisor/runsc/flag"
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
+	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -225,6 +226,7 @@ Commands:
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
   attach [OPTIONS] TARGET        Attach to a branch's init console
+  logs [OPTIONS] TARGET          Print or follow a branch's init-console logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
@@ -255,6 +257,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runStart(args[1:], stdout, stderr, backend)
 	case "attach":
 		err = runAttach(args[1:], stderr, backend)
+	case "logs":
+		err = runLogs(args[1:], stderr, backend)
 	case "exec":
 		err = runExec(args[1:], stderr, backend)
 	case "inspect":
@@ -762,6 +766,27 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	}
 	if code := waitStatusExitCode(status); code != 0 {
 		return exitStatus{code: code}
+	}
+	return nil
+}
+
+func runLogs(args []string, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	follow := fs.Bool("follow", false, "follow log output")
+	fs.BoolVar(follow, "f", false, "follow log output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos logs [-f] CONTAINER[@BRANCH]")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if err := backend.logs(target, *follow); err != nil {
+		return fmt.Errorf("reading logs for %s: %w", target, err)
 	}
 	return nil
 }
@@ -1282,6 +1307,7 @@ type backend interface {
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
 	attach(target selector, interactive bool) (uint32, error)
+	logs(target selector, follow bool) error
 	exec(request execRequest) (int, error)
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
@@ -1398,12 +1424,6 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	return 0, nil
 }
 
-type consoleReadResult struct {
-	Data       []byte `json:"Data"`
-	EOF        bool   `json:"EOF"`
-	WouldBlock bool   `json:"WouldBlock"`
-}
-
 type consoleWriteResult struct {
 	N          int  `json:"N"`
 	WouldBlock bool `json:"WouldBlock"`
@@ -1414,7 +1434,88 @@ type attachWaitResult struct {
 	err    error
 }
 
+type consoleLogFollower struct {
+	file      *os.File
+	pending   []byte
+	stdoutEOF bool
+	stderrEOF bool
+}
+
+func openConsoleLogFollower(path string) (*consoleLogFollower, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening console log: %w", err)
+	}
+	return &consoleLogFollower{file: file}, nil
+}
+
+func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
+	progress := false
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := f.file.Read(buf)
+		if n != 0 {
+			f.pending = append(f.pending, buf[:n]...)
+			progress = true
+			if err := f.consume(stdout, stderr); err != nil {
+				return false, err
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return false, fmt.Errorf("reading console log: %w", err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return progress, f.consume(stdout, stderr)
+}
+
+func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
+	for {
+		frame, consumed, complete, err := ttosconsole.DecodeFrame(f.pending)
+		if err != nil {
+			return fmt.Errorf("decoding console log: %w", err)
+		}
+		if !complete {
+			break
+		}
+		f.pending = f.pending[consumed:]
+		var output io.Writer
+		switch frame.Stream {
+		case ttosconsole.StreamStdout:
+			output = stdout
+			f.stdoutEOF = frame.EOF
+		case ttosconsole.StreamStderr:
+			output = stderr
+			f.stderrEOF = frame.EOF
+		}
+		if len(frame.Data) != 0 && output != nil {
+			n, err := output.Write(frame.Data)
+			if err != nil {
+				return fmt.Errorf("writing attached stream %d: %w", frame.Stream, err)
+			}
+			if n != len(frame.Data) {
+				return fmt.Errorf("writing attached stream %d: %w", frame.Stream, io.ErrShortWrite)
+			}
+		}
+	}
+	return nil
+}
+
 func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, error) {
+	paths, err := b.ensureConsoleDrain(target, false)
+	if err != nil {
+		return 0, err
+	}
+	follower, err := openConsoleLogFollower(paths.Log)
+	if err != nil {
+		return 0, err
+	}
+	defer follower.file.Close()
 	waitCh := make(chan attachWaitResult, 1)
 	go func() {
 		status, err := b.wait(target)
@@ -1424,26 +1525,22 @@ func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, erro
 	if interactive {
 		go func() { inputErrCh <- b.pumpConsoleInput(target) }()
 	}
+	var waitResult *attachWaitResult
 	for {
-		progress, stdoutEOF, stderrEOF, err := b.drainConsole(target)
+		progress, err := follower.drain(b.stdout, b.stderr)
 		if err != nil {
 			return 0, err
+		}
+		if waitResult != nil && follower.stdoutEOF && follower.stderrEOF {
+			return waitResult.status, nil
 		}
 		select {
 		case result := <-waitCh:
 			if result.err != nil {
 				return 0, result.err
 			}
-			for !stdoutEOF || !stderrEOF {
-				progress, stdoutEOF, stderrEOF, err = b.drainConsole(target)
-				if err != nil {
-					return 0, err
-				}
-				if !progress && (!stdoutEOF || !stderrEOF) {
-					time.Sleep(2 * time.Millisecond)
-				}
-			}
-			return result.status, nil
+			waitResult = &result
+			waitCh = nil
 		case err := <-inputErrCh:
 			if err != nil {
 				return 0, err
@@ -1452,47 +1549,140 @@ func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, erro
 		default:
 		}
 		if !progress {
+			active, err := consoleDrainActive(paths.Lock)
+			if err != nil {
+				return 0, err
+			}
+			if !active && (!follower.stdoutEOF || !follower.stderrEOF) {
+				return 0, consoleDrainStoppedError(paths.Error)
+			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
-func (b *runtimeBackend) drainConsole(target selector) (progress, stdoutEOF, stderrEOF bool, err error) {
-	for _, stream := range []struct {
-		name string
-		out  io.Writer
-		eof  *bool
-	}{
-		{name: "stdout", out: b.stdout, eof: &stdoutEOF},
-		{name: "stderr", out: b.stderr, eof: &stderrEOF},
-	} {
-		result, err := b.readConsole(target, stream.name)
+func (b *runtimeBackend) logs(target selector, follow bool) error {
+	paths, err := b.ensureConsoleDrain(target, false)
+	if err != nil {
+		return err
+	}
+	follower, err := openConsoleLogFollower(paths.Log)
+	if err != nil {
+		return err
+	}
+	defer follower.file.Close()
+	for {
+		progress, err := follower.drain(b.stdout, b.stderr)
 		if err != nil {
-			return false, false, false, err
+			return err
 		}
-		*stream.eof = result.EOF
-		if len(result.Data) != 0 {
-			progress = true
-			if stream.out != nil {
-				if _, err := stream.out.Write(result.Data); err != nil {
-					return false, false, false, fmt.Errorf("writing attached %s: %w", stream.name, err)
-				}
+		if !follow || (follower.stdoutEOF && follower.stderrEOF) {
+			return nil
+		}
+		if !progress {
+			active, err := consoleDrainActive(paths.Lock)
+			if err != nil {
+				return err
 			}
+			if !active {
+				return consoleDrainStoppedError(paths.Error)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	return progress, stdoutEOF, stderrEOF, nil
 }
 
-func (b *runtimeBackend) readConsole(target selector, stream string) (consoleReadResult, error) {
-	output, err := b.command("timetravel", "--console", "init", "--stream", stream, "--max-bytes", "65536", target.container, "console-read", target.branch)
+func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbundle.ConsolePaths, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	paths, err := store.BranchConsolePaths(target.container, target.branch)
 	if err != nil {
-		return consoleReadResult{}, err
+		return ttosbundle.ConsolePaths{}, err
 	}
-	var result consoleReadResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		return consoleReadResult{}, fmt.Errorf("decoding %s console read: %w", stream, err)
+	lockFile, err := os.OpenFile(paths.Lock, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("opening console drain lock: %w", err)
 	}
-	return result, nil
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			if reset {
+				return ttosbundle.ConsolePaths{}, fmt.Errorf("console drain for %s is still active", target)
+			}
+			return paths, nil
+		}
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("locking console drain: %w", err)
+	}
+	logFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	if reset {
+		logFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	}
+	logFile, err := os.OpenFile(paths.Log, logFlags, 0600)
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("opening console log: %w", err)
+	}
+	defer logFile.Close()
+	errorFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	if reset {
+		errorFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	}
+	errorFile, err := os.OpenFile(paths.Error, errorFlags, 0600)
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("opening console error log: %w", err)
+	}
+	defer errorFile.Close()
+
+	command := exec.Command(b.runsc,
+		"--root", b.root,
+		"timetravel", "--console", "init",
+		target.container, "console-follow", target.branch,
+	)
+	command.Stdout = logFile
+	command.Stderr = errorFile
+	// The inherited duplicate keeps the advisory lock held for exactly the
+	// lifetime of the drainer, preventing multiple consumers of one pipe.
+	command.ExtraFiles = []*os.File{lockFile}
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w", target, err)
+	}
+	if err := command.Process.Release(); err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("releasing console drain process for %s: %w", target, err)
+	}
+	return paths, nil
+}
+
+func consoleDrainActive(lockPath string) (bool, error) {
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return false, fmt.Errorf("opening console drain lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return true, nil
+		}
+		return false, fmt.Errorf("probing console drain lock: %w", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		return false, fmt.Errorf("unlocking console drain probe: %w", err)
+	}
+	return false, nil
+}
+
+func consoleDrainStoppedError(errorPath string) error {
+	data, err := os.ReadFile(errorPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("console drain stopped before output EOF; reading diagnostics: %w", err)
+	}
+	message := strings.TrimSpace(string(data))
+	const maxDiagnostic = 4096
+	if len(message) > maxDiagnostic {
+		message = message[len(message)-maxDiagnostic:]
+	}
+	if message == "" {
+		return errors.New("console drain stopped before output EOF")
+	}
+	return fmt.Errorf("console drain stopped before output EOF: %s", message)
 }
 
 func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWriteResult, error) {
@@ -1634,10 +1824,14 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 		}
 		return 1, fmt.Errorf("starting runsc: %w", err)
 	}
+	target := selector{container: name, branch: defaultBranchID}
+	if _, err := b.ensureConsoleDrain(target, true); err != nil {
+		return 1, err
+	}
 	if detach {
 		return 0, nil
 	}
-	status, err := b.attach(selector{container: name, branch: defaultBranchID}, interactive)
+	status, err := b.attach(target, interactive)
 	if err != nil {
 		return 1, err
 	}
@@ -1826,6 +2020,14 @@ func (b *runtimeBackend) fork(source selector, destination string, paused bool) 
 	var info runscBranchInfo
 	if err := json.Unmarshal(output, &info); err != nil {
 		return Branch{}, fmt.Errorf("decoding runsc fork result: %w", err)
+	}
+	target := selector{container: source.container, branch: destination}
+	if _, err := b.ensureConsoleDrain(target, true); err != nil {
+		cleanupErr := b.destroy(target)
+		if cleanupErr != nil {
+			return Branch{}, fmt.Errorf("starting console drain after fork: %w (cleanup also failed: %v)", err, cleanupErr)
+		}
+		return Branch{}, fmt.Errorf("starting console drain after fork: %w; forked branch was destroyed", err)
 	}
 	return branchView(info), nil
 }

@@ -12,6 +12,7 @@ go_library(
     deps = [
         "//runsc/flag",
         "//runsc/ttos/bundle",
+        "//runsc/ttos/console",
         "//runsc/ttos/images",
         "//runsc/version",
     ],
@@ -22,4 +23,5 @@ go_test(
     size = "small",
     srcs = ["cmd_test.go"],
     library = ":cmd",
+    deps = ["//runsc/ttos/console"],
 )

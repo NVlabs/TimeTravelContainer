@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -29,6 +30,8 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
+	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 )
 
 // TimeTravel controls experimental in-memory sandbox branches.
@@ -59,7 +62,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin|console-follow <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -174,6 +177,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			BranchID:  f.Arg(2),
 			ConsoleID: t.consoleID,
 		})
+	case "console-follow":
+		err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, &util.Writer{})
 	default:
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -189,4 +194,57 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 	}
 	return subcommands.ExitSuccess
+}
+
+// followConsole drains both output streams into Docker-compatible multiplexed
+// frames. It remains connected until both guest writers close.
+func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer *util.Writer) error {
+	type streamState struct {
+		kernelStream kernel.InternalConsoleStream
+		frameStream  byte
+		eof          bool
+	}
+	streams := []streamState{
+		{kernelStream: kernel.InternalConsoleStdout, frameStream: ttosconsole.StreamStdout},
+		{kernelStream: kernel.InternalConsoleStderr, frameStream: ttosconsole.StreamStderr},
+	}
+	for {
+		progress := false
+		allEOF := true
+		for i := range streams {
+			stream := &streams[i]
+			if stream.eof {
+				continue
+			}
+			allEOF = false
+			result, err := s.ReadConsole(&boot.ConsoleReadArgs{
+				BranchID:  branchID,
+				ConsoleID: consoleID,
+				Stream:    stream.kernelStream,
+				MaxBytes:  65536,
+			})
+			if err != nil {
+				return err
+			}
+			if len(result.Data) != 0 {
+				if err := ttosconsole.WriteFrame(writer, stream.frameStream, result.Data); err != nil {
+					return fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err)
+				}
+				progress = true
+			}
+			if result.EOF {
+				if err := ttosconsole.WriteFrame(writer, stream.frameStream, nil); err != nil {
+					return fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err)
+				}
+				stream.eof = true
+				progress = true
+			}
+		}
+		if allEOF {
+			return nil
+		}
+		if !progress {
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
 }

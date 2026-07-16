@@ -130,6 +130,7 @@ go_library(
         "//runsc/specutils",
         "//runsc/specutils/seccomp",
         "//runsc/starttime",
+        "//runsc/ttos/console",
         "//runsc/version",
         "//sandboxexec/proto:sandbox_options_go_proto",
         "@com_github_google_subcommands//:go_default_library",

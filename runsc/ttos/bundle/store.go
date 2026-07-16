@@ -66,6 +66,14 @@ type ContainerInfo struct {
 	ExitedAt   *time.Time      `json:"exited_at,omitempty"`
 }
 
+// ConsolePaths are persistent host-side files for one branch's init console.
+// None of these files are donated into the sandbox.
+type ConsolePaths struct {
+	Log   string
+	Lock  string
+	Error string
+}
+
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
 // contents live in Sentry tmpfs and are not checkpointed to this store.
 type VolumeInfo struct {
@@ -234,6 +242,30 @@ func (s Store) RemoveContainer(name string) error {
 		return fmt.Errorf("removing container %q: %w", name, err)
 	}
 	return nil
+}
+
+// BranchConsolePaths returns persistent console paths for one branch, creating
+// their private parent directory if needed.
+func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error) {
+	if err := validateName(container); err != nil {
+		return ConsolePaths{}, err
+	}
+	if err := validateObjectName("branch", branch); err != nil {
+		return ConsolePaths{}, err
+	}
+	if _, err := s.LoadContainer(container); err != nil {
+		return ConsolePaths{}, err
+	}
+	dir := filepath.Join(s.Root, "containers", container, "console")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", container, err)
+	}
+	base := filepath.Join(dir, branch)
+	return ConsolePaths{
+		Log:   base + ".log",
+		Lock:  base + ".lock",
+		Error: base + ".error.log",
+	}, nil
 }
 
 // CreateVolume creates metadata for a family-local managed tmpfs volume.

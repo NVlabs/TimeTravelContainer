@@ -22,10 +22,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
+	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 )
 
@@ -282,6 +284,103 @@ func TestAttach(t *testing.T) {
 	}
 }
 
+func TestLogs(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"logs", "--follow", "demo@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("logs status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.logsTarget != (selector{container: "demo", branch: "child"}) || !b.logsFollow {
+		t.Errorf("logs target=%+v follow=%t", b.logsTarget, b.logsFollow)
+	}
+}
+
+func TestConsoleLogFollowerHandlesPartialAppend(t *testing.T) {
+	var encoded bytes.Buffer
+	for _, frame := range []struct {
+		stream byte
+		data   string
+	}{
+		{stream: ttosconsole.StreamStdout, data: "hello"},
+		{stream: ttosconsole.StreamStderr, data: "problem"},
+		{stream: ttosconsole.StreamStdout},
+		{stream: ttosconsole.StreamStderr},
+	} {
+		if err := ttosconsole.WriteFrame(&encoded, frame.stream, []byte(frame.data)); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "main.log")
+	data := encoded.Bytes()
+	if err := os.WriteFile(path, data[:5], 0600); err != nil {
+		t.Fatalf("writing partial log: %v", err)
+	}
+	follower, err := openConsoleLogFollower(path)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	var stdout, stderr bytes.Buffer
+	if progress, err := follower.drain(&stdout, &stderr); err != nil || !progress {
+		t.Fatalf("draining partial header: progress=%t err=%v", progress, err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("partial frame produced stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatalf("opening append log: %v", err)
+	}
+	if _, err := appendFile.Write(data[5:]); err != nil {
+		appendFile.Close()
+		t.Fatalf("appending log: %v", err)
+	}
+	if err := appendFile.Close(); err != nil {
+		t.Fatalf("closing append log: %v", err)
+	}
+	if progress, err := follower.drain(&stdout, &stderr); err != nil || !progress {
+		t.Fatalf("draining completed frames: progress=%t err=%v", progress, err)
+	}
+	if got := stdout.String(); got != "hello" {
+		t.Errorf("stdout=%q, want hello", got)
+	}
+	if got := stderr.String(); got != "problem" {
+		t.Errorf("stderr=%q, want problem", got)
+	}
+	if !follower.stdoutEOF || !follower.stderrEOF || len(follower.pending) != 0 {
+		t.Errorf("follower state: stdoutEOF=%t stderrEOF=%t pending=%d", follower.stdoutEOF, follower.stderrEOF, len(follower.pending))
+	}
+}
+
+func TestConsoleDrainHealth(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "console.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatalf("opening lock: %v", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("locking: %v", err)
+	}
+	if active, err := consoleDrainActive(lockPath); err != nil || !active {
+		t.Fatalf("active probe=(%t, %v), want (true, nil)", active, err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlocking: %v", err)
+	}
+	if active, err := consoleDrainActive(lockPath); err != nil || active {
+		t.Fatalf("inactive probe=(%t, %v), want (false, nil)", active, err)
+	}
+	errorPath := filepath.Join(dir, "console.error.log")
+	if err := os.WriteFile(errorPath, []byte("low-level failure\n"), 0600); err != nil {
+		t.Fatalf("writing diagnostic: %v", err)
+	}
+	if err := consoleDrainStoppedError(errorPath); err == nil || !strings.Contains(err.Error(), "low-level failure") {
+		t.Fatalf("consoleDrainStoppedError=%v", err)
+	}
+}
+
 func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -460,6 +559,9 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "web" ] && [ "$7" = "console-follow" ] && [ "$8" = "child" ]; then
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
 	exit 0
 fi
@@ -473,7 +575,23 @@ exit 2
 	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
 		t.Fatalf("writing fake runsc: %v", err)
 	}
-	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatalf("encoding metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
 	families, err := b.listFamilies()
 	if err != nil {
 		t.Fatalf("listFamilies: %v", err)
@@ -487,6 +605,9 @@ exit 2
 	}
 	if child.ID != "child" || child.ParentID != "main" || child.State != "paused" || child.ForkTotalNS != 3_000_000 || child.KernelForkNS != 2_000_000 {
 		t.Errorf("fork returned %+v", child)
+	}
+	if _, err := os.Stat(filepath.Join(containerDir, "console", "child.log")); err != nil {
+		t.Errorf("fork console log: %v", err)
 	}
 	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
 		t.Fatalf("signal: %v", err)
@@ -628,6 +749,8 @@ type fakeBackend struct {
 	startInteractive  bool
 	attached          selector
 	attachInteractive bool
+	logsTarget        selector
+	logsFollow        bool
 	inspectInfo       InspectInfo
 	removed           string
 	removeForce       bool
@@ -660,6 +783,12 @@ func (b *fakeBackend) attach(target selector, interactive bool) (uint32, error) 
 	b.attached = target
 	b.attachInteractive = interactive
 	return b.waitStatus, b.err
+}
+
+func (b *fakeBackend) logs(target selector, follow bool) error {
+	b.logsTarget = target
+	b.logsFollow = follow
+	return b.err
 }
 
 func (b *fakeBackend) exec(request execRequest) (int, error) {
