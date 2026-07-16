@@ -352,6 +352,71 @@ func TestConsoleLogFollowerHandlesPartialAppend(t *testing.T) {
 	}
 }
 
+func TestConsoleLogFollowerFollowsLiveRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.log")
+	w, err := ttosconsole.NewRotatingWriter(path, 28)
+	if err != nil {
+		t.Fatalf("NewRotatingWriter: %v", err)
+	}
+	for _, value := range []string{"first", "second"} {
+		if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	follower, err := openConsoleLogFollower(path)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte("third")); err != nil {
+		t.Fatalf("WriteFrame(third): %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if progress, err := follower.drain(&stdout, &stderr); err != nil || !progress {
+		t.Fatalf("drain: progress=%t err=%v", progress, err)
+	}
+	if got, want := stdout.String(), "firstsecondthird"; got != want {
+		t.Errorf("stdout=%q, want %q", got, want)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr=%q, want empty", stderr.String())
+	}
+}
+
+func TestConsoleLogFollowerReplaysRetainedGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.log")
+	w, err := ttosconsole.NewRotatingWriter(path, 28)
+	if err != nil {
+		t.Fatalf("NewRotatingWriter: %v", err)
+	}
+	for _, value := range []string{"first", "second", "third"} {
+		if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStderr, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	follower, err := openConsoleLogFollower(path)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	var stdout, stderr bytes.Buffer
+	if progress, err := follower.drain(&stdout, &stderr); err != nil || !progress {
+		t.Fatalf("drain: progress=%t err=%v", progress, err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout=%q, want empty", stdout.String())
+	}
+	if got, want := stderr.String(), "firstsecondthird"; got != want {
+		t.Errorf("stderr=%q, want %q", got, want)
+	}
+}
+
 func TestConsoleDrainHealth(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "console.lock")
@@ -559,7 +624,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "web" ] && [ "$7" = "console-follow" ] && [ "$8" = "child" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "16777216" ] && [ "${10}" = "web" ] && [ "${11}" = "console-follow" ] && [ "${12}" = "child" ]; then
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
@@ -591,6 +656,14 @@ exit 2
 	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
+	consoleDir := filepath.Join(containerDir, "console")
+	if err := os.MkdirAll(consoleDir, 0700); err != nil {
+		t.Fatalf("creating console directory: %v", err)
+	}
+	staleRotatedLog := filepath.Join(consoleDir, "child.log"+ttosconsole.RotatedSuffix)
+	if err := os.WriteFile(staleRotatedLog, []byte("stale"), 0600); err != nil {
+		t.Fatalf("writing stale rotated log: %v", err)
+	}
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
 	families, err := b.listFamilies()
 	if err != nil {
@@ -608,6 +681,9 @@ exit 2
 	}
 	if _, err := os.Stat(filepath.Join(containerDir, "console", "child.log")); err != nil {
 		t.Errorf("fork console log: %v", err)
+	}
+	if _, err := os.Stat(staleRotatedLog); !os.IsNotExist(err) {
+		t.Errorf("stale rotated log still exists: %v", err)
 	}
 	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
 		t.Fatalf("signal: %v", err)

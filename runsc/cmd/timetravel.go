@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/google/subcommands"
@@ -46,6 +47,8 @@ type TimeTravel struct {
 	consoleStream   string
 	consoleMaxBytes int
 	consoleData     string
+	consoleLog      string
+	consoleLogMax   int64
 }
 
 // Name implements subcommands.Command.Name.
@@ -76,6 +79,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consoleStream, "stream", "stdout", "console output stream: stdout or stderr")
 	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
 	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
+	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
+	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -178,7 +183,21 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			ConsoleID: t.consoleID,
 		})
 	case "console-follow":
-		err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, &util.Writer{})
+		var writer io.Writer = &util.Writer{}
+		var logWriter *ttosconsole.RotatingWriter
+		if t.consoleLog != "" {
+			logWriter, err = ttosconsole.NewRotatingWriter(t.consoleLog, t.consoleLogMax)
+			if err != nil {
+				break
+			}
+			writer = logWriter
+		}
+		err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer)
+		if logWriter != nil {
+			if closeErr := logWriter.Close(); err == nil {
+				err = closeErr
+			}
+		}
 	default:
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -198,7 +217,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 
 // followConsole drains both output streams into Docker-compatible multiplexed
 // frames. It remains connected until both guest writers close.
-func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer *util.Writer) error {
+func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer) error {
 	type streamState struct {
 		kernelStream kernel.InternalConsoleStream
 		frameStream  byte

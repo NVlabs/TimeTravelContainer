@@ -43,6 +43,7 @@ const (
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 	defaultImageNamespace   = "ttos"
 	defaultBranchID         = "main"
+	defaultConsoleLogMax    = int64(16 << 20)
 )
 
 type options struct {
@@ -1436,17 +1437,30 @@ type attachWaitResult struct {
 
 type consoleLogFollower struct {
 	file      *os.File
+	path      string
+	nextPath  string
+	retained  os.FileInfo
 	pending   []byte
 	stdoutEOF bool
 	stderrEOF bool
 }
 
 func openConsoleLogFollower(path string) (*consoleLogFollower, error) {
-	file, err := os.Open(path)
+	activePath := path
+	nextPath := ""
+	var retained os.FileInfo
+	if info, err := os.Stat(path + ttosconsole.RotatedSuffix); err == nil {
+		activePath = path + ttosconsole.RotatedSuffix
+		nextPath = path
+		retained = info
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stating rotated console log: %w", err)
+	}
+	file, err := os.Open(activePath)
 	if err != nil {
 		return nil, fmt.Errorf("opening console log: %w", err)
 	}
-	return &consoleLogFollower{file: file}, nil
+	return &consoleLogFollower{file: file, path: path, nextPath: nextPath, retained: retained}, nil
 }
 
 func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
@@ -1463,6 +1477,14 @@ func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				advanced, advanceErr := f.advance()
+				if advanceErr != nil {
+					return false, advanceErr
+				}
+				if advanced {
+					progress = true
+					continue
+				}
 				break
 			}
 			return false, fmt.Errorf("reading console log: %w", err)
@@ -1472,6 +1494,80 @@ func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
 		}
 	}
 	return progress, f.consume(stdout, stderr)
+}
+
+func (f *consoleLogFollower) advance() (bool, error) {
+	if f.nextPath != "" {
+		if len(f.pending) != 0 {
+			return false, fmt.Errorf("rotated console log ended with %d bytes of an incomplete frame", len(f.pending))
+		}
+		file, err := os.Open(f.nextPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("opening next console log generation: %w", err)
+		}
+		if err := f.file.Close(); err != nil {
+			file.Close()
+			return false, fmt.Errorf("closing previous console log generation: %w", err)
+		}
+		f.file = file
+		f.nextPath = ""
+		return true, nil
+	}
+	openInfo, err := f.file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stating open console log: %w", err)
+	}
+	rotatedPath := f.path + ttosconsole.RotatedSuffix
+	rotatedInfo, rotatedErr := os.Stat(rotatedPath)
+	if rotatedErr == nil && !os.SameFile(openInfo, rotatedInfo) &&
+		(f.retained == nil || !os.SameFile(f.retained, rotatedInfo)) {
+		if len(f.pending) != 0 {
+			return false, fmt.Errorf("console log rotated with %d bytes of an incomplete frame", len(f.pending))
+		}
+		file, err := os.Open(rotatedPath)
+		if err != nil {
+			return false, fmt.Errorf("opening retained console log generation: %w", err)
+		}
+		if err := f.file.Close(); err != nil {
+			file.Close()
+			return false, fmt.Errorf("closing superseded console log generation: %w", err)
+		}
+		f.file = file
+		f.nextPath = f.path
+		f.retained = rotatedInfo
+		return true, nil
+	} else if rotatedErr != nil && !os.IsNotExist(rotatedErr) {
+		return false, fmt.Errorf("stating retained console log generation: %w", rotatedErr)
+	}
+	pathInfo, err := os.Stat(f.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stating current console log: %w", err)
+	}
+	if os.SameFile(openInfo, pathInfo) {
+		return false, nil
+	}
+	if len(f.pending) != 0 {
+		return false, fmt.Errorf("console log rotated with %d bytes of an incomplete frame", len(f.pending))
+	}
+	if rotatedErr == nil && os.SameFile(openInfo, rotatedInfo) {
+		f.retained = rotatedInfo
+	}
+	file, err := os.Open(f.path)
+	if err != nil {
+		return false, fmt.Errorf("opening rotated console log: %w", err)
+	}
+	if err := f.file.Close(); err != nil {
+		file.Close()
+		return false, fmt.Errorf("closing rotated console log: %w", err)
+	}
+	f.file = file
+	return true, nil
 }
 
 func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
@@ -1612,6 +1708,11 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 		}
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("locking console drain: %w", err)
 	}
+	if reset {
+		if err := os.Remove(paths.Log + ttosconsole.RotatedSuffix); err != nil && !os.IsNotExist(err) {
+			return ttosbundle.ConsolePaths{}, fmt.Errorf("removing rotated console log: %w", err)
+		}
+	}
 	logFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
 	if reset {
 		logFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
@@ -1620,7 +1721,9 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 	if err != nil {
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("opening console log: %w", err)
 	}
-	defer logFile.Close()
+	if err := logFile.Close(); err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("closing prepared console log: %w", err)
+	}
 	errorFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
 	if reset {
 		errorFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
@@ -1634,9 +1737,10 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 	command := exec.Command(b.runsc,
 		"--root", b.root,
 		"timetravel", "--console", "init",
+		"--console-log", paths.Log,
+		"--console-log-max-bytes", strconv.FormatInt(defaultConsoleLogMax, 10),
 		target.container, "console-follow", target.branch,
 	)
-	command.Stdout = logFile
 	command.Stderr = errorFile
 	// The inherited duplicate keeps the advisory lock held for exactly the
 	// lifetime of the drainer, preventing multiple consumers of one pipe.

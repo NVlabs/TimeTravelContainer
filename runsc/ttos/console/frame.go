@@ -50,13 +50,12 @@ func WriteFrame(w io.Writer, stream byte, data []byte) error {
 	if len(data) > MaxPayload {
 		return fmt.Errorf("console frame payload %d exceeds %d", len(data), MaxPayload)
 	}
-	var header [HeaderSize]byte
-	header[0] = stream
-	binary.BigEndian.PutUint32(header[4:], uint32(len(data)))
-	if err := writeFull(w, header[:]); err != nil {
-		return err
-	}
-	return writeFull(w, data)
+	encoded := make([]byte, HeaderSize+len(data))
+	encoded[0] = stream
+	binary.BigEndian.PutUint32(encoded[4:HeaderSize], uint32(len(data)))
+	copy(encoded[HeaderSize:], data)
+	// One logical Write keeps a frame wholly within one rotating generation.
+	return writeFull(w, encoded)
 }
 
 func writeFull(w io.Writer, data []byte) error {

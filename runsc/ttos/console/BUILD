@@ -7,13 +7,19 @@ package(
 
 go_library(
     name = "console",
-    srcs = ["frame.go"],
+    srcs = [
+        "frame.go",
+        "rotating.go",
+    ],
     visibility = ["//runsc:__subpackages__"],
 )
 
 go_test(
     name = "console_test",
     size = "small",
-    srcs = ["frame_test.go"],
+    srcs = [
+        "frame_test.go",
+        "rotating_test.go",
+    ],
     library = ":console",
 )
