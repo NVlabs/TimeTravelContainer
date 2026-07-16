@@ -56,6 +56,7 @@ type Exec struct {
 	caps            stringSlice
 	branch          string
 	detach          bool
+	execID          string
 	processPath     string
 	pidFile         string
 	internalPidFile string
@@ -65,10 +66,11 @@ type Exec struct {
 	// pseudoterminal.
 	consoleSocket string
 
-	// internalConsole requests a Sentry-owned branch-local PTY. It is used by
-	// TTOS instead of donating a host PTY into the sandbox.
-	internalConsole      string
-	internalConsoleStdin bool
+	// internalConsole requests Sentry-owned branch-local pipe or PTY stdio. It
+	// is used by TTOS instead of donating host descriptors into the sandbox.
+	internalConsole         string
+	internalConsoleTerminal bool
+	internalConsoleStdin    bool
 
 	// passFDs are user-supplied FDs from the host to be exposed to the
 	// sandboxed app.
@@ -116,11 +118,13 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.Var(&ex.caps, "cap", "add a capability to the bounding set for the process")
 	f.StringVar(&ex.branch, "branch", boot.DefaultBranchID, "TimeTravel branch in which to execute")
 	f.BoolVar(&ex.detach, "detach", false, "detach from the container's process")
+	f.StringVar(&ex.execID, "exec-id", "", "stable branch-local exec session ID")
 	f.StringVar(&ex.processPath, "process", "", "path to the process.json")
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
 	f.StringVar(&ex.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
-	f.StringVar(&ex.internalConsole, "internal-console", "", "Sentry-owned branch-local PTY console ID")
+	f.StringVar(&ex.internalConsole, "internal-console", "", "Sentry-owned branch-local pipe or PTY console ID")
+	f.BoolVar(&ex.internalConsoleTerminal, "internal-console-terminal", false, "make --internal-console a PTY")
 	f.BoolVar(&ex.internalConsoleStdin, "internal-console-stdin", false, "forward stdin to --internal-console")
 	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
@@ -151,6 +155,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("parsing process spec: %v", err)
 	}
 	e.BranchID = ex.branch
+	e.ExecID = ex.execID
 	if ex.internalConsole != "" {
 		if ex.consoleSocket != "" {
 			util.Fatalf("--internal-console and --console-socket cannot be combined")
@@ -159,7 +164,10 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 			util.Fatalf("--internal-console cannot be combined with --pass-fd or --exec-fd")
 		}
 		e.InternalConsoleID = ex.internalConsole
-		e.StdioIsPty = true
+		e.StdioIsPty = ex.internalConsoleTerminal
+	}
+	if ex.execID != "" && e.InternalConsoleID == "" {
+		util.Fatalf("--exec-id requires --internal-console")
 	}
 	if ex.branch != boot.DefaultBranchID && e.StdioIsPty && e.InternalConsoleID == "" {
 		util.Fatalf("branch exec with a host PTY is unsupported; use --internal-console")
@@ -289,7 +297,7 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 	}
 	target := &boot.ConsoleResizeArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}
 	stdinFD := int(os.Stdin.Fd())
-	stdinIsTerminal := term.IsTerminal(stdinFD)
+	stdinIsTerminal := e.StdioIsPty && term.IsTerminal(stdinFD)
 	if stdinIsTerminal {
 		cols, rows, err := term.GetSize(stdinFD)
 		if err != nil {

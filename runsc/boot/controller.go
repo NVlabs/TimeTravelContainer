@@ -121,6 +121,15 @@ const (
 	// ContMgrBranchWait waits for a process in one in-memory branch.
 	ContMgrBranchWait = "containerManager.BranchWait"
 
+	// ContMgrExecSessions lists managed exec sessions in one branch.
+	ContMgrExecSessions = "containerManager.ExecSessions"
+
+	// ContMgrExecWait waits for a managed exec session.
+	ContMgrExecWait = "containerManager.ExecWait"
+
+	// ContMgrExecSignal signals a managed exec session.
+	ContMgrExecSignal = "containerManager.ExecSignal"
+
 	// ContMgrConsoleFollow streams init output and waits for init to exit.
 	ContMgrConsoleFollow = "containerManager.ConsoleFollow"
 
@@ -1011,6 +1020,31 @@ func (cm *containerManager) BranchWait(args *BranchWaitArgs, waitStatus *uint32)
 	}
 	*waitStatus = status
 	return nil
+}
+
+// ExecSessions lists managed exec sessions in one branch.
+func (cm *containerManager) ExecSessions(args *ExecSessionsArgs, out *[]ExecSessionInfo) error {
+	sessions, err := cm.l.family.ExecSessions(args)
+	if err != nil {
+		return err
+	}
+	*out = sessions
+	return nil
+}
+
+// ExecWait waits for a managed exec session.
+func (cm *containerManager) ExecWait(args *ExecSessionArgs, waitStatus *uint32) error {
+	status, err := cm.l.family.WaitExecSession(args)
+	if err != nil {
+		return err
+	}
+	*waitStatus = status
+	return nil
+}
+
+// ExecSignal signals a managed exec session.
+func (cm *containerManager) ExecSignal(args *ExecSessionArgs, _ *struct{}) error {
+	return cm.l.family.SignalExecSession(args)
 }
 
 // ConsoleFollow coordinates client-side console draining with init lifetime.

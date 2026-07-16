@@ -2109,6 +2109,32 @@ func (s *Sandbox) WaitBranch(args *boot.BranchWaitArgs) (uint32, error) {
 	return waitStatus, nil
 }
 
+// ExecSessions lists managed exec sessions in one in-memory branch.
+func (s *Sandbox) ExecSessions(args *boot.ExecSessionsArgs) ([]boot.ExecSessionInfo, error) {
+	var sessions []boot.ExecSessionInfo
+	if err := s.call(boot.ContMgrExecSessions, args, &sessions); err != nil {
+		return nil, fmt.Errorf("listing exec sessions in live branch %q: %w", args.BranchID, err)
+	}
+	return sessions, nil
+}
+
+// WaitExecSession waits for a managed exec process by stable session ID.
+func (s *Sandbox) WaitExecSession(args *boot.ExecSessionArgs) (uint32, error) {
+	var waitStatus uint32
+	if err := s.call(boot.ContMgrExecWait, args, &waitStatus); err != nil {
+		return 0, fmt.Errorf("waiting for exec session %q in live branch %q: %w", args.ExecID, args.BranchID, err)
+	}
+	return waitStatus, nil
+}
+
+// SignalExecSession signals a managed exec process by stable session ID.
+func (s *Sandbox) SignalExecSession(args *boot.ExecSessionArgs) error {
+	if err := s.call(boot.ContMgrExecSignal, args, nil); err != nil {
+		return fmt.Errorf("signaling exec session %q in live branch %q: %w", args.ExecID, args.BranchID, err)
+	}
+	return nil
+}
+
 // FollowConsole streams framed init output and waits for init to exit.
 func (s *Sandbox) FollowConsole(args *boot.ConsoleFollowArgs) (uint32, error) {
 	var waitStatus uint32

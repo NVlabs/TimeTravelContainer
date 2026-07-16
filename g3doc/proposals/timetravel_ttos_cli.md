@@ -246,12 +246,14 @@ the `main` branch and leave `ttos` responsible for branch operations.
       `ttos exec`.
 - [x] Support synchronous non-TTY commands with output streaming and
       exit-status forwarding; optionally import stdin with `-i`.
-- [ ] Support TTY-interactive `-t` commands through the internal console (`-i`
+- [x] Support TTY-interactive `-t` commands through the internal console (`-i`
       without a TTY is supported for synchronous exec).
 - [ ] Support `--detach`, returning a stable branch-qualified execution ID.
+- [x] Add a Sentry-owned branch-local exec registry with stable IDs, terminal
+      metadata, retained exit status, and low-level list, wait, and signal RPCs.
 - [ ] Add `ttos exec ls`, `ttos exec wait`, `ttos exec kill`, and reattach by
       execution ID.
-- [ ] Preserve virtual PIDs and exec IDs when a running exec session is forked.
+- [x] Preserve virtual PIDs and exec IDs when a running exec session is forked.
 - [x] Require a running branch for exec; do not implicitly resume paused
       branches.
 
@@ -325,7 +327,8 @@ state still forks entirely in memory.
 
 - [x] Define a saved branch-local non-TTY console object with a stable session
       ID and stdin/stdout/stderr queues.
-- [ ] Add terminal metadata and detached exec-session IDs.
+- [x] Add terminal metadata to the Sentry-owned managed exec registry.
+- [ ] Allocate and expose detached exec-session IDs in `ttos`.
 - [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
 - [x] For init interactive processes, allocate a Sentry devpts PTY and install its

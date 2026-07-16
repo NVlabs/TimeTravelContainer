@@ -138,8 +138,11 @@ type ExecArgs struct {
 	// StdioIsPty indicates that FDs 0, 1, and 2 are connected to a PTY.
 	StdioIsPty bool
 
-	// InternalConsoleID requests a Sentry-owned PTY instead of imported host
-	// stdio. Loader populates FDTable and TTY before calling ExecAsync.
+	// ExecID is a stable branch-local identity for a managed exec session.
+	ExecID string `json:"exec_id,omitempty"`
+
+	// InternalConsoleID requests Sentry-owned pipe or PTY stdio instead of
+	// imported host descriptors. Loader populates FDTable and, for a PTY, TTY.
 	InternalConsoleID string `json:"internal_console_id,omitempty"`
 
 	// TTY is the controlling terminal associated with an internal console.
@@ -303,8 +306,14 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		if len(fdMap) != 0 {
 			return nil, 0, nil, fmt.Errorf("internal exec console cannot import host file descriptors")
 		}
-		if args.FDTable == nil || args.TTY == nil {
+		if args.FDTable == nil {
 			return nil, 0, nil, fmt.Errorf("internal exec console was not initialized by the loader")
+		}
+		if args.StdioIsPty && args.TTY == nil {
+			return nil, 0, nil, fmt.Errorf("internal exec PTY has no controlling terminal")
+		}
+		if !args.StdioIsPty && args.TTY != nil {
+			return nil, 0, nil, fmt.Errorf("internal non-terminal exec console unexpectedly has a TTY")
 		}
 	} else {
 		opts := fdimport.ImportOptions{

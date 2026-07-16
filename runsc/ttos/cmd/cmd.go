@@ -2991,6 +2991,7 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	if request.terminal {
 		consoleID := fmt.Sprintf("ttos-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
 		args = append(args, "--internal-console", consoleID)
+		args = append(args, "--internal-console-terminal")
 		if request.interactive {
 			args = append(args, "--internal-console-stdin")
 		}

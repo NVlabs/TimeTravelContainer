@@ -171,6 +171,46 @@ type ConsoleRemoveArgs struct {
 	ConsoleID string
 }
 
+// ExecSessionState is the lifecycle state of one branch-local exec session.
+type ExecSessionState string
+
+const (
+	ExecSessionCreating ExecSessionState = "creating"
+	ExecSessionRunning  ExecSessionState = "running"
+	ExecSessionExited   ExecSessionState = "exited"
+)
+
+// ExecSessionInfo is the stable control-plane identity of an exec process.
+// IDs are scoped by branch; a live fork preserves the ID and virtual PID.
+type ExecSessionInfo struct {
+	ID          string           `json:"id"`
+	ContainerID string           `json:"container_id"`
+	PID         kernel.ThreadID  `json:"pid"`
+	ConsoleID   string           `json:"console_id"`
+	Terminal    bool             `json:"terminal"`
+	State       ExecSessionState `json:"state"`
+	CreatedAt   time.Time        `json:"created_at"`
+	ExitStatus  *uint32          `json:"exit_status,omitempty"`
+}
+
+// ExecSessionsArgs selects exec sessions in one branch.
+type ExecSessionsArgs struct {
+	BranchID string
+	CID      string
+}
+
+// ExecSessionArgs selects one exec session in one branch.
+type ExecSessionArgs struct {
+	BranchID string
+	ExecID   string
+	Signo    int32
+}
+
+type execSession struct {
+	info ExecSessionInfo
+	tg   *kernel.ThreadGroup
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -185,6 +225,8 @@ type sandboxBranch struct {
 	state     BranchState
 	createdAt time.Time
 	metrics   SandboxForkMetrics
+
+	execSessions map[string]*execSession
 }
 
 // SandboxFamily owns all in-memory branches in one sentry process.
@@ -242,10 +284,11 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		defaultStarted:                 make(chan struct{}),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
-				id:        DefaultBranchID,
-				k:         k,
-				state:     kernelBranchState(k),
-				createdAt: createdAt,
+				id:           DefaultBranchID,
+				k:            k,
+				state:        kernelBranchState(k),
+				createdAt:    createdAt,
+				execSessions: make(map[string]*execSession),
 			},
 		},
 	}
@@ -313,6 +356,82 @@ func (f *SandboxFamily) MarkDefaultStarted() {
 	b.state = kernelBranchState(b.k)
 	f.mu.Unlock()
 	f.defaultStartedOnce.Do(func() { close(f.defaultStarted) })
+}
+
+func cloneExecSessionInfo(info ExecSessionInfo) ExecSessionInfo {
+	cloned := info
+	if info.ExitStatus != nil {
+		status := *info.ExitStatus
+		cloned.ExitStatus = &status
+	}
+	return cloned
+}
+
+// reserveExecSession registers a creating session. The caller must hold b.opMu
+// so that fork and lifecycle transitions cannot observe a partial publication.
+func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecArgs) error {
+	if args.ExecID == "" {
+		return nil
+	}
+	if args.InternalConsoleID == "" {
+		return fmt.Errorf("exec session %q requires a Sentry-owned internal console", args.ExecID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := b.execSessions[args.ExecID]; ok {
+		return fmt.Errorf("exec session %q already exists in branch %q", args.ExecID, b.id)
+	}
+	if b.execSessions == nil {
+		b.execSessions = make(map[string]*execSession)
+	}
+	b.execSessions[args.ExecID] = &execSession{info: ExecSessionInfo{
+		ID:          args.ExecID,
+		ContainerID: args.ContainerID,
+		ConsoleID:   args.InternalConsoleID,
+		Terminal:    args.StdioIsPty,
+		State:       ExecSessionCreating,
+		CreatedAt:   time.Now().UTC(),
+	}}
+	return nil
+}
+
+func (f *SandboxFamily) abortExecSession(b *sandboxBranch, id string) {
+	if id == "" {
+		return
+	}
+	f.mu.Lock()
+	delete(b.execSessions, id)
+	f.mu.Unlock()
+}
+
+func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kernel.ThreadID, tg *kernel.ThreadGroup) {
+	if id == "" {
+		return
+	}
+	f.mu.Lock()
+	session := b.execSessions[id]
+	if session != nil {
+		session.info.PID = pid
+		session.info.State = ExecSessionRunning
+		session.tg = tg
+	}
+	f.mu.Unlock()
+	if session != nil {
+		f.watchExecSession(b.id, id, session)
+	}
+}
+
+func (f *SandboxFamily) watchExecSession(branchID, id string, session *execSession) {
+	go func() {
+		session.tg.WaitExited()
+		status := uint32(session.tg.ExitStatus())
+		f.mu.Lock()
+		if branch := f.branches[branchID]; branch != nil && branch.execSessions[id] == session {
+			session.info.State = ExecSessionExited
+			session.info.ExitStatus = &status
+		}
+		f.mu.Unlock()
+	}()
 }
 
 // List returns a stable snapshot sorted by branch ID.
@@ -407,10 +526,11 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return nil, fmt.Errorf("branch %q already exists", args.ID)
 	}
 	childBranch := &sandboxBranch{
-		id:        args.ID,
-		parentID:  sourceID,
-		state:     BranchCreating,
-		createdAt: time.Now().UTC(),
+		id:           args.ID,
+		parentID:     sourceID,
+		state:        BranchCreating,
+		createdAt:    time.Now().UTC(),
+		execSessions: make(map[string]*execSession),
 	}
 	f.branches[args.ID] = childBranch
 	f.mu.Unlock()
@@ -492,6 +612,26 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return fail(fmt.Errorf("starting branch %q paused: %w", args.ID, err))
 	}
 	metrics.ChildStart = time.Since(childStartStarted)
+
+	// The child Kernel contains the same virtual PIDs. Clone only sessions whose
+	// thread groups were present in the memory snapshot; an exit racing the
+	// watcher may leave source metadata briefly marked running.
+	clonedExecSessions := make(map[string]*execSession)
+	f.mu.Lock()
+	for id, sourceSession := range source.execSessions {
+		if sourceSession.info.State != ExecSessionRunning {
+			continue
+		}
+		childTG := child.RootPIDNamespace().ThreadGroupWithID(sourceSession.info.PID)
+		if childTG == nil {
+			continue
+		}
+		info := cloneExecSessionInfo(sourceSession.info)
+		info.State = ExecSessionRunning
+		info.ExitStatus = nil
+		clonedExecSessions[id] = &execSession{info: info, tg: childTG}
+	}
+	f.mu.Unlock()
 	cleanupStartedChild := func(dog *watchdog.Watchdog) {
 		if dog != nil {
 			dog.Stop()
@@ -521,6 +661,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	childBranch.k = child
 	childBranch.watchdog = childWatchdog
 	childBranch.state = BranchPaused
+	childBranch.execSessions = clonedExecSessions
 	f.mu.Unlock()
 	if err := f.injectForkFailure(SandboxForkStageBranchReady); err != nil {
 		cleanupStartedChild(childWatchdog)
@@ -529,6 +670,9 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
 		}
 		return fail(err)
+	}
+	for id, session := range clonedExecSessions {
+		f.watchExecSession(childBranch.id, id, session)
 	}
 	if !args.Paused {
 		childResumeStarted := time.Now()
@@ -729,6 +873,89 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 	}
 	tg.WaitExited()
 	return uint32(tg.ExitStatus()), nil
+}
+
+func (f *SandboxFamily) execSession(args *ExecSessionArgs) (*sandboxBranch, *execSession, func(), error) {
+	if args == nil || args.ExecID == "" {
+		return nil, nil, nil, fmt.Errorf("exec session ID must not be empty")
+	}
+	b, done, err := f.beginControl(args.BranchID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	f.mu.Lock()
+	session := b.execSessions[args.ExecID]
+	f.mu.Unlock()
+	if session == nil {
+		done()
+		return nil, nil, nil, fmt.Errorf("exec session %q does not exist in branch %q", args.ExecID, args.BranchID)
+	}
+	return b, session, done, nil
+}
+
+// ExecSessions returns stable exec-session metadata for one branch.
+func (f *SandboxFamily) ExecSessions(args *ExecSessionsArgs) ([]ExecSessionInfo, error) {
+	if args == nil {
+		return nil, fmt.Errorf("missing exec-session list arguments")
+	}
+	b, done, err := f.beginControl(args.BranchID)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	f.mu.Lock()
+	out := make([]ExecSessionInfo, 0, len(b.execSessions))
+	for _, session := range b.execSessions {
+		if args.CID == "" || session.info.ContainerID == args.CID {
+			out = append(out, cloneExecSessionInfo(session.info))
+		}
+	}
+	f.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// WaitExecSession waits for one exec process and retains its exit status.
+func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs) (uint32, error) {
+	_, session, done, err := f.execSession(args)
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if session.tg == nil {
+		return 0, fmt.Errorf("exec session %q is not published", args.ExecID)
+	}
+	session.tg.WaitExited()
+	status := uint32(session.tg.ExitStatus())
+	f.mu.Lock()
+	session.info.State = ExecSessionExited
+	session.info.ExitStatus = &status
+	f.mu.Unlock()
+	return status, nil
+}
+
+// SignalExecSession signals one exec process by stable session ID.
+func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
+	b, session, done, err := f.execSession(args)
+	if err != nil {
+		return err
+	}
+	defer done()
+	if session.tg == nil {
+		return fmt.Errorf("exec session %q is not published", args.ExecID)
+	}
+	f.mu.Lock()
+	exited := session.info.State == ExecSessionExited
+	f.mu.Unlock()
+	if exited {
+		return fmt.Errorf("exec session %q has exited", args.ExecID)
+	}
+	return b.k.SendExternalSignalThreadGroup(session.tg, &linux.SignalInfo{Signo: args.Signo})
 }
 
 // FollowConsole coordinates a client-side console drainer with init lifetime.

@@ -1693,31 +1693,51 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	ctx := vfs.WithRoot(sctx, root)
 	defer args.MountNamespace.DecRef(ctx)
 
+	if err := l.family.reserveExecSession(branch, args); err != nil {
+		return 0, err
+	}
+	execSessionReserved := args.ExecID != ""
+	keepExecSession := false
+	defer func() {
+		if execSessionReserved && !keepExecSession {
+			l.family.abortExecSession(branch, args.ExecID)
+		}
+	}()
+
 	internalConsoleCreated := false
 	if args.InternalConsoleID != "" {
 		if len(args.Files) != 0 || len(args.GuestFDs) != 0 {
 			return 0, fmt.Errorf("internal exec console cannot accept donated host file descriptors")
 		}
 		execCreds := auth.NewUserCredentials(args.KUID, args.KGID, args.ExtraKGIDs, args.Capabilities, targetKernel.RootUserNamespace())
-		ptyCtx := auth.ContextWithCredentials(ctx, execCreds)
-		master, replica, tty, err := devpts.NewInternalPTY(ptyCtx, targetKernel.VFS(), args.MountNamespace)
-		if err != nil {
-			return 0, fmt.Errorf("creating internal exec PTY: %w", err)
+		consoleCtx := auth.ContextWithCredentials(ctx, execCreds)
+		var fdTable *kernel.FDTable
+		if args.StdioIsPty {
+			master, replica, tty, err := devpts.NewInternalPTY(consoleCtx, targetKernel.VFS(), args.MountNamespace)
+			if err != nil {
+				return 0, fmt.Errorf("creating internal exec PTY: %w", err)
+			}
+			defer master.DecRef(consoleCtx)
+			defer replica.DecRef(consoleCtx)
+			fdTable, err = targetKernel.NewInternalTTYConsoleFDTable(consoleCtx, args.InternalConsoleID, master, replica)
+			if err != nil {
+				return 0, err
+			}
+			if err := targetKernel.ResizeInternalConsole(consoleCtx, args.InternalConsoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
+				_ = targetKernel.RemoveInternalConsole(consoleCtx, args.InternalConsoleID)
+				return 0, fmt.Errorf("setting default internal exec PTY size: %w", err)
+			}
+			args.TTY = tty
+		} else {
+			var err error
+			fdTable, err = targetKernel.NewInternalConsoleFDTable(consoleCtx, args.InternalConsoleID)
+			if err != nil {
+				return 0, fmt.Errorf("creating internal exec pipe console: %w", err)
+			}
+			args.TTY = nil
 		}
-		defer master.DecRef(ptyCtx)
-		defer replica.DecRef(ptyCtx)
-		fdTable, err := targetKernel.NewInternalTTYConsoleFDTable(ptyCtx, args.InternalConsoleID, master, replica)
-		if err != nil {
-			return 0, err
-		}
-		defer fdTable.DecRef(ptyCtx)
-		if err := targetKernel.ResizeInternalConsole(ptyCtx, args.InternalConsoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
-			_ = targetKernel.RemoveInternalConsole(ptyCtx, args.InternalConsoleID)
-			return 0, fmt.Errorf("setting default internal exec PTY size: %w", err)
-		}
+		defer fdTable.DecRef(consoleCtx)
 		args.FDTable = fdTable
-		args.TTY = tty
-		args.StdioIsPty = true
 		internalConsoleCreated = true
 	}
 	keepInternalConsole := false
@@ -1761,6 +1781,8 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, err
 	}
 	keepInternalConsole = true
+	l.family.publishExecSession(branch, args.ExecID, tgid, newTG)
+	keepExecSession = true
 
 	if targetKernel == l.k {
 		eid := execID{cid: args.ContainerID, pid: tgid}

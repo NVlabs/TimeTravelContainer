@@ -46,6 +46,7 @@ type TimeTravel struct {
 	source            string
 	paused            bool
 	pid               int
+	execID            string
 	signal            int
 	all               bool
 	consoleID         string
@@ -78,6 +79,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
+		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
 
@@ -86,6 +88,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.source, "source", boot.DefaultBranchID, "source branch for fork")
 	f.BoolVar(&t.paused, "paused", false, "leave a forked branch paused")
 	f.IntVar(&t.pid, "pid", 0, "virtual process ID; 0 selects the container init")
+	f.StringVar(&t.execID, "exec-id", "", "stable branch-local exec session ID")
 	f.IntVar(&t.signal, "signal", int(linux.SIGTERM), "signal number for the signal action")
 	f.BoolVar(&t.all, "all", false, "signal every process in the container")
 	f.StringVar(&t.consoleID, "console", "init", "internal console session ID")
@@ -174,6 +177,30 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			PID:      int32(t.pid),
 		})
 		output = map[string]uint32{"wait_status": status}
+	case "exec-list":
+		output, err = cont.Sandbox.ExecSessions(&boot.ExecSessionsArgs{
+			BranchID: f.Arg(2),
+			CID:      cont.ID,
+		})
+	case "exec-wait":
+		if t.execID == "" {
+			util.Fatalf("--exec-id is required for exec-wait")
+		}
+		var status uint32
+		status, err = cont.Sandbox.WaitExecSession(&boot.ExecSessionArgs{
+			BranchID: f.Arg(2),
+			ExecID:   t.execID,
+		})
+		output = map[string]uint32{"wait_status": status}
+	case "exec-signal":
+		if t.execID == "" {
+			util.Fatalf("--exec-id is required for exec-signal")
+		}
+		err = cont.Sandbox.SignalExecSession(&boot.ExecSessionArgs{
+			BranchID: f.Arg(2),
+			ExecID:   t.execID,
+			Signo:    int32(t.signal),
+		})
 	case "console-read":
 		stream := kernel.InternalConsoleStdout
 		switch t.consoleStream {

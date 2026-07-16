@@ -354,7 +354,10 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatalf("terminal stderr probe: got %q eof=%t wouldBlock=%t err=%v", data, eof, wouldBlock, err)
 	}
 
-	const execConsoleID = "exec-session"
+	const (
+		execSessionID = "exec-one"
+		execConsoleID = "exec-console"
+	)
 	execPID, err := l.executeAsync(&control.ExecArgs{
 		BranchID:          DefaultBranchID,
 		Filename:          "/bin/sleep",
@@ -363,7 +366,9 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		WorkingDirectory:  "/",
 		KUID:              auth.RootKUID,
 		KGID:              auth.RootKGID,
+		ExecID:            execSessionID,
 		InternalConsoleID: execConsoleID,
+		StdioIsPty:        true,
 		ContainerID:       l.sandboxID,
 	})
 	if err != nil {
@@ -387,6 +392,62 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatal("exec terminal stdin, stdout, and stderr do not share one replica")
 	}
 	liveForkTestWrite(t, parentExecTask, parentExecStdout, "exec-fork-output")
+	const (
+		pipeExecSessionID = "pipe-exec"
+		pipeExecConsoleID = "pipe-exec-console"
+	)
+	pipeExecPID, err := l.executeAsync(&control.ExecArgs{
+		BranchID:          DefaultBranchID,
+		Filename:          "/bin/sleep",
+		Argv:              []string{"/bin/sleep", "30"},
+		Envv:              []string{"PATH=/bin:/usr/bin"},
+		WorkingDirectory:  "/",
+		KUID:              auth.RootKUID,
+		KGID:              auth.RootKGID,
+		ExecID:            pipeExecSessionID,
+		InternalConsoleID: pipeExecConsoleID,
+		ContainerID:       l.sandboxID,
+	})
+	if err != nil {
+		t.Fatalf("executing process with internal pipes: %v", err)
+	}
+	parentPipeExec, err := branchThreadGroup(l.k, l.sandboxID, pipeExecPID)
+	if err != nil {
+		t.Fatalf("looking up parent pipe exec process: %v", err)
+	}
+	parentPipeExecTask := parentPipeExec.Leader()
+	parentPipeExecStdin := liveForkTestTaskFD(t, parentPipeExecTask, 0)
+	parentPipeExecStdout := liveForkTestTaskFD(t, parentPipeExecTask, 1)
+	parentPipeExecStderr := liveForkTestTaskFD(t, parentPipeExecTask, 2)
+	if parentPipeExec.TTY() != nil {
+		t.Fatal("pipe exec process unexpectedly has a controlling TTY")
+	}
+	if parentPipeExecStdin.Impl() == parentPipeExecStdout.Impl() || parentPipeExecStdout.Impl() == parentPipeExecStderr.Impl() || parentPipeExecStdin.Impl() == parentPipeExecStderr.Impl() {
+		t.Fatal("pipe exec stdin, stdout, and stderr do not use distinct pipes")
+	}
+	liveForkTestWrite(t, parentPipeExecTask, parentPipeExecStdout, "pipe-fork-stdout")
+	liveForkTestWrite(t, parentPipeExecTask, parentPipeExecStderr, "pipe-fork-stderr")
+	liveForkTestExecSession(t, l.family, DefaultBranchID, l.sandboxID, execSessionID, execPID, true, ExecSessionRunning)
+	liveForkTestExecSession(t, l.family, DefaultBranchID, l.sandboxID, pipeExecSessionID, pipeExecPID, false, ExecSessionRunning)
+	if sessions, err := l.family.ExecSessions(&ExecSessionsArgs{BranchID: DefaultBranchID, CID: l.sandboxID}); err != nil {
+		t.Fatalf("listing parent exec sessions: %v", err)
+	} else if len(sessions) != 2 {
+		t.Fatalf("parent exec session count: got %d, want 2", len(sessions))
+	}
+	if _, err := l.executeAsync(&control.ExecArgs{
+		BranchID:          DefaultBranchID,
+		Filename:          "/bin/sleep",
+		Argv:              []string{"/bin/sleep", "30"},
+		Envv:              []string{"PATH=/bin:/usr/bin"},
+		WorkingDirectory:  "/",
+		KUID:              auth.RootKUID,
+		KGID:              auth.RootKGID,
+		ExecID:            execSessionID,
+		InternalConsoleID: "duplicate-exec-console",
+		ContainerID:       l.sandboxID,
+	}); err == nil {
+		t.Fatal("duplicate managed exec session ID was accepted")
+	}
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "tty-child"})
 	if err != nil {
@@ -413,6 +474,27 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	if parentExec.TTY() == childExec.TTY() {
 		t.Fatal("parent and child share the exec controlling TTY object")
 	}
+	childPipeExec, err := branchThreadGroup(child.k, l.sandboxID, pipeExecPID)
+	if err != nil {
+		t.Fatalf("looking up child pipe exec process: %v", err)
+	}
+	childPipeExecTask := childPipeExec.Leader()
+	childPipeExecStdin := liveForkTestTaskFD(t, childPipeExecTask, 0)
+	childPipeExecStdout := liveForkTestTaskFD(t, childPipeExecTask, 1)
+	childPipeExecStderr := liveForkTestTaskFD(t, childPipeExecTask, 2)
+	if childPipeExec.TTY() != nil {
+		t.Fatal("forked pipe exec process unexpectedly has a controlling TTY")
+	}
+	if parentPipeExecStdout.Impl() == childPipeExecStdout.Impl() || parentPipeExecStderr.Impl() == childPipeExecStderr.Impl() {
+		t.Fatal("parent and child share internal exec pipe objects")
+	}
+	liveForkTestExecSession(t, l.family, childInfo.ID, l.sandboxID, execSessionID, execPID, true, ExecSessionRunning)
+	liveForkTestExecSession(t, l.family, childInfo.ID, l.sandboxID, pipeExecSessionID, pipeExecPID, false, ExecSessionRunning)
+	if sessions, err := l.family.ExecSessions(&ExecSessionsArgs{BranchID: childInfo.ID, CID: l.sandboxID}); err != nil {
+		t.Fatalf("listing child exec sessions: %v", err)
+	} else if len(sessions) != 2 {
+		t.Fatalf("child exec session count: got %d, want 2", len(sessions))
+	}
 
 	if parentStdout.Impl() == childStdout.Impl() {
 		t.Fatal("parent and child share the internal PTY replica object")
@@ -436,12 +518,40 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	if got := parentExecStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
 		t.Fatalf("child exec PTY input became readable in parent: readiness=%#x", got)
 	}
+	liveForkTestConsoleRead(t, l.k, ctx, pipeExecConsoleID, kernel.InternalConsoleStdout, "pipe-fork-stdout")
+	liveForkTestConsoleRead(t, child.k, childCtx, pipeExecConsoleID, kernel.InternalConsoleStdout, "pipe-fork-stdout")
+	liveForkTestConsoleRead(t, l.k, ctx, pipeExecConsoleID, kernel.InternalConsoleStderr, "pipe-fork-stderr")
+	liveForkTestConsoleRead(t, child.k, childCtx, pipeExecConsoleID, kernel.InternalConsoleStderr, "pipe-fork-stderr")
+	liveForkTestWrite(t, childPipeExecTask, childPipeExecStdout, "pipe-child-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, pipeExecConsoleID, kernel.InternalConsoleStdout, "pipe-child-output")
+	liveForkTestConsoleWouldBlock(t, l.k, ctx, pipeExecConsoleID, kernel.InternalConsoleStdout)
+	liveForkTestConsoleWriteInput(t, child.k, childCtx, pipeExecConsoleID, "pipe-child-input")
+	liveForkTestRead(t, childPipeExecTask, childPipeExecStdin, "pipe-child-input")
+	if got := parentPipeExecStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Fatalf("child exec pipe input became readable in parent: readiness=%#x", got)
+	}
 
 	liveForkTestConsoleWriteInput(t, child.k, childCtx, consoleID, "child-input\n")
 	liveForkTestRead(t, childTask, childStdin, "child-input\n")
 	if got := parentStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
 		t.Fatalf("child PTY input became readable in parent: readiness=%#x", got)
 	}
+
+	if err := l.family.SignalExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID, Signo: int32(linux.SIGKILL)}); err != nil {
+		t.Fatalf("signaling child exec session: %v", err)
+	}
+	status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID})
+	if err != nil {
+		t.Fatalf("waiting for child exec session: %v", err)
+	}
+	if want := uint32(linux.WaitStatusTerminationSignal(linux.SIGKILL)); status != want {
+		t.Fatalf("child exec wait status: got %#x, want %#x", status, want)
+	}
+	exitedSession := liveForkTestExecSession(t, l.family, childInfo.ID, l.sandboxID, execSessionID, execPID, true, ExecSessionExited)
+	if exitedSession.ExitStatus == nil || *exitedSession.ExitStatus != status {
+		t.Fatalf("child exec retained status: got %v, want %#x", exitedSession.ExitStatus, status)
+	}
+	liveForkTestExecSession(t, l.family, DefaultBranchID, l.sandboxID, execSessionID, execPID, true, ExecSessionRunning)
 
 	if err := l.family.Destroy(childInfo.ID); err != nil {
 		t.Fatalf("destroying terminal child: %v", err)
@@ -451,6 +561,28 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		l.k.Unpause()
 	}
 	l.k.WaitExited()
+}
+
+func liveForkTestExecSession(t *testing.T, family *SandboxFamily, branchID, cid, id string, pid kernel.ThreadID, terminal bool, state ExecSessionState) ExecSessionInfo {
+	t.Helper()
+	sessions, err := family.ExecSessions(&ExecSessionsArgs{BranchID: branchID, CID: cid})
+	if err != nil {
+		t.Fatalf("listing exec sessions in branch %q: %v", branchID, err)
+	}
+	for _, session := range sessions {
+		if session.ID != id {
+			continue
+		}
+		if session.ContainerID != cid || session.PID != pid || session.ConsoleID == "" || session.Terminal != terminal || session.State != state {
+			t.Fatalf("exec session %q in branch %q: got %+v, want cid=%q pid=%d terminal=%t state=%q", id, branchID, session, cid, pid, terminal, state)
+		}
+		if state != ExecSessionExited && session.ExitStatus != nil {
+			t.Fatalf("running exec session %q unexpectedly has exit status %#x", id, *session.ExitStatus)
+		}
+		return session
+	}
+	t.Fatalf("exec session %q missing from branch %q: %+v", id, branchID, sessions)
+	return ExecSessionInfo{}
 }
 
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
