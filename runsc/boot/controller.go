@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -119,6 +120,9 @@ const (
 
 	// ContMgrBranchWait waits for a process in one in-memory branch.
 	ContMgrBranchWait = "containerManager.BranchWait"
+
+	// ContMgrConsoleFollow streams init output and waits for init to exit.
+	ContMgrConsoleFollow = "containerManager.ConsoleFollow"
 
 	// ContMgrConsoleRead reads branch-local internal console output.
 	ContMgrConsoleRead = "containerManager.ConsoleRead"
@@ -996,6 +1000,45 @@ func (cm *containerManager) BranchSignal(args *BranchSignalArgs, _ *struct{}) er
 // BranchWait waits for a process in one branch.
 func (cm *containerManager) BranchWait(args *BranchWaitArgs, waitStatus *uint32) error {
 	status, err := cm.l.family.Wait(args.BranchID, args.CID, args.PID)
+	if err != nil {
+		return err
+	}
+	*waitStatus = status
+	return nil
+}
+
+// ConsoleFollow coordinates client-side console draining with init lifetime.
+func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *uint32) error {
+	if len(args.FilePayload.Files) < 3 || len(args.FilePayload.Files) > 4 {
+		return fmt.Errorf("console follow received %d files, want final output, wait status, release, and optional readiness", len(args.FilePayload.Files))
+	}
+	var ready func() error
+	if len(args.FilePayload.Files) == 4 {
+		ready = func() error {
+			if _, err := args.FilePayload.Files[3].Write([]byte{1}); err != nil {
+				return fmt.Errorf("writing console follow readiness: %w", err)
+			}
+			return nil
+		}
+	}
+	exited := func(status uint32) error {
+		var encoded [4]byte
+		binary.BigEndian.PutUint32(encoded[:], status)
+		if n, err := args.FilePayload.Files[1].Write(encoded[:]); err != nil {
+			return fmt.Errorf("writing console follow wait status: %w", err)
+		} else if n != len(encoded) {
+			return fmt.Errorf("writing console follow wait status: %w", io.ErrShortWrite)
+		}
+		return nil
+	}
+	released := func() error {
+		var release [1]byte
+		if _, err := io.ReadFull(args.FilePayload.Files[2], release[:]); err != nil {
+			return err
+		}
+		return nil
+	}
+	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ConsoleID, args.FilePayload.Files[0], ready, exited, released)
 	if err != nil {
 		return err
 	}

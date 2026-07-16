@@ -24,8 +24,20 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+func TestGoferMountPathUnsafeNoHostIsolation(t *testing.T) {
+	const source = "/host/source"
+	const destination = "/guest/destination"
+	if got := goferMountPath(&config.Config{}, source, destination); got != destination {
+		t.Errorf("hardened mount path=%q, want %q", got, destination)
+	}
+	if got := goferMountPath(&config.Config{UnsafeNoHostIsolation: true}, source, destination); got != source {
+		t.Errorf("no-host-isolation mount path=%q, want %q", got, source)
+	}
+}
 
 func tmpDir() string {
 	if dir, ok := os.LookupEnv("TEST_TMPDIR"); ok {

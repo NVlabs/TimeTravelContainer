@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -919,6 +920,48 @@ func TestParseSignal(t *testing.T) {
 	}
 }
 
+func TestReadConsoleWaitStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.wait-status")
+	if status, found, err := readConsoleWaitStatus(path); err != nil || found || status != 0 {
+		t.Fatalf("missing status=(%d, %t, %v), want (0, false, nil)", status, found, err)
+	}
+	if err := os.WriteFile(path, []byte("1792\n"), 0600); err != nil {
+		t.Fatalf("writing status: %v", err)
+	}
+	if status, found, err := readConsoleWaitStatus(path); err != nil || !found || status != 1792 {
+		t.Fatalf("status=(%d, %t, %v), want (1792, true, nil)", status, found, err)
+	}
+	if err := os.WriteFile(path, []byte("partial"), 0600); err != nil {
+		t.Fatalf("writing invalid status: %v", err)
+	}
+	if _, _, err := readConsoleWaitStatus(path); err == nil {
+		t.Fatal("invalid status was accepted")
+	}
+}
+
+func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
+	opts, remaining, done, err := parseGlobalOptions([]string{"run", "busybox"}, io.Discard)
+	if err != nil || done || opts.unsafeNoHostIsolation || !reflect.DeepEqual(remaining, []string{"run", "busybox"}) {
+		t.Fatalf("default options=(%+v, %q, %t, %v), want hardened launch", opts, remaining, done, err)
+	}
+	opts, remaining, done, err = parseGlobalOptions([]string{"--unsafe-no-host-isolation", "run", "busybox"}, io.Discard)
+	if err != nil || done || !opts.unsafeNoHostIsolation || !reflect.DeepEqual(remaining, []string{"run", "busybox"}) {
+		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
+	}
+
+	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--overlay2=all:memory"}
+	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
+		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
+	}
+	wantUnsafe := []string{
+		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
+		"--network=none", "--directfs=false", "--overlay2=all:memory",
+	}
+	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
+		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
+	}
+}
+
 func TestRuntimeBackendUsesRunscCLI(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -928,7 +971,11 @@ if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 	exit 2
 fi
 if [ "$3" = "list" ]; then
-	echo '[{"id":"web","status":"running"}]'
+	if [ -e "$0.stopped" ]; then
+		echo '[{"id":"web","status":"stopped"}]'
+	else
+		echo '[{"id":"web","status":"running"}]'
+	fi
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
@@ -939,8 +986,9 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "web" ] && [ "${13}" = "console-follow" ] && [ "${14}" = "child" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-ready-fd" ] && [ "${15}" = "4" ] && [ "${16}" = "web" ] && [ "${17}" = "console-follow" ] && [ "${18}" = "child" ]; then
 	touch "$0.retention"
+	printf 1 >&4
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "child" ]; then
@@ -957,6 +1005,9 @@ fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "wait" ] && [ "$6" = "child" ]; then
 	echo '{"wait_status":15}'
 	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "wait" ] && [ "$6" = "main" ]; then
+	exit 128
 fi
 echo "unexpected command: $*" >&2
 exit 2
@@ -1048,6 +1099,30 @@ exit 2
 	status, err := b.wait(selector{container: "web", branch: "child"})
 	if err != nil || status != 15 {
 		t.Errorf("wait returned (%d, %v), want (15, nil)", status, err)
+	}
+	store := ttosbundle.Store{Root: dataRoot}
+	mainConsole, err := store.BranchConsolePaths("web", "main")
+	if err != nil {
+		t.Fatalf("BranchConsolePaths(main): %v", err)
+	}
+	if err := os.WriteFile(mainConsole.WaitStatus, []byte("9\n"), 0600); err != nil {
+		t.Fatalf("writing persistent main wait status: %v", err)
+	}
+	status, err = b.wait(selector{container: "web", branch: "main"})
+	if err != nil || status != 9 {
+		t.Errorf("wait fallback returned (%d, %v), want (9, nil)", status, err)
+	}
+	if err := b.destroy(selector{container: "web", branch: "child"}); err == nil {
+		t.Error("destroy swallowed a live-sandbox control error")
+	}
+	if err := os.WriteFile(runsc+".stopped", nil, 0600); err != nil {
+		t.Fatalf("marking fake sandbox stopped: %v", err)
+	}
+	if err := b.destroy(selector{container: "web", branch: "child"}); err != nil {
+		t.Errorf("destroy after sandbox exit: %v", err)
+	}
+	if err := b.destroy(selector{container: "missing", branch: "child"}); err == nil {
+		t.Error("destroy accepted a nonexistent persistent container")
 	}
 }
 

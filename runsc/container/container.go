@@ -338,7 +338,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		args.Spec.Linux = &specs.Linux{}
 	}
 	// Don't force the use of cgroups in tests because they lack permission to do so.
-	if args.Spec.Linux.CgroupsPath == "" && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if args.Spec.Linux.CgroupsPath == "" && !conf.AllowRunAsCurrentUserWithoutChroot() {
 		args.Spec.Linux.CgroupsPath = "/" + args.ID
 	}
 	var subCgroup, parentCgroup, containerCgroup cgroup.Cgroup
@@ -1583,7 +1583,11 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	// Setup any uid/gid mappings, and create or join the configured user
 	// namespace so the gofer's view of the filesystem aligns with the
 	// users in the sandbox.
-	if !rootlessEUID {
+	if conf.UnsafeNoHostIsolation {
+		nss = nil
+		cmd.Args = append(cmd.Args, "--setup-root=false", "--apply-caps=false")
+		log.Warningf("Starting gofer without host namespace or chroot isolation")
+	} else if !rootlessEUID {
 		if userNS, ok := specutils.GetNS(specs.UserNamespace, c.Spec); ok {
 			nss = append(nss, userNS)
 			specutils.SetUIDGIDMappings(cmd, c.Spec)
@@ -2009,7 +2013,7 @@ func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResour
 }
 
 func modifySpecForDirectfs(conf *config.Config, spec *specs.Spec) error {
-	if !conf.DirectFS || conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if !conf.DirectFS || conf.AllowRunAsCurrentUserWithoutChroot() {
 		return nil
 	}
 	if conf.Network == config.NetworkHost {

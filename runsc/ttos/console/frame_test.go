@@ -68,3 +68,85 @@ func TestFrameRejectsInvalidData(t *testing.T) {
 		t.Fatal("DecodeFrame accepted reserved bytes")
 	}
 }
+
+func TestCopyFinalFramesSynthesizesMissingEOFs(t *testing.T) {
+	var input bytes.Buffer
+	if err := WriteFrame(&input, StreamStdout, []byte("last output")); err != nil {
+		t.Fatalf("WriteFrame(stdout data): %v", err)
+	}
+	if err := WriteFrame(&input, StreamStdout, nil); err != nil {
+		t.Fatalf("WriteFrame(stdout EOF): %v", err)
+	}
+
+	want := append([]byte(nil), input.Bytes()...)
+	var stderrEOF bytes.Buffer
+	if err := WriteFrame(&stderrEOF, StreamStderr, nil); err != nil {
+		t.Fatalf("WriteFrame(stderr EOF): %v", err)
+	}
+	want = append(want, stderrEOF.Bytes()...)
+
+	var got bytes.Buffer
+	if err := CopyFinalFrames(&got, &input, false, false); err != nil {
+		t.Fatalf("CopyFinalFrames: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyFinalFrames wrote %x, want %x", got.Bytes(), want)
+	}
+}
+
+func TestCopyFinalFramesSynthesizesBothEOFs(t *testing.T) {
+	var got bytes.Buffer
+	if err := CopyFinalFrames(&got, bytes.NewReader(nil), false, false); err != nil {
+		t.Fatalf("CopyFinalFrames: %v", err)
+	}
+
+	var want bytes.Buffer
+	for _, stream := range []byte{StreamStdout, StreamStderr} {
+		if err := WriteFrame(&want, stream, nil); err != nil {
+			t.Fatalf("WriteFrame(%d EOF): %v", stream, err)
+		}
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("CopyFinalFrames wrote %x, want %x", got.Bytes(), want.Bytes())
+	}
+}
+
+func TestCopyFinalFramesSkipsCoordinatorDuplicateEOF(t *testing.T) {
+	var input bytes.Buffer
+	if err := WriteFrame(&input, StreamStdout, nil); err != nil {
+		t.Fatalf("WriteFrame(stdout EOF): %v", err)
+	}
+	if err := WriteFrame(&input, StreamStderr, []byte("last error")); err != nil {
+		t.Fatalf("WriteFrame(stderr data): %v", err)
+	}
+	if err := WriteFrame(&input, StreamStderr, nil); err != nil {
+		t.Fatalf("WriteFrame(stderr EOF): %v", err)
+	}
+
+	var want bytes.Buffer
+	if err := WriteFrame(&want, StreamStderr, []byte("last error")); err != nil {
+		t.Fatalf("WriteFrame(want stderr data): %v", err)
+	}
+	if err := WriteFrame(&want, StreamStderr, nil); err != nil {
+		t.Fatalf("WriteFrame(want stderr EOF): %v", err)
+	}
+	var got bytes.Buffer
+	if err := CopyFinalFrames(&got, &input, true, false); err != nil {
+		t.Fatalf("CopyFinalFrames: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("CopyFinalFrames wrote %x, want %x", got.Bytes(), want.Bytes())
+	}
+}
+
+func TestCopyFinalFramesRejectsTruncatedFrame(t *testing.T) {
+	for _, input := range [][]byte{
+		{StreamStdout},
+		{StreamStdout, 0, 0, 0, 0, 0, 0, 2, 'x'},
+	} {
+		var got bytes.Buffer
+		if err := CopyFinalFrames(&got, bytes.NewReader(input), false, false); err == nil {
+			t.Fatalf("CopyFinalFrames(%x) succeeded, want error", input)
+		}
+	}
+}

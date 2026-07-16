@@ -207,7 +207,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		if err := sandboxsetup.SetupRootFS(spec, conf, g.mountConfs, g.devIoFD, makeRPCMountOpener(goferToHostRPC), containerID, g.bundleDir); err != nil {
 			util.Fatalf("Error setting up root FS: %v", err)
 		}
-		if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if !conf.AllowRunAsCurrentUserWithoutChroot() {
 			cleanupUnmounter := g.syncFDs.spawnProcUnmounter()
 			defer cleanupUnmounter()
 		}
@@ -264,7 +264,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 
 	// Find what path is going to be served by this gofer.
 	root := spec.Root.Path
-	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if !conf.AllowRunAsCurrentUserWithoutChroot() {
 		root = "/root"
 	}
 
@@ -291,7 +291,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	unix.Umask(0)
 
 	procFDPath := sandboxsetup.ProcFDBindMount
-	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if conf.AllowRunAsCurrentUserWithoutChroot() {
 		procFDPath = "/proc/self/fd"
 	}
 	if err := fsgofer.OpenProcSelfFD(procFDPath); err != nil {
@@ -301,13 +301,17 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// procfs isn't needed anymore.
 	g.syncFDs.unmountProcfs()
 
-	if err := unix.Chroot(root); err != nil {
-		util.Fatalf("failed to chroot to %q: %v", root, err)
+	if conf.UnsafeNoHostIsolation {
+		log.Warningf("Serving rootfs without chroot isolation from %q", root)
+	} else {
+		if err := unix.Chroot(root); err != nil {
+			util.Fatalf("failed to chroot to %q: %v", root, err)
+		}
+		if err := unix.Chdir("/"); err != nil {
+			util.Fatalf("changing working dir: %v", err)
+		}
+		log.Infof("Process chroot'd to %q", root)
 	}
-	if err := unix.Chdir("/"); err != nil {
-		util.Fatalf("changing working dir: %v", err)
-	}
-	log.Infof("Process chroot'd to %q", root)
 
 	ruid := unix.Getuid()
 	euid := unix.Geteuid()
@@ -334,6 +338,12 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	return g.serve(spec, conf, root, ruid, euid, rgid, egid)
 }
 
+func goferMountPath(conf *config.Config, source, destination string) string {
+	if conf.UnsafeNoHostIsolation {
+		return source
+	}
+	return destination
+}
 func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock      *unet.Socket
@@ -346,13 +356,14 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 	ioFDs := g.ioFDs
 	rootfsConf := g.mountConfs[0]
 	if rootfsConf.ShouldUseLisafs() {
+		mountPath := goferMountPath(conf, root, "/")
 		// Start with root mount, then add any other additional mount as needed.
 		cfgs = append(cfgs, connectionConfig{
 			sock:      sandboxsetup.NewSocket(ioFDs[0]),
-			mountPath: "/", // fsgofer process is always chroot()ed. So serve root.
+			mountPath: mountPath,
 			readonly:  spec.Root.Readonly || rootfsConf.ShouldUseOverlayfs(),
 		})
-		log.Infof("Serving %q mapped to %q on FD %d (ro: %t)", "/", root, ioFDs[0], cfgs[0].readonly)
+		log.Infof("Serving %q mapped to %q on FD %d (ro: %t)", mountPath, root, ioFDs[0], cfgs[0].readonly)
 		ioFDs = ioFDs[1:]
 	}
 
@@ -377,9 +388,10 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		ioFD := ioFDs[0]
 		ioFDs = ioFDs[1:]
 		readonly := specutils.IsReadonlyMount(m.Options) || mountConf.ShouldUseOverlayfs()
+		mountPath := goferMountPath(conf, m.Source, m.Destination)
 		cfgs = append(cfgs, connectionConfig{
 			sock:      sandboxsetup.NewSocket(ioFD),
-			mountPath: m.Destination,
+			mountPath: mountPath,
 			readonly:  readonly,
 			mount:     m,
 		})

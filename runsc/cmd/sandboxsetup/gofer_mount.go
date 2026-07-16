@@ -129,7 +129,7 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 	goferRootFs := spec.Root.Path
 	containerRootFs := spec.Root.Path
 
-	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if !conf.AllowRunAsCurrentUserWithoutChroot() {
 		// runsc can't be re-executed without /proc, so we create a tmpfs mount,
 		// mount ./proc and ./root there, then move this mount to the root and after
 		// setCapsAndCallSelf, runsc will chroot into /root.
@@ -256,7 +256,7 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 		log.Warningf("CreateContainer hooks are not executed since container rootfs is not on lisafs")
 	}
 
-	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if !conf.AllowRunAsCurrentUserWithoutChroot() {
 		if err := PivotRoot("/proc/fs"); err != nil {
 			util.Fatalf("failed to change the root file system: %v", err)
 		}
@@ -532,6 +532,13 @@ func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) erro
 	return nil
 }
 
+func mountOptionsPath(conf *config.Config, root, destination, source string) string {
+	if conf.UnsafeNoHostIsolation {
+		return source
+	}
+	return filepath.Join(root, destination)
+}
+
 // ResolveMounts resolves relative paths and symlinks in mount point
 // destinations. It also adjusts mount options based on the underlying
 // filesystem type.
@@ -563,7 +570,8 @@ func ResolveMounts(conf *config.Config, mounts []specs.Mount, root string, mount
 			panic(fmt.Sprintf("%q could not be made relative to %q: %v", dst, root, err))
 		}
 
-		opts, err := AdjustMountOptions(conf, filepath.Join(root, relDst), m.Options)
+		optionsPath := mountOptionsPath(conf, root, relDst, m.Source)
+		opts, err := AdjustMountOptions(conf, optionsPath, m.Options)
 		if err != nil {
 			return nil, err
 		}

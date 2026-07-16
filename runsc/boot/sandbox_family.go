@@ -15,8 +15,10 @@
 package boot
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/urpc"
 )
 
 // DefaultBranchID is the branch used by existing, branch-unaware runsc RPCs.
@@ -98,6 +101,16 @@ type BranchWaitArgs struct {
 	PID      int32
 }
 
+// ConsoleFollowArgs streams one branch's init output and waits for init to
+// exit. FilePayload contains the final-output writer, wait-status writer,
+// release reader, and an optional readiness writer.
+type ConsoleFollowArgs struct {
+	urpc.FilePayload
+	BranchID  string
+	CID       string
+	ConsoleID string
+}
+
 // BranchSignalArgs selects signal recipients inside one live branch.
 type BranchSignalArgs struct {
 	BranchID string
@@ -163,7 +176,14 @@ type sandboxBranch struct {
 type SandboxFamily struct {
 	mu sync.Mutex
 
-	branches map[string]*sandboxBranch
+	branches         map[string]*sandboxBranch
+	controlsQuiesced bool
+	// defaultStarted is closed after Loader.Run has installed and started the
+	// default branch's init thread group. It allows wait RPCs to be established
+	// while the OCI container is still in the created state, eliminating the
+	// race between a short-lived init and a post-start waiter.
+	defaultStarted     chan struct{}
+	defaultStartedOnce sync.Once
 	// allowNetworkStack is true only when loader configuration proves that
 	// network state has no host-facing links.
 	allowNetworkStack              bool
@@ -200,6 +220,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
 		testOnlyForkFailureInjector:    opts.TestOnlyForkFailureInjector,
+		defaultStarted:                 make(chan struct{}),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
 				id:    DefaultBranchID,
@@ -248,12 +269,30 @@ func (f *SandboxFamily) HasChildren() bool {
 	return len(f.branches) != 1
 }
 
+// QuiesceControls rejects new Kernel-lifetime control operations and waits for
+// those already registered on every branch. Boot shutdown uses this after the
+// default init exits so final console frames and wait statuses reach clients
+// before the control server is destroyed.
+func (f *SandboxFamily) QuiesceControls() {
+	f.mu.Lock()
+	f.controlsQuiesced = true
+	branches := make([]*sandboxBranch, 0, len(f.branches))
+	for _, b := range f.branches {
+		branches = append(branches, b)
+	}
+	f.mu.Unlock()
+	for _, b := range branches {
+		b.controlOps.Wait()
+	}
+}
+
 // MarkDefaultStarted records the default kernel state after Loader.Run.
 func (f *SandboxFamily) MarkDefaultStarted() {
 	f.mu.Lock()
 	b := f.branches[DefaultBranchID]
 	b.state = kernelBranchState(b.k)
 	f.mu.Unlock()
+	f.defaultStartedOnce.Do(func() { close(f.defaultStarted) })
 }
 
 // List returns a stable snapshot sorted by branch ID.
@@ -644,12 +683,109 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 		return 0, err
 	}
 	defer done()
+	if id == "" || id == DefaultBranchID {
+		<-f.defaultStarted
+	}
 	tg, err := branchThreadGroup(b.k, cid, kernel.ThreadID(pid))
 	if err != nil {
 		return 0, err
 	}
 	tg.WaitExited()
 	return uint32(tg.ExitStatus()), nil
+}
+
+// FollowConsole coordinates a client-side console drainer with init lifetime.
+// It holds a branch control lease until output has been drained, preventing
+// Sentry shutdown from racing the client's final ConsoleRead calls.
+func (f *SandboxFamily) FollowConsole(id, cid, consoleID string, finalWriter io.Writer, ready func() error, exited func(uint32) error, released func() error) (uint32, error) {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if ready != nil {
+		if err := ready(); err != nil {
+			return 0, fmt.Errorf("acknowledging console follower registration: %w", err)
+		}
+	}
+	if id == "" || id == DefaultBranchID {
+		<-f.defaultStarted
+	}
+	tg, err := branchThreadGroup(b.k, cid, 0)
+	if err != nil {
+		return 0, err
+	}
+	tg.WaitExited()
+	status := uint32(tg.ExitStatus())
+	if exited != nil {
+		if err := exited(status); err != nil {
+			return 0, fmt.Errorf("reporting console init exit: %w", err)
+		}
+	}
+	b.k.WaitExited()
+	if released != nil {
+		if err := released(); err != nil {
+			return 0, fmt.Errorf("waiting for client console-read handoff: %w", err)
+		}
+	}
+	streams := []struct {
+		stream kernel.InternalConsoleStream
+		eof    bool
+	}{
+		{stream: kernel.InternalConsoleStdout},
+		{stream: kernel.InternalConsoleStderr},
+	}
+	for {
+		allEOF := true
+		for i := range streams {
+			stream := &streams[i]
+			if stream.eof {
+				continue
+			}
+			allEOF = false
+			b.opMu.Lock()
+			data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), consoleID, stream.stream, 65536)
+			b.opMu.Unlock()
+			if err != nil {
+				return 0, fmt.Errorf("draining final internal console stream %d: %w", stream.stream, err)
+			}
+			if len(data) != 0 {
+				if err := writeConsoleFrame(finalWriter, byte(stream.stream), data); err != nil {
+					return 0, fmt.Errorf("writing final internal console stream %d: %w", stream.stream, err)
+				}
+			}
+			if eof {
+				if err := writeConsoleFrame(finalWriter, byte(stream.stream), nil); err != nil {
+					return 0, fmt.Errorf("writing final internal console EOF %d: %w", stream.stream, err)
+				}
+				stream.eof = true
+			}
+			if wouldBlock {
+				return 0, fmt.Errorf("internal console stream %d would block after branch exit", stream.stream)
+			}
+		}
+		if allEOF {
+			break
+		}
+	}
+	return status, nil
+}
+
+func writeConsoleFrame(writer io.Writer, stream byte, data []byte) error {
+	encoded := make([]byte, 8+len(data))
+	encoded[0] = stream
+	binary.BigEndian.PutUint32(encoded[4:8], uint32(len(data)))
+	for len(encoded) != 0 {
+		n, err := writer.Write(encoded)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(encoded) {
+			return io.ErrShortWrite
+		}
+		encoded = encoded[n:]
+	}
+	return nil
 }
 
 // ConsoleRead performs one nonblocking read while serializing against fork,
@@ -736,6 +872,11 @@ func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) 
 	}
 	b.opMu.Lock()
 	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
 	if b.state != BranchRunning && b.state != BranchPaused {
 		state := b.state
 		f.mu.Unlock()
@@ -758,6 +899,11 @@ func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), 
 	}
 	b.opMu.Lock()
 	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
 	if b.state != BranchRunning {
 		state := b.state
 		f.mu.Unlock()
@@ -798,7 +944,18 @@ func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*ker
 		}
 	}
 	if initTG == nil {
-		return nil, fmt.Errorf("container %q has no init process", cid)
+		// Kernel retains GlobalInit after PID 1 has left the live PID table so
+		// external waiters can continue to observe its terminal status. This is
+		// also the init thread group cloned into every TimeTravel branch.
+		globalInit := k.GlobalInit()
+		if globalInit == nil {
+			return nil, fmt.Errorf("container %q has no init process", cid)
+		}
+		leader := globalInit.Leader()
+		if leader == nil || leader.ContainerID() != cid {
+			return nil, fmt.Errorf("container %q has no init process", cid)
+		}
+		initTG = globalInit
 	}
 	return initTG, nil
 }

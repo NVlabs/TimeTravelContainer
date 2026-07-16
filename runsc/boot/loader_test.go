@@ -339,6 +339,23 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	defer cleanup()
 	defer l.Destroy()
+	// OCI create must expose the console before StartRoot can run guest code.
+	liveForkTestConsoleWouldBlock(t, l.k, l.k.SupervisorContext(), "init", kernel.InternalConsoleStdout)
+	type waitOutcome struct {
+		status uint32
+		err    error
+	}
+	preStartWait := make(chan waitOutcome, 1)
+	go func() {
+		status, err := l.family.Wait(DefaultBranchID, l.root.cid, 0)
+		preStartWait <- waitOutcome{status: status, err: err}
+	}()
+	select {
+	case result := <-preStartWait:
+		t.Fatalf("wait established before Loader.Run returned early: %+v", result)
+	case <-time.After(10 * time.Millisecond):
+		// The waiter must remain in flight until Loader.Run installs init.
+	}
 
 	resultCh := make(chan error, 1)
 	go func() {
@@ -1127,6 +1144,15 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if !ws.Signaled() || ws.TerminationSignal() != linux.SIGKILL {
 		t.Errorf("child wait status: got %v, want SIGKILL", ws)
 	}
+	// PID 1 has left the live PID table after the first wait, but repeated
+	// lifecycle operations must still observe its retained terminal status.
+	statusAgain, err := l.family.Wait(childInfo.ID, l.root.cid, 0)
+	if err != nil {
+		t.Fatalf("waiting for exited child init again: %v", err)
+	}
+	if statusAgain != status {
+		t.Errorf("second child wait status: got %v, want %v", linux.WaitStatus(statusAgain), ws)
+	}
 	if got := l.k.GlobalInit().Leader().ExitState(); got != kernel.TaskExitNone {
 		t.Errorf("parent init changed after signaling child: got exit state %v", got)
 	}
@@ -1194,6 +1220,18 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	l.k.Unpause()
 	l.k.WaitExited()
+	select {
+	case result := <-preStartWait:
+		if result.err != nil {
+			t.Fatalf("pre-start wait failed: %v", result.err)
+		}
+		ws := linux.WaitStatus(result.status)
+		if !ws.Signaled() || ws.TerminationSignal() != linux.SIGKILL {
+			t.Errorf("pre-start wait status: got %v, want SIGKILL", ws)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pre-start wait did not complete after init exited")
+	}
 }
 
 func liveForkTestFD(t *testing.T, k *kernel.Kernel, fd int32) *vfs.FileDescription {

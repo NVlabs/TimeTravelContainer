@@ -89,6 +89,12 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.overlay"]; got != "memory" {
 		t.Errorf("root overlay=%q, want memory", got)
 	}
+	if got := spec.Annotations["dev.gvisor.spec.rootfs.source"]; got != root {
+		t.Errorf("root source=%q, want %q", got, root)
+	}
+	if got := spec.Annotations["dev.gvisor.spec.rootfs.type"]; got != "bind" {
+		t.Errorf("root type=%q, want bind", got)
+	}
 	if got := spec.Annotations["dev.timetravelos.internal-console"]; got != "init" {
 		t.Errorf("internal console=%q, want init", got)
 	}
@@ -185,7 +191,8 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	wantBase := filepath.Join(containerDir, "console", "test-a")
 	if paths.Log != wantBase+".log" || paths.Lock != wantBase+".lock" ||
-		paths.StdinLock != wantBase+".stdin.lock" || paths.Error != wantBase+".error.log" {
+		paths.StdinLock != wantBase+".stdin.lock" || paths.Error != wantBase+".error.log" ||
+		paths.WaitStatus != wantBase+".wait-status" {
 		t.Errorf("console paths=%+v, want base %q", paths, wantBase)
 	}
 	if info, err := os.Stat(filepath.Dir(paths.Log)); err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {

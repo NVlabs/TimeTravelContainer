@@ -114,6 +114,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
       non-TTY slice with procfs, `/dev` tmpfs, and restricted sysfs mounts).
 - [x] Support `--name`, environment variables, working directory, named or
       numeric user, entrypoint override, hostname, and rootless execution.
+- [x] Keep single-ID user-namespace rootless execution as the default without
+      requiring `newuidmap`, `newgidmap`, or subordinate-ID ranges. Provide an
+      explicit `--unsafe-no-host-isolation` fallback for trusted workloads on
+      hosts that prohibit user namespaces; this runs Sentry/gofer as the
+      caller without host namespaces or chroots while retaining Sentry guest
+      namespaces and credentials.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
 - [x] Support family-local named tmpfs volumes through `-v NAME:CONTAINER[:ro]`
@@ -276,6 +282,11 @@ state still forks entirely in memory.
       premature failure, rotate at complete-frame boundaries with bounded
       two-generation retention, and let attach/log readers follow without guest
       FDs.
+- [x] Register the main console follower before OCI start, atomically persist
+      terminal wait status, retain exited branch status for repeated waits, and
+      preserve exact stdout/stderr plus one EOF per stream for immediate exits.
+      The image matrix stress-checks 256 KiB per stream in both foreground and
+      persistent-log paths.
 - [ ] Move sidecar ownership into `ttosd`, add restart reconciliation, and
       replace the sidecar's polling RPC loop with readiness-driven transport.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
@@ -390,7 +401,7 @@ Reject            unsupported, externally mutable, or host/device-backed
       for example with an EROFS lower or an explicit ownership metadata scheme.
 - [ ] Construct the full mount manifest once allowed mount classes are
       implemented.
-- [ ] Place an in-memory OverlayFS upper over the immutable image lower by
+- [x] Place an in-memory OverlayFS upper over the immutable image lower by
       default.
 - [ ] Track containerd content/snapshot leases for every live family and release
       them only after the last branch is destroyed.
@@ -398,7 +409,9 @@ Reject            unsupported, externally mutable, or host/device-backed
       host snapshotter that cannot participate in live fork.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
       Python, and nginx images, covering rootless prerequisites, OCI startup,
-      Docker-like lifecycle commands, live fork, and managed-volume CoW.
+      Docker-like lifecycle commands, live fork, managed-volume CoW, read-only
+      host binds, exact quick-exit console integrity, and the explicit
+      no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 

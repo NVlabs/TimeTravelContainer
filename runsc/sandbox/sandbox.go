@@ -964,7 +964,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
 
 	// Clear environment variables, unless --TESTONLY-unsafe-nonroot is set.
-	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if !conf.AllowRunAsCurrentUserWithoutChroot() {
 		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
 		cmd.Env = []string{}
 	}
@@ -1105,7 +1105,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// configured.
 	rootlessEUID := unix.Geteuid() != 0
 	setUserMappings := false
-	if conf.Network == config.NetworkHost || conf.DirectFS {
+	if conf.UnsafeNoHostIsolation {
+		nss = nil
+		log.Warningf("Starting sandbox without host namespace or chroot isolation")
+	} else if conf.Network == config.NetworkHost || conf.DirectFS {
 		if userns, ok := specutils.GetNS(specs.UserNamespace, args.Spec); ok {
 			log.Infof("Sandbox will be started in container's user namespace: %+v", userns)
 			nss = append(nss, userns)
@@ -1146,7 +1149,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 		// If we have CAP_SYS_ADMIN, we can create an empty chroot and
 		// bind-mount the executable inside it.
-		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if conf.AllowRunAsCurrentUserWithoutChroot() {
 			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
 		} else if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) || rootlessEUID {
 			log.Infof("Sandbox will be started in minimal chroot")
@@ -1157,7 +1160,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	} else {
 		// If we have CAP_SETUID and CAP_SETGID, then we can also run
 		// as user nobody.
-		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if conf.AllowRunAsCurrentUserWithoutChroot() {
 			log.Warningf("Running sandbox in test mode as current user (uid=%d gid=%d). This is only safe in tests!", os.Getuid(), os.Getgid())
 			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
 		} else if rootlessEUID || specutils.HasCapabilities(capability.CAP_SETUID, capability.CAP_SETGID) {
@@ -2106,6 +2109,15 @@ func (s *Sandbox) WaitBranch(args *boot.BranchWaitArgs) (uint32, error) {
 	return waitStatus, nil
 }
 
+// FollowConsole streams framed init output and waits for init to exit.
+func (s *Sandbox) FollowConsole(args *boot.ConsoleFollowArgs) (uint32, error) {
+	var waitStatus uint32
+	if err := s.call(boot.ContMgrConsoleFollow, args, &waitStatus); err != nil {
+		return 0, fmt.Errorf("following internal console %q in live branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return waitStatus, nil
+}
+
 // ReadConsole performs one nonblocking branch-local internal-console read.
 func (s *Sandbox) ReadConsole(args *boot.ConsoleReadArgs) (boot.ConsoleReadResult, error) {
 	var result boot.ConsoleReadResult
@@ -2342,7 +2354,7 @@ func (s *Sandbox) waitForStopped() error {
 // configureStdios change stdios ownership to give access to the sandbox
 // process. This may be skipped depending on the configuration.
 func (s *Sandbox) configureStdios(conf *config.Config, stdios []*os.File) error {
-	if conf.Rootless || conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+	if conf.Rootless || conf.AllowRunAsCurrentUserWithoutChroot() {
 		// Cannot change ownership without CAP_CHOWN.
 		return nil
 	}

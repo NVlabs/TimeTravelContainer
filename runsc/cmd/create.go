@@ -116,7 +116,14 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 	conf := args[0].(*config.Config)
 
 	if conf.Rootless {
-		return util.Errorf("Rootless mode not supported with %q", c.Name())
+		if conf.Network == config.NetworkSandbox {
+			return util.Errorf("sandbox network isn't supported with --rootless, use --network=none or --network=host")
+		}
+		if err := specutils.MaybeRunAsRoot(); err != nil {
+			return util.Errorf("Error executing inside namespace: %v", err)
+		}
+		// Execution continues here after re-exec if no more capabilities are
+		// required, matching the rootless run command.
 	}
 
 	id, spec, err := c.FetchSpec(conf, f)

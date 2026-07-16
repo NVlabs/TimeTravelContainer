@@ -73,10 +73,11 @@ type ContainerInfo struct {
 // ConsolePaths are persistent host-side files for one branch's init console.
 // None of these files are donated into the sandbox.
 type ConsolePaths struct {
-	Log       string
-	Lock      string
-	StdinLock string
-	Error     string
+	Log        string
+	Lock       string
+	StdinLock  string
+	Error      string
+	WaitStatus string
 }
 
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
@@ -269,10 +270,11 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	}
 	base := filepath.Join(dir, branch)
 	return ConsolePaths{
-		Log:       base + ".log",
-		Lock:      base + ".lock",
-		StdinLock: base + ".stdin.lock",
-		Error:     base + ".error.log",
+		Log:        base + ".log",
+		Lock:       base + ".lock",
+		StdinLock:  base + ".stdin.lock",
+		Error:      base + ".error.log",
+		WaitStatus: base + ".wait-status",
 	}, nil
 }
 

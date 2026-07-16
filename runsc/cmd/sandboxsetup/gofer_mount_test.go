@@ -15,8 +15,23 @@
 package sandboxsetup
 
 import (
+	"path/filepath"
 	"testing"
+
+	"gvisor.dev/gvisor/runsc/config"
 )
+
+func TestMountOptionsPathUnsafeNoHostIsolation(t *testing.T) {
+	const root = "/image/root"
+	const destination = "guest/path"
+	const source = "/host/source"
+	if got, want := mountOptionsPath(&config.Config{}, root, destination, source), filepath.Join(root, destination); got != want {
+		t.Errorf("hardened options path=%q, want %q", got, want)
+	}
+	if got := mountOptionsPath(&config.Config{UnsafeNoHostIsolation: true}, root, destination, source); got != source {
+		t.Errorf("no-host-isolation options path=%q, want %q", got, source)
+	}
+}
 
 func TestShouldExposeNvidiaDevice(t *testing.T) {
 	tests := []struct {

@@ -58,11 +58,12 @@ var (
 )
 
 type options struct {
-	root       string
-	runsc      string
-	containerd string
-	namespace  string
-	dataRoot   string
+	root                  string
+	runsc                 string
+	containerd            string
+	namespace             string
+	dataRoot              string
+	unsafeNoHostIsolation bool
 }
 
 // Run executes ttos with args and returns a process exit status.
@@ -79,15 +80,19 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+	if opts.unsafeNoHostIsolation {
+		fmt.Fprintln(stderr, "ttos: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
+	}
 	return runCommand(args, stdout, stderr, &runtimeBackend{
-		root:       opts.root,
-		runsc:      opts.runsc,
-		containerd: opts.containerd,
-		namespace:  opts.namespace,
-		dataRoot:   opts.dataRoot,
-		stdin:      stdin,
-		stdout:     stdout,
-		stderr:     stderr,
+		root:                  opts.root,
+		runsc:                 opts.runsc,
+		containerd:            opts.containerd,
+		namespace:             opts.namespace,
+		dataRoot:              opts.dataRoot,
+		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
+		stdin:                 stdin,
+		stdout:                stdout,
+		stderr:                stderr,
 	})
 }
 
@@ -168,6 +173,9 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 				return opts, nil, false, errors.New("--data-root requires a path")
 			}
 			args = args[1:]
+		case arg == "--unsafe-no-host-isolation":
+			opts.unsafeNoHostIsolation = true
+			args = args[1:]
 		case strings.HasPrefix(arg, "-"):
 			return opts, nil, false, fmt.Errorf("unknown global option %q", arg)
 		default:
@@ -231,6 +239,7 @@ Global options:
   --containerd PATH              containerd socket
   --namespace NAME               containerd namespace (default: ttos)
   --data-root PATH               image, bundle, and metadata directory
+  --unsafe-no-host-isolation     run without host namespaces/chroots (unsafe)
 
 Commands:
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
@@ -1694,14 +1703,15 @@ type backend interface {
 }
 
 type runtimeBackend struct {
-	root       string
-	runsc      string
-	containerd string
-	namespace  string
-	dataRoot   string
-	stdin      io.Reader
-	stdout     io.Writer
-	stderr     io.Writer
+	root                  string
+	runsc                 string
+	containerd            string
+	namespace             string
+	dataRoot              string
+	unsafeNoHostIsolation bool
+	stdin                 io.Reader
+	stdout                io.Writer
+	stderr                io.Writer
 }
 
 func (b *runtimeBackend) run(request runRequest) (int, error) {
@@ -2010,6 +2020,22 @@ func acquireConsoleStdin(lockPath string, target selector) (*os.File, error) {
 	return lockFile, nil
 }
 
+func readConsoleWaitStatus(path string) (uint32, bool, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("reading console wait status: %w", err)
+	}
+	value := strings.TrimSpace(string(data))
+	status, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, false, fmt.Errorf("parsing console wait status %q: %w", value, err)
+	}
+	return uint32(status), true, nil
+}
+
 func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []byte) (status uint32, retErr error) {
 	paths, err := b.ensureConsoleDrain(target, false)
 	if err != nil {
@@ -2046,20 +2072,38 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 		return 0, err
 	}
 	defer follower.file.Close()
-	waitCh := make(chan attachWaitResult, 1)
-	go func() {
-		status, err := b.wait(target)
-		waitCh <- attachWaitResult{status: status, err: err}
-	}()
+	var waitResult *attachWaitResult
+	if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil {
+		return 0, err
+	} else if found {
+		waitResult = &attachWaitResult{status: status}
+	}
+	var waitCh chan attachWaitResult
+	if waitResult == nil {
+		ch := make(chan attachWaitResult, 1)
+		waitCh = ch
+		go func() {
+			status, err := b.wait(target)
+			ch <- attachWaitResult{status: status, err: err}
+		}()
+	}
 	inputErrCh := make(chan error, 1)
 	if interactive {
 		go func() { inputErrCh <- b.pumpConsoleInput(target, detachKeys) }()
 	}
-	var waitResult *attachWaitResult
+	var waitErr error
 	for {
 		progress, err := follower.drain(b.stdout, b.stderr)
 		if err != nil {
 			return 0, err
+		}
+		if waitResult == nil {
+			if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil {
+				return 0, err
+			} else if found {
+				waitResult = &attachWaitResult{status: status}
+				waitCh = nil
+			}
 		}
 		if waitResult != nil && follower.stdoutEOF && follower.stderrEOF {
 			return waitResult.status, nil
@@ -2067,9 +2111,10 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 		select {
 		case result := <-waitCh:
 			if result.err != nil {
-				return 0, result.err
+				waitErr = result.err
+			} else {
+				waitResult = &result
 			}
-			waitResult = &result
 			waitCh = nil
 		case err := <-inputErrCh:
 			if errors.Is(err, errDetached) {
@@ -2086,8 +2131,16 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 			if err != nil {
 				return 0, err
 			}
-			if !active && (!follower.stdoutEOF || !follower.stderrEOF) {
-				return 0, consoleDrainStoppedError(paths.Error)
+			if !active {
+				if !follower.stdoutEOF || !follower.stderrEOF {
+					return 0, consoleDrainStoppedError(paths.Error)
+				}
+				if waitResult == nil {
+					if waitErr != nil {
+						return 0, waitErr
+					}
+					return 0, consoleDrainStoppedError(paths.Error)
+				}
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -2298,11 +2351,21 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 		}
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("locking console drain: %w", err)
 	}
+	if !reset {
+		if _, err := os.Stat(paths.WaitStatus); err == nil {
+			return paths, nil
+		} else if !os.IsNotExist(err) {
+			return ttosbundle.ConsolePaths{}, fmt.Errorf("checking console wait status: %w", err)
+		}
+	}
 	maxBytes, maxFiles, err := b.consoleRetention(target.container)
 	if err != nil {
 		return ttosbundle.ConsolePaths{}, err
 	}
 	if reset {
+		if err := os.Remove(paths.WaitStatus); err != nil && !os.IsNotExist(err) {
+			return ttosbundle.ConsolePaths{}, fmt.Errorf("removing stale console wait status: %w", err)
+		}
 		for generation := 1; ; generation++ {
 			err := os.Remove(ttosconsole.GenerationPath(paths.Log, generation))
 			if os.IsNotExist(err) {
@@ -2334,21 +2397,45 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 	}
 	defer errorFile.Close()
 
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("creating console readiness pipe: %w", err)
+	}
+	defer readyReader.Close()
 	command := exec.Command(b.runsc,
 		"--root", b.root,
 		"timetravel", "--console", "init",
 		"--console-log", paths.Log,
 		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
 		"--console-log-max-files", strconv.Itoa(maxFiles),
+		"--console-wait-status", paths.WaitStatus,
+		"--console-ready-fd", "4",
 		target.container, "console-follow", target.branch,
 	)
 	command.Stderr = errorFile
 	// The inherited duplicate keeps the advisory lock held for exactly the
 	// lifetime of the drainer, preventing multiple consumers of one pipe.
-	command.ExtraFiles = []*os.File{lockFile}
+	command.ExtraFiles = []*os.File{lockFile, readyWriter}
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
+		readyWriter.Close()
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w", target, err)
+	}
+	if err := readyWriter.Close(); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("closing console readiness writer for %s: %w", target, err)
+	}
+	if err := readyReader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("setting console readiness deadline for %s: %w", target, err)
+	}
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("waiting for console drain readiness for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
 	}
 	if err := command.Process.Release(); err != nil {
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("releasing console drain process for %s: %w", target, err)
@@ -2524,16 +2611,24 @@ func (b *runtimeBackend) remove(name string, force bool) error {
 	return store.RemoveContainer(name)
 }
 
-func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool) (int, error) {
+func (b *runtimeBackend) configuredRunscArgs() []string {
 	args := []string{
 		"--root", b.root,
-		"--rootless=true",
+	}
+	if b.unsafeNoHostIsolation {
+		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
+	} else {
+		args = append(args, "--rootless=true")
+	}
+	args = append(args,
 		"--network=none",
 		"--directfs=false",
-		"--overlay2=all:memory",
-		"run", "--detach", "--bundle", bundleDir,
-	}
-	args = append(args, name)
+		"--overlay2=all:memory")
+	return args
+}
+
+func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
+	args = append(b.configuredRunscArgs(), args...)
 	command := exec.Command(b.runsc, args...)
 	command.Stdout = b.stdout
 	command.Stderr = b.stderr
@@ -2544,21 +2639,44 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 		}
 		return 1, fmt.Errorf("starting runsc: %w", err)
 	}
+	return 0, nil
+}
+
+func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool) (int, error) {
+	status, err := b.runConfiguredCommand("create", "--bundle", bundleDir, name)
+	if err != nil || status != 0 {
+		return status, err
+	}
 	target := selector{container: name, branch: defaultBranchID}
 	if _, err := b.ensureConsoleDrain(target, true); err != nil {
-		return 1, err
+		_, cleanupErr := b.command("delete", "--force", name)
+		if cleanupErr != nil {
+			return 1, fmt.Errorf("starting console drain before container start: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+		}
+		return 1, fmt.Errorf("starting console drain before container start: %w", err)
+	}
+	status, err = b.runConfiguredCommand("start", name)
+	if err != nil || status != 0 {
+		if err == nil {
+			err = fmt.Errorf("runsc start exited with status %d", status)
+		}
+		_, cleanupErr := b.command("delete", "--force", name)
+		if cleanupErr != nil {
+			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+		}
+		return status, err
 	}
 	if detach {
 		return 0, nil
 	}
-	status, err := b.attach(target, interactive, defaultDetachKeys)
+	waitStatus, err := b.attach(target, interactive, defaultDetachKeys)
 	if err != nil {
 		if errors.Is(err, errDetached) {
 			return 0, nil
 		}
 		return 1, err
 	}
-	return waitStatusExitCode(status), nil
+	return waitStatusExitCode(waitStatus), nil
 }
 
 func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
@@ -2766,8 +2884,37 @@ func (b *runtimeBackend) resume(target selector) error {
 }
 
 func (b *runtimeBackend) destroy(target selector) error {
-	_, err := b.command("timetravel", target.container, "destroy", target.branch)
-	return err
+	if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
+		return nil
+	} else {
+		destroyErr := err
+		families, listErr := b.listRuntimeFamilies()
+		if listErr != nil {
+			return destroyErr
+		}
+		for _, family := range families {
+			if family.ID != target.container {
+				continue
+			}
+			// Stopping main tears down the Sentry and all in-memory child
+			// branches. Removing one of those branches afterwards is already
+			// satisfied even though the control socket no longer exists.
+			if family.State == "stopped" || family.State == "exited" {
+				return nil
+			}
+			return destroyErr
+		}
+		// A known persistent family absent from runsc state has no in-memory
+		// branch left to destroy. Do not turn a misspelled container name into
+		// an apparent success.
+		if b.dataRoot == "" {
+			return destroyErr
+		}
+		if _, err := (ttosbundle.Store{Root: b.dataRoot}).LoadContainer(target.container); err != nil {
+			return destroyErr
+		}
+		return nil
+	}
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
@@ -2805,17 +2952,48 @@ func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
 }
 
 func (b *runtimeBackend) wait(target selector) (uint32, error) {
-	output, err := b.command("timetravel", target.container, "wait", target.branch)
+	output, commandErr := b.command("timetravel", target.container, "wait", target.branch)
+	if commandErr == nil {
+		var result struct {
+			Status uint32 `json:"wait_status"`
+		}
+		if err := json.Unmarshal(output, &result); err != nil {
+			return 0, fmt.Errorf("decoding runsc wait result: %w", err)
+		}
+		return result.Status, nil
+	}
+
+	status, found, err := b.waitForConsoleStatus(target)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("%w; checking persistent wait status: %v", commandErr, err)
 	}
-	var result struct {
-		Status uint32 `json:"wait_status"`
+	if found {
+		return status, nil
 	}
-	if err := json.Unmarshal(output, &result); err != nil {
-		return 0, fmt.Errorf("decoding runsc wait result: %w", err)
+	return 0, commandErr
+}
+
+func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	paths, err := store.BranchConsolePaths(target.container, target.branch)
+	if err != nil {
+		return 0, false, err
 	}
-	return result.Status, nil
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, found, err := readConsoleWaitStatus(paths.WaitStatus)
+		if err != nil || found {
+			return status, found, err
+		}
+		active, err := consoleDrainActive(paths.Lock)
+		if err != nil {
+			return 0, false, err
+		}
+		if !active || time.Now().After(deadline) {
+			return 0, false, nil
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func writeTree(w io.Writer, families []Family) {

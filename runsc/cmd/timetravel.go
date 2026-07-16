@@ -17,15 +17,20 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -38,18 +43,20 @@ import (
 // TimeTravel controls experimental in-memory sandbox branches.
 type TimeTravel struct {
 	containerLoader
-	source          string
-	paused          bool
-	pid             int
-	signal          int
-	all             bool
-	consoleID       string
-	consoleStream   string
-	consoleMaxBytes int
-	consoleData     string
-	consoleLog      string
-	consoleLogMax   int64
-	consoleLogFiles int
+	source            string
+	paused            bool
+	pid               int
+	signal            int
+	all               bool
+	consoleID         string
+	consoleStream     string
+	consoleMaxBytes   int
+	consoleData       string
+	consoleLog        string
+	consoleReadyFD    int
+	consoleWaitStatus string
+	consoleLogMax     int64
+	consoleLogFiles   int
 }
 
 // Name implements subcommands.Command.Name.
@@ -82,6 +89,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
 	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
 	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
+	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled after console-follow connects")
+	f.StringVar(&t.consoleWaitStatus, "console-wait-status", "", "host path where console-follow atomically records init wait status")
 	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
 }
@@ -188,6 +197,9 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			ConsoleID: t.consoleID,
 		})
 	case "console-follow":
+		type branchWaitResult struct {
+			err error
+		}
 		var writer io.Writer = &util.Writer{}
 		var logWriter *ttosconsole.RotatingWriter
 		if t.consoleLog != "" {
@@ -197,7 +209,84 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			writer = logWriter
 		}
-		err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer)
+		var ready func() error
+		var readyFile *os.File
+		if t.consoleReadyFD >= 0 {
+			readyFile = os.NewFile(uintptr(t.consoleReadyFD), "console-ready")
+			if readyFile == nil {
+				err = fmt.Errorf("invalid console readiness FD %d", t.consoleReadyFD)
+				break
+			}
+			defer readyFile.Close()
+			ready = func() error {
+				_, err := readyFile.Write([]byte{1})
+				return err
+			}
+		}
+		if t.consoleWaitStatus != "" {
+			finalReader, finalWriter, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				err = fmt.Errorf("creating final console-output pipe: %w", pipeErr)
+				break
+			}
+			statusReader, statusWriter, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				_ = finalReader.Close()
+				_ = finalWriter.Close()
+				err = fmt.Errorf("creating console wait-status pipe: %w", pipeErr)
+				break
+			}
+			releaseReader, releaseWriter, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				_ = finalReader.Close()
+				_ = finalWriter.Close()
+				_ = statusReader.Close()
+				_ = statusWriter.Close()
+				err = fmt.Errorf("creating console drain-release pipe: %w", pipeErr)
+				break
+			}
+			files := []*os.File{finalWriter, statusWriter, releaseReader}
+			if readyFile != nil {
+				files = append(files, readyFile)
+			}
+			waitCh := make(chan branchWaitResult, 1)
+			go func() {
+				_, waitErr := cont.Sandbox.FollowConsole(&boot.ConsoleFollowArgs{
+					FilePayload: urpc.FilePayload{Files: files},
+					BranchID:    f.Arg(2),
+					CID:         cont.ID,
+					ConsoleID:   t.consoleID,
+				})
+				_ = finalWriter.Close()
+				_ = statusWriter.Close()
+				_ = releaseReader.Close()
+				waitCh <- branchWaitResult{err: waitErr}
+			}()
+			drain := drainConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, nil)
+			if _, releaseErr := releaseWriter.Write([]byte{1}); err == nil && releaseErr != nil {
+				err = fmt.Errorf("handing console reads to coordinator: %w", releaseErr)
+			}
+			_ = releaseWriter.Close()
+			err = ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
+			_ = finalReader.Close()
+			var encodedStatus [4]byte
+			_, statusErr := io.ReadFull(statusReader, encodedStatus[:])
+			_ = statusReader.Close()
+			result := <-waitCh
+			if err == nil {
+				if statusErr != nil {
+					if result.err != nil {
+						err = result.err
+					} else {
+						err = fmt.Errorf("reading console wait status: %w", statusErr)
+					}
+				} else {
+					err = writeConsoleWaitStatus(t.consoleWaitStatus, binary.BigEndian.Uint32(encodedStatus[:]))
+				}
+			}
+		} else {
+			err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, ready)
+		}
 		if logWriter != nil {
 			if closeErr := logWriter.Close(); err == nil {
 				err = closeErr
@@ -220,9 +309,49 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	return subcommands.ExitSuccess
 }
 
+func writeConsoleWaitStatus(path string, status uint32) error {
+	dir := filepath.Dir(path)
+	tempFile, err := os.CreateTemp(dir, ".wait-status-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary console wait status in %q: %w", dir, err)
+	}
+	tempPath := tempFile.Name()
+	renamed := false
+	defer func() {
+		_ = tempFile.Close()
+		if !renamed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := tempFile.Chmod(0600); err != nil {
+		return fmt.Errorf("setting console wait status permissions: %w", err)
+	}
+	if _, err := tempFile.WriteString(strconv.FormatUint(uint64(status), 10) + "\n"); err != nil {
+		return fmt.Errorf("writing console wait status: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("closing console wait status: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("installing console wait status at %q: %w", path, err)
+	}
+	renamed = true
+	return nil
+}
+
+type consoleDrainResult struct {
+	stdoutEOF bool
+	stderrEOF bool
+	err       error
+}
+
 // followConsole drains both output streams into Docker-compatible multiplexed
 // frames. It remains connected until both guest writers close.
-func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer) error {
+func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) error {
+	return drainConsole(s, branchID, consoleID, writer, ready).err
+}
+
+func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) consoleDrainResult {
 	type streamState struct {
 		kernelStream kernel.InternalConsoleStream
 		frameStream  byte
@@ -231,6 +360,13 @@ func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Wri
 	streams := []streamState{
 		{kernelStream: kernel.InternalConsoleStdout, frameStream: ttosconsole.StreamStdout},
 		{kernelStream: kernel.InternalConsoleStderr, frameStream: ttosconsole.StreamStderr},
+	}
+	finish := func(err error) consoleDrainResult {
+		return consoleDrainResult{
+			stdoutEOF: streams[0].eof,
+			stderrEOF: streams[1].eof,
+			err:       err,
+		}
 	}
 	for {
 		progress := false
@@ -241,31 +377,37 @@ func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Wri
 				continue
 			}
 			allEOF = false
-			result, err := s.ReadConsole(&boot.ConsoleReadArgs{
+			readResult, err := s.ReadConsole(&boot.ConsoleReadArgs{
 				BranchID:  branchID,
 				ConsoleID: consoleID,
 				Stream:    stream.kernelStream,
 				MaxBytes:  65536,
 			})
 			if err != nil {
-				return err
+				return finish(err)
 			}
-			if len(result.Data) != 0 {
-				if err := ttosconsole.WriteFrame(writer, stream.frameStream, result.Data); err != nil {
-					return fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err)
+			if len(readResult.Data) != 0 {
+				if err := ttosconsole.WriteFrame(writer, stream.frameStream, readResult.Data); err != nil {
+					return finish(fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err))
 				}
 				progress = true
 			}
-			if result.EOF {
+			if readResult.EOF {
 				if err := ttosconsole.WriteFrame(writer, stream.frameStream, nil); err != nil {
-					return fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err)
+					return finish(fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err))
 				}
 				stream.eof = true
 				progress = true
 			}
 		}
+		if ready != nil {
+			if err := ready(); err != nil {
+				return finish(fmt.Errorf("signaling console readiness: %w", err))
+			}
+			ready = nil
+		}
 		if allEOF {
-			return nil
+			return finish(nil)
 		}
 		if !progress {
 			time.Sleep(2 * time.Millisecond)

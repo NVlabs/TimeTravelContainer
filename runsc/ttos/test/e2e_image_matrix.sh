@@ -22,6 +22,7 @@ RUNSC=${RUNSC:-}
 CONTAINERD_ADDRESS=${CONTAINERD_ADDRESS:-}
 TTOS_NAMESPACE=${TTOS_NAMESPACE:-ttos-e2e}
 TTOS_E2E_ROOT=${TTOS_E2E_ROOT:-}
+TTOS_UNSAFE_NO_HOST_ISOLATION=${TTOS_UNSAFE_NO_HOST_ISOLATION:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 ALPINE_IMAGE=${ALPINE_IMAGE:-alpine:3.20}
 PYTHON_IMAGE=${PYTHON_IMAGE:-python:3.12-alpine}
@@ -38,9 +39,11 @@ fail() {
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
 [ -n "$CONTAINERD_ADDRESS" ] || fail "set CONTAINERD_ADDRESS to an accessible containerd socket"
 [ -S "$CONTAINERD_ADDRESS" ] || fail "containerd socket does not exist: $CONTAINERD_ADDRESS"
-command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
-if ! unshare -Ur /bin/true >/dev/null 2>&1; then
-  fail "rootless UID/GID mapping is unavailable; configure unprivileged user namespaces and subordinate-ID policy (some AppArmor configurations also restrict this)"
+if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
+  command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
+  if ! unshare -Ur /bin/true >/dev/null 2>&1; then
+    fail "rootless UID/GID mapping is unavailable; enable unprivileged user namespaces or set TTOS_UNSAFE_NO_HOST_ISOLATION=1 for trusted workloads"
+  fi
 fi
 
 owned_root=false
@@ -52,11 +55,26 @@ else
 fi
 DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
+HOST_FIXTURE="$TTOS_E2E_ROOT/host-fixture"
+mkdir -p "$HOST_FIXTURE"
+echo host-readonly >"$HOST_FIXTURE/value"
 PREFIX="e2e-$$"
 LIFECYCLE="$PREFIX-lifecycle"
+CONSOLE_STRESS="$PREFIX-console-stress"
 VOLUME="$PREFIX-state"
 
 ttos() {
+  if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
+    "$TTOS" \
+      --unsafe-no-host-isolation \
+      --containerd "$CONTAINERD_ADDRESS" \
+      --namespace "$TTOS_NAMESPACE" \
+      --data-root "$DATA_ROOT" \
+      --root "$RUNSC_ROOT" \
+      --runsc "$RUNSC" \
+      "$@"
+    return
+  fi
   "$TTOS" \
     --containerd "$CONTAINERD_ADDRESS" \
     --namespace "$TTOS_NAMESPACE" \
@@ -67,7 +85,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$LIFECYCLE"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$LIFECYCLE"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -98,11 +116,41 @@ ttos rm "$PREFIX-python"
 ttos run --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 ttos rm "$PREFIX-nginx"
 
+echo "== quick-exit console integrity =="
+STRESS_BYTES=262144
+STRESS_RUN_STDOUT="$TTOS_E2E_ROOT/console-stress-run.stdout"
+STRESS_RUN_STDERR="$TTOS_E2E_ROOT/console-stress-run.stderr"
+STRESS_LOG_STDOUT="$TTOS_E2E_ROOT/console-stress-log.stdout"
+STRESS_LOG_STDERR="$TTOS_E2E_ROOT/console-stress-log.stderr"
+ttos run --name "$CONSOLE_STRESS" "$PYTHON_IMAGE" python3 -c \
+  'import sys; n=262144; sys.stdout.buffer.write(b"A"*n+b"\n"); sys.stdout.buffer.flush(); sys.stderr.buffer.write(b"B"*n+b"\n"); sys.stderr.buffer.flush()' \
+  >"$STRESS_RUN_STDOUT" 2>"$STRESS_RUN_STDERR"
+ttos logs "$CONSOLE_STRESS" >"$STRESS_LOG_STDOUT" 2>"$STRESS_LOG_STDERR"
+
+EXPECTED_A=$( \
+  { head -c "$STRESS_BYTES" /dev/zero | tr '\0' A; printf '\n'; } | \
+    sha256sum | awk '{print $1}' \
+)
+EXPECTED_B=$( \
+  { head -c "$STRESS_BYTES" /dev/zero | tr '\0' B; printf '\n'; } | \
+    sha256sum | awk '{print $1}' \
+)
+[ "$(wc -c <"$STRESS_RUN_STDOUT")" -eq $((STRESS_BYTES + 1)) ] || fail "foreground stdout was truncated"
+[ "$(sed '/^ttos: warning:/d' "$STRESS_RUN_STDERR" | wc -c)" -eq $((STRESS_BYTES + 1)) ] || fail "foreground stderr was truncated"
+[ "$(wc -c <"$STRESS_LOG_STDOUT")" -eq $((STRESS_BYTES + 1)) ] || fail "persisted stdout was truncated"
+[ "$(sed '/^ttos: warning:/d' "$STRESS_LOG_STDERR" | wc -c)" -eq $((STRESS_BYTES + 1)) ] || fail "persisted stderr was truncated"
+[ "$(sha256sum "$STRESS_RUN_STDOUT" | awk '{print $1}')" = "$EXPECTED_A" ] || fail "foreground stdout content changed"
+[ "$(sed '/^ttos: warning:/d' "$STRESS_RUN_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "foreground stderr content changed"
+[ "$(sha256sum "$STRESS_LOG_STDOUT" | awk '{print $1}')" = "$EXPECTED_A" ] || fail "persisted stdout content changed"
+[ "$(sed '/^ttos: warning:/d' "$STRESS_LOG_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "persisted stderr content changed"
+ttos rm "$CONSOLE_STRESS"
+
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
 ttos run --name "$LIFECYCLE" --detach \
   --log-opt max-size=64k --log-opt max-file=3 \
   --volume "$VOLUME:/state" \
+  --volume "$HOST_FIXTURE:/host-fixture:ro" \
   "$ALPINE_IMAGE" sh -c \
   'echo parent >/state/value; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done'
 
@@ -113,6 +161,10 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
 done
 
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
+[ "$(ttos exec "$LIFECYCLE" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"
+if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
+  fail "read-only host bind accepted a write"
+fi
 ttos fork --check "$LIFECYCLE"
 ttos fork "$LIFECYCLE" child
 

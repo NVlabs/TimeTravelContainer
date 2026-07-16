@@ -367,6 +367,14 @@ type Config struct {
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
+	// UnsafeNoHostIsolation runs the Sentry and gofer as the invoking user
+	// without placing either process in host namespaces or chroots. The Sentry
+	// still implements the guest's namespaces and credentials, but this option
+	// removes host-side defense in depth. It exists for TimeTravelOS deployments
+	// where unprivileged user namespaces are unavailable and workloads are
+	// trusted.
+	UnsafeNoHostIsolation bool `flag:"unsafe-no-host-isolation"`
+
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current
 	// user, and without chrooting the sandbox process. This can be
@@ -456,6 +464,12 @@ type Config struct {
 	// once their current RPC finishes. Setting this to 0 closes idle clients
 	// immediately.
 	ControlRPCStopTimeout time.Duration `flag:"control-rpc-stop-timeout"`
+}
+
+// AllowRunAsCurrentUserWithoutChroot reports whether host-side chroot setup
+// must be bypassed for an explicitly unsafe launch mode.
+func (c *Config) AllowRunAsCurrentUserWithoutChroot() bool {
+	return c.UnsafeNoHostIsolation || c.TestOnlyAllowRunAsCurrentUserWithoutChroot
 }
 
 // Validate checks that the Config is in a consistent state, e.g. that no

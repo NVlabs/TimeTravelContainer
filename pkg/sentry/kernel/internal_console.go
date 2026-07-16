@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const maxInternalConsoleIO = 1 << 20
@@ -170,7 +171,15 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 	if err != nil {
 		return nil, false, false, err
 	}
-	return buf[:n], n == 0, false, nil
+	eof = n == 0
+	if n > 0 {
+		// A pipe read may return its final buffered bytes without returning EOF.
+		// Report data and EOF together when the last writer is gone and the read
+		// drained the buffer, avoiding a follow-up control RPC during shutdown.
+		ready := file.Readiness(waiter.ReadableEvents | waiter.EventHUp)
+		eof = ready&waiter.EventHUp != 0 && ready&waiter.ReadableEvents == 0
+	}
+	return buf[:n], eof, false, nil
 }
 
 // WriteInternalConsole writes data to the process's standard input without

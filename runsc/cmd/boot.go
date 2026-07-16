@@ -683,6 +683,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	log.Infof("application exiting with %+v", ws)
 	waitStatus := args[1].(*unix.WaitStatus)
 	*waitStatus = unix.WaitStatus(ws)
+	l.QuiesceBranchControls()
 
 	if finalMetricsFile != nil {
 		if err := exportFinalMetrics(finalMetricsFile); err != nil {

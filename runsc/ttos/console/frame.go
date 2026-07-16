@@ -95,6 +95,78 @@ func DecodeFrame(data []byte) (frame Frame, consumed int, complete bool, err err
 	return Frame{Stream: data[0], Data: payload, EOF: size == 0}, HeaderSize + size, true, nil
 }
 
+// CopyFinalFrames copies complete encoded frames from reader to writer until
+// both output streams reach EOF. stdoutEOF and stderrEOF identify markers that
+// the client-side drain already wrote. If reader ends cleanly first, this
+// synthesizes missing EOF markers; partial frames remain errors.
+func CopyFinalFrames(writer io.Writer, reader io.Reader, stdoutEOF, stderrEOF bool) error {
+	for !stdoutEOF || !stderrEOF {
+		header := make([]byte, HeaderSize)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			if err == io.EOF {
+				// The coordinator can disappear with the Sentry after it has
+				// published the wait status, while the client-side reader has
+				// already consumed all payload data. Finish the persistent log
+				// with EOF markers for whichever streams the coordinator did not
+				// explicitly close. A partial header remains an error below.
+				if !stdoutEOF {
+					if err := WriteFrame(writer, StreamStdout, nil); err != nil {
+						return fmt.Errorf("writing synthesized stdout EOF: %w", err)
+					}
+				}
+				if !stderrEOF {
+					if err := WriteFrame(writer, StreamStderr, nil); err != nil {
+						return fmt.Errorf("writing synthesized stderr EOF: %w", err)
+					}
+				}
+				return nil
+			}
+			return fmt.Errorf("reading final console frame header: %w", err)
+		}
+		size := int(binary.BigEndian.Uint32(header[4:HeaderSize]))
+		if size > MaxPayload {
+			return fmt.Errorf("final console frame payload %d exceeds %d", size, MaxPayload)
+		}
+		encoded := make([]byte, HeaderSize+size)
+		copy(encoded, header)
+		if _, err := io.ReadFull(reader, encoded[HeaderSize:]); err != nil {
+			return fmt.Errorf("reading final console frame payload: %w", err)
+		}
+		frame, consumed, complete, err := DecodeFrame(encoded)
+		if err != nil {
+			return fmt.Errorf("decoding final console frame: %w", err)
+		}
+		if !complete || consumed != len(encoded) {
+			return fmt.Errorf("incomplete final console frame of %d bytes", len(encoded))
+		}
+		alreadyEOF := false
+		switch frame.Stream {
+		case StreamStdout:
+			alreadyEOF = stdoutEOF
+		case StreamStderr:
+			alreadyEOF = stderrEOF
+		}
+		if alreadyEOF {
+			if !frame.EOF {
+				return fmt.Errorf("final console stream %d contains data after EOF", frame.Stream)
+			}
+			continue
+		}
+		if err := writeFull(writer, encoded); err != nil {
+			return fmt.Errorf("writing final console frame: %w", err)
+		}
+		if frame.EOF {
+			switch frame.Stream {
+			case StreamStdout:
+				stdoutEOF = true
+			case StreamStderr:
+				stderrEOF = true
+			}
+		}
+	}
+	return nil
+}
+
 func validateStream(stream byte) error {
 	if stream != StreamStdout && stream != StreamStderr {
 		return fmt.Errorf("invalid console stream %d", stream)

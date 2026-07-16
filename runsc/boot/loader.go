@@ -786,6 +786,15 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating init process for root container: %w", err)
 	}
 	l.root.procArgs = procArgs
+	if args.Spec.Annotations[InternalConsoleAnnotation] != "" {
+		fdTable, err := l.newInternalConsoleFDTable(&l.root)
+		if err != nil {
+			return nil, fmt.Errorf("preparing root internal console: %w", err)
+		}
+		// createContainerProcess consumes this reference when StartRoot creates
+		// the init task. Until then, control RPCs can attach to the console.
+		l.root.procArgs.FDTable = fdTable
+	}
 
 	if err := initCompatLogs(args.UserLogFD); err != nil {
 		return nil, fmt.Errorf("initializing compat logs: %w", err)
@@ -1403,6 +1412,21 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable, error) {
+	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
+	if consoleID == "" {
+		return nil, fmt.Errorf("internal console annotation is empty")
+	}
+	if info.spec.Process.Terminal {
+		return nil, fmt.Errorf("internal PTY consoles are not implemented")
+	}
+	if len(info.passFDs) != 0 {
+		return nil, fmt.Errorf("internal console does not yet support donated file descriptors")
+	}
+	ctx := info.procArgs.NewContext(l.k)
+	return l.k.NewInternalConsoleFDTable(ctx, consoleID)
+}
+
 // +checklocks:l.mu
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
@@ -1412,13 +1436,10 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	var ttyFile *host.TTYFileDescription
 	var err error
 	if consoleID != "" {
-		if info.spec.Process.Terminal {
-			return nil, nil, fmt.Errorf("internal PTY consoles are not implemented")
+		fdTable = info.procArgs.FDTable
+		if fdTable == nil {
+			fdTable, err = l.newInternalConsoleFDTable(info)
 		}
-		if len(info.passFDs) != 0 {
-			return nil, nil, fmt.Errorf("internal console does not yet support donated file descriptors")
-		}
-		fdTable, err = l.k.NewInternalConsoleFDTable(ctx, consoleID)
 	} else {
 		fdTable, ttyFile, err = createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User, info.containerName)
 	}
@@ -1818,6 +1839,12 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	l.k.WaitExited()
 
 	return l.k.GlobalInit().ExitStatus()
+}
+
+// QuiesceBranchControls waits for registered branch operations to finish and
+// prevents new ones from acquiring Kernel lifetime during Sentry shutdown.
+func (l *Loader) QuiesceBranchControls() {
+	l.family.QuiesceControls()
 }
 
 func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace, uid uniqueid.Provider) (*inet.Namespace, error) {
