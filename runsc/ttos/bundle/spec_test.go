@@ -181,7 +181,8 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 		t.Fatalf("BranchConsolePaths: %v", err)
 	}
 	wantBase := filepath.Join(containerDir, "console", "test-a")
-	if paths.Log != wantBase+".log" || paths.Lock != wantBase+".lock" || paths.Error != wantBase+".error.log" {
+	if paths.Log != wantBase+".log" || paths.Lock != wantBase+".lock" ||
+		paths.StdinLock != wantBase+".stdin.lock" || paths.Error != wantBase+".error.log" {
 		t.Errorf("console paths=%+v, want base %q", paths, wantBase)
 	}
 	if info, err := os.Stat(filepath.Dir(paths.Log)); err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {

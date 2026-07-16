@@ -20,7 +20,7 @@ current generation plus one retained generation); `ttos attach` and `ttos logs
 [-f]` replay or follow rotations independently. This supports optional stdin
 forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground `run`/`start`,
 detached output draining, and multiple output readers without placing host FDs
-in the guest resource graph. `ttosd`, configurable retention, exclusive stdin
+in the guest resource graph. `ttosd`, configurable retention, daemon-owned stdin
 ownership, TTY detach, detached and TTY exec, persistent managed-volume backing,
 and managed OverlayFS volumes remain TODO.
 
@@ -191,7 +191,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial noninteractive streaming suitable for pipelines.
 - [x] Allow multiple independent stdout/stderr readers without consuming each
       other's output; one locked sidecar is the sole Sentry-pipe reader.
-- [ ] Define and enforce single-stdin-owner semantics.
+- [x] Initial single-stdin-owner enforcement with one advisory host lock per
+      branch; detach, exit, or client death releases it without adding a host FD
+      to forked guest state.
+- [ ] Move stdin leases into `ttosd` and define explicit takeover behavior.
 - [x] Drain output while no client is attached so guest writers do not stop at
       the Sentry pipe capacity; retain output in a persistent host log.
 - [x] Initial bounded retention: rotate only between complete multiplexed
@@ -243,7 +246,7 @@ state still forks entirely in memory.
 
 - [x] Define a saved branch-local non-TTY console object with a stable session
       ID and stdin/stdout/stderr queues.
-- [ ] Add terminal metadata, stdin ownership, and detached exec-session IDs.
+- [ ] Add terminal metadata and detached exec-session IDs.
 - [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
 - [ ] For interactive processes, allocate a Sentry devpts PTY and install its
@@ -252,7 +255,7 @@ state still forks entirely in memory.
       in a host `FileDescription`.
 - [x] Add branch-serialized nonblocking console read/write RPCs.
 - [x] Add branch-serialized stdin close and verify that the guest observes EOF.
-- [ ] Add readiness waiting, resize, stdin ownership, and cancellation.
+- [ ] Add readiness waiting, resize, and cancellation.
 - [x] Add a long-lived low-level multiplexed `console-follow` stream so one
       process drains both outputs without spawning one `runsc` per read.
 - [x] Start one advisory-locked sidecar per branch, persist its stream, diagnose
@@ -453,7 +456,7 @@ grandchild branches without PID or wait-status crossover.
 - [x] Persistent single-consumer branch sidecars, multi-reader log replay/follow,
       and detached output draining without fork-inhibiting host FDs.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
-- [ ] Configurable log retention, stdin ownership, and daemon-owned
+- [ ] Configurable log retention, daemon-owned stdin leases, and daemon-owned
       transport/reconciliation.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
@@ -486,7 +489,8 @@ bundle.
       current generation plus one retained generation.
 - [ ] Expose log size and generation-count policy in the user-facing CLI.
 - [x] Support multiple simultaneous output readers.
-- [ ] Define exclusive stdin ownership and takeover behavior.
+- [x] Use one exclusive manager-level stdin owner per branch.
+- [ ] Define daemon-reconciled stdin lease takeover behavior.
 - [ ] Host-mutation semantics and warnings for shared read-only binds.
 - [ ] Managed-volume sharing across unrelated families.
 - [ ] Whether stopped branch filesystem state may be retained without retaining

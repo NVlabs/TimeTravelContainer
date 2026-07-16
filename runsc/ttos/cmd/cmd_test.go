@@ -647,6 +647,37 @@ func TestStopEscalatesToKill(t *testing.T) {
 	}
 }
 
+func TestAcquireConsoleStdinIsExclusiveAndReleasable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.stdin.lock")
+	target := selector{container: "demo", branch: "main"}
+	first, err := acquireConsoleStdin(path, target)
+	if err != nil {
+		t.Fatalf("first acquireConsoleStdin: %v", err)
+	}
+	if _, err := acquireConsoleStdin(path, target); err == nil {
+		first.Close()
+		t.Fatal("second acquireConsoleStdin succeeded")
+	} else if !strings.Contains(err.Error(), "stdin for demo@main is already attached") {
+		first.Close()
+		t.Fatalf("second acquireConsoleStdin error=%q", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("closing first owner: %v", err)
+	}
+	second, err := acquireConsoleStdin(path, target)
+	if err != nil {
+		t.Fatalf("reacquireConsoleStdin: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("closing second owner: %v", err)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("stating stdin lock: %v", err)
+	} else if info.Mode().Perm() != 0600 {
+		t.Errorf("stdin lock mode=%o, want 600", info.Mode().Perm())
+	}
+}
+
 func TestParseSignal(t *testing.T) {
 	for _, test := range []struct {
 		value string

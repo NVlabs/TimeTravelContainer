@@ -1699,8 +1699,36 @@ func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
 	return nil
 }
 
+func acquireConsoleStdin(lockPath string, target selector) (*os.File, error) {
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("opening stdin ownership lock: %w", err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lockFile.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("stdin for %s is already attached", target)
+		}
+		return nil, fmt.Errorf("locking stdin for %s: %w", target, err)
+	}
+	return lockFile, nil
+}
+
 func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []byte) (status uint32, retErr error) {
+	paths, err := b.ensureConsoleDrain(target, false)
+	if err != nil {
+		return 0, err
+	}
 	if interactive {
+		inputLock, err := acquireConsoleStdin(paths.StdinLock, target)
+		if err != nil {
+			return 0, err
+		}
+		defer func() {
+			if err := inputLock.Close(); retErr == nil && err != nil {
+				retErr = fmt.Errorf("releasing stdin ownership for %s: %w", target, err)
+			}
+		}()
 		restore, err := makeRawTerminal(b.stdin)
 		if err != nil {
 			return 0, err
@@ -1712,10 +1740,6 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 				}
 			}()
 		}
-	}
-	paths, err := b.ensureConsoleDrain(target, false)
-	if err != nil {
-		return 0, err
 	}
 	follower, err := openConsoleLogFollower(paths.Log)
 	if err != nil {
