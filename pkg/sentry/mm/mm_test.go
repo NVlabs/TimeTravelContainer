@@ -128,6 +128,47 @@ func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 	}
 }
 
+func TestLiveForkPrivateAnonymousMemoryRepeatedRelease(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length:   hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	if _, err := parent.CopyOut(ctx, addr, []byte{1}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("faulting parent page: %v", err)
+	}
+	pseg := parent.pmas.FirstSegment()
+	if !pseg.Ok() {
+		t.Fatal("fault did not create a PMA")
+	}
+	fr := pseg.fileRange()
+	if !parent.mf.HasUniqueRef(fr) {
+		t.Fatal("parent PMA is not uniquely referenced before cloning")
+	}
+
+	for i := 0; i < 100; i++ {
+		child, err := cloneMemoryManagerMetadata(ctx, parent)
+		if err != nil {
+			t.Fatalf("clone %d: %v", i, err)
+		}
+		if parent.mf.HasUniqueRef(fr) {
+			t.Fatalf("clone %d did not acquire a child page reference", i)
+		}
+		child.DecUsers(ctx)
+		if !parent.mf.HasUniqueRef(fr) {
+			t.Fatalf("clone %d leaked a child page reference", i)
+		}
+	}
+}
+
 func BenchmarkLiveForkPrivateAnonymousMemory(b *testing.B) {
 	for _, size := range []uint64{1 << 20, 1 << 30} {
 		b.Run(fmt.Sprintf("resident_%d_MiB", size>>20), func(b *testing.B) {
