@@ -47,9 +47,10 @@ const (
 
 // BranchInfo is the branch metadata exposed over the control socket.
 type BranchInfo struct {
-	ID       string
-	ParentID string
-	State    BranchState
+	ID        string
+	ParentID  string
+	State     BranchState
+	CreatedAt time.Time
 	// ForkMetrics is populated for branches created by Fork.
 	ForkMetrics SandboxForkMetrics
 }
@@ -161,12 +162,13 @@ type sandboxBranch struct {
 	// these operations before releasing the Kernel.
 	controlOps sync.WaitGroup
 
-	id       string
-	parentID string
-	k        *kernel.Kernel
-	watchdog *watchdog.Watchdog
-	state    BranchState
-	metrics  SandboxForkMetrics
+	id        string
+	parentID  string
+	k         *kernel.Kernel
+	watchdog  *watchdog.Watchdog
+	state     BranchState
+	createdAt time.Time
+	metrics   SandboxForkMetrics
 }
 
 // SandboxFamily owns all in-memory branches in one sentry process.
@@ -215,6 +217,7 @@ const (
 
 // NewSandboxFamily creates a family containing k as its default branch.
 func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamily {
+	createdAt := time.Now().UTC()
 	return &SandboxFamily{
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
@@ -223,9 +226,10 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		defaultStarted:                 make(chan struct{}),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
-				id:    DefaultBranchID,
-				k:     k,
-				state: kernelBranchState(k),
+				id:        DefaultBranchID,
+				k:         k,
+				state:     kernelBranchState(k),
+				createdAt: createdAt,
 			},
 		},
 	}
@@ -301,7 +305,13 @@ func (f *SandboxFamily) List() []BranchInfo {
 	defer f.mu.Unlock()
 	out := make([]BranchInfo, 0, len(f.branches))
 	for _, b := range f.branches {
-		out = append(out, BranchInfo{ID: b.id, ParentID: b.parentID, State: b.state, ForkMetrics: b.metrics})
+		out = append(out, BranchInfo{
+			ID:          b.id,
+			ParentID:    b.parentID,
+			State:       b.state,
+			CreatedAt:   b.createdAt,
+			ForkMetrics: b.metrics,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -380,7 +390,12 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		f.mu.Unlock()
 		return nil, fmt.Errorf("branch %q already exists", args.ID)
 	}
-	childBranch := &sandboxBranch{id: args.ID, parentID: sourceID, state: BranchCreating}
+	childBranch := &sandboxBranch{
+		id:        args.ID,
+		parentID:  sourceID,
+		state:     BranchCreating,
+		createdAt: time.Now().UTC(),
+	}
 	f.branches[args.ID] = childBranch
 	f.mu.Unlock()
 
@@ -522,7 +537,13 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	source.state = kernelBranchState(source.k)
 	metrics.Total = time.Since(forkStarted)
 	childBranch.metrics = metrics
-	info := BranchInfo{ID: childBranch.id, ParentID: childBranch.parentID, State: childBranch.state, ForkMetrics: metrics}
+	info := BranchInfo{
+		ID:          childBranch.id,
+		ParentID:    childBranch.parentID,
+		State:       childBranch.state,
+		CreatedAt:   childBranch.createdAt,
+		ForkMetrics: metrics,
+	}
 	f.mu.Unlock()
 	return &info, nil
 }

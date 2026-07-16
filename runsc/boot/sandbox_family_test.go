@@ -99,8 +99,14 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if !eligibility.Eligible || len(eligibility.Issues) != 0 || eligibility.Reason != "" {
 		t.Fatalf("CheckFork returned %+v", eligibility)
 	}
-	if branches := family.List(); len(branches) != 1 || branches[0].State != BranchRunning || parent.IsPaused() {
+	initialBranches := family.List()
+	if len(initialBranches) != 1 || initialBranches[0].State != BranchRunning || parent.IsPaused() {
+		branches := initialBranches
 		t.Fatalf("CheckFork changed running family: branches=%+v paused=%t", branches, parent.IsPaused())
+	}
+	mainCreatedAt := initialBranches[0].CreatedAt
+	if mainCreatedAt.IsZero() {
+		t.Fatal("default branch has a zero creation timestamp")
 	}
 	child, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true})
 	if err != nil {
@@ -108,6 +114,9 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	if child.ID != "child" || child.ParentID != DefaultBranchID || child.State != BranchPaused {
 		t.Fatalf("Fork returned %+v", child)
+	}
+	if child.CreatedAt.IsZero() || child.CreatedAt.Before(mainCreatedAt) {
+		t.Errorf("child creation time=%v, main=%v", child.CreatedAt, mainCreatedAt)
 	}
 	if _, _, err := family.beginRunningControl("child"); err == nil {
 		t.Fatal("beginRunningControl succeeded for paused child")
@@ -121,6 +130,9 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	if branches[1].State != BranchRunning {
 		t.Fatalf("source state after fork: %s", branches[1].State)
+	}
+	if !branches[0].CreatedAt.Equal(child.CreatedAt) || !branches[1].CreatedAt.Equal(mainCreatedAt) {
+		t.Errorf("List creation timestamps=%+v, child=%v main=%v", branches, child.CreatedAt, mainCreatedAt)
 	}
 
 	if err := family.Resume("child"); err != nil {

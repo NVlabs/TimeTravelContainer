@@ -179,6 +179,13 @@ fi
 ttos fork --check "$LIFECYCLE"
 ttos fork "$LIFECYCLE" child
 
+PS_CHILD=$(ttos ps --filter branch=child --filter status=running --filter ancestor="$ALPINE_IMAGE" --format '{{.ID}}')
+[ "$PS_CHILD" = "$LIFECYCLE@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
+[ "$(ttos ps --latest --quiet)" = "$LIFECYCLE@child" ] || fail "ps --latest did not select the forked child"
+ttos ps --filter branch=child --format json |
+  grep -q '"created_at":"' ||
+  fail "ps JSON omitted the child creation timestamp"
+
 ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"

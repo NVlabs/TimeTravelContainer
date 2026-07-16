@@ -108,6 +108,111 @@ func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
 	}
 }
 
+func TestPsDockerFiltersLatestAndFormatting(t *testing.T) {
+	base := time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC)
+	digest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	b := &fakeBackend{families: []Family{
+		{
+			ID: "web", Image: "docker.io/library/alpine:3.20", Digest: digest,
+			CreatedAt: base, Volumes: []string{"cache"},
+			Branches: []Branch{
+				{ID: "main", State: "running", CreatedAt: base},
+				{ID: "child", ParentID: "main", State: "paused", CreatedAt: base.Add(2 * time.Hour)},
+				{ID: "old", ParentID: "main", State: "exited", CreatedAt: base.Add(time.Hour)},
+			},
+		},
+		{
+			ID: "newest", Image: "docker.io/library/busybox:1.36",
+			CreatedAt: base.Add(3 * time.Hour),
+			Branches:  []Branch{{ID: "main", State: "created", CreatedAt: base.Add(3 * time.Hour)}},
+		},
+	}}
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"ps", "--all",
+		"--filter", "status=paused",
+		"--filter", "ancestor=alpine:3.20",
+		"--filter", "volume=cache",
+		"--filter", "name=web@child",
+		"--format", "{{.ID}}|{{.Image}}|{{.State}}|{{.ImageID}}",
+	}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("filtered ps status=%d, stderr=%q", status, stderr.String())
+	}
+	want := "web@child|alpine:3.20|paused|0123456789ab\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("filtered ps=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"ps", "--latest", "--quiet"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps --latest status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "newest@main\n"; got != want {
+		t.Errorf("ps --latest=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"ps", "--last", "2", "--quiet"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps --last status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "newest@main\nweb@child\n"; got != want {
+		t.Errorf("ps --last 2=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"ps", "--all", "--filter", "branch=child", "--format", "table {{.Names}}\t{{.Status}}"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("formatted ps status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "NAMES\tSTATUS\nweb@child\tPaused\n"; got != want {
+		t.Errorf("formatted ps=%q, want %q", got, want)
+	}
+}
+
+func TestPsJSONAndNoTruncImageID(t *testing.T) {
+	created := time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC)
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	b := &fakeBackend{families: []Family{{
+		ID: "demo", Image: "docker.io/example/demo:v1", Digest: digest, CreatedAt: created,
+		Branches: []Branch{{ID: "main", State: "running", CreatedAt: created}},
+	}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"ps", "--format", "json", "--no-trunc"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps json status=%d, stderr=%q", status, stderr.String())
+	}
+	var row map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &row); err != nil {
+		t.Fatalf("decoding ps JSON %q: %v", stdout.String(), err)
+	}
+	if row["id"] != "demo@main" || row["image"] != "example/demo:v1" || row["image_id"] != digest {
+		t.Errorf("ps JSON row=%+v", row)
+	}
+	if row["created_at"] != created.Format(time.RFC3339Nano) {
+		t.Errorf("created_at=%v, want %s", row["created_at"], created.Format(time.RFC3339Nano))
+	}
+}
+
+func TestPsRejectsInvalidFiltersAndSelection(t *testing.T) {
+	tests := [][]string{
+		{"ps", "--filter", "missing-equals"},
+		{"ps", "--filter", "unknown=value"},
+		{"ps", "--filter", "name=["},
+		{"ps", "--last", "-2"},
+		{"ps", "--latest", "--last", "2"},
+	}
+	for _, args := range tests {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("%v status=%d, want 1", args, status)
+		}
+		if b.families == nil && stdout.Len() != 0 {
+			t.Errorf("%v unexpectedly wrote %q", args, stdout.String())
+		}
+	}
+}
+
 func TestTopTableAndJSON(t *testing.T) {
 	b := &fakeBackend{processList: []ProcessInfo{{
 		UID: 1000, PID: 7, PPID: 1, PGID: 7, Threads: []int32{7, 8},
@@ -1310,11 +1415,15 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
+	createdAt := time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC)
 	metadata, err := json.Marshal(ttosbundle.ContainerInfo{
 		Name:      "demo",
+		Reference: "docker.io/library/alpine:3.20",
+		Digest:    "sha256:abcd",
 		BundleDir: bundleDir,
 		State:     "created",
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: createdAt,
+		Volumes:   []ttosbundle.ManagedVolume{{Name: "cache", Destination: "/cache"}},
 	})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
@@ -1332,6 +1441,9 @@ exit 2
 		t.Fatalf("listFamilies returned %+v", families)
 	}
 
+	if families[0].Image != "docker.io/library/alpine:3.20" || families[0].Digest != "sha256:abcd" || !families[0].CreatedAt.Equal(createdAt) || !families[0].Branches[0].CreatedAt.Equal(createdAt) || !reflect.DeepEqual(families[0].Volumes, []string{"cache"}) {
+		t.Errorf("persistent family metadata=%+v", families[0])
+	}
 	store := ttosbundle.Store{Root: dataRoot}
 	if err := store.UpdateState("demo", "running", nil); err != nil {
 		t.Fatalf("marking container running: %v", err)
@@ -1344,6 +1456,9 @@ exit 2
 		t.Fatalf("reconciled listFamilies returned %+v", families)
 	}
 	info, err := store.LoadContainer("demo")
+	if families[0].Image == "" || !families[0].Branches[0].CreatedAt.Equal(createdAt) {
+		t.Errorf("reconciliation lost persistent metadata: %+v", families[0])
+	}
 	if err != nil {
 		t.Fatalf("loading reconciled metadata: %v", err)
 	}

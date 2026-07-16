@@ -161,8 +161,16 @@ the `main` branch and leave `ttos` responsible for branch operations.
       and explicit logging-driver policy.
 - [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
       `ttos top [--json] CONTAINER[@BRANCH]` process listing.
-- [ ] Add Docker-compatible `ps` filters, formatting, size/latest options, and
-      pass-through process-selection options for `top`.
+- [x] Add Docker-style `ps --filter/-f` for name, ID, status, ancestor image,
+      managed volume, and branch, with OR within one filter key and AND across
+      keys. Add Go-template and line-delimited JSON formatting, `--latest/-l`,
+      `--last/-n`, and `--no-trunc` image IDs.
+- [x] Carry authoritative branch creation timestamps from the Sentry and merge
+      persistent image, digest, volume, and container-creation metadata into
+      live family rows. Recent selection includes non-running states, matching
+      Docker's latest/last behavior.
+- [ ] Add writable/virtual size accounting and pass-through process-selection
+      options for `top`.
 
 ### TimeTravel lifecycle
 
@@ -401,8 +409,10 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] Use containerd's client APIs for registry pulls, OCI content, manifest
       resolution, and unpacking rather than implementing a Docker registry
       client from scratch.
-- [ ] Use containerd leases and APIs for image removal and content garbage
-      collection.
+- [x] Use target-guarded synchronous containerd image deletion APIs for image
+      removal and newly unreachable content collection.
+- [ ] Add containerd leases for materialization and live-family content
+      retention.
 - [ ] Select a rootless-compatible snapshotter; prefer an immutable directory
       lower that can be exposed to runsc through a read-only gofer.
 - [x] Cache content-addressed directory roots and construct the initial OCI

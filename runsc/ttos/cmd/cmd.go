@@ -27,11 +27,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"text/template"
 	"time"
 
 	"golang.org/x/term"
@@ -255,7 +257,7 @@ Commands:
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
-  ps [--all|--quiet]              List container branches in a flat table
+  ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET             Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   fork --check [--json] SOURCE    Validate SOURCE without creating a branch
@@ -1363,41 +1365,289 @@ func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.BoolVar(all, "a", false, "show created and exited branches")
 	quiet := fs.Bool("quiet", false, "only display branch-qualified selectors")
 	fs.BoolVar(quiet, "q", false, "only display branch-qualified selectors")
+	var filters stringSlice
+	fs.Var(&filters, "filter", "filter output (name, id, status, ancestor, volume, or branch)")
+	fs.Var(&filters, "f", "filter output (name, id, status, ancestor, volume, or branch)")
+	format := fs.String("format", "", "format rows using a Go template or json")
+	last := fs.Int("last", -1, "show the most recently created N branches")
+	fs.IntVar(last, "n", -1, "show the most recently created N branches")
+	latest := fs.Bool("latest", false, "show only the most recently created branch")
+	fs.BoolVar(latest, "l", false, "show only the most recently created branch")
+	noTrunc := fs.Bool("no-trunc", false, "do not truncate image IDs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: ttos ps [--all] [--quiet]")
+		return errors.New("usage: ttos ps [--all] [--quiet] [--filter KEY=VALUE] [--format TEMPLATE] [--latest|--last N]")
+	}
+	if *last < -1 {
+		return errors.New("ps --last must be -1 or greater")
+	}
+	if *latest {
+		if *last != -1 && *last != 1 {
+			return errors.New("ps --latest conflicts with --last other than 1")
+		}
+		*last = 1
+	}
+	parsedFilters, err := parsePsFilters(filters)
+	if err != nil {
+		return err
 	}
 	families, err := backend.listFamilies()
 	if err != nil {
 		return fmt.Errorf("listing container families: %w", err)
 	}
-	var table *tabwriter.Writer
-	if !*quiet {
-		table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(table, "CONTAINER\tBRANCH\tSTATE\tPARENT")
+	rows := psRows(families, time.Now(), *noTrunc)
+	includeAllStates := *all || *last >= 0
+	selected := rows[:0]
+	for _, row := range rows {
+		if !includeAllStates && row.State != "running" && row.State != "paused" {
+			continue
+		}
+		if !matchPsFilters(row, parsedFilters) {
+			continue
+		}
+		selected = append(selected, row)
 	}
+	rows = selected
+	sort.SliceStable(rows, func(i, j int) bool {
+		left, right := rows[i].created, rows[j].created
+		if left.Equal(right) {
+			return false
+		}
+		if left.IsZero() {
+			return false
+		}
+		if right.IsZero() {
+			return true
+		}
+		return left.After(right)
+	})
+	if *last >= 0 && len(rows) > *last {
+		rows = rows[:*last]
+	}
+	if *quiet {
+		for _, row := range rows {
+			fmt.Fprintln(stdout, row.ID)
+		}
+		return nil
+	}
+	if *format != "" {
+		return writePsFormat(stdout, rows, *format)
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "CONTAINER\tBRANCH\tIMAGE\tSTATE\tCREATED\tPARENT")
+	for _, row := range rows {
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			row.Container, row.Branch, row.Image, row.State, row.RunningFor, row.Parent)
+	}
+	return table.Flush()
+}
+
+type psRow struct {
+	ID         string   `json:"id"`
+	Names      string   `json:"names"`
+	Container  string   `json:"container"`
+	Branch     string   `json:"branch"`
+	Image      string   `json:"image"`
+	ImageID    string   `json:"image_id,omitempty"`
+	State      string   `json:"state"`
+	Status     string   `json:"status"`
+	Parent     string   `json:"parent"`
+	CreatedAt  string   `json:"created_at"`
+	RunningFor string   `json:"running_for"`
+	Volumes    []string `json:"volumes,omitempty"`
+
+	created time.Time
+	digest  string
+}
+
+func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
+	var rows []psRow
 	for _, family := range families {
+		image := familiarImageReference(family.Image)
+		if image == "" {
+			image = "<unknown>"
+		}
 		for _, branch := range family.Branches {
-			if !*all && branch.State != "running" && branch.State != "paused" {
-				continue
-			}
-			if *quiet {
-				fmt.Fprintf(stdout, "%s@%s\n", family.ID, branch.ID)
-				continue
+			created := branch.CreatedAt
+			if created.IsZero() {
+				created = family.CreatedAt
 			}
 			parent := branch.ParentID
 			if parent == "" {
 				parent = "-"
 			}
-			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", family.ID, branch.ID, branch.State, parent)
+			id := family.ID + "@" + branch.ID
+			runningFor := formatImageAge(now, created)
+			status := branch.State
+			switch branch.State {
+			case "running":
+				status = "Up " + strings.TrimSuffix(runningFor, " ago")
+			case "paused":
+				status = "Paused"
+			case "created":
+				status = "Created"
+			case "exited", "stopped":
+				status = "Exited"
+			}
+			createdAt := ""
+			if !created.IsZero() {
+				createdAt = created.UTC().Format(time.RFC3339Nano)
+			}
+			rows = append(rows, psRow{
+				ID:         id,
+				Names:      id,
+				Container:  family.ID,
+				Branch:     branch.ID,
+				Image:      image,
+				ImageID:    displayImageID(family.Digest, noTrunc),
+				State:      branch.State,
+				Status:     status,
+				Parent:     parent,
+				CreatedAt:  createdAt,
+				RunningFor: runningFor,
+				Volumes:    append([]string(nil), family.Volumes...),
+				created:    created,
+				digest:     family.Digest,
+			})
 		}
 	}
-	if table != nil {
-		return table.Flush()
+	return rows
+}
+
+type psFilters map[string][]string
+
+func parsePsFilters(values []string) (psFilters, error) {
+	filters := make(psFilters)
+	for _, value := range values {
+		key, match, ok := strings.Cut(value, "=")
+		if !ok || key == "" || match == "" {
+			return nil, fmt.Errorf("invalid ps filter %q; want KEY=VALUE", value)
+		}
+		key = strings.ToLower(key)
+		switch key {
+		case "name":
+			if _, err := regexp.Compile(match); err != nil {
+				return nil, fmt.Errorf("invalid ps name filter %q: %w", match, err)
+			}
+		case "id", "status", "ancestor", "volume", "branch":
+		default:
+			return nil, fmt.Errorf("unsupported ps filter %q", key)
+		}
+		filters[key] = append(filters[key], match)
+	}
+	return filters, nil
+}
+
+func matchPsFilters(row psRow, filters psFilters) bool {
+	for key, matches := range filters {
+		matched := false
+		for _, match := range matches {
+			switch key {
+			case "name":
+				matched, _ = regexp.MatchString(match, row.Names)
+			case "id":
+				matched = strings.HasPrefix(row.ID, match) ||
+					strings.HasPrefix(row.Container, match)
+			case "status":
+				matched = strings.EqualFold(row.State, match) ||
+					(row.State == "stopped" && strings.EqualFold(match, "exited"))
+			case "ancestor":
+				matched = matchPsAncestor(row, match)
+			case "volume":
+				for _, volume := range row.Volumes {
+					if volume == match {
+						matched = true
+						break
+					}
+				}
+			case "branch":
+				matched = row.Branch == match
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func matchPsAncestor(row psRow, value string) bool {
+	if normalized, err := ttosimages.NormalizeReference(value); err == nil {
+		if normalized == row.Image || familiarImageReference(normalized) == row.Image {
+			return true
+		}
+	}
+	prefix := strings.TrimPrefix(strings.ToLower(value), "sha256:")
+	digest := strings.TrimPrefix(strings.ToLower(row.digest), "sha256:")
+	return len(prefix) >= 4 && strings.HasPrefix(digest, prefix)
+}
+
+func writePsFormat(w io.Writer, rows []psRow, format string) error {
+	if format == "json" {
+		encoder := json.NewEncoder(w)
+		for _, row := range rows {
+			if err := encoder.Encode(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	withHeader := false
+	if format == "table" {
+		withHeader = true
+		format = ""
+	} else if strings.HasPrefix(format, "table ") {
+		withHeader = true
+		format = strings.TrimSpace(strings.TrimPrefix(format, "table "))
+	}
+	if format == "" {
+		format = "{{.ID}}"
+	}
+	tmpl, err := template.New("ps").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			data, err := json.Marshal(value)
+			return string(data), err
+		},
+		"lower": strings.ToLower,
+		"upper": strings.ToUpper,
+	}).Parse(format)
+	if err != nil {
+		return fmt.Errorf("parsing ps format: %w", err)
+	}
+	if withHeader {
+		header := psRow{
+			ID: "ID", Names: "NAMES", Container: "CONTAINER", Branch: "BRANCH",
+			Image: "IMAGE", ImageID: "IMAGE ID", State: "STATE", Status: "STATUS",
+			Parent: "PARENT", CreatedAt: "CREATED AT", RunningFor: "CREATED",
+			Volumes: []string{"VOLUMES"},
+		}
+		if err := executePsTemplate(w, tmpl, header); err != nil {
+			return err
+		}
+	}
+	for _, row := range rows {
+		if err := executePsTemplate(w, tmpl, row); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func executePsTemplate(w io.Writer, tmpl *template.Template, row psRow) error {
+	var output bytes.Buffer
+	if err := tmpl.Execute(&output, row); err != nil {
+		return fmt.Errorf("executing ps format: %w", err)
+	}
+	if output.Len() == 0 || output.Bytes()[output.Len()-1] != '\n' {
+		output.WriteByte('\n')
+	}
+	_, err := io.Copy(w, &output)
+	return err
 }
 
 func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -1829,20 +2079,25 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttos ls --json.
 type Branch struct {
-	ID               string `json:"id"`
-	ParentID         string `json:"parent_id,omitempty"`
-	State            string `json:"state"`
-	ForkTotalNS      int64  `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64  `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64  `json:"kernel_fork_ns,omitempty"`
+	ID               string    `json:"id"`
+	ParentID         string    `json:"parent_id,omitempty"`
+	State            string    `json:"state"`
+	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Family is stable family metadata returned by ttos ls --json.
 type Family struct {
-	ID       string   `json:"id"`
-	State    string   `json:"state"`
-	Branches []Branch `json:"branches"`
-	Error    string   `json:"error,omitempty"`
+	ID        string    `json:"id"`
+	Image     string    `json:"image,omitempty"`
+	Digest    string    `json:"digest,omitempty"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	Volumes   []string  `json:"volumes,omitempty"`
+	Branches  []Branch  `json:"branches"`
+	Error     string    `json:"error,omitempty"`
 }
 
 // ForkResourceIssue identifies one resource that blocks a live fork.
@@ -3181,16 +3436,50 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		if state == "" {
 			state = "created"
 		}
+		volumes := make([]string, 0, len(container.Volumes))
+		seenVolumes := make(map[string]bool)
+		for _, volume := range container.Volumes {
+			if !seenVolumes[volume.Name] {
+				volumes = append(volumes, volume.Name)
+				seenVolumes[volume.Name] = true
+			}
+		}
+		sort.Strings(volumes)
 		byID[container.Name] = Family{
-			ID:       container.Name,
-			State:    state,
-			Branches: []Branch{{ID: defaultBranchID, State: state}},
+			ID:        container.Name,
+			Image:     container.Reference,
+			Digest:    container.Digest,
+			State:     state,
+			CreatedAt: container.CreatedAt,
+			Volumes:   volumes,
+			Branches:  []Branch{{ID: defaultBranchID, State: state, CreatedAt: container.CreatedAt}},
 		}
 	}
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
 			runtimeIDs[family.ID] = struct{}{}
+			if persistent, ok := byID[family.ID]; ok {
+				family.Image = persistent.Image
+				family.Digest = persistent.Digest
+				family.CreatedAt = persistent.CreatedAt
+				family.Volumes = persistent.Volumes
+				for i := range family.Branches {
+					if family.Branches[i].ID == defaultBranchID {
+						family.Branches[i].CreatedAt = persistent.CreatedAt
+					}
+				}
+			} else if len(family.Branches) != 0 {
+				for _, branch := range family.Branches {
+					if branch.ID == defaultBranchID {
+						family.CreatedAt = branch.CreatedAt
+						break
+					}
+				}
+				if family.CreatedAt.IsZero() {
+					family.CreatedAt = family.Branches[0].CreatedAt
+				}
+			}
 			byID[family.ID] = family
 		}
 		for _, container := range containers {
@@ -3199,7 +3488,12 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 					continue
 				}
 				_ = store.UpdateState(container.Name, "exited", nil)
-				byID[container.Name] = Family{ID: container.Name, State: "exited", Branches: []Branch{{ID: defaultBranchID, State: "exited"}}}
+				family := byID[container.Name]
+				family.State = "exited"
+				family.Branches = []Branch{{
+					ID: defaultBranchID, State: "exited", CreatedAt: container.CreatedAt,
+				}}
+				byID[container.Name] = family
 			}
 		}
 	} else {
@@ -3264,9 +3558,10 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 }
 
 type runscBranchInfo struct {
-	ID          string `json:"ID"`
-	ParentID    string `json:"ParentID"`
-	State       string `json:"State"`
+	ID          string    `json:"ID"`
+	ParentID    string    `json:"ParentID"`
+	State       string    `json:"State"`
+	CreatedAt   time.Time `json:"CreatedAt"`
 	ForkMetrics struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
@@ -3281,6 +3576,7 @@ func branchView(info runscBranchInfo) Branch {
 		ID:               info.ID,
 		ParentID:         info.ParentID,
 		State:            info.State,
+		CreatedAt:        info.CreatedAt,
 		ForkTotalNS:      info.ForkMetrics.Total.Nanoseconds(),
 		SourceDowntimeNS: info.ForkMetrics.SourceDowntime.Nanoseconds(),
 		KernelForkNS:     info.ForkMetrics.Kernel.Total.Nanoseconds(),
