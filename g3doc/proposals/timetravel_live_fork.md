@@ -476,16 +476,22 @@ signaling, writable roots, additional mounts, and general network resource
 closure remain later work.
 
 The first Phase 3 resource slice is validated for anonymous pipes, pure Sentry
-eventfds, and epoll registration graphs. The real-loader fork test installs
-these objects in PID 1's FD table before cloning. It verifies that queued pipe
-bytes and eventfd counters start identical, reader/writer aliases remain
-coherent inside each branch, consumption and writes diverge, and readiness
-never crosses branches. A cloned epoll interest resolves to the cloned pipe;
-deleting the interest in the child does not mutate the parent interest.
-Existing state graph traversal and post-load hooks already provide the required
-semantics; no special clone implementation was needed. Host-backed eventfds and
-the remaining object classes are not enabled by this result and still require
-explicit closure validation.
+eventfds, epoll registration graphs, and timerfds. The real-loader fork test
+installs these objects in PID 1's FD table before cloning. It verifies that
+queued pipe bytes, eventfd counters, and timerfd expiration counts start
+identical, aliases remain coherent inside each branch, consumption and writes
+diverge, and readiness never crosses branches. A cloned epoll interest resolves
+to the cloned pipe; deleting the interest in the child does not mutate the
+parent interest. An armed cloned timerfd also expires in the running child
+without making the paused parent readable.
+
+Pipe, eventfd, and epoll required no special clone implementation beyond their
+existing state graph and post-load hooks. Timerfd testing exposed and fixed a
+kernel lifecycle gap: `StartPaused` paused Timekeeper updates and timers, but
+the final matching `Unpause` did not resume them. The kernel now resumes time
+before releasing the final task stop. Host-backed eventfds and the remaining
+object classes are not enabled by this result and still require explicit
+closure validation.
 
 ## Implementation phases and gates
 

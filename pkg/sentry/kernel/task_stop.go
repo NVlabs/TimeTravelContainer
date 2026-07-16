@@ -248,3 +248,11 @@ func (ts *TaskSet) isExternallyStopped() bool {
 	defer ts.mu.Unlock()
 	return ts.stopCount > 0
 }
+
+// isFinalExternalStop reports whether one EndExternalStop call would remove
+// the last TaskSet-wide external stop.
+func (ts *TaskSet) isFinalExternalStop() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.stopCount == 1
+}

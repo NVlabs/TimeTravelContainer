@@ -40,8 +40,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -282,6 +284,19 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	parentEpollFile := liveForkTestFD(t, l.k, epollFD)
 	parentEpoll = parentEpollFile.Impl().(*vfs.EpollInstance)
+	timerFile, err := timerfd.New(ctx, l.k.VFS(), l.k.MonotonicClock(), linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("creating timerfd: %v", err)
+	}
+	parentTimer := timerFile.Impl().(*timerfd.TimerFileDescription)
+	parentTimer.NotifyTimer(2)
+	timerFD, err := l.k.GlobalInit().Leader().FDTable().NewFD(ctx, 14, timerFile, kernel.FDFlags{})
+	timerFile.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing timerfd: %v", err)
+	}
+	parentTimerFile := liveForkTestFD(t, l.k, timerFD)
+	parentTimer = parentTimerFile.Impl().(*timerfd.TimerFileDescription)
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -308,6 +323,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childEvent := liveForkTestFD(t, child.k, eventFD)
 	childEpollFile := liveForkTestFD(t, child.k, epollFD)
 	childEpoll := childEpollFile.Impl().(*vfs.EpollInstance)
+	childTimerFile := liveForkTestFD(t, child.k, timerFD)
+	childTimer := childTimerFile.Impl().(*timerfd.TimerFileDescription)
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -360,14 +377,49 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkEventRead(t, childCtx, childEvent, 4)
 	liveForkEventWouldBlock(t, ctx, parentEvent)
 	liveForkEventWouldBlock(t, childCtx, childEvent)
+
+	// Timerfd expiration counters and notifications are branch-local, while
+	// Resume above reconstructs each cloned timer's runtime-only host fields.
+	liveForkCounterRead(t, childCtx, childTimerFile, 2, "child timerfd")
+	if got := parentTimerFile.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child timerfd read consumed parent expirations: %#x", got)
+	}
+	liveForkCounterRead(t, ctx, parentTimerFile, 2, "parent timerfd")
+	parentTimer.NotifyTimer(3)
+	if got := childTimerFile.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent timerfd notification made child readable: %#x", got)
+	}
+	childTimer.NotifyTimer(4)
+	liveForkCounterRead(t, ctx, parentTimerFile, 3, "parent timerfd")
+	liveForkCounterRead(t, childCtx, childTimerFile, 4, "child timerfd")
+	liveForkEventWouldBlock(t, ctx, parentTimerFile)
+	liveForkEventWouldBlock(t, childCtx, childTimerFile)
+	entry, timerReady := waiter.NewChannelEntry(waiter.EventIn)
+	if err := childTimerFile.EventRegister(&entry); err != nil {
+		t.Fatalf("registering child timerfd waiter: %v", err)
+	}
+	now, _ := childTimer.GetTime()
+	childTimer.SetTime(ktime.Setting{Enabled: true, Next: now.Add(20 * time.Millisecond)})
+	select {
+	case <-timerReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cloned child timerfd did not expire")
+	}
+	childTimerFile.EventUnregister(&entry)
+	liveForkCounterRead(t, childCtx, childTimerFile, 1, "armed child timerfd")
+	if got := parentTimerFile.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("child timerfd expiration made parent readable: %#x", got)
+	}
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
 	parentEpollFile.DecRef(ctx)
+	parentTimerFile.DecRef(ctx)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
 	childEpollFile.DecRef(childCtx)
+	childTimerFile.DecRef(childCtx)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -456,6 +508,16 @@ func liveForkEventRead(t *testing.T, ctx context.Context, file *vfs.FileDescript
 	got := binary.NativeEndian.Uint64(buf[:])
 	if err != nil || n != int64(len(buf)) || got != want {
 		t.Fatalf("eventfd Read: got (%d, %d, %v), want %d", got, n, err, want)
+	}
+}
+
+func liveForkCounterRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, want uint64, kind string) {
+	t.Helper()
+	var buf [8]byte
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf[:]), vfs.ReadOptions{})
+	got := binary.NativeEndian.Uint64(buf[:])
+	if err != nil || n != int64(len(buf)) || got != want {
+		t.Fatalf("%s Read: got (%d, %d, %v), want %d", kind, got, n, err, want)
 	}
 }
 

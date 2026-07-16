@@ -161,6 +161,11 @@ type Kernel struct {
 	// all Kernel fields become immutable once started becomes true.
 	started bool `state:"nosave"`
 
+	// timePausedByStartPaused is true after StartPaused has paused Timekeeper
+	// updates and timers, until the final matching Unpause resumes them.
+	// Protected by extMu.
+	timePausedByStartPaused bool `state:"nosave"`
+
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
@@ -1472,6 +1477,7 @@ func (k *Kernel) startLocked(resumeTime bool) error {
 	}
 	if !resumeTime {
 		k.pauseTimeLocked(k.SupervisorContext())
+		k.timePausedByStartPaused = true
 	}
 
 	k.started = true
@@ -1754,6 +1760,12 @@ func (k *Kernel) ReceiveTaskStates() {
 func (k *Kernel) Unpause() {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
+	// Resume time before ending the final external stop, while task goroutines
+	// are still stopped as required by resumeTimeLocked.
+	if k.timePausedByStartPaused && k.tasks.isFinalExternalStop() {
+		k.resumeTimeLocked(k.SupervisorContext())
+		k.timePausedByStartPaused = false
+	}
 	k.tasks.EndExternalStop()
 }
 
