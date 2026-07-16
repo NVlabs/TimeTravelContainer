@@ -25,6 +25,7 @@ import (
 	mobyuser "github.com/moby/sys/user"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -156,6 +157,12 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		"dev.gvisor.spec.rootfs.overlay":    "memory",
 		"dev.timetravelos.internal-console": "init",
 		"dev.timetravelos.config.network":   networkMode,
+	}
+	ownerManifest := ownership.ManifestPath(rootfs)
+	if _, err := ownership.Read(ownerManifest); err == nil {
+		annotations[ownership.Annotation] = ownerManifest
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("loading rootfs ownership: %w", err)
 	}
 	entrypointJSON, err := json.Marshal(entrypoint)
 	if err != nil {

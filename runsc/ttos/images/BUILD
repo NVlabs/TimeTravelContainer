@@ -13,6 +13,7 @@ go_library(
     ],
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
+        "//runsc/ttos/ownership",
         "@com_github_containerd_containerd_v2//client",
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_containerd_v2//core/images",

@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 // LINT.IfChange
@@ -72,6 +73,10 @@ type Config struct {
 
 	// Gofer process's EGID.
 	EGID int
+
+	// VirtualOwners overrides host UID/GID values for an immutable TTOS image
+	// root. It is nil for ordinary gofer mounts.
+	VirtualOwners *ownership.Manifest
 }
 
 var procSelfFD *rwfd.FD
@@ -111,6 +116,19 @@ type connectionImpl struct {
 
 var _ lisafs.ConnectionImpl = (*connectionImpl)(nil)
 
+func (i *connectionImpl) stat(hostFD int, virtualPath string) (lisafs.Statx, error) {
+	stat, err := fstatTo(hostFD)
+	if err != nil {
+		return lisafs.Statx{}, err
+	}
+	if owner, ok := i.config.VirtualOwners.Lookup(virtualPath); ok {
+		stat.Mask |= unix.STATX_UID | unix.STATX_GID
+		stat.UID = owner.UID
+		stat.GID = owner.GID
+	}
+	return stat, nil
+}
+
 // Mount implements lisafs.ConnectionImpl.Mount.
 func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*lisafs.ControlFD, lisafs.Statx, int, error) {
 	mountPath := mountNode.FilePath()
@@ -125,7 +143,7 @@ func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*l
 	})
 	defer cu.Clean()
 
-	stat, err := fstatTo(rootHostFD)
+	stat, err := i.stat(rootHostFD, ".")
 	if err != nil {
 		return nil, lisafs.Statx{}, -1, err
 	}
@@ -148,6 +166,7 @@ func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*l
 		hostFD:         rootHostFD,
 		writableHostFD: atomicbitops.FromInt32(-1),
 		isMountPoint:   true,
+		virtualPath:    ".",
 	}
 	mountNode.IncRef() // Ref is transferred to ControlFD.
 	rootFD.ControlFD.Init(c, mountNode, linux.FileMode(stat.Mode), rootFD)
@@ -213,6 +232,9 @@ type controlFDLisa struct {
 	// isMountpoint indicates whether this FD represents the mount point for its
 	// owning connection. isMountPoint is immutable.
 	isMountPoint bool
+
+	// virtualPath is the clean path relative to this connection's root.
+	virtualPath string
 }
 
 var _ lisafs.ControlFDImpl = (*controlFDLisa)(nil)
@@ -244,6 +266,7 @@ func newControlFDLisa(hostFD int, parent *controlFDLisa, name string, mode linux
 		}
 	})
 	childFD.hostFD = hostFD
+	childFD.virtualPath = path.Join(parent.virtualPath, name)
 	childFD.writableHostFD = atomicbitops.FromInt32(-1)
 	childFD.ControlFD.Init(parent.Conn(), childNode, mode, childFD)
 	return childFD
@@ -297,9 +320,13 @@ func (fd *controlFDLisa) Close() {
 	}
 }
 
+func (fd *controlFDLisa) stat(hostFD int, virtualPath string) (lisafs.Statx, error) {
+	return fd.Conn().Impl().(*connectionImpl).stat(hostFD, virtualPath)
+}
+
 // Stat implements lisafs.ControlFDImpl.Stat.
 func (fd *controlFDLisa) Stat() (lisafs.Statx, error) {
-	return fstatTo(fd.hostFD)
+	return fd.stat(fd.hostFD, fd.virtualPath)
 }
 
 // SetStat implements lisafs.ControlFDImpl.SetStat.
@@ -425,7 +452,7 @@ func (fd *controlFDLisa) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, err
 		return nil, lisafs.Statx{}, err
 	}
 
-	stat, err := fstatTo(childHostFD)
+	stat, err := fd.stat(childHostFD, path.Join(fd.virtualPath, name))
 	if err != nil {
 		_ = unix.Close(childHostFD)
 		return nil, lisafs.Statx{}, err
@@ -441,34 +468,35 @@ func (fd *controlFDLisa) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, err
 }
 
 // WalkStat implements lisafs.ControlFDImpl.WalkStat.
-func (fd *controlFDLisa) WalkStat(path lisafs.StringArray, recordStat func(lisafs.Statx)) error {
+func (fd *controlFDLisa) WalkStat(names lisafs.StringArray, recordStat func(lisafs.Statx)) error {
 	// Note that while performing the walk below, we do not have read concurrency
 	// guarantee for any descendants. So files can be created/deleted inside fd
 	// while the walk is being performed. However, this should be fine from a
 	// security perspective as we are using host FDs to walk and checking that
 	// each opened path component is not a symlink.
 	curDirFD := fd.hostFD
+	curVirtualPath := fd.virtualPath
 	closeCurDirFD := func() {
 		if curDirFD != fd.hostFD {
 			unix.Close(curDirFD)
 		}
 	}
 	defer closeCurDirFD()
-	if len(path) > 0 && len(path[0]) == 0 {
+	if len(names) > 0 && len(names[0]) == 0 {
 		// Write stat results for dirFD if the first path component is "".
-		stat, err := fstatTo(fd.hostFD)
+		stat, err := fd.stat(fd.hostFD, fd.virtualPath)
 		if err != nil {
 			return err
 		}
 		recordStat(stat)
-		path = path[1:]
+		names = names[1:]
 	}
 
 	// Don't attempt walking if parent is a symlink.
 	if fd.IsSymlink() {
 		return nil
 	}
-	for _, name := range path {
+	for _, name := range names {
 		curFD, err := unix.Openat(curDirFD, name, unix.O_PATH|openFlags, 0)
 		if err == unix.ENOENT {
 			// No more path components exist on the filesystem. Return the partial
@@ -480,13 +508,14 @@ func (fd *controlFDLisa) WalkStat(path lisafs.StringArray, recordStat func(lisaf
 		}
 		closeCurDirFD()
 		curDirFD = curFD
+		curVirtualPath = path.Join(curVirtualPath, name)
 
-		stat, err := fstatTo(curFD)
+		stat, err := fd.stat(curFD, curVirtualPath)
 		if err != nil {
 			return err
 		}
 		if err := checkSupportedFileType(uint32(stat.Mode)); err != nil {
-			log.Warningf("WalkStat: checkSupportedFileType() failed for file %q with mode %#o while walking path %+v: %v", name, stat.Mode, path, err)
+			log.Warningf("WalkStat: checkSupportedFileType() failed for file %q with mode %#o while walking path %+v: %v", name, stat.Mode, names, err)
 			return err
 		}
 		recordStat(stat)
@@ -584,7 +613,7 @@ func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lis
 	}
 
 	// Get stat results.
-	childStat, err := fstatTo(childHostFD)
+	childStat, err := fd.stat(childHostFD, path.Join(fd.virtualPath, name))
 	if err != nil {
 		return nil, lisafs.Statx{}, nil, -1, err
 	}
@@ -638,7 +667,7 @@ func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 
 	// Get stat results.
-	childDirStat, err := fstatTo(childDirFd)
+	childDirStat, err := fd.stat(childDirFd, path.Join(fd.virtualPath, name))
 	if err != nil {
 		unix.Close(childDirFd)
 		return nil, lisafs.Statx{}, err
@@ -691,7 +720,7 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 
 	// Get stat results.
-	childStat, err := fstatTo(childFD)
+	childStat, err := fd.stat(childFD, path.Join(fd.virtualPath, name))
 	if err != nil {
 		unix.Close(childFD)
 		return nil, lisafs.Statx{}, err
@@ -724,7 +753,7 @@ func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid
 		return nil, lisafs.Statx{}, err
 	}
 
-	symlinkStat, err := fstatTo(symlinkFD)
+	symlinkStat, err := fd.stat(symlinkFD, path.Join(fd.virtualPath, name))
 	if err != nil {
 		unix.Close(symlinkFD)
 		return nil, lisafs.Statx{}, err
@@ -763,7 +792,7 @@ func (fd *controlFDLisa) Link(dir lisafs.ControlFDImpl, name string) (*lisafs.Co
 		return nil, lisafs.Statx{}, err
 	}
 
-	linkStat, err := fstatTo(linkFD)
+	linkStat, err := dirFD.stat(linkFD, path.Join(dirFD.virtualPath, name))
 	if err != nil {
 		return nil, lisafs.Statx{}, err
 	}
@@ -978,7 +1007,7 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 	}
 
 	// Stat the socket.
-	sockStat, err := fstatTo(sockFileFD)
+	sockStat, err := fd.stat(sockFileFD, path.Join(fd.virtualPath, name))
 	if err != nil {
 		return nil, lisafs.Statx{}, nil, -1, err
 	}
@@ -1138,7 +1167,8 @@ func (fd *openFDLisa) Close() {
 
 // Stat implements lisafs.OpenFDImpl.Stat.
 func (fd *openFDLisa) Stat() (lisafs.Statx, error) {
-	return fstatTo(fd.hostFD)
+	controlFD := fd.ControlFD().(*controlFDLisa)
+	return controlFD.stat(fd.hostFD, controlFD.virtualPath)
 }
 
 // Sync implements lisafs.OpenFDImpl.Sync.

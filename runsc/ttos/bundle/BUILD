@@ -14,6 +14,7 @@ go_library(
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
         "//runsc/ttos/images",
+        "//runsc/ttos/ownership",
         "@com_github_moby_sys_user//:user",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
         "@com_github_opencontainers_runtime_spec//specs-go",

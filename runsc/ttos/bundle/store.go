@@ -28,7 +28,10 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/ttos/images"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
+
+const imageRootFormatVersion = "v2"
 
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
@@ -289,7 +292,7 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 	if digest == "" || platform == "" {
 		return false, nil
 	}
-	dir := filepath.Join(s.Root, "images", safeComponent(digest+"-"+platform))
+	dir := filepath.Join(s.Root, "images", imageRootKey(digest, platform))
 	if _, err := loadImageRoot(dir); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -314,10 +317,20 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 		}
 		return 0, fmt.Errorf("listing image roots: %w", err)
 	}
-	prefix := safeComponent(digest + "-")
+	prefixes := []string{
+		safeComponent(digest + "-"),
+		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
+	}
 	removed := 0
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+		matches := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix) {
+				matches = true
+				break
+			}
+		}
+		if !entry.IsDir() || !matches {
 			continue
 		}
 		path := filepath.Join(imagesDir, entry.Name())
@@ -478,7 +491,7 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	if selectedPlatform == "" {
 		selectedPlatform = pulled.Platform
 	}
-	key := safeComponent(pulled.Digest + "-" + selectedPlatform)
+	key := imageRootKey(pulled.Digest, selectedPlatform)
 	finalDir := filepath.Join(imagesDir, key)
 	if info, err := loadImageRoot(finalDir); err == nil {
 		return info, filepath.Join(finalDir, "rootfs"), nil
@@ -511,6 +524,10 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	return info, filepath.Join(finalDir, "rootfs"), nil
 }
 
+func imageRootKey(digest, platform string) string {
+	return safeComponent(imageRootFormatVersion + "-" + digest + "-" + platform)
+}
+
 func loadImageRoot(dir string) (images.RootFSInfo, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "image.json"))
 	if err != nil {
@@ -520,8 +537,12 @@ func loadImageRoot(dir string) (images.RootFSInfo, error) {
 	if err := json.Unmarshal(data, &info); err != nil {
 		return images.RootFSInfo{}, err
 	}
-	if stat, err := os.Stat(filepath.Join(dir, "rootfs")); err != nil || !stat.IsDir() {
+	rootfs := filepath.Join(dir, "rootfs")
+	if stat, err := os.Stat(rootfs); err != nil || !stat.IsDir() {
 		return images.RootFSInfo{}, fmt.Errorf("cached rootfs is missing")
+	}
+	if _, err := ownership.Read(ownership.ManifestPath(rootfs)); err != nil {
+		return images.RootFSInfo{}, fmt.Errorf("cached rootfs ownership is invalid: %w", err)
 	}
 	return info, nil
 }

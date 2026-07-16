@@ -27,6 +27,7 @@ BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 ALPINE_IMAGE=${ALPINE_IMAGE:-alpine:3.20}
 PYTHON_IMAGE=${PYTHON_IMAGE:-python:3.12-alpine}
 NGINX_IMAGE=${NGINX_IMAGE:-nginx:1.27-alpine}
+REDIS_IMAGE=${REDIS_IMAGE:-redis:7-alpine}
 
 fail() {
   echo "ttos e2e: $*" >&2
@@ -89,7 +90,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -100,17 +101,17 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 echo "== pulling public image matrix =="
-for image in "$BUSYBOX_IMAGE" "$ALPINE_IMAGE" "$PYTHON_IMAGE" "$NGINX_IMAGE"; do
+for image in "$BUSYBOX_IMAGE" "$ALPINE_IMAGE" "$PYTHON_IMAGE" "$NGINX_IMAGE" "$REDIS_IMAGE"; do
   ttos pull "$image"
 done
 
 echo "== image inventory =="
 IMAGE_LIST="$TTOS_E2E_ROOT/images.json"
 ttos images --json >"$IMAGE_LIST"
-for reference in docker.io/library/busybox:1.36 docker.io/library/alpine:3.20 docker.io/library/python:3.12-alpine docker.io/library/nginx:1.27-alpine; do
+for reference in docker.io/library/busybox:1.36 docker.io/library/alpine:3.20 docker.io/library/python:3.12-alpine docker.io/library/nginx:1.27-alpine docker.io/library/redis:7-alpine; do
   grep -q "\"reference\": \"$reference\"" "$IMAGE_LIST" || fail "image inventory omitted $reference"
 done
-[ "$(ttos images -q | wc -l)" -ge 4 ] || fail "quiet image inventory omitted an image ID"
+[ "$(ttos images -q | wc -l)" -ge 5 ] || fail "quiet image inventory omitted an image ID"
 
 echo "== one-shot compatibility probes =="
 ttos create --name "$PREFIX-busybox" "$BUSYBOX_IMAGE" sh -c \
@@ -169,6 +170,10 @@ ttos rm "$PREFIX-python"
 
 ttos run --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 ttos rm "$PREFIX-nginx"
+
+ttos run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
+  'test "$(stat -c %u:%g /data)" = 999:1000 && echo redis-owner-ok'
+ttos rm "$PREFIX-redis"
 
 echo "== quick-exit console integrity =="
 STRESS_BYTES=262144

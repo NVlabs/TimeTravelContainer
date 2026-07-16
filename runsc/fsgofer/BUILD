@@ -21,6 +21,7 @@ go_library(
         "//pkg/log",
         "//pkg/marshal/primitive",
         "//runsc/config",
+        "//runsc/ttos/ownership",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -34,5 +35,16 @@ go_test(
         "//pkg/lisafs",
         "//pkg/lisafs/testsuite",
         "//pkg/log",
+    ],
+)
+
+go_test(
+    name = "virtual_ownership_test",
+    size = "small",
+    srcs = ["virtual_ownership_test.go"],
+    library = ":fsgofer",
+    deps = [
+        "//runsc/ttos/ownership",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

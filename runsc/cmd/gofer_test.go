@@ -26,7 +26,42 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
+
+func TestLoadRootfsOwnership(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "rootfs")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manifest.Entries["owned"] = ownership.Owner{UID: 123, GID: 456}
+	manifestPath := ownership.ManifestPath(root)
+	if err := ownership.Write(manifestPath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: root},
+		Annotations: map[string]string{ownership.Annotation: manifestPath},
+	}
+	got, err := loadRootfsOwnership(spec)
+	if err != nil {
+		t.Fatalf("loadRootfsOwnership: %v", err)
+	}
+	if owner, ok := got.Lookup("owned"); !ok || owner != (ownership.Owner{UID: 123, GID: 456}) {
+		t.Fatalf("owned=%+v, ok=%t", owner, ok)
+	}
+	spec.Annotations[ownership.Annotation] = filepath.Join(dir, "other.json")
+	if _, err := loadRootfsOwnership(spec); err == nil {
+		t.Fatal("loadRootfsOwnership accepted a manifest not paired with the rootfs")
+	}
+	delete(spec.Annotations, ownership.Annotation)
+	if got, err := loadRootfsOwnership(spec); err != nil || got != nil {
+		t.Fatalf("unannotated load=(%v, %v), want nil, nil", got, err)
+	}
+}
 
 func TestGoferMountPathUnsafeNoHostIsolation(t *testing.T) {
 	const source = "/host/source"

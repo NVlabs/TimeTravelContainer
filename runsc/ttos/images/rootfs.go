@@ -15,12 +15,17 @@
 package images
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
+	"syscall"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
@@ -29,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 // RootFSOptions identifies an image and an empty destination directory.
@@ -51,9 +57,9 @@ type RootFSInfo struct {
 
 // MaterializeRootFS applies the selected image's layers directly to an empty
 // directory. It does not mount a containerd snapshot, so it can run without
-// host mount privileges. The first rootless slice maps all file ownership to
-// the invoking user; preserving distinct image UIDs and GIDs is tracked as a
-// compatibility requirement for the image-root format.
+// host mount privileges. Physical files remain owned by the invoking user;
+// their image UIDs and GIDs are persisted in a sidecar manifest for the gofer
+// to expose to the Sentry.
 func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, error) {
 	if opts.Root == "" {
 		return RootFSInfo{}, fmt.Errorf("rootfs destination must not be empty")
@@ -101,10 +107,18 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 		return RootFSInfo{}, fmt.Errorf("image %q has unsupported OS %q", reference, imageConfig.OS)
 	}
 
+	owners := newOwnershipState()
 	for _, layer := range manifest.Layers {
-		if err := applyContentLayer(ctx, store, opts.Root, layer); err != nil {
+		if err := applyContentLayer(ctx, store, opts.Root, layer, owners); err != nil {
 			return RootFSInfo{}, fmt.Errorf("applying layer %s: %w", layer.Digest, err)
 		}
+	}
+	ownerManifest, err := owners.finalize(opts.Root)
+	if err != nil {
+		return RootFSInfo{}, fmt.Errorf("finalizing image ownership: %w", err)
+	}
+	if err := ownership.Write(ownership.ManifestPath(opts.Root), ownerManifest); err != nil {
+		return RootFSInfo{}, fmt.Errorf("writing image ownership: %w", err)
 	}
 	platform := strings.TrimSuffix(imageConfig.OS+"/"+imageConfig.Architecture+"/"+imageConfig.Variant, "/")
 	return RootFSInfo{
@@ -133,23 +147,205 @@ func prepareEmptyRoot(root string) error {
 	return nil
 }
 
-func applyContentLayer(ctx context.Context, store content.Store, root string, layer ocispec.Descriptor) error {
+func applyContentLayer(ctx context.Context, store content.Store, root string, layer ocispec.Descriptor, owners *ownershipState) error {
 	readerAt, err := store.ReaderAt(ctx, layer)
 	if err != nil {
 		return err
 	}
 	defer readerAt.Close()
-	return applyLayer(ctx, root, content.NewReader(readerAt))
+	return applyLayerWithOwnership(ctx, root, content.NewReader(readerAt), owners)
 }
 
 func applyLayer(ctx context.Context, root string, compressed io.Reader) error {
+	return applyLayerWithOwnership(ctx, root, compressed, nil)
+}
+
+func applyLayerWithOwnership(ctx context.Context, root string, compressed io.Reader, owners *ownershipState) error {
 	stream, err := compression.DecompressStream(compressed)
 	if err != nil {
 		return fmt.Errorf("decompressing layer: %w", err)
 	}
 	defer stream.Close()
-	if _, err := archive.Apply(ctx, root, stream, archive.WithNoSameOwner()); err != nil {
+	options := []archive.ApplyOpt{archive.WithNoSameOwner()}
+	if owners != nil {
+		options = append(options, archive.WithFilter(owners.record))
+	}
+	if _, err := archive.Apply(ctx, root, stream, options...); err != nil {
 		return fmt.Errorf("extracting layer: %w", err)
 	}
 	return nil
+}
+
+type ownershipRecord struct {
+	owner    ownership.Owner
+	sequence uint64
+}
+
+type ownershipState struct {
+	entries   map[string]ownershipRecord
+	groups    map[string]uint64
+	sequence  uint64
+	nextGroup uint64
+}
+
+func newOwnershipState() *ownershipState {
+	return &ownershipState{
+		entries: map[string]ownershipRecord{
+			".": {owner: ownership.Owner{}},
+		},
+		groups: make(map[string]uint64),
+	}
+}
+
+func (s *ownershipState) record(header *tar.Header) (bool, error) {
+	rel, err := ownership.CleanPath(header.Name)
+	if err != nil {
+		return false, err
+	}
+	base := path.Base(rel)
+	dir := path.Dir(rel)
+	if base == ".wh..wh..opq" {
+		s.deleteChildren(dir)
+		return true, nil
+	}
+	if strings.HasPrefix(base, ".wh.") {
+		target, err := ownership.CleanPath(path.Join(dir, strings.TrimPrefix(base, ".wh.")))
+		if err != nil {
+			return false, err
+		}
+		s.deleteSubtree(target)
+		return true, nil
+	}
+	if header.Typeflag == tar.TypeXGlobalHeader {
+		return true, nil
+	}
+	if header.Uid < 0 || uint64(header.Uid) > math.MaxUint32 || header.Gid < 0 || uint64(header.Gid) > math.MaxUint32 {
+		return false, fmt.Errorf("image path %q has invalid owner %d:%d", header.Name, header.Uid, header.Gid)
+	}
+	s.sequence++
+	record := ownershipRecord{
+		owner:    ownership.Owner{UID: uint32(header.Uid), GID: uint32(header.Gid)},
+		sequence: s.sequence,
+	}
+	switch header.Typeflag {
+	case tar.TypeDir:
+		// A directory header merges with an existing directory, but replaces a
+		// non-directory at the same path. Either way it is not a hardlink.
+		delete(s.groups, rel)
+		s.entries[rel] = record
+	case tar.TypeLink:
+		s.deleteSubtree(rel)
+		target, err := ownership.CleanPath(header.Linkname)
+		if err != nil {
+			return false, fmt.Errorf("invalid hardlink target for %q: %w", header.Name, err)
+		}
+		group, ok := s.groups[target]
+		if !ok {
+			s.nextGroup++
+			group = s.nextGroup
+			s.groups[target] = group
+		}
+		// containerd applies the link header owner with lchown(2), which changes
+		// the shared inode and therefore every existing alias.
+		for name, candidate := range s.groups {
+			if candidate == group {
+				s.entries[name] = record
+			}
+		}
+		s.groups[rel] = group
+		s.entries[rel] = record
+	default:
+		s.deleteSubtree(rel)
+		s.nextGroup++
+		s.groups[rel] = s.nextGroup
+		s.entries[rel] = record
+	}
+	return true, nil
+}
+
+func (s *ownershipState) deleteSubtree(rel string) {
+	prefix := rel + "/"
+	for name := range s.entries {
+		if name == rel || strings.HasPrefix(name, prefix) {
+			delete(s.entries, name)
+			delete(s.groups, name)
+		}
+	}
+}
+
+func (s *ownershipState) deleteChildren(rel string) {
+	prefix := ""
+	if rel != "." {
+		prefix = rel + "/"
+	}
+	for name := range s.entries {
+		if name != rel && strings.HasPrefix(name, prefix) {
+			delete(s.entries, name)
+			delete(s.groups, name)
+		}
+	}
+}
+
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+type inodeOwners struct {
+	paths    []string
+	winner   ownershipRecord
+	hasOwner bool
+}
+
+func (s *ownershipState) finalize(root string) (*ownership.Manifest, error) {
+	manifest := ownership.NewManifest()
+	inodes := make(map[inodeKey]*inodeOwners)
+	err := filepath.WalkDir(root, func(name string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, name)
+		if err != nil {
+			return err
+		}
+		rel, err = ownership.CleanPath(rel)
+		if err != nil {
+			return err
+		}
+		record, ok := s.entries[rel]
+		if !ok {
+			record = ownershipRecord{owner: ownership.Owner{}}
+		}
+		manifest.Entries[rel] = record.owner
+
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Nlink < 2 || entry.IsDir() {
+			return nil
+		}
+		key := inodeKey{dev: uint64(stat.Dev), ino: stat.Ino}
+		group := inodes[key]
+		if group == nil {
+			group = &inodeOwners{}
+			inodes[key] = group
+		}
+		group.paths = append(group.paths, rel)
+		if !group.hasOwner || record.sequence > group.winner.sequence {
+			group.winner = record
+			group.hasOwner = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, group := range inodes {
+		for _, rel := range group.paths {
+			manifest.Entries[rel] = group.winner.owner
+		}
+	}
+	return manifest, nil
 }

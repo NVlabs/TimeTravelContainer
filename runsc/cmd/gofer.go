@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/runsc/fsgofer/filter"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 var caps = []string{
@@ -190,6 +191,10 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if err != nil {
 		util.Fatalf("parsing rootfs hint: %v", err)
 	}
+	virtualOwners, err := loadRootfsOwnership(spec)
+	if err != nil {
+		util.Fatalf("loading rootfs ownership: %v", err)
+	}
 	lisafsNeeded := lisafsNeededForDirectFSSuppression(spec, mountHints, rootfsHint, g.mountConfs)
 
 	g.syncFDs.syncChroot()
@@ -335,7 +340,24 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, virtualOwners)
+}
+
+func loadRootfsOwnership(spec *specs.Spec) (*ownership.Manifest, error) {
+	name := spec.Annotations[ownership.Annotation]
+	if name == "" {
+		return nil, nil
+	}
+	want := ownership.ManifestPath(spec.Root.Path)
+	if !filepath.IsAbs(name) || filepath.Clean(name) != filepath.Clean(want) {
+		return nil, fmt.Errorf("ownership manifest path %q does not match rootfs %q", name, spec.Root.Path)
+	}
+	manifest, err := ownership.Read(name)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("Loaded virtual ownership for %d rootfs paths from %q", len(manifest.Entries), name)
+	return manifest, nil
 }
 
 func goferMountPath(conf *config.Config, source, destination string) string {
@@ -344,12 +366,13 @@ func goferMountPath(conf *config.Config, source, destination string) string {
 	}
 	return destination
 }
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, virtualOwners *ownership.Manifest) subcommands.ExitStatus {
 	type connectionConfig struct {
-		sock      *unet.Socket
-		mountPath string
-		readonly  bool
-		mount     *specs.Mount
+		sock          *unet.Socket
+		mountPath     string
+		readonly      bool
+		mount         *specs.Mount
+		virtualOwners *ownership.Manifest
 	}
 	cfgs := make([]connectionConfig, 0, len(spec.Mounts)+1)
 
@@ -359,9 +382,10 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		mountPath := goferMountPath(conf, root, "/")
 		// Start with root mount, then add any other additional mount as needed.
 		cfgs = append(cfgs, connectionConfig{
-			sock:      sandboxsetup.NewSocket(ioFDs[0]),
-			mountPath: mountPath,
-			readonly:  spec.Root.Readonly || rootfsConf.ShouldUseOverlayfs(),
+			sock:          sandboxsetup.NewSocket(ioFDs[0]),
+			mountPath:     mountPath,
+			readonly:      spec.Root.Readonly || rootfsConf.ShouldUseOverlayfs(),
+			virtualOwners: virtualOwners,
 		})
 		log.Infof("Serving %q mapped to %q on FD %d (ro: %t)", mountPath, root, ioFDs[0], cfgs[0].readonly)
 		ioFDs = ioFDs[1:]
@@ -442,7 +466,9 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 			}
 		}
 		if connImpl == nil {
-			connImpl = fsgofer.NewConnectionImpl(fsgoferConf)
+			connectionConf := *fsgoferConf
+			connectionConf.VirtualOwners = cfg.virtualOwners
+			connImpl = fsgofer.NewConnectionImpl(&connectionConf)
 			connOpts = fsgofer.ConnectionOpts(cfg.readonly)
 		}
 		conn, err := server.CreateConnection(cfg.sock, cfg.mountPath, connOpts, connImpl)

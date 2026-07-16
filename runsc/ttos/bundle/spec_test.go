@@ -23,6 +23,7 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
@@ -34,6 +35,11 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "etc/group"), []byte("app:x:456:\nextra:x:789:app\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(root), manifest); err != nil {
 		t.Fatal(err)
 	}
 	host := t.TempDir()
@@ -95,6 +101,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.type"]; got != "bind" {
 		t.Errorf("root type=%q, want bind", got)
+	}
+	if got := spec.Annotations[ownership.Annotation]; got != ownership.ManifestPath(root) {
+		t.Errorf("ownership annotation=%q, want %q", got, ownership.ManifestPath(root))
 	}
 	if got := spec.Annotations["dev.timetravelos.internal-console"]; got != "init" {
 		t.Errorf("internal console=%q, want init", got)
@@ -322,11 +331,16 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	otherDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	makeRoot := func(imageDigest, platform string) string {
 		t.Helper()
-		dir := filepath.Join(root, "images", safeComponent(imageDigest+"-"+platform))
+		dir := filepath.Join(root, "images", imageRootKey(imageDigest, platform))
 		if err := os.MkdirAll(filepath.Join(dir, "rootfs"), 0700); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "image.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		manifest := ownership.NewManifest()
+		manifest.Entries["."] = ownership.Owner{}
+		if err := ownership.Write(ownership.ManifestPath(filepath.Join(dir, "rootfs")), manifest); err != nil {
 			t.Fatal(err)
 		}
 		return dir

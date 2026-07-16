@@ -21,6 +21,8 @@ covers:
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
+- Redis image ownership fidelity for a `999:1000` lower-layer directory while
+  physical rootfs files remain caller-owned;
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
@@ -77,9 +79,9 @@ CONTAINERD_ADDRESS=/path/to/containerd.sock \
 ```
 Use `TTOS_E2E_ROOT` to retain the generated TTOS state for inspection. Image
 references and the containerd namespace can be overridden with
-`BUSYBOX_IMAGE`, `ALPINE_IMAGE`, `PYTHON_IMAGE`, `NGINX_IMAGE`, and
-`TTOS_NAMESPACE`. By default, temporary TTOS state is removed on success or
-failure; pulled content remains managed by the selected containerd namespace.
+`BUSYBOX_IMAGE`, `ALPINE_IMAGE`, `PYTHON_IMAGE`, `NGINX_IMAGE`,
+`REDIS_IMAGE`, and `TTOS_NAMESPACE`. By default, temporary TTOS state is
+removed on success or failure; pulled content remains managed by the selected containerd namespace.
 
 A passing result is stronger than the unit suite: it proves image pulling,
 layer extraction, OCI generation, rootless runsc startup, nontrivial userspace,

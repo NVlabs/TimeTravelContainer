@@ -21,13 +21,20 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+
+	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
 type tarEntry struct {
-	name string
-	body string
-	mode int64
+	name     string
+	body     string
+	mode     int64
+	uid      int
+	gid      int
+	typeflag byte
+	linkname string
 }
 
 func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
@@ -69,6 +76,68 @@ func TestPrepareEmptyRootRejectsContents(t *testing.T) {
 	}
 }
 
+func TestOwnershipStateTracksLayersAndAllFileTypes(t *testing.T) {
+	root := t.TempDir()
+	owners := newOwnershipState()
+	base := makeLayer(t, false, []tarEntry{
+		{name: "etc/", mode: 0755},
+		{name: "etc/remove", body: "old", mode: 0644, uid: 10, gid: 11},
+		{name: "etc/keep", body: "base", mode: 0644, uid: 20, gid: 21},
+		{name: "hard-target", body: "hard", mode: 0644, uid: 30, gid: 31},
+		{name: "symbolic", mode: 0777, uid: 40, gid: 41, typeflag: tar.TypeSymlink, linkname: "etc/keep"},
+		{name: "synth/child", body: "child", mode: 0644, uid: 50, gid: 51},
+		{name: "opaque/", mode: 0755, uid: 70, gid: 71},
+		{name: "opaque/lower", body: "lower", mode: 0644, uid: 72, gid: 73},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(base), owners); err != nil {
+		t.Fatalf("applying base layer: %v", err)
+	}
+	upper := makeLayer(t, false, []tarEntry{
+		{name: "etc/.wh.remove", mode: 0600},
+		{name: "etc/keep", body: "upper", mode: 0644, uid: 100, gid: 101},
+		{name: "hard-copy", mode: 0644, uid: 60, gid: 61, typeflag: tar.TypeLink, linkname: "hard-target"},
+		{name: "opaque/.wh..wh..opq", mode: 0600},
+		{name: "opaque/upper", body: "upper", mode: 0644, uid: 80, gid: 81},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(upper), owners); err != nil {
+		t.Fatalf("applying upper layer: %v", err)
+	}
+	removeLink := makeLayer(t, false, []tarEntry{{name: ".wh.hard-copy", mode: 0600}})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(removeLink), owners); err != nil {
+		t.Fatalf("removing hardlink in later layer: %v", err)
+	}
+	manifest, err := owners.finalize(root)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	want := map[string]ownership.Owner{
+		".":            {},
+		"etc":          {},
+		"etc/keep":     {UID: 100, GID: 101},
+		"hard-target":  {UID: 60, GID: 61},
+		"symbolic":     {UID: 40, GID: 41},
+		"synth":        {},
+		"synth/child":  {UID: 50, GID: 51},
+		"opaque":       {UID: 70, GID: 71},
+		"opaque/upper": {UID: 80, GID: 81},
+	}
+	for name, owner := range want {
+		if got, ok := manifest.Lookup(name); !ok || got != owner {
+			t.Errorf("owner[%q]=%+v, %t; want %+v", name, got, ok, owner)
+		}
+	}
+	for _, removed := range []string{"etc/remove", "opaque/lower", "hard-copy"} {
+		if got, ok := manifest.Lookup(removed); ok {
+			t.Errorf("removed owner[%q]=%+v", removed, got)
+		}
+	}
+	if stat, err := os.Lstat(filepath.Join(root, "etc/keep")); err != nil {
+		t.Fatal(err)
+	} else if stat.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		t.Errorf("physical uid=%d, want invoking uid %d", stat.Sys().(*syscall.Stat_t).Uid, os.Geteuid())
+	}
+}
+
 func makeLayer(t *testing.T, compressed bool, entries []tarEntry) []byte {
 	t.Helper()
 	var output bytes.Buffer
@@ -79,11 +148,18 @@ func makeLayer(t *testing.T, compressed bool, entries []tarEntry) []byte {
 		writer = tar.NewWriter(gzipWriter)
 	}
 	for _, entry := range entries {
-		typeflag := byte(tar.TypeReg)
-		if entry.name[len(entry.name)-1] == '/' {
-			typeflag = tar.TypeDir
+		typeflag := entry.typeflag
+		if typeflag == 0 {
+			typeflag = tar.TypeReg
+			if entry.name[len(entry.name)-1] == '/' {
+				typeflag = tar.TypeDir
+			}
 		}
-		header := &tar.Header{Name: entry.name, Mode: entry.mode, Size: int64(len(entry.body)), Typeflag: typeflag}
+		size := int64(0)
+		if typeflag == tar.TypeReg {
+			size = int64(len(entry.body))
+		}
+		header := &tar.Header{Name: entry.name, Mode: entry.mode, Size: size, Typeflag: typeflag, Uid: entry.uid, Gid: entry.gid, Linkname: entry.linkname}
 		if err := writer.WriteHeader(header); err != nil {
 			t.Fatal(err)
 		}
