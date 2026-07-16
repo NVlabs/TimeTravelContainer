@@ -5,9 +5,9 @@ Status: TODO roadmap following the live-fork prototype.
 Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
-containerd, and generates rootless image-backed OCI bundles for `ttos run`.
-Create/start lifecycle, `ttosd`, exec, attach, mounts, and managed volumes
-remain TODO.
+containerd, generates rootless image-backed OCI bundles, and implements the
+initial run/create/start/inspect/list/remove lifecycle with persistent metadata.
+`ttosd`, exec, attach, ordinary OCI mounts, and managed volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -68,8 +68,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       in-memory branch state is not reconstructed.
 - [ ] Specify behavior when a family or branch name conflicts with an image,
       volume, or exec-session name.
-- [ ] Store desired configuration separately from transient Sentry state so
-      stopped containers can be inspected and removed.
+- [x] Store initial desired configuration and lifecycle metadata separately
+      from transient Sentry state so created/stopped containers can be listed,
+      inspected, restarted, and removed.
+- [ ] Move persistent state behind `ttosd`, make updates transactional, and
+      persist complete branch lineage rather than only the base container.
 
 ## `ttos` command surface
 
@@ -100,7 +103,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       default with optional `--attach`.
 - [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
 - [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
-- [ ] `ttos rm CONTAINER` and explicit policy for live descendant branches.
+- [x] Initial `ttos rm CONTAINER`: remove stopped/created family metadata,
+      reject a live family unless `--force` is given, and require `branch rm`
+      for an individual non-main branch.
+- [ ] Finalize forced-removal and tombstone policy for live descendant
+      branches once persistent lineage is implemented.
 - [x] Initial `ttos inspect CONTAINER` exposing persistent image/bundle data and
       the live family/branch tree when present.
 - [ ] Extend inspect with branch process, resource-eligibility, timing, and
@@ -117,8 +124,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] `ttos pause CONTAINER[@BRANCH]`.
 - [x] `ttos resume CONTAINER[@BRANCH]`.
 - [x] `ttos branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
-- [ ] `ttos ls --tree` with a compact Unicode tree, current state, PID 1 state,
-      parent, fork latency, source downtime, memory sharing, and creation time.
+- [x] Initial `ttos ls --tree` compact Unicode lineage and lifecycle-state
+      output, merging persistent base containers with authoritative live runsc
+      branch state.
+- [ ] Extend tree output with PID 1 state, memory sharing, creation time, and
+      the complete persisted lineage/tombstone model.
 - [x] `ttos ls --json` with a stable machine-readable schema.
 - [x] Mark deleted historical parents in tree output without reparenting their
       descendants.
@@ -301,6 +311,8 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ## `ttosd` and persistence
 
+- [x] Initial direct-CLI persistent base-container metadata with created,
+      running, and exited reconciliation against `runsc list`.
 - [ ] Implement a local Unix-domain control service so console sessions,
       background pulls, event streams, and state survive individual CLI
       processes.

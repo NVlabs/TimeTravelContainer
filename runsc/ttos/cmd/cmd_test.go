@@ -16,10 +16,12 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
@@ -250,6 +252,17 @@ func TestInspect(t *testing.T) {
 	}
 }
 
+func TestRemove(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"rm", "--force", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("rm status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.removed != "demo" || !b.removeForce || stdout.String() != "demo\n" {
+		t.Errorf("removed=%q force=%t output=%q", b.removed, b.removeForce, stdout.String())
+	}
+}
+
 func TestListJSON(t *testing.T) {
 	b := &fakeBackend{families: []Family{{ID: "web", State: "running", Branches: []Branch{{ID: "main", State: "running"}}}}}
 	var stdout, stderr bytes.Buffer
@@ -374,6 +387,69 @@ exit 2
 	}
 }
 
+func TestListFamiliesMergesPersistentStateAndReconcilesStaleRunning(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte(`#!/bin/sh
+if [ "$3" = "list" ]; then
+	echo '[]'
+	exit 0
+fi
+exit 2
+`), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", "demo", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{
+		Name:      "demo",
+		BundleDir: bundleDir,
+		State:     "created",
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("encoding metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "demo", "container.json"), metadata, 0600); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if len(families) != 1 || families[0].ID != "demo" || families[0].State != "created" || families[0].Branches[0].State != "created" {
+		t.Fatalf("listFamilies returned %+v", families)
+	}
+
+	store := ttosbundle.Store{Root: dataRoot}
+	if err := store.UpdateState("demo", "running", nil); err != nil {
+		t.Fatalf("marking container running: %v", err)
+	}
+	families, err = b.listFamilies()
+	if err != nil {
+		t.Fatalf("reconciling listFamilies: %v", err)
+	}
+	if len(families) != 1 || families[0].State != "exited" || families[0].Branches[0].State != "exited" {
+		t.Fatalf("reconciled listFamilies returned %+v", families)
+	}
+	info, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatalf("loading reconciled metadata: %v", err)
+	}
+	if info.State != "exited" || info.ExitedAt == nil {
+		t.Errorf("reconciled metadata = %+v, want exited with timestamp", info)
+	}
+}
+
 type signalCall struct {
 	target selector
 	signal int
@@ -405,6 +481,8 @@ type fakeBackend struct {
 	startDetach      bool
 	startInteractive bool
 	inspectInfo      InspectInfo
+	removed          string
+	removeForce      bool
 }
 
 func (b *fakeBackend) create(request runRequest) error {
@@ -427,6 +505,12 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 
 func (b *fakeBackend) inspect(name string) (InspectInfo, error) {
 	return b.inspectInfo, b.err
+}
+
+func (b *fakeBackend) remove(name string, force bool) error {
+	b.removed = name
+	b.removeForce = force
+	return b.err
 }
 
 func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {

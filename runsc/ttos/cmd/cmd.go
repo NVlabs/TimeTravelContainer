@@ -223,6 +223,7 @@ Commands:
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
   inspect CONTAINER...           Show persistent and live branch state
+  rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
@@ -249,6 +250,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runStart(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, backend)
+	case "rm":
+		err = runRemove(args[1:], stdout, stderr, backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "fork":
@@ -478,6 +481,29 @@ func runInspect(args []string, stdout io.Writer, backend backend) error {
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(results)
+}
+
+func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	force := fs.Bool("force", false, "force removal of a running container family")
+	fs.BoolVar(force, "f", false, "force removal of a running container family")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos rm [--force] CONTAINER [CONTAINER...]")
+	}
+	for _, name := range fs.Args() {
+		if strings.Contains(name, "@") {
+			return fmt.Errorf("rm removes a whole container family; use 'branch rm' for %q", name)
+		}
+		if err := backend.remove(name, *force); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, name)
+	}
+	return nil
 }
 
 func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -813,6 +839,7 @@ type backend interface {
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
 	inspect(name string) (InspectInfo, error)
+	remove(name string, force bool) error
 	listFamilies() ([]Family, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
@@ -851,7 +878,11 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	return b.launch(request.name, prepared.BundleDir, request.detach, request.interactive)
+	status, err := b.launch(request.name, prepared.BundleDir, request.detach, request.interactive)
+	if err == nil {
+		b.recordLaunchState(request.name, request.detach, status)
+	}
+	return status, err
 }
 
 func (b *runtimeBackend) create(request runRequest) error {
@@ -878,7 +909,25 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err != nil {
 		return 1, err
 	}
-	return b.launch(name, info.BundleDir, detach, interactive)
+	status, err := b.launch(name, info.BundleDir, detach, interactive)
+	if err == nil {
+		b.recordLaunchState(name, detach, status)
+	}
+	return status, err
+}
+
+func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	state := "exited"
+	var exitStatus *int
+	if detach && status == 0 {
+		state = "running"
+	} else {
+		exitStatus = &status
+	}
+	if err := store.UpdateState(name, state, exitStatus); err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttos: warning: recording state for %s: %v\n", name, err)
+	}
 }
 
 func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
@@ -900,6 +949,35 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		}
 	}
 	return result, nil
+}
+
+func (b *runtimeBackend) remove(name string, force bool) error {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	if _, err := store.LoadContainer(name); err != nil {
+		return err
+	}
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("checking runtime state before removing %q: %w", name, err)
+	}
+	for _, family := range families {
+		if family.ID != name {
+			continue
+		}
+		if !force && family.State != "stopped" && family.State != "exited" {
+			return fmt.Errorf("container %q is %s; stop it or use --force", name, family.State)
+		}
+		args := []string{"delete"}
+		if force {
+			args = append(args, "--force")
+		}
+		args = append(args, name)
+		if _, err := b.command(args...); err != nil {
+			return fmt.Errorf("deleting runtime container %q: %w", name, err)
+		}
+		break
+	}
+	return store.RemoveContainer(name)
 }
 
 func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool) (int, error) {
@@ -959,6 +1037,60 @@ func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 }
 
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
+	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
+	if b.dataRoot == "" {
+		return runtimeFamilies, runtimeErr
+	}
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	containers, storeErr := store.ListContainers()
+	if storeErr != nil {
+		return nil, storeErr
+	}
+	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
+	for _, container := range containers {
+		state := container.State
+		if state == "" {
+			state = "created"
+		}
+		byID[container.Name] = Family{
+			ID:       container.Name,
+			State:    state,
+			Branches: []Branch{{ID: defaultBranchID, State: state}},
+		}
+	}
+	if runtimeErr == nil {
+		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
+		for _, family := range runtimeFamilies {
+			runtimeIDs[family.ID] = struct{}{}
+			byID[family.ID] = family
+		}
+		for _, container := range containers {
+			if container.State == "running" {
+				if _, ok := runtimeIDs[container.Name]; ok {
+					continue
+				}
+				_ = store.UpdateState(container.Name, "exited", nil)
+				byID[container.Name] = Family{ID: container.Name, State: "exited", Branches: []Branch{{ID: defaultBranchID, State: "exited"}}}
+			}
+		}
+	} else {
+		if len(byID) == 0 {
+			return nil, runtimeErr
+		}
+		for id, family := range byID {
+			family.Error = runtimeErr.Error()
+			byID[id] = family
+		}
+	}
+	families := make([]Family, 0, len(byID))
+	for _, family := range byID {
+		families = append(families, family)
+	}
+	sort.Slice(families, func(i, j int) bool { return families[i].ID < families[j].ID })
+	return families, nil
+}
+
+func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 	output, err := b.command("list", "--format=json", "--sandbox")
 	if err != nil {
 		return nil, err

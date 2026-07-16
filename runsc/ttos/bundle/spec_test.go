@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -90,5 +91,38 @@ func TestValidateName(t *testing.T) {
 		if err := validateName(name); err == nil {
 			t.Errorf("validateName(%q) succeeded", name)
 		}
+	}
+}
+
+func TestStoreLifecycleMetadata(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, State: "created", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	status := 17
+	if err := store.UpdateState("demo", "exited", &status); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	containers, err := store.ListContainers()
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(containers) != 1 || containers[0].State != "exited" || containers[0].ExitStatus == nil || *containers[0].ExitStatus != 17 || containers[0].ExitedAt == nil {
+		t.Fatalf("containers=%+v", containers)
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
+		t.Fatalf("containers after remove=%+v, err=%v", containers, err)
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -50,13 +51,17 @@ type Prepared struct {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	Name      string    `json:"name"`
-	Reference string    `json:"reference"`
-	Digest    string    `json:"digest"`
-	Platform  string    `json:"platform"`
-	BundleDir string    `json:"bundle_dir"`
-	RootFS    string    `json:"rootfs"`
-	CreatedAt time.Time `json:"created_at"`
+	Name       string     `json:"name"`
+	Reference  string     `json:"reference"`
+	Digest     string     `json:"digest"`
+	Platform   string     `json:"platform"`
+	BundleDir  string     `json:"bundle_dir"`
+	RootFS     string     `json:"rootfs"`
+	State      string     `json:"state"`
+	ExitStatus *int       `json:"exit_status,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	ExitedAt   *time.Time `json:"exited_at,omitempty"`
 }
 
 // Prepare pulls content, creates or reuses an immutable root, and writes a new
@@ -116,6 +121,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Platform:  imageInfo.Platform,
 		BundleDir: bundleDir,
 		RootFS:    rootfs,
+		State:     "created",
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
@@ -144,10 +150,74 @@ func (s Store) LoadContainer(name string) (ContainerInfo, error) {
 	if info.Name != name || info.BundleDir == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", name)
 	}
+	if info.State == "" {
+		info.State = "created"
+	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", name, err)
 	}
 	return info, nil
+}
+
+// ListContainers returns all persistent containers ordered by name.
+func (s Store) ListContainers() ([]ContainerInfo, error) {
+	containersDir := filepath.Join(s.Root, "containers")
+	entries, err := os.ReadDir(containersDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []ContainerInfo{}, nil
+		}
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	containers := make([]ContainerInfo, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := s.LoadContainer(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, info)
+	}
+	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+	return containers, nil
+}
+
+// UpdateState records the last known base-container lifecycle state.
+func (s Store) UpdateState(name, state string, exitStatus *int) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	info.State = state
+	info.ExitStatus = exitStatus
+	switch state {
+	case "running":
+		info.StartedAt = &now
+		info.ExitedAt = nil
+	case "exited":
+		info.ExitedAt = &now
+	}
+	path := filepath.Join(s.Root, "containers", name, "container.json")
+	if err := writeJSON(path, &info); err != nil {
+		return fmt.Errorf("updating container %q: %w", name, err)
+	}
+	return nil
+}
+
+// RemoveContainer removes persistent configuration for name. Shared image
+// roots remain until image garbage collection proves that no container uses
+// them.
+func (s Store) RemoveContainer(name string) error {
+	if _, err := s.LoadContainer(name); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(filepath.Join(s.Root, "containers", name)); err != nil {
+		return fmt.Errorf("removing container %q: %w", name, err)
+	}
+	return nil
 }
 
 func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string) (images.RootFSInfo, string, error) {
