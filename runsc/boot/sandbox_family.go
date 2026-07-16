@@ -376,13 +376,6 @@ func (f *SandboxFamily) Destroy(id string) error {
 		b.opMu.Unlock()
 		return fmt.Errorf("branch %q is %s", id, state)
 	}
-	for _, candidate := range f.branches {
-		if candidate.parentID == id {
-			f.mu.Unlock()
-			b.opMu.Unlock()
-			return fmt.Errorf("branch %q still has child %q", id, candidate.id)
-		}
-	}
 	b.state = BranchDestroying
 	paused := b.k.IsPaused()
 	dog := b.watchdog

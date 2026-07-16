@@ -169,6 +169,69 @@ func TestLiveForkPrivateAnonymousMemoryRepeatedRelease(t *testing.T) {
 	}
 }
 
+func TestLiveForkPrivateAnonymousMemoryBranchTreeReleaseOrder(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length:   hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	write := func(name string, memMgr *MemoryManager, value byte) {
+		t.Helper()
+		if n, err := memMgr.CopyOut(ctx, addr, []byte{value}, usermem.IOOpts{}); err != nil || n != 1 {
+			t.Fatalf("%s.CopyOut: n=%d err=%v", name, n, err)
+		}
+	}
+	read := func(name string, memMgr *MemoryManager, want byte) {
+		t.Helper()
+		buf := []byte{0}
+		if n, err := memMgr.CopyIn(ctx, addr, buf, usermem.IOOpts{}); err != nil || n != 1 {
+			t.Fatalf("%s.CopyIn: n=%d err=%v", name, n, err)
+		}
+		if buf[0] != want {
+			t.Fatalf("%s byte: got %#x, want %#x", name, buf[0], want)
+		}
+	}
+
+	write("parent", parent, 0x11)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("clone child: %v", err)
+	}
+	sibling, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("clone sibling: %v", err)
+	}
+	write("child", child, 0x22)
+	grandchild, err := cloneMemoryManagerMetadata(ctx, child)
+	if err != nil {
+		t.Fatalf("clone grandchild: %v", err)
+	}
+
+	// Destroy ancestors before descendants. Surviving branches must retain both
+	// their page references and their branch-local view of the bytes.
+	parent.DecUsers(ctx)
+	read("sibling after parent release", sibling, 0x11)
+	read("child after parent release", child, 0x22)
+	read("grandchild after parent release", grandchild, 0x22)
+	child.DecUsers(ctx)
+	read("sibling after child release", sibling, 0x11)
+	read("grandchild after child release", grandchild, 0x22)
+	write("grandchild", grandchild, 0x33)
+	read("sibling after grandchild write", sibling, 0x11)
+	read("grandchild after write", grandchild, 0x33)
+
+	sibling.DecUsers(ctx)
+	read("grandchild after sibling release", grandchild, 0x33)
+	grandchild.DecUsers(ctx)
+}
+
 func BenchmarkLiveForkPrivateAnonymousMemory(b *testing.B) {
 	for _, size := range []uint64{1 << 20, 1 << 30} {
 		b.Run(fmt.Sprintf("resident_%d_MiB", size>>20), func(b *testing.B) {

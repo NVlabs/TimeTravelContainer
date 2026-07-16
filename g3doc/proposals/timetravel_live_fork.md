@@ -659,6 +659,10 @@ Enable any branch to fork again. Optimize metadata streaming, reference
 acquisition, and range marking based on profiles. Consider persistent metadata
 structures only after correctness and measurement.
 
+`ParentID` records historical creation lineage, not a lifetime dependency.
+Every successful child owns its complete Kernel and backing references, so an
+ancestor may be destroyed while descendants continue to run and fork.
+
 Gate: a branch tree can be repeatedly forked and destroyed in arbitrary order
 without page leaks, use-after-free, or cross-branch state changes.
 
