@@ -247,6 +247,7 @@ Global options:
 Commands:
   images [OPTIONS]               List local images
   image COMMAND                  Manage local images (ls, inspect, rm)
+  container COMMAND              Docker-style container command aliases
   rmi [OPTIONS] IMAGE...         Remove one or more local images
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
@@ -256,6 +257,8 @@ Commands:
   logs [-f] [--tail N] TARGET    Print or follow a branch's init-console logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   inspect [OPTIONS] CONTAINER... Show Docker and TTOS branch/process state
+  wait [OPTIONS] TARGET...       Wait for branches and print exit codes
+  restart [OPTIONS] CONTAINER... Restart one or more container families
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
@@ -277,6 +280,8 @@ run immediately unless --paused is set; omitting DEST generates a branch ID.
 func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	var err error
 	switch args[0] {
+	case "container":
+		err = runContainerNamespace(args[1:], stdout, stderr, backend)
 	case "images":
 		err = runImages(args[1:], stdout, stderr, backend)
 	case "image":
@@ -317,6 +322,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runKill(args[1:], stdout, stderr, backend)
 	case "stop":
 		err = runStop(args[1:], stdout, stderr, backend)
+	case "wait":
+		err = runWait(args[1:], stdout, stderr, backend)
+	case "restart":
+		err = runRestart(args[1:], stdout, stderr, backend)
 	case "branch":
 		err = runBranch(args[1:], stdout, backend)
 	case "volume":
@@ -338,6 +347,48 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		return 1
 	}
 	return 0
+}
+
+func runContainerNamespace(args []string, stdout, stderr io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos container COMMAND [OPTIONS]")
+	}
+	switch args[0] {
+	case "run":
+		return runContainer(args[1:], stdout, stderr, backend)
+	case "create":
+		return runCreate(args[1:], stdout, stderr, backend)
+	case "start":
+		return runStart(args[1:], stdout, stderr, backend)
+	case "attach":
+		return runAttach(args[1:], stderr, backend)
+	case "logs":
+		return runLogs(args[1:], stderr, backend)
+	case "exec":
+		return runExec(args[1:], stderr, backend)
+	case "inspect":
+		return runInspect(args[1:], stdout, stderr, backend)
+	case "rm":
+		return runRemove(args[1:], stdout, stderr, backend)
+	case "ls", "ps":
+		return runPs(args[1:], stdout, stderr, backend)
+	case "top":
+		return runTop(args[1:], stdout, stderr, backend)
+	case "pause":
+		return runPauseResume(args[1:], stdout, backend, true)
+	case "unpause":
+		return runPauseResume(args[1:], stdout, backend, false)
+	case "kill":
+		return runKill(args[1:], stdout, stderr, backend)
+	case "stop":
+		return runStop(args[1:], stdout, stderr, backend)
+	case "wait":
+		return runWait(args[1:], stdout, stderr, backend)
+	case "restart":
+		return runRestart(args[1:], stdout, stderr, backend)
+	default:
+		return fmt.Errorf("unknown container command %q", args[0])
+	}
 }
 
 type stringSlice []string
@@ -856,21 +907,29 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("usage: ttos start [--attach] CONTAINER")
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos start [--attach] CONTAINER [CONTAINER...]")
 	}
 	if *interactive && !*attach {
 		return errors.New("--interactive requires --attach")
 	}
-	status, err := backend.start(fs.Arg(0), !*attach, *interactive)
-	if err != nil {
-		return err
+	if *attach && fs.NArg() != 1 {
+		return errors.New("--attach supports exactly one container")
 	}
-	if status != 0 {
-		return exitStatus{code: status}
-	}
-	if !*attach {
-		fmt.Fprintln(stdout, fs.Arg(0))
+	for _, name := range fs.Args() {
+		if strings.Contains(name, "@") {
+			return fmt.Errorf("start accepts container families, not branch selector %q", name)
+		}
+		status, err := backend.start(name, !*attach, *interactive)
+		if err != nil {
+			return err
+		}
+		if status != 0 {
+			return exitStatus{code: status}
+		}
+		if !*attach {
+			fmt.Fprintln(stdout, name)
+		}
 	}
 	return nil
 }
@@ -1220,7 +1279,7 @@ func writeInspectFormat(w io.Writer, results []InspectInfo, format string) error
 	}
 	tmpl, err := template.New("inspect").Funcs(template.FuncMap{
 		"json": func(value any) (string, error) {
-			data, err := json.Marshal(value)
+			data, err := marshalInspectTemplateJSON(value)
 			return string(data), err
 		},
 		"join":  strings.Join,
@@ -1233,7 +1292,7 @@ func writeInspectFormat(w io.Writer, results []InspectInfo, format string) error
 	}
 	for _, result := range results {
 		var output bytes.Buffer
-		if err := tmpl.Execute(&output, result); err != nil {
+		if err := tmpl.Execute(&output, inspectTemplateValuesFor(result)); err != nil {
 			return fmt.Errorf("executing inspect format: %w", err)
 		}
 		if output.Len() == 0 || output.Bytes()[output.Len()-1] != '\n' {
@@ -1244,6 +1303,43 @@ func writeInspectFormat(w io.Writer, results []InspectInfo, format string) error
 		}
 	}
 	return nil
+}
+
+type inspectTemplateValues map[string]any
+
+func inspectTemplateValuesFor(result InspectInfo) inspectTemplateValues {
+	return inspectTemplateValues{
+		"Id":           result.ID,
+		"ID":           result.ID,
+		"Created":      result.Created,
+		"Path":         result.Path,
+		"Args":         result.Args,
+		"State":        result.State,
+		"Image":        result.Image,
+		"Name":         result.Name,
+		"RestartCount": result.RestartCount,
+		"Driver":       result.Driver,
+		"Platform":     result.Platform,
+		"GraphDriver":  result.GraphDriver,
+		"Config":       result.Config,
+		"HostConfig":   result.HostConfig,
+		"Mounts":       result.Mounts,
+		"TTOS":         result.TTOS,
+	}
+}
+
+func marshalInspectTemplateJSON(value any) ([]byte, error) {
+	values, ok := value.(inspectTemplateValues)
+	if !ok {
+		return json.Marshal(value)
+	}
+	dockerValues := make(map[string]any, len(values)-1)
+	for key, item := range values {
+		if key != "ID" {
+			dockerValues[key] = item
+		}
+	}
+	return json.Marshal(dockerValues)
 }
 
 func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -2017,6 +2113,133 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	condition := fs.String("condition", "not-running", "wait condition (not-running only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos wait [--condition not-running] TARGET [TARGET...]")
+	}
+	if *condition != "not-running" {
+		return fmt.Errorf("wait condition %q is not implemented; use 'not-running'", *condition)
+	}
+	targets := make([]selector, 0, fs.NArg())
+	for _, arg := range fs.Args() {
+		target, err := parseSelector(arg)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", arg, err)
+		}
+		targets = append(targets, target)
+	}
+	waiters := make([]<-chan waitResult, len(targets))
+	for i, target := range targets {
+		waited := make(chan waitResult, 1)
+		waiters[i] = waited
+		go func(target selector, waited chan<- waitResult) {
+			status, err := backend.wait(target)
+			waited <- waitResult{status: status, err: err}
+		}(target, waited)
+	}
+	for i, waited := range waiters {
+		result := <-waited
+		if result.err != nil {
+			return fmt.Errorf("waiting for %s: %w", targets[i], result.err)
+		}
+		fmt.Fprintln(stdout, waitStatusExitCode(result.status))
+	}
+	return nil
+}
+
+func runRestart(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var timeout int
+	fs.IntVar(&timeout, "time", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "timeout", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "t", 10, "seconds to wait for graceful termination; -1 waits forever")
+	force := fs.Bool("force", false, "discard live descendant branches and in-memory managed volumes")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos restart [--time SECONDS] CONTAINER [CONTAINER...]")
+	}
+	if timeout < -1 {
+		return errors.New("restart timeout must be -1 or greater")
+	}
+	for _, name := range fs.Args() {
+		if strings.Contains(name, "@") {
+			return fmt.Errorf("restart accepts container families, not branch selector %q", name)
+		}
+		info, err := backend.inspect(name)
+		if err != nil {
+			return fmt.Errorf("inspecting %s before restart: %w", name, err)
+		}
+		if reason := restartDataLossReason(info); reason != "" && !*force {
+			return fmt.Errorf("restarting %q would discard %s; use --force", name, reason)
+		}
+		target := selector{container: name, branch: defaultBranchID}
+		switch info.State.Status {
+		case "paused":
+			if err := backend.resume(target); err != nil {
+				return fmt.Errorf("resuming %s before restart: %w", target, err)
+			}
+			if err := stopBranch(target, timeout, backend); err != nil {
+				return err
+			}
+		case "running", "restarting":
+			if err := stopBranch(target, timeout, backend); err != nil {
+				return err
+			}
+		case "created", "exited", "failed", "dead":
+		default:
+			return fmt.Errorf("cannot restart container %q in state %q", name, info.State.Status)
+		}
+		status, err := backend.start(name, true, false)
+		if err != nil {
+			return fmt.Errorf("starting %s after restart: %w", name, err)
+		}
+		if status != 0 {
+			return exitStatus{code: status}
+		}
+		fmt.Fprintln(stdout, name)
+	}
+	return nil
+}
+
+func restartDataLossReason(info InspectInfo) string {
+	switch info.State.Status {
+	case "running", "paused", "restarting":
+	default:
+		return ""
+	}
+	for _, branch := range info.TTOS.Branches {
+		if branch.Metadata.ID != defaultBranchID {
+			return fmt.Sprintf("live descendant branch %q", branch.Metadata.ID)
+		}
+	}
+	volumeNames := []string{}
+	if info.TTOS.Runtime != nil {
+		volumeNames = append(volumeNames, info.TTOS.Runtime.Volumes...)
+	} else {
+		seen := make(map[string]bool)
+		for _, volume := range info.TTOS.Container.Volumes {
+			if !seen[volume.Name] {
+				volumeNames = append(volumeNames, volume.Name)
+				seen[volume.Name] = true
+			}
+		}
+		sort.Strings(volumeNames)
+	}
+	if len(volumeNames) != 0 {
+		return fmt.Sprintf("in-memory managed volume state (%s)", strings.Join(volumeNames, ", "))
+	}
+	return ""
+}
+
 type waitResult struct {
 	status uint32
 	err    error
@@ -2629,11 +2852,34 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err != nil {
 		return 1, err
 	}
+	if err := b.removeStoppedRuntime(name); err != nil {
+		return 1, err
+	}
 	status, err := b.launch(name, info.BundleDir, detach, interactive)
 	if err == nil {
 		b.recordLaunchState(name, detach, status)
 	}
 	return status, err
+}
+
+func (b *runtimeBackend) removeStoppedRuntime(name string) error {
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
+	}
+	for _, family := range families {
+		if family.ID != name {
+			continue
+		}
+		if family.State != "stopped" && family.State != "exited" {
+			return fmt.Errorf("container %q is already %s", name, family.State)
+		}
+		if _, err := b.command("delete", "--force", name); err != nil {
+			return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
+		}
+		return nil
+	}
+	return nil
 }
 
 func (b *runtimeBackend) exec(request execRequest) (int, error) {

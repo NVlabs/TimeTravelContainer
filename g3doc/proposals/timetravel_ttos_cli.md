@@ -6,16 +6,19 @@ Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
-initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
-plus synchronous non-TTY exec into a selected live branch. Container inspect
-uses Docker-shaped JSON and Go templates while adding a `TTOS` section with
-the family tree, fork timings, per-branch processes, and optional live-fork
-eligibility reports. Effective Docker entrypoint, command, user, and image
-labels are retained in the generated bundle for later inspection. Generated
-bundles include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and
-`/dev/shm`, and a private devpts instance with `/dev/ptmx`. Existing host paths
-can be attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
-tmpfs volumes can be attached at one or more paths, and their state forks CoW
+initial run/create/start/wait/restart/inspect/list/remove lifecycle with
+persistent metadata, plus synchronous non-TTY exec into a selected live branch.
+Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
+`start` and `wait` accept multiple containers and preserve argument-order
+output. Container inspect uses Docker-shaped JSON and Go templates while adding
+a `TTOS` section with the family tree, fork timings, per-branch processes, and
+optional live-fork eligibility reports. Effective Docker entrypoint, command,
+user, and image labels are retained in the generated bundle for later
+inspection. Generated bundles include procfs, restricted read-only sysfs,
+tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
+`/dev/ptmx`. Existing host paths can be attached read-only with Docker-style
+`-v` or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
+more paths, and their state forks CoW
 with each live branch. An opt-in non-TTY internal-console substrate now provides
 branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
@@ -143,7 +146,21 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Support `-t` after the internal detachable console is implemented.
 - [x] `ttos create` as persistent image-root and OCI-bundle preparation.
 - [x] `ttos start CONTAINER` for created/exited base containers, detached by
-      default with optional `--attach`.
+      default with optional `--attach`. Multiple detached containers start in
+      argument order, and stale stopped runsc records are removed before OCI
+      recreation while live duplicate IDs remain protected.
+- [x] Docker-style `ttos container` aliases for run, create, start, attach,
+      logs, exec, inspect, rm, ls/ps, top, pause/unpause, kill, stop, wait, and
+      restart.
+- [x] `ttos wait [--condition not-running] CONTAINER[@BRANCH]...` starts all
+      waits concurrently, prints Docker exit codes in argument order, and
+      retains branch-aware wait semantics.
+- [x] `ttos restart CONTAINER...` for created, exited, running, or paused base
+      containers, including TERM/timeout/KILL behavior. Restart rejects an
+      individual branch because destroyed in-memory branches cannot be
+      reconstructed. Live descendants or in-memory managed volumes require
+      explicit `--force`; persistent volume restart parity remains blocked on
+      persistent managed-volume backing.
 - [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
 - [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
 - [x] Initial `ttos rm CONTAINER`: remove stopped/created family metadata,

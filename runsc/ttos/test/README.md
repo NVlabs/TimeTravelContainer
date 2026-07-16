@@ -10,6 +10,10 @@ covers:
   running, forked, paused, and exited states, including effective image
   configuration, user mounts, sandbox PID, per-branch processes and timings,
   and explicit fork-eligibility reports;
+- Docker-style `container` aliases, multi-container detached `start`, concurrent
+  `wait` with argument-ordered exit codes, restart of an exited container, and
+  an explicitly forced running-family restart where in-memory managed-volume
+  contents are expected to be recreated;
 - BusyBox process/procfs/sysfs startup;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;

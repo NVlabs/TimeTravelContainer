@@ -61,6 +61,8 @@ echo host-readonly >"$HOST_FIXTURE/value"
 PREFIX="e2e-$$"
 LIFECYCLE="$PREFIX-lifecycle"
 CONSOLE_STRESS="$PREFIX-console-stress"
+MULTI_A="$PREFIX-multi-a"
+MULTI_B="$PREFIX-multi-b"
 VOLUME="$PREFIX-state"
 
 ttos() {
@@ -85,7 +87,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$LIFECYCLE"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$LIFECYCLE"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -118,10 +120,22 @@ ttos start --attach "$PREFIX-busybox"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
   "exited|0|false" ] ||
   fail "exited-container inspect did not expose exit state"
+ttos container restart --time 1 "$PREFIX-busybox"
+[ "$(ttos container wait "$PREFIX-busybox")" = "0" ] ||
+  fail "restart/wait did not preserve the BusyBox command exit status"
 ttos rm "$PREFIX-busybox"
 ttos image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
   fail "image inspection did not report the materialized BusyBox root"
+
+ttos container create --name "$MULTI_A" "$BUSYBOX_IMAGE" sh -c 'exit 3'
+ttos container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
+MULTI_STARTED=$(ttos container start "$MULTI_A" "$MULTI_B")
+echo "$MULTI_STARTED" | grep -qx "$MULTI_A" || fail "multi-start omitted $MULTI_A"
+echo "$MULTI_STARTED" | grep -qx "$MULTI_B" || fail "multi-start omitted $MULTI_B"
+MULTI_WAIT=$(ttos wait "$MULTI_A" "$MULTI_B")
+[ "$MULTI_WAIT" = "$(printf '3\n4')" ] || fail "multi-wait returned: $MULTI_WAIT"
+ttos container rm "$MULTI_A" "$MULTI_B"
 
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'
@@ -175,6 +189,13 @@ ttos run --name "$LIFECYCLE" --detach \
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached init did not produce console output"
+  sleep 1
+done
+
+ttos container restart --force --time 2 "$LIFECYCLE"
+deadline=$(( $(date +%s) + 15 ))
+while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "restarted detached init did not produce console output"
   sleep 1
 done
 

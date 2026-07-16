@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -613,6 +614,44 @@ func TestCreateAndStart(t *testing.T) {
 	}
 }
 
+func TestStartMultipleAndContainerAliases(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"container", "start", "one", "two"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("container start status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+		t.Errorf("multi-start output=%q, want %q", got, want)
+	}
+	if got, want := b.startCalls, []startCall{{name: "one", detach: true}, {name: "two", detach: true}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("start calls=%+v, want %+v", got, want)
+	}
+
+	b = &fakeBackend{}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"start", "--attach", "one", "two"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("multi-start accepted --attach")
+	}
+	if len(b.startCalls) != 0 {
+		t.Errorf("rejected attached multi-start made calls %+v", b.startCalls)
+	}
+
+	b = &fakeBackend{inspectInfo: InspectInfo{ID: "demo", Name: "/demo"}}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"container", "inspect", "-f", "{{.Id}}|{{.ID}}|{{json .}}", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("container inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); !strings.HasPrefix(got, "demo|demo|") || !strings.Contains(got, `"Id":"demo"`) || strings.Contains(got, `"ID":`) {
+		t.Errorf("Docker and legacy ID template output=%q", got)
+	}
+
+	if status := runCommand([]string{"container", "unknown"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("container namespace accepted an unknown command")
+	}
+}
+
 func TestAttach(t *testing.T) {
 	b := &fakeBackend{waitStatus: uint32(7 << 8)}
 	var stdout, stderr bytes.Buffer
@@ -1200,6 +1239,119 @@ func TestStopEscalatesToKill(t *testing.T) {
 	}
 }
 
+func TestWaitPrintsDockerExitCodesInArgumentOrder(t *testing.T) {
+	main := selector{container: "web", branch: "main"}
+	child := selector{container: "web", branch: "child"}
+	b := &fakeBackend{waitStatuses: map[selector]uint32{
+		main:  uint32(7 << 8),
+		child: uint32(syscall.SIGTERM),
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"container", "wait", "web", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("wait status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "7\n143\n"; got != want {
+		t.Errorf("wait output=%q, want %q", got, want)
+	}
+	b.mu.Lock()
+	calls := append([]selector(nil), b.waitCalls...)
+	b.mu.Unlock()
+	if len(calls) != 2 || !containsSelector(calls, main) || !containsSelector(calls, child) {
+		t.Errorf("wait calls=%+v", calls)
+	}
+
+	b = &fakeBackend{}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"wait", "--condition", "removed", "web"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("wait accepted unsupported removed condition")
+	}
+}
+
+func containsSelector(values []selector, target selector) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		state      string
+		wantSignal bool
+		wantResume bool
+	}{
+		{name: "running", state: "running", wantSignal: true},
+		{name: "exited", state: "exited"},
+		{name: "paused", state: "paused", wantSignal: true, wantResume: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			b := &fakeBackend{inspectInfo: InspectInfo{State: InspectState{Status: test.state}}}
+			var stdout, stderr bytes.Buffer
+			if status := runCommand([]string{"restart", "--time", "1", "web"}, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("restart status=%d, stderr=%q", status, stderr.String())
+			}
+			if got, want := stdout.String(), "web\n"; got != want {
+				t.Errorf("restart output=%q, want %q", got, want)
+			}
+			if got, want := b.startCalls, []startCall{{name: "web", detach: true}}; !reflect.DeepEqual(got, want) {
+				t.Errorf("start calls=%+v, want %+v", got, want)
+			}
+			if got := len(b.signals) != 0; got != test.wantSignal {
+				t.Errorf("signals=%+v, wantSignal=%t", b.signals, test.wantSignal)
+			}
+			wantTarget := selector{container: "web", branch: "main"}
+			if test.wantSignal && (len(b.signals) != 1 || b.signals[0].target != wantTarget || b.signals[0].signal != 15) {
+				t.Errorf("restart signals=%+v, want main SIGTERM", b.signals)
+			}
+			if test.wantResume && b.resumed != wantTarget {
+				t.Errorf("resumed=%+v, want %+v", b.resumed, wantTarget)
+			}
+		})
+	}
+
+	descendantInfo := InspectInfo{
+		State: InspectState{Status: "running", Running: true},
+		TTOS: TTOSInspectInfo{Branches: []InspectBranch{
+			{Metadata: Branch{ID: "main", State: "running"}},
+			{Metadata: Branch{ID: "child", ParentID: "main", State: "running"}},
+		}},
+	}
+	if got, want := restartDataLossReason(descendantInfo), `live descendant branch "child"`; got != want {
+		t.Errorf("descendant restart reason=%q, want %q", got, want)
+	}
+	volumeInfo := InspectInfo{
+		State: InspectState{Status: "running", Running: true},
+		TTOS:  TTOSInspectInfo{Runtime: &Family{Volumes: []string{"cache"}}},
+	}
+	if got, want := restartDataLossReason(volumeInfo), "in-memory managed volume state (cache)"; got != want {
+		t.Errorf("volume restart reason=%q, want %q", got, want)
+	}
+	b := &fakeBackend{inspectInfo: descendantInfo}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("restart discarded a descendant without --force")
+	}
+	if len(b.signals) != 0 || len(b.startCalls) != 0 {
+		t.Errorf("rejected restart mutated backend: signals=%+v starts=%+v", b.signals, b.startCalls)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"restart", "--force", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("forced restart status=%d, stderr=%q", status, stderr.String())
+	}
+
+	b = &fakeBackend{}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"restart", "web@child"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("restart accepted an individual branch")
+	}
+}
+
 func TestAcquireConsoleStdinIsExclusiveAndReleasable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "main.stdin.lock")
 	target := selector{container: "demo", branch: "main"}
@@ -1503,6 +1655,56 @@ exit 2
 	}
 }
 
+func TestRemoveStoppedRuntimeBeforeStart(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+if [ "$3" = "list" ]; then
+	case "$(cat "$0.mode")" in
+	stopped) echo '[{"id":"web","status":"stopped"}]' ;;
+	running) echo '[{"id":"web","status":"running"}]' ;;
+	absent) echo '[]' ;;
+	esac
+	exit 0
+fi
+if [ "$3" = "delete" ] && [ "$4" = "--force" ] && [ "$5" = "web" ]; then
+	touch "$0.deleted"
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	if err := os.WriteFile(runsc+".mode", []byte("stopped\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.removeStoppedRuntime("web"); err != nil {
+		t.Fatalf("removeStoppedRuntime(stopped): %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Errorf("stopped runtime was not deleted: %v", err)
+	}
+	if err := os.Remove(runsc + ".deleted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsc+".mode", []byte("running\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.removeStoppedRuntime("web"); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("removeStoppedRuntime(running)=%v, want already-running error", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); !os.IsNotExist(err) {
+		t.Errorf("running runtime delete marker err=%v", err)
+	}
+}
+
 func TestListFamiliesMergesPersistentStateAndReconcilesStaleRunning(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -1582,7 +1784,14 @@ type signalCall struct {
 	all    bool
 }
 
+type startCall struct {
+	name        string
+	detach      bool
+	interactive bool
+}
+
 type fakeBackend struct {
+	mu                sync.Mutex
 	families          []Family
 	processTarget     selector
 	processList       []ProcessInfo
@@ -1597,7 +1806,9 @@ type fakeBackend struct {
 	destroyed         selector
 	signals           []signalCall
 	waited            selector
+	waitCalls         []selector
 	waitStatus        uint32
+	waitStatuses      map[selector]uint32
 	waitRelease       chan struct{}
 	pullReference     string
 	pullPlatform      string
@@ -1614,6 +1825,7 @@ type fakeBackend struct {
 	runStatus         int
 	created           bool
 	started           string
+	startCalls        []startCall
 	startDetach       bool
 	startInteractive  bool
 	attached          selector
@@ -1644,6 +1856,7 @@ func (b *fakeBackend) run(request runRequest) (int, error) {
 }
 
 func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) {
+	b.startCalls = append(b.startCalls, startCall{name: name, detach: detach, interactive: interactive})
 	b.started = name
 	b.startDetach = detach
 	b.startInteractive = interactive
@@ -1750,11 +1963,20 @@ func (b *fakeBackend) signal(target selector, signal int, all bool) error {
 }
 
 func (b *fakeBackend) wait(target selector) (uint32, error) {
+	b.mu.Lock()
 	b.waited = target
-	if b.waitRelease != nil {
-		<-b.waitRelease
+	b.waitCalls = append(b.waitCalls, target)
+	status := b.waitStatus
+	if value, ok := b.waitStatuses[target]; ok {
+		status = value
 	}
-	return b.waitStatus, b.err
+	release := b.waitRelease
+	err := b.err
+	b.mu.Unlock()
+	if release != nil {
+		<-release
+	}
+	return status, err
 }
 
 func (b *fakeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
