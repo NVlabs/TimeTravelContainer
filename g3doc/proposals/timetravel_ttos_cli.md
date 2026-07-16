@@ -4,8 +4,9 @@ Status: TODO roadmap following the live-fork prototype.
 
 Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
-sandboxes through runsc's JSON command surface. Image-backed lifecycle,
-containerd, `ttosd`, exec, attach, mounts, and managed volumes remain TODO.
+sandboxes through runsc's JSON command surface and pulls OCI/Docker images
+through containerd. Image-backed run/create lifecycle, `ttosd`, exec, attach,
+mounts, and managed volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -73,9 +74,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### Images
 
-- [ ] `ttos pull IMAGE` with Docker Hub shorthand such as `ubuntu:24.04`.
-- [ ] Normalize unqualified names to `docker.io/library/...`.
-- [ ] Support OCI registries, tags, immutable digests, and multi-architecture
+- [x] `ttos pull IMAGE` with Docker Hub shorthand such as `ubuntu:24.04`.
+- [x] Normalize unqualified names to `docker.io/library/...`.
+- [x] Support OCI registries, tags, immutable digests, and multi-architecture
       manifest selection.
 - [ ] Integrate registry authentication and Docker-compatible credential
       helpers without storing plaintext credentials in the state database.
@@ -269,9 +270,11 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ## Image and storage backend
 
-- [ ] Use containerd's client APIs for registry pulls, OCI content, manifest
-      resolution, unpacking, and garbage collection rather than implementing a
-      Docker registry client from scratch.
+- [x] Use containerd's client APIs for registry pulls, OCI content, manifest
+      resolution, and unpacking rather than implementing a Docker registry
+      client from scratch.
+- [ ] Use containerd leases and APIs for image removal and content garbage
+      collection.
 - [ ] Select a rootless-compatible snapshotter; prefer an immutable directory
       lower that can be exposed to runsc through a read-only gofer.
 - [ ] Construct OCI specs and mount manifests from image config plus `ttos run`

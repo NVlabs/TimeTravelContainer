@@ -16,6 +16,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,17 +30,22 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/runsc/flag"
+	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 const (
-	defaultRuntimeRoot = "/var/run/runsc"
-	defaultBranchID    = "main"
+	defaultRuntimeRoot      = "/var/run/runsc"
+	defaultContainerdSocket = "/run/containerd/containerd.sock"
+	defaultImageNamespace   = "ttos"
+	defaultBranchID         = "main"
 )
 
 type options struct {
-	root  string
-	runsc string
+	root       string
+	runsc      string
+	containerd string
+	namespace  string
 }
 
 // Run executes ttos with args and returns a process exit status.
@@ -56,11 +62,21 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
-	return runCommand(args, stdout, stderr, &runtimeBackend{root: opts.root, runsc: opts.runsc})
+	return runCommand(args, stdout, stderr, &runtimeBackend{
+		root:       opts.root,
+		runsc:      opts.runsc,
+		containerd: opts.containerd,
+		namespace:  opts.namespace,
+	})
 }
 
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
-	opts := options{root: runtimeRoot(), runsc: runscPath()}
+	opts := options{
+		root:       runtimeRoot(),
+		runsc:      runscPath(),
+		containerd: containerdAddress(),
+		namespace:  defaultImageNamespace,
+	}
 	for len(args) != 0 {
 		arg := args[0]
 		switch {
@@ -94,6 +110,30 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 				return opts, nil, false, errors.New("--runsc requires a path")
 			}
 			args = args[1:]
+		case arg == "--containerd":
+			if len(args) < 2 || args[1] == "" {
+				return opts, nil, false, errors.New("--containerd requires a socket path")
+			}
+			opts.containerd = args[1]
+			args = args[2:]
+		case strings.HasPrefix(arg, "--containerd="):
+			opts.containerd = strings.TrimPrefix(arg, "--containerd=")
+			if opts.containerd == "" {
+				return opts, nil, false, errors.New("--containerd requires a socket path")
+			}
+			args = args[1:]
+		case arg == "--namespace":
+			if len(args) < 2 || args[1] == "" {
+				return opts, nil, false, errors.New("--namespace requires a name")
+			}
+			opts.namespace = args[1]
+			args = args[2:]
+		case strings.HasPrefix(arg, "--namespace="):
+			opts.namespace = strings.TrimPrefix(arg, "--namespace=")
+			if opts.namespace == "" {
+				return opts, nil, false, errors.New("--namespace requires a name")
+			}
+			args = args[1:]
 		case strings.HasPrefix(arg, "-"):
 			return opts, nil, false, fmt.Errorf("unknown global option %q", arg)
 		default:
@@ -123,12 +163,29 @@ func runscPath() string {
 	return "runsc"
 }
 
+func containerdAddress() string {
+	if address := os.Getenv("CONTAINERD_ADDRESS"); address != "" {
+		return address
+	}
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "containerd", "containerd.sock")
+	}
+	return defaultContainerdSocket
+}
+
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: ttos [--root PATH] [--runsc PATH] COMMAND
+	fmt.Fprint(w, `Usage: ttos [GLOBAL OPTIONS] COMMAND
 
 Manage TimeTravelOS container families and live branches.
 
+Global options:
+  --root PATH                    runsc state root
+  --runsc PATH                   TimeTravel-enabled runsc executable
+  --containerd PATH              containerd socket
+  --namespace NAME               containerd namespace (default: ttos)
+
 Commands:
+  pull [OPTIONS] IMAGE           Pull and unpack an OCI/Docker image
   ls [--tree|--json]              List container families and branch trees
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
@@ -145,6 +202,8 @@ run immediately unless --paused is set; omitting DEST generates a branch ID.
 func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	var err error
 	switch args[0] {
+	case "pull":
+		err = runPull(args[1:], stdout, stderr, backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "fork":
@@ -172,6 +231,43 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		return 1
 	}
 	return 0
+}
+
+func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("pull", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	unpack := fs.Bool("unpack", true, "unpack the selected platform after pulling")
+	snapshotter := fs.String("snapshotter", defaultSnapshotter(), "containerd snapshotter used for unpacking")
+	quiet := fs.Bool("quiet", false, "only print the pulled digest")
+	fs.BoolVar(quiet, "q", false, "only print the pulled digest")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos pull [OPTIONS] IMAGE")
+	}
+	reference, err := ttosimages.NormalizeReference(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	info, err := backend.pull(reference, *platform, *snapshotter, *unpack)
+	if err != nil {
+		return err
+	}
+	if *quiet {
+		fmt.Fprintln(stdout, info.Digest)
+		return nil
+	}
+	fmt.Fprintf(stdout, "Pulled %s\nDigest: %s\nPlatform: %s\n", info.Reference, info.Digest, info.Platform)
+	return nil
+}
+
+func defaultSnapshotter() string {
+	if snapshotter := os.Getenv("CONTAINERD_SNAPSHOTTER"); snapshotter != "" {
+		return snapshotter
+	}
+	return "native"
 }
 
 func runList(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -234,9 +330,9 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool) error {
 	if len(args) == 0 {
 		if pause {
-			return errors.New("usage: ttos pause TARGET...")
+			return errors.New("usage: ttos pause TARGET [TARGET...]")
 		}
-		return errors.New("usage: ttos resume TARGET...")
+		return errors.New("usage: ttos resume TARGET [TARGET...]")
 	}
 	for _, arg := range args {
 		target, err := parseSelector(arg)
@@ -267,7 +363,7 @@ func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttos kill [--signal SIGNAL] TARGET...")
+		return errors.New("usage: ttos kill [--signal SIGNAL] TARGET [TARGET...]")
 	}
 	signal, err := parseSignal(signalName)
 	if err != nil {
@@ -297,7 +393,7 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttos stop [--time SECONDS] TARGET...")
+		return errors.New("usage: ttos stop [--time SECONDS] TARGET [TARGET...]")
 	}
 	if timeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
@@ -381,7 +477,7 @@ func parseSignal(value string) (int, error) {
 
 func runBranch(args []string, stdout io.Writer, backend backend) error {
 	if len(args) < 2 || args[0] != "rm" {
-		return errors.New("usage: ttos branch rm TARGET...")
+		return errors.New("usage: ttos branch rm TARGET [TARGET...]")
 	}
 	for _, arg := range args[1:] {
 		target, err := parseSelector(arg)
@@ -465,6 +561,7 @@ type Family struct {
 }
 
 type backend interface {
+	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
 	listFamilies() ([]Family, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
@@ -475,8 +572,21 @@ type backend interface {
 }
 
 type runtimeBackend struct {
-	root  string
-	runsc string
+	root       string
+	runsc      string
+	containerd string
+	namespace  string
+}
+
+func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
+	return ttosimages.Pull(context.Background(), ttosimages.PullOptions{
+		Address:     b.containerd,
+		Namespace:   b.namespace,
+		Reference:   reference,
+		Platform:    platform,
+		Snapshotter: snapshotter,
+		Unpack:      unpack,
+	})
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {

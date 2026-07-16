@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 )
 
 func TestParseSelector(t *testing.T) {
@@ -146,6 +148,40 @@ func TestBranchRMRejectsMain(t *testing.T) {
 	}
 	if b.destroyed.container != "" {
 		t.Errorf("destroy unexpectedly called for %+v", b.destroyed)
+	}
+}
+
+func TestPullNormalizesDockerReference(t *testing.T) {
+	b := &fakeBackend{pullInfo: ttosimages.Info{
+		Reference: "docker.io/library/ubuntu:latest",
+		Digest:    "sha256:1234",
+		Platform:  "linux/amd64",
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"pull", "ubuntu"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("pull status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.pullReference != "docker.io/library/ubuntu:latest" || b.pullSnapshotter != "native" || !b.pullUnpack {
+		t.Errorf("pull call: reference=%q snapshotter=%q unpack=%t", b.pullReference, b.pullSnapshotter, b.pullUnpack)
+	}
+	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("pull output=%q, want %q", got, want)
+	}
+}
+
+func TestPullOptionsAndQuietOutput(t *testing.T) {
+	b := &fakeBackend{pullInfo: ttosimages.Info{Digest: "sha256:5678"}}
+	var stdout, stderr bytes.Buffer
+	args := []string{"pull", "--platform", "linux/arm64", "--snapshotter", "overlayfs", "--unpack=false", "-q", "example/app:v1"}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("pull status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.pullReference != "docker.io/example/app:v1" || b.pullPlatform != "linux/arm64" || b.pullSnapshotter != "overlayfs" || b.pullUnpack {
+		t.Errorf("pull call: reference=%q platform=%q snapshotter=%q unpack=%t", b.pullReference, b.pullPlatform, b.pullSnapshotter, b.pullUnpack)
+	}
+	if got := stdout.String(); got != "sha256:5678\n" {
+		t.Errorf("quiet pull output=%q", got)
 	}
 }
 
@@ -292,6 +328,19 @@ type fakeBackend struct {
 	waited          selector
 	waitStatus      uint32
 	waitRelease     chan struct{}
+	pullReference   string
+	pullPlatform    string
+	pullSnapshotter string
+	pullUnpack      bool
+	pullInfo        ttosimages.Info
+}
+
+func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
+	b.pullReference = reference
+	b.pullPlatform = platform
+	b.pullSnapshotter = snapshotter
+	b.pullUnpack = unpack
+	return b.pullInfo, b.err
 }
 
 func (b *fakeBackend) listFamilies() ([]Family, error) {
