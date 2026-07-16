@@ -100,6 +100,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := k.validateLiveForkResources(); err != nil {
 			return err
 		}
+		// Discard PMAs backed by files that state serialization cannot encode,
+		// such as a gofer MmapCachedFile. The VMAs remain and refault from their
+		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
+		// for the same reason as in Kernel.SaveTo.
+		if err := k.invalidateUnsavableMappings(ctx); err != nil {
+			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
+		}
 		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 			stack := rootNS.Stack()
 			stack.SetRemoveConf(false)

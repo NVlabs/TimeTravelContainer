@@ -749,9 +749,15 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("setting watchdog action: %w", err)
 	}
 	l.watchdog = watchdog.New(l.k, dogOpts)
+	rootFilesystemContained := args.Spec.Root != nil && args.Spec.Root.Readonly
+	if len(args.GoferMountConfs) != 0 && args.GoferMountConfs[0].Upper == specutils.MemoryOverlay {
+		// Memory overlays have a Sentry-owned tmpfs upper and configure their
+		// gofer lower read-only.
+		rootFilesystemContained = true
+	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
-		AllowSharedFilesystemResources: args.Spec.Root != nil && args.Spec.Root.Readonly && len(args.Spec.Mounts) == 0,
+		AllowSharedFilesystemResources: rootFilesystemContained && len(args.Spec.Mounts) == 0,
 		WatchdogOpts:                   &dogOpts,
 	})
 

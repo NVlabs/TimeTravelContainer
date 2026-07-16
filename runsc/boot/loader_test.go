@@ -138,6 +138,10 @@ func startGofer(root string, conf *config.Config) (int, func(), error) {
 }
 
 func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error) {
+	return createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.NoOverlay})
+}
+
+func createLoaderWithGoferMountConf(conf *config.Config, spec *specs.Spec, mountConf specutils.GoferMountConf) (*Loader, func(), error) {
 	sock := fmt.Sprintf("\x00loader-test.%010d", rand.Int())
 	fd, err := server.CreateSocket(sock)
 	if err != nil {
@@ -167,7 +171,7 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 		GoferFDs:         []int{sandEnd},
 		DevGoferFD:       -1,
 		StdioFDs:         stdio,
-		GoferMountConfs:  []specutils.GoferMountConf{{Lower: specutils.Lisafs, Upper: specutils.NoOverlay}},
+		GoferMountConfs:  []specutils.GoferMountConf{mountConf},
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
 		RootfsUpperTarFD: -1,
@@ -221,9 +225,10 @@ func TestRun(t *testing.T) {
 func TestRunLiveForkNetworkNone(t *testing.T) {
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sleep", "30"}
+	spec.Root.Readonly = false
 	conf := testConfig()
 	conf.DirectFS = false
-	l, cleanup, err := createLoader(conf, spec)
+	l, cleanup, err := createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.MemoryOverlay})
 	if err != nil {
 		t.Fatalf("error creating loader: %v", err)
 	}
@@ -429,6 +434,16 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	memfdFile.DecRef(parentTask)
 	parentMemfd := liveForkTestFD(t, l.k, memfdFD)
 	liveForkTestPWrite(t, parentTask, parentMemfd, 0, "seed")
+	const overlayPath = "timetravel-overlay-state"
+	overlayFile := liveForkTestCreateFile(t, parentTask, overlayPath)
+	const overlayFD = int32(20)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, overlayFD, overlayFile, kernel.FDFlags{}); err != nil {
+		overlayFile.DecRef(parentTask)
+		t.Fatalf("installing overlay file: %v", err)
+	}
+	overlayFile.DecRef(parentTask)
+	parentOverlayFile := liveForkTestFD(t, l.k, overlayFD)
+	liveForkTestPWrite(t, parentTask, parentOverlayFile, 0, "seed")
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -465,6 +480,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUnix1 := liveForkTestFD(t, child.k, unixFDs[0])
 	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
 	childMemfd := liveForkTestFD(t, child.k, memfdFD)
+	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -621,6 +637,56 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMappedWrite(t, childTask, childMemfd, "chld")
 	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
+
+	// The writable root uses a branch-local tmpfs OverlayFS upper over the
+	// shared immutable gofer lower. Contents, open-unlinked files, and directory
+	// topology diverge independently.
+	liveForkTestPRead(t, parentTask, parentOverlayFile, 0, "seed")
+	liveForkTestPRead(t, childTask, childOverlayFile, 0, "seed")
+	liveForkTestPWrite(t, parentTask, parentOverlayFile, 0, "prnt")
+	liveForkTestPWrite(t, childTask, childOverlayFile, 0, "chld")
+	liveForkTestPRead(t, parentTask, parentOverlayFile, 0, "prnt")
+	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
+	liveForkTestUnlink(t, childTask, overlayPath)
+	liveForkTestPathMissing(t, childTask, overlayPath)
+	liveForkTestPathRead(t, parentTask, overlayPath, "prnt")
+	parentOnly := liveForkTestCreateFile(t, parentTask, "parent-only")
+	parentOnly.DecRef(parentTask)
+	liveForkTestPathMissing(t, childTask, "parent-only")
+	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
+	parentLowerFile := liveForkTestOpenPath(t, parentTask, "etc/hostname", linux.O_RDONLY)
+	originalLower := liveForkTestPReadString(t, parentTask.Kernel().SupervisorContext(), parentLowerFile, 0, 4)
+	childCopiedUpFile := liveForkTestOpenPath(t, childTask, "etc/hostname", linux.O_RDWR)
+	liveForkTestPWrite(t, childCtx, childCopiedUpFile, 0, "CHLD")
+	liveForkTestPRead(t, childCtx, childCopiedUpFile, 0, "CHLD")
+	liveForkTestPRead(t, ctx, parentLowerFile, 0, originalLower)
+	parentLowerFile.DecRef(ctx)
+	childCopiedUpFile.DecRef(childCtx)
+
+	grandchildInfo, err := l.family.Fork(&ForkBranchArgs{Source: childInfo.ID, ID: "grandchild", Paused: true})
+	if err != nil {
+		t.Fatalf("recursively forking child: %v", err)
+	}
+	grandchild, err := l.family.branch(grandchildInfo.ID)
+	if err != nil {
+		t.Fatalf("looking up grandchild: %v", err)
+	}
+	grandchildTask := grandchild.k.GlobalInit().Leader()
+	grandchildMemfd := liveForkTestFD(t, grandchild.k, memfdFD)
+	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
+	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
+	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
+	liveForkTestPathMissing(t, grandchildTask, overlayPath)
+	liveForkTestPathMissing(t, grandchildTask, "parent-only")
+	liveForkTestPWrite(t, grandchildTask, grandchildMemfd, 0, "grnd")
+	liveForkTestPWrite(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
+	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
+	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
+	grandchildMemfd.DecRef(grandchildTask)
+	grandchildOverlayFile.DecRef(grandchildTask)
+	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
+		t.Fatalf("destroying grandchild: %v", err)
+	}
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
@@ -632,6 +698,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUnix1.DecRef(parentTask)
 	parentUnix2.DecRef(parentTask)
 	parentMemfd.DecRef(parentTask)
+	parentOverlayFile.DecRef(parentTask)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
@@ -643,6 +710,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUnix1.DecRef(childTask)
 	childUnix2.DecRef(childTask)
 	childMemfd.DecRef(childTask)
+	childOverlayFile.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -818,6 +886,91 @@ func liveForkTestPRead(t *testing.T, ctx context.Context, file *vfs.FileDescript
 	if err != nil || n != int64(len(buf)) || string(buf) != want {
 		t.Fatalf("PRead(%d): got (%q, %d, %v), want %q", offset, buf, n, err, want)
 	}
+}
+
+func liveForkTestCreateFile(t *testing.T, task *kernel.Task, path string) *vfs.FileDescription {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(path),
+	}, &vfs.OpenOptions{
+		Flags: linux.O_RDWR | linux.O_CREAT | linux.O_EXCL,
+		Mode:  linux.ModeRegular | 0644,
+	})
+	if err != nil {
+		t.Fatalf("creating %q: %v", path, err)
+	}
+	return file
+}
+
+func liveForkTestUnlink(t *testing.T, task *kernel.Task, path string) {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	if err := task.Kernel().VFS().UnlinkAt(ctx, task.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(path),
+	}); err != nil {
+		t.Fatalf("unlinking %q: %v", path, err)
+	}
+}
+
+func liveForkTestPathMissing(t *testing.T, task *kernel.Task, path string) {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(path),
+	}, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+	if file != nil {
+		file.DecRef(ctx)
+	}
+	if !linuxerr.Equals(linuxerr.ENOENT, err) {
+		t.Fatalf("opening missing path %q: got %v, want ENOENT", path, err)
+	}
+}
+
+func liveForkTestPathRead(t *testing.T, task *kernel.Task, path, want string) {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	file := liveForkTestOpenPath(t, task, path, linux.O_RDONLY)
+	defer file.DecRef(ctx)
+	liveForkTestPRead(t, ctx, file, 0, want)
+}
+
+func liveForkTestOpenPath(t *testing.T, task *kernel.Task, path string, flags uint32) *vfs.FileDescription {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(path),
+	}, &vfs.OpenOptions{Flags: flags})
+	if err != nil {
+		t.Fatalf("opening %q: %v", path, err)
+	}
+	return file
+}
+
+func liveForkTestPReadString(t *testing.T, ctx context.Context, file *vfs.FileDescription, offset int64, length int) string {
+	t.Helper()
+	buf := make([]byte, length)
+	n, err := file.PRead(ctx, usermem.BytesIOSequence(buf), offset, vfs.ReadOptions{})
+	if err != nil || n != int64(length) {
+		t.Fatalf("PRead(%d, %d): got (%q, %d, %v)", offset, length, buf, n, err)
+	}
+	return string(buf)
 }
 
 func liveForkTestMappedWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value string) {

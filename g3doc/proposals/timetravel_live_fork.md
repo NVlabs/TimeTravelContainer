@@ -388,7 +388,7 @@ Initial policy:
 | Private anonymous mappings | Clone with existing MM CoW |
 | Internal pipe/eventfd/epoll graph | Clone after object-graph tests |
 | Tmpfs/memfd/POSIX SHM | Memfd page CoW implemented; broader tmpfs tests pending |
-| Overlay upper on tmpfs | Clone after tmpfs and overlay tests |
+| In-memory OverlayFS upper on tmpfs | Clone; advanced topology tests pending |
 | Read-only immutable gofer lower | Share with explicit hook |
 | SysV SHM | Reject until branch page map is implemented |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
@@ -523,8 +523,23 @@ runs under MM fault locks and cannot synchronously invalidate every mapping in
 the same branch. It preserves fork-time scaling and page-granular sharing, but
 true write-fault-only tmpfs CoW requires an MM/Mappable handshake that performs
 branch-wide invalidation before installing the writable translation. Private
-tmpfs MemoryFiles, complete truncate/fallocate/mapping stress, directory and
-metadata divergence, and OverlayFS upper behavior remain in Phase 4.
+tmpfs MemoryFiles and complete truncate/fallocate/mapping stress remain in
+Phase 4.
+
+The runsc gate now also accepts a writable root backed specifically by an
+in-memory OverlayFS upper; self-backed and anonymous-filestore uppers remain
+ineligible. The real-loader fixture uses that writable root and verifies upper
+file content divergence, child unlink with a still-open FD, a parent-only new
+entry, and child-only copy-up and mutation of an immutable lower file. It then
+recursively forks the modified child, checks that memfd and open-unlinked upper
+contents start equal and diverge again, and destroys the grandchild first.
+
+Recursive fork testing exposed gofer-backed executable and library PMAs that
+were refaulted after the first child ran. `LiveFork` now invokes the same
+`InvalidateUnsavable` pass as normal `Kernel.SaveTo`, after resource validation
+but before VFS preparation. These VMAs remain intact and refault through the
+cloned gofer graph, while unsupported `MmapCachedFile` PMAs never reach state
+serialization.
 
 ## Implementation phases and gates
 
