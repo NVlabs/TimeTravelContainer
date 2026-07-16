@@ -236,7 +236,7 @@ Commands:
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
   attach [OPTIONS] TARGET        Attach to a branch's init console
-  logs [OPTIONS] TARGET          Print or follow a branch's init-console logs
+  logs [-f] [--tail N] TARGET    Print or follow a branch's init-console logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
@@ -881,17 +881,23 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	follow := fs.Bool("follow", false, "follow log output")
 	fs.BoolVar(follow, "f", false, "follow log output")
+	tailValue := fs.String("tail", "all", "number of lines to show from the end of the logs")
+	fs.StringVar(tailValue, "n", "all", "number of lines to show from the end of the logs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos logs [-f] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos logs [-f] [--tail all|N] CONTAINER[@BRANCH]")
+	}
+	tail := -1
+	if parsed, err := strconv.Atoi(*tailValue); err == nil && parsed >= 0 {
+		tail = parsed
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	if err := backend.logs(target, *follow); err != nil {
+	if err := backend.logs(target, *follow, tail); err != nil {
 		return fmt.Errorf("reading logs for %s: %w", target, err)
 	}
 	return nil
@@ -1576,7 +1582,7 @@ type backend interface {
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
 	attach(target selector, interactive bool, detachKeys []byte) (uint32, error)
-	logs(target selector, follow bool) error
+	logs(target selector, follow bool, tail int) error
 	exec(request execRequest) (int, error)
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
@@ -1967,7 +1973,126 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 	}
 }
 
-func (b *runtimeBackend) logs(target selector, follow bool) error {
+type consoleLogLine struct {
+	stream byte
+	data   []byte
+}
+
+// consoleLogTail retains a globally ordered tail while preserving each line's
+// stdout/stderr destination. Partial lines count as one line at snapshot time.
+type consoleLogTail struct {
+	limit int
+	lines []consoleLogLine
+	next  int
+	seq   uint64
+
+	stdoutPartial []byte
+	stdoutSeq     uint64
+	stderrPartial []byte
+	stderrSeq     uint64
+}
+
+type consoleLogTailWriter struct {
+	tail   *consoleLogTail
+	stream byte
+}
+
+func (w consoleLogTailWriter) Write(data []byte) (int, error) {
+	w.tail.write(w.stream, data)
+	return len(data), nil
+}
+
+func (t *consoleLogTail) writer(stream byte) io.Writer {
+	return consoleLogTailWriter{tail: t, stream: stream}
+}
+
+func (t *consoleLogTail) write(stream byte, data []byte) {
+	if t.limit == 0 || len(data) == 0 {
+		return
+	}
+	var partial *[]byte
+	var partialSeq *uint64
+	switch stream {
+	case ttosconsole.StreamStdout:
+		partial = &t.stdoutPartial
+		partialSeq = &t.stdoutSeq
+	case ttosconsole.StreamStderr:
+		partial = &t.stderrPartial
+		partialSeq = &t.stderrSeq
+	default:
+		return
+	}
+	for len(data) != 0 {
+		t.seq++
+		*partialSeq = t.seq
+		newline := bytes.IndexByte(data, '\n')
+		if newline < 0 {
+			*partial = append(*partial, data...)
+			return
+		}
+		line := make([]byte, 0, len(*partial)+newline+1)
+		line = append(line, *partial...)
+		line = append(line, data[:newline+1]...)
+		*partial = nil
+		t.push(consoleLogLine{stream: stream, data: line})
+		data = data[newline+1:]
+	}
+}
+
+func (t *consoleLogTail) push(line consoleLogLine) {
+	if t.limit == 0 {
+		return
+	}
+	if len(t.lines) < t.limit {
+		t.lines = append(t.lines, line)
+		return
+	}
+	t.lines[t.next] = line
+	t.next = (t.next + 1) % t.limit
+}
+
+func (t *consoleLogTail) pushPartials() {
+	if len(t.stdoutPartial) != 0 && (len(t.stderrPartial) == 0 || t.stdoutSeq <= t.stderrSeq) {
+		t.push(consoleLogLine{stream: ttosconsole.StreamStdout, data: t.stdoutPartial})
+		t.stdoutPartial = nil
+	}
+	if len(t.stderrPartial) != 0 {
+		t.push(consoleLogLine{stream: ttosconsole.StreamStderr, data: t.stderrPartial})
+		t.stderrPartial = nil
+	}
+	if len(t.stdoutPartial) != 0 {
+		t.push(consoleLogLine{stream: ttosconsole.StreamStdout, data: t.stdoutPartial})
+		t.stdoutPartial = nil
+	}
+}
+
+func (t *consoleLogTail) flush(stdout, stderr io.Writer) error {
+	t.pushPartials()
+	start := 0
+	if len(t.lines) == t.limit {
+		start = t.next
+	}
+	for i := 0; i < len(t.lines); i++ {
+		line := t.lines[(start+i)%len(t.lines)]
+		output := stdout
+		if line.stream == ttosconsole.StreamStderr {
+			output = stderr
+		}
+		if output == nil {
+			continue
+		}
+		n, err := output.Write(line.data)
+		if err != nil {
+			return fmt.Errorf("writing tailed stream %d: %w", line.stream, err)
+		}
+		if n != len(line.data) {
+			return fmt.Errorf("writing tailed stream %d: %w", line.stream, io.ErrShortWrite)
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) logs(target selector, follow bool, tail int) error {
 	paths, err := b.ensureConsoleDrain(target, false)
 	if err != nil {
 		return err
@@ -1977,11 +2102,24 @@ func (b *runtimeBackend) logs(target selector, follow bool) error {
 		return err
 	}
 	defer follower.file.Close()
+	initial := true
 	for {
-		progress, err := follower.drain(b.stdout, b.stderr)
+		var progress bool
+		if initial && tail >= 0 {
+			collector := &consoleLogTail{limit: tail}
+			progress, err = follower.drain(
+				collector.writer(ttosconsole.StreamStdout),
+				collector.writer(ttosconsole.StreamStderr))
+			if err == nil {
+				err = collector.flush(b.stdout, b.stderr)
+			}
+		} else {
+			progress, err = follower.drain(b.stdout, b.stderr)
+		}
 		if err != nil {
 			return err
 		}
+		initial = false
 		if !follow || (follower.stdoutEOF && follower.stderrEOF) {
 			return nil
 		}

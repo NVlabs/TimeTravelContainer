@@ -17,8 +17,9 @@ branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
 into a Docker-multiplexed host log with frame-safe bounded rotation (a 16 MiB
 current generation plus one retained generation); `ttos attach` and `ttos logs
-[-f]` replay or follow rotations independently. This supports optional stdin
-forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground `run`/`start`,
+[-f] [--tail all|N]` replay, tail, or follow rotations independently. This
+supports optional stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach,
+foreground `run`/`start`,
 detached output draining, and multiple output readers without placing host FDs
 in the guest resource graph. `ttosd`, configurable retention, daemon-owned stdin
 ownership, TTY detach, detached and TTY exec, persistent managed-volume backing,
@@ -136,7 +137,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       mount information.
 - [x] Initial `ttos logs CONTAINER[@BRANCH]` and `logs -f`, preserving separate
       stdout/stderr streams and backed by branch-local persistent console logs.
-- [ ] Add Docker-compatible `--tail`, `--since`, `--until`, timestamps, details,
+- [x] Add Docker-compatible `logs --tail all|N`, including global logical-line
+      ordering across the retained and active log generations and `--tail 0 -f`.
+- [ ] Add Docker-compatible `--since`, `--until`, timestamps, details,
       configurable retention, and explicit logging-driver policy.
 - [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
       `ttos top [--json] CONTAINER[@BRANCH]` process listing.

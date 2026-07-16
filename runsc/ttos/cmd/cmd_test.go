@@ -439,11 +439,69 @@ func TestDetachKeyFilterForwardsNearMatchAndFlushesPrefix(t *testing.T) {
 func TestLogs(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"logs", "--follow", "demo@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"logs", "--follow", "--tail", "7", "demo@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.logsTarget != (selector{container: "demo", branch: "child"}) || !b.logsFollow {
-		t.Errorf("logs target=%+v follow=%t", b.logsTarget, b.logsFollow)
+	if b.logsTarget != (selector{container: "demo", branch: "child"}) || !b.logsFollow || b.logsTail != 7 {
+		t.Errorf("logs target=%+v follow=%t tail=%d", b.logsTarget, b.logsFollow, b.logsTail)
+	}
+	if status := runCommand([]string{"logs", "--tail", "invalid", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("logs with Docker-compatible invalid tail status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.logsTail != -1 {
+		t.Errorf("invalid --tail selected %d, want all (-1)", b.logsTail)
+	}
+}
+
+func TestConsoleLogTailPreservesGlobalLineOrderAndStreams(t *testing.T) {
+	tail := &consoleLogTail{limit: 3}
+	stdout := tail.writer(ttosconsole.StreamStdout)
+	stderr := tail.writer(ttosconsole.StreamStderr)
+	stdout.Write([]byte("drop\nkeep-out"))
+	stderr.Write([]byte("keep-err-1\nkeep-err-2\n"))
+	stdout.Write([]byte("-continued"))
+
+	var gotStdout, gotStderr bytes.Buffer
+	if err := tail.flush(&gotStdout, &gotStderr); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got, want := gotStdout.String(), "keep-out-continued"; got != want {
+		t.Errorf("stdout=%q, want %q", got, want)
+	}
+	if got, want := gotStderr.String(), "keep-err-1\nkeep-err-2\n"; got != want {
+		t.Errorf("stderr=%q, want %q", got, want)
+	}
+}
+
+func TestConsoleLogFollowerTailsAcrossRetainedGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.log")
+	w, err := ttosconsole.NewRotatingWriter(path, 34)
+	if err != nil {
+		t.Fatalf("NewRotatingWriter: %v", err)
+	}
+	for _, value := range []string{"drop\n", "keep-one\n", "keep-two\n"} {
+		if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	follower, err := openConsoleLogFollower(path)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	tail := &consoleLogTail{limit: 2}
+	if _, err := follower.drain(tail.writer(ttosconsole.StreamStdout), tail.writer(ttosconsole.StreamStderr)); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	var stdout bytes.Buffer
+	if err := tail.flush(&stdout, nil); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got, want := stdout.String(), "keep-one\nkeep-two\n"; got != want {
+		t.Errorf("stdout=%q, want %q", got, want)
 	}
 }
 
@@ -1037,6 +1095,7 @@ type fakeBackend struct {
 	attachDetachKeys  []byte
 	logsTarget        selector
 	logsFollow        bool
+	logsTail          int
 	inspectInfo       InspectInfo
 	removed           string
 	removeForce       bool
@@ -1072,9 +1131,10 @@ func (b *fakeBackend) attach(target selector, interactive bool, detachKeys []byt
 	return b.waitStatus, b.err
 }
 
-func (b *fakeBackend) logs(target selector, follow bool) error {
+func (b *fakeBackend) logs(target selector, follow bool, tail int) error {
 	b.logsTarget = target
 	b.logsFollow = follow
+	b.logsTail = tail
 	return b.err
 }
 
