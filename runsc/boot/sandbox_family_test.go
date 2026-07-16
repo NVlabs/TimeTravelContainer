@@ -161,6 +161,73 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent.Release()
 }
 
+func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	// Exclude one-time source-side lazy initialization from the leak baseline.
+	// A retained branch reference would continue growing after this warm-up.
+	if _, err := family.Fork(&ForkBranchArgs{ID: "warm-up", Paused: true}); err != nil {
+		t.Fatalf("warm-up fork: %v", err)
+	}
+	if err := family.Destroy("warm-up"); err != nil {
+		t.Fatalf("warm-up destroy: %v", err)
+	}
+	baselineUsage, err := parent.MemoryFile().TotalUsage()
+	if err != nil {
+		t.Fatalf("initial MemoryFile.TotalUsage: %v", err)
+	}
+
+	for round := 0; round < 20; round++ {
+		childID := fmt.Sprintf("child-%d", round)
+		siblingID := fmt.Sprintf("sibling-%d", round)
+		grandchildID := fmt.Sprintf("grandchild-%d", round)
+		greatGrandchildID := fmt.Sprintf("great-grandchild-%d", round)
+		if _, err := family.Fork(&ForkBranchArgs{ID: childID, Paused: true}); err != nil {
+			t.Fatalf("round %d child fork: %v", round, err)
+		}
+		if _, err := family.Fork(&ForkBranchArgs{ID: siblingID, Paused: true}); err != nil {
+			t.Fatalf("round %d sibling fork: %v", round, err)
+		}
+		if _, err := family.Fork(&ForkBranchArgs{Source: childID, ID: grandchildID, Paused: true}); err != nil {
+			t.Fatalf("round %d grandchild fork: %v", round, err)
+		}
+		if _, err := family.Fork(&ForkBranchArgs{Source: grandchildID, ID: greatGrandchildID, Paused: true}); err != nil {
+			t.Fatalf("round %d great-grandchild fork: %v", round, err)
+		}
+
+		// Destroy two ancestors while their descendants remain, then remove
+		// the surviving leaves in a different lineage order.
+		for _, id := range []string{childID, grandchildID, siblingID, greatGrandchildID} {
+			if err := family.Destroy(id); err != nil {
+				t.Fatalf("round %d destroy %q: %v", round, id, err)
+			}
+		}
+		if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
+			t.Fatalf("round %d branches after destroy: %+v", round, got)
+		}
+	}
+
+	finalUsage, err := parent.MemoryFile().TotalUsage()
+	if err != nil {
+		t.Fatalf("final MemoryFile.TotalUsage: %v", err)
+	}
+	if finalUsage != baselineUsage {
+		t.Errorf("live branch page usage leaked: before=%d after=%d", baselineUsage, finalUsage)
+	}
+	parent.Pause()
+	parent.Release()
+}
+
 func BenchmarkSandboxFamilyFork(b *testing.B) {
 	parent, err := testutil.Boot()
 	if err != nil {

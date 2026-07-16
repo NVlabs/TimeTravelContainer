@@ -698,6 +698,12 @@ about 617 us at 1 MiB resident and 305 us at 1 GiB resident; the noisy inversion
 is not a throughput claim, but it confirms that fork latency did not grow with
 the number of resident bytes because those pages were not copied.
 
+The recursive-lifetime gate also builds and tears down twenty four-branch trees,
+destroying ancestors while descendants remain live. After each round only the
+default branch may remain, and aggregate `MemoryFile.TotalUsage` after the sweep
+must exactly match a pre-sweep baseline taken after one warm-up fork, excluding
+one-time lazy source initialization while still detecting per-branch growth.
+
 Gate: a branch tree can be repeatedly forked and destroyed in arbitrary order
 without page leaks, use-after-free, or cross-branch state changes.
 
