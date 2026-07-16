@@ -297,6 +297,120 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
+func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, error) {
+	mounts := make([]ttosbundle.HostMount, 0, len(volumeSpecs)+len(mountSpecs))
+	for _, value := range volumeSpecs {
+		parts := strings.Split(value, ":")
+		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER:ro", value)
+		}
+		readonly := false
+		if len(parts) == 3 {
+			for _, option := range strings.Split(parts[2], ",") {
+				switch option {
+				case "ro", "readonly":
+					readonly = true
+				case "rw":
+					readonly = false
+				case "":
+				default:
+					return nil, fmt.Errorf("unsupported volume option %q in %q", option, value)
+				}
+			}
+		}
+		mount, err := normalizeHostMount(parts[0], parts[1], readonly)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, mount)
+	}
+	for _, value := range mountSpecs {
+		mountType := ""
+		source := ""
+		destination := ""
+		readonly := false
+		seen := make(map[string]struct{})
+		for _, field := range strings.Split(value, ",") {
+			key, raw, found := strings.Cut(field, "=")
+			key = strings.TrimSpace(key)
+			if !found {
+				switch key {
+				case "ro", "readonly":
+					readonly = true
+					continue
+				default:
+					return nil, fmt.Errorf("invalid --mount field %q in %q", field, value)
+				}
+			}
+			raw = strings.TrimSpace(raw)
+			canonical := key
+			switch key {
+			case "src":
+				canonical = "source"
+			case "dst", "target":
+				canonical = "destination"
+			case "ro":
+				canonical = "readonly"
+			}
+			if _, ok := seen[canonical]; ok {
+				return nil, fmt.Errorf("duplicate --mount field %q in %q", key, value)
+			}
+			seen[canonical] = struct{}{}
+			switch canonical {
+			case "type":
+				mountType = raw
+			case "source":
+				source = raw
+			case "destination":
+				destination = raw
+			case "readonly":
+				parsed, err := strconv.ParseBool(raw)
+				if err != nil {
+					return nil, fmt.Errorf("invalid readonly value %q in %q", raw, value)
+				}
+				readonly = parsed
+			default:
+				return nil, fmt.Errorf("unsupported --mount field %q in %q", key, value)
+			}
+		}
+		if mountType != "bind" {
+			if mountType == "volume" || (mountType == "" && source != "" && !filepath.IsAbs(source)) {
+				return nil, fmt.Errorf("managed volume %q is not implemented yet", source)
+			}
+			return nil, fmt.Errorf("--mount %q must specify type=bind", value)
+		}
+		mount, err := normalizeHostMount(source, destination, readonly)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, mount)
+	}
+	return mounts, nil
+}
+
+func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.HostMount, error) {
+	if source == "" || destination == "" {
+		return ttosbundle.HostMount{}, errors.New("host bind mount requires both source and destination")
+	}
+	if !filepath.IsAbs(source) {
+		if source != "." && !strings.HasPrefix(source, "."+string(filepath.Separator)) {
+			return ttosbundle.HostMount{}, fmt.Errorf("managed volume %q is not implemented yet", source)
+		}
+		absolute, err := filepath.Abs(source)
+		if err != nil {
+			return ttosbundle.HostMount{}, fmt.Errorf("resolving host mount source %q: %w", source, err)
+		}
+		source = absolute
+	}
+	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
+		return ttosbundle.HostMount{}, fmt.Errorf("host mount destination %q must be an absolute non-root path", destination)
+	}
+	if !readonly {
+		return ttosbundle.HostMount{}, fmt.Errorf("writable host bind %q:%q requires a managed CoW volume; add :ro for a shared read-only view", source, destination)
+	}
+	return ttosbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: true}, nil
+}
+
 type runRequest struct {
 	name        string
 	reference   string
@@ -307,6 +421,7 @@ type runRequest struct {
 	user        string
 	hostname    string
 	entrypoint  []string
+	hostMounts  []ttosbundle.HostMount
 	detach      bool
 	interactive bool
 }
@@ -344,6 +459,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	var env stringSlice
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
 	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	var volumes, mounts stringSlice
+	fs.Var(&volumes, "volume", "bind mount HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "bind mount HOST:CONTAINER:ro")
+	fs.Var(&mounts, "mount", "bind mount type=bind,source=HOST,target=CONTAINER,readonly")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -355,6 +474,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	}
 	if *detach && *interactive {
 		return errors.New("detached interactive containers require the internal console, which is not implemented yet")
+	}
+	hostMounts, err := parseHostMounts(volumes, mounts)
+	if err != nil {
+		return err
 	}
 	containerName := *name
 	if containerName == "" {
@@ -369,6 +492,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		cwd:         *cwd,
 		user:        *user,
 		hostname:    *hostname,
+		hostMounts:  hostMounts,
 		detach:      *detach,
 		interactive: *interactive,
 	}
@@ -407,25 +531,34 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	var env stringSlice
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
 	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	var volumes, mounts stringSlice
+	fs.Var(&volumes, "volume", "bind mount HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "bind mount HOST:CONTAINER:ro")
+	fs.Var(&mounts, "mount", "bind mount type=bind,source=HOST,target=CONTAINER,readonly")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
 	}
+	hostMounts, err := parseHostMounts(volumes, mounts)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	request := runRequest{
-		name:      containerName,
-		reference: fs.Arg(0),
-		platform:  *platform,
-		args:      append([]string(nil), fs.Args()[1:]...),
-		env:       append([]string(nil), env...),
-		cwd:       *cwd,
-		user:      *user,
-		hostname:  *hostname,
+		name:       containerName,
+		reference:  fs.Arg(0),
+		platform:   *platform,
+		args:       append([]string(nil), fs.Args()[1:]...),
+		env:        append([]string(nil), env...),
+		cwd:        *cwd,
+		user:       *user,
+		hostname:   *hostname,
+		hostMounts: hostMounts,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -928,6 +1061,7 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 			User:       request.user,
 			Hostname:   request.hostname,
 			Entrypoint: request.entrypoint,
+			HostMounts: request.hostMounts,
 		},
 		Reference: request.reference,
 		Platform:  request.platform,
@@ -953,6 +1087,7 @@ func (b *runtimeBackend) create(request runRequest) error {
 			User:       request.user,
 			Hostname:   request.hostname,
 			Entrypoint: request.entrypoint,
+			HostMounts: request.hostMounts,
 		},
 		Reference: request.reference,
 		Platform:  request.platform,

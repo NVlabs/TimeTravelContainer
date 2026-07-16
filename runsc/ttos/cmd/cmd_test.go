@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -191,7 +192,7 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "-v", "/host/a:/data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -206,6 +207,31 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if got, want := strings.Join(b.runRequest.entrypoint, " "), "/entry"; got != want {
 		t.Errorf("entrypoint=%q, want %q", got, want)
+	}
+	wantMounts := []ttosbundle.HostMount{
+		{Source: "/host/a", Destination: "/data", Readonly: true},
+		{Source: "/host/b", Destination: "/config", Readonly: true},
+	}
+	if !reflect.DeepEqual(b.runRequest.hostMounts, wantMounts) {
+		t.Errorf("host mounts=%+v, want %+v", b.runRequest.hostMounts, wantMounts)
+	}
+}
+
+func TestRunRejectsUnmanagedWritableMounts(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "-v", "/host:/data", "busybox"},
+		{"run", "-v", "named:/data:ro", "busybox"},
+		{"run", "--mount", "type=bind,source=/host,target=/data", "busybox"},
+		{"run", "--mount", "type=volume,source=named,target=/data", "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
 	}
 }
 

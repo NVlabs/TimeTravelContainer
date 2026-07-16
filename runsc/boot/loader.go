@@ -848,8 +848,13 @@ func liveForkMountsCompatible(spec *specs.Spec, conf *config.Config) bool {
 		return false
 	}
 	for _, mount := range spec.Mounts {
+		specutils.MaybeConvertToBindMount(&mount)
 		switch mount.Type {
 		case devpts.Name, proc.Name, tmpfs.Name:
+		case Bind:
+			if conf.DirectFS || !specutils.IsReadonlyMount(mount.Options) {
+				return false
+			}
 		case sys.Name:
 			readOnly := false
 			for _, option := range mount.Options {

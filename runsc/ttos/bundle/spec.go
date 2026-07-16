@@ -17,6 +17,7 @@ package bundle
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -55,6 +56,16 @@ type SpecOptions struct {
 	Hostname   string
 	Terminal   bool
 	Entrypoint []string
+	HostMounts []HostMount
+}
+
+// HostMount describes a host path exposed through a read-only gofer bind.
+// Writable host paths require a managed CoW volume and are intentionally not
+// represented by this type yet.
+type HostMount struct {
+	Source      string
+	Destination string
+	Readonly    bool
 }
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
@@ -108,6 +119,45 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if hostname == "" {
 		hostname = opts.Name
 	}
+	mounts := []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+	}
+	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts))
+	for _, mount := range mounts {
+		seenDestinations[mount.Destination] = struct{}{}
+	}
+	for _, mount := range opts.HostMounts {
+		if !mount.Readonly {
+			return nil, fmt.Errorf("host mount %q at %q is writable; use a managed CoW volume", mount.Source, mount.Destination)
+		}
+		if !filepath.IsAbs(mount.Source) {
+			return nil, fmt.Errorf("host mount source %q is not absolute", mount.Source)
+		}
+		if info, err := os.Stat(mount.Source); err != nil {
+			return nil, fmt.Errorf("stating host mount source %q: %w", mount.Source, err)
+		} else if info.Mode()&os.ModeSocket != 0 || info.Mode()&os.ModeNamedPipe != 0 || info.Mode()&os.ModeDevice != 0 {
+			return nil, fmt.Errorf("host mount source %q is not a regular file or directory", mount.Source)
+		}
+		destination := filepath.Clean(mount.Destination)
+		if !filepath.IsAbs(destination) || destination == "/" {
+			return nil, fmt.Errorf("host mount destination %q must be an absolute non-root path", mount.Destination)
+		}
+		if _, ok := seenDestinations[destination]; ok {
+			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+		}
+		seenDestinations[destination] = struct{}{}
+		mounts = append(mounts, specs.Mount{
+			Destination: destination,
+			Type:        "bind",
+			Source:      filepath.Clean(mount.Source),
+			Options:     []string{"rbind", "ro"},
+		})
+	}
+
 	return &specs.Spec{
 		Version: specs.Version,
 		Root: &specs.Root{
@@ -136,13 +186,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			}},
 		},
 		Hostname: hostname,
-		Mounts: []specs.Mount{
-			{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
-			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
-			{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
-			{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
-			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
-		},
+		Mounts:   mounts,
 		Linux: &specs.Linux{
 			Namespaces: []specs.LinuxNamespace{
 				{Type: specs.PIDNamespace},

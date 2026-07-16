@@ -36,6 +36,10 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "etc/group"), []byte("app:x:456:\nextra:x:789:app\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	host := t.TempDir()
+	if err := os.WriteFile(filepath.Join(host, "fixture"), []byte("host-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	image := ocispec.Image{Config: ocispec.ImageConfig{
 		User:       "app",
 		Env:        []string{"A=image", "B=keep"},
@@ -44,10 +48,11 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		WorkingDir: "/work",
 	}}
 	spec, err := BuildSpec(image, SpecOptions{
-		Name:   "demo",
-		RootFS: root,
-		Args:   []string{"override", "arg"},
-		Env:    []string{"A=run", "C=new"},
+		Name:       "demo",
+		RootFS:     root,
+		Args:       []string{"override", "arg"},
+		Env:        []string{"A=run", "C=new"},
+		HostMounts: []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
 	})
 	if err != nil {
 		t.Fatalf("BuildSpec: %v", err)
@@ -70,6 +75,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		{Destination: "/mnt/fixture", Type: "bind", Source: host, Options: []string{"rbind", "ro"}},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("mounts=%+v, want %+v", spec.Mounts, wantMounts)
@@ -86,6 +92,20 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), Cwd: "relative"}); err == nil {
 		t.Error("BuildSpec accepted relative working directory")
+	}
+	host := t.TempDir()
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "/data"}}}); err == nil {
+		t.Error("BuildSpec accepted writable host mount")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: "relative", Destination: "/data", Readonly: true}}}); err == nil {
+		t.Error("BuildSpec accepted relative host source")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "relative", Readonly: true}}}); err == nil {
+		t.Error("BuildSpec accepted relative host destination")
+	}
+	missing := filepath.Join(host, "missing")
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: missing, Destination: "/data", Readonly: true}}}); err == nil {
+		t.Error("BuildSpec accepted missing host source")
 	}
 }
 

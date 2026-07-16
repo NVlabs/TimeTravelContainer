@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -146,46 +147,84 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 }
 
 func createLoaderWithGoferMountConf(conf *config.Config, spec *specs.Spec, mountConf specutils.GoferMountConf) (*Loader, func(), error) {
+	return createLoaderWithGoferMountConfs(conf, spec, []specutils.GoferMountConf{mountConf})
+}
+
+func createLoaderWithGoferMountConfs(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf) (*Loader, func(), error) {
 	sock := fmt.Sprintf("\x00loader-test.%010d", rand.Int())
-	fd, err := server.CreateSocket(sock)
+	controllerFD, err := server.CreateSocket(sock)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create socket: %w", err)
 	}
-	sandEnd, cleanup, err := startGofer(spec.Root.Path, conf)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to start gofer: %w", err)
+	goferRoots := []string{spec.Root.Path}
+	for _, mount := range spec.Mounts {
+		if specutils.HasMountConfig(mount) {
+			goferRoots = append(goferRoots, mount.Source)
+		}
+	}
+	if len(goferRoots) != len(mountConfs) {
+		unix.Close(controllerFD)
+		return nil, nil, fmt.Errorf("got %d gofer mount configurations for %d roots", len(mountConfs), len(goferRoots))
+	}
+	goferEnds := make([]int, 0, len(goferRoots))
+	cleanups := make([]func(), 0, len(goferRoots))
+	cleanupGofers := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	for _, root := range goferRoots {
+		sandEnd, cleanup, err := startGofer(root, conf)
+		if err != nil {
+			for _, goferFD := range goferEnds {
+				unix.Close(goferFD)
+			}
+			cleanupGofers()
+			unix.Close(controllerFD)
+			return nil, nil, fmt.Errorf("failed to start gofer for %q: %w", root, err)
+		}
+		goferEnds = append(goferEnds, sandEnd)
+		cleanups = append(cleanups, cleanup)
 	}
 
 	// Loader takes ownership of stdio.
 	var stdio []int
 	for _, f := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
-		fd := int(f.Fd())
-		newFd, err := unix.Dup(fd)
+		hostFD := int(f.Fd())
+		newFD, err := unix.Dup(hostFD)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to dup FD %d: %w", fd, err)
+			for _, goferFD := range goferEnds {
+				unix.Close(goferFD)
+			}
+			for _, stdioFD := range stdio {
+				unix.Close(stdioFD)
+			}
+			cleanupGofers()
+			unix.Close(controllerFD)
+			return nil, nil, fmt.Errorf("failed to dup FD %d: %w", hostFD, err)
 		}
-		stdio = append(stdio, newFd)
+		stdio = append(stdio, newFD)
 	}
 
 	args := Args{
 		ID:               "foo",
 		Spec:             spec,
 		Conf:             conf,
-		ControllerFD:     fd,
-		GoferFDs:         []int{sandEnd},
+		ControllerFD:     controllerFD,
+		GoferFDs:         goferEnds,
 		DevGoferFD:       -1,
 		StdioFDs:         stdio,
-		GoferMountConfs:  []specutils.GoferMountConf{mountConf},
+		GoferMountConfs:  mountConfs,
 		PodInitConfigFD:  -1,
 		ExecFD:           -1,
 		RootfsUpperTarFD: -1,
 	}
 	l, err := New(args)
 	if err != nil {
-		cleanup()
+		cleanupGofers()
 		return nil, nil, fmt.Errorf("boot.New: %w", err)
 	}
-	return l, cleanup, nil
+	return l, cleanupGofers, nil
 }
 
 // TestRun runs a simple application in a sandbox and checks that it succeeds.
@@ -243,13 +282,31 @@ func TestLiveForkMountsCompatible(t *testing.T) {
 		t.Fatal("writable sysfs mount accepted")
 	}
 	spec.Mounts[4] = specs.Mount{Destination: "/host", Type: "bind", Source: "/host", Options: []string{"ro"}}
+	conf.DirectFS = false
+	if !liveForkMountsCompatible(spec, conf) {
+		t.Fatal("read-only lisafs bind mount rejected")
+	}
+	spec.Mounts[4] = specs.Mount{Destination: "/host", Type: "none", Source: "/host", Options: []string{"rbind", "ro"}}
+	if !liveForkMountsCompatible(spec, conf) {
+		t.Fatal("read-only rbind mount rejected")
+	}
+	spec.Mounts[4].Options = []string{"rbind", "rw"}
 	if liveForkMountsCompatible(spec, conf) {
-		t.Fatal("bind mount accepted before immutable-gofer eligibility is implemented")
+		t.Fatal("writable bind mount accepted")
+	}
+	spec.Mounts[4].Options = []string{"rbind", "ro"}
+	conf.DirectFS = true
+	if liveForkMountsCompatible(spec, conf) {
+		t.Fatal("directfs bind mount accepted")
 	}
 }
 
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
 func TestRunLiveForkNetworkNone(t *testing.T) {
+	hostBind := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hostBind, "fixture"), []byte("host-data"), 0644); err != nil {
+		t.Fatalf("writing read-only bind fixture: %v", err)
+	}
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sleep", "30"}
 	spec.Root.Readonly = false
@@ -259,10 +316,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		{Destination: "/readonly", Type: "bind", Source: hostBind, Options: []string{"rbind", "ro"}},
 	}
 	conf := testConfig()
 	conf.DirectFS = false
-	l, cleanup, err := createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.MemoryOverlay})
+	l, cleanup, err := createLoaderWithGoferMountConfs(conf, spec, []specutils.GoferMountConf{
+		{Lower: specutils.Lisafs, Upper: specutils.MemoryOverlay},
+		{Lower: specutils.Lisafs, Upper: specutils.NoOverlay},
+	})
 	if err != nil {
 		t.Fatalf("error creating loader: %v", err)
 	}
@@ -652,6 +713,10 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		file := liveForkTestOpenPath(t, check.task, check.path, linux.O_RDONLY)
 		file.DecRef(check.task)
 	}
+	liveForkTestPathRead(t, parentTask, "readonly/fixture", "host-data")
+	liveForkTestPathRead(t, childTask, "readonly/fixture", "host-data")
+	liveForkTestPathWriteDenied(t, parentTask, "readonly/fixture")
+	liveForkTestPathWriteDenied(t, childTask, "readonly/fixture")
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -934,6 +999,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
+	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "host-data")
 	liveForkTestPathMissing(t, grandchildTask, overlayPath)
 	liveForkTestPathMissing(t, grandchildTask, "parent-only")
 	liveForkTestPWrite(t, grandchildTask, grandchildMemfd, 0, "grnd")
@@ -994,6 +1060,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
+	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "host-data")
 	liveForkTestWrite(t, grandchildTask, grandchildUDPClient, "stay")
 	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "stay")
 	liveForkTestWrite(t, grandchildTask, grandchildTCPClient, "stay")
@@ -1393,6 +1460,28 @@ func liveForkTestOpenPath(t *testing.T, task *kernel.Task, path string, flags ui
 		t.Fatalf("opening %q: %v", path, err)
 	}
 	return file
+}
+
+func liveForkTestPathWriteDenied(t *testing.T, task *kernel.Task, path string) {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(path),
+		FollowFinalSymlink: true,
+	}, &vfs.OpenOptions{Flags: linux.O_WRONLY})
+	if file != nil {
+		file.DecRef(ctx)
+	}
+	if err == nil {
+		t.Fatalf("opening read-only path %q for write succeeded", path)
+	}
+	if !linuxerr.Equals(linuxerr.EROFS, err) && !linuxerr.Equals(linuxerr.EACCES, err) && !linuxerr.Equals(linuxerr.EPERM, err) {
+		t.Fatalf("opening read-only path %q for write: got %v, want EROFS/EACCES/EPERM", path, err)
+	}
 }
 
 func liveForkTestPReadString(t *testing.T, ctx context.Context, file *vfs.FileDescription, offset int64, length int) string {

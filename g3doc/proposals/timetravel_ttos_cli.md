@@ -9,8 +9,9 @@ containerd, generates rootless image-backed OCI bundles, and implements the
 initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
 plus synchronous non-TTY exec into a selected live branch. Generated bundles
 include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`,
-and a private devpts instance with `/dev/ptmx`. `ttosd`, detached and TTY exec,
-attach, read-only host binds, and managed volumes remain TODO.
+and a private devpts instance with `/dev/ptmx`. Existing host paths can be
+attached read-only with Docker-style `-v` or `--mount` syntax. `ttosd`, detached
+and TTY exec, attach, and managed CoW volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -98,6 +99,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
       non-TTY slice with procfs, `/dev` tmpfs, and restricted sysfs mounts).
 - [x] Support `--name`, environment variables, working directory, named or
       numeric user, entrypoint override, hostname, and rootless execution.
+- [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
+      `--mount type=bind,...,readonly`.
 - [ ] Add CPU, memory, process-count, and other resource-limit flags.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
 - [ ] Support `-t` after the internal detachable console is implemented.
@@ -272,9 +275,12 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ### Read-only host paths
 
-- [ ] Admit a LISAFS/gofer bind only when the OCI mount and server connection
+- [x] Admit a LISAFS/gofer bind only when the OCI mount and server connection
       are both read-only and directfs is disabled.
-- [ ] Borrow one live gofer client/root control FD per filesystem UniqueID.
+- [x] Borrow one live gofer client/root control FD per filesystem UniqueID.
+- [x] Initial integration coverage reads the bind in parent, child, and
+      grandchild branches, rejects writes, recursively forks it, and keeps the
+      grandchild functional after deleting its source branch.
 - [ ] Test multiple simultaneous read-only binds, open files, directory cursors,
       executable mappings, recursive fork, and descendant-first or
       ancestor-first destruction.
@@ -370,7 +376,8 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [ ] Per-mount eligibility framework.
 - [x] Initial tmpfs, procfs, and restricted read-only sysfs mounts.
 - [x] devpts and `/dev/ptmx` mounts for the internal TTY console.
-- [ ] Multiple immutable read-only gofer binds.
+- [x] Initial immutable read-only gofer bind.
+- [ ] Multiple immutable read-only gofer binds and exhaustive access coverage.
 - [ ] Managed tmpfs/OverlayFS submount volumes.
 
 Gate: an ordinary generated OCI bundle with `/proc`, `/sys`, `/dev`, `/dev/pts`,
