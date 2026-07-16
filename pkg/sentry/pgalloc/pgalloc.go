@@ -190,6 +190,12 @@ type MemoryFile struct {
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
 	destroyed bool
 
+	// owners is the number of objects that may call Destroy. This is distinct
+	// from references on pages allocated from this MemoryFile: live-forked
+	// kernels share the allocator itself while independently owning its pages.
+	// owners is protected by mu.
+	owners uint64
+
 	// stopNotifyPressure stops memory cgroup pressure level
 	// notifications used to drive eviction. stopNotifyPressure is
 	// immutable.
@@ -466,6 +472,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 }
 
 func (f *MemoryFile) initFields() {
+	f.owners = 1
 	// Initially, all pages are void.
 	fullFR := memmap.FileRange{0, math.MaxUint64}
 	f.unwasteSmall.InsertRange(fullFR, unwasteInfo{})
@@ -514,14 +521,36 @@ func IMAWorkAroundForMemFile(fd uintptr) {
 	}
 }
 
-// Destroy releases all resources used by f.
+// IncOwner adds an owner of f. Each successful call must be paired with a
+// call to Destroy.
 //
-// Preconditions: All pages allocated by f have been freed.
+// IncOwner must not be called after the last owner has called Destroy.
+func (f *MemoryFile) IncOwner() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.destroyed || f.owners == 0 {
+		panic("IncOwner called on destroyed MemoryFile")
+	}
+	f.owners++
+}
+
+// Destroy releases one ownership reference to f. Resources used by f are
+// released after the last owner calls Destroy.
 //
-// Postconditions: None of f's methods may be called after Destroy.
+// Preconditions: When the last owner calls Destroy, all pages allocated by f
+// have been freed.
+//
+// Postconditions: The caller may not use f after calling Destroy.
 func (f *MemoryFile) Destroy() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.owners == 0 {
+		panic("Destroy called without a MemoryFile owner")
+	}
+	f.owners--
+	if f.owners != 0 {
+		return
+	}
 	f.destroyed = true
 	f.releaseCond.Signal()
 }

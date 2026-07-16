@@ -171,6 +171,7 @@ go_library(
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
+        "//pkg/state",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",

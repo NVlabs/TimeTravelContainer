@@ -15,6 +15,8 @@
 package mm
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -26,10 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-func testMemoryManagerWithMmapDirection(ctx context.Context, t *testing.T, mmapDirection arch.MmapDirection) *MemoryManager {
+func testMemoryManagerWithMmapDirection(ctx context.Context, t testing.TB, mmapDirection arch.MmapDirection) *MemoryManager {
 	p := platform.FromContext(ctx)
 	mm, err := NewMemoryManager(p, pgalloc.MemoryFileFromContext(ctx))
 	if err != nil {
@@ -45,12 +48,121 @@ func testMemoryManagerWithMmapDirection(ctx context.Context, t *testing.T, mmapD
 	return mm
 }
 
-func testMemoryManager(ctx context.Context, t *testing.T) *MemoryManager {
+func testMemoryManager(ctx context.Context, t testing.TB) *MemoryManager {
 	return testMemoryManagerWithMmapDirection(ctx, t, arch.MmapBottomUp)
 }
 
 func (mm *MemoryManager) realUsageAS() uint64 {
 	return uint64(mm.vmas.Span())
+}
+
+func cloneMemoryManagerMetadata(ctx context.Context, src *MemoryManager) (*MemoryManager, error) {
+	src.PrepareLiveFork()
+	src.mf.MarkSavable()
+
+	var metadata bytes.Buffer
+	if _, err := state.Save(ctx, &metadata, src); err != nil {
+		return nil, fmt.Errorf("state.Save: %w", err)
+	}
+	loadCtx := context.WithValue(ctx, pgalloc.CtxLiveForkClone, true)
+	dst := &MemoryManager{}
+	if _, err := state.Load(loadCtx, &metadata, dst); err != nil {
+		return nil, fmt.Errorf("state.Load: %w", err)
+	}
+	return dst, nil
+}
+
+func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length:   2 * hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	initial := []byte("parent-before-fork")
+	if n, err := parent.CopyOut(ctx, addr, initial, usermem.IOOpts{}); err != nil || n != len(initial) {
+		t.Fatalf("parent.CopyOut: n=%d err=%v", n, err)
+	}
+
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer child.DecUsers(ctx)
+
+	read := func(name string, memMgr *MemoryManager) string {
+		buf := make([]byte, len(initial))
+		if n, err := memMgr.CopyIn(ctx, addr, buf, usermem.IOOpts{}); err != nil || n != len(buf) {
+			t.Fatalf("%s.CopyIn: n=%d err=%v", name, n, err)
+		}
+		return string(buf)
+	}
+	if got := read("child", child); got != string(initial) {
+		t.Fatalf("child initial bytes: got %q, want %q", got, initial)
+	}
+
+	childBytes := []byte("child--after--fork")
+	if n, err := child.CopyOut(ctx, addr, childBytes, usermem.IOOpts{}); err != nil || n != len(childBytes) {
+		t.Fatalf("child.CopyOut: n=%d err=%v", n, err)
+	}
+	if got := read("parent", parent); got != string(initial) {
+		t.Errorf("child write changed parent: got %q, want %q", got, initial)
+	}
+	if got := read("child", child); got != string(childBytes) {
+		t.Errorf("child write missing in child: got %q, want %q", got, childBytes)
+	}
+
+	parentBytes := []byte("parent-after-fork")
+	if n, err := parent.CopyOut(ctx, addr, parentBytes, usermem.IOOpts{}); err != nil || n != len(parentBytes) {
+		t.Fatalf("parent.CopyOut after fork: n=%d err=%v", n, err)
+	}
+	if got := read("child", child); got != string(childBytes) {
+		t.Errorf("parent write changed child: got %q, want %q", got, childBytes)
+	}
+}
+
+func BenchmarkLiveForkPrivateAnonymousMemory(b *testing.B) {
+	for _, size := range []uint64{1 << 20, 1 << 30} {
+		b.Run(fmt.Sprintf("resident_%d_MiB", size>>20), func(b *testing.B) {
+			ctx := contexttest.Context(b)
+			parent := testMemoryManager(ctx, b)
+			defer parent.DecUsers(ctx)
+			addr, err := parent.MMap(ctx, memmap.MMapOpts{
+				Length:   size,
+				Private:  true,
+				Perms:    hostarch.ReadWrite,
+				MaxPerms: hostarch.AnyAccess,
+			})
+			if err != nil {
+				b.Fatalf("MMap: %v", err)
+			}
+			one := []byte{1}
+			for off := uint64(0); off < size; off += hostarch.PageSize {
+				if _, err := parent.CopyOut(ctx, addr+hostarch.Addr(off), one, usermem.IOOpts{}); err != nil {
+					b.Fatalf("faulting page at %#x: %v", off, err)
+				}
+			}
+
+			b.ReportMetric(float64(size), "resident-bytes")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				child, err := cloneMemoryManagerMetadata(ctx, parent)
+				if err != nil {
+					b.Fatalf("cloneMemoryManagerMetadata: %v", err)
+				}
+				b.StopTimer()
+				child.DecUsers(ctx)
+				b.StartTimer()
+			}
+		})
+	}
 }
 
 func TestUsageASUpdates(t *testing.T) {

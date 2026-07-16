@@ -44,6 +44,32 @@ const (
 	existingReleasing // or sub-releasing
 )
 
+func TestMemoryFileOwnerLifetime(t *testing.T) {
+	f := &MemoryFile{}
+	f.initFields()
+
+	f.IncOwner()
+	f.Destroy()
+	f.mu.Lock()
+	if got := f.owners; got != 1 {
+		t.Errorf("owners after first Destroy: got %d, want 1", got)
+	}
+	if f.destroyed {
+		t.Error("MemoryFile destroyed while an owner remains")
+	}
+	f.mu.Unlock()
+
+	f.Destroy()
+	f.mu.Lock()
+	if got := f.owners; got != 0 {
+		t.Errorf("owners after final Destroy: got %d, want 0", got)
+	}
+	if !f.destroyed {
+		t.Error("MemoryFile not destroyed after final owner")
+	}
+	f.mu.Unlock()
+}
+
 func TestFindAllocatable(t *testing.T) {
 	for _, test := range []struct {
 		name string

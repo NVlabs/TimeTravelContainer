@@ -33,7 +33,20 @@ const (
 	// CtxMemoryFileMap is a Context.Value key for mapping
 	// MemoryFileOpts.RestoreID to *MemoryFile. This is used for save/restore.
 	CtxMemoryFileMap
+
+	// CtxLiveForkClone indicates that state is being loaded as an in-memory
+	// live fork. Restored page owners must acquire references to existing
+	// MemoryFile ranges instead of relying on MemoryFile restore to create them.
+	CtxLiveForkClone
 )
+
+// IsLiveForkClone returns true if ctx is loading an in-memory live fork.
+func IsLiveForkClone(ctx context.Context) bool {
+	if v := ctx.Value(CtxLiveForkClone); v != nil {
+		return v.(bool)
+	}
+	return false
+}
 
 // MemoryFileFromContext returns the MemoryFile used by ctx, or nil if no such
 // MemoryFile exists.

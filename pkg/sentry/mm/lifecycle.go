@@ -57,6 +57,44 @@ func (mm *MemoryManager) SetMmapLayout(ac *arch.Context64, r *limits.LimitSet) (
 	return layout, nil
 }
 
+// PrepareLiveFork write-protects private PMAs so that a metadata clone can
+// share their MemoryFile ranges safely. The child receives the resulting PMA
+// metadata through state serialization and acquires its own range references
+// while loading.
+//
+// Preconditions: Tasks using mm are externally stopped.
+func (mm *MemoryManager) PrepareLiveFork() {
+	mm.AddressSpace().PreFork()
+	defer mm.AddressSpace().PostFork()
+
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+
+	var unmapAR hostarch.AddrRange
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		pma := pseg.ValuePtr()
+		if !pma.private || pma.needCOW {
+			continue
+		}
+		pma.needCOW = true
+		if pma.effectivePerms.Write {
+			if unmapAR.End == pseg.Start() {
+				unmapAR.End = pseg.End()
+			} else {
+				if unmapAR.Length() != 0 {
+					mm.unmapASLocked(unmapAR)
+				}
+				unmapAR = pseg.Range()
+			}
+			pma.effectivePerms.Write = false
+		}
+		pma.maxPerms.Write = false
+	}
+	if unmapAR.Length() != 0 {
+		mm.unmapASLocked(unmapAR)
+	}
+}
+
 // Fork creates a copy of mm with 1 user, as for Linux syscalls fork() or
 // clone() (without CLONE_VM).
 func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {

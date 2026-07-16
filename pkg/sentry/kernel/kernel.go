@@ -249,6 +249,12 @@ type Kernel struct {
 	// cpuClock if it's sleeping between ticks.
 	cpuClockTickerWakeCh chan struct{} `state:"nosave"`
 
+	// cpuClockTickerStopCh requests termination of the per-Kernel ticker.
+	cpuClockTickerStopCh chan struct{} `state:"nosave"`
+
+	// cpuClockTickerDoneCh is closed after the per-Kernel ticker exits.
+	cpuClockTickerDoneCh chan struct{} `state:"nosave"`
+
 	// cpuClockTickerStopCond is broadcast when cpuClockTickerRunning transitions
 	// from true to false.
 	//
@@ -505,6 +511,16 @@ type InitKernelArgs struct {
 	Cgroup2FSInit func(ctx context.Context, k *Kernel, vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error)
 }
 
+// initRuntimeFields initializes synchronization fields that are not saved.
+func (k *Kernel) initRuntimeFields() {
+	k.runningTasksCond.L = &k.runningTasksMu
+	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
+	k.cpuClockTickerStopCh = make(chan struct{})
+	k.cpuClockTickerDoneCh = make(chan struct{})
+	k.cpuClockTickerStopCond.L = &k.runningTasksMu
+	k.taskActivityCh = make(chan struct{})
+}
+
 // Init initialize the Kernel with no tasks.
 //
 // Callers must manually set Kernel.Platform and call Kernel.SetMemoryFile
@@ -533,10 +549,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	if k.rootNetworkNamespace == nil {
 		k.rootNetworkNamespace = inet.NewRootNamespace(nil, nil, args.RootUserNamespace)
 	}
-	k.runningTasksCond.L = &k.runningTasksMu
-	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
-	k.cpuClockTickerStopCond.L = &k.runningTasksMu
-	k.taskActivityCh = make(chan struct{})
+	k.initRuntimeFields()
 	k.applicationCores = args.ApplicationCores
 	if args.UseHostCores && k.HasCPUNumbers() {
 		args.UseHostCores = false
@@ -935,10 +948,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *Async
 	}
 	loadStart := time.Now()
 
-	k.runningTasksCond.L = &k.runningTasksMu
-	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
-	k.cpuClockTickerStopCond.L = &k.runningTasksMu
-	k.taskActivityCh = make(chan struct{})
+	k.initRuntimeFields()
 
 	initAppCores := k.applicationCores
 
@@ -1040,10 +1050,7 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 	}
 	loadStart := time.Now()
 
-	k.runningTasksCond.L = &k.runningTasksMu
-	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
-	k.cpuClockTickerStopCond.L = &k.runningTasksMu
-	k.taskActivityCh = make(chan struct{})
+	k.initRuntimeFields()
 
 	// Load the pre-saved CPUID FeatureSet.
 	cpuidStart := time.Now()
@@ -1438,9 +1445,33 @@ func (k *Kernel) StartProcess(tg *ThreadGroup) {
 func (k *Kernel) Start() error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
+	return k.startLocked(true)
+}
 
+// StartPaused starts task goroutines while preserving an existing external
+// stop. Time remains paused until Unpause is called.
+//
+// Preconditions: Pause must have been called and StartPaused may be called
+// exactly once.
+func (k *Kernel) StartPaused() error {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if !k.tasks.isExternallyStopped() {
+		return fmt.Errorf("kernel is not paused")
+	}
+	return k.startLocked(false)
+}
+
+// startLocked starts task goroutines. If resumeTime is false, the caller must
+// hold an external stop that will be released by a later call to Unpause.
+//
+// Preconditions: k.extMu must be locked.
+func (k *Kernel) startLocked(resumeTime bool) error {
 	if k.started {
 		return fmt.Errorf("kernel already started")
+	}
+	if !resumeTime {
+		k.pauseTimeLocked(k.SupervisorContext())
 	}
 
 	k.started = true
@@ -1452,7 +1483,9 @@ func (k *Kernel) Start() error {
 	// If k was created by LoadKernelFrom, timers were stopped during
 	// Kernel.SaveTo and need to be resumed. If k was created by NewKernel,
 	// this is a no-op.
-	k.resumeTimeLocked(k.SupervisorContext())
+	if resumeTime {
+		k.resumeTimeLocked(k.SupervisorContext())
+	}
 	k.tasks.mu.RLock()
 	ts := make([]*Task, 0, len(k.tasks.Root.tids))
 	for t := range k.tasks.Root.tids {
@@ -1460,7 +1493,7 @@ func (k *Kernel) Start() error {
 	}
 	k.tasks.mu.RUnlock()
 	// Start task goroutines.
-	// NOTE(b/235349091): We don't actually need the TaskSet mutex, we just
+	// NOTE(b/235349091): We do not actually need the TaskSet mutex, we just
 	// need to make sure we only call t.Start() once for each task. Holding the
 	// mutex for each task start may cause a nested locking error.
 	for _, t := range ts {
@@ -2210,11 +2243,29 @@ func (k *Kernel) releaseCgroupMounts(ctx context.Context) {
 	}
 }
 
+// stopCPUClockTicker stops and joins the per-Kernel CPU ticker.
+func (k *Kernel) stopCPUClockTicker() {
+	if !k.started {
+		return
+	}
+	close(k.cpuClockTickerStopCh)
+	k.runningTasksMu.Lock()
+	k.runningTasksCond.Broadcast()
+	k.runningTasksMu.Unlock()
+	select {
+	case k.cpuClockTickerWakeCh <- struct{}{}:
+	default:
+	}
+	<-k.cpuClockTickerDoneCh
+	k.cpuClockTickTimer.Stop()
+}
+
 // Release releases resources owned by k.
 //
 // Precondition: This should only be called after the kernel is fully
 // initialized, e.g. after k.Start() has been called.
 func (k *Kernel) Release() {
+	k.stopCPUClockTicker()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)
 	k.hostMount.DecRef(ctx)

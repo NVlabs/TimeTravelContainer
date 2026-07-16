@@ -115,6 +115,17 @@ func (m *SpecialMappable) InvalidateUnsavable(ctx context.Context) error {
 	return nil
 }
 
+// RebindMemoryFileRange transfers m to a replacement MemoryFile range and
+// releases the range previously owned by m. The replacement range must carry
+// one reference for m.
+//
+// Preconditions: m is not concurrently accessible.
+func (m *SpecialMappable) RebindMemoryFileRange(mf *pgalloc.MemoryFile, fr memmap.FileRange) {
+	oldMF, oldFR := m.mf, m.fr
+	m.mf, m.fr = mf, fr
+	oldMF.DecRef(oldFR)
+}
+
 // FileRange returns the offsets into m.mf that stores the SpecialMappable's
 // contents.
 func (m *SpecialMappable) FileRange() memmap.FileRange {

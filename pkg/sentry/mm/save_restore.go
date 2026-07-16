@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // InvalidateUnsavable invokes memmap.Mappable.InvalidateUnsavable on all
@@ -40,7 +41,19 @@ func (mm *MemoryManager) InvalidateUnsavable(ctx context.Context) error {
 
 // afterLoad is invoked by stateify.
 func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
+	if p := ctx.Value(platform.CtxPlatform); p != nil {
+		mm.p = p.(platform.Platform)
+	}
+	if mm.p == nil {
+		panic("MemoryManager restore context has no platform")
+	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
+	if pgalloc.IsLiveForkClone(ctx) {
+		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+			pseg.ValuePtr().file.IncRef(pseg.fileRange(), memCgID)
+		}
+	}
 	mm.haveASIO = mm.p.SupportsAddressSpaceIO()
 	if mm.users.Load() != 0 {
 		as, err := mm.p.NewAddressSpace()
@@ -54,6 +67,9 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 // afterLoad is invoked by stateify.
 func (m *SpecialMappable) afterLoad(ctx goContext.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
+	if pgalloc.IsLiveForkClone(ctx) {
+		m.mf.IncRef(m.fr, 0)
+	}
 }
 
 const (

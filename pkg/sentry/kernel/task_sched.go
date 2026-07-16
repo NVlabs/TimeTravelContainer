@@ -216,6 +216,13 @@ func (tg *ThreadGroup) JoinedChildCPUStats() usage.CPUStats {
 }
 
 func (k *Kernel) runCPUClockTicker() {
+	defer func() {
+		k.runningTasksMu.Lock()
+		k.cpuClockTickerRunning = false
+		k.cpuClockTickerStopCond.Broadcast()
+		k.runningTasksMu.Unlock()
+		close(k.cpuClockTickerDoneCh)
+	}()
 	// Storage reused between iterations of the main loop:
 	var (
 		allTasks []*Task
@@ -230,7 +237,19 @@ func (k *Kernel) runCPUClockTicker() {
 			if k.runningTasks.Load() == 0 {
 				k.cpuClockTickerRunning = false
 				k.cpuClockTickerStopCond.Broadcast()
+				select {
+				case <-k.cpuClockTickerStopCh:
+					k.runningTasksMu.Unlock()
+					return
+				default:
+				}
 				k.runningTasksCond.Wait()
+				select {
+				case <-k.cpuClockTickerStopCh:
+					k.runningTasksMu.Unlock()
+					return
+				default:
+				}
 				// k.cpuClockTickerRunning was set to true by our waker
 				// (Kernel.incRunningTasks()). For reasons described there, we must
 				// process at least one CPU clock tick between calls to
@@ -245,6 +264,8 @@ func (k *Kernel) runCPUClockTicker() {
 			k.cpuClockTickTimer.Reset(linux.ClockTick)
 		case <-k.cpuClockTickerWakeCh:
 			continue
+		case <-k.cpuClockTickerStopCh:
+			return
 		}
 
 		// Advance the "kernel CPU clock".

@@ -276,6 +276,7 @@ go_library(
         "kcov.go",
         "kcov_unsafe.go",
         "kernel.go",
+        "live_fork.go",
         "kernel_opts.go",
         "kernel_restore.go",
         "kernel_state.go",
@@ -460,5 +461,32 @@ go_test(
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+    ],
+)
+
+go_test(
+    name = "live_fork_test",
+    size = "small",
+    srcs = ["live_fork_test.go"],
+    library = ":kernel",
+    deps = [
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/time",
+    ],
+)
+
+go_test(
+    name = "live_fork_systrap_test",
+    size = "small",
+    srcs = [
+        "live_fork_test.go",
+        "systrap_platform_test.go",
+    ],
+    args = ["--platform=systrap"],
+    library = ":kernel",
+    deps = [
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/platform/systrap",
+        "//pkg/sentry/time",
     ],
 )
