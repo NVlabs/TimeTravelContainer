@@ -100,6 +100,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := k.validateLiveForkResources(); err != nil {
 			return err
 		}
+		k.prepareSharedMemoryForLiveFork(ctx)
 		// Discard PMAs backed by files that state serialization cannot encode,
 		// such as a gofer MmapCachedFile. The VMAs remain and refault from their
 		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
@@ -182,6 +183,26 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		return nil, err
 	}
 	return child, nil
+}
+
+// prepareSharedMemoryForLiveFork establishes page CoW for every SysV SHM
+// registry reachable from a task, including the root IPC namespace. Tasks are
+// paused, so their ipcns pointers are stable without Task.mu.
+func (k *Kernel) prepareSharedMemoryForLiveFork(ctx context.Context) {
+	namespaces := make(map[*IPCNamespace]struct{})
+	if k.rootIPCNamespace != nil {
+		namespaces[k.rootIPCNamespace] = struct{}{}
+	}
+	k.tasks.mu.RLock()
+	for task := range k.tasks.Root.tids {
+		if task.ipcns != nil {
+			namespaces[task.ipcns] = struct{}{}
+		}
+	}
+	k.tasks.mu.RUnlock()
+	for ns := range namespaces {
+		ns.shms.PrepareLiveFork(ctx)
+	}
 }
 
 // validateLiveForkResources walks all descriptor-table roots and any

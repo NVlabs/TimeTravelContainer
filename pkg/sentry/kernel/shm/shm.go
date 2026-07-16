@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
@@ -224,10 +225,10 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 		size:          size,
 		effectiveSize: effectiveSize,
 		obj:           ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, mode),
-		fr:            fr,
 		creatorPID:    pid,
 		changeTime:    ktime.NowFromContext(ctx),
 	}
+	shm.data.Insert(shm.data.FindGap(0), memmap.MappableRange{Start: 0, End: effectiveSize}, fr.Start)
 	shm.InitRefs()
 
 	if err := r.reg.Register(shm); err != nil {
@@ -308,6 +309,26 @@ func (r *Registry) Release(ctx context.Context) {
 	}
 }
 
+// PrepareLiveFork invalidates all cached segment translations and marks the
+// backing pages of every live segment as shared with an impending child.
+// Callers must prevent concurrent registry and mapping mutations.
+func (r *Registry) PrepareLiveFork(ctx context.Context) {
+	var segments []*Shm
+	r.mu.Lock()
+	r.reg.ForAllObjects(func(o ipc.Mechanism) {
+		s := o.(*Shm)
+		if s.TryIncRef() {
+			segments = append(segments, s)
+		}
+	})
+	r.mu.Unlock()
+
+	for _, s := range segments {
+		s.prepareLiveFork()
+		s.DecRef(ctx)
+	}
+}
+
 // Shm represents a single shared memory segment.
 //
 // Shm segments are backed directly by an allocation from platform memory.
@@ -350,9 +371,25 @@ type Shm struct {
 	// Invariant: effectiveSize must be a multiple of hostarch.PageSize.
 	effectiveSize uint64
 
-	// fr is the offset into mfp.MemoryFile() that backs this contents of this
-	// segment. Immutable.
-	fr memmap.FileRange
+	// mapsMu protects mappings.
+	mapsMu sync.Mutex `state:"nosave"`
+
+	// mappings tracks every mapping of this segment into a MappingSpace.
+	// Protected by mapsMu.
+	mappings memmap.MappingSet
+
+	// dataMu protects data and cow.
+	dataMu sync.Mutex `state:"nosave"`
+
+	// data maps offsets in this segment to offsets in mf. Unlike the original
+	// single FileRange backing, this may become page-granular after live fork.
+	// Protected by dataMu.
+	data ShmFileRangeSet
+
+	// cow contains logical ranges whose backing is also owned by a sibling
+	// live-fork branch. It does not own MemoryFile references.
+	// Protected by dataMu.
+	cow ShmFileRangeSet
 
 	// mu protects all fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -383,6 +420,75 @@ type Shm struct {
 // afterLoad is invoked by stateify.
 func (s *Shm) afterLoad(ctx goContext.Context) {
 	s.mf = pgalloc.MemoryFileFromContext(ctx)
+	if !pgalloc.IsLiveForkClone(ctx) {
+		return
+	}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for seg := s.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		s.mf.IncRef(seg.FileRange(), memCgID)
+	}
+}
+
+// prepareLiveFork invalidates all cached translations and marks all segment
+// pages as shared with the impending child branch.
+func (s *Shm) prepareLiveFork() {
+	s.mapsMu.Lock()
+	s.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	s.dataMu.Lock()
+	s.cow.RemoveAll()
+	for seg := s.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		s.cow.Insert(s.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
+	}
+	s.dataMu.Unlock()
+	s.mapsMu.Unlock()
+}
+
+// copyOnWriteLocked gives s branch-private backing for shared pages in mr.
+//
+// Preconditions:
+//   - s.dataMu is locked.
+//   - mr is page-aligned.
+func (s *Shm) copyOnWriteLocked(ctx context.Context, mr memmap.MappableRange) error {
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for cowSeg := s.cow.LowerBoundSegment(mr.Start); cowSeg.Ok() && cowSeg.Start() < mr.End; {
+		cowRange := cowSeg.Range().Intersect(mr)
+		cowSeg = s.cow.Isolate(cowSeg, cowRange)
+		dataSeg := s.data.FindSegment(cowRange.Start)
+		if !dataSeg.Ok() || !dataSeg.Range().IsSupersetOf(cowRange) {
+			return fmt.Errorf("SysV SHM live-fork CoW range %v has no data segment", cowRange)
+		}
+		dataSeg = s.data.Isolate(dataSeg, cowRange)
+		oldRange := dataSeg.FileRange()
+		newRange, err := s.mf.Allocate(cowRange.Length(), pgalloc.AllocOpts{
+			Kind:    usage.Anonymous,
+			MemCgID: memCgID,
+			Mode:    pgalloc.AllocateAndWritePopulate,
+		})
+		if err != nil {
+			return err
+		}
+		oldIMS, err := s.mf.MapInternal(oldRange, hostarch.Read)
+		if err != nil {
+			s.mf.DecRef(newRange)
+			return err
+		}
+		newIMS, err := s.mf.MapInternal(newRange, hostarch.Write)
+		if err != nil {
+			s.mf.DecRef(newRange)
+			return err
+		}
+		if n, err := safemem.CopySeq(newIMS, oldIMS); err != nil || n != cowRange.Length() {
+			s.mf.DecRef(newRange)
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("short SysV SHM live-fork CoW copy: got %d bytes, want %d", n, cowRange.Length())
+		}
+		dataSeg.SetValue(newRange.Start)
+		s.mf.DecRef(oldRange)
+		cowSeg = s.cow.Remove(cowSeg).NextSegment()
+	}
+	return nil
 }
 
 // ID returns object's ID.
@@ -442,7 +548,10 @@ func (s *Shm) InodeID() uint64 {
 // Precondition: Caller must not hold s.mu.
 func (s *Shm) DecRef(ctx context.Context) {
 	s.ShmRefs.DecRef(func() {
-		s.mf.DecRef(s.fr)
+		s.dataMu.Lock()
+		s.data.DropAll(s.mf)
+		s.cow.RemoveAll()
+		s.dataMu.Unlock()
 		s.registry.remove(s)
 	})
 }
@@ -454,7 +563,10 @@ func (s *Shm) Msync(context.Context, memmap.MappableRange) error {
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
-func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ hostarch.AddrRange, _ uint64, _ bool) error {
+func (s *Shm) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	s.mapsMu.Lock()
+	s.mappings.AddMapping(ms, ar, offset, writable)
+	s.mapsMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attachTime = ktime.NowFromContext(ctx)
@@ -469,7 +581,10 @@ func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ hostarch.
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
-func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ hostarch.AddrRange, _ uint64, _ bool) {
+func (s *Shm) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	s.mapsMu.Lock()
+	s.mappings.RemoveMapping(ms, ar, offset, writable)
+	s.mapsMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// RemoveMapping may be called during task exit, when ctx
@@ -490,27 +605,52 @@ func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ hostar
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
-func (*Shm) CopyMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, hostarch.AddrRange, uint64, bool) error {
+
+func (s *Shm) CopyMapping(_ context.Context, ms memmap.MappingSpace, _, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	s.mapsMu.Lock()
+	s.mappings.AddMapping(ms, dstAR, offset, writable)
+	s.mapsMu.Unlock()
 	return nil
 }
 
 // Translate implements memmap.Mappable.Translate.
 func (s *Shm) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+
 	var err error
-	if required.End > s.fr.Length() {
+	valid := memmap.MappableRange{Start: 0, End: s.effectiveSize}
+	if required.End > valid.End {
 		err = &memmap.BusError{linuxerr.EFAULT}
 	}
-	if source := optional.Intersect(memmap.MappableRange{0, s.fr.Length()}); source.Length() != 0 {
-		return []memmap.Translation{
-			{
-				Source: source,
-				File:   s.mf,
-				Offset: s.fr.Start + source.Start,
-				Perms:  hostarch.AnyAccess,
-			},
-		}, err
+	required = required.Intersect(valid)
+	if required.Length() == 0 {
+		return nil, err
 	}
-	return nil, err
+
+	// As with tmpfs, conservatively detach required pages on their first
+	// post-fork fault. This guarantees that all mappings in this branch will
+	// subsequently resolve to the same branch-private page.
+	if cowErr := s.copyOnWriteLocked(ctx, required); cowErr != nil {
+		return nil, &memmap.BusError{cowErr}
+	}
+
+	translateRange := optional.Intersect(valid)
+	if !s.cow.IsEmpty() {
+		// Do not install translations for shared pages that have not detached.
+		translateRange = required
+	}
+	var ts []memmap.Translation
+	for seg := s.data.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg = seg.NextSegment() {
+		segMR := seg.Range().Intersect(translateRange)
+		ts = append(ts, memmap.Translation{
+			Source: segMR,
+			File:   s.mf,
+			Offset: seg.FileRangeOf(segMR).Start,
+			Perms:  hostarch.AnyAccess,
+		})
+	}
+	return ts, err
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.

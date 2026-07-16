@@ -48,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/shm"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -374,6 +375,33 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentTimerFile := liveForkTestFD(t, l.k, timerFD)
 	parentTimer = parentTimerFile.Impl().(*timerfd.TimerFileDescription)
 	parentTask := l.k.GlobalInit().Leader()
+	shmSegment, err := parentTask.IPCNamespace().ShmRegistry().FindOrCreate(parentTask, 1, 0, hostarch.PageSize, 0600, true, true, true)
+	if err != nil {
+		t.Fatalf("creating SysV SHM segment: %v", err)
+	}
+	shmOpts, err := shmSegment.ConfigureAttach(parentTask, 0, shm.AttachOpts{})
+	if err != nil {
+		shmSegment.DecRef(parentTask)
+		t.Fatalf("configuring first SysV SHM mapping: %v", err)
+	}
+	shmAddr1, err := parentTask.MemoryManager().MMap(parentTask, shmOpts)
+	if err != nil {
+		shmSegment.DecRef(parentTask)
+		t.Fatalf("mapping first SysV SHM alias: %v", err)
+	}
+	shmOpts, err = shmSegment.ConfigureAttach(parentTask, 0, shm.AttachOpts{})
+	if err != nil {
+		shmSegment.DecRef(parentTask)
+		t.Fatalf("configuring second SysV SHM mapping: %v", err)
+	}
+	shmAddr2, err := parentTask.MemoryManager().MMap(parentTask, shmOpts)
+	if err != nil {
+		shmSegment.DecRef(parentTask)
+		t.Fatalf("mapping second SysV SHM alias: %v", err)
+	}
+	shmSegment.DecRef(parentTask)
+	liveForkTestMMWrite(t, parentTask, shmAddr1, "seed")
+	liveForkTestMMRead(t, parentTask, shmAddr2, "seed")
 	signalMask := linux.SignalSetOf(linux.SIGUSR1)
 	parentTask.SetSignalMask(parentTask.SignalMask() | signalMask)
 	signalFile, err := signalfd.New(l.k.VFS(), parentTask, signalMask, linux.O_NONBLOCK)
@@ -486,6 +514,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childTimerFile := liveForkTestFD(t, child.k, timerFD)
 	childTimer := childTimerFile.Impl().(*timerfd.TimerFileDescription)
 	childTask := child.k.GlobalInit().Leader()
+	liveForkTestMMRead(t, childTask, shmAddr1, "seed")
+	liveForkTestMMRead(t, childTask, shmAddr2, "seed")
+	liveForkTestMMWrite(t, childTask, shmAddr1, "chld")
+	liveForkTestMMRead(t, childTask, shmAddr2, "chld")
+	liveForkTestMMRead(t, parentTask, shmAddr1, "seed")
+	liveForkTestMMWrite(t, parentTask, shmAddr2, "prnt")
+	liveForkTestMMRead(t, parentTask, shmAddr1, "prnt")
+	liveForkTestMMRead(t, childTask, shmAddr2, "chld")
 	childSignalFile := liveForkTestFD(t, child.k, signalFD)
 	childRoot := childTask.MountNamespace().Root(childCtx)
 	childInotifyFile := liveForkTestFD(t, child.k, inotifyFD)
@@ -719,6 +755,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("looking up grandchild: %v", err)
 	}
 	grandchildTask := grandchild.k.GlobalInit().Leader()
+	liveForkTestMMRead(t, grandchildTask, shmAddr1, "chld")
+	liveForkTestMMWrite(t, grandchildTask, shmAddr2, "grnd")
+	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
+	liveForkTestMMRead(t, childTask, shmAddr1, "chld")
+	liveForkTestMMRead(t, parentTask, shmAddr1, "prnt")
 	grandchildMemfd := liveForkTestFD(t, grandchild.k, memfdFD)
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
@@ -1053,6 +1094,24 @@ func liveForkTestSize(t *testing.T, ctx context.Context, file *vfs.FileDescripti
 	}
 	if stat.Size != want {
 		t.Fatalf("size: got %d, want %d", stat.Size, want)
+	}
+}
+
+func liveForkTestMMWrite(t *testing.T, task *kernel.Task, addr hostarch.Addr, value string) {
+	t.Helper()
+	if n, err := task.MemoryManager().CopyOut(task, addr, []byte(value), usermem.IOOpts{}); err != nil || n != len(value) {
+		t.Fatalf("MemoryManager.CopyOut(%#x, %q): got (%d, %v)", addr, value, n, err)
+	}
+}
+
+func liveForkTestMMRead(t *testing.T, task *kernel.Task, addr hostarch.Addr, want string) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if n, err := task.MemoryManager().CopyIn(task, addr, got, usermem.IOOpts{}); err != nil || n != len(got) {
+		t.Fatalf("MemoryManager.CopyIn(%#x): got (%q, %d, %v)", addr, got, n, err)
+	}
+	if string(got) != want {
+		t.Fatalf("memory at %#x: got %q, want %q", addr, got, want)
 	}
 }
 

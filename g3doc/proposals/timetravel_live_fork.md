@@ -390,7 +390,7 @@ Initial policy:
 | Tmpfs/memfd/POSIX SHM | Page CoW implemented and exercised through syscall and mapped writes |
 | In-memory OverlayFS upper on tmpfs | Clone, including metadata, hardlinks, whiteouts, and sparse size divergence |
 | Read-only immutable gofer lower | Share with explicit hook |
-| SysV SHM | Reject until branch page map is implemented |
+| SysV SHM | Clone through a branch-local page map with first-fault CoW |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
 | Loopback netstack socket | Reject until networking phase |
 | Host TCP/UDP/Unix socket | Reject |
@@ -542,6 +542,15 @@ were refaulted after the first child ran. `LiveFork` now invokes the same
 but before VFS preparation. These VMAs remain intact and refault through the
 cloned gofer graph, while unsupported `MmapCachedFile` PMAs never reach state
 serialization.
+
+The first Phase 5 slice replaces the single immutable MemoryFile range backing
+each SysV SHM segment with an interval page map. Fork preparation invalidates
+every mapping of each reachable IPC namespace and marks its present ranges
+shared; the child takes one MemoryFile reference per range. The first post-fork
+fault detaches only the required pages, using the same conservative first-access
+rule as tmpfs. A real-loader test maps one segment twice and verifies alias
+coherence within parent, child, and grandchild branches, isolation between those
+branches, and recursive re-forking without copying untouched pages.
 
 ## Implementation phases and gates
 

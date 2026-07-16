@@ -185,6 +185,7 @@ go_test(
         "//pkg/sentry/fsimpl/timerfd",
         "//pkg/sentry/fsimpl/tmpfs",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/kernel/shm",
         "//pkg/sentry/memmap",
         "//pkg/sentry/seccheck",
         "//pkg/sentry/socket/unix",
