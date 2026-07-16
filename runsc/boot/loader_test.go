@@ -225,11 +225,37 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestLiveForkMountsCompatible(t *testing.T) {
+	conf := testConfig()
+	spec := testSpec()
+	spec.Mounts = []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc"},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs"},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro"}},
+	}
+	if !liveForkMountsCompatible(spec, conf) {
+		t.Fatal("proc/tmpfs/read-only-sysfs mounts rejected")
+	}
+	spec.Mounts[2].Options = nil
+	if liveForkMountsCompatible(spec, conf) {
+		t.Fatal("writable sysfs mount accepted")
+	}
+	spec.Mounts[2] = specs.Mount{Destination: "/host", Type: "bind", Source: "/host", Options: []string{"ro"}}
+	if liveForkMountsCompatible(spec, conf) {
+		t.Fatal("bind mount accepted before immutable-gofer eligibility is implemented")
+	}
+}
+
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
 func TestRunLiveForkNetworkNone(t *testing.T) {
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sleep", "30"}
 	spec.Root.Readonly = false
+	spec.Mounts = []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+	}
 	conf := testConfig()
 	conf.DirectFS = false
 	l, cleanup, err := createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.MemoryOverlay})
@@ -538,6 +564,15 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	truncateFile.DecRef(parentTask)
 	parentTruncateFile := liveForkTestFD(t, l.k, truncateFD)
+	devMountFile := liveForkTestCreateFile(t, parentTask, "dev/ttos-mount-state")
+	const devMountFD = int32(26)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, devMountFD, devMountFile, kernel.FDFlags{}); err != nil {
+		devMountFile.DecRef(parentTask)
+		t.Fatalf("installing /dev tmpfs file: %v", err)
+	}
+	devMountFile.DecRef(parentTask)
+	parentDevMountFile := liveForkTestFD(t, l.k, devMountFD)
+	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "seed")
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -588,6 +623,19 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childMemfd := liveForkTestFD(t, child.k, memfdFD)
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
+	childDevMountFile := liveForkTestFD(t, child.k, devMountFD)
+	for _, check := range []struct {
+		task *kernel.Task
+		path string
+	}{
+		{parentTask, "proc/1/status"},
+		{childTask, "proc/1/status"},
+		{parentTask, "sys"},
+		{childTask, "sys"},
+	} {
+		file := liveForkTestOpenPath(t, check.task, check.path, linux.O_RDONLY)
+		file.DecRef(check.task)
+	}
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -766,6 +814,16 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMappedWrite(t, childTask, childMemfd, "chld")
 	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
+
+	// An explicit tmpfs submount uses the Kernel MemoryFile and therefore
+	// detaches pages independently just like memfd and the root overlay upper.
+	liveForkTestPRead(t, parentTask, parentDevMountFile, 0, "seed")
+	liveForkTestPRead(t, childTask, childDevMountFile, 0, "seed")
+	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "prnt")
+	liveForkTestPRead(t, childTask, childDevMountFile, 0, "seed")
+	liveForkTestPWrite(t, childTask, childDevMountFile, 0, "chld")
+	liveForkTestPRead(t, parentTask, parentDevMountFile, 0, "prnt")
+	liveForkTestPRead(t, childTask, childDevMountFile, 0, "chld")
 
 	// The writable root uses a branch-local tmpfs OverlayFS upper over the
 	// shared immutable gofer lower. Contents, open-unlinked files, and directory

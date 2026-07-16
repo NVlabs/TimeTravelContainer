@@ -136,6 +136,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			}},
 		},
 		Hostname: hostname,
+		Mounts: []specs.Mount{
+			{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		},
 		Linux: &specs.Linux{
 			Namespaces: []specs.LinuxNamespace{
 				{Type: specs.PIDNamespace},

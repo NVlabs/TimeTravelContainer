@@ -45,6 +45,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
@@ -757,7 +759,7 @@ func New(args Args) (*Loader, error) {
 	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
-		AllowSharedFilesystemResources: rootFilesystemContained && len(args.Spec.Mounts) == 0,
+		AllowSharedFilesystemResources: rootFilesystemContained && liveForkMountsCompatible(args.Spec, args.Conf),
 		WatchdogOpts:                   &dogOpts,
 	})
 
@@ -835,6 +837,34 @@ func New(args Args) (*Loader, error) {
 	}
 
 	return l, nil
+}
+
+// liveForkMountsCompatible reports whether every explicit OCI mount belongs to
+// the initial Sentry-owned live-fork allowlist. Filesystem state is still
+// validated by Kernel.LiveFork before the source is modified.
+func liveForkMountsCompatible(spec *specs.Spec, conf *config.Config) bool {
+	if specutils.TPUProxyEnabled(spec, conf) || specutils.NVProxyEnabled(spec, conf) {
+		return false
+	}
+	for _, mount := range spec.Mounts {
+		switch mount.Type {
+		case proc.Name, tmpfs.Name:
+		case sys.Name:
+			readOnly := false
+			for _, option := range mount.Options {
+				if option == "ro" {
+					readOnly = true
+					break
+				}
+			}
+			if !readOnly {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.

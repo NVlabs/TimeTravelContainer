@@ -8,7 +8,8 @@ sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
 initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
 plus synchronous non-TTY exec into a selected live branch. `ttosd`, detached
-and TTY exec, attach, ordinary OCI mounts, and managed volumes remain TODO.
+and TTY exec, attach, devpts and other remaining mount classes, and managed
+volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -93,7 +94,7 @@ the `main` branch and leave `ttos` responsible for branch operations.
 ### Container lifecycle
 
 - [x] `ttos run [OPTIONS] IMAGE [COMMAND...]` (initial foreground/detached,
-      non-TTY slice with no additional mounts).
+      non-TTY slice with procfs, `/dev` tmpfs, and restricted sysfs mounts).
 - [x] Support `--name`, environment variables, working directory, named or
       numeric user, entrypoint override, hostname, and rootless execution.
 - [ ] Add CPU, memory, process-count, and other resource-limit flags.
@@ -226,9 +227,9 @@ host clients connect transiently through the control plane.
 
 ## Mount eligibility framework
 
-The current loader admits filesystem sharing with one sandbox-wide boolean and
-rejects every additional OCI mount. Replace this with an explicit decision for
-each reachable filesystem and mount:
+The initial loader now has a narrow OCI-spec allowlist for procfs, main-
+`MemoryFile` tmpfs, and read-only Sentry sysfs. Replace this transitional gate
+with an explicit decision for each reachable filesystem and mount:
 
 ```text
 Clone             mutable Sentry-owned state, copied using page CoW
@@ -241,22 +242,28 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [ ] Collect all mount decisions before any parent CoW mutation.
 - [ ] Include mount path, filesystem type, source class, and reason in
       structured eligibility errors.
-- [ ] Replace `len(spec.Mounts) == 0` with closure validation over every mount.
+- [x] Replace the blanket `len(spec.Mounts) == 0` gate with an initial
+      conservative allowlist that rejects every unclassified mount.
+- [ ] Replace the spec-level allowlist with closure validation over every
+      reachable mounted filesystem and resource.
 - [ ] Verify recursive forks and arbitrary destruction orders for every allowed
       mount class.
 
 ### tmpfs, procfs, and sysfs
 
-- [ ] Admit main-`MemoryFile` tmpfs mounts as `Clone`.
+- [x] Admit main-`MemoryFile` tmpfs mounts as the initial `Clone` class and
+      verify file contents diverge CoW across branches.
 - [ ] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
       truncate, fallocate, and mount flags across branches.
 - [ ] Admit procfs only after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,
       namespaces, mounts, clocks, and `/proc/net` resolve through the child
       Kernel rather than the source Kernel.
-- [ ] Admit a restricted Sentry-owned sysfs profile.
-- [ ] Keep host PCI, VFIO, accelerator, TPU, device proxy, and other mirrored
-      host sysfs paths rejected until separately proven branch-local or
-      immutable.
+- [x] Initial procfs fork and parent/child `/proc/1/status` access coverage;
+      exhaustive dynamic-file validation remains above.
+- [x] Admit a read-only restricted Sentry-owned sysfs profile.
+- [x] Keep host binds and TPU/NVIDIA device proxies rejected by the initial
+      allowlist; other mirrored host sysfs paths remain rejected until
+      separately proven branch-local or immutable.
 - [ ] Test nested and repeated procfs/sysfs mounts and bind-remount flags.
 
 ### Read-only host paths
@@ -357,7 +364,8 @@ Reject            unsupported, externally mutable, or host/device-backed
 ### Milestone A: normal OCI bundles
 
 - [ ] Per-mount eligibility framework.
-- [ ] tmpfs, procfs, restricted sysfs, and devpts mounts.
+- [x] Initial tmpfs, procfs, and restricted read-only sysfs mounts.
+- [ ] devpts and `/dev/ptmx` mounts for the internal TTY console.
 - [ ] Multiple immutable read-only gofer binds.
 - [ ] Managed tmpfs/OverlayFS submount volumes.
 
@@ -367,7 +375,7 @@ read-only binds, and managed volumes forks without hand-editing its spec.
 ### Milestone B: branch-native exec
 
 - [ ] Branch-local process bookkeeping and branch-aware execute/wait/signal.
-- [ ] Synchronous non-TTY `ttos exec`.
+- [x] Synchronous non-TTY `ttos exec` with branch-aware execute/wait.
 - [ ] Eligibility recovery after an attached exec process exits and its imported
       host FDs are released.
 

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
@@ -63,8 +64,13 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if spec.Process.User.UID != 123 || spec.Process.User.GID != 456 || !reflect.DeepEqual(spec.Process.User.AdditionalGids, []uint32{789}) {
 		t.Errorf("user=%+v", spec.Process.User)
 	}
-	if len(spec.Mounts) != 0 {
-		t.Errorf("mounts=%+v, want none for live-fork gate", spec.Mounts)
+	wantMounts := []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+	}
+	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
+		t.Errorf("mounts=%+v, want %+v", spec.Mounts, wantMounts)
 	}
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.overlay"]; got != "memory" {
 		t.Errorf("root overlay=%q, want memory", got)
