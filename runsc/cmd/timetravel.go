@@ -16,12 +16,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -32,11 +34,15 @@ import (
 // TimeTravel controls experimental in-memory sandbox branches.
 type TimeTravel struct {
 	containerLoader
-	source string
-	paused bool
-	pid    int
-	signal int
-	all    bool
+	source          string
+	paused          bool
+	pid             int
+	signal          int
+	all             bool
+	consoleID       string
+	consoleStream   string
+	consoleMaxBytes int
+	consoleData     string
 }
 
 // Name implements subcommands.Command.Name.
@@ -52,7 +58,8 @@ func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
-		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n"
+		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
+		"timetravel [flags] <container-id> console-read|console-write <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -62,6 +69,10 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.pid, "pid", 0, "virtual process ID; 0 selects the container init")
 	f.IntVar(&t.signal, "signal", int(linux.SIGTERM), "signal number for the signal action")
 	f.BoolVar(&t.all, "all", false, "signal every process in the container")
+	f.StringVar(&t.consoleID, "console", "init", "internal console session ID")
+	f.StringVar(&t.consoleStream, "stream", "stdout", "console output stream: stdout or stderr")
+	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
+	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -133,6 +144,31 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			PID:      int32(t.pid),
 		})
 		output = map[string]uint32{"wait_status": status}
+	case "console-read":
+		stream := kernel.InternalConsoleStdout
+		switch t.consoleStream {
+		case "stdout":
+		case "stderr":
+			stream = kernel.InternalConsoleStderr
+		default:
+			util.Fatalf("unknown console stream %q", t.consoleStream)
+		}
+		output, err = cont.Sandbox.ReadConsole(&boot.ConsoleReadArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
+			Stream:    stream,
+			MaxBytes:  t.consoleMaxBytes,
+		})
+	case "console-write":
+		data, decodeErr := base64.StdEncoding.DecodeString(t.consoleData)
+		if decodeErr != nil {
+			util.Fatalf("decoding --data-base64: %v", decodeErr)
+		}
+		output, err = cont.Sandbox.WriteConsole(&boot.ConsoleWriteArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
+			Data:      data,
+		})
 	default:
 		f.Usage()
 		return subcommands.ExitUsageError
