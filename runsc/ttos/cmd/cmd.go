@@ -220,6 +220,9 @@ Global options:
 Commands:
   pull [OPTIONS] IMAGE           Pull and unpack an OCI/Docker image
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
+  create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
+  start [OPTIONS] CONTAINER      Start a prepared or exited container
+  inspect CONTAINER...           Show persistent and live branch state
   ls [--tree|--json]              List container families and branch trees
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
@@ -240,6 +243,12 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPull(args[1:], stdout, stderr, backend)
 	case "run":
 		err = runContainer(args[1:], stdout, stderr, backend)
+	case "create":
+		err = runCreate(args[1:], stdout, stderr, backend)
+	case "start":
+		err = runStart(args[1:], stdout, stderr, backend)
+	case "inspect":
+		err = runInspect(args[1:], stdout, backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "fork":
@@ -367,6 +376,108 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		fmt.Fprintln(stdout, request.name)
 	}
 	return nil
+}
+
+func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	name := fs.String("name", "", "assign a container name")
+	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	cwd := fs.String("workdir", "", "working directory inside the container")
+	fs.StringVar(cwd, "w", "", "working directory inside the container")
+	user := fs.String("user", "", "username or UID[:GID]")
+	fs.StringVar(user, "u", "", "username or UID[:GID]")
+	hostname := fs.String("hostname", "", "container hostname")
+	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
+	var env stringSlice
+	fs.Var(&env, "env", "set environment variable NAME=VALUE")
+	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
+	}
+	containerName := *name
+	if containerName == "" {
+		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	}
+	request := runRequest{
+		name:      containerName,
+		reference: fs.Arg(0),
+		platform:  *platform,
+		args:      append([]string(nil), fs.Args()[1:]...),
+		env:       append([]string(nil), env...),
+		cwd:       *cwd,
+		user:      *user,
+		hostname:  *hostname,
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "entrypoint" {
+			request.entrypoint = []string{*entrypoint}
+			if *entrypoint == "" {
+				request.entrypoint = []string{}
+			}
+		}
+	})
+	if err := backend.create(request); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, request.name)
+	return nil
+}
+
+func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	attach := fs.Bool("attach", false, "attach stdout and stderr and wait")
+	fs.BoolVar(attach, "a", false, "attach stdout and stderr and wait")
+	interactive := fs.Bool("interactive", false, "keep stdin open (requires --attach)")
+	fs.BoolVar(interactive, "i", false, "keep stdin open (requires --attach)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos start [--attach] CONTAINER")
+	}
+	if *interactive && !*attach {
+		return errors.New("--interactive requires --attach")
+	}
+	status, err := backend.start(fs.Arg(0), !*attach, *interactive)
+	if err != nil {
+		return err
+	}
+	if status != 0 {
+		return exitStatus{code: status}
+	}
+	if !*attach {
+		fmt.Fprintln(stdout, fs.Arg(0))
+	}
+	return nil
+}
+
+// InspectInfo combines persistent image/bundle configuration with live state.
+type InspectInfo struct {
+	Container    ttosbundle.ContainerInfo `json:"container"`
+	Runtime      *Family                  `json:"runtime,omitempty"`
+	RuntimeError string                   `json:"runtime_error,omitempty"`
+}
+
+func runInspect(args []string, stdout io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos inspect CONTAINER [CONTAINER...]")
+	}
+	results := make([]InspectInfo, 0, len(args))
+	for _, name := range args {
+		info, err := backend.inspect(name)
+		if err != nil {
+			return err
+		}
+		results = append(results, info)
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(results)
 }
 
 func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -698,7 +809,10 @@ type Family struct {
 
 type backend interface {
 	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
+	create(request runRequest) error
 	run(request runRequest) (int, error)
+	start(name string, detach, interactive bool) (int, error)
+	inspect(name string) (InspectInfo, error)
 	listFamilies() ([]Family, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
@@ -737,20 +851,72 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	return b.launch(request.name, prepared.BundleDir, request.detach, request.interactive)
+}
+
+func (b *runtimeBackend) create(request runRequest) error {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	_, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
+		SpecOptions: ttosbundle.SpecOptions{
+			Name:       request.name,
+			Args:       request.args,
+			Env:        request.env,
+			Cwd:        request.cwd,
+			User:       request.user,
+			Hostname:   request.hostname,
+			Entrypoint: request.entrypoint,
+		},
+		Reference: request.reference,
+		Platform:  request.platform,
+	})
+	return err
+}
+
+func (b *runtimeBackend) start(name string, detach, interactive bool) (int, error) {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	info, err := store.LoadContainer(name)
+	if err != nil {
+		return 1, err
+	}
+	return b.launch(name, info.BundleDir, detach, interactive)
+}
+
+func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	containerInfo, err := store.LoadContainer(name)
+	if err != nil {
+		return InspectInfo{}, err
+	}
+	result := InspectInfo{Container: containerInfo}
+	families, err := b.listFamilies()
+	if err != nil {
+		result.RuntimeError = err.Error()
+		return result, nil
+	}
+	for i := range families {
+		if families[i].ID == name {
+			result.Runtime = &families[i]
+			break
+		}
+	}
+	return result, nil
+}
+
+func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool) (int, error) {
 	args := []string{
 		"--root", b.root,
 		"--rootless=true",
 		"--network=none",
 		"--directfs=false",
 		"--overlay2=all:memory",
-		"run", "--bundle", prepared.BundleDir,
+		"run", "--bundle", bundleDir,
 	}
-	if request.detach {
+	if detach {
 		args = append(args, "--detach")
 	}
-	args = append(args, request.name)
+	args = append(args, name)
 	command := exec.Command(b.runsc, args...)
-	if request.interactive && !request.detach {
+	if interactive && !detach {
 		command.Stdin = b.stdin
 	}
 	command.Stdout = b.stdout

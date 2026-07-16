@@ -63,9 +63,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Distinguish family state, branch state, and exec-session state.
 - [ ] Define `stop` as process termination, not suspension; `pause`/`resume`
       retain memory and kernel state.
-- [ ] Decide `start` semantics for an exited branch. The first release may
-      support `start` only for created/stopped base containers and require a new
-      branch or run for a destroyed in-memory state.
+- [x] Define initial `start` semantics: a created or exited base container
+      starts from its persistent OCI bundle and immutable image root; destroyed
+      in-memory branch state is not reconstructed.
 - [ ] Specify behavior when a family or branch name conflicts with an image,
       volume, or exec-session name.
 - [ ] Store desired configuration separately from transient Sentry state so
@@ -90,16 +90,21 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 - [x] `ttos run [OPTIONS] IMAGE [COMMAND...]` (initial foreground/detached,
       non-TTY slice with no additional mounts).
-- [ ] Support `--name`, environment variables, working directory, user,
-      entrypoint override, resource limits, hostname, and rootless execution.
-- [ ] Support foreground, `--detach`, and interactive `-i`/`-t` modes.
-- [ ] `ttos create`, even if initially implemented as `run` without `start`.
-- [ ] `ttos start CONTAINER` for created/stopped base containers.
+- [x] Support `--name`, environment variables, working directory, named or
+      numeric user, entrypoint override, hostname, and rootless execution.
+- [ ] Add CPU, memory, process-count, and other resource-limit flags.
+- [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
+- [ ] Support `-t` after the internal detachable console is implemented.
+- [x] `ttos create` as persistent image-root and OCI-bundle preparation.
+- [x] `ttos start CONTAINER` for created/exited base containers, detached by
+      default with optional `--attach`.
 - [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
 - [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
 - [ ] `ttos rm CONTAINER` and explicit policy for live descendant branches.
-- [ ] `ttos inspect CONTAINER[@BRANCH]` exposing family, branch, process,
-      resource-eligibility, timing, and mount information.
+- [x] Initial `ttos inspect CONTAINER` exposing persistent image/bundle data and
+      the live family/branch tree when present.
+- [ ] Extend inspect with branch process, resource-eligibility, timing, and
+      mount information.
 - [ ] `ttos logs CONTAINER[@BRANCH]` backed by branch-local console output.
 - [ ] `ttos ps` for host-side container families and `ttos top` for processes
       inside a selected branch.

@@ -48,7 +48,8 @@ type Prepared struct {
 	Image     images.RootFSInfo
 }
 
-type containerMetadata struct {
+// ContainerInfo is the persistent configuration needed to start a container.
+type ContainerInfo struct {
 	Name      string    `json:"name"`
 	Reference string    `json:"reference"`
 	Digest    string    `json:"digest"`
@@ -108,7 +109,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
 		return Prepared{}, fmt.Errorf("writing OCI config: %w", err)
 	}
-	metadata := containerMetadata{
+	metadata := ContainerInfo{
 		Name:      opts.Name,
 		Reference: imageInfo.Reference,
 		Digest:    pulled.Digest,
@@ -122,6 +123,31 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	keep = true
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo}, nil
+}
+
+// LoadContainer returns persistent configuration for name.
+func (s Store) LoadContainer(name string) (ContainerInfo, error) {
+	if err := validateName(name); err != nil {
+		return ContainerInfo{}, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.Root, "containers", name, "container.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ContainerInfo{}, fmt.Errorf("container %q does not exist", name)
+		}
+		return ContainerInfo{}, fmt.Errorf("reading container %q: %w", name, err)
+	}
+	var info ContainerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", name, err)
+	}
+	if info.Name != name || info.BundleDir == "" {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", name)
+	}
+	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", name, err)
+	}
+	return info, nil
 }
 
 func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string) (images.RootFSInfo, string, error) {

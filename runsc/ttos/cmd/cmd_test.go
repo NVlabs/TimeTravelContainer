@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 )
 
@@ -214,6 +215,41 @@ func TestRunForwardsContainerExitStatus(t *testing.T) {
 	}
 }
 
+func TestCreateAndStart(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"create", "--name", "demo", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
+	}
+	if !b.created || b.runRequest.name != "demo" || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"start", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("start status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.started != "demo" || !b.startDetach || b.startInteractive {
+		t.Errorf("start name=%q detach=%t interactive=%t", b.started, b.startDetach, b.startInteractive)
+	}
+	if stdout.String() != "demo\n" {
+		t.Errorf("start output=%q", stdout.String())
+	}
+}
+
+func TestInspect(t *testing.T) {
+	b := &fakeBackend{inspectInfo: InspectInfo{
+		Container: ttosbundle.ContainerInfo{Name: "demo", Reference: "docker.io/library/busybox:latest"},
+		Runtime:   &Family{ID: "demo", State: "running", Branches: []Branch{{ID: "main", State: "running"}}},
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"inspect", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"reference": "docker.io/library/busybox:latest"`) || !strings.Contains(stdout.String(), `"state": "running"`) {
+		t.Errorf("inspect output=%q", stdout.String())
+	}
+}
+
 func TestListJSON(t *testing.T) {
 	b := &fakeBackend{families: []Family{{ID: "web", State: "running", Branches: []Branch{{ID: "main", State: "running"}}}}}
 	var stdout, stderr bytes.Buffer
@@ -345,30 +381,52 @@ type signalCall struct {
 }
 
 type fakeBackend struct {
-	families        []Family
-	err             error
-	forkSource      selector
-	forkDestination string
-	forkPaused      bool
-	paused          selector
-	resumed         selector
-	destroyed       selector
-	signals         []signalCall
-	waited          selector
-	waitStatus      uint32
-	waitRelease     chan struct{}
-	pullReference   string
-	pullPlatform    string
-	pullSnapshotter string
-	pullUnpack      bool
-	pullInfo        ttosimages.Info
-	runRequest      runRequest
-	runStatus       int
+	families         []Family
+	err              error
+	forkSource       selector
+	forkDestination  string
+	forkPaused       bool
+	paused           selector
+	resumed          selector
+	destroyed        selector
+	signals          []signalCall
+	waited           selector
+	waitStatus       uint32
+	waitRelease      chan struct{}
+	pullReference    string
+	pullPlatform     string
+	pullSnapshotter  string
+	pullUnpack       bool
+	pullInfo         ttosimages.Info
+	runRequest       runRequest
+	runStatus        int
+	created          bool
+	started          string
+	startDetach      bool
+	startInteractive bool
+	inspectInfo      InspectInfo
+}
+
+func (b *fakeBackend) create(request runRequest) error {
+	b.runRequest = request
+	b.created = true
+	return b.err
 }
 
 func (b *fakeBackend) run(request runRequest) (int, error) {
 	b.runRequest = request
 	return b.runStatus, b.err
+}
+
+func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) {
+	b.started = name
+	b.startDetach = detach
+	b.startInteractive = interactive
+	return b.runStatus, b.err
+}
+
+func (b *fakeBackend) inspect(name string) (InspectInfo, error) {
+	return b.inspectInfo, b.err
 }
 
 func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
