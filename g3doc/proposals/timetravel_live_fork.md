@@ -475,23 +475,28 @@ destroyed before the default branch. Branch-local exec, events, foreground TTY
 signaling, writable roots, additional mounts, and general network resource
 closure remain later work.
 
-The first Phase 3 resource slice is validated for anonymous pipes, pure Sentry
-eventfds, epoll registration graphs, and timerfds. The real-loader fork test
-installs these objects in PID 1's FD table before cloning. It verifies that
-queued pipe bytes, eventfd counters, and timerfd expiration counts start
-identical, aliases remain coherent inside each branch, consumption and writes
-diverge, and readiness never crosses branches. A cloned epoll interest resolves
-to the cloned pipe; deleting the interest in the child does not mutate the
-parent interest. An armed cloned timerfd also expires in the running child
-without making the paused parent readable.
+The Phase 3 object-graph slice is validated for anonymous pipes, pure Sentry
+eventfds, epoll registration graphs, timerfds, signalfds, inotify watches, and
+connected internal Unix socketpairs. The real-loader fork test installs these
+objects in the virtual PID 1 FD table before cloning. It verifies that queued
+bytes, event counters, pending signals, inotify events, and timer expiration
+counts start identical, aliases remain coherent inside each branch, consumption
+and writes diverge, and readiness never crosses branches. A cloned epoll
+interest resolves to the cloned pipe; deleting the interest in the child does
+not mutate the parent interest. An armed cloned timerfd also expires in the
+running child without making the paused parent readable. Signalfd target-task
+pointers and inotify watch targets resolve inside the cloned graph. A connected
+Unix socketpair preserves its peer topology while its receive queues become
+branch-local.
 
-Pipe, eventfd, and epoll required no special clone implementation beyond their
-existing state graph and post-load hooks. Timerfd testing exposed and fixed a
-kernel lifecycle gap: `StartPaused` paused Timekeeper updates and timers, but
-the final matching `Unpause` did not resume them. The kernel now resumes time
-before releasing the final task stop. Host-backed eventfds and the remaining
-object classes are not enabled by this result and still require explicit
-closure validation.
+These resources required no special clone implementation beyond their existing
+state graph and post-load hooks. Timerfd testing exposed and fixed a kernel
+lifecycle gap: `StartPaused` paused Timekeeper updates and timers, but the final
+matching `Unpause` did not resume them. The kernel now resumes time before
+releasing the final task stop. Host-backed variants, externally connected
+sockets, and queued descriptor-passing messages are not enabled by this result.
+All supported classes still require an explicit pre-CoW resource-closure
+validator rather than relying on checkpoint serialization failures.
 
 ## Implementation phases and gates
 

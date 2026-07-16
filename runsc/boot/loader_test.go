@@ -40,11 +40,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/signalfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
+	unixtransport "gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -297,6 +300,55 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	parentTimerFile := liveForkTestFD(t, l.k, timerFD)
 	parentTimer = parentTimerFile.Impl().(*timerfd.TimerFileDescription)
+	parentTask := l.k.GlobalInit().Leader()
+	signalMask := linux.SignalSetOf(linux.SIGUSR1)
+	parentTask.SetSignalMask(parentTask.SignalMask() | signalMask)
+	signalFile, err := signalfd.New(l.k.VFS(), parentTask, signalMask, linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("creating signalfd: %v", err)
+	}
+	signalFD, err := parentTask.FDTable().NewFD(ctx, 15, signalFile, kernel.FDFlags{})
+	signalFile.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing signalfd: %v", err)
+	}
+	parentSignalFile := liveForkTestFD(t, l.k, signalFD)
+	if err := parentTask.SendSignal(kernel.SignalInfoPriv(linux.SIGUSR1)); err != nil {
+		t.Fatalf("queuing parent signal before fork: %v", err)
+	}
+	parentRoot := parentTask.MountNamespace().Root(ctx)
+	inotifyFile, err := vfs.NewInotifyFD(ctx, l.k.VFS(), linux.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("creating inotify instance: %v", err)
+	}
+	parentInotify := inotifyFile.Impl().(*vfs.Inotify)
+	watchID := parentInotify.AddWatch(parentRoot.Dentry(), linux.IN_ATTRIB)
+	inotifyFD, err := parentTask.FDTable().NewFD(ctx, 16, inotifyFile, kernel.FDFlags{})
+	inotifyFile.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing inotify instance: %v", err)
+	}
+	parentInotifyFile := liveForkTestFD(t, l.k, inotifyFD)
+	parentRoot.Dentry().Watches().Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
+	unixEP1, unixEP2 := unixtransport.NewPair(parentTask, linux.SOCK_SEQPACKET, l.k)
+	unixFile1, unixErr := unixsocket.NewSockfsFile(parentTask, unixEP1, linux.SOCK_SEQPACKET)
+	if unixErr != nil {
+		t.Fatalf("creating first internal Unix socket: %v", unixErr)
+	}
+	unixFile2, unixErr := unixsocket.NewSockfsFile(parentTask, unixEP2, linux.SOCK_SEQPACKET)
+	if unixErr != nil {
+		unixFile1.DecRef(parentTask)
+		t.Fatalf("creating second internal Unix socket: %v", unixErr)
+	}
+	unixFDs, err := parentTask.FDTable().NewFDs(parentTask, 17, []*vfs.FileDescription{unixFile1, unixFile2}, kernel.FDFlags{})
+	unixFile1.DecRef(parentTask)
+	unixFile2.DecRef(parentTask)
+	if err != nil {
+		t.Fatalf("installing internal Unix socketpair: %v", err)
+	}
+	parentUnix1 := liveForkTestFD(t, l.k, unixFDs[0])
+	parentUnix2 := liveForkTestFD(t, l.k, unixFDs[1])
+	liveForkTestWrite(t, parentTask, parentUnix1, "seed")
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -325,6 +377,13 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childEpoll := childEpollFile.Impl().(*vfs.EpollInstance)
 	childTimerFile := liveForkTestFD(t, child.k, timerFD)
 	childTimer := childTimerFile.Impl().(*timerfd.TimerFileDescription)
+	childTask := child.k.GlobalInit().Leader()
+	childSignalFile := liveForkTestFD(t, child.k, signalFD)
+	childRoot := childTask.MountNamespace().Root(childCtx)
+	childInotifyFile := liveForkTestFD(t, child.k, inotifyFD)
+	childInotify := childInotifyFile.Impl().(*vfs.Inotify)
+	childUnix1 := liveForkTestFD(t, child.k, unixFDs[0])
+	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -410,16 +469,86 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if got := parentTimerFile.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
 		t.Errorf("child timerfd expiration made parent readable: %#x", got)
 	}
+
+	// Signalfd target-task pointers, pending queues, and waiter registrations
+	// are reconstructed within each branch.
+	liveForkSignalRead(t, childCtx, childSignalFile, linux.SIGUSR1)
+	if got := parentSignalFile.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child signalfd read consumed parent pending signal: %#x", got)
+	}
+	liveForkSignalRead(t, ctx, parentSignalFile, linux.SIGUSR1)
+	if err := parentTask.SendSignal(kernel.SignalInfoPriv(linux.SIGUSR1)); err != nil {
+		t.Fatalf("queuing parent-only signal: %v", err)
+	}
+	if got := childSignalFile.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent signal made child signalfd readable: %#x", got)
+	}
+	if err := childTask.SendSignal(kernel.SignalInfoPriv(linux.SIGUSR1)); err != nil {
+		t.Fatalf("queuing child-only signal: %v", err)
+	}
+	liveForkSignalRead(t, ctx, parentSignalFile, linux.SIGUSR1)
+	liveForkSignalRead(t, childCtx, childSignalFile, linux.SIGUSR1)
+	liveForkSignalWouldBlock(t, ctx, parentSignalFile)
+	liveForkSignalWouldBlock(t, childCtx, childSignalFile)
+
+	// Inotify watch targets, queued events, and watch-list mutations are local
+	// to each cloned VFS graph.
+	liveForkInotifyRead(t, childCtx, childInotifyFile, watchID, linux.IN_ATTRIB)
+	if got := parentInotifyFile.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child inotify read consumed parent event: %#x", got)
+	}
+	liveForkInotifyRead(t, ctx, parentInotifyFile, watchID, linux.IN_ATTRIB)
+	parentRoot.Dentry().Watches().Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
+	if got := childInotifyFile.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent inotify event made child readable: %#x", got)
+	}
+	childRoot.Dentry().Watches().Notify(childCtx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
+	liveForkInotifyRead(t, ctx, parentInotifyFile, watchID, linux.IN_ATTRIB)
+	liveForkInotifyRead(t, childCtx, childInotifyFile, watchID, linux.IN_ATTRIB)
+	if err := childInotify.RmWatch(childCtx, watchID); err != nil {
+		t.Fatalf("removing child inotify watch: %v", err)
+	}
+	liveForkInotifyRead(t, childCtx, childInotifyFile, watchID, linux.IN_IGNORED)
+	parentRoot.Dentry().Watches().Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
+	liveForkInotifyRead(t, ctx, parentInotifyFile, watchID, linux.IN_ATTRIB)
+	liveForkInotifyWouldBlock(t, childCtx, childInotifyFile)
+
+	// A connected internal Unix socketpair preserves peer topology inside each
+	// branch, but receive queues and readiness are duplicated at the fork.
+	liveForkTestRead(t, childTask, childUnix2, "seed")
+	if got := parentUnix2.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
+		t.Errorf("child Unix read consumed parent queued packet: %#x", got)
+	}
+	liveForkTestRead(t, parentTask, parentUnix2, "seed")
+	liveForkTestWrite(t, parentTask, parentUnix1, "parent")
+	if got := childUnix2.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Errorf("parent Unix write made child peer readable: %#x", got)
+	}
+	liveForkTestWrite(t, childTask, childUnix1, "child")
+	liveForkTestRead(t, parentTask, parentUnix2, "parent")
+	liveForkTestRead(t, childTask, childUnix2, "child")
+	liveForkTestWouldBlock(t, parentTask, parentUnix2)
+	liveForkTestWouldBlock(t, childTask, childUnix2)
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
 	parentEpollFile.DecRef(ctx)
 	parentTimerFile.DecRef(ctx)
+	parentSignalFile.DecRef(ctx)
+	parentInotifyFile.DecRef(ctx)
+	parentRoot.DecRef(ctx)
+	parentUnix1.DecRef(parentTask)
+	parentUnix2.DecRef(parentTask)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
 	childEpollFile.DecRef(childCtx)
 	childTimerFile.DecRef(childCtx)
+	childSignalFile.DecRef(childCtx)
+	childInotifyFile.DecRef(childCtx)
+	childRoot.DecRef(childCtx)
+	childUnix1.DecRef(childTask)
+	childUnix2.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -535,6 +664,45 @@ func liveForkEpollEvents(t *testing.T, epoll *vfs.EpollInstance, want []linux.Ep
 	got := epoll.ReadEvents(nil, 16)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("epoll events mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func liveForkSignalRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, want linux.Signal) {
+	t.Helper()
+	buf := make([]byte, 128)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	got := linux.Signal(binary.NativeEndian.Uint32(buf[:4]))
+	if err != nil || n != int64(len(buf)) || got != want {
+		t.Fatalf("signalfd Read: got (signal %d, %d, %v), want signal %d", got, n, err, want)
+	}
+}
+
+func liveForkSignalWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
+	t.Helper()
+	buf := make([]byte, 128)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Fatalf("empty signalfd Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkInotifyRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, wantWD int32, wantMask uint32) {
+	t.Helper()
+	buf := make([]byte, 128)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	gotWD := int32(binary.NativeEndian.Uint32(buf[0:4]))
+	gotMask := binary.NativeEndian.Uint32(buf[4:8])
+	if err != nil || n != 16 || gotWD != wantWD || gotMask != wantMask {
+		t.Fatalf("inotify Read: got (wd %d, mask %#x, %d, %v), want (wd %d, mask %#x, 16, nil)", gotWD, gotMask, n, err, wantWD, wantMask)
+	}
+}
+
+func liveForkInotifyWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
+	t.Helper()
+	buf := make([]byte, 128)
+	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Fatalf("empty inotify Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
 	}
 }
 
