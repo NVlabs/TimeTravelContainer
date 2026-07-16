@@ -263,6 +263,25 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("installing internal eventfd: %v", err)
 	}
 	parentEvent := liveForkTestFD(t, l.k, eventFD)
+	epollFile, err := l.k.VFS().NewEpollInstanceFD(ctx)
+	if err != nil {
+		t.Fatalf("creating epoll instance: %v", err)
+	}
+	parentEpoll := epollFile.Impl().(*vfs.EpollInstance)
+	const epollData = int32(0x544f53)
+	if err := parentEpoll.AddInterest(parentReader, pipeFDs[0], linux.EpollEvent{
+		Events: linux.EPOLLIN,
+		Data:   [2]int32{epollData, 0},
+	}); err != nil {
+		t.Fatalf("registering pipe with epoll: %v", err)
+	}
+	epollFD, err := l.k.GlobalInit().Leader().FDTable().NewFD(ctx, 13, epollFile, kernel.FDFlags{})
+	epollFile.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("installing epoll instance: %v", err)
+	}
+	parentEpollFile := liveForkTestFD(t, l.k, epollFD)
+	parentEpoll = parentEpollFile.Impl().(*vfs.EpollInstance)
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -287,6 +306,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childReader := liveForkTestFD(t, child.k, pipeFDs[0])
 	childWriter := liveForkTestFD(t, child.k, pipeFDs[1])
 	childEvent := liveForkTestFD(t, child.k, eventFD)
+	childEpollFile := liveForkTestFD(t, child.k, epollFD)
+	childEpoll := childEpollFile.Impl().(*vfs.EpollInstance)
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -297,12 +318,27 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if got := parentReader.Readiness(waiter.EventIn); got&waiter.EventIn == 0 {
 		t.Errorf("child read consumed parent's seed: parent readiness %#x", got)
 	}
+	liveForkEpollEvents(t, childEpoll, nil)
+	liveForkEpollEvents(t, parentEpoll, []linux.EpollEvent{{
+		Events: linux.EPOLLIN,
+		Data:   [2]int32{epollData, 0},
+	}})
 	liveForkTestRead(t, ctx, parentReader, "seed")
+	liveForkEpollEvents(t, parentEpoll, nil)
 	liveForkTestWrite(t, ctx, parentWriter, "parent")
 	if got := childReader.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
 		t.Errorf("parent write made child readable: %#x", got)
 	}
+	liveForkEpollEvents(t, parentEpoll, []linux.EpollEvent{{
+		Events: linux.EPOLLIN,
+		Data:   [2]int32{epollData, 0},
+	}})
+	liveForkEpollEvents(t, childEpoll, nil)
+	if err := childEpoll.DeleteInterest(childReader, pipeFDs[0]); err != nil {
+		t.Fatalf("deleting child epoll interest: %v", err)
+	}
 	liveForkTestWrite(t, childCtx, childWriter, "child")
+	liveForkEpollEvents(t, childEpoll, nil)
 	liveForkTestRead(t, ctx, parentReader, "parent")
 	liveForkTestRead(t, childCtx, childReader, "child")
 	liveForkTestWouldBlock(t, ctx, parentReader)
@@ -327,9 +363,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
+	parentEpollFile.DecRef(ctx)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
+	childEpollFile.DecRef(childCtx)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -427,6 +465,14 @@ func liveForkEventWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDe
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf[:]), vfs.ReadOptions{})
 	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		t.Fatalf("empty eventfd Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkEpollEvents(t *testing.T, epoll *vfs.EpollInstance, want []linux.EpollEvent) {
+	t.Helper()
+	got := epoll.ReadEvents(nil, 16)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("epoll events mismatch (-want +got):\n%s", diff)
 	}
 }
 

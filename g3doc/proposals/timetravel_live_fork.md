@@ -475,15 +475,17 @@ destroyed before the default branch. Branch-local exec, events, foreground TTY
 signaling, writable roots, additional mounts, and general network resource
 closure remain later work.
 
-The first Phase 3 resource slice is validated for anonymous pipes and pure
-Sentry eventfds. The real-loader fork test installs both objects in PID 1's FD
-table before cloning. It verifies that queued pipe bytes and eventfd counters
-start identical, reader/writer aliases remain coherent inside each branch,
-consumption and writes diverge, and readiness never crosses branches. Existing
-state graph traversal and the pipe post-load hook already provide the required
-semantics; no special clone implementation was needed. Host-backed eventfds,
-epoll registration graphs, and the remaining object classes are not enabled by
-this result and still require explicit closure validation.
+The first Phase 3 resource slice is validated for anonymous pipes, pure Sentry
+eventfds, and epoll registration graphs. The real-loader fork test installs
+these objects in PID 1's FD table before cloning. It verifies that queued pipe
+bytes and eventfd counters start identical, reader/writer aliases remain
+coherent inside each branch, consumption and writes diverge, and readiness
+never crosses branches. A cloned epoll interest resolves to the cloned pipe;
+deleting the interest in the child does not mutate the parent interest.
+Existing state graph traversal and post-load hooks already provide the required
+semantics; no special clone implementation was needed. Host-backed eventfds and
+the remaining object classes are not enabled by this result and still require
+explicit closure validation.
 
 ## Implementation phases and gates
 
