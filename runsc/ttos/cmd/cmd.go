@@ -16,6 +16,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -31,6 +32,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"gvisor.dev/gvisor/runsc/flag"
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
@@ -44,6 +47,11 @@ const (
 	defaultImageNamespace   = "ttos"
 	defaultBranchID         = "main"
 	defaultConsoleLogMax    = int64(16 << 20)
+)
+
+var (
+	defaultDetachKeys = []byte{0x10, 0x11} // Ctrl-P, Ctrl-Q.
+	errDetached       = errors.New("detached from container")
 )
 
 type options struct {
@@ -746,23 +754,112 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func parseDetachKeys(value string) ([]byte, error) {
+	if value == "" {
+		return nil, errors.New("detach key sequence must not be empty")
+	}
+	parts := strings.Split(strings.ToLower(value), ",")
+	keys := make([]byte, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 1 {
+			keys = append(keys, part[0])
+			continue
+		}
+		if !strings.HasPrefix(part, "ctrl-") || len(part) != len("ctrl-")+1 {
+			return nil, fmt.Errorf("invalid detach key %q", part)
+		}
+		key := part[len("ctrl-")]
+		switch {
+		case key == '@':
+			keys = append(keys, 0)
+		case key >= 'a' && key <= 'z':
+			keys = append(keys, key-'a'+1)
+		case key >= '[' && key <= '_':
+			keys = append(keys, key-'['+27)
+		default:
+			return nil, fmt.Errorf("invalid control detach key %q", part)
+		}
+	}
+	return keys, nil
+}
+
+type detachKeyFilter struct {
+	sequence []byte
+	pending  []byte
+}
+
+func (f *detachKeyFilter) push(data []byte) ([]byte, bool) {
+	if len(f.sequence) == 0 {
+		return append([]byte(nil), data...), false
+	}
+	combined := make([]byte, 0, len(f.pending)+len(data))
+	combined = append(combined, f.pending...)
+	combined = append(combined, data...)
+	f.pending = f.pending[:0]
+	if index := bytes.Index(combined, f.sequence); index >= 0 {
+		return append([]byte(nil), combined[:index]...), true
+	}
+	keep := len(f.sequence) - 1
+	if keep > len(combined) {
+		keep = len(combined)
+	}
+	for keep > 0 && !bytes.Equal(combined[len(combined)-keep:], f.sequence[:keep]) {
+		keep--
+	}
+	output := append([]byte(nil), combined[:len(combined)-keep]...)
+	f.pending = append(f.pending, combined[len(combined)-keep:]...)
+	return output, false
+}
+
+func (f *detachKeyFilter) flush() []byte {
+	output := append([]byte(nil), f.pending...)
+	f.pending = f.pending[:0]
+	return output
+}
+
+func makeRawTerminal(input io.Reader) (func() error, error) {
+	file, ok := input.(*os.File)
+	if !ok {
+		return nil, nil
+	}
+	fd := int(file.Fd())
+	if !term.IsTerminal(fd) {
+		return nil, nil
+	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return nil, fmt.Errorf("making attached stdin terminal raw: %w", err)
+	}
+	return func() error {
+		return term.Restore(fd, state)
+	}, nil
+}
+
 func runAttach(args []string, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	interactive := fs.Bool("interactive", false, "forward stdin")
 	fs.BoolVar(interactive, "i", false, "forward stdin")
+	detachKeysValue := fs.String("detach-keys", "ctrl-p,ctrl-q", "override the key sequence for detaching")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos attach [-i] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos attach [-i] [--detach-keys KEYS] CONTAINER[@BRANCH]")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	status, err := backend.attach(target, *interactive)
+	detachKeys, err := parseDetachKeys(*detachKeysValue)
 	if err != nil {
+		return err
+	}
+	status, err := backend.attach(target, *interactive, detachKeys)
+	if err != nil {
+		if errors.Is(err, errDetached) {
+			return nil
+		}
 		return err
 	}
 	if code := waitStatusExitCode(status); code != 0 {
@@ -1307,7 +1404,7 @@ type backend interface {
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
-	attach(target selector, interactive bool) (uint32, error)
+	attach(target selector, interactive bool, detachKeys []byte) (uint32, error)
 	logs(target selector, follow bool) error
 	exec(request execRequest) (int, error)
 	inspect(name string) (InspectInfo, error)
@@ -1602,7 +1699,20 @@ func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
 	return nil
 }
 
-func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, error) {
+func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []byte) (status uint32, retErr error) {
+	if interactive {
+		restore, err := makeRawTerminal(b.stdin)
+		if err != nil {
+			return 0, err
+		}
+		if restore != nil {
+			defer func() {
+				if err := restore(); retErr == nil && err != nil {
+					retErr = fmt.Errorf("restoring attached stdin terminal: %w", err)
+				}
+			}()
+		}
+	}
 	paths, err := b.ensureConsoleDrain(target, false)
 	if err != nil {
 		return 0, err
@@ -1619,7 +1729,7 @@ func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, erro
 	}()
 	inputErrCh := make(chan error, 1)
 	if interactive {
-		go func() { inputErrCh <- b.pumpConsoleInput(target) }()
+		go func() { inputErrCh <- b.pumpConsoleInput(target, detachKeys) }()
 	}
 	var waitResult *attachWaitResult
 	for {
@@ -1638,6 +1748,9 @@ func (b *runtimeBackend) attach(target selector, interactive bool) (uint32, erro
 			waitResult = &result
 			waitCh = nil
 		case err := <-inputErrCh:
+			if errors.Is(err, errDetached) {
+				return 0, errDetached
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -1802,30 +1915,45 @@ func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWrit
 	return result, nil
 }
 
+func (b *runtimeBackend) writeConsoleAll(target selector, data []byte) error {
+	for written := 0; written < len(data); {
+		result, err := b.writeConsole(target, data[written:])
+		if err != nil {
+			return err
+		}
+		written += result.N
+		if result.WouldBlock || result.N == 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
 func (b *runtimeBackend) closeConsoleStdin(target selector) error {
 	_, err := b.command("timetravel", "--console", "init", target.container, "console-close-stdin", target.branch)
 	return err
 }
 
-func (b *runtimeBackend) pumpConsoleInput(target selector) error {
+func (b *runtimeBackend) pumpConsoleInput(target selector, detachKeys []byte) error {
 	if b.stdin == nil {
 		return b.closeConsoleStdin(target)
 	}
+	filter := detachKeyFilter{sequence: append([]byte(nil), detachKeys...)}
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := b.stdin.Read(buf)
-		for written := 0; written < n; {
-			result, err := b.writeConsole(target, buf[written:n])
-			if err != nil {
-				return err
-			}
-			written += result.N
-			if result.WouldBlock || result.N == 0 {
-				time.Sleep(2 * time.Millisecond)
-			}
+		data, detached := filter.push(buf[:n])
+		if err := b.writeConsoleAll(target, data); err != nil {
+			return err
+		}
+		if detached {
+			return errDetached
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
+				if err := b.writeConsoleAll(target, filter.flush()); err != nil {
+					return err
+				}
 				return b.closeConsoleStdin(target)
 			}
 			return fmt.Errorf("reading attached stdin: %w", readErr)
@@ -1935,8 +2063,11 @@ func (b *runtimeBackend) launch(name, bundleDir string, detach, interactive bool
 	if detach {
 		return 0, nil
 	}
-	status, err := b.attach(target, interactive)
+	status, err := b.attach(target, interactive, defaultDetachKeys)
 	if err != nil {
+		if errors.Is(err, errDetached) {
+			return 0, nil
+		}
 		return 1, err
 	}
 	return waitStatusExitCode(status), nil

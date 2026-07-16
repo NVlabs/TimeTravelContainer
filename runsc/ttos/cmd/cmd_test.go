@@ -275,12 +275,74 @@ func TestCreateAndStart(t *testing.T) {
 func TestAttach(t *testing.T) {
 	b := &fakeBackend{waitStatus: uint32(7 << 8)}
 	var stdout, stderr bytes.Buffer
-	status := runCommand([]string{"attach", "-i", "demo@child"}, &stdout, &stderr, b)
+	status := runCommand([]string{"attach", "-i", "--detach-keys", "ctrl-a,z", "demo@child"}, &stdout, &stderr, b)
 	if status != 7 {
 		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.attached != (selector{container: "demo", branch: "child"}) || !b.attachInteractive {
 		t.Errorf("attach target=%+v interactive=%t", b.attached, b.attachInteractive)
+	}
+	if got, want := b.attachDetachKeys, []byte{1, 'z'}; !bytes.Equal(got, want) {
+		t.Errorf("attach detach keys=%v, want %v", got, want)
+	}
+}
+
+func TestAttachDetachIsSuccess(t *testing.T) {
+	b := &fakeBackend{err: errDetached}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"attach", "-i", "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.attachDetachKeys, defaultDetachKeys; !bytes.Equal(got, want) {
+		t.Errorf("default detach keys=%v, want %v", got, want)
+	}
+}
+
+func TestParseDetachKeys(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  []byte
+	}{
+		{value: "ctrl-p,ctrl-q", want: []byte{0x10, 0x11}},
+		{value: "CTRL-@,ctrl-[,ctrl-\\,ctrl-_,x", want: []byte{0, 27, 28, 31, 'x'}},
+	} {
+		got, err := parseDetachKeys(test.value)
+		if err != nil {
+			t.Errorf("parseDetachKeys(%q): %v", test.value, err)
+		} else if !bytes.Equal(got, test.want) {
+			t.Errorf("parseDetachKeys(%q)=%v, want %v", test.value, got, test.want)
+		}
+	}
+	for _, value := range []string{"", "ctrl-", "ctrl-1", "too-long"} {
+		if _, err := parseDetachKeys(value); err == nil {
+			t.Errorf("parseDetachKeys(%q) succeeded", value)
+		}
+	}
+}
+
+func TestDetachKeyFilterAcrossReads(t *testing.T) {
+	filter := detachKeyFilter{sequence: append([]byte(nil), defaultDetachKeys...)}
+	output, detached := filter.push([]byte("hello\x10"))
+	if got, want := string(output), "hello"; got != want || detached {
+		t.Fatalf("first push=(%q, %t), want (%q, false)", got, detached, want)
+	}
+	output, detached = filter.push([]byte("\x11ignored"))
+	if len(output) != 0 || !detached {
+		t.Fatalf("second push=(%q, %t), want (empty, true)", output, detached)
+	}
+	if pending := filter.flush(); len(pending) != 0 {
+		t.Errorf("flush after detach=%q, want empty", pending)
+	}
+}
+
+func TestDetachKeyFilterForwardsNearMatchAndFlushesPrefix(t *testing.T) {
+	filter := detachKeyFilter{sequence: append([]byte(nil), defaultDetachKeys...)}
+	output, detached := filter.push([]byte{'a', 0x10, 'x', 0x10})
+	if got, want := output, []byte{'a', 0x10, 'x'}; !bytes.Equal(got, want) || detached {
+		t.Fatalf("push=(%v, %t), want (%v, false)", got, detached, want)
+	}
+	if got, want := filter.flush(), []byte{0x10}; !bytes.Equal(got, want) {
+		t.Errorf("flush=%v, want %v", got, want)
 	}
 }
 
@@ -825,6 +887,7 @@ type fakeBackend struct {
 	startInteractive  bool
 	attached          selector
 	attachInteractive bool
+	attachDetachKeys  []byte
 	logsTarget        selector
 	logsFollow        bool
 	inspectInfo       InspectInfo
@@ -855,9 +918,10 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 	return b.runStatus, b.err
 }
 
-func (b *fakeBackend) attach(target selector, interactive bool) (uint32, error) {
+func (b *fakeBackend) attach(target selector, interactive bool, detachKeys []byte) (uint32, error) {
 	b.attached = target
 	b.attachInteractive = interactive
+	b.attachDetachKeys = append([]byte(nil), detachKeys...)
 	return b.waitStatus, b.err
 }
 

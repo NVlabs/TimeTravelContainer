@@ -17,12 +17,12 @@ branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
 into a Docker-multiplexed host log with frame-safe bounded rotation (a 16 MiB
 current generation plus one retained generation); `ttos attach` and `ttos logs
-[-f]` replay or follow rotations independently. This supports optional stdin,
-forwarding, foreground `run`/`start`, detached output draining, and multiple
-output readers without placing host FDs in the guest resource graph. `ttosd`,
-configurable retention, exclusive stdin ownership, detach keys, detached and TTY
-exec, persistent managed-volume backing, and managed OverlayFS volumes remain
-TODO.
+[-f]` replay or follow rotations independently. This supports optional stdin
+forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground `run`/`start`,
+detached output draining, and multiple output readers without placing host FDs
+in the guest resource graph. `ttosd`, configurable retention, exclusive stdin
+ownership, TTY detach, detached and TTY exec, persistent managed-volume backing,
+and managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -185,7 +185,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       with stdout/stderr streaming, optional `-i`, and exit-status forwarding.
 - [ ] `ttos attach CONTAINER[@BRANCH] --exec EXEC_ID` for an exec session.
 - [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
-- [ ] Support Docker-like detach keys, terminal resize, and signal forwarding.
+- [x] Support Docker-like detach keys for non-TTY stdin attachment, including
+      Ctrl-P, Ctrl-Q by default and `ttos attach --detach-keys` overrides.
+- [ ] Support TTY detach, terminal resize, and signal forwarding.
 - [x] Initial noninteractive streaming suitable for pipelines.
 - [x] Allow multiple independent stdout/stderr readers without consuming each
       other's output; one locked sidecar is the sole Sentry-pipe reader.
@@ -265,8 +267,9 @@ state still forks entirely in memory.
 - [x] Ensure post-fork non-TTY input and output cannot cross branches and that a
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
-- [ ] Test detach keys, client crash during stdin, sidecar crash/restart, daemon
-      restart, and control-socket failure.
+- [x] Test detach-key parsing and detection across stdin read boundaries.
+- [ ] Test client crash during stdin, sidecar crash/restart, daemon restart, and
+      control-socket failure.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 
@@ -450,7 +453,7 @@ grandchild branches without PID or wait-status crossover.
 - [x] Persistent single-consumer branch sidecars, multi-reader log replay/follow,
       and detached output draining without fork-inhibiting host FDs.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
-- [ ] Configurable log retention, detach keys, stdin ownership, and daemon-owned
+- [ ] Configurable log retention, stdin ownership, and daemon-owned
       transport/reconciliation.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.

@@ -15,6 +15,7 @@ go_library(
         "//runsc/ttos/console",
         "//runsc/ttos/images",
         "//runsc/version",
+        "@org_golang_x_term//:go_default_library",
     ],
 )
 
