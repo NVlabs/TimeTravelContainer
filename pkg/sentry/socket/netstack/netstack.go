@@ -459,6 +459,21 @@ type sock struct {
 
 var _ = socket.Socket(&sock{})
 
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (s *sock) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	if !s.namespace.IsRoot() {
+		return nil, fmt.Errorf("network socket belongs to a non-root network namespace")
+	}
+	validator, ok := s.namespace.Stack().(inet.LiveForkStackValidator)
+	if !ok {
+		return nil, fmt.Errorf("network stack has not opted into live fork")
+	}
+	if err := validator.ValidateLiveFork(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 // New creates a new endpoint socket.
 func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*vfs.FileDescription, *syserr.Error) {
 	if skType == linux.SOCK_STREAM {

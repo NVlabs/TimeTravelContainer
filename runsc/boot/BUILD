@@ -188,6 +188,8 @@ go_test(
         "//pkg/sentry/kernel/shm",
         "//pkg/sentry/memmap",
         "//pkg/sentry/seccheck",
+        "//pkg/sentry/socket",
+        "//pkg/sentry/socket/netstack",
         "//pkg/sentry/socket/unix",
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/vfs",

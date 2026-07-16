@@ -194,9 +194,10 @@ different lifetime and rollback semantics.
 The child must therefore receive an external stop before `StartPaused()` starts
 its task goroutines.
 
-Checkpoint-only package-global state requires audit. In particular, dangling
-netstack endpoints are currently gathered globally during state save. The
-network phase must make this per-Kernel or reject non-empty network state.
+Checkpoint-only package-global state requires audit. Registered loopback UDP
+endpoints now pass recursive-fork tests, but dangling TCP endpoint registries
+remain a Phase 7 audit target and should be rejected if they cannot be proven
+Kernel-local.
 
 ### `pkg/state`
 
@@ -392,7 +393,7 @@ Initial policy:
 | Read-only immutable gofer lower | Share with explicit hook |
 | SysV SHM | Clone through a branch-local page map with first-fault CoW |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
-| Loopback netstack socket | Reject until networking phase |
+| Loopback netstack socket | Clone on canonical loopback with unmodified default iptables |
 | Host TCP/UDP/Unix socket | Reject |
 | Writable or mutable gofer mount | Reject |
 | Host FD/device/FUSE/GPU | Reject |
@@ -560,6 +561,19 @@ fallback also rejects mappings whose retained VFS identity belongs to host,
 FUSE, anonymous, dev, or devtmpfs filesystems, covering closed device FDs that
 remain reachable only through a VMA. The real-loader gate creates an AIO ring,
 checks rejection, destroys it, and then forks the same parent successfully.
+
+The first Phase 6 slice admits an empty netstack or exactly the canonical
+loopback NIC. Stack validation rejects every other interface, unknown route,
+non-root network namespace, modified iptables/conntrack state, nftables, and
+stack implementation without an explicit containment hook. Netstack socket FDs
+opt in only through that same validator. Because NICs, routes, and firewall
+objects are intentionally omitted from normal state serialization, live fork
+reconstructs fresh child loopback link/NIC/address/route objects and independent
+unmodified default iptables before restoring endpoints. The real-loader gate
+uses two connected nonblocking UDP sockets: unread datagrams clone into parent,
+child, and grandchild queues, while later sends and readiness remain local to
+the originating branch. Hostinet, plugin stacks, external links, secondary
+network namespaces, modified firewall state, and packet-mmap VMAs still reject.
 
 ## Implementation phases and gates
 

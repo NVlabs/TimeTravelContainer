@@ -228,6 +228,21 @@ func DefaultTables(clock tcpip.Clock, rand *rand.Rand) *IPTables {
 	}
 }
 
+// CloneUnmodifiedForLiveFork returns an independent copy of unmodified default
+// tables. Modified rule and conntrack state requires a full savable config path
+// and is intentionally rejected by the initial live-fork networking slice.
+func (it *IPTables) CloneUnmodifiedForLiveFork(clock tcpip.Clock) (*IPTables, bool) {
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+	if it.modified {
+		return nil, false
+	}
+	seed := it.connections.seed
+	clone := DefaultTables(clock, rand.New(rand.NewSource(int64(seed))))
+	clone.connections.seed = seed
+	return clone, true
+}
+
 // EmptyFilterTable returns a Table with no rules and the filter table chains
 // mapped to HookUnset.
 func EmptyFilterTable() Table {

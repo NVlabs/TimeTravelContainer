@@ -143,6 +143,21 @@ type Stack interface {
 	GetRemoveConf() bool
 }
 
+// LiveForkStackValidator may be implemented by network stacks that can prove
+// their complete link graph is contained within one Sentry.
+type LiveForkStackValidator interface {
+	// ValidateLiveFork returns nil only if cloning this stack cannot retain or
+	// communicate through an external link endpoint.
+	ValidateLiveFork() error
+}
+
+// LiveForkStackConfigCloner reconstructs intentionally unsaved network
+// configuration in a cloned stack. Implementations must create new link and
+// NIC objects rather than sharing them with the source stack.
+type LiveForkStackConfigCloner interface {
+	CloneLiveForkConfig(dst Stack) error
+}
+
 // Interface contains information about a network interface.
 type Interface struct {
 	// DeviceType is the device type, a Linux ARPHRD_* constant.

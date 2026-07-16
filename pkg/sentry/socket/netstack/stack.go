@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
+	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -1166,6 +1167,72 @@ func (s *Stack) SetPortRange(start uint16, end uint16) error {
 // SetRemoveConf implements inet.Stack.SetRemoveConf.
 func (s *Stack) SetRemoveConf(removeConf bool) {
 	s.Stack.SetRemoveConf(removeConf)
+}
+
+// ValidateLiveFork implements inet.LiveForkStackValidator. The initial live
+// fork networking policy accepts an empty stack or the canonical loopback NIC
+// and rejects every host-facing or cross-namespace link.
+func (s *Stack) ValidateLiveFork() error {
+	if tables := s.Stack.IPTables(); tables == nil {
+		return fmt.Errorf("network stack has no iptables configuration")
+	} else if tables.Modified() {
+		return fmt.Errorf("modified iptables/conntrack state is not yet supported")
+	}
+	if s.Stack.NFTables() != nil {
+		return fmt.Errorf("nftables configuration is not yet supported")
+	}
+	interfaces := s.Interfaces()
+	for id, iface := range interfaces {
+		if id != linux.LOOPBACK_IFINDEX || iface.DeviceType != linux.ARPHRD_LOOPBACK || iface.Name != "lo" {
+			return fmt.Errorf("network interface %d (%q, device type %d) is not the canonical loopback interface", id, iface.Name, iface.DeviceType)
+		}
+	}
+	for _, route := range s.RouteTable() {
+		if route.OutputInterface != 0 {
+			if _, ok := interfaces[route.OutputInterface]; !ok {
+				return fmt.Errorf("route uses unknown interface %d", route.OutputInterface)
+			}
+		}
+	}
+	return nil
+}
+
+// CloneLiveForkConfig implements inet.LiveForkStackConfigCloner. Validation
+// restricts the source to an empty stack or canonical loopback, so rebuilding
+// config never borrows a host or parent-branch link endpoint.
+func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
+	if err := s.ValidateLiveFork(); err != nil {
+		return err
+	}
+	dstStack, ok := dst.(*Stack)
+	if !ok {
+		return fmt.Errorf("cannot clone netstack config into %T", dst)
+	}
+	interfaces := s.Interfaces()
+	tables, ok := s.Stack.IPTables().CloneUnmodifiedForLiveFork(dstStack.Stack.Clock())
+	if !ok {
+		return fmt.Errorf("modified iptables/conntrack state is not yet supported")
+	}
+	dstStack.Stack.SetIPTables(tables)
+	if len(interfaces) == 0 {
+		dstStack.Stack.ResetConfig()
+		return nil
+	}
+	dstStack.Stack.ResetConfig()
+	const nicID = tcpip.NICID(linux.LOOPBACK_IFINDEX)
+	if err := dstStack.Stack.CreateNICWithOptions(nicID, ethernet.New(loopback.New()), stack.NICOptions{
+		Name:               "lo",
+		DeliverLinkPackets: true,
+	}); err != nil {
+		return fmt.Errorf("creating cloned loopback NIC: %v", err)
+	}
+	for _, addr := range s.InterfaceAddrs()[linux.LOOPBACK_IFINDEX] {
+		if err := dstStack.AddInterfaceAddr(linux.LOOPBACK_IFINDEX, addr); err != nil {
+			return fmt.Errorf("adding cloned loopback address: %v", err)
+		}
+	}
+	dstStack.Stack.SetRouteTable(s.Stack.GetRouteTable())
+	return nil
 }
 
 // GetRemoveConf implements inet.Stack.GetRemoveConf.

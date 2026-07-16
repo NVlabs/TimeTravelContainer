@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -103,6 +104,15 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() error {
+		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			stack := rootNS.Stack()
+			stack.SetRemoveConf(false)
+			stack.Pause()
+			defer stack.Resume()
+			if err := k.validateLiveForkNetwork(stack); err != nil {
+				return err
+			}
+		}
 		if err := k.validateLiveForkResources(); err != nil {
 			return err
 		}
@@ -117,13 +127,6 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
 		}
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.SetRemoveConf(false)
-			stack.Pause()
-			defer stack.Resume()
-		}
-
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
 		var fsResources vfs.LiveForkFilesystemResources
 		if opts.AllowSharedFilesystemResources {
@@ -179,6 +182,14 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		}
 		child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
 		if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			sourceStack := k.rootNetworkNamespace.Stack()
+			cloner, ok := sourceStack.(inet.LiveForkStackConfigCloner)
+			if !ok {
+				return fmt.Errorf("live fork network stack %T cannot clone unsaved configuration", sourceStack)
+			}
+			if err := cloner.CloneLiveForkConfig(rootNS.Stack()); err != nil {
+				return fmt.Errorf("cloning live-fork network configuration: %w", err)
+			}
 			rootNS.Stack().Restore()
 		}
 		if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
@@ -192,6 +203,27 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		return nil, err
 	}
 	return child, nil
+}
+
+// validateLiveForkNetwork verifies that stack is a contained root netstack and
+// that no task observes a secondary network namespace. The latter remains an
+// explicit restriction until all namespace stacks are paused and restored.
+func (k *Kernel) validateLiveForkNetwork(stack inet.Stack) error {
+	validator, ok := stack.(inet.LiveForkStackValidator)
+	if !ok {
+		return fmt.Errorf("live fork network stack %T has not opted into containment validation", stack)
+	}
+	if err := validator.ValidateLiveFork(); err != nil {
+		return fmt.Errorf("live fork network containment validation failed: %w", err)
+	}
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+	for task, tid := range k.tasks.Root.tids {
+		if task.netns != k.rootNetworkNamespace {
+			return fmt.Errorf("live fork does not yet support non-root network namespace observed by pid %d", tid)
+		}
+	}
+	return nil
 }
 
 // validateLiveForkMappings walks each unique task address space and rejects

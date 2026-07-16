@@ -52,6 +52,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/sentry/socket"
+	sentrynetstack "gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	unixtransport "gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -252,6 +254,12 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	l.k.Pause()
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
+	networkStack := l.k.RootNetworkNamespace().Stack().(*sentrynetstack.Stack)
+	if err := (&Network{Stack: networkStack.Stack, Kernel: l.k}).CreateLinksAndRoutes(&CreateLinksAndRoutesArgs{
+		LoopbackLinks: []LoopbackLink{DefaultLoopbackLink},
+	}, &struct{}{}); err != nil {
+		t.Fatalf("configuring contained loopback network: %v", err)
+	}
 	for fd := int32(0); fd < 3; fd++ {
 		if file := l.k.GlobalInit().Leader().FDTable().Remove(ctx, fd); file != nil {
 			file.DecRef(ctx)
@@ -472,6 +480,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUnix1 := liveForkTestFD(t, l.k, unixFDs[0])
 	parentUnix2 := liveForkTestFD(t, l.k, unixFDs[1])
 	liveForkTestWrite(t, parentTask, parentUnix1, "seed")
+	udpClientFile, udpServerFile := liveForkTestUDPPair(t, parentTask, 31001, 31002)
+	const udpClientFD = int32(22)
+	udpFDs, err := parentTask.FDTable().NewFDs(parentTask, udpClientFD, []*vfs.FileDescription{udpClientFile, udpServerFile}, kernel.FDFlags{})
+	udpClientFile.DecRef(parentTask)
+	udpServerFile.DecRef(parentTask)
+	if err != nil {
+		t.Fatalf("installing loopback UDP pair: %v", err)
+	}
+	parentUDPClient := liveForkTestFD(t, l.k, udpFDs[0])
+	parentUDPServer := liveForkTestFD(t, l.k, udpFDs[1])
+	liveForkTestWrite(t, parentTask, parentUDPClient, "seed")
 	memfdFile, err := tmpfs.NewMemfd(parentTask, parentTask.Credentials(), l.k.ShmMount(), false, "live-fork")
 	if err != nil {
 		t.Fatalf("creating memfd: %v", err)
@@ -536,6 +555,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childTimerFile := liveForkTestFD(t, child.k, timerFD)
 	childTimer := childTimerFile.Impl().(*timerfd.TimerFileDescription)
 	childTask := child.k.GlobalInit().Leader()
+	childUDPClient := liveForkTestFD(t, child.k, udpFDs[0])
+	childUDPServer := liveForkTestFD(t, child.k, udpFDs[1])
 	liveForkTestMMRead(t, childTask, shmAddr1, "seed")
 	liveForkTestMMRead(t, childTask, shmAddr2, "seed")
 	liveForkTestMMWrite(t, childTask, shmAddr1, "chld")
@@ -699,6 +720,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestWouldBlock(t, parentTask, parentUnix2)
 	liveForkTestWouldBlock(t, childTask, childUnix2)
 
+	// The unread loopback datagram is duplicated at the fork. Subsequent sends
+	// are routed only through the branch-local cloned stack and endpoint graph.
+	liveForkTestRead(t, parentTask, parentUDPServer, "seed")
+	liveForkTestRead(t, childTask, childUDPServer, "seed")
+	liveForkTestWrite(t, parentTask, parentUDPClient, "parn")
+	liveForkTestRead(t, parentTask, parentUDPServer, "parn")
+	liveForkTestWouldBlock(t, childTask, childUDPServer)
+	liveForkTestWrite(t, childTask, childUDPClient, "chld")
+	liveForkTestRead(t, childTask, childUDPServer, "chld")
+	liveForkTestWouldBlock(t, parentTask, parentUDPServer)
+
 	// Tmpfs syscall writes and mapped shared writes detach MemoryFile pages
 	// without copying file contents at the fork boundary.
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "seed")
@@ -768,6 +800,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentLowerFile.DecRef(ctx)
 	childCopiedUpFile.DecRef(childCtx)
 
+	liveForkTestWrite(t, childTask, childUDPClient, "fork")
 	grandchildInfo, err := l.family.Fork(&ForkBranchArgs{Source: childInfo.ID, ID: "grandchild", Paused: true})
 	if err != nil {
 		t.Fatalf("recursively forking child: %v", err)
@@ -777,6 +810,13 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("looking up grandchild: %v", err)
 	}
 	grandchildTask := grandchild.k.GlobalInit().Leader()
+	grandchildUDPClient := liveForkTestFD(t, grandchild.k, udpFDs[0])
+	grandchildUDPServer := liveForkTestFD(t, grandchild.k, udpFDs[1])
+	liveForkTestRead(t, childTask, childUDPServer, "fork")
+	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "fork")
+	liveForkTestWrite(t, grandchildTask, grandchildUDPClient, "grnd")
+	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "grnd")
+	liveForkTestWouldBlock(t, childTask, childUDPServer)
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "chld")
 	liveForkTestMMWrite(t, grandchildTask, shmAddr2, "grnd")
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
@@ -794,6 +834,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
 	grandchildMemfd.DecRef(grandchildTask)
 	grandchildOverlayFile.DecRef(grandchildTask)
+	grandchildUDPClient.DecRef(grandchildTask)
+	grandchildUDPServer.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
 	}
@@ -807,6 +849,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentRoot.DecRef(ctx)
 	parentUnix1.DecRef(parentTask)
 	parentUnix2.DecRef(parentTask)
+	parentUDPClient.DecRef(parentTask)
+	parentUDPServer.DecRef(parentTask)
 	parentMemfd.DecRef(parentTask)
 	parentOverlayFile.DecRef(parentTask)
 	parentTruncateFile.DecRef(parentTask)
@@ -820,6 +864,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childRoot.DecRef(childCtx)
 	childUnix1.DecRef(childTask)
 	childUnix2.DecRef(childTask)
+	childUDPClient.DecRef(childTask)
+	childUDPServer.DecRef(childTask)
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
 	childTruncateFile.DecRef(childTask)
@@ -895,6 +941,53 @@ func liveForkTestWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDes
 	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		t.Fatalf("empty nonblocking Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
 	}
+}
+
+func liveForkTestUDPPair(t *testing.T, task *kernel.Task, clientPort, serverPort uint16) (*vfs.FileDescription, *vfs.FileDescription) {
+	t.Helper()
+	newSocket := func(name string) *vfs.FileDescription {
+		file, err := socket.New(task, linux.AF_INET, linux.SOCK_DGRAM, unix.IPPROTO_UDP)
+		if err != nil {
+			t.Fatalf("creating loopback UDP %s: %v", name, err)
+		}
+		if err := file.SetStatusFlags(task, task.Credentials(), file.StatusFlags()|linux.O_NONBLOCK); err != nil {
+			file.DecRef(task)
+			t.Fatalf("making loopback UDP %s nonblocking: %v", name, err)
+		}
+		return file
+	}
+	client := newSocket("client")
+	server := newSocket("server")
+	bind := func(name string, file *vfs.FileDescription, port uint16) {
+		if err := file.Impl().(socket.Socket).Bind(task, liveForkTestIPv4Sockaddr(port)); err != nil {
+			client.DecRef(task)
+			server.DecRef(task)
+			t.Fatalf("binding loopback UDP %s: %v", name, err)
+		}
+	}
+	bind("client", client, clientPort)
+	bind("server", server, serverPort)
+	connect := func(name string, file *vfs.FileDescription, port uint16) {
+		if err := file.Impl().(socket.Socket).Connect(task, liveForkTestIPv4Sockaddr(port), false); err != nil {
+			client.DecRef(task)
+			server.DecRef(task)
+			t.Fatalf("connecting loopback UDP %s: %v", name, err)
+		}
+	}
+	connect("client", client, serverPort)
+	connect("server", server, clientPort)
+	return client, server
+}
+
+func liveForkTestIPv4Sockaddr(port uint16) []byte {
+	addr := linux.SockAddrInet{
+		Family: linux.AF_INET,
+		Port:   socket.Htons(port),
+		Addr:   linux.InetAddr{127, 0, 0, 1},
+	}
+	buf := make([]byte, addr.SizeBytes())
+	addr.MarshalBytes(buf)
+	return buf
 }
 
 func liveForkEventWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value uint64) {

@@ -63,6 +63,7 @@ go_library(
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/ethernet",
+        "//pkg/tcpip/link/loopback",
         "//pkg/tcpip/link/packetsocket",
         "//pkg/tcpip/link/tun",
         "//pkg/tcpip/link/veth",
