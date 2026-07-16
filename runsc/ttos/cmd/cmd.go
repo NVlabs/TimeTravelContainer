@@ -232,6 +232,7 @@ Commands:
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
+  volume COMMAND                   Manage family-local tmpfs volumes
 
 Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
 run immediately unless --paused is set; omitting DEST generates a branch ID.
@@ -269,6 +270,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runStop(args[1:], stdout, stderr, backend)
 	case "branch":
 		err = runBranch(args[1:], stdout, backend)
+	case "volume":
+		err = runVolume(args[1:], stdout, stderr, backend)
 	case "help":
 		printUsage(stdout)
 		return 0
@@ -295,6 +298,132 @@ func (s *stringSlice) Get() any       { return s }
 func (s *stringSlice) Set(value string) error {
 	*s = append(*s, value)
 	return nil
+}
+
+type mountRequests struct {
+	host    []ttosbundle.HostMount
+	managed []ttosbundle.ManagedVolume
+}
+
+func parseMountRequests(volumeSpecs, mountSpecs []string) (mountRequests, error) {
+	var request mountRequests
+	var hostVolumes, hostMounts []string
+	for _, value := range volumeSpecs {
+		parts := strings.Split(value, ":")
+		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want SOURCE:CONTAINER[:ro]", value)
+		}
+		if isHostMountSource(parts[0]) {
+			hostVolumes = append(hostVolumes, value)
+			continue
+		}
+		readonly, err := parseVolumeOptions(value, parts[2:])
+		if err != nil {
+			return mountRequests{}, err
+		}
+		volume, err := normalizeManagedVolume(parts[0], parts[1], readonly)
+		if err != nil {
+			return mountRequests{}, err
+		}
+		request.managed = append(request.managed, volume)
+	}
+	for _, value := range mountSpecs {
+		mountType := ""
+		for _, field := range strings.Split(value, ",") {
+			key, raw, found := strings.Cut(field, "=")
+			if found && strings.TrimSpace(key) == "type" {
+				mountType = strings.TrimSpace(raw)
+				break
+			}
+		}
+		if mountType != "volume" {
+			hostMounts = append(hostMounts, value)
+			continue
+		}
+		volume, err := parseManagedLongMount(value)
+		if err != nil {
+			return mountRequests{}, err
+		}
+		request.managed = append(request.managed, volume)
+	}
+	var err error
+	request.host, err = parseHostMounts(hostVolumes, hostMounts)
+	if err != nil {
+		return mountRequests{}, err
+	}
+	return request, nil
+}
+
+func isHostMountSource(source string) bool {
+	return filepath.IsAbs(source) || source == "." || strings.HasPrefix(source, "."+string(filepath.Separator))
+}
+
+func parseVolumeOptions(spec string, optionParts []string) (bool, error) {
+	readonly := false
+	if len(optionParts) == 0 {
+		return readonly, nil
+	}
+	for _, option := range strings.Split(optionParts[0], ",") {
+		switch option {
+		case "ro", "readonly":
+			readonly = true
+		case "rw", "":
+			readonly = false
+		default:
+			return false, fmt.Errorf("unsupported volume option %q in %q", option, spec)
+		}
+	}
+	return readonly, nil
+}
+
+func parseManagedLongMount(value string) (ttosbundle.ManagedVolume, error) {
+	name := ""
+	destination := ""
+	readonly := false
+	for _, field := range strings.Split(value, ",") {
+		key, raw, found := strings.Cut(field, "=")
+		key = strings.TrimSpace(key)
+		if !found {
+			if key == "ro" || key == "readonly" {
+				readonly = true
+				continue
+			}
+			return ttosbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", field, value)
+		}
+		raw = strings.TrimSpace(raw)
+		switch key {
+		case "type":
+			if raw != "volume" {
+				return ttosbundle.ManagedVolume{}, fmt.Errorf("managed mount %q has type %q", value, raw)
+			}
+		case "source", "src":
+			name = raw
+		case "destination", "dst", "target":
+			destination = raw
+		case "readonly", "ro":
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return ttosbundle.ManagedVolume{}, fmt.Errorf("invalid readonly value %q in %q", raw, value)
+			}
+			readonly = parsed
+		default:
+			return ttosbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", key, value)
+		}
+	}
+	return normalizeManagedVolume(name, destination, readonly)
+}
+
+func normalizeManagedVolume(name, destination string, readonly bool) (ttosbundle.ManagedVolume, error) {
+	if name == "" {
+		return ttosbundle.ManagedVolume{}, errors.New("managed volume name must not be empty")
+	}
+	if isHostMountSource(name) {
+		return ttosbundle.ManagedVolume{}, fmt.Errorf("managed volume name %q looks like a host path", name)
+	}
+	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
+		return ttosbundle.ManagedVolume{}, fmt.Errorf("managed volume destination %q must be an absolute non-root path", destination)
+	}
+	return ttosbundle.ManagedVolume{Name: name, Destination: filepath.Clean(destination), Readonly: readonly}, nil
 }
 
 func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, error) {
@@ -412,18 +541,19 @@ func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.H
 }
 
 type runRequest struct {
-	name        string
-	reference   string
-	platform    string
-	args        []string
-	env         []string
-	cwd         string
-	user        string
-	hostname    string
-	entrypoint  []string
-	hostMounts  []ttosbundle.HostMount
-	detach      bool
-	interactive bool
+	name           string
+	reference      string
+	platform       string
+	args           []string
+	env            []string
+	cwd            string
+	user           string
+	hostname       string
+	entrypoint     []string
+	hostMounts     []ttosbundle.HostMount
+	managedVolumes []ttosbundle.ManagedVolume
+	detach         bool
+	interactive    bool
 }
 
 type execRequest struct {
@@ -460,9 +590,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
 	fs.Var(&env, "e", "set environment variable NAME=VALUE")
 	var volumes, mounts stringSlice
-	fs.Var(&volumes, "volume", "bind mount HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "bind mount HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "bind mount type=bind,source=HOST,target=CONTAINER,readonly")
+	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -475,7 +605,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *detach && *interactive {
 		return errors.New("detached interactive containers require the internal console, which is not implemented yet")
 	}
-	hostMounts, err := parseHostMounts(volumes, mounts)
+	parsedMounts, err := parseMountRequests(volumes, mounts)
 	if err != nil {
 		return err
 	}
@@ -484,17 +614,18 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	request := runRequest{
-		name:        containerName,
-		reference:   fs.Arg(0),
-		platform:    *platform,
-		args:        append([]string(nil), fs.Args()[1:]...),
-		env:         append([]string(nil), env...),
-		cwd:         *cwd,
-		user:        *user,
-		hostname:    *hostname,
-		hostMounts:  hostMounts,
-		detach:      *detach,
-		interactive: *interactive,
+		name:           containerName,
+		reference:      fs.Arg(0),
+		platform:       *platform,
+		args:           append([]string(nil), fs.Args()[1:]...),
+		env:            append([]string(nil), env...),
+		cwd:            *cwd,
+		user:           *user,
+		hostname:       *hostname,
+		hostMounts:     parsedMounts.host,
+		managedVolumes: parsedMounts.managed,
+		detach:         *detach,
+		interactive:    *interactive,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -532,16 +663,16 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
 	fs.Var(&env, "e", "set environment variable NAME=VALUE")
 	var volumes, mounts stringSlice
-	fs.Var(&volumes, "volume", "bind mount HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "bind mount HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "bind mount type=bind,source=HOST,target=CONTAINER,readonly")
+	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
 	}
-	hostMounts, err := parseHostMounts(volumes, mounts)
+	parsedMounts, err := parseMountRequests(volumes, mounts)
 	if err != nil {
 		return err
 	}
@@ -550,15 +681,16 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	request := runRequest{
-		name:       containerName,
-		reference:  fs.Arg(0),
-		platform:   *platform,
-		args:       append([]string(nil), fs.Args()[1:]...),
-		env:        append([]string(nil), env...),
-		cwd:        *cwd,
-		user:       *user,
-		hostname:   *hostname,
-		hostMounts: hostMounts,
+		name:           containerName,
+		reference:      fs.Arg(0),
+		platform:       *platform,
+		args:           append([]string(nil), fs.Args()[1:]...),
+		env:            append([]string(nil), env...),
+		cwd:            *cwd,
+		user:           *user,
+		hostname:       *hostname,
+		hostMounts:     parsedMounts.host,
+		managedVolumes: parsedMounts.managed,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -937,6 +1069,98 @@ func parseSignal(value string) (int, error) {
 	return 0, fmt.Errorf("unknown signal %q", value)
 }
 
+func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos volume create|ls|inspect|rm [OPTIONS]")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("volume create", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		driver := fs.String("driver", "local-tmpfs", "volume driver")
+		fs.StringVar(driver, "d", "local-tmpfs", "volume driver")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() > 1 {
+			return errors.New("usage: ttos volume create [--driver local-tmpfs] [NAME]")
+		}
+		if *driver != "local-tmpfs" {
+			return fmt.Errorf("unsupported volume driver %q", *driver)
+		}
+		name := "ttos-volume-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+		if fs.NArg() == 1 {
+			name = fs.Arg(0)
+		}
+		info, err := backend.ensureVolume(name)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, info.Name)
+		return nil
+	case "ls", "list":
+		fs := flag.NewFlagSet("volume ls", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		quiet := fs.Bool("quiet", false, "only display volume names")
+		fs.BoolVar(quiet, "q", false, "only display volume names")
+		jsonOutput := fs.Bool("json", false, "emit stable JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("usage: ttos volume ls [--quiet|--json]")
+		}
+		volumes, err := backend.listVolumes()
+		if err != nil {
+			return err
+		}
+		if *jsonOutput {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(volumes)
+		}
+		if !*quiet {
+			fmt.Fprintln(stdout, "DRIVER\tVOLUME NAME")
+		}
+		for _, volume := range volumes {
+			if *quiet {
+				fmt.Fprintln(stdout, volume.Name)
+			} else {
+				fmt.Fprintf(stdout, "%s\t%s\n", volume.Driver, volume.Name)
+			}
+		}
+		return nil
+	case "inspect":
+		if len(args) < 2 {
+			return errors.New("usage: ttos volume inspect VOLUME [VOLUME...]")
+		}
+		volumes := make([]ttosbundle.VolumeInfo, 0, len(args)-1)
+		for _, name := range args[1:] {
+			volume, err := backend.inspectVolume(name)
+			if err != nil {
+				return err
+			}
+			volumes = append(volumes, volume)
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(volumes)
+	case "rm", "remove":
+		if len(args) < 2 {
+			return errors.New("usage: ttos volume rm VOLUME [VOLUME...]")
+		}
+		for _, name := range args[1:] {
+			if err := backend.removeVolume(name); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown volume command %q", args[0])
+	}
+}
+
 func runBranch(args []string, stdout io.Writer, backend backend) error {
 	if len(args) < 2 || args[0] != "rm" {
 		return errors.New("usage: ttos branch rm TARGET [TARGET...]")
@@ -1037,6 +1261,10 @@ type backend interface {
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
 	wait(target selector) (uint32, error)
+	ensureVolume(name string) (ttosbundle.VolumeInfo, error)
+	listVolumes() ([]ttosbundle.VolumeInfo, error)
+	inspectVolume(name string) (ttosbundle.VolumeInfo, error)
+	removeVolume(name string) error
 }
 
 type runtimeBackend struct {
@@ -1054,14 +1282,15 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
-			Name:       request.name,
-			Args:       request.args,
-			Env:        request.env,
-			Cwd:        request.cwd,
-			User:       request.user,
-			Hostname:   request.hostname,
-			Entrypoint: request.entrypoint,
-			HostMounts: request.hostMounts,
+			Name:           request.name,
+			Args:           request.args,
+			Env:            request.env,
+			Cwd:            request.cwd,
+			User:           request.user,
+			Hostname:       request.hostname,
+			Entrypoint:     request.entrypoint,
+			ManagedVolumes: request.managedVolumes,
+			HostMounts:     request.hostMounts,
 		},
 		Reference: request.reference,
 		Platform:  request.platform,
@@ -1080,14 +1309,15 @@ func (b *runtimeBackend) create(request runRequest) error {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	_, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
-			Name:       request.name,
-			Args:       request.args,
-			Env:        request.env,
-			Cwd:        request.cwd,
-			User:       request.user,
-			Hostname:   request.hostname,
-			Entrypoint: request.entrypoint,
-			HostMounts: request.hostMounts,
+			Name:           request.name,
+			Args:           request.args,
+			Env:            request.env,
+			Cwd:            request.cwd,
+			User:           request.user,
+			Hostname:       request.hostname,
+			Entrypoint:     request.entrypoint,
+			HostMounts:     request.hostMounts,
+			ManagedVolumes: request.managedVolumes,
 		},
 		Reference: request.reference,
 		Platform:  request.platform,
@@ -1239,6 +1469,26 @@ func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bo
 		Snapshotter: snapshotter,
 		Unpack:      unpack,
 	})
+}
+
+func (b *runtimeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
+	return (ttosbundle.Store{Root: b.dataRoot}).EnsureVolume(name)
+}
+
+func (b *runtimeBackend) listVolumes() ([]ttosbundle.VolumeInfo, error) {
+	return (ttosbundle.Store{Root: b.dataRoot}).ListVolumes()
+}
+
+func (b *runtimeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) {
+	return (ttosbundle.Store{Root: b.dataRoot}).LoadVolume(name)
+}
+
+func (b *runtimeBackend) removeVolume(name string) error {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	if err := store.RemoveVolume(name); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {

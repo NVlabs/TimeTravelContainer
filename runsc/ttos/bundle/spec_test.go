@@ -53,6 +53,10 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Args:       []string{"override", "arg"},
 		Env:        []string{"A=run", "C=new"},
 		HostMounts: []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
+		ManagedVolumes: []ManagedVolume{
+			{Name: "cache", Destination: "/cache"},
+			{Name: "cache", Destination: "/cache-ro", Readonly: true},
+		},
 	})
 	if err != nil {
 		t.Fatalf("BuildSpec: %v", err)
@@ -76,12 +80,25 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/mnt/fixture", Type: "bind", Source: host, Options: []string{"rbind", "ro"}},
+		{Destination: "/cache", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
+		{Destination: "/cache-ro", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"ro", "nosuid", "nodev", "mode=0755"}},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("mounts=%+v, want %+v", spec.Mounts, wantMounts)
 	}
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.overlay"]; got != "memory" {
 		t.Errorf("root overlay=%q, want memory", got)
+	}
+	wantVolumeAnnotations := map[string]string{
+		"dev.gvisor.spec.mount.ttos0.source":  "ttos-volume-cache",
+		"dev.gvisor.spec.mount.ttos0.share":   "container",
+		"dev.gvisor.spec.mount.ttos0.type":    "tmpfs",
+		"dev.gvisor.spec.mount.ttos0.options": "rw,nosuid,nodev,mode=0755",
+	}
+	for key, want := range wantVolumeAnnotations {
+		if got := spec.Annotations[key]; got != want {
+			t.Errorf("annotation %q=%q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -106,6 +123,15 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	missing := filepath.Join(host, "missing")
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: missing, Destination: "/data", Readonly: true}}}); err == nil {
 		t.Error("BuildSpec accepted missing host source")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ManagedVolumes: []ManagedVolume{{Name: "-bad", Destination: "/data"}}}); err == nil {
+		t.Error("BuildSpec accepted invalid managed volume name")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "relative"}}}); err == nil {
+		t.Error("BuildSpec accepted relative managed volume destination")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "/data", Readonly: true}}, ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "/data"}}}); err == nil {
+		t.Error("BuildSpec accepted duplicate host/managed destination")
 	}
 }
 
@@ -152,5 +178,55 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
 		t.Fatalf("containers after remove=%+v, err=%v", containers, err)
+	}
+}
+
+func TestVolumeStoreLifecycle(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created, err := store.EnsureVolume("cache")
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	again, err := store.EnsureVolume("cache")
+	if err != nil {
+		t.Fatalf("second EnsureVolume: %v", err)
+	}
+	if created != again || created.Driver != "local-tmpfs" {
+		t.Errorf("idempotent volume metadata: first=%+v second=%+v", created, again)
+	}
+	volumes, err := store.ListVolumes()
+	if err != nil || len(volumes) != 1 || volumes[0].Name != "cache" {
+		t.Fatalf("ListVolumes=%+v, err=%v", volumes, err)
+	}
+
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		Name:      "demo",
+		BundleDir: bundleDir,
+		State:     "created",
+		CreatedAt: time.Now(),
+		Volumes:   []ManagedVolume{{Name: "cache", Destination: "/cache"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveVolume("cache"); err == nil {
+		t.Fatal("RemoveVolume accepted a volume referenced by a container")
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if err := store.RemoveVolume("cache"); err != nil {
+		t.Fatalf("RemoveVolume: %v", err)
+	}
+	if volumes, err := store.ListVolumes(); err != nil || len(volumes) != 0 {
+		t.Fatalf("volumes after remove=%+v, err=%v", volumes, err)
 	}
 }

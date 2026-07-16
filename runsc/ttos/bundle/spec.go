@@ -47,16 +47,17 @@ var defaultCapabilities = []string{
 
 // SpecOptions contains user-facing overrides for an image's OCI configuration.
 type SpecOptions struct {
-	Name       string
-	RootFS     string
-	Args       []string
-	Env        []string
-	Cwd        string
-	User       string
-	Hostname   string
-	Terminal   bool
-	Entrypoint []string
-	HostMounts []HostMount
+	Name           string
+	RootFS         string
+	Args           []string
+	Env            []string
+	Cwd            string
+	User           string
+	Hostname       string
+	Terminal       bool
+	Entrypoint     []string
+	HostMounts     []HostMount
+	ManagedVolumes []ManagedVolume
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind.
@@ -66,6 +67,14 @@ type HostMount struct {
 	Source      string
 	Destination string
 	Readonly    bool
+}
+
+// ManagedVolume describes a family-local Sentry tmpfs. Repeated attachments of
+// the same name resolve to one filesystem inside each branch.
+type ManagedVolume struct {
+	Name        string `json:"name"`
+	Destination string `json:"destination"`
+	Readonly    bool   `json:"readonly,omitempty"`
 }
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
@@ -126,7 +135,10 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 	}
-	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts))
+	annotations := map[string]string{
+		"dev.gvisor.spec.rootfs.overlay": "memory",
+	}
+	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes))
 	for _, mount := range mounts {
 		seenDestinations[mount.Destination] = struct{}{}
 	}
@@ -156,6 +168,35 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Source:      filepath.Clean(mount.Source),
 			Options:     []string{"rbind", "ro"},
 		})
+	}
+	volumeSources := make(map[string]string)
+	for _, volume := range opts.ManagedVolumes {
+		if err := validateVolumeName(volume.Name); err != nil {
+			return nil, err
+		}
+		destination := filepath.Clean(volume.Destination)
+		if !filepath.IsAbs(destination) || destination == "/" {
+			return nil, fmt.Errorf("managed volume destination %q must be an absolute non-root path", volume.Destination)
+		}
+		if _, ok := seenDestinations[destination]; ok {
+			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+		}
+		seenDestinations[destination] = struct{}{}
+		source, ok := volumeSources[volume.Name]
+		if !ok {
+			source = "ttos-volume-" + volume.Name
+			volumeSources[volume.Name] = source
+			hint := fmt.Sprintf("dev.gvisor.spec.mount.ttos%d.", len(volumeSources)-1)
+			annotations[hint+"source"] = source
+			annotations[hint+"share"] = "container"
+			annotations[hint+"type"] = "tmpfs"
+			annotations[hint+"options"] = "rw,nosuid,nodev,mode=0755"
+		}
+		mountOptions := []string{"rw", "nosuid", "nodev", "mode=0755"}
+		if volume.Readonly {
+			mountOptions[0] = "ro"
+		}
+		mounts = append(mounts, specs.Mount{Destination: destination, Type: "tmpfs", Source: source, Options: mountOptions})
 	}
 
 	return &specs.Spec{
@@ -196,9 +237,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 				{Type: specs.NetworkNamespace},
 			},
 		},
-		Annotations: map[string]string{
-			"dev.gvisor.spec.rootfs.overlay": "memory",
-		},
+		Annotations: annotations,
 	}, nil
 }
 

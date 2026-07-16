@@ -317,6 +317,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/readonly", Type: "bind", Source: hostBind, Options: []string{"rbind", "ro"}},
+		{Destination: "/managed", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
+		{Destination: "/managed-alias", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
+	}
+	spec.Annotations = map[string]string{
+		"dev.gvisor.spec.mount.managed.source":  "ttos-volume-cache",
+		"dev.gvisor.spec.mount.managed.share":   "container",
+		"dev.gvisor.spec.mount.managed.type":    "tmpfs",
+		"dev.gvisor.spec.mount.managed.options": "rw,nosuid,nodev,mode=0755",
 	}
 	conf := testConfig()
 	conf.DirectFS = false
@@ -638,6 +646,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	devMountFile.DecRef(parentTask)
 	parentDevMountFile := liveForkTestFD(t, l.k, devMountFD)
 	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "seed")
+	managedVolumeFile := liveForkTestCreateFile(t, parentTask, "managed/state")
+	const managedVolumeFD = int32(28)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, managedVolumeFD, managedVolumeFile, kernel.FDFlags{}); err != nil {
+		managedVolumeFile.DecRef(parentTask)
+		t.Fatalf("installing managed-volume file: %v", err)
+	}
+	managedVolumeFile.DecRef(parentTask)
+	parentManagedVolume := liveForkTestFD(t, l.k, managedVolumeFD)
+	liveForkTestPWrite(t, parentTask, parentManagedVolume, 0, "seed")
+	parentManagedAlias := liveForkTestOpenPath(t, parentTask, "managed-alias/state", linux.O_RDWR)
+	liveForkTestPRead(t, parentTask, parentManagedAlias, 0, "seed")
 	ptyMaster := liveForkTestOpenPath(t, parentTask, "dev/ptmx", linux.O_RDWR|linux.O_NONBLOCK)
 	const ptyMasterFD = int32(27)
 	if _, err := parentTask.FDTable().NewFDAt(parentTask, ptyMasterFD, ptyMaster, kernel.FDFlags{}); err != nil {
@@ -697,6 +716,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
 	childDevMountFile := liveForkTestFD(t, child.k, devMountFD)
+	childManagedVolume := liveForkTestFD(t, child.k, managedVolumeFD)
+	childManagedAlias := liveForkTestOpenPath(t, childTask, "managed-alias/state", linux.O_RDWR)
 	childPTYMaster := liveForkTestFD(t, child.k, ptyMasterFD)
 	if parentPTYMaster.Impl() == childPTYMaster.Impl() {
 		t.Fatal("parent and child share the same internal PTY master object")
@@ -718,6 +739,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPathWriteDenied(t, parentTask, "readonly/fixture")
 	liveForkTestPathWriteDenied(t, childTask, "readonly/fixture")
 
+	liveForkTestPRead(t, childTask, childManagedVolume, 0, "seed")
+	liveForkTestPRead(t, childTask, childManagedAlias, 0, "seed")
+	liveForkTestPWrite(t, childTask, childManagedAlias, 0, "chld")
+	liveForkTestPRead(t, childTask, childManagedVolume, 0, "chld")
+	liveForkTestPRead(t, parentTask, parentManagedVolume, 0, "seed")
+	liveForkTestPWrite(t, parentTask, parentManagedVolume, 0, "prnt")
+	liveForkTestPRead(t, parentTask, parentManagedAlias, 0, "prnt")
+	liveForkTestPRead(t, childTask, childManagedVolume, 0, "chld")
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
 	liveForkTestRead(t, childCtx, childReader, "seed")
@@ -999,14 +1028,21 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
+	grandchildManagedVolume := liveForkTestFD(t, grandchild.k, managedVolumeFD)
+	grandchildManagedAlias := liveForkTestOpenPath(t, grandchildTask, "managed-alias/state", linux.O_RDWR)
 	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "host-data")
 	liveForkTestPathMissing(t, grandchildTask, overlayPath)
 	liveForkTestPathMissing(t, grandchildTask, "parent-only")
+	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "chld")
+	liveForkTestPRead(t, grandchildTask, grandchildManagedAlias, 0, "chld")
 	liveForkTestPWrite(t, grandchildTask, grandchildMemfd, 0, "grnd")
 	liveForkTestPWrite(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
 	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
 	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
 
+	liveForkTestPWrite(t, grandchildTask, grandchildManagedAlias, 0, "grnd")
+	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "grnd")
+	liveForkTestPRead(t, childTask, childManagedVolume, 0, "chld")
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
@@ -1024,6 +1060,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
 	childTruncateFile.DecRef(childTask)
+	childManagedVolume.DecRef(childTask)
+	childManagedAlias.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -1064,6 +1102,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestWrite(t, grandchildTask, grandchildUDPClient, "stay")
 	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "stay")
 	liveForkTestWrite(t, grandchildTask, grandchildTCPClient, "stay")
+	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "grnd")
+	liveForkTestPRead(t, grandchildTask, grandchildManagedAlias, 0, "grnd")
 	liveForkTestReadEventually(t, grandchildTask, grandchildTCPServer, "stay")
 	grandchildMemfd.DecRef(grandchildTask)
 	grandchildOverlayFile.DecRef(grandchildTask)
@@ -1071,6 +1111,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildUDPServer.DecRef(grandchildTask)
 	grandchildTCPClient.DecRef(grandchildTask)
 	grandchildTCPServer.DecRef(grandchildTask)
+	grandchildManagedVolume.DecRef(grandchildTask)
+	grandchildManagedAlias.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
 	}
@@ -1095,6 +1137,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
 	parentMemfd.DecRef(parentTask)
 
+	parentManagedVolume.DecRef(parentTask)
+	parentManagedAlias.DecRef(parentTask)
 	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	l.k.Unpause()
 	l.k.WaitExited()

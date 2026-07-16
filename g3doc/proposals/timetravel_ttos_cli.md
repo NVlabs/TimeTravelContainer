@@ -10,8 +10,10 @@ initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
 plus synchronous non-TTY exec into a selected live branch. Generated bundles
 include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`,
 and a private devpts instance with `/dev/ptmx`. Existing host paths can be
-attached read-only with Docker-style `-v` or `--mount` syntax. `ttosd`, detached
-and TTY exec, attach, and managed CoW volumes remain TODO.
+attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
+tmpfs volumes can be attached at one or more paths, and their state forks CoW
+with each live branch. `ttosd`, detached and TTY exec, attach, persistent
+managed-volume backing, and managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -101,6 +103,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
       numeric user, entrypoint override, hostname, and rootless execution.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
+- [x] Support family-local named tmpfs volumes through `-v NAME:CONTAINER[:ro]`
+      and `--mount type=volume,...`, including repeated aliases of one volume.
 - [ ] Add CPU, memory, process-count, and other resource-limit flags.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
 - [ ] Support `-t` after the internal detachable console is implemented.
@@ -291,21 +295,26 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ### Managed volumes
 
-- [ ] `ttos volume create NAME` for a forkable managed volume.
-- [ ] Support pure tmpfs managed volumes.
+- [x] `ttos volume create NAME` for a forkable managed volume.
+- [x] Support pure tmpfs managed volumes.
 - [ ] Support immutable image/host lower plus main-MemoryFile tmpfs OverlayFS
       upper.
 - [ ] Generalize the already-supported root OverlayFS live-fork tests to
       arbitrary submounts.
-- [ ] Fork every managed volume upper together with its branch.
-- [ ] Preserve volume aliases and sharing among processes inside one branch
+- [x] Fork every managed tmpfs volume together with its branch and verify
+      parent/child/grandchild write isolation.
+- [x] Preserve volume aliases and sharing among processes inside one branch
       without sharing writes across branches.
-- [ ] Reject writable host binds without a managed CoW upper.
-- [ ] Define `ttos run --volume NAME:/path`, anonymous volumes, read-only
-      attachment, ownership, quotas, inspect, list, and removal.
-- [ ] Define whether a volume belongs to one family or may be attached to
-      multiple unrelated families; default to one family for deterministic
-      fork semantics.
+- [x] Reject writable host binds without a managed CoW upper.
+- [x] Initial named-volume attachment, read-only aliases, metadata inspection,
+      listing, in-use removal rejection, and removal.
+- [ ] Add anonymous volumes, ownership initialization, quotas, and richer
+      inspection.
+- [x] Initial family-local semantics: attaching a name instantiates one tmpfs
+      per sandbox family; the same name in unrelated families does not share
+      data.
+- [ ] Retain managed-volume contents across sandbox-family teardown. The first
+      slice persists metadata only; contents remain entirely in Sentry memory.
 - [ ] Add export/commit of a selected branch's managed volume without making
       disk checkpointing part of live fork.
 
@@ -378,7 +387,8 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] devpts and `/dev/ptmx` mounts for the internal TTY console.
 - [x] Initial immutable read-only gofer bind.
 - [ ] Multiple immutable read-only gofer binds and exhaustive access coverage.
-- [ ] Managed tmpfs/OverlayFS submount volumes.
+- [x] Managed tmpfs submount volumes.
+- [ ] Managed OverlayFS submount volumes.
 
 Gate: an ordinary generated OCI bundle with `/proc`, `/sys`, `/dev`, `/dev/pts`,
 read-only binds, and managed volumes forks without hand-editing its spec.
@@ -405,9 +415,10 @@ process, fork its branch, and then attach independently to both branches.
 
 ### Milestone D: Docker-like `ttos`
 
-- [ ] containerd-backed image pull/unpack and managed storage.
+- [x] Initial containerd-backed image pull/unpack and managed image-root storage.
 - [ ] Full run/create/start/stop/rm/inspect/logs/exec/attach UX.
-- [ ] Fork/pause/resume/check and beautified branch tree.
+- [x] Initial fork/pause/resume and beautified branch tree.
+- [ ] Read-only fork eligibility check and richer branch-tree diagnostics.
 - [ ] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
 

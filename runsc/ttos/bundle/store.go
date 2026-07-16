@@ -17,6 +17,7 @@ package bundle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,17 +52,26 @@ type Prepared struct {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	Name       string     `json:"name"`
-	Reference  string     `json:"reference"`
-	Digest     string     `json:"digest"`
-	Platform   string     `json:"platform"`
-	BundleDir  string     `json:"bundle_dir"`
-	RootFS     string     `json:"rootfs"`
-	State      string     `json:"state"`
-	ExitStatus *int       `json:"exit_status,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	StartedAt  *time.Time `json:"started_at,omitempty"`
-	ExitedAt   *time.Time `json:"exited_at,omitempty"`
+	Name       string          `json:"name"`
+	Reference  string          `json:"reference"`
+	Digest     string          `json:"digest"`
+	Platform   string          `json:"platform"`
+	BundleDir  string          `json:"bundle_dir"`
+	RootFS     string          `json:"rootfs"`
+	Volumes    []ManagedVolume `json:"volumes,omitempty"`
+	State      string          `json:"state"`
+	ExitStatus *int            `json:"exit_status,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+	StartedAt  *time.Time      `json:"started_at,omitempty"`
+	ExitedAt   *time.Time      `json:"exited_at,omitempty"`
+}
+
+// VolumeInfo is persistent metadata for a family-local managed volume. Volume
+// contents live in Sentry tmpfs and are not checkpointed to this store.
+type VolumeInfo struct {
+	Name      string    `json:"name"`
+	Driver    string    `json:"driver"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Prepare pulls content, creates or reuses an immutable root, and writes a new
@@ -88,6 +98,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	spec, err := BuildSpec(imageInfo.Image, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
+	}
+	for _, volume := range opts.ManagedVolumes {
+		if _, err := s.EnsureVolume(volume.Name); err != nil {
+			return Prepared{}, err
+		}
 	}
 
 	containersDir := filepath.Join(s.Root, "containers")
@@ -121,6 +136,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Platform:  imageInfo.Platform,
 		BundleDir: bundleDir,
 		RootFS:    rootfs,
+		Volumes:   append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		State:     "created",
 		CreatedAt: time.Now().UTC(),
 	}
@@ -220,6 +236,120 @@ func (s Store) RemoveContainer(name string) error {
 	return nil
 }
 
+// CreateVolume creates metadata for a family-local managed tmpfs volume.
+func (s Store) CreateVolume(name string) (VolumeInfo, error) {
+	if err := validateVolumeName(name); err != nil {
+		return VolumeInfo{}, err
+	}
+	volumesDir := filepath.Join(s.Root, "volumes")
+	if err := os.MkdirAll(volumesDir, 0700); err != nil {
+		return VolumeInfo{}, fmt.Errorf("creating volume state root: %w", err)
+	}
+	volumeDir := filepath.Join(volumesDir, name)
+	if err := os.Mkdir(volumeDir, 0700); err != nil {
+		return VolumeInfo{}, fmt.Errorf("creating volume %q: %w", name, err)
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(volumeDir)
+		}
+	}()
+	info := VolumeInfo{Name: name, Driver: "local-tmpfs", CreatedAt: time.Now().UTC()}
+	if err := writeJSON(filepath.Join(volumeDir, "volume.json"), &info); err != nil {
+		return VolumeInfo{}, fmt.Errorf("writing volume %q metadata: %w", name, err)
+	}
+	keep = true
+	return info, nil
+}
+
+// EnsureVolume returns an existing volume or creates it idempotently.
+func (s Store) EnsureVolume(name string) (VolumeInfo, error) {
+	info, err := s.LoadVolume(name)
+	if err == nil {
+		return info, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return VolumeInfo{}, err
+	}
+	info, err = s.CreateVolume(name)
+	if err == nil {
+		return info, nil
+	}
+	if errors.Is(err, os.ErrExist) {
+		return s.LoadVolume(name)
+	}
+	return VolumeInfo{}, err
+}
+
+// LoadVolume returns persistent managed-volume metadata.
+func (s Store) LoadVolume(name string) (VolumeInfo, error) {
+	if err := validateVolumeName(name); err != nil {
+		return VolumeInfo{}, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.Root, "volumes", name, "volume.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return VolumeInfo{}, fmt.Errorf("volume %q does not exist: %w", name, err)
+		}
+		return VolumeInfo{}, fmt.Errorf("reading volume %q: %w", name, err)
+	}
+	var info VolumeInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return VolumeInfo{}, fmt.Errorf("decoding volume %q: %w", name, err)
+	}
+	if info.Name != name || info.Driver != "local-tmpfs" {
+		return VolumeInfo{}, fmt.Errorf("volume %q has invalid metadata", name)
+	}
+	return info, nil
+}
+
+// ListVolumes returns managed volumes ordered by name.
+func (s Store) ListVolumes() ([]VolumeInfo, error) {
+	entries, err := os.ReadDir(filepath.Join(s.Root, "volumes"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []VolumeInfo{}, nil
+		}
+		return nil, fmt.Errorf("listing volumes: %w", err)
+	}
+	volumes := make([]VolumeInfo, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := s.LoadVolume(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, info)
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+	return volumes, nil
+}
+
+// RemoveVolume removes an unused managed volume's metadata.
+func (s Store) RemoveVolume(name string) error {
+	if _, err := s.LoadVolume(name); err != nil {
+		return err
+	}
+	containers, err := s.ListContainers()
+	if err != nil {
+		return err
+	}
+	for _, container := range containers {
+		for _, volume := range container.Volumes {
+			if volume.Name == name {
+				return fmt.Errorf("volume %q is used by container %q", name, container.Name)
+			}
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(s.Root, "volumes", name)); err != nil {
+		return fmt.Errorf("removing volume %q: %w", name, err)
+	}
+	return nil
+}
+
 func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string) (images.RootFSInfo, string, error) {
 	imagesDir := filepath.Join(s.Root, "images")
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
@@ -287,14 +417,22 @@ func writeJSON(path string, value any) error {
 }
 
 func validateName(name string) error {
+	return validateObjectName("container", name)
+}
+
+func validateVolumeName(name string) error {
+	return validateObjectName("volume", name)
+}
+
+func validateObjectName(kind, name string) error {
 	if name == "" {
-		return fmt.Errorf("container name must not be empty")
+		return fmt.Errorf("%s name must not be empty", kind)
 	}
 	for i, r := range name {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) || (i > 0 && strings.ContainsRune("_.-", r)) {
 			continue
 		}
-		return fmt.Errorf("invalid container name %q", name)
+		return fmt.Errorf("invalid %s name %q", kind, name)
 	}
 	return nil
 }

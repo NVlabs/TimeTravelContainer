@@ -17,6 +17,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -192,7 +193,7 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "-v", "/host/a:/data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -209,20 +210,25 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 		t.Errorf("entrypoint=%q, want %q", got, want)
 	}
 	wantMounts := []ttosbundle.HostMount{
-		{Source: "/host/a", Destination: "/data", Readonly: true},
+		{Source: "/host/a", Destination: "/host-data", Readonly: true},
 		{Source: "/host/b", Destination: "/config", Readonly: true},
 	}
 	if !reflect.DeepEqual(b.runRequest.hostMounts, wantMounts) {
 		t.Errorf("host mounts=%+v, want %+v", b.runRequest.hostMounts, wantMounts)
+	}
+	wantVolumes := []ttosbundle.ManagedVolume{
+		{Name: "cache", Destination: "/cache"},
+		{Name: "data", Destination: "/data", Readonly: true},
+	}
+	if !reflect.DeepEqual(b.runRequest.managedVolumes, wantVolumes) {
+		t.Errorf("managed volumes=%+v, want %+v", b.runRequest.managedVolumes, wantVolumes)
 	}
 }
 
 func TestRunRejectsUnmanagedWritableMounts(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "-v", "/host:/data", "busybox"},
-		{"run", "-v", "named:/data:ro", "busybox"},
 		{"run", "--mount", "type=bind,source=/host,target=/data", "busybox"},
-		{"run", "--mount", "type=volume,source=named,target=/data", "busybox"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
@@ -313,6 +319,45 @@ func TestRemove(t *testing.T) {
 	}
 	if b.removed != "demo" || !b.removeForce || stdout.String() != "demo\n" {
 		t.Errorf("removed=%q force=%t output=%q", b.removed, b.removeForce, stdout.String())
+	}
+}
+
+func TestVolumeCommands(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"volume", "create", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume create status=%d stderr=%q", status, stderr.String())
+	}
+	if b.ensuredVolume != "cache" || stdout.String() != "cache\n" {
+		t.Errorf("create ensured=%q output=%q", b.ensuredVolume, stdout.String())
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "ls", "-q"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume ls status=%d stderr=%q", status, stderr.String())
+	}
+	if stdout.String() != "cache\n" {
+		t.Errorf("quiet list output=%q", stdout.String())
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "inspect", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume inspect status=%d stderr=%q", status, stderr.String())
+	}
+	var inspected []ttosbundle.VolumeInfo
+	if err := json.Unmarshal(stdout.Bytes(), &inspected); err != nil {
+		t.Fatalf("decoding volume inspect: %v", err)
+	}
+	if len(inspected) != 1 || inspected[0].Name != "cache" || inspected[0].Driver != "local-tmpfs" {
+		t.Errorf("inspect returned %+v", inspected)
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "rm", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume rm status=%d stderr=%q", status, stderr.String())
+	}
+	if b.removedVolume != "cache" || stdout.String() != "cache\n" {
+		t.Errorf("remove volume=%q output=%q", b.removedVolume, stdout.String())
 	}
 }
 
@@ -574,6 +619,9 @@ type fakeBackend struct {
 	removeForce      bool
 	execRequest      execRequest
 	execStatus       int
+	volumes          []ttosbundle.VolumeInfo
+	ensuredVolume    string
+	removedVolume    string
 }
 
 func (b *fakeBackend) create(request runRequest) error {
@@ -660,4 +708,37 @@ func (b *fakeBackend) wait(target selector) (uint32, error) {
 		<-b.waitRelease
 	}
 	return b.waitStatus, b.err
+}
+
+func (b *fakeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
+	b.ensuredVolume = name
+	if b.err != nil {
+		return ttosbundle.VolumeInfo{}, b.err
+	}
+	for _, volume := range b.volumes {
+		if volume.Name == name {
+			return volume, nil
+		}
+	}
+	volume := ttosbundle.VolumeInfo{Name: name, Driver: "local-tmpfs"}
+	b.volumes = append(b.volumes, volume)
+	return volume, nil
+}
+
+func (b *fakeBackend) listVolumes() ([]ttosbundle.VolumeInfo, error) {
+	return append([]ttosbundle.VolumeInfo(nil), b.volumes...), b.err
+}
+
+func (b *fakeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) {
+	for _, volume := range b.volumes {
+		if volume.Name == name {
+			return volume, b.err
+		}
+	}
+	return ttosbundle.VolumeInfo{}, fmt.Errorf("volume %q does not exist", name)
+}
+
+func (b *fakeBackend) removeVolume(name string) error {
+	b.removedVolume = name
+	return b.err
 }
