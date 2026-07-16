@@ -206,6 +206,13 @@ type Kernel struct {
 	// syslog is the kernel log.
 	syslog syslog
 
+	// internalConsoles owns Sentry pipe peers used by detachable process
+	// consoles. It is saved so live fork clones console queues and endpoints.
+	internalConsoles map[string]*InternalConsole
+
+	// internalConsolesMu protects internalConsoles.
+	internalConsolesMu sync.Mutex `state:"nosave"`
+
 	runningTasksMu runningTasksMutex `state:"nosave"`
 
 	// runningTasks is the total count of tasks currently in
@@ -2280,6 +2287,7 @@ func (k *Kernel) Release() {
 	k.stopCPUClockTicker()
 	ctx := k.SupervisorContext()
 	k.releaseCgroupMounts(ctx)
+	k.releaseInternalConsoles(ctx)
 	k.hostMount.DecRef(ctx)
 	k.pipeMount.DecRef(ctx)
 	k.nsfsMount.DecRef(ctx)

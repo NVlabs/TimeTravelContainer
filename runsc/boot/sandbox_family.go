@@ -99,6 +99,34 @@ type BranchSignalArgs struct {
 	Mode     SignalDeliveryMode
 }
 
+// ConsoleReadArgs selects one output stream of a branch-local internal console.
+type ConsoleReadArgs struct {
+	BranchID  string
+	ConsoleID string
+	Stream    kernel.InternalConsoleStream
+	MaxBytes  int
+}
+
+// ConsoleReadResult is a nonblocking internal-console read result.
+type ConsoleReadResult struct {
+	Data       []byte
+	EOF        bool
+	WouldBlock bool
+}
+
+// ConsoleWriteArgs writes to a branch-local internal console's stdin.
+type ConsoleWriteArgs struct {
+	BranchID  string
+	ConsoleID string
+	Data      []byte
+}
+
+// ConsoleWriteResult is a nonblocking internal-console write result.
+type ConsoleWriteResult struct {
+	N          int
+	WouldBlock bool
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -561,6 +589,60 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 	}
 	tg.WaitExited()
 	return uint32(tg.ExitStatus()), nil
+}
+
+// ConsoleRead performs one nonblocking read while serializing against fork,
+// pause, resume, and destroy of the selected branch.
+func (f *SandboxFamily) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResult) error {
+	if args == nil || out == nil {
+		return fmt.Errorf("missing internal console read arguments or result")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), args.ConsoleID, args.Stream, args.MaxBytes)
+	if err != nil {
+		return err
+	}
+	*out = ConsoleReadResult{Data: data, EOF: eof, WouldBlock: wouldBlock}
+	return nil
+}
+
+// ConsoleWrite performs one nonblocking write while serializing against fork,
+// pause, resume, and destroy of the selected branch.
+func (f *SandboxFamily) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteResult) error {
+	if args == nil || out == nil {
+		return fmt.Errorf("missing internal console write arguments or result")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	n, wouldBlock, err := b.k.WriteInternalConsole(b.k.SupervisorContext(), args.ConsoleID, args.Data)
+	if err != nil {
+		return err
+	}
+	*out = ConsoleWriteResult{N: n, WouldBlock: wouldBlock}
+	return nil
 }
 
 // beginControl acquires a Kernel-lifetime lease for a branch-local operation.

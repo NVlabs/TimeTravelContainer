@@ -2097,6 +2097,24 @@ func (s *Sandbox) WaitBranch(args *boot.BranchWaitArgs) (uint32, error) {
 	return waitStatus, nil
 }
 
+// ReadConsole performs one nonblocking branch-local internal-console read.
+func (s *Sandbox) ReadConsole(args *boot.ConsoleReadArgs) (boot.ConsoleReadResult, error) {
+	var result boot.ConsoleReadResult
+	if err := s.call(boot.ContMgrConsoleRead, args, &result); err != nil {
+		return boot.ConsoleReadResult{}, fmt.Errorf("reading internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return result, nil
+}
+
+// WriteConsole performs one nonblocking branch-local internal-console write.
+func (s *Sandbox) WriteConsole(args *boot.ConsoleWriteArgs) (boot.ConsoleWriteResult, error) {
+	var result boot.ConsoleWriteResult
+	if err := s.call(boot.ContMgrConsoleWrite, args, &result); err != nil {
+		return boot.ConsoleWriteResult{}, fmt.Errorf("writing internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return result, nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

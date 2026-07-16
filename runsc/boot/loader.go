@@ -479,6 +479,10 @@ const (
 	containerSpecsKey = "container_specs"
 )
 
+// InternalConsoleAnnotation requests Sentry-internal, detachable stdio and
+// names the console session registered for the container init process.
+const InternalConsoleAnnotation = "dev.timetravelos.internal-console"
+
 func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.UserNamespace) *auth.Credentials {
 	// Create capabilities.
 	caps, err := specutils.Capabilities(conf.EnableRaw, spec.Process.Capabilities)
@@ -1403,7 +1407,21 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
-	fdTable, ttyFile, err := createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User, info.containerName)
+	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
+	var fdTable *kernel.FDTable
+	var ttyFile *host.TTYFileDescription
+	var err error
+	if consoleID != "" {
+		if info.spec.Process.Terminal {
+			return nil, nil, fmt.Errorf("internal PTY consoles are not implemented")
+		}
+		if len(info.passFDs) != 0 {
+			return nil, nil, fmt.Errorf("internal console does not yet support donated file descriptors")
+		}
+		fdTable, err = l.k.NewInternalConsoleFDTable(ctx, consoleID)
+	} else {
+		fdTable, ttyFile, err = createFDTable(ctx, info.spec.Process.Terminal, info.stdioFDs, info.passFDs, info.spec.Process.User, info.containerName)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("importing fds: %w", err)
 	}

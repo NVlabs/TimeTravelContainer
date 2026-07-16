@@ -321,6 +321,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		{Destination: "/managed-alias", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
 	}
 	spec.Annotations = map[string]string{
+		InternalConsoleAnnotation:               "init",
 		"dev.gvisor.spec.mount.managed.source":  "ttos-volume-cache",
 		"dev.gvisor.spec.mount.managed.share":   "container",
 		"dev.gvisor.spec.mount.managed.type":    "tmpfs",
@@ -349,8 +350,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("start result: %v", err)
 	}
 
-	// Standard OCI stdio is host-facing and therefore ineligible. Close it at
-	// the fork boundary so this fixture is a self-contained container.
+	// The annotated init stdio is entirely Sentry-owned and remains forkable.
 	l.k.Pause()
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
@@ -359,11 +359,6 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		LoopbackLinks: []LoopbackLink{DefaultLoopbackLink},
 	}, &struct{}{}); err != nil {
 		t.Fatalf("configuring contained loopback network: %v", err)
-	}
-	for fd := int32(0); fd < 3; fd++ {
-		if file := l.k.GlobalInit().Leader().FDTable().Remove(ctx, fd); file != nil {
-			file.DecRef(ctx)
-		}
 	}
 	aioID, err := parentTask.MemoryManager().NewAIOContext(parentTask, 1)
 	if err != nil {
@@ -657,6 +652,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPWrite(t, parentTask, parentManagedVolume, 0, "seed")
 	parentManagedAlias := liveForkTestOpenPath(t, parentTask, "managed-alias/state", linux.O_RDWR)
 	liveForkTestPRead(t, parentTask, parentManagedAlias, 0, "seed")
+	const internalConsoleID = "init"
+	const consoleBaseFD = int32(0)
+	parentConsoleStdin := liveForkTestFD(t, l.k, consoleBaseFD)
+	parentConsoleStdout := liveForkTestFD(t, l.k, consoleBaseFD+1)
+	parentConsoleStderr := liveForkTestFD(t, l.k, consoleBaseFD+2)
+	liveForkTestConsoleWriteInput(t, l.k, ctx, internalConsoleID, "seed-input")
+	liveForkTestRead(t, parentTask, parentConsoleStdin, "seed-input")
+	liveForkTestWrite(t, parentTask, parentConsoleStderr, "seed-error")
+	liveForkTestConsoleRead(t, l.k, ctx, internalConsoleID, kernel.InternalConsoleStderr, "seed-error")
+	liveForkTestConsoleWriteInput(t, l.k, ctx, internalConsoleID, "fork-input")
+	liveForkTestWrite(t, parentTask, parentConsoleStdout, "fork-output")
 	ptyMaster := liveForkTestOpenPath(t, parentTask, "dev/ptmx", linux.O_RDWR|linux.O_NONBLOCK)
 	const ptyMasterFD = int32(27)
 	if _, err := parentTask.FDTable().NewFDAt(parentTask, ptyMasterFD, ptyMaster, kernel.FDFlags{}); err != nil {
@@ -718,6 +724,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childDevMountFile := liveForkTestFD(t, child.k, devMountFD)
 	childManagedVolume := liveForkTestFD(t, child.k, managedVolumeFD)
 	childManagedAlias := liveForkTestOpenPath(t, childTask, "managed-alias/state", linux.O_RDWR)
+	childConsoleStdin := liveForkTestFD(t, child.k, consoleBaseFD)
+	childConsoleStdout := liveForkTestFD(t, child.k, consoleBaseFD+1)
 	childPTYMaster := liveForkTestFD(t, child.k, ptyMasterFD)
 	if parentPTYMaster.Impl() == childPTYMaster.Impl() {
 		t.Fatal("parent and child share the same internal PTY master object")
@@ -747,6 +755,18 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPWrite(t, parentTask, parentManagedVolume, 0, "prnt")
 	liveForkTestPRead(t, parentTask, parentManagedAlias, 0, "prnt")
 	liveForkTestPRead(t, childTask, childManagedVolume, 0, "chld")
+	liveForkTestRead(t, parentTask, parentConsoleStdin, "fork-input")
+	liveForkTestRead(t, childTask, childConsoleStdin, "fork-input")
+	liveForkTestConsoleRead(t, l.k, ctx, internalConsoleID, kernel.InternalConsoleStdout, "fork-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, internalConsoleID, kernel.InternalConsoleStdout, "fork-output")
+	liveForkTestWrite(t, childTask, childConsoleStdout, "child-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, internalConsoleID, kernel.InternalConsoleStdout, "child-output")
+	liveForkTestConsoleWouldBlock(t, l.k, ctx, internalConsoleID, kernel.InternalConsoleStdout)
+	liveForkTestWrite(t, parentTask, parentConsoleStdout, "parent-output")
+	liveForkTestConsoleRead(t, l.k, ctx, internalConsoleID, kernel.InternalConsoleStdout, "parent-output")
+	liveForkTestConsoleWouldBlock(t, child.k, childCtx, internalConsoleID, kernel.InternalConsoleStdout)
+	liveForkTestConsoleWriteInput(t, child.k, childCtx, internalConsoleID, "child-input")
+	liveForkTestRead(t, childTask, childConsoleStdin, "child-input")
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
 	liveForkTestRead(t, childCtx, childReader, "seed")
@@ -995,6 +1015,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 
 	liveForkTestWrite(t, childTask, childUDPClient, "fork")
 	liveForkTestWrite(t, childTask, childTCPClient, "fork")
+	liveForkTestWrite(t, childTask, childConsoleStdout, "recursive-output")
 	liveForkTestWaitReadable(t, childTCPServer)
 	grandchildInfo, err := l.family.Fork(&ForkBranchArgs{Source: childInfo.ID, ID: "grandchild", Paused: true})
 	if err != nil {
@@ -1026,6 +1047,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, parentTask, shmAddr1, "prnt")
 	grandchildMemfd := liveForkTestFD(t, grandchild.k, memfdFD)
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
+	grandchildConsoleStdout := liveForkTestFD(t, grandchild.k, consoleBaseFD+1)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
 	grandchildManagedVolume := liveForkTestFD(t, grandchild.k, managedVolumeFD)
@@ -1035,6 +1057,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPathMissing(t, grandchildTask, "parent-only")
 	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildManagedAlias, 0, "chld")
+	liveForkTestConsoleRead(t, child.k, childCtx, internalConsoleID, kernel.InternalConsoleStdout, "recursive-output")
+	liveForkTestConsoleRead(t, grandchild.k, grandchildTask, internalConsoleID, kernel.InternalConsoleStdout, "recursive-output")
+	liveForkTestWrite(t, grandchildTask, grandchildConsoleStdout, "grandchild-output")
+	liveForkTestConsoleRead(t, grandchild.k, grandchildTask, internalConsoleID, kernel.InternalConsoleStdout, "grandchild-output")
+	liveForkTestConsoleWouldBlock(t, child.k, childCtx, internalConsoleID, kernel.InternalConsoleStdout)
 	liveForkTestPWrite(t, grandchildTask, grandchildMemfd, 0, "grnd")
 	liveForkTestPWrite(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
 	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
@@ -1062,6 +1089,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childTruncateFile.DecRef(childTask)
 	childManagedVolume.DecRef(childTask)
 	childManagedAlias.DecRef(childTask)
+	childConsoleStdin.DecRef(childTask)
+	childConsoleStdout.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -1104,6 +1133,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestWrite(t, grandchildTask, grandchildTCPClient, "stay")
 	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildManagedAlias, 0, "grnd")
+	liveForkTestWrite(t, grandchildTask, grandchildConsoleStdout, "survivor-output")
+	liveForkTestConsoleRead(t, grandchild.k, grandchildTask, internalConsoleID, kernel.InternalConsoleStdout, "survivor-output")
 	liveForkTestReadEventually(t, grandchildTask, grandchildTCPServer, "stay")
 	grandchildMemfd.DecRef(grandchildTask)
 	grandchildOverlayFile.DecRef(grandchildTask)
@@ -1113,6 +1144,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildTCPServer.DecRef(grandchildTask)
 	grandchildManagedVolume.DecRef(grandchildTask)
 	grandchildManagedAlias.DecRef(grandchildTask)
+	grandchildConsoleStdout.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
 	}
@@ -1139,6 +1171,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 
 	parentManagedVolume.DecRef(parentTask)
 	parentManagedAlias.DecRef(parentTask)
+	parentConsoleStdin.DecRef(parentTask)
+	parentConsoleStdout.DecRef(parentTask)
+	parentConsoleStderr.DecRef(parentTask)
 	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	l.k.Unpause()
 	l.k.WaitExited()
@@ -1208,6 +1243,39 @@ func liveForkTestWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDes
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		t.Fatalf("empty nonblocking Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkTestConsoleWriteInput(t *testing.T, k *kernel.Kernel, ctx context.Context, id, value string) {
+	t.Helper()
+	n, wouldBlock, err := k.WriteInternalConsole(ctx, id, []byte(value))
+	if err != nil {
+		t.Fatalf("writing internal console %q input: %v", id, err)
+	}
+	if wouldBlock || n != len(value) {
+		t.Fatalf("writing internal console %q input: wrote %d/%d, wouldBlock=%t", id, n, len(value), wouldBlock)
+	}
+}
+
+func liveForkTestConsoleRead(t *testing.T, k *kernel.Kernel, ctx context.Context, id string, stream kernel.InternalConsoleStream, want string) {
+	t.Helper()
+	data, eof, wouldBlock, err := k.ReadInternalConsole(ctx, id, stream, len(want))
+	if err != nil {
+		t.Fatalf("reading internal console %q stream %d: %v", id, stream, err)
+	}
+	if eof || wouldBlock || string(data) != want {
+		t.Fatalf("reading internal console %q stream %d: got %q, eof=%t wouldBlock=%t, want %q", id, stream, data, eof, wouldBlock, want)
+	}
+}
+
+func liveForkTestConsoleWouldBlock(t *testing.T, k *kernel.Kernel, ctx context.Context, id string, stream kernel.InternalConsoleStream) {
+	t.Helper()
+	data, eof, wouldBlock, err := k.ReadInternalConsole(ctx, id, stream, 1)
+	if err != nil {
+		t.Fatalf("probing internal console %q stream %d: %v", id, stream, err)
+	}
+	if eof || !wouldBlock || len(data) != 0 {
+		t.Fatalf("probing internal console %q stream %d: got %q, eof=%t wouldBlock=%t", id, stream, data, eof, wouldBlock)
 	}
 }
 

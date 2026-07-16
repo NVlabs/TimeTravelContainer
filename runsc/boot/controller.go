@@ -117,6 +117,12 @@ const (
 	// ContMgrBranchWait waits for a process in one in-memory branch.
 	ContMgrBranchWait = "containerManager.BranchWait"
 
+	// ContMgrConsoleRead reads branch-local internal console output.
+	ContMgrConsoleRead = "containerManager.ConsoleRead"
+
+	// ContMgrConsoleWrite writes branch-local internal console input.
+	ContMgrConsoleWrite = "containerManager.ConsoleWrite"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -979,6 +985,16 @@ func (cm *containerManager) BranchWait(args *BranchWaitArgs, waitStatus *uint32)
 	}
 	*waitStatus = status
 	return nil
+}
+
+// ConsoleRead reads output from a branch-local internal console.
+func (cm *containerManager) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResult) error {
+	return cm.l.family.ConsoleRead(args, out)
+}
+
+// ConsoleWrite writes input to a branch-local internal console.
+func (cm *containerManager) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteResult) error {
+	return cm.l.family.ConsoleWrite(args, out)
 }
 
 // Wait waits for the init process in the given container.

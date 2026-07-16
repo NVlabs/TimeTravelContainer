@@ -268,6 +268,7 @@ go_library(
         "fd_table_refs.go",
         "fd_table_unsafe.go",
         "fs_context.go",
+        "internal_console.go",
         "fs_context_mutex.go",
         "fs_context_refs.go",
         "fs_save_mutex.go",

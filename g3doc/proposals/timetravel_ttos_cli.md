@@ -12,8 +12,10 @@ include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`,
 and a private devpts instance with `/dev/ptmx`. Existing host paths can be
 attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
 tmpfs volumes can be attached at one or more paths, and their state forks CoW
-with each live branch. `ttosd`, detached and TTY exec, attach, persistent
-managed-volume backing, and managed OverlayFS volumes remain TODO.
+with each live branch. An opt-in non-TTY internal-console substrate now provides
+branch-local Sentry pipes and nonblocking control RPCs. The `ttos` stream pump,
+`ttosd`, detached and TTY exec, attach, persistent managed-volume backing, and
+managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -213,21 +215,24 @@ CLI detaches. Closing only the host CLI is therefore insufficient for live-fork
 eligibility. Guest processes must instead retain Sentry-internal endpoints;
 host clients connect transiently through the control plane.
 
-- [ ] Define a branch-local `ConsoleSession` object with stable session ID,
-      stdin queue, stdout/stderr queues, terminal metadata, and attachment
-      leases.
-- [ ] For non-TTY processes, install internal Sentry pipes or equivalent queue
+- [x] Define a saved branch-local non-TTY console object with a stable session
+      ID and stdin/stdout/stderr queues.
+- [ ] Add terminal metadata, attachment leases, and detached exec-session IDs.
+- [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
 - [ ] For interactive processes, allocate a Sentry devpts PTY and install its
       slave as guest stdio.
-- [ ] Keep the PTY master or pipe peer in the branch-local console service, not
+- [x] Keep pipe peers in the branch-local Kernel console registry, not
       in a host `FileDescription`.
-- [ ] Add pollable console read/write/resize/close RPCs and cancellation.
+- [x] Add branch-serialized nonblocking console read/write RPCs.
+- [ ] Add readiness waiting, resize, close, attachment leases, and cancellation.
 - [ ] Implement host-side stream pumping in `ttos`/`ttosd` without adding host
       FDs to the guest resource graph.
-- [ ] Clone unread console data, termios, foreground process group, window size,
-      and hangup state during live fork.
-- [ ] Ensure post-fork input and output cannot cross branches.
+- [x] Clone unread non-TTY console data and pipe connectivity during live fork,
+      including recursively forked branches.
+- [ ] Clone PTY termios, foreground process group, window size, and hangup state.
+- [x] Ensure post-fork non-TTY input and output cannot cross branches and that a
+      descendant console survives deletion of its source branch.
 - [ ] Test detach caused by normal command, detach keys, client crash, daemon
       restart, and network/socket failure.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
@@ -405,10 +410,12 @@ grandchild branches without PID or wait-status crossover.
 
 ### Milestone C: detachable console
 
-- [ ] Internal non-TTY console sessions and streaming RPC.
+- [x] Internal non-TTY console sessions and nonblocking branch RPC substrate.
+- [ ] Host-side streaming, attach leases, detach, and log retention.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
-- [ ] Console state fork and branch-local I/O.
+- [x] Non-TTY console state fork and branch-local I/O.
+- [ ] PTY console state fork and branch-local I/O.
 
 Gate: a user can detach from a still-running interactive or noninteractive
 process, fork its branch, and then attach independently to both branches.
