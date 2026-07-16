@@ -543,6 +543,11 @@ type sqEntriesFile struct {
 	fr memmap.FileRange
 }
 
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (*sqEntriesFile) ValidateLiveForkMapping() error {
+	return fmt.Errorf("io_uring SQE mappings do not yet have branch-local backing")
+}
+
 // Translate implements memmap.Mappable.Translate.
 func (sqemf *sqEntriesFile) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	if required.End > sqemf.fr.Length() {
@@ -570,6 +575,11 @@ type ringsBufferFile struct {
 	memmap.MappableNoTrackMappings
 
 	fr memmap.FileRange
+}
+
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (*ringsBufferFile) ValidateLiveForkMapping() error {
+	return fmt.Errorf("io_uring SQ/CQ mappings do not yet have branch-local backing")
 }
 
 // Translate implements memmap.Mappable.Translate.

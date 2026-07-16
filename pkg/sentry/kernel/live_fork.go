@@ -70,7 +70,13 @@ func (e *LiveForkResourceError) Error() string {
 	}
 	i := e.Issues[0]
 	if len(e.Issues) == 1 {
+		if i.FD < 0 {
+			return fmt.Sprintf("live fork resource validation failed: pid %d mapping resource %s: %s", i.PID, i.Resource, i.Reason)
+		}
 		return fmt.Sprintf("live fork resource validation failed: pid %d fd %d resource %s: %s", i.PID, i.FD, i.Resource, i.Reason)
+	}
+	if i.FD < 0 {
+		return fmt.Sprintf("live fork resource validation failed with %d issues; first: pid %d mapping resource %s: %s", len(e.Issues), i.PID, i.Resource, i.Reason)
 	}
 	return fmt.Sprintf("live fork resource validation failed with %d issues; first: pid %d fd %d resource %s: %s", len(e.Issues), i.PID, i.FD, i.Resource, i.Reason)
 }
@@ -98,6 +104,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() error {
 		if err := k.validateLiveForkResources(); err != nil {
+			return err
+		}
+		if err := k.validateLiveForkMappings(); err != nil {
 			return err
 		}
 		k.prepareSharedMemoryForLiveFork(ctx)
@@ -183,6 +192,58 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		return nil, err
 	}
 	return child, nil
+}
+
+// validateLiveForkMappings walks each unique task address space and rejects
+// special or host-backed VMAs that cannot yet be made branch-local. It runs
+// before any live-fork CoW mutation.
+func (k *Kernel) validateLiveForkMappings() error {
+	type memoryRoot struct {
+		pid ThreadID
+		mm  *mm.MemoryManager
+	}
+	var roots []memoryRoot
+	k.tasks.mu.RLock()
+	for task, tid := range k.tasks.Root.tids {
+		if task.image.MemoryManager != nil {
+			roots = append(roots, memoryRoot{tid, task.image.MemoryManager})
+		}
+		if r, ok := task.runState.(*runExecveAfterSiblingExitStop); ok && r.image.MemoryManager != nil {
+			roots = append(roots, memoryRoot{tid, r.image.MemoryManager})
+		}
+	}
+	k.tasks.mu.RUnlock()
+	sort.Slice(roots, func(i, j int) bool { return roots[i].pid < roots[j].pid })
+
+	seen := make(map[*mm.MemoryManager]struct{})
+	var issues []LiveForkResourceIssue
+	for _, root := range roots {
+		if _, ok := seen[root.mm]; ok {
+			continue
+		}
+		seen[root.mm] = struct{}{}
+		for _, issue := range root.mm.ValidateLiveForkMappings() {
+			issues = append(issues, LiveForkResourceIssue{
+				PID:      root.pid,
+				FD:       -1,
+				Resource: issue.Resource,
+				Reason:   fmt.Sprintf("virtual address range %v: %s", issue.AddrRange, issue.Reason),
+			})
+		}
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].PID != issues[j].PID {
+			return issues[i].PID < issues[j].PID
+		}
+		if issues[i].Resource != issues[j].Resource {
+			return issues[i].Resource < issues[j].Resource
+		}
+		return issues[i].Reason < issues[j].Reason
+	})
+	return &LiveForkResourceError{Issues: issues}
 }
 
 // prepareSharedMemoryForLiveFork establishes page CoW for every SysV SHM

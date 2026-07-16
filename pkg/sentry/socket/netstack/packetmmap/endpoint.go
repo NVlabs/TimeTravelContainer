@@ -39,6 +39,7 @@ import (
 
 var _ stack.PacketMMapEndpoint = (*Endpoint)(nil)
 var _ memmap.Mappable = (*Endpoint)(nil)
+var _ memmap.LiveForkMappingValidator = (*Endpoint)(nil)
 
 // ringBufferMode is the mode of a packet ring buffer.
 type ringBufferMode uint
@@ -357,6 +358,11 @@ func (m *Endpoint) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) err
 	}
 	m.mapped.Store(1)
 	return nil
+}
+
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (*Endpoint) ValidateLiveForkMapping() error {
+	return fmt.Errorf("PACKET_MMAP rings do not yet have branch-local backing")
 }
 
 // Mapped returns whether the endpoint has been mapped.

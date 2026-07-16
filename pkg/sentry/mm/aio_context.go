@@ -15,6 +15,8 @@
 package mm
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -358,6 +360,11 @@ func (m *aioMappable) Translate(ctx context.Context, required, optional memmap.M
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 func (m *aioMappable) InvalidateUnsavable(ctx context.Context) error {
 	return nil
+}
+
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (*aioMappable) ValidateLiveForkMapping() error {
+	return fmt.Errorf("AIO ring mappings do not yet have branch-local backing")
 }
 
 // NewAIOContext creates a new context for asynchronous I/O.

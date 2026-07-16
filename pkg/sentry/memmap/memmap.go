@@ -268,6 +268,15 @@ type MappingIdentity interface {
 	Msync(ctx context.Context, mr MappableRange) error
 }
 
+// LiveForkMappingValidator may be implemented by Mappables whose state cannot
+// yet be safely duplicated by an in-memory live fork. Ordinary filesystem
+// mappings are validated by their filesystem save hooks instead.
+type LiveForkMappingValidator interface {
+	// ValidateLiveForkMapping returns nil if mappings of this object may be
+	// cloned without cross-branch state or host-resource sharing.
+	ValidateLiveForkMapping() error
+}
+
 // MLockMode specifies the memory locking behavior of a memory mapping.
 type MLockMode int
 

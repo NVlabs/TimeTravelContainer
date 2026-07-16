@@ -251,10 +251,33 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	// the fork boundary so this fixture is a self-contained container.
 	l.k.Pause()
 	ctx := l.k.SupervisorContext()
+	parentTask := l.k.GlobalInit().Leader()
 	for fd := int32(0); fd < 3; fd++ {
 		if file := l.k.GlobalInit().Leader().FDTable().Remove(ctx, fd); file != nil {
 			file.DecRef(ctx)
 		}
+	}
+	aioID, err := parentTask.MemoryManager().NewAIOContext(parentTask, 1)
+	if err != nil {
+		t.Fatalf("creating AIO ring mapping: %v", err)
+	}
+	if _, err := l.family.Fork(&ForkBranchArgs{ID: "aio-ring"}); err == nil {
+		t.Fatal("live fork unexpectedly accepted an AIO ring mapping")
+	} else {
+		var resourceErr *kernel.LiveForkResourceError
+		if !errors.As(err, &resourceErr) {
+			t.Fatalf("AIO ring rejection is not a resource report: %v", err)
+		}
+		if len(resourceErr.Issues) != 1 {
+			t.Fatalf("AIO ring rejection issues: got %+v, want one", resourceErr.Issues)
+		}
+		issue := resourceErr.Issues[0]
+		if issue.PID != 1 || issue.FD != -1 || !strings.Contains(issue.Resource, "aioMappable") || !strings.Contains(issue.Reason, "virtual address range") {
+			t.Fatalf("AIO ring rejection issue: got %+v", issue)
+		}
+	}
+	if aio := parentTask.MemoryManager().DestroyAIOContext(parentTask, aioID); aio == nil {
+		t.Fatal("AIO ring mapping disappeared after rejected live fork")
 	}
 	hostEventFD, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 	if err != nil {
@@ -374,7 +397,6 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	parentTimerFile := liveForkTestFD(t, l.k, timerFD)
 	parentTimer = parentTimerFile.Impl().(*timerfd.TimerFileDescription)
-	parentTask := l.k.GlobalInit().Leader()
 	shmSegment, err := parentTask.IPCNamespace().ShmRegistry().FindOrCreate(parentTask, 1, 0, hostarch.PageSize, 0600, true, true, true)
 	if err != nil {
 		t.Fatalf("creating SysV SHM segment: %v", err)

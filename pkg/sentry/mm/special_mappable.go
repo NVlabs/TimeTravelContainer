@@ -15,6 +15,9 @@
 package mm
 
 import (
+	"fmt"
+	"strings"
+
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -112,6 +115,14 @@ func (m *SpecialMappable) Translate(ctx context.Context, required, optional memm
 func (m *SpecialMappable) InvalidateUnsavable(ctx context.Context) error {
 	// Since data is stored in pgalloc.MemoryFile, the contents of which are
 	// preserved across save/restore, we don't need to do anything.
+	return nil
+}
+
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (m *SpecialMappable) ValidateLiveForkMapping() error {
+	if strings.HasPrefix(m.name, "[kcov:") {
+		return fmt.Errorf("KCOV mappings do not yet have branch-local backing")
+	}
 	return nil
 }
 

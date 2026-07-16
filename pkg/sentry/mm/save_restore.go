@@ -19,10 +19,52 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+// LiveForkMappingIssue describes one VMA that cannot be cloned safely.
+type LiveForkMappingIssue struct {
+	AddrRange hostarch.AddrRange
+	Resource  string
+	Reason    string
+}
+
+// ValidateLiveForkMappings rejects special and host/device-backed Mappables
+// before live-fork preparation mutates page ownership.
+func (mm *MemoryManager) ValidateLiveForkMappings() []LiveForkMappingIssue {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
+	var issues []LiveForkMappingIssue
+	for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
+		vma := vseg.ValuePtr()
+		if vma.mappable == nil {
+			continue
+		}
+		if validator, ok := vma.mappable.(memmap.LiveForkMappingValidator); ok {
+			if err := validator.ValidateLiveForkMapping(); err != nil {
+				issues = append(issues, LiveForkMappingIssue{vseg.Range(), fmt.Sprintf("%T", vma.mappable), err.Error()})
+			}
+			continue
+		}
+		if fd, ok := vma.id.(*vfs.FileDescription); ok {
+			fsType := fd.Mount().Filesystem().FilesystemType().Name()
+			switch fsType {
+			case "none", "host", "fuse", "dev", "devtmpfs":
+				issues = append(issues, LiveForkMappingIssue{
+					vseg.Range(),
+					fmt.Sprintf("%T", vma.mappable),
+					fmt.Sprintf("mapping identity is backed by unsupported filesystem %q", fsType),
+				})
+			}
+		}
+	}
+	return issues
+}
 
 // InvalidateUnsavable invokes memmap.Mappable.InvalidateUnsavable on all
 // Mappables mapped by mm.

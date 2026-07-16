@@ -503,8 +503,8 @@ opts in. Pure eventfds are accepted while host-backed eventfds are rejected;
 Unix transport validation rejects host-backed receivers, peers, bound host
 sockets, and queued SCM_RIGHTS. A real-loader test checks direct and
 epoll-reachable host eventfd rejection, then removes the resource and completes
-a valid fork. Mapping, ioctl-held, and filesystem-specific closure still need
-the same explicit treatment in later phases.
+a valid fork. Filesystem-specific and ioctl-held closure still need the same
+explicit treatment in later phases.
 
 The first Phase 4 tmpfs slice is implemented for main-MemoryFile-backed regular
 files, including memfd. Each tmpfs filesystem maintains a runtime registry that
@@ -551,6 +551,15 @@ fault detaches only the required pages, using the same conservative first-access
 rule as tmpfs. A real-loader test maps one segment twice and verifies alias
 coherence within parent, child, and grandchild branches, isolation between those
 branches, and recursive re-forking without copying untouched pages.
+
+VMA resource closure now runs immediately after FD-graph validation and before
+any page-ownership mutation. Mappables may provide an explicit live-fork
+validator; AIO rings, io_uring SQ/CQ/SQE mappings, PACKET_MMAP rings, and KCOV
+mappings reject with a stable PID/address-range/resource/reason report. A
+fallback also rejects mappings whose retained VFS identity belongs to host,
+FUSE, anonymous, dev, or devtmpfs filesystems, covering closed device FDs that
+remain reachable only through a VMA. The real-loader gate creates an AIO ring,
+checks rejection, destroys it, and then forks the same parent successfully.
 
 ## Implementation phases and gates
 
