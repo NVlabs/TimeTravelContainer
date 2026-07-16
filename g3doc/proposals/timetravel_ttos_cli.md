@@ -6,8 +6,9 @@ Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
-initial run/create/start/inspect/list/remove lifecycle with persistent metadata.
-`ttosd`, exec, attach, ordinary OCI mounts, and managed volumes remain TODO.
+initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
+plus synchronous non-TTY exec into a selected live branch. `ttosd`, detached
+and TTY exec, attach, ordinary OCI mounts, and managed volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -138,17 +139,21 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### Exec
 
-- [ ] `ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND...`.
-- [ ] Support environment, cwd, UID/GID, supplementary groups, capabilities,
-      and an OCI process JSON input.
-- [ ] Support synchronous noninteractive commands with exit-status forwarding.
-- [ ] Support interactive `-i`/`-t` commands.
+- [x] Initial `ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND...` selecting a
+      live branch through `runsc exec --branch`.
+- [x] Support environment, cwd, and UID/GID overrides in the initial CLI.
+- [ ] Add supplementary groups, capabilities, and an OCI process JSON input to
+      `ttos exec`.
+- [x] Support synchronous non-TTY commands with output streaming and
+      exit-status forwarding; optionally import stdin with `-i`.
+- [ ] Support TTY-interactive `-t` commands through the internal console (`-i`
+      without a TTY is supported for synchronous exec).
 - [ ] Support `--detach`, returning a stable branch-qualified execution ID.
 - [ ] Add `ttos exec ls`, `ttos exec wait`, `ttos exec kill`, and reattach by
       execution ID.
 - [ ] Preserve virtual PIDs and exec IDs when a running exec session is forked.
-- [ ] Require a running branch for exec in the first release; do not implicitly
-      resume paused branches.
+- [x] Require a running branch for exec; do not implicitly resume paused
+      branches.
 
 ### Attach and detach
 
@@ -174,17 +179,19 @@ The existing `runsc exec` path reaches `control.ExecAsync`, which can operate on
 a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
 `Loader.k`, default-branch namespaces, and a single process/TTY map.
 
-- [ ] Add branch ID to execute, wait-PID, process signal, and terminal-control
-      RPCs.
+- [x] Add branch ID to execute and wait-PID paths.
+- [ ] Add branch ID to general process-signal and terminal-control RPCs (the
+      TimeTravel-specific signal RPC is already branch-aware).
 - [ ] Move process bookkeeping from `Loader.processes` into each
       `sandboxBranch`.
 - [ ] Reconstruct branch process records after fork by resolving cloned virtual
       TIDs, container IDs, process groups, and execution IDs.
-- [ ] Select mount and PID namespaces from the target branch's container init.
-- [ ] Use the target branch Kernel in `control.Proc` and `control.ExecAsync`.
+- [x] Select mount and PID namespaces from the target branch's container init.
+- [x] Use the target branch Kernel in `control.Proc` and `control.ExecAsync`.
 - [ ] Share immutable OCI specs and seccomp configuration while keeping mutable
       process/TTY state branch-local.
-- [ ] Extend `beginControl` lifetime leases to exec creation and wait.
+- [x] Extend branch Kernel-lifetime leases to exec creation and wait, rejecting
+      exec creation unless the selected branch is running.
 - [ ] Add failure injection around FD import, namespace selection, process
       creation, publication, client disconnect, and wait cleanup.
 - [ ] Test exec concurrently with pause, resume, fork, destroy, and sibling

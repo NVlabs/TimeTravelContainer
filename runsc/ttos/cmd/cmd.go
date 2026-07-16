@@ -222,6 +222,7 @@ Commands:
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
+  exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
@@ -248,6 +249,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runCreate(args[1:], stdout, stderr, backend)
 	case "start":
 		err = runStart(args[1:], stdout, stderr, backend)
+	case "exec":
+		err = runExec(args[1:], stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, backend)
 	case "rm":
@@ -305,6 +308,15 @@ type runRequest struct {
 	hostname    string
 	entrypoint  []string
 	detach      bool
+	interactive bool
+}
+
+type execRequest struct {
+	target      selector
+	args        []string
+	env         []string
+	cwd         string
+	user        string
 	interactive bool
 }
 
@@ -455,6 +467,50 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	if !*attach {
 		fmt.Fprintln(stdout, fs.Arg(0))
+	}
+	return nil
+}
+
+func runExec(args []string, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	interactive := fs.Bool("interactive", false, "keep stdin open")
+	fs.BoolVar(interactive, "i", false, "keep stdin open")
+	terminal := fs.Bool("tty", false, "allocate a terminal")
+	fs.BoolVar(terminal, "t", false, "allocate a terminal")
+	cwd := fs.String("workdir", "", "working directory inside the container")
+	fs.StringVar(cwd, "w", "", "working directory inside the container")
+	user := fs.String("user", "", "username or UID[:GID]")
+	fs.StringVar(user, "u", "", "username or UID[:GID]")
+	var env stringSlice
+	fs.Var(&env, "env", "set environment variable NAME=VALUE")
+	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return errors.New("usage: ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND [ARG...]")
+	}
+	if *terminal {
+		return errors.New("-t/--tty requires the detachable internal console, which is not implemented yet")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	status, err := backend.exec(execRequest{
+		target:      target,
+		args:        append([]string(nil), fs.Args()[1:]...),
+		env:         append([]string(nil), env...),
+		cwd:         *cwd,
+		user:        *user,
+		interactive: *interactive,
+	})
+	if err != nil {
+		return err
+	}
+	if status != 0 {
+		return exitStatus{code: status}
 	}
 	return nil
 }
@@ -838,6 +894,7 @@ type backend interface {
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
+	exec(request execRequest) (int, error)
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
 	listFamilies() ([]Family, error)
@@ -914,6 +971,35 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 		b.recordLaunchState(name, detach, status)
 	}
 	return status, err
+}
+
+func (b *runtimeBackend) exec(request execRequest) (int, error) {
+	args := []string{"--root", b.root, "exec", "--branch", request.target.branch}
+	for _, value := range request.env {
+		args = append(args, "--env", value)
+	}
+	if request.cwd != "" {
+		args = append(args, "--cwd", request.cwd)
+	}
+	if request.user != "" {
+		args = append(args, "--user", request.user)
+	}
+	args = append(args, request.target.container)
+	args = append(args, request.args...)
+	command := exec.Command(b.runsc, args...)
+	if request.interactive {
+		command.Stdin = b.stdin
+	}
+	command.Stdout = b.stdout
+	command.Stderr = b.stderr
+	if err := command.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, fmt.Errorf("executing runsc: %w", err)
+	}
+	return 0, nil
 }
 
 func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {

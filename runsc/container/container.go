@@ -710,6 +710,21 @@ func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 	return c.Sandbox.WaitPID(c.ID, pid)
 }
 
+// WaitBranchPID waits for process pid in a TimeTravel branch and returns its
+// wait status.
+func (c *Container) WaitBranchPID(branchID string, pid int32) (unix.WaitStatus, error) {
+	log.Debugf("Wait on process %d in branch %q, cid: %s", pid, branchID, c.ID)
+	if !c.IsSandboxRunning() {
+		return 0, fmt.Errorf("sandbox is not running")
+	}
+	status, err := c.Sandbox.WaitBranch(&boot.BranchWaitArgs{
+		BranchID: branchID,
+		CID:      c.ID,
+		PID:      pid,
+	})
+	return unix.WaitStatus(status), err
+}
+
 // WaitCheckpoint waits for the Kernel to have been successfully checkpointed.
 func (c *Container) WaitCheckpoint() error {
 	log.Debugf("Waiting for checkpoint to complete in container, cid: %s", c.ID)

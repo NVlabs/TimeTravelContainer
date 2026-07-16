@@ -583,6 +583,28 @@ func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) 
 	return b, b.controlOps.Done, nil
 }
 
+// beginRunningControl acquires a Kernel-lifetime lease only if id is running.
+// It is used by operations, such as exec, that must not implicitly resume a
+// paused branch.
+func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if b.state != BranchRunning {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("branch %q is %s, not running", id, state)
+	}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	b.opMu.Unlock()
+	return b, b.controlOps.Done, nil
+}
+
 func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*kernel.ThreadGroup, error) {
 	if tgid < 0 {
 		return nil, fmt.Errorf("PID (%d) must be non-negative", tgid)

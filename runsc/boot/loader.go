@@ -1547,12 +1547,33 @@ func (l *Loader) destroySubcontainer(cid string) error {
 }
 
 func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
+	targetKernel := l.k
+	var branchDone func()
+	if args.BranchID != "" && args.BranchID != DefaultBranchID {
+		if args.StdioIsPty {
+			return 0, fmt.Errorf("branch exec with a host TTY is unsupported")
+		}
+		branch, done, err := l.family.beginRunningControl(args.BranchID)
+		if err != nil {
+			return 0, err
+		}
+		targetKernel = branch.k
+		branchDone = done
+		defer branchDone()
+	}
+
 	// Hold the lock for the entire operation to ensure that exec'd process is
 	// added to 'processes' in case it races with destroyContainer().
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	tg, err := l.tryThreadGroupFromIDLocked(execID{cid: args.ContainerID})
+	var tg *kernel.ThreadGroup
+	var err error
+	if targetKernel == l.k {
+		tg, err = l.tryThreadGroupFromIDLocked(execID{cid: args.ContainerID})
+	} else {
+		tg, err = branchThreadGroup(targetKernel, args.ContainerID, 0)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1567,7 +1588,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if args.MountNamespace == nil || !args.MountNamespace.TryIncRef() {
 		return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
 	}
-	sctx := l.k.SupervisorContext()
+	sctx := targetKernel.SupervisorContext()
 	root := args.MountNamespace.Root(sctx)
 	defer root.DecRef(sctx)
 	ctx := vfs.WithRoot(sctx, root)
@@ -1590,7 +1611,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
 
-	containerName := l.k.ContainerName(args.ContainerID)
+	containerName := targetKernel.ContainerName(args.ContainerID)
 	spec := l.containerSpecs[containerName]
 	if spec != nil {
 		seccompProgram, err := buildOCISeccompProgram(l.root.conf, spec)
@@ -1601,18 +1622,20 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 
 	// Start the process.
-	proc := control.Proc{Kernel: l.k}
+	proc := control.Proc{Kernel: targetKernel}
 	newTG, tgid, ttyFile, err := control.ExecAsync(&proc, args)
 	if err != nil {
 		return 0, err
 	}
 
-	eid := execID{cid: args.ContainerID, pid: tgid}
-	l.processes[eid] = &execProcess{
-		tg:  newTG,
-		tty: ttyFile,
+	if targetKernel == l.k {
+		eid := execID{cid: args.ContainerID, pid: tgid}
+		l.processes[eid] = &execProcess{
+			tg:  newTG,
+			tty: ttyFile,
+		}
+		log.Debugf("updated processes: %v", l.processes)
 	}
-	log.Debugf("updated processes: %v", l.processes)
 
 	return tgid, nil
 }

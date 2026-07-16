@@ -238,6 +238,33 @@ func TestCreateAndStart(t *testing.T) {
 	}
 }
 
+func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	args := []string{"exec", "-i", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "demo@child", "sh", "-c", "echo ok"}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
+	}
+	request := b.execRequest
+	if request.target != (selector{container: "demo", branch: "child"}) || !request.interactive || request.cwd != "/work" || request.user != "123:456" {
+		t.Errorf("exec request=%+v", request)
+	}
+	if got := strings.Join(request.env, " "); got != "A=1" {
+		t.Errorf("exec env=%q", got)
+	}
+	if got := strings.Join(request.args, " "); got != "sh -c echo ok" {
+		t.Errorf("exec args=%q", got)
+	}
+}
+
+func TestExecForwardsProcessExitStatus(t *testing.T) {
+	b := &fakeBackend{execStatus: 23}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "demo", "false"}, &stdout, &stderr, b); status != 23 {
+		t.Fatalf("exec status=%d, want 23; stderr=%q", status, stderr.String())
+	}
+}
+
 func TestInspect(t *testing.T) {
 	b := &fakeBackend{inspectInfo: InspectInfo{
 		Container: ttosbundle.ContainerInfo{Name: "demo", Reference: "docker.io/library/busybox:latest"},
@@ -387,6 +414,42 @@ exit 2
 	}
 }
 
+func TestRuntimeBackendExecUsesBranchFlag(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
+   [ "$3" = "exec" ] && [ "$4" = "--branch" ] && [ "$5" = "child" ] &&
+   [ "$6" = "--env" ] && [ "$7" = "A=1" ] &&
+   [ "$8" = "--cwd" ] && [ "$9" = "/work" ] &&
+   [ "${10}" = "--user" ] && [ "${11}" = "123:456" ] &&
+   [ "${12}" = "web" ] && [ "${13}" = "echo" ] && [ "${14}" = "ok" ]; then
+	echo branch-output
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
+	status, err := b.exec(execRequest{
+		target: selector{container: "web", branch: "child"},
+		args:   []string{"echo", "ok"},
+		env:    []string{"A=1"},
+		cwd:    "/work",
+		user:   "123:456",
+	})
+	if err != nil || status != 0 {
+		t.Fatalf("exec returned status=%d err=%v stderr=%q", status, err, stderr.String())
+	}
+	if stdout.String() != "branch-output\n" {
+		t.Errorf("stdout=%q", stdout.String())
+	}
+}
+
 func TestListFamiliesMergesPersistentStateAndReconcilesStaleRunning(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -483,6 +546,8 @@ type fakeBackend struct {
 	inspectInfo      InspectInfo
 	removed          string
 	removeForce      bool
+	execRequest      execRequest
+	execStatus       int
 }
 
 func (b *fakeBackend) create(request runRequest) error {
@@ -501,6 +566,11 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 	b.startDetach = detach
 	b.startInteractive = interactive
 	return b.runStatus, b.err
+}
+
+func (b *fakeBackend) exec(request execRequest) (int, error) {
+	b.execRequest = request
+	return b.execStatus, b.err
 }
 
 func (b *fakeBackend) inspect(name string) (InspectInfo, error) {

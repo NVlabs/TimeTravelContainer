@@ -99,6 +99,9 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if child.ID != "child" || child.ParentID != DefaultBranchID || child.State != BranchPaused {
 		t.Fatalf("Fork returned %+v", child)
 	}
+	if _, _, err := family.beginRunningControl("child"); err == nil {
+		t.Fatal("beginRunningControl succeeded for paused child")
+	}
 	if child.ForkMetrics.Total <= 0 || child.ForkMetrics.Kernel.MetadataStream <= 0 || child.ForkMetrics.ChildStart <= 0 {
 		t.Fatalf("incomplete fork metrics: %+v", child.ForkMetrics)
 	}
@@ -112,6 +115,11 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 
 	if err := family.Resume("child"); err != nil {
 		t.Fatalf("Resume child: %v", err)
+	}
+	if _, done, err := family.beginRunningControl("child"); err != nil {
+		t.Fatalf("beginRunningControl running child: %v", err)
+	} else {
+		done()
 	}
 	if err := family.Pause("child"); err != nil {
 		t.Fatalf("Pause child: %v", err)

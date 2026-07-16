@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -48,6 +49,7 @@ type Exec struct {
 	user            user
 	extraKGIDs      stringSlice
 	caps            stringSlice
+	branch          string
 	detach          bool
 	processPath     string
 	pidFile         string
@@ -102,6 +104,7 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.Var(&ex.user, "user", "UID (format: <uid>[:<gid>])")
 	f.Var(&ex.extraKGIDs, "additional-gids", "additional gids")
 	f.Var(&ex.caps, "cap", "add a capability to the bounding set for the process")
+	f.StringVar(&ex.branch, "branch", boot.DefaultBranchID, "TimeTravel branch in which to execute")
 	f.BoolVar(&ex.detach, "detach", false, "detach from the container's process")
 	f.StringVar(&ex.processPath, "process", "", "path to the process.json")
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
@@ -134,6 +137,10 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	e, err := ex.parseArgs(f, c.Spec.Process, conf.EnableRaw)
 	if err != nil {
 		util.Fatalf("parsing process spec: %v", err)
+	}
+	e.BranchID = ex.branch
+	if ex.branch != boot.DefaultBranchID && e.StdioIsPty {
+		util.Fatalf("branch exec with a host PTY is unsupported; use non-TTY stdio until the internal detachable console is implemented")
 	}
 
 	log.Debugf("Exec arguments: %+v", e)
@@ -217,7 +224,12 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	}
 
 	// Wait for the process to exit.
-	ws, err := c.WaitPID(pid)
+	var ws unix.WaitStatus
+	if e.BranchID == "" || e.BranchID == boot.DefaultBranchID {
+		ws, err = c.WaitPID(pid)
+	} else {
+		ws, err = c.WaitBranchPID(e.BranchID, pid)
+	}
 	if err != nil {
 		return util.Errorf("waiting on pid %d: %v", pid, err)
 	}

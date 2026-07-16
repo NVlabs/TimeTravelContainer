@@ -94,6 +94,10 @@ func NewFilePayload(fdMap map[int]*os.File, execFile *os.File) FilePayload {
 
 // ExecArgs is the set of arguments to exec.
 type ExecArgs struct {
+	// BranchID selects the in-memory sandbox branch in which to execute. An
+	// empty value selects the default branch.
+	BranchID string `json:"branch_id,omitempty"`
+
 	// Filename is the filename to load.
 	//
 	// If this is provided as "", then the file will be guessed via Argv[0].
