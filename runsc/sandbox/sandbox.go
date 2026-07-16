@@ -2152,6 +2152,14 @@ func (s *Sandbox) ResizeConsole(args *boot.ConsoleResizeArgs) error {
 	return nil
 }
 
+// RemoveConsole unregisters a transient branch-local internal console.
+func (s *Sandbox) RemoveConsole(args *boot.ConsoleRemoveArgs) error {
+	if err := s.call(boot.ContMgrConsoleRemove, args, nil); err != nil {
+		return fmt.Errorf("removing internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

@@ -796,6 +796,7 @@ type execRequest struct {
 	cwd         string
 	user        string
 	interactive bool
+	terminal    bool
 }
 
 type exitStatus struct{ code int }
@@ -1185,9 +1186,6 @@ func runExec(args []string, stderr io.Writer, backend backend) error {
 	if fs.NArg() < 2 {
 		return errors.New("usage: ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND [ARG...]")
 	}
-	if *terminal {
-		return errors.New("-t/--tty requires the detachable internal console, which is not implemented yet")
-	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
@@ -1199,6 +1197,7 @@ func runExec(args []string, stderr io.Writer, backend backend) error {
 		cwd:         *cwd,
 		user:        *user,
 		interactive: *interactive,
+		terminal:    *terminal,
 	})
 	if err != nil {
 		return err
@@ -2989,10 +2988,17 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	if request.user != "" {
 		args = append(args, "--user", request.user)
 	}
+	if request.terminal {
+		consoleID := fmt.Sprintf("ttos-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
+		args = append(args, "--internal-console", consoleID)
+		if request.interactive {
+			args = append(args, "--internal-console-stdin")
+		}
+	}
 	args = append(args, request.target.container)
 	args = append(args, request.args...)
 	command := exec.Command(b.runsc, args...)
-	if request.interactive {
+	if request.interactive || request.terminal {
 		command.Stdin = b.stdin
 	}
 	command.Stdout = b.stdout

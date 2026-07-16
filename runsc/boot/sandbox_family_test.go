@@ -138,10 +138,18 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if err := family.Resume("child"); err != nil {
 		t.Fatalf("Resume child: %v", err)
 	}
-	if _, done, err := family.beginRunningControl("child"); err != nil {
+	if branch, done, err := family.beginRunningControl("child"); err != nil {
 		t.Fatalf("beginRunningControl running child: %v", err)
 	} else {
+		if branch.opMu.TryLock() {
+			branch.opMu.Unlock()
+			t.Fatal("beginRunningControl did not retain the branch operation lock")
+		}
 		done()
+		if !branch.opMu.TryLock() {
+			t.Fatal("beginRunningControl done did not release the branch operation lock")
+		}
+		branch.opMu.Unlock()
 	}
 	if err := family.Pause("child"); err != nil {
 		t.Fatalf("Pause child: %v", err)

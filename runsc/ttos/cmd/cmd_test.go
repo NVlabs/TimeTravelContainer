@@ -1023,12 +1023,12 @@ func TestConsoleDrainHealth(t *testing.T) {
 func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"exec", "-i", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "demo@child", "sh", "-c", "echo ok"}
+	args := []string{"exec", "-it", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "demo@child", "sh", "-c", "echo ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
 	}
 	request := b.execRequest
-	if request.target != (selector{container: "demo", branch: "child"}) || !request.interactive || request.cwd != "/work" || request.user != "123:456" {
+	if request.target != (selector{container: "demo", branch: "child"}) || !request.interactive || !request.terminal || request.cwd != "/work" || request.user != "123:456" {
 		t.Errorf("exec request=%+v", request)
 	}
 	if got := strings.Join(request.env, " "); got != "A=1" {

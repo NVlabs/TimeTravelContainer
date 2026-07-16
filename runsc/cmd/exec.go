@@ -17,9 +17,12 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -28,8 +31,10 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -59,6 +64,11 @@ type Exec struct {
 	// file descriptor referencing the master end of the console's
 	// pseudoterminal.
 	consoleSocket string
+
+	// internalConsole requests a Sentry-owned branch-local PTY. It is used by
+	// TTOS instead of donating a host PTY into the sandbox.
+	internalConsole      string
+	internalConsoleStdin bool
 
 	// passFDs are user-supplied FDs from the host to be exposed to the
 	// sandboxed app.
@@ -110,6 +120,8 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
 	f.StringVar(&ex.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
+	f.StringVar(&ex.internalConsole, "internal-console", "", "Sentry-owned branch-local PTY console ID")
+	f.BoolVar(&ex.internalConsoleStdin, "internal-console-stdin", false, "forward stdin to --internal-console")
 	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 }
@@ -139,18 +151,29 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("parsing process spec: %v", err)
 	}
 	e.BranchID = ex.branch
-	if ex.branch != boot.DefaultBranchID && e.StdioIsPty {
-		util.Fatalf("branch exec with a host PTY is unsupported; use non-TTY stdio until the internal detachable console is implemented")
+	if ex.internalConsole != "" {
+		if ex.consoleSocket != "" {
+			util.Fatalf("--internal-console and --console-socket cannot be combined")
+		}
+		if len(ex.passFDs) != 0 || ex.execFD >= 0 {
+			util.Fatalf("--internal-console cannot be combined with --pass-fd or --exec-fd")
+		}
+		e.InternalConsoleID = ex.internalConsole
+		e.StdioIsPty = true
+	}
+	if ex.branch != boot.DefaultBranchID && e.StdioIsPty && e.InternalConsoleID == "" {
+		util.Fatalf("branch exec with a host PTY is unsupported; use --internal-console")
 	}
 
 	log.Debugf("Exec arguments: %+v", e)
 	log.Debugf("Exec capabilities: %+v", e.Capabilities)
 
 	// Create the file descriptor map for the process in the container.
-	fdMap := map[int]*os.File{
-		0: os.Stdin,
-		1: os.Stdout,
-		2: os.Stderr,
+	fdMap := make(map[int]*os.File)
+	if e.InternalConsoleID == "" {
+		fdMap[0] = os.Stdin
+		fdMap[1] = os.Stdout
+		fdMap[2] = os.Stderr
 	}
 
 	// Add custom file descriptors to the map.
@@ -200,7 +223,24 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 		return util.Errorf("executing processes for container: %v", err)
 	}
 
-	if e.StdioIsPty {
+	var consoleOutput <-chan error
+	if e.InternalConsoleID != "" {
+		output, cleanup, err := ex.startInternalConsole(c, e)
+		if err != nil {
+			branchID := e.BranchID
+			if branchID == "" {
+				branchID = boot.DefaultBranchID
+			}
+			if removeErr := c.Sandbox.RemoveConsole(&boot.ConsoleRemoveArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}); removeErr != nil {
+				log.Warningf("removing internal exec console after attach failure: %v", removeErr)
+			}
+			return util.Errorf("attaching internal exec console: %v", err)
+		}
+		consoleOutput = output
+		defer cleanup()
+	}
+
+	if e.StdioIsPty && e.InternalConsoleID == "" {
 		// Forward signals sent to this process to the foreground
 		// process in the sandbox.
 		stopForwarding := c.ForwardSignals(pid, true /* fgProcess */)
@@ -233,8 +273,166 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	if err != nil {
 		return util.Errorf("waiting on pid %d: %v", pid, err)
 	}
+	if consoleOutput != nil {
+		if err := <-consoleOutput; err != nil {
+			return util.Errorf("reading internal exec console: %v", err)
+		}
+	}
 	*waitStatus = ws
 	return subcommands.ExitSuccess
+}
+
+func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs) (<-chan error, func(), error) {
+	branchID := e.BranchID
+	if branchID == "" {
+		branchID = boot.DefaultBranchID
+	}
+	target := &boot.ConsoleResizeArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}
+	stdinFD := int(os.Stdin.Fd())
+	stdinIsTerminal := term.IsTerminal(stdinFD)
+	if stdinIsTerminal {
+		cols, rows, err := term.GetSize(stdinFD)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading host terminal size: %w", err)
+		}
+		target.Rows = uint16(rows)
+		target.Cols = uint16(cols)
+		if err := c.Sandbox.ResizeConsole(target); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	var restore func() error
+	if ex.internalConsoleStdin && stdinIsTerminal {
+		state, err := term.MakeRaw(stdinFD)
+		if err != nil {
+			return nil, nil, fmt.Errorf("making host terminal raw: %w", err)
+		}
+		restore = func() error { return term.Restore(stdinFD, state) }
+	}
+
+	resizeSignals := make(chan os.Signal, 1)
+	resizeDone := make(chan struct{})
+	if stdinIsTerminal {
+		signal.Notify(resizeSignals, unix.SIGWINCH)
+		go func() {
+			for {
+				select {
+				case <-resizeSignals:
+					cols, rows, err := term.GetSize(stdinFD)
+					if err == nil {
+						target.Rows = uint16(rows)
+						target.Cols = uint16(cols)
+						err = c.Sandbox.ResizeConsole(target)
+					}
+					if err != nil {
+						log.Warningf("resizing internal exec console: %v", err)
+					}
+				case <-resizeDone:
+					return
+				}
+			}
+		}()
+	}
+
+	if ex.internalConsoleStdin {
+		go ex.pumpInternalConsoleInput(c, branchID, e.InternalConsoleID)
+	} else if err := c.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}); err != nil {
+		if restore != nil {
+			_ = restore()
+		}
+		if stdinIsTerminal {
+			signal.Stop(resizeSignals)
+			close(resizeDone)
+		}
+		return nil, nil, err
+	}
+
+	output := make(chan error, 1)
+	go func() { output <- ex.pumpInternalConsoleOutput(c, branchID, e.InternalConsoleID) }()
+	cleanup := func() {
+		if stdinIsTerminal {
+			signal.Stop(resizeSignals)
+			close(resizeDone)
+		}
+		if restore != nil {
+			if err := restore(); err != nil {
+				log.Warningf("restoring host terminal: %v", err)
+			}
+		}
+		if err := c.Sandbox.RemoveConsole(&boot.ConsoleRemoveArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}); err != nil {
+			log.Warningf("removing internal exec console: %v", err)
+		}
+	}
+	return output, cleanup, nil
+}
+
+func (ex *Exec) pumpInternalConsoleInput(c *container.Container, branchID, consoleID string) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := os.Stdin.Read(buf)
+		for written := 0; written < n; {
+			result, err := c.Sandbox.WriteConsole(&boot.ConsoleWriteArgs{
+				BranchID: branchID, ConsoleID: consoleID, Data: buf[written:n],
+			})
+			if err != nil {
+				return
+			}
+			written += result.N
+			if result.WouldBlock || result.N == 0 {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				log.Warningf("reading internal exec console stdin: %v", readErr)
+			}
+			_ = c.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{BranchID: branchID, ConsoleID: consoleID})
+			return
+		}
+	}
+}
+
+func (ex *Exec) pumpInternalConsoleOutput(c *container.Container, branchID, consoleID string) error {
+	type outputStream struct {
+		stream kernel.InternalConsoleStream
+		file   *os.File
+		eof    bool
+	}
+	streams := []outputStream{
+		{stream: kernel.InternalConsoleStdout, file: os.Stdout},
+		{stream: kernel.InternalConsoleStderr, file: os.Stderr},
+	}
+	for {
+		progress := false
+		allEOF := true
+		for i := range streams {
+			stream := &streams[i]
+			if stream.eof {
+				continue
+			}
+			allEOF = false
+			result, err := c.Sandbox.ReadConsole(&boot.ConsoleReadArgs{
+				BranchID: branchID, ConsoleID: consoleID, Stream: stream.stream, MaxBytes: 65536,
+			})
+			if err != nil {
+				return err
+			}
+			if len(result.Data) != 0 {
+				if _, err := stream.file.Write(result.Data); err != nil {
+					return err
+				}
+				progress = true
+			}
+			stream.eof = result.EOF
+		}
+		if allEOF {
+			return nil
+		}
+		if !progress {
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
 }
 
 func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitStatus {

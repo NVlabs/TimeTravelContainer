@@ -322,20 +322,41 @@ func (k *Kernel) ResizeInternalConsole(ctx context.Context, id string, size linu
 	return nil
 }
 
+// RemoveInternalConsole unregisters id and releases its control endpoints.
+// Process-side file descriptions remain valid until their FD tables release
+// them. Branch control serialization must prevent concurrent console I/O.
+func (k *Kernel) RemoveInternalConsole(ctx context.Context, id string) error {
+	k.internalConsolesMu.Lock()
+	console := k.internalConsoles[id]
+	if console != nil {
+		delete(k.internalConsoles, id)
+	}
+	k.internalConsolesMu.Unlock()
+	if console == nil {
+		return fmt.Errorf("internal console %q does not exist", id)
+	}
+	releaseInternalConsole(ctx, console)
+	return nil
+}
+
+func releaseInternalConsole(ctx context.Context, console *InternalConsole) {
+	if console.terminal {
+		console.master.DecRef(ctx)
+		return
+	}
+	if console.stdin != nil {
+		console.stdin.DecRef(ctx)
+	}
+	console.stdout.DecRef(ctx)
+	console.stderr.DecRef(ctx)
+}
+
 func (k *Kernel) releaseInternalConsoles(ctx context.Context) {
 	k.internalConsolesMu.Lock()
 	consoles := k.internalConsoles
 	k.internalConsoles = nil
 	k.internalConsolesMu.Unlock()
 	for _, console := range consoles {
-		if console.terminal {
-			console.master.DecRef(ctx)
-			continue
-		}
-		if console.stdin != nil {
-			console.stdin.DecRef(ctx)
-		}
-		console.stdout.DecRef(ctx)
-		console.stderr.DecRef(ctx)
+		releaseInternalConsole(ctx, console)
 	}
 }

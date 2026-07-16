@@ -141,6 +141,7 @@ go_library(
         "@org_golang_google_protobuf//encoding/prototext:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+        "@org_golang_x_term//:go_default_library",
     ] + select({
         ":metric_server_elided": [],
         "//conditions:default": [

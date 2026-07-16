@@ -136,6 +136,9 @@ const (
 	// ContMgrConsoleResize changes a branch-local PTY console's window size.
 	ContMgrConsoleResize = "containerManager.ConsoleResize"
 
+	// ContMgrConsoleRemove unregisters a transient branch-local console.
+	ContMgrConsoleRemove = "containerManager.ConsoleRemove"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -1067,6 +1070,11 @@ func (cm *containerManager) ConsoleCloseStdin(args *ConsoleCloseStdinArgs, _ *st
 // ConsoleResize changes a branch-local PTY console's window size.
 func (cm *containerManager) ConsoleResize(args *ConsoleResizeArgs, _ *struct{}) error {
 	return cm.l.family.ConsoleResize(args)
+}
+
+// ConsoleRemove unregisters a transient branch-local internal console.
+func (cm *containerManager) ConsoleRemove(args *ConsoleRemoveArgs, _ *struct{}) error {
+	return cm.l.family.ConsoleRemove(args)
 }
 
 // Wait waits for the init process in the given container.

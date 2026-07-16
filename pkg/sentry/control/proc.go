@@ -135,8 +135,16 @@ type ExecArgs struct {
 	// Capabilities is the list of capabilities to give to the process.
 	Capabilities *auth.TaskCapabilities
 
-	// StdioIsPty indicates that FDs 0, 1, and 2 are connected to a host pty FD.
+	// StdioIsPty indicates that FDs 0, 1, and 2 are connected to a PTY.
 	StdioIsPty bool
+
+	// InternalConsoleID requests a Sentry-owned PTY instead of imported host
+	// stdio. Loader populates FDTable and TTY before calling ExecAsync.
+	InternalConsoleID string `json:"internal_console_id,omitempty"`
+
+	// TTY is the controlling terminal associated with an internal console.
+	// It is populated inside the Sentry and is nil on the RPC wire.
+	TTY *kernel.TTY
 
 	// SupportTTYs indicates whether TTYs other than the console TTY should be
 	// imported as TTYs.
@@ -253,6 +261,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		defer fdTable.DecRef(ctx)
 	}
 	initArgs.FDTable = fdTable
+	initArgs.TTY = args.TTY
 
 	fdMap, execFD, err := args.unpackFiles()
 	if err != nil {
@@ -289,22 +298,31 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		initArgs.Filename = resolved
 	}
 
-	opts := fdimport.ImportOptions{
-		Console: args.StdioIsPty,
-		// Exec sessions are not restorable because the caller will not be present after the restore.
-		// Exec'd processes are killed after the restore.
-		Restorable:  false,
-		UID:         args.KUID,
-		GID:         args.KGID,
-		SupportTTYs: args.SupportTTYs,
-	}
-	ttyFile, err := fdimport.Import(ctx, fdTable, fdMap, opts)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-
-	if ttyFile != nil {
-		initArgs.TTY = ttyFile.TTY()
+	var ttyFile *host.TTYFileDescription
+	if args.InternalConsoleID != "" {
+		if len(fdMap) != 0 {
+			return nil, 0, nil, fmt.Errorf("internal exec console cannot import host file descriptors")
+		}
+		if args.FDTable == nil || args.TTY == nil {
+			return nil, 0, nil, fmt.Errorf("internal exec console was not initialized by the loader")
+		}
+	} else {
+		opts := fdimport.ImportOptions{
+			Console: args.StdioIsPty,
+			// Exec sessions are not restorable because the caller will not be present after the restore.
+			// Exec'd processes are killed after the restore.
+			Restorable:  false,
+			UID:         args.KUID,
+			GID:         args.KGID,
+			SupportTTYs: args.SupportTTYs,
+		}
+		ttyFile, err = fdimport.Import(ctx, fdTable, fdMap, opts)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if ttyFile != nil {
+			initArgs.TTY = ttyFile.TTY()
+		}
 	}
 
 	// Set cgroups to the new exec task if cgroups are mounted.

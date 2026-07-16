@@ -165,6 +165,12 @@ type ConsoleResizeArgs struct {
 	YPixels   uint16
 }
 
+// ConsoleRemoveArgs unregisters a transient branch-local internal console.
+type ConsoleRemoveArgs struct {
+	BranchID  string
+	ConsoleID string
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -922,6 +928,28 @@ func (f *SandboxFamily) ConsoleResize(args *ConsoleResizeArgs) error {
 	})
 }
 
+// ConsoleRemove unregisters a transient console while serializing against
+// branch lifecycle operations and live fork.
+func (f *SandboxFamily) ConsoleRemove(args *ConsoleRemoveArgs) error {
+	if args == nil {
+		return fmt.Errorf("missing internal console remove arguments")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	return b.k.RemoveInternalConsole(b.k.SupervisorContext(), args.ConsoleID)
+}
+
 // beginControl acquires a Kernel-lifetime lease for a branch-local operation.
 func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) {
 	b, err := f.branch(id)
@@ -947,9 +975,9 @@ func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) 
 	return b, b.controlOps.Done, nil
 }
 
-// beginRunningControl acquires a Kernel-lifetime lease only if id is running.
-// It is used by operations, such as exec, that must not implicitly resume a
-// paused branch.
+// beginRunningControl acquires the branch operation lock and a Kernel-lifetime
+// lease only if id is running. The caller holds the operation lock until done,
+// serializing process creation against fork, pause, resume, and destroy.
 func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), error) {
 	b, err := f.branch(id)
 	if err != nil {
@@ -970,8 +998,10 @@ func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), 
 	}
 	b.controlOps.Add(1)
 	f.mu.Unlock()
-	b.opMu.Unlock()
-	return b, b.controlOps.Done, nil
+	return b, func() {
+		b.controlOps.Done()
+		b.opMu.Unlock()
+	}, nil
 }
 
 func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*kernel.ThreadGroup, error) {

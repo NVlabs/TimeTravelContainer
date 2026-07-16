@@ -354,6 +354,40 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatalf("terminal stderr probe: got %q eof=%t wouldBlock=%t err=%v", data, eof, wouldBlock, err)
 	}
 
+	const execConsoleID = "exec-session"
+	execPID, err := l.executeAsync(&control.ExecArgs{
+		BranchID:          DefaultBranchID,
+		Filename:          "/bin/sleep",
+		Argv:              []string{"/bin/sleep", "30"},
+		Envv:              []string{"PATH=/bin:/usr/bin"},
+		WorkingDirectory:  "/",
+		KUID:              auth.RootKUID,
+		KGID:              auth.RootKGID,
+		InternalConsoleID: execConsoleID,
+		ContainerID:       l.sandboxID,
+	})
+	if err != nil {
+		t.Fatalf("executing process with an internal PTY: %v", err)
+	}
+	parentExec, err := branchThreadGroup(l.k, l.sandboxID, execPID)
+	if err != nil {
+		t.Fatalf("looking up parent exec process: %v", err)
+	}
+	parentExecTask := parentExec.Leader()
+	parentExecStdin := liveForkTestTaskFD(t, parentExecTask, 0)
+	parentExecStdout := liveForkTestTaskFD(t, parentExecTask, 1)
+	parentExecStderr := liveForkTestTaskFD(t, parentExecTask, 2)
+	if parentExec.TTY() == nil {
+		t.Fatal("exec process has no controlling TTY")
+	}
+	if parentExec.TTY() == parentTask.ThreadGroup().TTY() {
+		t.Fatal("init and exec processes share a controlling TTY")
+	}
+	if parentExecStdin.Impl() != parentExecStdout.Impl() || parentExecStdout.Impl() != parentExecStderr.Impl() {
+		t.Fatal("exec terminal stdin, stdout, and stderr do not share one replica")
+	}
+	liveForkTestWrite(t, parentExecTask, parentExecStdout, "exec-fork-output")
+
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "tty-child"})
 	if err != nil {
 		t.Fatalf("forking terminal container: %v", err)
@@ -366,6 +400,20 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	childTask := child.k.GlobalInit().Leader()
 	childStdin := liveForkTestFD(t, child.k, 0)
 	childStdout := liveForkTestFD(t, child.k, 1)
+	childExec, err := branchThreadGroup(child.k, l.sandboxID, execPID)
+	if err != nil {
+		t.Fatalf("looking up child exec process: %v", err)
+	}
+	childExecTask := childExec.Leader()
+	childExecStdin := liveForkTestTaskFD(t, childExecTask, 0)
+	childExecStdout := liveForkTestTaskFD(t, childExecTask, 1)
+	if parentExecStdout.Impl() == childExecStdout.Impl() {
+		t.Fatal("parent and child share the internal exec PTY replica object")
+	}
+	if parentExec.TTY() == childExec.TTY() {
+		t.Fatal("parent and child share the exec controlling TTY object")
+	}
+
 	if parentStdout.Impl() == childStdout.Impl() {
 		t.Fatal("parent and child share the internal PTY replica object")
 	}
@@ -378,11 +426,31 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	liveForkTestConsoleRead(t, child.k, childCtx, consoleID, kernel.InternalConsoleStdout, "child-output")
 	liveForkTestConsoleWouldBlock(t, l.k, ctx, consoleID, kernel.InternalConsoleStdout)
 
+	liveForkTestConsoleRead(t, l.k, ctx, execConsoleID, kernel.InternalConsoleStdout, "exec-fork-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, execConsoleID, kernel.InternalConsoleStdout, "exec-fork-output")
+	liveForkTestWrite(t, childExecTask, childExecStdout, "exec-child-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, execConsoleID, kernel.InternalConsoleStdout, "exec-child-output")
+	liveForkTestConsoleWouldBlock(t, l.k, ctx, execConsoleID, kernel.InternalConsoleStdout)
+	liveForkTestConsoleWriteInput(t, child.k, childCtx, execConsoleID, "exec-child-input\n")
+	liveForkTestRead(t, childExecTask, childExecStdin, "exec-child-input\n")
+	if got := parentExecStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Fatalf("child exec PTY input became readable in parent: readiness=%#x", got)
+	}
+
 	liveForkTestConsoleWriteInput(t, child.k, childCtx, consoleID, "child-input\n")
 	liveForkTestRead(t, childTask, childStdin, "child-input\n")
 	if got := parentStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
 		t.Fatalf("child PTY input became readable in parent: readiness=%#x", got)
 	}
+
+	if err := l.family.Destroy(childInfo.ID); err != nil {
+		t.Fatalf("destroying terminal child: %v", err)
+	}
+	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	if l.k.IsPaused() {
+		l.k.Unpause()
+	}
+	l.k.WaitExited()
 }
 
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
@@ -1319,7 +1387,12 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 
 func liveForkTestFD(t *testing.T, k *kernel.Kernel, fd int32) *vfs.FileDescription {
 	t.Helper()
-	file, _ := k.GlobalInit().Leader().FDTable().Get(fd)
+	return liveForkTestTaskFD(t, k.GlobalInit().Leader(), fd)
+}
+
+func liveForkTestTaskFD(t *testing.T, task *kernel.Task, fd int32) *vfs.FileDescription {
+	t.Helper()
+	file, _ := task.FDTable().Get(fd)
 	if file == nil {
 		t.Fatalf("FD %d is missing", fd)
 	}

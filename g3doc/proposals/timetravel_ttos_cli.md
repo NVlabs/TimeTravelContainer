@@ -155,6 +155,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Support `run/create -t` with a detachable Sentry-internal PTY, Docker-style
       combined `-it`/`-dit`, raw interactive attach, resize propagation, and
       branch-local terminal state.
+- [x] Support Docker-style `exec -t`/`-it` with a transient Sentry-internal
+      devpts PTY, raw host-terminal mode, resize propagation, stdin close, exact
+      exit status, and execution in any running live branch.
 - [x] `ttos create` as persistent image-root and OCI-bundle preparation.
 - [x] `ttos start CONTAINER` for created/exited base containers, detached by
       default with optional `--attach`. Multiple detached containers start in
@@ -327,11 +330,14 @@ state still forks entirely in memory.
       endpoints at guest FDs 0, 1, and 2.
 - [x] For init interactive processes, allocate a Sentry devpts PTY and install its
       slave as guest stdio.
+- [x] Allocate a distinct Sentry devpts PTY for each attached interactive exec
+      process and install one shared slave description at guest FDs 0, 1, and 2.
 - [x] Keep pipe peers in the branch-local Kernel console registry, not
       in a host `FileDescription`.
 - [x] Add branch-serialized nonblocking console read/write RPCs.
 - [x] Add branch-serialized stdin close and verify that the guest observes EOF.
-- [ ] Add readiness waiting, resize, and cancellation.
+- [ ] Add readiness waiting and cancellation. Resize is implemented for init and
+      attached exec PTYs.
 - [x] Add a long-lived low-level multiplexed `console-follow` stream so one
       process drains both outputs without spawning one `runsc` per read.
 - [x] Start one advisory-locked sidecar per branch, persist its stream, diagnose
@@ -347,8 +353,8 @@ state still forks entirely in memory.
       replace the sidecar's polling RPC loop with readiness-driven transport.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
-- [x] Clone init-console PTY termios, foreground process group, window size,
-      queues, and hangup state.
+- [x] Clone init- and exec-console PTY termios, foreground process groups,
+      window sizes, queues, hangup state, and controlling-terminal identity.
 - [x] Ensure post-fork non-TTY input and output cannot cross branches and that a
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
@@ -550,11 +556,11 @@ grandchild branches without PID or wait-status crossover.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
 - [x] Persistent configurable log size/generation retention.
 - [ ] Daemon-owned stdin leases and daemon-owned transport/reconciliation.
-- [ ] Detached exec and reattach.
-- [ ] Internal devpts interactive console, resize, signals, and detach keys.
+- [ ] Detached exec, reattach, and exec-session detach keys.
+- [x] Internal devpts interactive consoles for init and attached exec, including
+      host-size propagation and branch-local PTY signal semantics.
 - [x] Non-TTY console state fork and branch-local I/O.
-- [x] Init PTY console state fork and branch-local I/O. Exec-session PTYs remain
-      TODO.
+- [x] Init and attached exec-session PTY state fork and branch-local I/O.
 
 Gate: a user can detach from a still-running interactive or noninteractive
 process, fork its branch, and then attach independently to both branches.

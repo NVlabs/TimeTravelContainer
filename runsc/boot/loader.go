@@ -1648,20 +1648,19 @@ func (l *Loader) destroySubcontainer(cid string) error {
 }
 
 func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
-	targetKernel := l.k
-	var branchDone func()
-	if args.BranchID != "" && args.BranchID != DefaultBranchID {
-		if args.StdioIsPty {
-			return 0, fmt.Errorf("branch exec with a host TTY is unsupported")
-		}
-		branch, done, err := l.family.beginRunningControl(args.BranchID)
-		if err != nil {
-			return 0, err
-		}
-		targetKernel = branch.k
-		branchDone = done
-		defer branchDone()
+	branchID := args.BranchID
+	if branchID == "" {
+		branchID = DefaultBranchID
 	}
+	if branchID != DefaultBranchID && args.StdioIsPty && args.InternalConsoleID == "" {
+		return 0, fmt.Errorf("branch exec with a host TTY is unsupported")
+	}
+	branch, branchDone, err := l.family.beginRunningControl(branchID)
+	if err != nil {
+		return 0, err
+	}
+	defer branchDone()
+	targetKernel := branch.k
 
 	// Hold the lock for the entire operation to ensure that exec'd process is
 	// added to 'processes' in case it races with destroyContainer().
@@ -1669,7 +1668,6 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	defer l.mu.Unlock()
 
 	var tg *kernel.ThreadGroup
-	var err error
 	if targetKernel == l.k {
 		tg, err = l.tryThreadGroupFromIDLocked(execID{cid: args.ContainerID})
 	} else {
@@ -1694,6 +1692,40 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	defer root.DecRef(sctx)
 	ctx := vfs.WithRoot(sctx, root)
 	defer args.MountNamespace.DecRef(ctx)
+
+	internalConsoleCreated := false
+	if args.InternalConsoleID != "" {
+		if len(args.Files) != 0 || len(args.GuestFDs) != 0 {
+			return 0, fmt.Errorf("internal exec console cannot accept donated host file descriptors")
+		}
+		execCreds := auth.NewUserCredentials(args.KUID, args.KGID, args.ExtraKGIDs, args.Capabilities, targetKernel.RootUserNamespace())
+		ptyCtx := auth.ContextWithCredentials(ctx, execCreds)
+		master, replica, tty, err := devpts.NewInternalPTY(ptyCtx, targetKernel.VFS(), args.MountNamespace)
+		if err != nil {
+			return 0, fmt.Errorf("creating internal exec PTY: %w", err)
+		}
+		defer master.DecRef(ptyCtx)
+		defer replica.DecRef(ptyCtx)
+		fdTable, err := targetKernel.NewInternalTTYConsoleFDTable(ptyCtx, args.InternalConsoleID, master, replica)
+		if err != nil {
+			return 0, err
+		}
+		defer fdTable.DecRef(ptyCtx)
+		if err := targetKernel.ResizeInternalConsole(ptyCtx, args.InternalConsoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
+			_ = targetKernel.RemoveInternalConsole(ptyCtx, args.InternalConsoleID)
+			return 0, fmt.Errorf("setting default internal exec PTY size: %w", err)
+		}
+		args.FDTable = fdTable
+		args.TTY = tty
+		args.StdioIsPty = true
+		internalConsoleCreated = true
+	}
+	keepInternalConsole := false
+	defer func() {
+		if internalConsoleCreated && !keepInternalConsole {
+			_ = targetKernel.RemoveInternalConsole(ctx, args.InternalConsoleID)
+		}
+	}()
 
 	args.Envv, err = specutils.ResolveEnvs(args.Envv)
 	if err != nil {
@@ -1728,6 +1760,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if err != nil {
 		return 0, err
 	}
+	keepInternalConsole = true
 
 	if targetKernel == l.k {
 		eid := execID{cid: args.ContainerID, pid: tgid}
