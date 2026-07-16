@@ -242,6 +242,9 @@ Global options:
   --unsafe-no-host-isolation     run without host namespaces/chroots (unsafe)
 
 Commands:
+  images [OPTIONS]               List local images
+  image COMMAND                  Manage local images (ls, inspect, rm)
+  rmi [OPTIONS] IMAGE...         Remove one or more local images
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
@@ -271,6 +274,12 @@ run immediately unless --paused is set; omitting DEST generates a branch ID.
 func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	var err error
 	switch args[0] {
+	case "images":
+		err = runImages(args[1:], stdout, stderr, backend)
+	case "image":
+		err = runImage(args[1:], stdout, stderr, backend)
+	case "rmi":
+		err = runImageRemove(args[1:], stdout, stderr, backend)
 	case "pull":
 		err = runPull(args[1:], stdout, stderr, backend)
 	case "run":
@@ -1125,6 +1134,194 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func runImage(args []string, stdout, stderr io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos image ls|inspect|rm [OPTIONS]")
+	}
+	switch args[0] {
+	case "ls", "list":
+		return runImages(args[1:], stdout, stderr, backend)
+	case "inspect":
+		return runImageInspect(args[1:], stdout, backend)
+	case "rm", "remove":
+		return runImageRemove(args[1:], stdout, stderr, backend)
+	default:
+		return fmt.Errorf("unknown image command %q", args[0])
+	}
+}
+
+func runImages(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("images", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	quiet := fs.Bool("quiet", false, "only show image IDs")
+	fs.BoolVar(quiet, "q", false, "only show image IDs")
+	noTrunc := fs.Bool("no-trunc", false, "do not truncate image IDs")
+	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: ttos images [--quiet] [--no-trunc] [--json]")
+	}
+	infos, err := backend.listImages()
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(infos)
+	}
+	if *quiet {
+		seen := make(map[string]bool)
+		for _, info := range infos {
+			if seen[info.Digest] {
+				continue
+			}
+			seen[info.Digest] = true
+			fmt.Fprintln(stdout, displayImageID(info.Digest, *noTrunc))
+		}
+		return nil
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "REPOSITORY\tTAG\tIMAGE ID\tPLATFORM\tROOTFS\tUNPACKED\tSIZE\tCREATED")
+	now := time.Now()
+	for _, info := range infos {
+		repository, tag := splitImageReference(info.Reference)
+		repository = familiarImageReference(repository)
+		materialized := "no"
+		if info.Materialized {
+			materialized = "yes"
+		}
+		unpacked := "no"
+		if info.Unpacked {
+			unpacked = "yes"
+		}
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			repository, tag, displayImageID(info.Digest, *noTrunc), info.Platform,
+			materialized, unpacked, formatImageSize(info.Size), formatImageAge(now, info.CreatedAt))
+	}
+	return table.Flush()
+}
+
+func runImageInspect(args []string, stdout io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos image inspect IMAGE [IMAGE...]")
+	}
+	results := make([]ImageInspectInfo, 0, len(args))
+	for _, identifier := range args {
+		info, err := backend.inspectImage(identifier)
+		if err != nil {
+			return err
+		}
+		results = append(results, info)
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(results)
+}
+
+func runImageRemove(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("image rm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	force := fs.Bool("force", false, "force removal of an image used by a container")
+	fs.BoolVar(force, "f", false, "force removal of an image used by a container")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos image rm [--force] IMAGE [IMAGE...]")
+	}
+	for _, identifier := range fs.Args() {
+		result, err := backend.removeImage(identifier, *force)
+		if err != nil {
+			return err
+		}
+		for _, reference := range result.Untagged {
+			fmt.Fprintf(stdout, "Untagged: %s\n", reference)
+		}
+		if result.Deleted != "" {
+			fmt.Fprintf(stdout, "Deleted: %s\n", result.Deleted)
+		}
+	}
+	return nil
+}
+
+func displayImageID(digest string, noTrunc bool) string {
+	if noTrunc {
+		return digest
+	}
+	id := strings.TrimPrefix(digest, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
+}
+
+func splitImageReference(reference string) (string, string) {
+	if at := strings.LastIndexByte(reference, '@'); at >= 0 {
+		return reference[:at], "<none>"
+	}
+	slash := strings.LastIndexByte(reference, '/')
+	colon := strings.LastIndexByte(reference, ':')
+	if colon > slash {
+		return reference[:colon], reference[colon+1:]
+	}
+	return reference, "<none>"
+}
+
+func familiarImageReference(reference string) string {
+	if strings.HasPrefix(reference, "docker.io/library/") {
+		return strings.TrimPrefix(reference, "docker.io/library/")
+	}
+	return strings.TrimPrefix(reference, "docker.io/")
+}
+
+func formatImageSize(size int64) string {
+	if size < 1000 {
+		return fmt.Sprintf("%dB", size)
+	}
+	value := float64(size)
+	for _, unit := range []string{"kB", "MB", "GB", "TB"} {
+		value /= 1000
+		if value < 1000 || unit == "TB" {
+			return fmt.Sprintf("%.3g%s", value, unit)
+		}
+	}
+	panic("unreachable")
+}
+
+func formatImageAge(now, created time.Time) string {
+	if created.IsZero() {
+		return "unknown"
+	}
+	age := now.Sub(created)
+	if age < 0 {
+		age = 0
+	}
+	for _, unit := range []struct {
+		duration time.Duration
+		name     string
+	}{
+		{365 * 24 * time.Hour, "year"},
+		{30 * 24 * time.Hour, "month"},
+		{7 * 24 * time.Hour, "week"},
+		{24 * time.Hour, "day"},
+		{time.Hour, "hour"},
+		{time.Minute, "minute"},
+	} {
+		if age >= unit.duration {
+			count := int(age / unit.duration)
+			suffix := ""
+			if count != 1 {
+				suffix = "s"
+			}
+			return fmt.Sprintf("%d %s%s ago", count, unit.name, suffix)
+		}
+	}
+	return "less than a minute ago"
+}
+
 func defaultSnapshotter() string {
 	if snapshotter := os.Getenv("CONTAINERD_SNAPSHOTTER"); snapshotter != "" {
 		return snapshotter
@@ -1677,8 +1874,49 @@ type ProcessInfo struct {
 	Cmd     string  `json:"cmd"`
 }
 
+// ImageInfo is one named local image record enriched with TTOS cache usage.
+type ImageInfo struct {
+	Reference    string    `json:"reference"`
+	Digest       string    `json:"digest"`
+	MediaType    string    `json:"media_type"`
+	Size         int64     `json:"size"`
+	Platform     string    `json:"platform"`
+	Snapshotter  string    `json:"snapshotter,omitempty"`
+	Unpacked     bool      `json:"unpacked"`
+	Materialized bool      `json:"materialized"`
+	Containers   []string  `json:"containers,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// ImageInspectInfo follows Docker's top-level image inspection naming while
+// exposing TTOS-specific root and container use explicitly.
+type ImageInspectInfo struct {
+	ID           string    `json:"Id"`
+	RepoTags     []string  `json:"RepoTags"`
+	RepoDigests  []string  `json:"RepoDigests"`
+	Created      time.Time `json:"Created"`
+	Size         int64     `json:"Size"`
+	Architecture string    `json:"Architecture"`
+	OS           string    `json:"Os"`
+	Variant      string    `json:"Variant,omitempty"`
+	MediaType    string    `json:"MediaType"`
+	Unpacked     bool      `json:"Unpacked"`
+	Materialized bool      `json:"Materialized"`
+	Containers   []string  `json:"Containers,omitempty"`
+}
+
+// ImageRemoveResult describes Docker-compatible removal output.
+type ImageRemoveResult struct {
+	Untagged []string
+	Deleted  string
+}
+
 type backend interface {
 	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
+	listImages() ([]ImageInfo, error)
+	inspectImage(identifier string) (ImageInspectInfo, error)
+	removeImage(identifier string, force bool) (ImageRemoveResult, error)
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
@@ -1712,6 +1950,207 @@ type runtimeBackend struct {
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
+}
+
+func (b *runtimeBackend) imageRecords() ([]ttosimages.Info, error) {
+	return ttosimages.List(context.Background(), ttosimages.ListOptions{
+		Address:     b.containerd,
+		Namespace:   b.namespace,
+		Snapshotter: defaultSnapshotter(),
+	})
+}
+
+func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
+	records, err := b.imageRecords()
+	if err != nil {
+		return nil, err
+	}
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	containers, err := store.ListContainers()
+	if err != nil {
+		return nil, err
+	}
+	users := make(map[string][]string)
+	for _, container := range containers {
+		users[container.Digest] = append(users[container.Digest], container.Name)
+	}
+	infos := make([]ImageInfo, 0, len(records))
+	for _, record := range records {
+		materialized, err := store.HasImageRoot(record.Digest, record.Platform)
+		if err != nil {
+			return nil, err
+		}
+		containerNames := append([]string(nil), users[record.Digest]...)
+		sort.Strings(containerNames)
+		infos = append(infos, ImageInfo{
+			Reference:    record.Reference,
+			Digest:       record.Digest,
+			MediaType:    record.MediaType,
+			Size:         record.Size,
+			Platform:     record.Platform,
+			Snapshotter:  record.Snapshotter,
+			Unpacked:     record.Unpacked,
+			Materialized: materialized,
+			Containers:   containerNames,
+			CreatedAt:    record.CreatedAt,
+			UpdatedAt:    record.UpdatedAt,
+		})
+	}
+	return infos, nil
+}
+
+func (b *runtimeBackend) inspectImage(identifier string) (ImageInspectInfo, error) {
+	infos, err := b.listImages()
+	if err != nil {
+		return ImageInspectInfo{}, err
+	}
+	return inspectImageFromInventory(infos, identifier)
+}
+
+func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspectInfo, error) {
+	records := make([]ttosimages.Info, 0, len(infos))
+	for _, info := range infos {
+		records = append(records, ttosimages.Info{
+			Reference: info.Reference,
+			Digest:    info.Digest,
+		})
+	}
+	matches, err := ttosimages.Resolve(records, identifier)
+	if err != nil {
+		return ImageInspectInfo{}, err
+	}
+	digest := matches[0].Digest
+	var selected *ImageInfo
+	var tags, repoDigests, containers []string
+	seenRepoDigest := make(map[string]bool)
+	seenContainer := make(map[string]bool)
+	materialized := false
+	unpacked := false
+	for i := range infos {
+		info := &infos[i]
+		if info.Digest != digest {
+			continue
+		}
+		if selected == nil {
+			selected = info
+		}
+		if strings.Contains(info.Reference, "@") {
+			repoDigest := familiarImageReference(info.Reference)
+			if !seenRepoDigest[repoDigest] {
+				repoDigests = append(repoDigests, repoDigest)
+				seenRepoDigest[repoDigest] = true
+			}
+		} else {
+			tags = append(tags, familiarImageReference(info.Reference))
+			repository, _ := splitImageReference(info.Reference)
+			repoDigest := familiarImageReference(repository) + "@" + digest
+			if !seenRepoDigest[repoDigest] {
+				repoDigests = append(repoDigests, repoDigest)
+				seenRepoDigest[repoDigest] = true
+			}
+		}
+		materialized = materialized || info.Materialized
+		unpacked = unpacked || info.Unpacked
+		for _, container := range info.Containers {
+			if !seenContainer[container] {
+				containers = append(containers, container)
+				seenContainer[container] = true
+			}
+		}
+	}
+	if selected == nil {
+		return ImageInspectInfo{}, fmt.Errorf("image %q does not exist", identifier)
+	}
+	sort.Strings(tags)
+	sort.Strings(repoDigests)
+	sort.Strings(containers)
+	platform := strings.Split(selected.Platform, "/")
+	osName, architecture, variant := "", "", ""
+	if len(platform) > 0 {
+		osName = platform[0]
+	}
+	if len(platform) > 1 {
+		architecture = platform[1]
+	}
+	if len(platform) > 2 {
+		variant = platform[2]
+	}
+	return ImageInspectInfo{
+		ID:           digest,
+		RepoTags:     tags,
+		RepoDigests:  repoDigests,
+		Created:      selected.CreatedAt,
+		Size:         selected.Size,
+		Architecture: architecture,
+		OS:           osName,
+		Variant:      variant,
+		MediaType:    selected.MediaType,
+		Unpacked:     unpacked,
+		Materialized: materialized,
+		Containers:   containers,
+	}, nil
+}
+
+func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemoveResult, error) {
+	records, err := b.imageRecords()
+	if err != nil {
+		return ImageRemoveResult{}, err
+	}
+	matches, err := ttosimages.Resolve(records, identifier)
+	if err != nil {
+		return ImageRemoveResult{}, err
+	}
+	digest := matches[0].Digest
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	containers, err := store.ListContainers()
+	if err != nil {
+		return ImageRemoveResult{}, err
+	}
+	var users []string
+	for _, container := range containers {
+		if container.Digest == digest {
+			users = append(users, container.Name)
+		}
+	}
+	sort.Strings(users)
+	if err := validateImageRemoval(digest, users, force); err != nil {
+		return ImageRemoveResult{}, err
+	}
+	result := ImageRemoveResult{Untagged: make([]string, 0, len(matches))}
+	for _, match := range matches {
+		if err := ttosimages.Delete(context.Background(), ttosimages.DeleteOptions{
+			Address:   b.containerd,
+			Namespace: b.namespace,
+			Reference: match.Reference,
+			Digest:    match.Digest,
+		}); err != nil {
+			return result, err
+		}
+		result.Untagged = append(result.Untagged, familiarImageReference(match.Reference))
+	}
+	remaining, err := b.imageRecords()
+	if err != nil {
+		return result, err
+	}
+	for _, record := range remaining {
+		if record.Digest == digest {
+			return result, nil
+		}
+	}
+	result.Deleted = digest
+	if len(users) == 0 {
+		if _, err := store.RemoveImageRoots(digest); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+func validateImageRemoval(digest string, users []string, force bool) error {
+	if len(users) != 0 && !force {
+		return fmt.Errorf("image %s is used by container(s) %s; use --force to remove its image records", digest, strings.Join(users, ", "))
+	}
+	return nil
 }
 
 func (b *runtimeBackend) run(request runRequest) (int, error) {

@@ -261,3 +261,52 @@ func TestVolumeStoreLifecycle(t *testing.T) {
 		t.Fatalf("volumes after remove=%+v, err=%v", volumes, err)
 	}
 }
+
+func TestImageRootInventoryAndRemoval(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	otherDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	makeRoot := func(imageDigest, platform string) string {
+		t.Helper()
+		dir := filepath.Join(root, "images", safeComponent(imageDigest+"-"+platform))
+		if err := os.MkdirAll(filepath.Join(dir, "rootfs"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "image.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	amd64 := makeRoot(digest, "linux/amd64")
+	arm64 := makeRoot(digest, "linux/arm64/v8")
+	other := makeRoot(otherDigest, "linux/amd64")
+
+	for _, platform := range []string{"linux/amd64", "linux/arm64/v8"} {
+		found, err := store.HasImageRoot(digest, platform)
+		if err != nil || !found {
+			t.Fatalf("HasImageRoot(%q)=(%t, %v), want true", platform, found, err)
+		}
+	}
+	if found, err := store.HasImageRoot(digest, "linux/s390x"); err != nil || found {
+		t.Fatalf("HasImageRoot(missing)=(%t, %v), want false", found, err)
+	}
+	removed, err := store.RemoveImageRoots(digest)
+	if err != nil {
+		t.Fatalf("RemoveImageRoots: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("RemoveImageRoots removed %d roots, want 2", removed)
+	}
+	for _, dir := range []string{amd64, arm64} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("removed image root %q still exists: %v", dir, err)
+		}
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("unrelated image root was removed: %v", err)
+	}
+	if _, err := store.RemoveImageRoots(""); err == nil {
+		t.Fatal("RemoveImageRoots accepted an empty digest")
+	}
+}

@@ -104,9 +104,19 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Integrate registry authentication and Docker-compatible credential
       helpers without storing plaintext credentials in the state database.
 - [ ] Show pull/unpack progress and content reuse.
-- [ ] `ttos images` with reference, digest, platform, unpacked state, size, and
+- [x] `ttos images` with reference, digest, platform, unpacked state, size, and
       creation time.
-- [ ] `ttos image inspect`, `ttos image rm`, and content garbage collection.
+- [x] `ttos image inspect`, `ttos image rm`, and content garbage collection.
+      `ttos image ls`, top-level `ttos images`, and `ttos rmi` aliases
+      accept familiar Docker Hub names and unique image-ID prefixes. Listing
+      supports Docker-style tables, `-q`, `--no-trunc`, and JSON while
+      exposing the target platform and whether TTOS has materialized its own
+      immutable root.
+- [x] Protect image removal with persistent-container usage checks. A forced
+      removal may untag containerd records while retaining TTOS roots required
+      by existing containers. Removing the last alias of an unused digest
+      synchronously requests containerd content collection and removes all
+      platform-specific TTOS roots for that digest.
 
 ### Container lifecycle
 

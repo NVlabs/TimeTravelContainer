@@ -4,6 +4,8 @@
 unmodified public Docker images through the complete TTOS path. It currently
 covers:
 
+- Docker-style image inventory, quiet IDs, JSON output, and materialized-root
+  inspection;
 - BusyBox process/procfs/sysfs startup;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;

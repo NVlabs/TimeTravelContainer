@@ -283,6 +283,133 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 	}
 }
 
+func TestImagesDockerStyleTableAndQuietAliases(t *testing.T) {
+	digest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	b := &fakeBackend{imageList: []ImageInfo{
+		{
+			Reference:    "docker.io/library/busybox:latest",
+			Digest:       digest,
+			Size:         2_150_000,
+			Platform:     "linux/amd64",
+			Materialized: true,
+			CreatedAt:    time.Now().Add(-2 * time.Hour),
+		},
+		{
+			Reference: "docker.io/library/busybox:stable",
+			Digest:    digest,
+			Size:      2_150_000,
+			Platform:  "linux/amd64",
+			CreatedAt: time.Now().Add(-2 * time.Hour),
+		},
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"images"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("images status=%d, stderr=%q", status, stderr.String())
+	}
+	for _, want := range []string{"REPOSITORY", "TAG", "IMAGE ID", "PLATFORM", "ROOTFS", "UNPACKED", "busybox", "latest", "stable", "0123456789ab", "linux/amd64", "2.15MB", "2 hours ago"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("images output %q does not contain %q", stdout.String(), want)
+		}
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"image", "ls", "-q"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("image ls -q status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "0123456789ab\n"; got != want {
+		t.Errorf("image ls -q=%q, want %q", got, want)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"images", "-q", "--no-trunc"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("images --no-trunc status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), digest+"\n"; got != want {
+		t.Errorf("images --no-trunc=%q, want %q", got, want)
+	}
+}
+
+func TestImageInspectAggregatesAliasesAndTTOSState(t *testing.T) {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	created := time.Date(2026, time.July, 1, 2, 3, 4, 0, time.UTC)
+	infos := []ImageInfo{
+		{
+			Reference:  "docker.io/library/busybox:latest",
+			Digest:     digest,
+			MediaType:  "application/vnd.oci.image.index.v1+json",
+			Size:       1234,
+			Platform:   "linux/arm64/v8",
+			Containers: []string{"zeta", "alpha"},
+			CreatedAt:  created,
+		},
+		{
+			Reference:    "docker.io/library/busybox:stable",
+			Digest:       digest,
+			Platform:     "linux/arm64/v8",
+			Materialized: true,
+			Unpacked:     true,
+		},
+	}
+	got, err := inspectImageFromInventory(infos, "busybox")
+	if err != nil {
+		t.Fatalf("inspectImageFromInventory: %v", err)
+	}
+	if got.ID != digest || got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" || !got.Materialized || !got.Unpacked {
+		t.Errorf("inspect info=%+v", got)
+	}
+	if want := []string{"busybox:latest", "busybox:stable"}; !reflect.DeepEqual(got.RepoTags, want) {
+		t.Errorf("RepoTags=%q, want %q", got.RepoTags, want)
+	}
+	if want := []string{"busybox@" + digest}; !reflect.DeepEqual(got.RepoDigests, want) {
+		t.Errorf("RepoDigests=%q, want %q", got.RepoDigests, want)
+	}
+	if want := []string{"alpha", "zeta"}; !reflect.DeepEqual(got.Containers, want) {
+		t.Errorf("Containers=%q, want %q", got.Containers, want)
+	}
+}
+
+func TestImageInspectAndRemoveCommandRouting(t *testing.T) {
+	digest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	b := &fakeBackend{
+		imageInspectInfo: ImageInspectInfo{ID: digest, RepoTags: []string{"alpine:latest"}},
+		imageRemoveResult: ImageRemoveResult{
+			Untagged: []string{"alpine:latest"},
+			Deleted:  digest,
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"image", "inspect", "alpine"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("image inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.imageInspectID != "alpine" || !strings.Contains(stdout.String(), `"Id": "`+digest+`"`) {
+		t.Errorf("image inspect id=%q output=%q", b.imageInspectID, stdout.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"rmi", "--force", "alpine"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("rmi status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.imageRemoveID != "alpine" || !b.imageRemoveForce {
+		t.Errorf("remove call id=%q force=%t", b.imageRemoveID, b.imageRemoveForce)
+	}
+	want := "Untagged: alpine:latest\nDeleted: " + digest + "\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("rmi output=%q, want %q", got, want)
+	}
+}
+
+func TestValidateImageRemovalRequiresForceWhenInUse(t *testing.T) {
+	digest := "sha256:abcd"
+	users := []string{"alpha", "zeta"}
+	if err := validateImageRemoval(digest, users, false); err == nil || !strings.Contains(err.Error(), "alpha, zeta") {
+		t.Fatalf("validateImageRemoval without force=%v, want named conflict", err)
+	}
+	if err := validateImageRemoval(digest, users, true); err != nil {
+		t.Errorf("validateImageRemoval with force: %v", err)
+	}
+	if err := validateImageRemoval(digest, nil, false); err != nil {
+		t.Errorf("validateImageRemoval unused: %v", err)
+	}
+}
+
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -1253,6 +1380,12 @@ type fakeBackend struct {
 	pullSnapshotter   string
 	pullUnpack        bool
 	pullInfo          ttosimages.Info
+	imageList         []ImageInfo
+	imageInspectID    string
+	imageInspectInfo  ImageInspectInfo
+	imageRemoveID     string
+	imageRemoveForce  bool
+	imageRemoveResult ImageRemoveResult
 	runRequest        runRequest
 	runStatus         int
 	created           bool
@@ -1328,6 +1461,21 @@ func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool)
 	b.pullSnapshotter = snapshotter
 	b.pullUnpack = unpack
 	return b.pullInfo, b.err
+}
+
+func (b *fakeBackend) listImages() ([]ImageInfo, error) {
+	return b.imageList, b.err
+}
+
+func (b *fakeBackend) inspectImage(identifier string) (ImageInspectInfo, error) {
+	b.imageInspectID = identifier
+	return b.imageInspectInfo, b.err
+}
+
+func (b *fakeBackend) removeImage(identifier string, force bool) (ImageRemoveResult, error) {
+	b.imageRemoveID = identifier
+	b.imageRemoveForce = force
+	return b.imageRemoveResult, b.err
 }
 
 func (b *fakeBackend) listFamilies() ([]Family, error) {

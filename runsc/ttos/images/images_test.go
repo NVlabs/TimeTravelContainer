@@ -14,7 +14,12 @@
 
 package images
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestNormalizeReference(t *testing.T) {
 	tests := []struct {
@@ -46,5 +51,60 @@ func TestNormalizeReferenceRejectsInvalid(t *testing.T) {
 		if got, err := NormalizeReference(input); err == nil {
 			t.Errorf("NormalizeReference(%q)=%q, want error", input, got)
 		}
+	}
+}
+
+func TestResolveNameDigestAndAliases(t *testing.T) {
+	digestA := "sha256:" + strings.Repeat("a", 64)
+	digestB := "sha256:" + strings.Repeat("b", 64)
+	infos := []Info{
+		{Reference: "docker.io/library/ubuntu:latest", Digest: digestA},
+		{Reference: "docker.io/library/ubuntu:stable", Digest: digestA},
+		{Reference: "quay.io/example/tool:v1", Digest: digestB},
+	}
+	matches, err := Resolve(infos, "ubuntu")
+	if err != nil {
+		t.Fatalf("Resolve(ubuntu): %v", err)
+	}
+	if len(matches) != 1 || matches[0].Reference != "docker.io/library/ubuntu:latest" {
+		t.Errorf("Resolve(ubuntu)=%+v", matches)
+	}
+	matches, err = Resolve(infos, strings.Repeat("a", 12))
+	if err != nil {
+		t.Fatalf("Resolve(short digest): %v", err)
+	}
+	wantAliases := []Info{infos[0], infos[1]}
+	if !reflect.DeepEqual(matches, wantAliases) {
+		t.Errorf("Resolve(short digest)=%+v, want %+v", matches, wantAliases)
+	}
+	matches, err = Resolve(infos, "sha256:"+strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatalf("Resolve(full digest): %v", err)
+	}
+	if len(matches) != 1 || matches[0].Reference != infos[2].Reference {
+		t.Errorf("Resolve(full digest)=%+v", matches)
+	}
+}
+
+func TestResolveRejectsUnknownAndAmbiguousPrefixes(t *testing.T) {
+	infos := []Info{
+		{Reference: "example/a:v1", Digest: "sha256:abcd" + strings.Repeat("1", 60)},
+		{Reference: "example/b:v1", Digest: "sha256:abcd" + strings.Repeat("2", 60)},
+	}
+	for _, identifier := range []string{"abcd", "missing", "1234"} {
+		if matches, err := Resolve(infos, identifier); err == nil {
+			t.Errorf("Resolve(%q)=%+v, want error", identifier, matches)
+		}
+	}
+}
+
+func TestImageCreatedAtPrefersOCIConfiguration(t *testing.T) {
+	stored := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	configured := stored.Add(-24 * time.Hour)
+	if got := imageCreatedAt(stored, &configured); !got.Equal(configured) {
+		t.Errorf("imageCreatedAt with config=%v, want %v", got, configured)
+	}
+	if got := imageCreatedAt(stored, nil); !got.Equal(stored) {
+		t.Errorf("imageCreatedAt without config=%v, want %v", got, stored)
 	}
 }

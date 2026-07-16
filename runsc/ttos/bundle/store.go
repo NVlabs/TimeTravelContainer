@@ -252,6 +252,53 @@ func (s Store) RemoveContainer(name string) error {
 	return nil
 }
 
+// HasImageRoot reports whether TTOS has materialized the immutable root for a
+// digest and platform. A corrupt cache entry is reported instead of silently
+// looking absent.
+func (s Store) HasImageRoot(digest, platform string) (bool, error) {
+	if digest == "" || platform == "" {
+		return false, nil
+	}
+	dir := filepath.Join(s.Root, "images", safeComponent(digest+"-"+platform))
+	if _, err := loadImageRoot(dir); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading cached root for %s (%s): %w", digest, platform, err)
+	}
+	return true, nil
+}
+
+// RemoveImageRoots removes every platform-specific immutable root for digest.
+// Callers must first prove that no persistent container or image alias still
+// references the digest.
+func (s Store) RemoveImageRoots(digest string) (int, error) {
+	if digest == "" || !strings.Contains(digest, ":") {
+		return 0, fmt.Errorf("invalid image digest %q", digest)
+	}
+	imagesDir := filepath.Join(s.Root, "images")
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("listing image roots: %w", err)
+	}
+	prefix := safeComponent(digest + "-")
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(imagesDir, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return removed, fmt.Errorf("removing image root %q: %w", path, err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // BranchConsolePaths returns persistent console paths for one branch, creating
 // their private parent directory if needed.
 func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error) {

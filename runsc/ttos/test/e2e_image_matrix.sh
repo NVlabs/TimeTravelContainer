@@ -100,10 +100,21 @@ for image in "$BUSYBOX_IMAGE" "$ALPINE_IMAGE" "$PYTHON_IMAGE" "$NGINX_IMAGE"; do
   ttos pull "$image"
 done
 
+echo "== image inventory =="
+IMAGE_LIST="$TTOS_E2E_ROOT/images.json"
+ttos images --json >"$IMAGE_LIST"
+for reference in docker.io/library/busybox:1.36 docker.io/library/alpine:3.20 docker.io/library/python:3.12-alpine docker.io/library/nginx:1.27-alpine; do
+  grep -q "\"reference\": \"$reference\"" "$IMAGE_LIST" || fail "image inventory omitted $reference"
+done
+[ "$(ttos images -q | wc -l)" -ge 4 ] || fail "quiet image inventory omitted an image ID"
+
 echo "== one-shot compatibility probes =="
 ttos run --name "$PREFIX-busybox" "$BUSYBOX_IMAGE" sh -c \
   'test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok'
 ttos rm "$PREFIX-busybox"
+ttos image inspect "$BUSYBOX_IMAGE" |
+  grep -q '"Materialized": true' ||
+  fail "image inspection did not report the materialized BusyBox root"
 
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'
