@@ -7,10 +7,14 @@ Implementation status: an initial lightweight `ttos` client is available at
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
 initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
-plus synchronous non-TTY exec into a selected live branch. Generated bundles
-include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`,
-and a private devpts instance with `/dev/ptmx`. Existing host paths can be
-attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
+plus synchronous non-TTY exec into a selected live branch. Container inspect
+uses Docker-shaped JSON and Go templates while adding a `TTOS` section with
+the family tree, fork timings, per-branch processes, and optional live-fork
+eligibility reports. Effective Docker entrypoint, command, user, and image
+labels are retained in the generated bundle for later inspection. Generated
+bundles include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and
+`/dev/shm`, and a private devpts instance with `/dev/ptmx`. Existing host paths
+can be attached read-only with Docker-style `-v` or `--mount` syntax. Named managed
 tmpfs volumes can be attached at one or more paths, and their state forks CoW
 with each live branch. An opt-in non-TTY internal-console substrate now provides
 branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
@@ -147,10 +151,15 @@ the `main` branch and leave `ttos` responsible for branch operations.
       for an individual non-main branch.
 - [ ] Finalize forced-removal and tombstone policy for live descendant
       branches once persistent lineage is implemented.
-- [x] Initial `ttos inspect CONTAINER` exposing persistent image/bundle data and
-      the live family/branch tree when present.
-- [ ] Extend inspect with branch process, resource-eligibility, timing, and
-      mount information.
+- [x] Docker-shaped `ttos inspect CONTAINER...` covering identity, image,
+      process configuration, lifecycle state, sandbox PID, graph driver, and
+      user mounts. Support Docker-style `--format/-f`, line-delimited
+      `--format json`, and `--type container`.
+- [x] Add a `TTOS` inspect extension containing persistent metadata, the live
+      family/branch tree, fork timing, and observational process lists for
+      every running or paused branch. `--fork-check` explicitly adds a
+      per-branch resource-eligibility report without making ordinary inspect
+      mutate pause state.
 - [x] Initial `ttos logs CONTAINER[@BRANCH]` and `logs -f`, preserving separate
       stdout/stderr streams and backed by branch-local persistent console logs.
 - [x] Add Docker-compatible `logs --tail all|N`, including global logical-line
@@ -429,9 +438,10 @@ Reject            unsupported, externally mutable, or host/device-backed
       host snapshotter that cannot participate in live fork.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
       Python, and nginx images, covering rootless prerequisites, OCI startup,
-      Docker-like lifecycle commands, live fork, managed-volume CoW, read-only
-      host binds, exact quick-exit console integrity, and the explicit
-      no-userns fallback.
+      Docker-like lifecycle commands and inspect across created, running,
+      forked, paused, and exited states; live fork; managed-volume CoW;
+      read-only host binds; exact quick-exit console integrity; and the
+      explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 

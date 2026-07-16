@@ -26,6 +26,7 @@ import (
 	"time"
 	"unicode"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/ttos/images"
 )
 
@@ -189,6 +190,23 @@ func (s Store) LoadContainer(name string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", name, err)
 	}
 	return info, nil
+}
+
+// LoadSpec returns the generated OCI runtime spec for a persistent container.
+func (s Store) LoadSpec(name string) (*specs.Spec, error) {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(info.BundleDir, "config.json"))
+	if err != nil {
+		return nil, fmt.Errorf("reading OCI config for container %q: %w", name, err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return nil, fmt.Errorf("decoding OCI config for container %q: %w", name, err)
+	}
+	return &spec, nil
 }
 
 // ListContainers returns all persistent containers ordered by name.

@@ -16,6 +16,7 @@
 package bundle
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -141,6 +142,22 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		"dev.gvisor.spec.rootfs.overlay":    "memory",
 		"dev.timetravelos.internal-console": "init",
 	}
+	entrypointJSON, err := json.Marshal(entrypoint)
+	if err != nil {
+		return nil, fmt.Errorf("encoding effective entrypoint: %w", err)
+	}
+	commandJSON, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("encoding effective command: %w", err)
+	}
+	labelsJSON, err := json.Marshal(image.Config.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("encoding image labels: %w", err)
+	}
+	annotations["dev.timetravelos.config.entrypoint"] = string(entrypointJSON)
+	annotations["dev.timetravelos.config.cmd"] = string(commandJSON)
+	annotations["dev.timetravelos.config.user"] = userSpec
+	annotations["dev.timetravelos.config.labels"] = string(labelsJSON)
 	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes))
 	for _, mount := range mounts {
 		seenDestinations[mount.Destination] = struct{}{}

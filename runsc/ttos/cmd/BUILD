@@ -15,6 +15,7 @@ go_library(
         "//runsc/ttos/console",
         "//runsc/ttos/images",
         "//runsc/version",
+        "@com_github_opencontainers_runtime_spec//specs-go",
         "@org_golang_x_term//:go_default_library",
     ],
 )
@@ -24,5 +25,8 @@ go_test(
     size = "small",
     srcs = ["cmd_test.go"],
     library = ":cmd",
-    deps = ["//runsc/ttos/console"],
+    deps = [
+        "//runsc/ttos/console",
+        "@com_github_opencontainers_runtime_spec//specs-go",
+    ],
 )

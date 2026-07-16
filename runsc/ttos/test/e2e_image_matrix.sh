@@ -109,8 +109,15 @@ done
 [ "$(ttos images -q | wc -l)" -ge 4 ] || fail "quiet image inventory omitted an image ID"
 
 echo "== one-shot compatibility probes =="
-ttos run --name "$PREFIX-busybox" "$BUSYBOX_IMAGE" sh -c \
+ttos create --name "$PREFIX-busybox" "$BUSYBOX_IMAGE" sh -c \
   'test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok'
+[ "$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{.Path}}|{{len .TTOS.Branches}}' "$PREFIX-busybox")" = \
+  "created|docker.io/library/busybox:1.36|sh|1" ] ||
+  fail "created-container inspect did not expose Docker config and TTOS branch state"
+ttos start --attach "$PREFIX-busybox"
+[ "$(ttos inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
+  "exited|0|false" ] ||
+  fail "exited-container inspect did not expose exit state"
 ttos rm "$PREFIX-busybox"
 ttos image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
@@ -179,6 +186,18 @@ fi
 ttos fork --check "$LIFECYCLE"
 ttos fork "$LIFECYCLE" child
 
+RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
+[ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||
+  fail "running forked inspect returned $RUNNING_INSPECT"
+INSPECT_JSON="$TTOS_E2E_ROOT/lifecycle-inspect.json"
+ttos inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
+grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"
+grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
+grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch processes"
+FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
+echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"
+echo "$FORK_INSPECT" | grep -q 'child=true' || fail "inspect fork check omitted eligible child branch: $FORK_INSPECT"
+
 PS_CHILD=$(ttos ps --filter branch=child --filter status=running --filter ancestor="$ALPINE_IMAGE" --format '{{.ID}}')
 [ "$PS_CHILD" = "$LIFECYCLE@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
 [ "$(ttos ps --latest --quiet)" = "$LIFECYCLE@child" ] || fail "ps --latest did not select the forked child"
@@ -191,6 +210,9 @@ ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
 
 ttos pause "$LIFECYCLE" "$LIFECYCLE@child"
+PAUSED_INSPECT=$(ttos inspect -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$LIFECYCLE")
+echo "$PAUSED_INSPECT" | grep -q 'main=paused' || fail "inspect did not report paused main branch: $PAUSED_INSPECT"
+echo "$PAUSED_INSPECT" | grep -q 'child=paused' || fail "inspect did not report paused child branch: $PAUSED_INSPECT"
 ttos resume "$LIFECYCLE" "$LIFECYCLE@child"
 ttos ps --all
 ttos top "$LIFECYCLE"
@@ -199,6 +221,8 @@ ttos logs --tail 2 "$LIFECYCLE"
 ttos logs --tail 2 "$LIFECYCLE@child"
 
 ttos stop --time 2 "$LIFECYCLE@child" "$LIFECYCLE"
+[ "$(ttos inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
+  fail "inspect did not report the stopped family as exited"
 ttos branch rm "$LIFECYCLE@child"
 ttos rm "$LIFECYCLE"
 ttos volume rm "$VOLUME"

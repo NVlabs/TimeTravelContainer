@@ -46,6 +46,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Entrypoint: []string{"/entry"},
 		Cmd:        []string{"default"},
 		WorkingDir: "/work",
+		Labels:     map[string]string{"suite": "ttos"},
 	}}
 	spec, err := BuildSpec(image, SpecOptions{
 		Name:       "demo",
@@ -109,6 +110,17 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 			t.Errorf("annotation %q=%q, want %q", key, got, want)
 		}
 	}
+	wantConfigAnnotations := map[string]string{
+		"dev.timetravelos.config.entrypoint": `["/entry"]`,
+		"dev.timetravelos.config.cmd":        `["override","arg"]`,
+		"dev.timetravelos.config.user":       "app",
+		"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
+	}
+	for key, want := range wantConfigAnnotations {
+		if got := spec.Annotations[key]; got != want {
+			t.Errorf("annotation %q=%q, want %q", key, got, want)
+		}
+	}
 }
 
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
@@ -165,7 +177,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["true"]}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
@@ -181,6 +193,13 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if len(containers) != 1 || containers[0].State != "exited" || containers[0].ExitStatus == nil || *containers[0].ExitStatus != 17 || containers[0].ExitedAt == nil {
 		t.Fatalf("containers=%+v", containers)
+	}
+	spec, err := store.LoadSpec("demo")
+	if err != nil {
+		t.Fatalf("LoadSpec: %v", err)
+	}
+	if spec.Process == nil || !reflect.DeepEqual(spec.Process.Args, []string{"true"}) {
+		t.Errorf("loaded spec=%+v", spec)
 	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)

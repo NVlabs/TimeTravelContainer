@@ -36,6 +36,7 @@ import (
 	"text/template"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 
 	"gvisor.dev/gvisor/runsc/flag"
@@ -254,7 +255,7 @@ Commands:
   attach [OPTIONS] TARGET        Attach to a branch's init console
   logs [-f] [--tail N] TARGET    Print or follow a branch's init-console logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
-  inspect CONTAINER...           Show persistent and live branch state
+  inspect [OPTIONS] CONTAINER... Show Docker and TTOS branch/process state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
@@ -297,7 +298,7 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	case "exec":
 		err = runExec(args[1:], stderr, backend)
 	case "inspect":
-		err = runInspect(args[1:], stdout, backend)
+		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
 		err = runRemove(args[1:], stdout, stderr, backend)
 	case "ls":
@@ -1059,28 +1060,190 @@ func runExec(args []string, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-// InspectInfo combines persistent image/bundle configuration with live state.
-type InspectInfo struct {
+// InspectState is the Docker-compatible lifecycle view of the main branch.
+type InspectState struct {
+	Status     string `json:"Status"`
+	Running    bool   `json:"Running"`
+	Paused     bool   `json:"Paused"`
+	Restarting bool   `json:"Restarting"`
+	OOMKilled  bool   `json:"OOMKilled"`
+	Dead       bool   `json:"Dead"`
+	Pid        int    `json:"Pid"`
+	ExitCode   int    `json:"ExitCode"`
+	Error      string `json:"Error"`
+	StartedAt  string `json:"StartedAt"`
+	FinishedAt string `json:"FinishedAt"`
+}
+
+// InspectConfig is the Docker-compatible process configuration view.
+type InspectConfig struct {
+	Hostname     string              `json:"Hostname"`
+	User         string              `json:"User"`
+	AttachStdin  bool                `json:"AttachStdin"`
+	AttachStdout bool                `json:"AttachStdout"`
+	AttachStderr bool                `json:"AttachStderr"`
+	Tty          bool                `json:"Tty"`
+	OpenStdin    bool                `json:"OpenStdin"`
+	StdinOnce    bool                `json:"StdinOnce"`
+	Env          []string            `json:"Env"`
+	Cmd          []string            `json:"Cmd"`
+	Image        string              `json:"Image"`
+	Volumes      map[string]struct{} `json:"Volumes"`
+	WorkingDir   string              `json:"WorkingDir"`
+	Entrypoint   []string            `json:"Entrypoint"`
+	Labels       map[string]string   `json:"Labels"`
+}
+
+// InspectHostConfig is the subset of Docker host configuration implemented by TTOS.
+type InspectHostConfig struct {
+	Binds          []string          `json:"Binds"`
+	NetworkMode    string            `json:"NetworkMode"`
+	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
+	Runtime        string            `json:"Runtime"`
+	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
+}
+
+// InspectMount is a Docker-compatible user mount description.
+type InspectMount struct {
+	Type        string `json:"Type"`
+	Name        string `json:"Name,omitempty"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Driver      string `json:"Driver,omitempty"`
+	Mode        string `json:"Mode"`
+	RW          bool   `json:"RW"`
+	Propagation string `json:"Propagation"`
+}
+
+// InspectGraphDriver describes TTOS's immutable lower root and Sentry-memory upper layer.
+type InspectGraphDriver struct {
+	Name string            `json:"Name"`
+	Data map[string]string `json:"Data"`
+}
+
+// InspectBranch enriches stable lineage metadata with observational live state.
+type InspectBranch struct {
+	Metadata        Branch           `json:"metadata"`
+	Processes       []ProcessInfo    `json:"processes,omitempty"`
+	ProcessError    string           `json:"process_error,omitempty"`
+	ForkEligibility *ForkEligibility `json:"fork_eligibility,omitempty"`
+	ForkCheckError  string           `json:"fork_check_error,omitempty"`
+}
+
+// TTOSInspectInfo contains state with no direct Docker analogue.
+type TTOSInspectInfo struct {
 	Container    ttosbundle.ContainerInfo `json:"container"`
 	Runtime      *Family                  `json:"runtime,omitempty"`
+	Branches     []InspectBranch          `json:"branches"`
 	RuntimeError string                   `json:"runtime_error,omitempty"`
 }
 
-func runInspect(args []string, stdout io.Writer, backend backend) error {
-	if len(args) == 0 {
-		return errors.New("usage: ttos inspect CONTAINER [CONTAINER...]")
+// InspectInfo combines a Docker-compatible main-container view with TTOS lineage.
+type InspectInfo struct {
+	ID           string             `json:"Id"`
+	Created      string             `json:"Created"`
+	Path         string             `json:"Path"`
+	Args         []string           `json:"Args"`
+	State        InspectState       `json:"State"`
+	Image        string             `json:"Image"`
+	Name         string             `json:"Name"`
+	RestartCount int                `json:"RestartCount"`
+	Driver       string             `json:"Driver"`
+	Platform     string             `json:"Platform"`
+	GraphDriver  InspectGraphDriver `json:"GraphDriver"`
+	Config       InspectConfig      `json:"Config"`
+	HostConfig   InspectHostConfig  `json:"HostConfig"`
+	Mounts       []InspectMount     `json:"Mounts"`
+	TTOS         TTOSInspectInfo    `json:"TTOS"`
+}
+
+func runInspect(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	format := fs.String("format", "", "format output using a Go template or 'json'")
+	fs.StringVar(format, "f", "", "format output using a Go template or 'json'")
+	objectType := fs.String("type", "container", "inspect object type (container only)")
+	forkCheck := fs.Bool("fork-check", false, "include live-fork eligibility for each branch")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	results := make([]InspectInfo, 0, len(args))
-	for _, name := range args {
+	if *objectType != "container" {
+		return fmt.Errorf("inspect type %q is not supported; use 'container'", *objectType)
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttos inspect [--format TEMPLATE] [--fork-check] CONTAINER [CONTAINER...]")
+	}
+	results := make([]InspectInfo, 0, fs.NArg())
+	for _, name := range fs.Args() {
+		if strings.Contains(name, "@") {
+			return fmt.Errorf("inspect accepts container families, not branch selector %q", name)
+		}
 		info, err := backend.inspect(name)
 		if err != nil {
 			return err
 		}
+		if *forkCheck {
+			for i := range info.TTOS.Branches {
+				branch := &info.TTOS.Branches[i]
+				switch branch.Metadata.State {
+				case "running", "paused":
+					report, err := backend.checkFork(selector{container: name, branch: branch.Metadata.ID})
+					if err != nil {
+						branch.ForkCheckError = err.Error()
+					} else {
+						branch.ForkEligibility = &report
+					}
+				default:
+					branch.ForkCheckError = fmt.Sprintf("branch is %s", branch.Metadata.State)
+				}
+			}
+		}
 		results = append(results, info)
+	}
+	if *format != "" {
+		return writeInspectFormat(stdout, results, *format)
 	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(results)
+}
+
+func writeInspectFormat(w io.Writer, results []InspectInfo, format string) error {
+	if format == "json" {
+		encoder := json.NewEncoder(w)
+		for _, result := range results {
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	tmpl, err := template.New("inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			data, err := json.Marshal(value)
+			return string(data), err
+		},
+		"join":  strings.Join,
+		"lower": strings.ToLower,
+		"split": strings.Split,
+		"upper": strings.ToUpper,
+	}).Parse(format)
+	if err != nil {
+		return fmt.Errorf("parsing inspect format: %w", err)
+	}
+	for _, result := range results {
+		var output bytes.Buffer
+		if err := tmpl.Execute(&output, result); err != nil {
+			return fmt.Errorf("executing inspect format: %w", err)
+		}
+		if output.Len() == 0 || output.Bytes()[output.Len()-1] != '\n' {
+			output.WriteByte('\n')
+		}
+		if _, err := io.Copy(w, &output); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -2090,14 +2253,15 @@ type Branch struct {
 
 // Family is stable family metadata returned by ttos ls --json.
 type Family struct {
-	ID        string    `json:"id"`
-	Image     string    `json:"image,omitempty"`
-	Digest    string    `json:"digest,omitempty"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	Volumes   []string  `json:"volumes,omitempty"`
-	Branches  []Branch  `json:"branches"`
-	Error     string    `json:"error,omitempty"`
+	ID         string    `json:"id"`
+	Image      string    `json:"image,omitempty"`
+	Digest     string    `json:"digest,omitempty"`
+	State      string    `json:"state"`
+	CreatedAt  time.Time `json:"created_at"`
+	SandboxPID int       `json:"sandbox_pid,omitempty"`
+	Volumes    []string  `json:"volumes,omitempty"`
+	Branches   []Branch  `json:"branches"`
+	Error      string    `json:"error,omitempty"`
 }
 
 // ForkResourceIssue identifies one resource that blocks a live fork.
@@ -3255,23 +3419,188 @@ func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int)
 	}
 }
 
+func inspectTimestamp(value *time.Time) string {
+	if value == nil {
+		return time.Time{}.UTC().Format(time.RFC3339Nano)
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func inspectUser(user specs.User) string {
+	return strconv.FormatUint(uint64(user.UID), 10) + ":" + strconv.FormatUint(uint64(user.GID), 10)
+}
+
+func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struct{}) {
+	mounts := []InspectMount{}
+	binds := []string{}
+	volumes := make(map[string]struct{})
+	if spec == nil {
+		return mounts, binds, volumes
+	}
+	for _, mount := range spec.Mounts {
+		readonly := false
+		for _, option := range mount.Options {
+			if option == "ro" {
+				readonly = true
+			}
+		}
+		mode := "rw"
+		if readonly {
+			mode = "ro"
+		}
+		switch {
+		case mount.Type == "bind":
+			binds = append(binds, mount.Source+":"+mount.Destination+":"+mode)
+			mounts = append(mounts, InspectMount{
+				Type: "bind", Source: mount.Source, Destination: mount.Destination,
+				Mode: mode, RW: !readonly, Propagation: "rprivate",
+			})
+		case mount.Type == "tmpfs" && strings.HasPrefix(mount.Source, "ttos-volume-"):
+			name := strings.TrimPrefix(mount.Source, "ttos-volume-")
+			volumes[mount.Destination] = struct{}{}
+			mounts = append(mounts, InspectMount{
+				Type: "volume", Name: name, Source: name, Destination: mount.Destination,
+				Driver: "local-tmpfs", Mode: mode, RW: !readonly,
+			})
+		}
+	}
+	return mounts, binds, volumes
+}
+
+func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, family *Family, runtimeErr string) InspectInfo {
+	state := container.State
+	if state == "" {
+		state = "created"
+	}
+	if family != nil {
+		state = family.State
+		for _, branch := range family.Branches {
+			if branch.ID == defaultBranchID {
+				state = branch.State
+				break
+			}
+		}
+	}
+	if state == "stopped" {
+		state = "exited"
+	}
+	exitCode := 0
+	if container.ExitStatus != nil {
+		exitCode = *container.ExitStatus
+	}
+	sandboxPID := 0
+	stateError := runtimeErr
+	if family != nil {
+		sandboxPID = family.SandboxPID
+		if family.Error != "" {
+			stateError = family.Error
+		}
+	}
+	process := &specs.Process{}
+	if spec != nil && spec.Process != nil {
+		process = spec.Process
+	}
+	path := ""
+	args := []string{}
+	if len(process.Args) != 0 {
+		path = process.Args[0]
+		args = append(args, process.Args[1:]...)
+	}
+	mounts, binds, volumes := inspectMounts(spec)
+	hostname := container.Name
+	configUser := inspectUser(process.User)
+	configCmd := append([]string(nil), process.Args...)
+	var entrypoint []string
+	labels := make(map[string]string)
+	if spec != nil {
+		if spec.Hostname != "" {
+			hostname = spec.Hostname
+		}
+		if value, ok := spec.Annotations["dev.timetravelos.config.user"]; ok {
+			configUser = value
+		}
+		if value, ok := spec.Annotations["dev.timetravelos.config.cmd"]; ok {
+			_ = json.Unmarshal([]byte(value), &configCmd)
+		}
+		if value, ok := spec.Annotations["dev.timetravelos.config.entrypoint"]; ok {
+			_ = json.Unmarshal([]byte(value), &entrypoint)
+		}
+		if value, ok := spec.Annotations["dev.timetravelos.config.labels"]; ok {
+			_ = json.Unmarshal([]byte(value), &labels)
+		}
+	}
+	branches := []InspectBranch{}
+	if family != nil {
+		for _, branch := range family.Branches {
+			branches = append(branches, InspectBranch{Metadata: branch})
+		}
+	}
+	created := container.CreatedAt.UTC().Format(time.RFC3339Nano)
+	if container.CreatedAt.IsZero() {
+		created = inspectTimestamp(nil)
+	}
+	readonlyRootfs := spec != nil && spec.Root != nil && spec.Root.Readonly
+	return InspectInfo{
+		ID: container.Name, Created: created, Path: path, Args: args,
+		State: InspectState{
+			Status: state, Running: state == "running" || state == "paused", Paused: state == "paused",
+			Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
+			Error: stateError, StartedAt: inspectTimestamp(container.StartedAt), FinishedAt: inspectTimestamp(container.ExitedAt),
+		},
+		Image: container.Digest, Name: "/" + container.Name, Driver: "ttos-memory-overlay",
+		Platform: container.Platform, RestartCount: 0,
+		GraphDriver: InspectGraphDriver{
+			Name: "ttos-memory-overlay",
+			Data: map[string]string{"LowerDir": container.RootFS, "UpperDir": "sentry-memory"},
+		},
+		Config: InspectConfig{
+			Hostname: hostname, User: configUser, AttachStdout: true, AttachStderr: true,
+			Tty: process.Terminal, Env: append([]string(nil), process.Env...), Cmd: configCmd,
+			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
+		},
+		HostConfig: InspectHostConfig{
+			Binds: binds, NetworkMode: "none", ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
+		},
+		Mounts: mounts,
+		TTOS: TTOSInspectInfo{
+			Container: container, Runtime: family, Branches: branches, RuntimeError: runtimeErr,
+		},
+	}
+}
+
 func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	containerInfo, err := store.LoadContainer(name)
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	result := InspectInfo{Container: containerInfo}
+	spec, err := store.LoadSpec(name)
+	if err != nil {
+		return InspectInfo{}, err
+	}
 	families, err := b.listFamilies()
 	if err != nil {
-		result.RuntimeError = err.Error()
-		return result, nil
+		return buildInspectInfo(containerInfo, spec, nil, err.Error()), nil
 	}
+	var runtimeFamily *Family
 	for i := range families {
 		if families[i].ID == name {
-			result.Runtime = &families[i]
+			runtimeFamily = &families[i]
 			break
 		}
+	}
+	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
+	for i := range result.TTOS.Branches {
+		branch := &result.TTOS.Branches[i]
+		if branch.Metadata.State != "running" && branch.Metadata.State != "paused" {
+			continue
+		}
+		processes, err := b.processes(selector{container: name, branch: branch.Metadata.ID})
+		if err != nil {
+			branch.ProcessError = err.Error()
+			continue
+		}
+		branch.Processes = processes
 	}
 	return result, nil
 }
@@ -3520,6 +3849,7 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 	}
 	var states []struct {
 		ID     string `json:"id"`
+		PID    int    `json:"pid"`
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(output, &states); err != nil {
@@ -3528,7 +3858,7 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
 	families := make([]Family, 0, len(states))
 	for _, state := range states {
-		family := Family{ID: state.ID, State: state.Status, Branches: []Branch{}}
+		family := Family{ID: state.ID, State: state.Status, SandboxPID: state.PID, Branches: []Branch{}}
 		if state.Status == "stopped" {
 			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: "exited"})
 			families = append(families, family)

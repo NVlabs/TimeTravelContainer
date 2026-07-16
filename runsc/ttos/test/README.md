@@ -6,6 +6,10 @@ covers:
 
 - Docker-style image inventory, quiet IDs, JSON output, and materialized-root
   inspection;
+- Docker-shaped container inspect JSON and Go templates across created,
+  running, forked, paused, and exited states, including effective image
+  configuration, user mounts, sandbox PID, per-branch processes and timings,
+  and explicit fork-eligibility reports;
 - BusyBox process/procfs/sysfs startup;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;

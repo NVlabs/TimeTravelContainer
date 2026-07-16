@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
@@ -992,15 +994,111 @@ func TestExecForwardsProcessExitStatus(t *testing.T) {
 
 func TestInspect(t *testing.T) {
 	b := &fakeBackend{inspectInfo: InspectInfo{
-		Container: ttosbundle.ContainerInfo{Name: "demo", Reference: "docker.io/library/busybox:latest"},
-		Runtime:   &Family{ID: "demo", State: "running", Branches: []Branch{{ID: "main", State: "running"}}},
+		ID: "demo", Name: "/demo", Image: "sha256:abc",
+		State:  InspectState{Status: "running", Running: true},
+		Config: InspectConfig{Image: "docker.io/library/busybox:latest"},
+		TTOS: TTOSInspectInfo{Branches: []InspectBranch{{
+			Metadata: Branch{ID: "main", State: "running"},
+		}}},
 	}}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"inspect", "demo"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("inspect status=%d, stderr=%q", status, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), `"reference": "docker.io/library/busybox:latest"`) || !strings.Contains(stdout.String(), `"state": "running"`) {
-		t.Errorf("inspect output=%q", stdout.String())
+	var infos []InspectInfo
+	if err := json.Unmarshal(stdout.Bytes(), &infos); err != nil {
+		t.Fatalf("decoding inspect output %q: %v", stdout.String(), err)
+	}
+	if len(infos) != 1 || infos[0].ID != "demo" || infos[0].State.Status != "running" || infos[0].Config.Image != "docker.io/library/busybox:latest" {
+		t.Errorf("inspect output=%+v", infos)
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"inspect", "--format", `{{.Name}}|{{.State.Status}}|{{len .TTOS.Branches}}`, "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("formatted inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "/demo|running|1\n"; got != want {
+		t.Errorf("formatted inspect=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	b.checkResult = ForkEligibility{Eligible: true}
+	if status := runCommand([]string{"inspect", "--fork-check", "-f", `{{(index .TTOS.Branches 0).ForkEligibility.Eligible}}`, "demo"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("fork-check inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.checkTarget, (selector{container: "demo", branch: "main"}); got != want {
+		t.Errorf("fork-check target=%+v, want %+v", got, want)
+	}
+	if got, want := stdout.String(), "true\n"; got != want {
+		t.Errorf("fork-check output=%q, want %q", got, want)
+	}
+
+	if status := runCommand([]string{"inspect", "--type", "image", "demo"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("inspect accepted unsupported object type")
+	}
+	if status := runCommand([]string{"inspect", "demo@main"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("inspect accepted branch selector")
+	}
+	if status := runCommand([]string{"inspect", "--format", "{{", "demo"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("inspect accepted invalid template")
+	}
+}
+
+func TestBuildInspectInfo(t *testing.T) {
+	created := time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC)
+	started := created.Add(time.Second)
+	exit := 23
+	container := ttosbundle.ContainerInfo{
+		Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
+		RootFS: "/roots/alpine", State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+	}
+	spec := &specs.Spec{
+		Root: &specs.Root{Readonly: false},
+		Process: &specs.Process{
+			Args: []string{"/bin/sh", "-c", "sleep 10"}, Env: []string{"A=1"}, Cwd: "/work",
+			User: specs.User{UID: 123, GID: 456},
+		},
+		Mounts: []specs.Mount{
+			{Type: "proc", Source: "proc", Destination: "/proc"},
+			{Type: "bind", Source: "/host/data", Destination: "/data", Options: []string{"rbind", "ro"}},
+			{Type: "tmpfs", Source: "ttos-volume-cache", Destination: "/cache", Options: []string{"rw"}},
+		},
+		Hostname: "custom-host",
+		Annotations: map[string]string{
+			"dev.timetravelos.config.entrypoint": `["/bin/sh"]`,
+			"dev.timetravelos.config.cmd":        `["-c","sleep 10"]`,
+			"dev.timetravelos.config.user":       "app",
+			"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
+		},
+	}
+	family := &Family{ID: "demo", State: "running", SandboxPID: 4321, Branches: []Branch{
+		{ID: "child", ParentID: "main", State: "running"},
+		{ID: "main", State: "paused"},
+	}}
+	info := buildInspectInfo(container, spec, family, "")
+	if info.ID != "demo" || info.Name != "/demo" || info.Path != "/bin/sh" || !reflect.DeepEqual(info.Args, []string{"-c", "sleep 10"}) {
+		t.Errorf("identity/process view=%+v", info)
+	}
+	if info.State.Status != "paused" || !info.State.Running || !info.State.Paused || info.State.Pid != 4321 || info.State.ExitCode != 23 {
+		t.Errorf("state=%+v", info.State)
+	}
+	if info.Config.Hostname != "custom-host" || info.Config.User != "app" || info.Config.WorkingDir != "/work" || info.Config.Image != container.Reference {
+		t.Errorf("config=%+v", info.Config)
+	}
+	if !reflect.DeepEqual(info.Config.Entrypoint, []string{"/bin/sh"}) || !reflect.DeepEqual(info.Config.Cmd, []string{"-c", "sleep 10"}) || info.Config.Labels["suite"] != "ttos" {
+		t.Errorf("Docker config reconstruction=%+v", info.Config)
+	}
+	if len(info.Mounts) != 2 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Name != "cache" || !info.Mounts[1].RW {
+		t.Errorf("mounts=%+v", info.Mounts)
+	}
+	if got := info.HostConfig.Binds; !reflect.DeepEqual(got, []string{"/host/data:/data:ro"}) {
+		t.Errorf("binds=%q", got)
+	}
+	if _, ok := info.Config.Volumes["/cache"]; !ok {
+		t.Errorf("volumes=%v", info.Config.Volumes)
+	}
+	if len(info.TTOS.Branches) != 2 || info.TTOS.Branches[0].Metadata.ID != "child" {
+		t.Errorf("TTOS branches=%+v", info.TTOS.Branches)
 	}
 }
 
@@ -1204,9 +1302,9 @@ if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 fi
 if [ "$3" = "list" ]; then
 	if [ -e "$0.stopped" ]; then
-		echo '[{"id":"web","status":"stopped"}]'
+		echo '[{"id":"web","pid":0,"status":"stopped"}]'
 	else
-		echo '[{"id":"web","status":"running"}]'
+		echo '[{"id":"web","pid":4321,"status":"running"}]'
 	fi
 	exit 0
 fi
@@ -1221,6 +1319,10 @@ fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-ready-fd" ] && [ "${15}" = "4" ] && [ "${16}" = "web" ] && [ "${17}" = "console-follow" ] && [ "${18}" = "child" ]; then
 	touch "$0.retention"
 	printf 1 >&4
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "main" ]; then
+	echo '[{"uid":0,"pid":1,"ppid":0,"pgid":1,"threads":[1],"c":0,"tty":"?","stime":"12:00","time":"1ms","cmd":"init"}]'
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "child" ]; then
@@ -1282,6 +1384,13 @@ exit 2
 	}
 	if len(families) != 1 || families[0].ID != "web" || len(families[0].Branches) != 1 || families[0].Branches[0].ID != "main" {
 		t.Fatalf("listFamilies returned %+v", families)
+	}
+	inspected, err := b.inspect("web")
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if inspected.State.Status != "running" || inspected.State.Pid != 4321 || len(inspected.TTOS.Branches) != 1 || len(inspected.TTOS.Branches[0].Processes) != 1 || inspected.TTOS.Branches[0].Processes[0].PID != 1 {
+		t.Errorf("runtime-enriched inspect=%+v", inspected)
 	}
 	child, err := b.fork(selector{container: "web", branch: "main"}, "child", true)
 	if err != nil {
