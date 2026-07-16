@@ -33,6 +33,8 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -255,6 +257,27 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	if err := l.family.Resume(childInfo.ID); err != nil {
 		t.Fatalf("resuming child: %v", err)
+	}
+	var childProcesses []*control.Process
+	if err := l.family.Processes(childInfo.ID, l.root.cid, &childProcesses); err != nil {
+		t.Fatalf("listing child processes: %v", err)
+	}
+	if len(childProcesses) != 1 || childProcesses[0].PID != 1 {
+		t.Fatalf("child processes: got %+v, want virtual PID 1", childProcesses)
+	}
+	if err := l.family.Signal(childInfo.ID, l.root.cid, 0, int32(linux.SIGKILL), DeliverToProcess); err != nil {
+		t.Fatalf("signaling child init: %v", err)
+	}
+	status, err := l.family.Wait(childInfo.ID, l.root.cid, 0)
+	if err != nil {
+		t.Fatalf("waiting for child init: %v", err)
+	}
+	ws := linux.WaitStatus(status)
+	if !ws.Signaled() || ws.TerminationSignal() != linux.SIGKILL {
+		t.Errorf("child wait status: got %v, want SIGKILL", ws)
+	}
+	if got := l.k.GlobalInit().Leader().ExitState(); got != kernel.TaskExitNone {
+		t.Errorf("parent init changed after signaling child: got exit state %v", got)
 	}
 	if err := l.family.Destroy(childInfo.ID); err != nil {
 		t.Fatalf("destroying child: %v", err)

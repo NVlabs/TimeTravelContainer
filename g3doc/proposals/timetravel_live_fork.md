@@ -456,16 +456,24 @@ resident bytes in this setup. A 100-cycle clone/release test also verifies that
 the parent PMA regains a unique page reference after every child release. A real
 multithreaded sandbox workload remains before the complete Phase 1 gate.
 
-The first Phase 2 control-plane slice is implemented. `runsc` now owns a
-`SandboxFamily` with explicit creating, paused, running, destroying, and failed
-states; exposes fork/list/pause/resume/destroy RPCs; and provides
-`runsc timetravel` as a minimal host CLI. Fork publication is transactional,
-source run state is restored on failure, branch trees can fork recursively, and
-loader teardown destroys leaves before ancestors. A systrap lifecycle test
-covers parent-to-child and child-to-grandchild forks plus independent
-pause/resume/destroy. The full Phase 2 gate is not yet met: ordinary runsc
-sandboxes initialize a netstack, which live fork still rejects, and existing
-process/wait/watchdog controls remain bound to the default branch.
+The restricted Phase 2 gate is implemented. `runsc` now owns a `SandboxFamily`
+with explicit creating, paused, running, destroying, and failed states; exposes
+fork/list/pause/resume/destroy plus branch-local process, signal, and wait RPCs;
+and provides matching `runsc timetravel` commands. Fork publication is
+transactional, source run state is restored on failure, branch trees can fork
+recursively, each child has its own watchdog, and loader teardown destroys
+leaves before ancestors. A real loader test forks a running systrap sandbox,
+observes virtual PID 1 in both kernels, kills and waits for only the child, and
+verifies that the parent remains alive.
+
+That gate currently applies only to `NetworkNone`, a read-only gofer root with
+no additional OCI mounts, directfs disabled, and no host-facing process FDs at
+the fork boundary. The contained netstack is cloned and restored as an
+independent object. The child gofer filesystem borrows the immutable root
+connection and root FDID while owning descendant FDIDs; children are therefore
+destroyed before the default branch. Branch-local exec, events, foreground TTY
+signaling, writable roots, additional mounts, and general network resource
+closure remain later work.
 
 ## Implementation phases and gates
 

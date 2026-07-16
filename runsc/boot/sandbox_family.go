@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 )
 
 // DefaultBranchID is the branch used by existing, branch-unaware runsc RPCs.
@@ -61,12 +62,40 @@ type BranchArgs struct {
 	ID string
 }
 
+// BranchProcessesArgs selects a container inside one live branch.
+type BranchProcessesArgs struct {
+	BranchID string
+	CID      string
+}
+
+// BranchWaitArgs selects a process inside one live branch. PID 0 selects the
+// container init process.
+type BranchWaitArgs struct {
+	BranchID string
+	CID      string
+	PID      int32
+}
+
+// BranchSignalArgs selects signal recipients inside one live branch.
+type BranchSignalArgs struct {
+	BranchID string
+	CID      string
+	Signo    int32
+	PID      int32
+	Mode     SignalDeliveryMode
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
+	// controlOps holds Kernel lifetime while branch-local controls are active.
+	// Destroy marks the branch destroying, terminates its tasks, then waits for
+	// these operations before releasing the Kernel.
+	controlOps sync.WaitGroup
 
 	id       string
 	parentID string
 	k        *kernel.Kernel
+	watchdog *watchdog.Watchdog
 	state    BranchState
 }
 
@@ -82,12 +111,14 @@ type SandboxFamily struct {
 	// network state has no host-facing links.
 	allowNetworkStack              bool
 	allowSharedFilesystemResources bool
+	watchdogOpts                   *watchdog.Opts
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
 type SandboxFamilyOptions struct {
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
+	WatchdogOpts                   *watchdog.Opts
 }
 
 // NewSandboxFamily creates a family containing k as its default branch.
@@ -95,6 +126,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 	return &SandboxFamily{
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
+		watchdogOpts:                   opts.WatchdogOpts,
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
 				id:    DefaultBranchID,
@@ -230,14 +262,23 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		_ = resumeSource()
 		return fail(fmt.Errorf("starting branch %q paused: %w", args.ID, err))
 	}
+	var childWatchdog *watchdog.Watchdog
+	if f.watchdogOpts != nil {
+		childWatchdog = watchdog.New(child, *f.watchdogOpts)
+		childWatchdog.Start()
+	}
 
 	f.mu.Lock()
 	childBranch.k = child
+	childBranch.watchdog = childWatchdog
 	childBranch.state = BranchPaused
 	f.mu.Unlock()
 	if !args.Paused {
 		child.Unpause()
 		if err := control.PostResume(child, nil); err != nil {
+			if childWatchdog != nil {
+				childWatchdog.Stop()
+			}
 			child.Pause()
 			child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 			child.Unpause()
@@ -251,6 +292,9 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		f.mu.Unlock()
 	}
 	if err := resumeSource(); err != nil {
+		if childWatchdog != nil {
+			childWatchdog.Stop()
+		}
 		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 		if child.IsPaused() {
 			child.Unpause()
@@ -325,34 +369,170 @@ func (f *SandboxFamily) Destroy(id string) error {
 		return err
 	}
 	b.opMu.Lock()
-	defer b.opMu.Unlock()
 	f.mu.Lock()
 	if b.state == BranchCreating || b.state == BranchDestroying {
 		state := b.state
 		f.mu.Unlock()
+		b.opMu.Unlock()
 		return fmt.Errorf("branch %q is %s", id, state)
 	}
 	for _, candidate := range f.branches {
 		if candidate.parentID == id {
 			f.mu.Unlock()
+			b.opMu.Unlock()
 			return fmt.Errorf("branch %q still has child %q", id, candidate.id)
 		}
 	}
 	b.state = BranchDestroying
 	paused := b.k.IsPaused()
+	dog := b.watchdog
 	f.mu.Unlock()
+	b.opMu.Unlock()
 
+	if dog != nil {
+		dog.Stop()
+	}
 	b.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	if paused {
 		b.k.Unpause()
 	}
 	b.k.WaitExited()
+	b.controlOps.Wait()
 	b.k.Release()
 
 	f.mu.Lock()
 	delete(f.branches, id)
 	f.mu.Unlock()
 	return nil
+}
+
+// Processes returns processes from one branch's kernel task graph.
+func (f *SandboxFamily) Processes(id, cid string, out *[]*control.Process) error {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return control.Processes(b.k, cid, out)
+}
+
+// Signal sends a signal within one branch. Foreground TTY process-group
+// delivery is excluded because branch eligibility currently excludes external
+// TTY resources and Loader's host-side TTY bookkeeping is not cloned.
+func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeliveryMode) error {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	k := b.k
+	switch mode {
+	case DeliverToProcess:
+		tg, err := branchThreadGroup(k, cid, kernel.ThreadID(pid))
+		if err != nil {
+			return err
+		}
+		return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
+	case DeliverToAllProcesses:
+		if pid != 0 {
+			return fmt.Errorf("PID (%d) cannot be set when signaling all processes", pid)
+		}
+		if _, err := branchThreadGroup(k, cid, 0); err != nil {
+			return err
+		}
+		k.Pause()
+		defer k.Unpause()
+		return k.SendContainerSignal(cid, &linux.SignalInfo{Signo: signo})
+	case DeliverToProcessGroup:
+		if pid <= 0 {
+			return fmt.Errorf("PGID must be positive")
+		}
+		pgid := kernel.ProcessGroupID(pid)
+		pg := k.RootPIDNamespace().ProcessGroupWithID(pgid)
+		if pg == nil {
+			return fmt.Errorf("no such process group with PGID %d", pgid)
+		}
+		for _, tg := range k.TaskSet().Root.ThreadGroups() {
+			if tg.ProcessGroup() == pg && tg.Leader().ContainerID() == cid {
+				return k.SendExternalSignalProcessGroup(pg, &linux.SignalInfo{Signo: signo})
+			}
+		}
+		return fmt.Errorf("process group %d does not belong to container %q", pgid, cid)
+	case DeliverToForegroundProcessGroup:
+		return fmt.Errorf("foreground process-group signaling is not supported for live branches")
+	default:
+		return fmt.Errorf("unknown signal delivery mode %v", mode)
+	}
+}
+
+// Wait waits for a process in one branch and returns its wait status. PID 0
+// selects the container's init process.
+func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	tg, err := branchThreadGroup(b.k, cid, kernel.ThreadID(pid))
+	if err != nil {
+		return 0, err
+	}
+	tg.WaitExited()
+	return uint32(tg.ExitStatus()), nil
+}
+
+// beginControl acquires a Kernel-lifetime lease for a branch-local operation.
+func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("branch %q is %s", id, state)
+	}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	b.opMu.Unlock()
+	return b, b.controlOps.Done, nil
+}
+
+func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*kernel.ThreadGroup, error) {
+	if tgid < 0 {
+		return nil, fmt.Errorf("PID (%d) must be non-negative", tgid)
+	}
+	if tgid != 0 {
+		tg := k.RootPIDNamespace().ThreadGroupWithID(tgid)
+		if tg == nil {
+			return nil, fmt.Errorf("no such process with PID %d", tgid)
+		}
+		if tg.Leader().ContainerID() != cid {
+			return nil, fmt.Errorf("process %d belongs to a different container: %q", tgid, tg.Leader().ContainerID())
+		}
+		return tg, nil
+	}
+
+	var initTG *kernel.ThreadGroup
+	var initID kernel.ThreadID
+	for _, tg := range k.TaskSet().Root.ThreadGroups() {
+		if tg.Leader().ContainerID() != cid {
+			continue
+		}
+		id := k.RootPIDNamespace().IDOfThreadGroup(tg)
+		if initTG == nil || id < initID {
+			initTG = tg
+			initID = id
+		}
+	}
+	if initTG == nil {
+		return nil, fmt.Errorf("container %q has no init process", cid)
+	}
+	return initTG, nil
 }
 
 // DestroyChildren destroys all non-default branches during loader teardown.

@@ -2070,6 +2070,33 @@ func (s *Sandbox) DestroyBranch(id string) error {
 	return nil
 }
 
+// BranchProcesses lists processes in one in-memory branch.
+func (s *Sandbox) BranchProcesses(branchID, cid string) ([]*control.Process, error) {
+	args := &boot.BranchProcessesArgs{BranchID: branchID, CID: cid}
+	var processes []*control.Process
+	if err := s.call(boot.ContMgrBranchProcesses, args, &processes); err != nil {
+		return nil, fmt.Errorf("listing processes in live branch %q: %w", branchID, err)
+	}
+	return processes, nil
+}
+
+// SignalBranch sends a signal within one in-memory branch.
+func (s *Sandbox) SignalBranch(args *boot.BranchSignalArgs) error {
+	if err := s.call(boot.ContMgrBranchSignal, args, nil); err != nil {
+		return fmt.Errorf("signaling live branch %q: %w", args.BranchID, err)
+	}
+	return nil
+}
+
+// WaitBranch waits for a process in one in-memory branch.
+func (s *Sandbox) WaitBranch(args *boot.BranchWaitArgs) (uint32, error) {
+	var waitStatus uint32
+	if err := s.call(boot.ContMgrBranchWait, args, &waitStatus); err != nil {
+		return 0, fmt.Errorf("waiting in live branch %q: %w", args.BranchID, err)
+	}
+	return waitStatus, nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

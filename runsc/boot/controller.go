@@ -108,6 +108,15 @@ const (
 	// ContMgrDestroyBranch destroys one non-default in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
 
+	// ContMgrBranchProcesses lists processes in one in-memory branch.
+	ContMgrBranchProcesses = "containerManager.BranchProcesses"
+
+	// ContMgrBranchSignal sends a signal within one in-memory branch.
+	ContMgrBranchSignal = "containerManager.BranchSignal"
+
+	// ContMgrBranchWait waits for a process in one in-memory branch.
+	ContMgrBranchWait = "containerManager.BranchWait"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -950,6 +959,26 @@ func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 // DestroyBranch destroys one non-default branch.
 func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Destroy(args.ID)
+}
+
+// BranchProcesses returns processes from one branch.
+func (cm *containerManager) BranchProcesses(args *BranchProcessesArgs, out *[]*control.Process) error {
+	return cm.l.family.Processes(args.BranchID, args.CID, out)
+}
+
+// BranchSignal sends a signal within one branch.
+func (cm *containerManager) BranchSignal(args *BranchSignalArgs, _ *struct{}) error {
+	return cm.l.family.Signal(args.BranchID, args.CID, args.PID, args.Signo, args.Mode)
+}
+
+// BranchWait waits for a process in one branch.
+func (cm *containerManager) BranchWait(args *BranchWaitArgs, waitStatus *uint32) error {
+	status, err := cm.l.family.Wait(args.BranchID, args.CID, args.PID)
+	if err != nil {
+		return err
+	}
+	*waitStatus = status
+	return nil
 }
 
 // Wait waits for the init process in the given container.

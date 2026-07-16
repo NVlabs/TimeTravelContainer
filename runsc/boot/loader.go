@@ -743,9 +743,16 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
+	// Create a watchdog.
+	dogOpts := watchdog.DefaultOpts
+	if err := dogOpts.TaskTimeoutAction.Set(args.Conf.WatchdogAction); err != nil {
+		return nil, fmt.Errorf("setting watchdog action: %w", err)
+	}
+	l.watchdog = watchdog.New(l.k, dogOpts)
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
 		AllowSharedFilesystemResources: args.Spec.Root != nil && args.Spec.Root.Readonly && len(args.Spec.Mounts) == 0,
+		WatchdogOpts:                   &dogOpts,
 	})
 
 	if err := registerFilesystems(l.k, &l.root); err != nil {
@@ -760,13 +767,6 @@ func New(args Args) (*Loader, error) {
 		log.Infof("Packet logging disabled")
 		sniffer.LogPackets.Store(0)
 	}
-
-	// Create a watchdog.
-	dogOpts := watchdog.DefaultOpts
-	if err := dogOpts.TaskTimeoutAction.Set(args.Conf.WatchdogAction); err != nil {
-		return nil, fmt.Errorf("setting watchdog action: %w", err)
-	}
-	l.watchdog = watchdog.New(l.k, dogOpts)
 
 	procArgs, err := createProcessArgs(args.ID, args.Spec, args.Conf, creds, l.k, l.k.RootPIDNamespace())
 	if err != nil {

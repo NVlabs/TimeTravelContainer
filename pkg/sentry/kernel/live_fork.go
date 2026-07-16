@@ -98,8 +98,14 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 		k.mf.IncOwner()
 		ownerTransferred := false
+		childLoaded := false
 		defer func() {
-			if !ownerTransferred {
+			if ownerTransferred {
+				return
+			}
+			if childLoaded {
+				child.Release()
+			} else {
 				k.mf.Destroy()
 			}
 		}()
@@ -116,7 +122,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
 		}
-		ownerTransferred = true
+		childLoaded = true
 
 		if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
 			return err
@@ -129,6 +135,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return vfs.PrependErrMsg("VFS live-fork restore failed", err)
 		}
 		child.Pause()
+		ownerTransferred = true
 		return nil
 	})
 	if err != nil {
