@@ -39,8 +39,10 @@ type Store struct {
 // PrepareOptions describes an image-backed OCI bundle.
 type PrepareOptions struct {
 	SpecOptions
-	Reference string
-	Platform  string
+	Reference          string
+	Platform           string
+	ConsoleLogMaxBytes int64
+	ConsoleLogMaxFiles int
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -52,18 +54,20 @@ type Prepared struct {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	Name       string          `json:"name"`
-	Reference  string          `json:"reference"`
-	Digest     string          `json:"digest"`
-	Platform   string          `json:"platform"`
-	BundleDir  string          `json:"bundle_dir"`
-	RootFS     string          `json:"rootfs"`
-	Volumes    []ManagedVolume `json:"volumes,omitempty"`
-	State      string          `json:"state"`
-	ExitStatus *int            `json:"exit_status,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
-	StartedAt  *time.Time      `json:"started_at,omitempty"`
-	ExitedAt   *time.Time      `json:"exited_at,omitempty"`
+	Name               string          `json:"name"`
+	Reference          string          `json:"reference"`
+	Digest             string          `json:"digest"`
+	Platform           string          `json:"platform"`
+	BundleDir          string          `json:"bundle_dir"`
+	RootFS             string          `json:"rootfs"`
+	Volumes            []ManagedVolume `json:"volumes,omitempty"`
+	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
+	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
+	State              string          `json:"state"`
+	ExitStatus         *int            `json:"exit_status,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
+	StartedAt          *time.Time      `json:"started_at,omitempty"`
+	ExitedAt           *time.Time      `json:"exited_at,omitempty"`
 }
 
 // ConsolePaths are persistent host-side files for one branch's init console.
@@ -139,15 +143,17 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, fmt.Errorf("writing OCI config: %w", err)
 	}
 	metadata := ContainerInfo{
-		Name:      opts.Name,
-		Reference: imageInfo.Reference,
-		Digest:    pulled.Digest,
-		Platform:  imageInfo.Platform,
-		BundleDir: bundleDir,
-		RootFS:    rootfs,
-		Volumes:   append([]ManagedVolume(nil), opts.ManagedVolumes...),
-		State:     "created",
-		CreatedAt: time.Now().UTC(),
+		Name:               opts.Name,
+		Reference:          imageInfo.Reference,
+		Digest:             pulled.Digest,
+		Platform:           imageInfo.Platform,
+		BundleDir:          bundleDir,
+		RootFS:             rootfs,
+		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
+		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
+		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
+		State:              "created",
+		CreatedAt:          time.Now().UTC(),
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)

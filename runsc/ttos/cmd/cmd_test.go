@@ -285,7 +285,7 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -314,6 +314,22 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(b.runRequest.managedVolumes, wantVolumes) {
 		t.Errorf("managed volumes=%+v, want %+v", b.runRequest.managedVolumes, wantVolumes)
+	}
+	if b.runRequest.consoleLogMaxBytes != 1572864 || b.runRequest.consoleLogMaxFiles != 4 {
+		t.Errorf("log retention=(%d, %d), want (1572864, 4)", b.runRequest.consoleLogMaxBytes, b.runRequest.consoleLogMaxFiles)
+	}
+}
+
+func TestRunRejectsInvalidLogOptions(t *testing.T) {
+	for _, option := range []string{"max-size=0", "max-size=nope", "max-file=0", "unknown=value", "missing"} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand([]string{"run", "--log-opt", option, "busybox"}, &stdout, &stderr, b); status != 1 {
+			t.Errorf("--log-opt %q status=%d, want 1", option, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("--log-opt %q invoked backend with %+v", option, b.runRequest)
+		}
 	}
 }
 
@@ -596,6 +612,37 @@ func TestConsoleLogFollowerFollowsLiveRotation(t *testing.T) {
 	}
 }
 
+func TestConsoleLogFollowerReportsRetentionOverrun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.log")
+	w, err := ttosconsole.NewRotatingWriterWithFiles(path, 10, 2)
+	if err != nil {
+		t.Fatalf("NewRotatingWriterWithFiles: %v", err)
+	}
+	if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte("first")); err != nil {
+		t.Fatalf("WriteFrame(first): %v", err)
+	}
+	follower, err := openConsoleLogFollower(path, 2)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	for _, value := range []string{"second", "third"} {
+		if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	var stdout bytes.Buffer
+	_, err = follower.drain(&stdout, nil)
+	if err == nil || !strings.Contains(err.Error(), "fell behind retention") {
+		t.Fatalf("drain error=%v, want retention overrun", err)
+	}
+	if got, want := stdout.String(), "first"; got != want {
+		t.Errorf("stdout before overrun=%q, want %q", got, want)
+	}
+}
 func TestConsoleLogFollowerReplaysRetainedGeneration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "main.log")
 	w, err := ttosconsole.NewRotatingWriter(path, 28)
@@ -627,6 +674,33 @@ func TestConsoleLogFollowerReplaysRetainedGeneration(t *testing.T) {
 	}
 }
 
+func TestConsoleLogFollowerReplaysMultipleGenerations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.log")
+	w, err := ttosconsole.NewRotatingWriterWithFiles(path, 10, 3)
+	if err != nil {
+		t.Fatalf("NewRotatingWriterWithFiles: %v", err)
+	}
+	for _, value := range []string{"drop", "two", "three", "four"} {
+		if err := ttosconsole.WriteFrame(w, ttosconsole.StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	follower, err := openConsoleLogFollower(path, 3)
+	if err != nil {
+		t.Fatalf("openConsoleLogFollower: %v", err)
+	}
+	defer follower.file.Close()
+	var stdout bytes.Buffer
+	if progress, err := follower.drain(&stdout, nil); err != nil || !progress {
+		t.Fatalf("drain: progress=%t err=%v", progress, err)
+	}
+	if got, want := stdout.String(), "twothreefour"; got != want {
+		t.Errorf("stdout=%q, want %q", got, want)
+	}
+}
 func TestConsoleDrainHealth(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "console.lock")
@@ -865,7 +939,8 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "16777216" ] && [ "${10}" = "web" ] && [ "${11}" = "console-follow" ] && [ "${12}" = "child" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "web" ] && [ "${13}" = "console-follow" ] && [ "${14}" = "child" ]; then
+	touch "$0.retention"
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "child" ]; then
@@ -898,7 +973,7 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now()})
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
 	}
@@ -912,6 +987,10 @@ exit 2
 	staleRotatedLog := filepath.Join(consoleDir, "child.log"+ttosconsole.RotatedSuffix)
 	if err := os.WriteFile(staleRotatedLog, []byte("stale"), 0600); err != nil {
 		t.Fatalf("writing stale rotated log: %v", err)
+	}
+	staleOlderLog := ttosconsole.GenerationPath(filepath.Join(consoleDir, "child.log"), 2)
+	if err := os.WriteFile(staleOlderLog, []byte("older"), 0600); err != nil {
+		t.Fatalf("writing older stale log: %v", err)
 	}
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
 	families, err := b.listFamilies()
@@ -934,6 +1013,21 @@ exit 2
 	if _, err := os.Stat(staleRotatedLog); !os.IsNotExist(err) {
 		t.Errorf("stale rotated log still exists: %v", err)
 	}
+	if _, err := os.Stat(staleOlderLog); !os.IsNotExist(err) {
+		t.Errorf("older stale log still exists: %v", err)
+	}
+	marker := runsc + ".retention"
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("console sidecar did not receive persisted retention flags")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	processes, err := b.processes(selector{container: "web", branch: "child"})
 	if err != nil {
 		t.Fatalf("processes: %v", err)

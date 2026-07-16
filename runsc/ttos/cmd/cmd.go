@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +49,7 @@ const (
 	defaultImageNamespace   = "ttos"
 	defaultBranchID         = "main"
 	defaultConsoleLogMax    = int64(16 << 20)
+	defaultConsoleLogFiles  = 2
 )
 
 var (
@@ -566,20 +568,94 @@ func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.H
 	return ttosbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: true}, nil
 }
 
+func parseLogOptions(values []string) (int64, int, error) {
+	maxBytes := defaultConsoleLogMax
+	maxFiles := defaultConsoleLogFiles
+	for _, option := range values {
+		key, value, found := strings.Cut(option, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !found || key == "" || value == "" {
+			return 0, 0, fmt.Errorf("invalid --log-opt %q; want KEY=VALUE", option)
+		}
+		switch key {
+		case "max-size":
+			parsed, err := parseLogSize(value)
+			if err != nil {
+				return 0, 0, fmt.Errorf("invalid --log-opt max-size=%q: %w", value, err)
+			}
+			maxBytes = parsed
+		case "max-file":
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 1 {
+				return 0, 0, fmt.Errorf("invalid --log-opt max-file=%q: must be a positive integer", value)
+			}
+			maxFiles = parsed
+		default:
+			return 0, 0, fmt.Errorf("unsupported --log-opt %q; supported options are max-size and max-file", key)
+		}
+	}
+	return maxBytes, maxFiles, nil
+}
+
+func parseLogSize(value string) (int64, error) {
+	type unit struct {
+		suffix     string
+		multiplier float64
+	}
+	units := []unit{
+		{suffix: "tib", multiplier: 1 << 40}, {suffix: "tb", multiplier: 1 << 40},
+		{suffix: "gib", multiplier: 1 << 30}, {suffix: "gb", multiplier: 1 << 30},
+		{suffix: "mib", multiplier: 1 << 20}, {suffix: "mb", multiplier: 1 << 20},
+		{suffix: "kib", multiplier: 1 << 10}, {suffix: "kb", multiplier: 1 << 10},
+		{suffix: "t", multiplier: 1 << 40}, {suffix: "g", multiplier: 1 << 30},
+		{suffix: "m", multiplier: 1 << 20}, {suffix: "k", multiplier: 1 << 10},
+		{suffix: "b", multiplier: 1},
+	}
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return 0, errors.New("size must not be empty")
+	}
+	number := normalized
+	multiplier := float64(1)
+	for _, candidate := range units {
+		if strings.HasSuffix(normalized, candidate.suffix) {
+			number = strings.TrimSpace(strings.TrimSuffix(normalized, candidate.suffix))
+			multiplier = candidate.multiplier
+			break
+		}
+	}
+	parsed, err := strconv.ParseFloat(number, 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 {
+		return 0, errors.New("size must be a positive number with an optional k, m, g, or t suffix")
+	}
+	bytes := parsed * multiplier
+	if bytes > float64(math.MaxInt64) {
+		return 0, errors.New("size overflows int64 bytes")
+	}
+	result := int64(bytes)
+	if result < 1 {
+		return 0, errors.New("size must be at least one byte")
+	}
+	return result, nil
+}
+
 type runRequest struct {
-	name           string
-	reference      string
-	platform       string
-	args           []string
-	env            []string
-	cwd            string
-	user           string
-	hostname       string
-	entrypoint     []string
-	hostMounts     []ttosbundle.HostMount
-	managedVolumes []ttosbundle.ManagedVolume
-	detach         bool
-	interactive    bool
+	name               string
+	reference          string
+	platform           string
+	args               []string
+	env                []string
+	cwd                string
+	user               string
+	hostname           string
+	entrypoint         []string
+	hostMounts         []ttosbundle.HostMount
+	consoleLogMaxBytes int64
+	consoleLogMaxFiles int
+	managedVolumes     []ttosbundle.ManagedVolume
+	detach             bool
+	interactive        bool
 }
 
 type execRequest struct {
@@ -619,6 +695,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
+	var logOptions stringSlice
+	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -635,23 +713,29 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	request := runRequest{
-		name:           containerName,
-		reference:      fs.Arg(0),
-		platform:       *platform,
-		args:           append([]string(nil), fs.Args()[1:]...),
-		env:            append([]string(nil), env...),
-		cwd:            *cwd,
-		user:           *user,
-		hostname:       *hostname,
-		hostMounts:     parsedMounts.host,
-		managedVolumes: parsedMounts.managed,
-		detach:         *detach,
-		interactive:    *interactive,
+		name:               containerName,
+		reference:          fs.Arg(0),
+		platform:           *platform,
+		args:               append([]string(nil), fs.Args()[1:]...),
+		env:                append([]string(nil), env...),
+		cwd:                *cwd,
+		user:               *user,
+		hostname:           *hostname,
+		hostMounts:         parsedMounts.host,
+		managedVolumes:     parsedMounts.managed,
+		consoleLogMaxBytes: logMaxBytes,
+		consoleLogMaxFiles: logMaxFiles,
+		detach:             *detach,
+		interactive:        *interactive,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -692,6 +776,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
+	var logOptions stringSlice
+	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -702,21 +788,27 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
 	request := runRequest{
-		name:           containerName,
-		reference:      fs.Arg(0),
-		platform:       *platform,
-		args:           append([]string(nil), fs.Args()[1:]...),
-		env:            append([]string(nil), env...),
-		cwd:            *cwd,
-		user:           *user,
-		hostname:       *hostname,
-		hostMounts:     parsedMounts.host,
-		managedVolumes: parsedMounts.managed,
+		name:               containerName,
+		reference:          fs.Arg(0),
+		platform:           *platform,
+		args:               append([]string(nil), fs.Args()[1:]...),
+		env:                append([]string(nil), env...),
+		cwd:                *cwd,
+		user:               *user,
+		hostname:           *hostname,
+		hostMounts:         parsedMounts.host,
+		managedVolumes:     parsedMounts.managed,
+		consoleLogMaxBytes: logMaxBytes,
+		consoleLogMaxFiles: logMaxFiles,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -1626,8 +1718,10 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 			ManagedVolumes: request.managedVolumes,
 			HostMounts:     request.hostMounts,
 		},
-		Reference: request.reference,
-		Platform:  request.platform,
+		Reference:          request.reference,
+		Platform:           request.platform,
+		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 	})
 	if err != nil {
 		return 1, err
@@ -1653,8 +1747,10 @@ func (b *runtimeBackend) create(request runRequest) error {
 			HostMounts:     request.hostMounts,
 			ManagedVolumes: request.managedVolumes,
 		},
-		Reference: request.reference,
-		Platform:  request.platform,
+		Reference:          request.reference,
+		Platform:           request.platform,
+		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 	})
 	return err
 }
@@ -1714,29 +1810,69 @@ type attachWaitResult struct {
 type consoleLogFollower struct {
 	file      *os.File
 	path      string
-	nextPath  string
-	retained  os.FileInfo
+	maxFiles  int
 	pending   []byte
 	stdoutEOF bool
 	stderrEOF bool
 }
 
-func openConsoleLogFollower(path string) (*consoleLogFollower, error) {
-	activePath := path
-	nextPath := ""
-	var retained os.FileInfo
-	if info, err := os.Stat(path + ttosconsole.RotatedSuffix); err == nil {
-		activePath = path + ttosconsole.RotatedSuffix
-		nextPath = path
-		retained = info
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("stating rotated console log: %w", err)
+type consoleLogGeneration struct {
+	generation int
+	path       string
+	info       os.FileInfo
+}
+
+func listConsoleLogGenerations(path string, maxFiles int) ([]consoleLogGeneration, error) {
+	var generations []consoleLogGeneration
+	for generation := maxFiles - 1; generation >= 0; generation-- {
+		generationPath := ttosconsole.GenerationPath(path, generation)
+		info, err := os.Stat(generationPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stating console log generation %d: %w", generation, err)
+		}
+		generations = append(generations, consoleLogGeneration{
+			generation: generation,
+			path:       generationPath,
+			info:       info,
+		})
 	}
-	file, err := os.Open(activePath)
-	if err != nil {
-		return nil, fmt.Errorf("opening console log: %w", err)
+	return generations, nil
+}
+
+func openConsoleLogFollower(path string, maxFilesValues ...int) (*consoleLogFollower, error) {
+	maxFiles := defaultConsoleLogFiles
+	if len(maxFilesValues) != 0 {
+		maxFiles = maxFilesValues[0]
 	}
-	return &consoleLogFollower{file: file, path: path, nextPath: nextPath, retained: retained}, nil
+	if maxFiles < 1 {
+		return nil, fmt.Errorf("console log max files must be at least 1, got %d", maxFiles)
+	}
+	for attempts := 0; attempts < 4; attempts++ {
+		generations, err := listConsoleLogGenerations(path, maxFiles)
+		if err != nil {
+			return nil, err
+		}
+		if len(generations) == 0 {
+			return nil, fmt.Errorf("opening console log: %w", os.ErrNotExist)
+		}
+		oldest := generations[0]
+		file, err := os.Open(oldest.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("opening console log generation %d: %w", oldest.generation, err)
+		}
+		info, err := file.Stat()
+		if err == nil && os.SameFile(info, oldest.info) {
+			return &consoleLogFollower{file: file, path: path, maxFiles: maxFiles}, nil
+		}
+		file.Close()
+	}
+	return nil, errors.New("console logs rotated repeatedly while opening the oldest generation")
 }
 
 func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
@@ -1773,77 +1909,58 @@ func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
 }
 
 func (f *consoleLogFollower) advance() (bool, error) {
-	if f.nextPath != "" {
-		if len(f.pending) != 0 {
-			return false, fmt.Errorf("rotated console log ended with %d bytes of an incomplete frame", len(f.pending))
-		}
-		file, err := os.Open(f.nextPath)
+	for attempts := 0; attempts < 4; attempts++ {
+		openInfo, err := f.file.Stat()
 		if err != nil {
-			if os.IsNotExist(err) {
+			return false, fmt.Errorf("stating open console log: %w", err)
+		}
+		generations, err := listConsoleLogGenerations(f.path, f.maxFiles)
+		if err != nil {
+			return false, err
+		}
+		if len(generations) == 0 {
+			return false, nil
+		}
+		next := -1
+		for index := range generations {
+			if os.SameFile(openInfo, generations[index].info) {
+				if index+1 < len(generations) {
+					next = index + 1
+				}
+				break
+			}
+		}
+		if next < 0 {
+			active := generations[len(generations)-1]
+			if os.SameFile(openInfo, active.info) {
 				return false, nil
 			}
-			return false, fmt.Errorf("opening next console log generation: %w", err)
+			return false, errors.New("console log reader fell behind retention; an unread generation was evicted")
+		}
+		if len(f.pending) != 0 {
+			return false, fmt.Errorf("console log rotated with %d bytes of an incomplete frame", len(f.pending))
+		}
+		candidate := generations[next]
+		file, err := os.Open(candidate.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("opening console log generation %d: %w", candidate.generation, err)
+		}
+		candidateInfo, err := file.Stat()
+		if err != nil || !os.SameFile(candidateInfo, candidate.info) {
+			file.Close()
+			continue
 		}
 		if err := f.file.Close(); err != nil {
 			file.Close()
 			return false, fmt.Errorf("closing previous console log generation: %w", err)
 		}
 		f.file = file
-		f.nextPath = ""
 		return true, nil
 	}
-	openInfo, err := f.file.Stat()
-	if err != nil {
-		return false, fmt.Errorf("stating open console log: %w", err)
-	}
-	rotatedPath := f.path + ttosconsole.RotatedSuffix
-	rotatedInfo, rotatedErr := os.Stat(rotatedPath)
-	if rotatedErr == nil && !os.SameFile(openInfo, rotatedInfo) &&
-		(f.retained == nil || !os.SameFile(f.retained, rotatedInfo)) {
-		if len(f.pending) != 0 {
-			return false, fmt.Errorf("console log rotated with %d bytes of an incomplete frame", len(f.pending))
-		}
-		file, err := os.Open(rotatedPath)
-		if err != nil {
-			return false, fmt.Errorf("opening retained console log generation: %w", err)
-		}
-		if err := f.file.Close(); err != nil {
-			file.Close()
-			return false, fmt.Errorf("closing superseded console log generation: %w", err)
-		}
-		f.file = file
-		f.nextPath = f.path
-		f.retained = rotatedInfo
-		return true, nil
-	} else if rotatedErr != nil && !os.IsNotExist(rotatedErr) {
-		return false, fmt.Errorf("stating retained console log generation: %w", rotatedErr)
-	}
-	pathInfo, err := os.Stat(f.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("stating current console log: %w", err)
-	}
-	if os.SameFile(openInfo, pathInfo) {
-		return false, nil
-	}
-	if len(f.pending) != 0 {
-		return false, fmt.Errorf("console log rotated with %d bytes of an incomplete frame", len(f.pending))
-	}
-	if rotatedErr == nil && os.SameFile(openInfo, rotatedInfo) {
-		f.retained = rotatedInfo
-	}
-	file, err := os.Open(f.path)
-	if err != nil {
-		return false, fmt.Errorf("opening rotated console log: %w", err)
-	}
-	if err := f.file.Close(); err != nil {
-		file.Close()
-		return false, fmt.Errorf("closing rotated console log: %w", err)
-	}
-	f.file = file
-	return true, nil
+	return false, errors.New("console logs rotated repeatedly while advancing generations")
 }
 
 func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
@@ -1898,6 +2015,10 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 	if err != nil {
 		return 0, err
 	}
+	_, maxFiles, err := b.consoleRetention(target.container)
+	if err != nil {
+		return 0, err
+	}
 	if interactive {
 		inputLock, err := acquireConsoleStdin(paths.StdinLock, target)
 		if err != nil {
@@ -1920,7 +2041,7 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 			}()
 		}
 	}
-	follower, err := openConsoleLogFollower(paths.Log)
+	follower, err := openConsoleLogFollower(paths.Log, maxFiles)
 	if err != nil {
 		return 0, err
 	}
@@ -2097,7 +2218,11 @@ func (b *runtimeBackend) logs(target selector, follow bool, tail int) error {
 	if err != nil {
 		return err
 	}
-	follower, err := openConsoleLogFollower(paths.Log)
+	_, maxFiles, err := b.consoleRetention(target.container)
+	if err != nil {
+		return err
+	}
+	follower, err := openConsoleLogFollower(paths.Log, maxFiles)
 	if err != nil {
 		return err
 	}
@@ -2136,6 +2261,23 @@ func (b *runtimeBackend) logs(target selector, follow bool, tail int) error {
 	}
 }
 
+func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	info, err := store.LoadContainer(container)
+	if err != nil {
+		return 0, 0, fmt.Errorf("loading console retention for %s: %w", container, err)
+	}
+	maxBytes := info.ConsoleLogMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultConsoleLogMax
+	}
+	maxFiles := info.ConsoleLogMaxFiles
+	if maxFiles < 1 {
+		maxFiles = defaultConsoleLogFiles
+	}
+	return maxBytes, maxFiles, nil
+}
+
 func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbundle.ConsolePaths, error) {
 	store := ttosbundle.Store{Root: b.dataRoot}
 	paths, err := store.BranchConsolePaths(target.container, target.branch)
@@ -2156,9 +2298,19 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 		}
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("locking console drain: %w", err)
 	}
+	maxBytes, maxFiles, err := b.consoleRetention(target.container)
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, err
+	}
 	if reset {
-		if err := os.Remove(paths.Log + ttosconsole.RotatedSuffix); err != nil && !os.IsNotExist(err) {
-			return ttosbundle.ConsolePaths{}, fmt.Errorf("removing rotated console log: %w", err)
+		for generation := 1; ; generation++ {
+			err := os.Remove(ttosconsole.GenerationPath(paths.Log, generation))
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				return ttosbundle.ConsolePaths{}, fmt.Errorf("removing console log generation %d: %w", generation, err)
+			}
 		}
 	}
 	logFlags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
@@ -2186,7 +2338,8 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 		"--root", b.root,
 		"timetravel", "--console", "init",
 		"--console-log", paths.Log,
-		"--console-log-max-bytes", strconv.FormatInt(defaultConsoleLogMax, 10),
+		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
+		"--console-log-max-files", strconv.Itoa(maxFiles),
 		target.container, "console-follow", target.branch,
 	)
 	command.Stderr = errorFile

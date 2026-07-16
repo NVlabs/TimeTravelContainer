@@ -18,16 +18,27 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 )
 
 // RotatedSuffix is appended to the immediately preceding log generation.
 const RotatedSuffix = ".1"
 
-// RotatingWriter retains the current log and one previous generation. WriteFrame
+// GenerationPath returns the path for a log generation. Generation zero is the
+// active log; positive generations are older, with larger values being older.
+func GenerationPath(path string, generation int) string {
+	if generation <= 0 {
+		return path
+	}
+	return path + "." + strconv.Itoa(generation)
+}
+
+// RotatingWriter retains a configurable number of generations. WriteFrame
 // submits a whole encoded frame in one Write, so rotation never splits a frame.
 type RotatingWriter struct {
 	path     string
 	maxBytes int64
+	maxFiles int
 	file     *os.File
 	size     int64
 }
@@ -35,8 +46,17 @@ type RotatingWriter struct {
 // NewRotatingWriter opens path for append. maxBytes <= 0 disables rotation.
 // A single frame larger than maxBytes is retained whole and may exceed the cap.
 func NewRotatingWriter(path string, maxBytes int64) (*RotatingWriter, error) {
+	return NewRotatingWriterWithFiles(path, maxBytes, 2)
+}
+
+// NewRotatingWriterWithFiles is equivalent to NewRotatingWriter, retaining
+// maxFiles generations including the active log.
+func NewRotatingWriterWithFiles(path string, maxBytes int64, maxFiles int) (*RotatingWriter, error) {
 	if path == "" {
 		return nil, errors.New("rotating console log path must not be empty")
+	}
+	if maxFiles < 1 {
+		return nil, fmt.Errorf("rotating console log max files must be at least 1, got %d", maxFiles)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
@@ -47,7 +67,17 @@ func NewRotatingWriter(path string, maxBytes int64) (*RotatingWriter, error) {
 		file.Close()
 		return nil, fmt.Errorf("stating rotating console log: %w", err)
 	}
-	return &RotatingWriter{path: path, maxBytes: maxBytes, file: file, size: info.Size()}, nil
+	for generation := maxFiles; ; generation++ {
+		err := os.Remove(GenerationPath(path, generation))
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("removing excess console log generation %d: %w", generation, err)
+		}
+	}
+	return &RotatingWriter{path: path, maxBytes: maxBytes, maxFiles: maxFiles, file: file, size: info.Size()}, nil
 }
 
 // Write implements io.Writer.
@@ -81,12 +111,24 @@ func (w *RotatingWriter) rotate() error {
 		return fmt.Errorf("closing console log before rotation: %w", err)
 	}
 	w.file = nil
-	rotated := w.path + RotatedSuffix
-	if err := os.Remove(rotated); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing old console log generation: %w", err)
-	}
-	if err := os.Rename(w.path, rotated); err != nil {
-		return fmt.Errorf("rotating console log: %w", err)
+	if w.maxFiles == 1 {
+		if err := os.Remove(w.path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing active console log during rotation: %w", err)
+		}
+	} else {
+		for generation := w.maxFiles - 1; generation >= 1; generation-- {
+			destination := GenerationPath(w.path, generation)
+			if err := os.Remove(destination); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing console log generation %d: %w", generation, err)
+			}
+			source := GenerationPath(w.path, generation-1)
+			if err := os.Rename(source, destination); err != nil {
+				if os.IsNotExist(err) && generation > 1 {
+					continue
+				}
+				return fmt.Errorf("rotating console log generation %d: %w", generation, err)
+			}
+		}
 	}
 	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {

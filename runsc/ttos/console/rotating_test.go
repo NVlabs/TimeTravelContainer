@@ -73,6 +73,53 @@ func TestRotatingWriterReopenAndOversizedFrame(t *testing.T) {
 	}
 }
 
+func TestRotatingWriterConfigurableGenerations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console.log")
+	w, err := NewRotatingWriterWithFiles(path, 10, 3)
+	if err != nil {
+		t.Fatalf("NewRotatingWriterWithFiles: %v", err)
+	}
+	for _, value := range []string{"one", "two", "three", "four"} {
+		if err := WriteFrame(w, StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for generation, want := range map[int][]string{
+		2: {"two"},
+		1: {"three"},
+		0: {"four"},
+	} {
+		if got := readFrameStrings(t, GenerationPath(path, generation)); !reflect.DeepEqual(got, want) {
+			t.Errorf("generation %d frames=%q, want %q", generation, got, want)
+		}
+	}
+	if _, err := os.Stat(GenerationPath(path, 3)); !os.IsNotExist(err) {
+		t.Errorf("generation 3 exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRotatingWriterSingleFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console.log")
+	w, err := NewRotatingWriterWithFiles(path, 10, 1)
+	if err != nil {
+		t.Fatalf("NewRotatingWriterWithFiles: %v", err)
+	}
+	for _, value := range []string{"old", "new"} {
+		if err := WriteFrame(w, StreamStderr, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got, want := readFrameStrings(t, path), []string{"new"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("current frames=%q, want %q", got, want)
+	}
+}
+
 func readFrameStrings(t *testing.T, path string) []string {
 	t.Helper()
 	data, err := os.ReadFile(path)

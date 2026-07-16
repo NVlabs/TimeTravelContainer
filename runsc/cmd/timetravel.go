@@ -49,6 +49,7 @@ type TimeTravel struct {
 	consoleData     string
 	consoleLog      string
 	consoleLogMax   int64
+	consoleLogFiles int
 }
 
 // Name implements subcommands.Command.Name.
@@ -82,6 +83,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
 	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
 	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
+	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -189,7 +191,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		var writer io.Writer = &util.Writer{}
 		var logWriter *ttosconsole.RotatingWriter
 		if t.consoleLog != "" {
-			logWriter, err = ttosconsole.NewRotatingWriter(t.consoleLog, t.consoleLogMax)
+			logWriter, err = ttosconsole.NewRotatingWriterWithFiles(t.consoleLog, t.consoleLogMax, t.consoleLogFiles)
 			if err != nil {
 				break
 			}

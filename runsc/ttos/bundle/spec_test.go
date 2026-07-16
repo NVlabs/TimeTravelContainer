@@ -162,7 +162,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, State: "created", CreatedAt: time.Now()}); err != nil {
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	status := 17
@@ -175,6 +175,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if len(containers) != 1 || containers[0].State != "exited" || containers[0].ExitStatus == nil || *containers[0].ExitStatus != 17 || containers[0].ExitedAt == nil {
 		t.Fatalf("containers=%+v", containers)
+	}
+	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
+		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
 	}
 	paths, err := store.BranchConsolePaths("demo", "test-a")
 	if err != nil {

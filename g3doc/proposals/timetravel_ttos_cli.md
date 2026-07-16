@@ -15,15 +15,15 @@ tmpfs volumes can be attached at one or more paths, and their state forks CoW
 with each live branch. An opt-in non-TTY internal-console substrate now provides
 branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
-into a Docker-multiplexed host log with frame-safe bounded rotation (a 16 MiB
-current generation plus one retained generation); `ttos attach` and `ttos logs
-[-f] [--tail all|N]` replay, tail, or follow rotations independently. This
-supports optional stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach,
-foreground `run`/`start`,
-detached output draining, and multiple output readers without placing host FDs
-in the guest resource graph. `ttosd`, configurable retention, daemon-owned stdin
-ownership, TTY detach, detached and TTY exec, persistent managed-volume backing,
-and managed OverlayFS volumes remain TODO.
+into a Docker-multiplexed host log with frame-safe bounded rotation (defaulting
+to two 16 MiB generations and configurable with Docker-style `--log-opt
+max-size=...` and `max-file=...`); `ttos attach` and `ttos logs [-f] [--tail
+all|N]` replay, tail, or follow rotations independently. This supports optional
+stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground
+`run`/`start`, detached output draining, and multiple output readers without
+placing host FDs in the guest resource graph. `ttosd`, daemon-owned stdin
+ownership, TTY detach, detached and TTY exec, persistent managed-volume
+backing, and managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -139,8 +139,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       stdout/stderr streams and backed by branch-local persistent console logs.
 - [x] Add Docker-compatible `logs --tail all|N`, including global logical-line
       ordering across the retained and active log generations and `--tail 0 -f`.
+- [x] Persist Docker-style `run/create --log-opt max-size=SIZE` and
+      `max-file=COUNT` and apply them to every branch sidecar.
 - [ ] Add Docker-compatible `--since`, `--until`, timestamps, details,
-      configurable retention, and explicit logging-driver policy.
+      and explicit logging-driver policy.
 - [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
       `ttos top [--json] CONTAINER[@BRANCH]` process listing.
 - [ ] Add Docker-compatible `ps` filters, formatting, size/latest options, and
@@ -210,8 +212,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial bounded retention: rotate only between complete multiplexed
       frames, keeping a 16 MiB current generation and one retained generation;
       readers follow inode replacement without duplicating frames.
-- [ ] Make retention size and generation count configurable, and define
-      backpressure and log-truncation diagnostics.
+- [x] Make retention size and generation count configurable, persist the
+      settings per container, and report when a reader falls behind retention.
+- [ ] Define explicit backpressure policy and surface cumulative truncation
+      counters through inspect/events.
 - [x] Allow fork while output readers are attached: read RPCs serialize against
       fork, readers follow a host log, and a new child sidecar starts afterward.
 - [x] Keep branches fork-eligible before, during, and after output attachment;
@@ -466,8 +470,8 @@ grandchild branches without PID or wait-status crossover.
 - [x] Persistent single-consumer branch sidecars, multi-reader log replay/follow,
       and detached output draining without fork-inhibiting host FDs.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
-- [ ] Configurable log retention, daemon-owned stdin leases, and daemon-owned
-      transport/reconciliation.
+- [x] Persistent configurable log size/generation retention.
+- [ ] Daemon-owned stdin leases and daemon-owned transport/reconciliation.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
 - [x] Non-TTY console state fork and branch-local I/O.
