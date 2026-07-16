@@ -2,6 +2,11 @@
 
 Status: TODO roadmap following the live-fork prototype.
 
+Implementation status: an initial lightweight `ttos` client is available at
+`//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
+sandboxes through runsc's JSON command surface. Image-backed lifecycle,
+containerd, `ttosd`, exec, attach, mounts, and managed volumes remain TODO.
+
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
 Docker-like local container manager. The underlying live-fork design remains in
@@ -45,7 +50,7 @@ the `main` branch and leave `ttos` responsible for branch operations.
 ## Object and state model
 
 - [ ] Define a stable family ID and user-facing container name.
-- [ ] Define branch selectors, initially `<container>@<branch>`, with `main` as
+- [x] Define branch selectors, initially `<container>@<branch>`, with `main` as
       the default branch.
 - [ ] Define immutable branch creation lineage. `ParentID` remains historical
       even if an ancestor is destroyed.
@@ -98,16 +103,16 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### TimeTravel lifecycle
 
-- [ ] `ttos fork SOURCE [DESTINATION]`, for example `ttos fork web@main
+- [x] `ttos fork SOURCE [DESTINATION]`, for example `ttos fork web@main
       web@test-a`.
-- [ ] Support `--paused`, defaulting according to a documented policy.
-- [ ] `ttos pause CONTAINER[@BRANCH]`.
-- [ ] `ttos resume CONTAINER[@BRANCH]`.
-- [ ] `ttos branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
+- [x] Support `--paused`, defaulting according to a documented policy.
+- [x] `ttos pause CONTAINER[@BRANCH]`.
+- [x] `ttos resume CONTAINER[@BRANCH]`.
+- [x] `ttos branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
 - [ ] `ttos ls --tree` with a compact Unicode tree, current state, PID 1 state,
       parent, fork latency, source downtime, memory sharing, and creation time.
-- [ ] `ttos ls --json` with a stable machine-readable schema.
-- [ ] Mark deleted historical parents in tree output without reparenting their
+- [x] `ttos ls --json` with a stable machine-readable schema.
+- [x] Mark deleted historical parents in tree output without reparenting their
       descendants.
 - [ ] Display structured fork-ineligibility issues before attempting a fork.
 - [ ] Add `ttos fork --check SOURCE` for a read-only eligibility report.
@@ -296,8 +301,8 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [ ] Serialize conflicting lifecycle operations and make commands idempotent.
 - [ ] Add a versioned local API so the CLI and daemon may be upgraded
       independently.
-- [ ] Decide whether the first implementation invokes runsc directly or extends
-      `containerd-shim-runsc-v1`; keep the API boundary compatible with moving
+- [x] Use direct runsc invocation for the first lightweight client; later extend
+      `containerd-shim-runsc-v1`, keeping the API boundary compatible with moving
       branch control into the shim later.
 
 ## Docker and containerd compatibility
