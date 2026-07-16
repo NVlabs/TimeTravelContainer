@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -44,10 +45,28 @@ type savedDentryRW struct {
 	write bool
 }
 
+type liveForkFilesystemResource struct {
+	client *lisafs.Client
+	rootFD lisafs.ClientFD
+}
+
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	if len(fs.iopts.UniqueID.Path) == 0 {
 		return fmt.Errorf("gofer.filesystem with no UniqueID cannot be saved")
+	}
+	if resources := vfs.LiveForkFilesystemResourcesFromContext(ctx); resources != nil {
+		if fs.opts.directfs.enabled {
+			return fmt.Errorf("live fork does not support directfs gofer mounts")
+		}
+		root, ok := fs.root.inode.impl.(*lisafsInode)
+		if !ok || !root.controlFD.Ok() {
+			return fmt.Errorf("live fork cannot borrow gofer root for %q", fs.iopts.UniqueID)
+		}
+		resources[fs.iopts.UniqueID] = &liveForkFilesystemResource{
+			client: fs.client,
+			rootFD: root.controlFD,
+		}
 	}
 
 	// Purge cached dentries, which may not be reopenable after restore due to
@@ -268,20 +287,46 @@ func (d *dentry) loadParent(_ goContext.Context, parent *dentry) {
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
 func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
-	fdmap := vfs.RestoreFilesystemFDMapFromContext(ctx)
-	if fdmap == nil {
-		return fmt.Errorf("no server FD map available")
-	}
-	fd, ok := fdmap[fs.iopts.UniqueID]
-	if !ok {
-		return fmt.Errorf("no server FD available for filesystem with unique ID %q, map: %#v", fs.iopts.UniqueID, fdmap)
-	}
-	fs.opts.fd = fd
 	fs.inoByKey = make(map[inoKey]uint64)
 	fs.inodeByKey = make(map[inoKey]*inode)
 
-	if err := fs.restoreRoot(ctx, &opts); err != nil {
-		return vfs.PrependErrMsg("failed to restore root", err)
+	if resources := vfs.LiveForkFilesystemResourcesFromContext(ctx); resources != nil {
+		resourceAny, ok := resources[fs.iopts.UniqueID]
+		if !ok {
+			return fmt.Errorf("no live-fork resource for filesystem %q", fs.iopts.UniqueID)
+		}
+		resource, ok := resourceAny.(*liveForkFilesystemResource)
+		if !ok || resource.client == nil || !resource.rootFD.Ok() {
+			return fmt.Errorf("invalid live-fork resource for filesystem %q", fs.iopts.UniqueID)
+		}
+		fs.client = resource.client
+		fs.iopts.LeakConnection = true
+		root, ok := fs.root.inode.impl.(*lisafsInode)
+		if !ok {
+			return fmt.Errorf("live fork supports only lisafs gofer roots")
+		}
+		var stat lisafs.Statx
+		if err := resource.rootFD.StatTo(ctx, &stat); err != nil {
+			return fmt.Errorf("stating borrowed gofer root: %w", err)
+		}
+		root.borrowedControlFD = true
+		rootInode := lisafs.Inode{ControlFD: resource.rootFD.ID(), Stat: stat}
+		if err := root.restoreInode(ctx, &rootInode, &opts, fs.root); err != nil {
+			return vfs.PrependErrMsg("failed to borrow live-fork root", err)
+		}
+	} else {
+		fdmap := vfs.RestoreFilesystemFDMapFromContext(ctx)
+		if fdmap == nil {
+			return fmt.Errorf("no server FD map available")
+		}
+		fd, ok := fdmap[fs.iopts.UniqueID]
+		if !ok {
+			return fmt.Errorf("no server FD available for filesystem with unique ID %q, map: %#v", fs.iopts.UniqueID, fdmap)
+		}
+		fs.opts.fd = fd
+		if err := fs.restoreRoot(ctx, &opts); err != nil {
+			return vfs.PrependErrMsg("failed to restore root", err)
+		}
 	}
 
 	// Restore remaining dentries.

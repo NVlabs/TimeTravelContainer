@@ -743,7 +743,10 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
-	l.family = NewSandboxFamily(l.k)
+	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
+		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
+		AllowSharedFilesystemResources: args.Spec.Root != nil && args.Spec.Root.Readonly && len(args.Spec.Mounts) == 0,
+	})
 
 	if err := registerFilesystems(l.k, &l.root); err != nil {
 		return nil, fmt.Errorf("registering filesystems: %w", err)

@@ -33,7 +33,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	parent.Unpause()
 
-	family := NewSandboxFamily(parent)
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
 	child, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)

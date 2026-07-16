@@ -110,6 +110,13 @@ func (t *SampledTimer) Destroy() {
 	t.setting.Enabled = false
 	// Set timerDestroyed to prevent t.tick() from mutating timer state.
 	t.pauseState = timerDestroyed
+	// Restored timers are initialized lazily by Resume. A restored sandbox may
+	// be destroyed while it is still paused, in which case there are no host
+	// timer, waiter, or goroutine resources to tear down.
+	if t.kicker == nil {
+		t.mu.Unlock()
+		return
+	}
 	t.mu.Unlock()
 	t.kicker.Stop()
 	// Unregister t.entry, ensuring that the Clock will not send to t.events,

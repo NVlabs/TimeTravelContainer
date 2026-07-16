@@ -82,6 +82,7 @@ go_test(
     name = "ktime_test",
     size = "small",
     srcs = [
+        "sampled_timer_test.go",
         "synthetic_timer_test.go",
     ],
     library = ":ktime",

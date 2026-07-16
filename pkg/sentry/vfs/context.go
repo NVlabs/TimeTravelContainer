@@ -35,6 +35,10 @@ const (
 	// map[checkpoint.ResourceID]int mapping filesystem unique IDs (cf.
 	// gofer.InternalFilesystemOptions.UniqueID) to host FDs.
 	CtxRestoreFilesystemFDMap
+
+	// CtxLiveForkFilesystemResources is a Context.Value key for in-process
+	// filesystem resources indexed by stable filesystem ID.
+	CtxLiveForkFilesystemResources
 )
 
 // MountNamespaceFromContext returns the MountNamespace used by ctx. If ctx is
@@ -50,6 +54,16 @@ func MountNamespaceFromContext(ctx goContext.Context) *MountNamespace {
 
 // RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used
 // by ctx. If ctx is not associated with a RestoreFilesystemFDMap, returns nil.
+// LiveForkFilesystemResources maps stable filesystem IDs to implementation-
+// specific resources borrowed by an in-process clone.
+type LiveForkFilesystemResources map[checkpoint.ResourceID]any
+
+// LiveForkFilesystemResourcesFromContext returns live-fork resources, or nil.
+func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFilesystemResources {
+	resources, _ := ctx.Value(CtxLiveForkFilesystemResources).(LiveForkFilesystemResources)
+	return resources
+}
+
 func RestoreFilesystemFDMapFromContext(ctx goContext.Context) map[checkpoint.ResourceID]int {
 	fdmap, ok := ctx.Value(CtxRestoreFilesystemFDMap).(map[checkpoint.ResourceID]int)
 	if !ok {

@@ -197,6 +197,74 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
+func TestRunLiveForkNetworkNone(t *testing.T) {
+	spec := testSpec()
+	spec.Process.Args = []string{"/bin/sleep", "30"}
+	conf := testConfig()
+	conf.DirectFS = false
+	l, cleanup, err := createLoader(conf, spec)
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer cleanup()
+	defer l.Destroy()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- <-l.ctrl.manager.startResultChan
+	}()
+	if err := l.Run(); err != nil {
+		t.Fatalf("running container: %v", err)
+	}
+	if err := <-resultCh; err != nil {
+		t.Fatalf("start result: %v", err)
+	}
+
+	// Standard OCI stdio is host-facing and therefore ineligible. Close it at
+	// the fork boundary so this fixture is a self-contained container.
+	l.k.Pause()
+	ctx := l.k.SupervisorContext()
+	for fd := int32(0); fd < 3; fd++ {
+		if file := l.k.GlobalInit().Leader().FDTable().Remove(ctx, fd); file != nil {
+			file.DecRef(ctx)
+		}
+	}
+
+	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
+	if err != nil {
+		t.Fatalf("forking live loader: %v", err)
+	}
+	if got, want := childInfo.State, BranchRunning; got != want {
+		t.Errorf("child state after fork: got %q, want %q", got, want)
+	}
+	child, err := l.family.branch(childInfo.ID)
+	if err != nil {
+		t.Fatalf("looking up child: %v", err)
+	}
+	if l.k.RootNetworkNamespace().Stack() == child.k.RootNetworkNamespace().Stack() {
+		t.Error("parent and child share a network stack object")
+	}
+	parentPID := l.k.RootPIDNamespace().IDOfThreadGroup(l.k.GlobalInit())
+	childPID := child.k.RootPIDNamespace().IDOfThreadGroup(child.k.GlobalInit())
+	if parentPID != childPID {
+		t.Errorf("init PID changed: parent=%d child=%d", parentPID, childPID)
+	}
+	if err := l.family.Pause(childInfo.ID); err != nil {
+		t.Fatalf("pausing child: %v", err)
+	}
+	if err := l.family.Resume(childInfo.ID); err != nil {
+		t.Fatalf("resuming child: %v", err)
+	}
+	if err := l.family.Destroy(childInfo.ID); err != nil {
+		t.Fatalf("destroying child: %v", err)
+	}
+
+	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	l.k.Unpause()
+	l.k.WaitExited()
+}
+
 // TestStartSignal tests that the controller Start message will cause
 // WaitForStartSignal to return.
 func TestStartSignal(t *testing.T) {

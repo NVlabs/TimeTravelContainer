@@ -36,6 +36,14 @@ type LiveForkOptions struct {
 
 	// RestoreOptions are passed to filesystem restore completion hooks.
 	RestoreOptions vfs.CompleteRestoreOptions
+
+	// AllowNetworkStack permits cloning an initialized network stack. Callers
+	// must first prove that every link and endpoint is contained in the sandbox.
+	AllowNetworkStack bool
+
+	// AllowSharedFilesystemResources permits clone-aware filesystems to borrow
+	// resources that the caller has proven immutable or otherwise share-safe.
+	AllowSharedFilesystemResources bool
 }
 
 // LiveFork creates a paused Kernel by streaming only state metadata from k.
@@ -54,16 +62,28 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	if opts.Clocks == nil {
 		return nil, fmt.Errorf("live fork requires a clock source")
 	}
-	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil && !opts.AllowNetworkStack {
 		return nil, fmt.Errorf("live fork does not yet support a network stack")
 	}
 
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() error {
+		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			stack := rootNS.Stack()
+			stack.SetRemoveConf(false)
+			stack.Pause()
+			defer stack.Resume()
+		}
+
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+		var fsResources vfs.LiveForkFilesystemResources
+		if opts.AllowSharedFilesystemResources {
+			fsResources = make(vfs.LiveForkFilesystemResources)
+		}
 		saveCtx := context.WithValues(k.SupervisorContext(), map[any]any{
-			pgalloc.CtxMemoryFile:    k.mf,
-			pgalloc.CtxMemoryFileMap: mfs,
+			pgalloc.CtxMemoryFile:              k.mf,
+			pgalloc.CtxMemoryFileMap:           mfs,
+			vfs.CtxLiveForkFilesystemResources: fsResources,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
@@ -88,9 +108,10 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		child.SetMemoryFile(k.mf)
 		child.initRuntimeFields()
 		loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
-			pgalloc.CtxMemoryFile:    k.mf,
-			pgalloc.CtxMemoryFileMap: mfs,
-			pgalloc.CtxLiveForkClone: true,
+			pgalloc.CtxMemoryFile:              k.mf,
+			pgalloc.CtxMemoryFileMap:           mfs,
+			pgalloc.CtxLiveForkClone:           true,
+			vfs.CtxLiveForkFilesystemResources: fsResources,
 		})
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
@@ -101,6 +122,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+		if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			rootNS.Stack().Restore()
+		}
 		if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 			return vfs.PrependErrMsg("VFS live-fork restore failed", err)
 		}

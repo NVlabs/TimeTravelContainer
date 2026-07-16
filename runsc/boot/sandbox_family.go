@@ -78,11 +78,23 @@ type SandboxFamily struct {
 	mu sync.Mutex
 
 	branches map[string]*sandboxBranch
+	// allowNetworkStack is true only when loader configuration proves that
+	// network state has no host-facing links.
+	allowNetworkStack              bool
+	allowSharedFilesystemResources bool
+}
+
+// SandboxFamilyOptions controls eligibility policy shared by all branches.
+type SandboxFamilyOptions struct {
+	AllowNetworkStack              bool
+	AllowSharedFilesystemResources bool
 }
 
 // NewSandboxFamily creates a family containing k as its default branch.
-func NewSandboxFamily(k *kernel.Kernel) *SandboxFamily {
+func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamily {
 	return &SandboxFamily{
+		allowNetworkStack:              opts.AllowNetworkStack,
+		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
 				id:    DefaultBranchID,
@@ -200,7 +212,9 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	}
 
 	child, err := source.k.LiveFork(source.k.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks:                         sentrytime.NewCalibratedClocks(),
+		AllowNetworkStack:              f.allowNetworkStack,
+		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 	})
 	if err != nil {
 		resumeErr := resumeSource()

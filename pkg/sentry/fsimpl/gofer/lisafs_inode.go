@@ -77,6 +77,9 @@ type lisafsInode struct {
 	// file that does not exist on the remote filesystem. As of this writing, the
 	// only files that can be synthetic are sockets, pipes, and directories.
 	controlFD lisafs.ClientFD `state:"nosave"`
+	// borrowedControlFD prevents a live-fork child from closing its source
+	// branch root FDID. Descendant FDIDs are branch-owned.
+	borrowedControlFD bool `state:"nosave"`
 
 	// If this dentry represents a regular file or directory, readFDLisa is a
 	// LISAFS FD used for reads by all regularFileFDs/directoryFDs representing
@@ -335,7 +338,7 @@ func (i *lisafsInode) destroy(ctx context.Context, d *dentry) {
 	if i.writeFDLisa.Ok() {
 		i.writeFDLisa.Close(ctx, false /* flush */)
 	}
-	if i.controlFD.Ok() {
+	if i.controlFD.Ok() && !i.borrowedControlFD {
 		// Close the control FD.
 		// Propagate the Close RPCs immediately to the server if:
 		// - The dentry being destroyed is a deleted regular file. This is to
