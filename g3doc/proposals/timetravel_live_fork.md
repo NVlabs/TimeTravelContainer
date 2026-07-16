@@ -391,7 +391,7 @@ Initial policy:
 | Overlay upper on tmpfs | Clone after tmpfs and overlay tests |
 | Read-only immutable gofer lower | Share with explicit hook |
 | SysV SHM | Reject until branch page map is implemented |
-| Internal Unix socket | Reject, then enable after peer/queue tests |
+| Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
 | Loopback netstack socket | Reject until networking phase |
 | Host TCP/UDP/Unix socket | Reject |
 | Writable or mutable gofer mount | Reject |
@@ -493,10 +493,18 @@ These resources required no special clone implementation beyond their existing
 state graph and post-load hooks. Timerfd testing exposed and fixed a kernel
 lifecycle gap: `StartPaused` paused Timekeeper updates and timers, but the final
 matching `Unpause` did not resume them. The kernel now resumes time before
-releasing the final task stop. Host-backed variants, externally connected
-sockets, and queued descriptor-passing messages are not enabled by this result.
-All supported classes still require an explicit pre-CoW resource-closure
-validator rather than relying on checkpoint serialization failures.
+releasing the final task stop.
+
+An explicit FD-graph validator now runs before VFS save hooks and before the
+parent MM is transitioned to CoW. It walks each distinct task FD table,
+recursively follows epoll interests, and returns a stable PID/FD/resource/reason
+report. Anonymous and socket objects fail closed unless their implementation
+opts in. Pure eventfds are accepted while host-backed eventfds are rejected;
+Unix transport validation rejects host-backed receivers, peers, bound host
+sockets, and queued SCM_RIGHTS. A real-loader test checks direct and
+epoll-reachable host eventfd rejection, then removes the resource and completes
+a valid fork. Mapping, ioctl-held, and filesystem-specific closure still need
+the same explicit treatment in later phases.
 
 ## Implementation phases and gates
 

@@ -17,6 +17,7 @@ package boot
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -245,6 +246,69 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 			file.DecRef(ctx)
 		}
 	}
+	hostEventFD, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		t.Fatalf("creating host eventfd: %v", err)
+	}
+	hostEventFile, err := eventfd.NewFromHost(ctx, l.k.VFS(), hostEventFD, linux.O_RDWR|linux.O_NONBLOCK)
+	if err != nil {
+		unix.Close(hostEventFD)
+		t.Fatalf("importing host eventfd: %v", err)
+	}
+	const rejectedFD = int32(9)
+	if _, err := l.k.GlobalInit().Leader().FDTable().NewFDAt(ctx, rejectedFD, hostEventFile, kernel.FDFlags{}); err != nil {
+		hostEventFile.DecRef(ctx)
+		t.Fatalf("installing host eventfd: %v", err)
+	}
+	hostEventFile.DecRef(ctx)
+	if _, err := l.family.Fork(&ForkBranchArgs{ID: "host-eventfd"}); err == nil {
+		t.Fatal("live fork unexpectedly accepted a host-backed eventfd")
+	} else {
+		var resourceErr *kernel.LiveForkResourceError
+		if !errors.As(err, &resourceErr) {
+			t.Fatalf("host eventfd rejection is not a resource report: %v", err)
+		}
+		if len(resourceErr.Issues) != 1 || resourceErr.Issues[0].PID != 1 || resourceErr.Issues[0].FD != rejectedFD {
+			t.Fatalf("host eventfd rejection issues: got %+v, want pid 1 fd %d", resourceErr.Issues, rejectedFD)
+		}
+	}
+	rejectedEventFile := l.k.GlobalInit().Leader().FDTable().Remove(ctx, rejectedFD)
+	if rejectedEventFile == nil {
+		t.Fatalf("host eventfd %d disappeared", rejectedFD)
+	}
+	rejectionEpollFile, err := l.k.VFS().NewEpollInstanceFD(ctx)
+	if err != nil {
+		rejectedEventFile.DecRef(ctx)
+		t.Fatalf("creating rejection epoll: %v", err)
+	}
+	rejectionEpoll := rejectionEpollFile.Impl().(*vfs.EpollInstance)
+	if err := rejectionEpoll.AddInterest(rejectedEventFile, rejectedFD, linux.EpollEvent{Events: linux.EPOLLIN}); err != nil {
+		rejectionEpollFile.DecRef(ctx)
+		rejectedEventFile.DecRef(ctx)
+		t.Fatalf("registering host eventfd with rejection epoll: %v", err)
+	}
+	const rejectionEpollFD = int32(8)
+	if _, err := l.k.GlobalInit().Leader().FDTable().NewFDAt(ctx, rejectionEpollFD, rejectionEpollFile, kernel.FDFlags{}); err != nil {
+		rejectionEpollFile.DecRef(ctx)
+		rejectedEventFile.DecRef(ctx)
+		t.Fatalf("installing rejection epoll: %v", err)
+	}
+	rejectionEpollFile.DecRef(ctx)
+	if _, err := l.family.Fork(&ForkBranchArgs{ID: "epoll-host-eventfd"}); err == nil {
+		t.Fatal("live fork unexpectedly accepted an epoll-reachable host eventfd")
+	} else {
+		var resourceErr *kernel.LiveForkResourceError
+		if !errors.As(err, &resourceErr) {
+			t.Fatalf("epoll host eventfd rejection is not a resource report: %v", err)
+		}
+		if len(resourceErr.Issues) != 1 || resourceErr.Issues[0].FD != rejectionEpollFD {
+			t.Fatalf("epoll host eventfd rejection issues: got %+v, want root fd %d", resourceErr.Issues, rejectionEpollFD)
+		}
+	}
+	if file := l.k.GlobalInit().Leader().FDTable().Remove(ctx, rejectionEpollFD); file != nil {
+		file.DecRef(ctx)
+	}
+	rejectedEventFile.DecRef(ctx)
 	pipeReader, pipeWriter, err := pipefs.NewConnectedPipeFDs(ctx, l.k.PipeMount(), linux.O_NONBLOCK)
 	if err != nil {
 		t.Fatalf("creating internal pipe: %v", err)

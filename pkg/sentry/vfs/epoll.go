@@ -70,6 +70,17 @@ type EpollInstance struct {
 	readySeq uint32
 }
 
+// ValidateLiveFork implements LiveForkFileDescription.
+func (ep *EpollInstance) ValidateLiveFork() ([]*FileDescription, error) {
+	ep.interestMu.Lock()
+	defer ep.interestMu.Unlock()
+	files := make([]*FileDescription, 0, len(ep.interest))
+	for key := range ep.interest {
+		files = append(files, key.file)
+	}
+	return files, nil
+}
+
 // +stateify savable
 type epollInterestKey struct {
 	// file is the registered FileDescription. No reference is held on file;

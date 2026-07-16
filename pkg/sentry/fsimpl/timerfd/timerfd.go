@@ -47,7 +47,13 @@ type TimerFileDescription struct {
 }
 
 var _ vfs.FileDescriptionImpl = (*TimerFileDescription)(nil)
+var _ vfs.LiveForkFileDescription = (*TimerFileDescription)(nil)
 var _ ktime.Listener = (*TimerFileDescription)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (*TimerFileDescription) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
 
 // New returns a new timer fd.
 func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, flags uint32) (*vfs.FileDescription, error) {

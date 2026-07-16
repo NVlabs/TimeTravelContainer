@@ -56,6 +56,12 @@ type SignalFileDescription struct {
 }
 
 var _ vfs.FileDescriptionImpl = (*SignalFileDescription)(nil)
+var _ vfs.LiveForkFileDescription = (*SignalFileDescription)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (*SignalFileDescription) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
 
 // New creates a new signal fd.
 func New(vfsObj *vfs.VirtualFilesystem, target *kernel.Task, mask linux.SignalSet, flags uint32) (*vfs.FileDescription, error) {

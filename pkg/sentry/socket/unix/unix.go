@@ -68,6 +68,15 @@ type Socket struct {
 }
 
 var _ = socket.Socket(&Socket{})
+var _ vfs.LiveForkFileDescription = (*Socket)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (s *Socket) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	if err := transport.ValidateLiveFork(s.ep); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
 
 func isAbstract(path string) bool {
 	return len(path) == 0 || path[0] == 0

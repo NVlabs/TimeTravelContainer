@@ -68,6 +68,17 @@ type EventFileDescription struct {
 }
 
 var _ vfs.FileDescriptionImpl = (*EventFileDescription)(nil)
+var _ vfs.LiveForkFileDescription = (*EventFileDescription)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (efd *EventFileDescription) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+	if efd.hostfd >= 0 {
+		return nil, fmt.Errorf("host-backed eventfd")
+	}
+	return nil, nil
+}
 
 // New creates a new event fd.
 func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, initVal uint64, semMode bool, flags uint32) (*vfs.FileDescription, error) {

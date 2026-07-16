@@ -336,6 +336,14 @@ func (fd *FileDescription) Impl() FileDescriptionImpl {
 	return fd.impl
 }
 
+// LiveForkFileDescription is implemented by file descriptions that can prove
+// that their non-filesystem resource graph is safe to clone in memory.
+// Referenced returns additional file descriptions reachable from this object,
+// such as epoll interests, which must also pass validation.
+type LiveForkFileDescription interface {
+	ValidateLiveFork() (referenced []*FileDescription, err error)
+}
+
 // FileDescriptionImpl contains implementation details for an FileDescription.
 // Implementations of FileDescriptionImpl should contain their associated
 // FileDescription by value as their first field.

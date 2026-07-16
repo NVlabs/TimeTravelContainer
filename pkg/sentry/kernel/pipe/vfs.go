@@ -175,6 +175,12 @@ type VFSPipeFD struct {
 	lastAddr hostarch.Addr
 }
 
+// ValidateLiveFork implements vfs.LiveForkFileDescription. Pipe endpoints,
+// buffers, and waiter queues are wholly represented in Sentry state.
+func (*VFSPipeFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
+
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *VFSPipeFD) Release(context.Context) {
 	var event waiter.EventMask

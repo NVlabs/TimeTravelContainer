@@ -16,6 +16,8 @@
 package transport
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -24,6 +26,99 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// ValidateLiveFork verifies that ep and every transport object reachable from
+// it are implemented entirely by Sentry. Host-backed peers and queued file
+// descriptor control messages are rejected.
+func ValidateLiveFork(ep Endpoint) error {
+	return validateLiveForkEndpoint(ep, make(map[*connectionedEndpoint]struct{}))
+}
+
+func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct{}) error {
+	switch e := ep.(type) {
+	case *connectionlessEndpoint:
+		return validateLiveForkBaseEndpoint(&e.baseEndpoint)
+	case *connectionedEndpoint:
+		if _, ok := seen[e]; ok {
+			return nil
+		}
+		seen[e] = struct{}{}
+		e.Lock()
+		if e.boundSocketFD != nil {
+			e.Unlock()
+			return fmt.Errorf("Unix endpoint is bound to a host socket")
+		}
+		accepted := make([]*connectionedEndpoint, 0, len(e.acceptedChan))
+		for range len(e.acceptedChan) {
+			child := <-e.acceptedChan
+			accepted = append(accepted, child)
+			e.acceptedChan <- child
+		}
+		e.Unlock()
+		if err := validateLiveForkBaseEndpoint(&e.baseEndpoint); err != nil {
+			return err
+		}
+		for _, child := range accepted {
+			if err := validateLiveForkEndpoint(child, seen); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported Unix endpoint type %T", ep)
+	}
+}
+
+func validateLiveForkBaseEndpoint(e *baseEndpoint) error {
+	e.Lock()
+	receiver := e.receiver
+	connected := e.connected
+	e.Unlock()
+	if err := validateLiveForkReceiver(receiver); err != nil {
+		return err
+	}
+	switch c := connected.(type) {
+	case nil:
+		return nil
+	case *connectedEndpoint:
+		return validateLiveForkQueue(c.writeQueue)
+	default:
+		return fmt.Errorf("host-backed Unix connected endpoint %T", connected)
+	}
+}
+
+func validateLiveForkReceiver(receiver Receiver) error {
+	switch r := receiver.(type) {
+	case nil:
+		return nil
+	case *queueReceiver:
+		return validateLiveForkQueue(r.readQueue)
+	case *streamQueueReceiver:
+		r.mu.Lock()
+		hasRights := r.control.Rights != nil
+		r.mu.Unlock()
+		if hasRights {
+			return fmt.Errorf("Unix stream receiver has pending SCM_RIGHTS")
+		}
+		return validateLiveForkQueue(r.readQueue)
+	default:
+		return fmt.Errorf("host-backed Unix receiver %T", receiver)
+	}
+}
+
+func validateLiveForkQueue(q *queue) error {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for m := q.dataList.Front(); m != nil; m = m.Next() {
+		if m.Control.Rights != nil {
+			return fmt.Errorf("Unix receive queue contains SCM_RIGHTS")
+		}
+	}
+	return nil
+}
 
 const (
 	// The minimum size of the send/receive buffers.

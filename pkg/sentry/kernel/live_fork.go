@@ -17,6 +17,7 @@ package kernel
 import (
 	"fmt"
 	"io"
+	"sort"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -46,6 +47,34 @@ type LiveForkOptions struct {
 	AllowSharedFilesystemResources bool
 }
 
+// LiveForkResourceIssue describes one resource that prevents an in-memory
+// fork. PID and FD identify the descriptor-table root through which Resource
+// was reached; Resource may be a transitively referenced object.
+type LiveForkResourceIssue struct {
+	PID      ThreadID
+	FD       int32
+	Resource string
+	Reason   string
+}
+
+// LiveForkResourceError is returned before the parent is changed when its
+// open-resource graph is not closed within the Sentry.
+type LiveForkResourceError struct {
+	Issues []LiveForkResourceIssue
+}
+
+// Error implements error.Error.
+func (e *LiveForkResourceError) Error() string {
+	if len(e.Issues) == 0 {
+		return "live fork resource validation failed"
+	}
+	i := e.Issues[0]
+	if len(e.Issues) == 1 {
+		return fmt.Sprintf("live fork resource validation failed: pid %d fd %d resource %s: %s", i.PID, i.FD, i.Resource, i.Reason)
+	}
+	return fmt.Sprintf("live fork resource validation failed with %d issues; first: pid %d fd %d resource %s: %s", len(e.Issues), i.PID, i.FD, i.Resource, i.Reason)
+}
+
 // LiveFork creates a paused Kernel by streaming only state metadata from k.
 // Application pages remain in the shared MemoryFile and are made copy-on-write.
 // The returned Kernel has not executed any task instructions; callers must call
@@ -68,6 +97,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() error {
+		if err := k.validateLiveForkResources(); err != nil {
+			return err
+		}
 		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 			stack := rootNS.Stack()
 			stack.SetRemoveConf(false)
@@ -142,6 +174,86 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		return nil, err
 	}
 	return child, nil
+}
+
+// validateLiveForkResources walks all descriptor-table roots and any
+// file-description edges exposed by vfs.LiveForkFileDescription. It runs
+// before VFS save hooks and before private mappings are transitioned to CoW.
+// Filesystem-backed descriptions are validated by VFS.PrepareSave; anonymous,
+// socket, and inherently host-backed descriptions must opt in here.
+func (k *Kernel) validateLiveForkResources() error {
+	type tableRoot struct {
+		pid   ThreadID
+		table *FDTable
+	}
+	k.tasks.mu.RLock()
+	roots := make([]tableRoot, 0, len(k.tasks.Root.tids))
+	for task, tid := range k.tasks.Root.tids {
+		if table := task.FDTable(); table != nil {
+			roots = append(roots, tableRoot{pid: tid, table: table})
+		}
+	}
+	k.tasks.mu.RUnlock()
+	sort.Slice(roots, func(i, j int) bool { return roots[i].pid < roots[j].pid })
+
+	seenTables := make(map[*FDTable]struct{})
+	var issues []LiveForkResourceIssue
+	for _, root := range roots {
+		if _, ok := seenTables[root.table]; ok {
+			continue
+		}
+		seenTables[root.table] = struct{}{}
+		root.table.mu.Lock()
+		root.table.ForEach(k.SupervisorContext(), func(fd int32, file *vfs.FileDescription, _ FDFlags) bool {
+			visited := make(map[*vfs.FileDescription]struct{})
+			var validate func(*vfs.FileDescription)
+			validate = func(current *vfs.FileDescription) {
+				if _, ok := visited[current]; ok {
+					return
+				}
+				visited[current] = struct{}{}
+				impl := current.Impl()
+				validator, ok := impl.(vfs.LiveForkFileDescription)
+				if !ok {
+					fsType := current.Mount().Filesystem().FilesystemType().Name()
+					switch fsType {
+					case "none", "sockfs":
+						issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), "anonymous or socket resource has not opted in"})
+					case "host", "fuse":
+						issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), fmt.Sprintf("filesystem %q is host-backed", fsType)})
+					}
+					return
+				}
+				referenced, err := validator.ValidateLiveFork()
+				if err != nil {
+					issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), err.Error()})
+					return
+				}
+				for _, next := range referenced {
+					validate(next)
+				}
+			}
+			validate(file)
+			return true
+		})
+		root.table.mu.Unlock()
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].PID != issues[j].PID {
+			return issues[i].PID < issues[j].PID
+		}
+		if issues[i].FD != issues[j].FD {
+			return issues[i].FD < issues[j].FD
+		}
+		if issues[i].Resource != issues[j].Resource {
+			return issues[i].Resource < issues[j].Resource
+		}
+		return issues[i].Reason < issues[j].Reason
+	})
+	return &LiveForkResourceError{Issues: issues}
 }
 
 // privatizeLiveForkVDSOParamPage gives the child Timekeeper a branch-private

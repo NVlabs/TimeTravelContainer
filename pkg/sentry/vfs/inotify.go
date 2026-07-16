@@ -93,6 +93,13 @@ type Inotify struct {
 }
 
 var _ FileDescriptionImpl = (*Inotify)(nil)
+var _ LiveForkFileDescription = (*Inotify)(nil)
+
+// ValidateLiveFork implements LiveForkFileDescription. Watch targets and
+// pending events are wholly represented in the VFS state graph.
+func (*Inotify) ValidateLiveFork() ([]*FileDescription, error) {
+	return nil, nil
+}
 
 // NewInotifyFD constructs a new Inotify instance.
 func NewInotifyFD(ctx context.Context, vfsObj *VirtualFilesystem, flags uint32) (*FileDescription, error) {
