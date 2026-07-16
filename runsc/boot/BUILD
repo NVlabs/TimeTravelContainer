@@ -22,6 +22,7 @@ go_library(
         "network.go",
         "nvproxy.go",
         "restore.go",
+        "sandbox_family.go",
         "seccheck.go",
         "seccomp.go",
         "strace.go",
@@ -188,5 +189,20 @@ go_test(
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "sandbox_family_systrap_test",
+    size = "small",
+    srcs = [
+        "sandbox_family_test.go",
+        "systrap_platform_test.go",
+    ],
+    args = ["--platform=systrap"],
+    library = ":boot",
+    deps = [
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/platform/systrap",
     ],
 )

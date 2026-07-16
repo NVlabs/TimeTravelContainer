@@ -93,6 +93,21 @@ const (
 	// ContMgrResume resumes all tasks.
 	ContMgrResume = "containerManager.Resume"
 
+	// ContMgrForkBranch creates an in-memory branch of a paused instant.
+	ContMgrForkBranch = "containerManager.ForkBranch"
+
+	// ContMgrListBranches lists all in-memory branches in the sandbox family.
+	ContMgrListBranches = "containerManager.ListBranches"
+
+	// ContMgrPauseBranch pauses one in-memory branch.
+	ContMgrPauseBranch = "containerManager.PauseBranch"
+
+	// ContMgrResumeBranch resumes one in-memory branch.
+	ContMgrResumeBranch = "containerManager.ResumeBranch"
+
+	// ContMgrDestroyBranch destroys one non-default in-memory branch.
+	ContMgrDestroyBranch = "containerManager.DestroyBranch"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -898,14 +913,43 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
-	cm.l.k.Pause()
-	return nil
+	return cm.l.family.Pause(DefaultBranchID)
 }
 
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
-	cm.l.k.Unpause()
-	return control.PostResume(cm.l.k, nil)
+	return cm.l.family.Resume(DefaultBranchID)
+}
+
+// ForkBranch creates an in-memory child branch.
+func (cm *containerManager) ForkBranch(args *ForkBranchArgs, out *BranchInfo) error {
+	info, err := cm.l.family.Fork(args)
+	if err != nil {
+		return err
+	}
+	*out = *info
+	return nil
+}
+
+// ListBranches returns the sandbox branch family.
+func (cm *containerManager) ListBranches(_ *struct{}, out *[]BranchInfo) error {
+	*out = cm.l.family.List()
+	return nil
+}
+
+// PauseBranch pauses one branch.
+func (cm *containerManager) PauseBranch(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.Pause(args.ID)
+}
+
+// ResumeBranch resumes one branch.
+func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.Resume(args.ID)
+}
+
+// DestroyBranch destroys one non-default branch.
+func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.Destroy(args.ID)
 }
 
 // Wait waits for the init process in the given container.

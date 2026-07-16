@@ -350,6 +350,9 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
+	if l.family.HasChildren() {
+		return errors.New("cannot restore a checkpoint while live child branches exist")
+	}
 
 	// Validate the container specs to ensure they did not meaningfully change
 	// between checkpoint and restore.
@@ -380,6 +383,9 @@ func (r *restorer) restore(l *Loader) error {
 		Platform: p,
 	}
 	l.k.SetMemoryFile(r.mainMF)
+	if err := l.family.ReplaceDefaultKernel(l.k); err != nil {
+		return err
+	}
 
 	if l.root.conf.ProfileEnable {
 		// pprof.Initialize opens /proc/self/maps, so has to be called before

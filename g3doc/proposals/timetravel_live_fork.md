@@ -456,6 +456,17 @@ resident bytes in this setup. A 100-cycle clone/release test also verifies that
 the parent PMA regains a unique page reference after every child release. A real
 multithreaded sandbox workload remains before the complete Phase 1 gate.
 
+The first Phase 2 control-plane slice is implemented. `runsc` now owns a
+`SandboxFamily` with explicit creating, paused, running, destroying, and failed
+states; exposes fork/list/pause/resume/destroy RPCs; and provides
+`runsc timetravel` as a minimal host CLI. Fork publication is transactional,
+source run state is restored on failure, branch trees can fork recursively, and
+loader teardown destroys leaves before ancestors. A systrap lifecycle test
+covers parent-to-child and child-to-grandchild forks plus independent
+pause/resume/destroy. The full Phase 2 gate is not yet met: ordinary runsc
+sandboxes initialize a netstack, which live fork still rejects, and existing
+process/wait/watchdog controls remain bound to the default branch.
+
 ## Implementation phases and gates
 
 ### Phase 0: metadata-clone feasibility spike

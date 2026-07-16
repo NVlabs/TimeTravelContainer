@@ -68,6 +68,7 @@ func commands() (map[util.SubCommand]string, []subcommands.Command) {
 		new(cmd.Read):         userGroup,
 		new(cmd.SandboxExec):  userGroup,
 		new(cmd.Tar):          userGroup,
+		new(cmd.TimeTravel):   userGroup,
 
 		// Helpers.
 		new(cmd.Install):     helperGroup,

@@ -2028,6 +2028,48 @@ func (s *Sandbox) Resume(cid string) error {
 	return nil
 }
 
+// ForkBranch creates an in-memory branch in the sandbox family.
+func (s *Sandbox) ForkBranch(args *boot.ForkBranchArgs) (boot.BranchInfo, error) {
+	var info boot.BranchInfo
+	if err := s.call(boot.ContMgrForkBranch, args, &info); err != nil {
+		return boot.BranchInfo{}, fmt.Errorf("forking live branch %q: %w", args.ID, err)
+	}
+	return info, nil
+}
+
+// ListBranches lists all in-memory branches in the sandbox family.
+func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
+	var branches []boot.BranchInfo
+	if err := s.call(boot.ContMgrListBranches, nil, &branches); err != nil {
+		return nil, fmt.Errorf("listing live branches: %w", err)
+	}
+	return branches, nil
+}
+
+// PauseBranch pauses one in-memory branch.
+func (s *Sandbox) PauseBranch(id string) error {
+	if err := s.call(boot.ContMgrPauseBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("pausing live branch %q: %w", id, err)
+	}
+	return nil
+}
+
+// ResumeBranch resumes one in-memory branch.
+func (s *Sandbox) ResumeBranch(id string) error {
+	if err := s.call(boot.ContMgrResumeBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("resuming live branch %q: %w", id, err)
+	}
+	return nil
+}
+
+// DestroyBranch destroys one non-default in-memory branch.
+func (s *Sandbox) DestroyBranch(id string) error {
+	if err := s.call(boot.ContMgrDestroyBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("destroying live branch %q: %w", id, err)
+	}
+	return nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

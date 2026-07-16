@@ -212,6 +212,9 @@ type Loader struct {
 	// k is the kernel.
 	k *kernel.Kernel
 
+	// family owns the default kernel and its live in-memory branches.
+	family *SandboxFamily
+
 	// ctrl is the control server.
 	ctrl *controller
 
@@ -740,6 +743,8 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
+	l.family = NewSandboxFamily(l.k)
+
 	if err := registerFilesystems(l.k, &l.root); err != nil {
 		return nil, fmt.Errorf("registering filesystems: %w", err)
 	}
@@ -928,6 +933,7 @@ func (l *Loader) Destroy() {
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
+	l.family.DestroyChildren()
 	l.k.Release()
 
 	// Release any dangling tcp connections.
@@ -1203,6 +1209,7 @@ func (l *Loader) run() error {
 	if err := l.k.Start(); err != nil {
 		return err
 	}
+	l.family.MarkDefaultStarted()
 	switch l.state {
 	case created:
 		l.state = started

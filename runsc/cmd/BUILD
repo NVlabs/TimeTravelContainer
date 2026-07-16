@@ -75,6 +75,7 @@ go_library(
         "symbolize.go",
         "syscalls.go",
         "tar.go",
+        "timetravel.go",
         "umount_unsafe.go",
         "update.go",
         "usage.go",
