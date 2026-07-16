@@ -444,6 +444,19 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	overlayFile.DecRef(parentTask)
 	parentOverlayFile := liveForkTestFD(t, l.k, overlayFD)
 	liveForkTestPWrite(t, parentTask, parentOverlayFile, 0, "seed")
+	hardlinkFile := liveForkTestCreateFile(t, parentTask, "hardlink-source")
+	liveForkTestPWrite(t, parentTask, hardlinkFile, 0, "seed")
+	hardlinkFile.DecRef(parentTask)
+	liveForkTestLink(t, parentTask, "hardlink-source", "hardlink-alias")
+	truncateFile := liveForkTestCreateFile(t, parentTask, "truncate-state")
+	liveForkTestPWrite(t, parentTask, truncateFile, 0, "seed")
+	const truncateFD = int32(21)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, truncateFD, truncateFile, kernel.FDFlags{}); err != nil {
+		truncateFile.DecRef(parentTask)
+		t.Fatalf("installing truncate file: %v", err)
+	}
+	truncateFile.DecRef(parentTask)
+	parentTruncateFile := liveForkTestFD(t, l.k, truncateFD)
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -481,6 +494,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
 	childMemfd := liveForkTestFD(t, child.k, memfdFD)
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
+	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -644,9 +658,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, parentTask, parentOverlayFile, 0, "seed")
 	liveForkTestPRead(t, childTask, childOverlayFile, 0, "seed")
 	liveForkTestPWrite(t, parentTask, parentOverlayFile, 0, "prnt")
-	liveForkTestPWrite(t, childTask, childOverlayFile, 0, "chld")
+	liveForkTestMappedWrite(t, childTask, childOverlayFile, "chld")
 	liveForkTestPRead(t, parentTask, parentOverlayFile, 0, "prnt")
 	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
+	if err := parentOverlayFile.SetStat(ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: uint16(linux.ModeRegular | 0600)}}); err != nil {
+		t.Fatalf("changing parent overlay mode: %v", err)
+	}
+	liveForkTestMode(t, ctx, parentOverlayFile, 0600)
+	liveForkTestMode(t, childCtx, childOverlayFile, 0644)
 	liveForkTestUnlink(t, childTask, overlayPath)
 	liveForkTestPathMissing(t, childTask, overlayPath)
 	liveForkTestPathRead(t, parentTask, overlayPath, "prnt")
@@ -654,10 +673,38 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentOnly.DecRef(parentTask)
 	liveForkTestPathMissing(t, childTask, "parent-only")
 	liveForkTestPRead(t, childTask, childOverlayFile, 0, "chld")
+	parentHardlink := liveForkTestOpenPath(t, parentTask, "hardlink-alias", linux.O_RDWR)
+	childHardlink := liveForkTestOpenPath(t, childTask, "hardlink-alias", linux.O_RDWR)
+	liveForkTestPWrite(t, ctx, parentHardlink, 0, "PARN")
+	liveForkTestPathRead(t, parentTask, "hardlink-source", "PARN")
+	liveForkTestPRead(t, childCtx, childHardlink, 0, "seed")
+	liveForkTestUnlink(t, childTask, "hardlink-alias")
+	liveForkTestPathMissing(t, childTask, "hardlink-alias")
+	liveForkTestPathRead(t, childTask, "hardlink-source", "seed")
+	liveForkTestPathRead(t, parentTask, "hardlink-alias", "PARN")
+	parentHardlink.DecRef(ctx)
+	childHardlink.DecRef(childCtx)
+	if err := childTruncateFile.SetStat(childCtx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 2}}); err != nil {
+		t.Fatalf("truncating child upper file: %v", err)
+	}
+	liveForkTestPRead(t, parentTask, parentTruncateFile, 0, "seed")
+	liveForkTestPRead(t, childTask, childTruncateFile, 0, "se")
+	liveForkTestSize(t, ctx, parentTruncateFile, 4)
+	liveForkTestSize(t, childCtx, childTruncateFile, 2)
+	if err := parentTruncateFile.Allocate(ctx, 0, hostarch.PageSize, hostarch.PageSize); err != nil {
+		t.Fatalf("allocating sparse parent upper range: %v", err)
+	}
+	liveForkTestSize(t, ctx, parentTruncateFile, 2*hostarch.PageSize)
+	liveForkTestSize(t, childCtx, childTruncateFile, 2)
+	liveForkTestPRead(t, childTask, childTruncateFile, 0, "se")
 	parentLowerFile := liveForkTestOpenPath(t, parentTask, "etc/hostname", linux.O_RDONLY)
 	originalLower := liveForkTestPReadString(t, parentTask.Kernel().SupervisorContext(), parentLowerFile, 0, 4)
 	childCopiedUpFile := liveForkTestOpenPath(t, childTask, "etc/hostname", linux.O_RDWR)
 	liveForkTestPWrite(t, childCtx, childCopiedUpFile, 0, "CHLD")
+	liveForkTestPRead(t, childCtx, childCopiedUpFile, 0, "CHLD")
+	liveForkTestPRead(t, ctx, parentLowerFile, 0, originalLower)
+	liveForkTestUnlink(t, childTask, "etc/hostname")
+	liveForkTestPathMissing(t, childTask, "etc/hostname")
 	liveForkTestPRead(t, childCtx, childCopiedUpFile, 0, "CHLD")
 	liveForkTestPRead(t, ctx, parentLowerFile, 0, originalLower)
 	parentLowerFile.DecRef(ctx)
@@ -699,6 +746,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUnix2.DecRef(parentTask)
 	parentMemfd.DecRef(parentTask)
 	parentOverlayFile.DecRef(parentTask)
+	parentTruncateFile.DecRef(parentTask)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
@@ -711,6 +759,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUnix2.DecRef(childTask)
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
+	childTruncateFile.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -921,6 +970,18 @@ func liveForkTestUnlink(t *testing.T, task *kernel.Task, path string) {
 	}
 }
 
+func liveForkTestLink(t *testing.T, task *kernel.Task, oldPath, newPath string) {
+	t.Helper()
+	ctx := task.Kernel().SupervisorContext()
+	root := task.MountNamespace().Root(ctx)
+	defer root.DecRef(ctx)
+	oldPop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(oldPath)}
+	newPop := &vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(newPath)}
+	if err := task.Kernel().VFS().LinkAt(ctx, task.Credentials(), oldPop, newPop); err != nil {
+		t.Fatalf("linking %q to %q: %v", newPath, oldPath, err)
+	}
+}
+
 func liveForkTestPathMissing(t *testing.T, task *kernel.Task, path string) {
 	t.Helper()
 	ctx := task.Kernel().SupervisorContext()
@@ -971,6 +1032,28 @@ func liveForkTestPReadString(t *testing.T, ctx context.Context, file *vfs.FileDe
 		t.Fatalf("PRead(%d, %d): got (%q, %d, %v)", offset, length, buf, n, err)
 	}
 	return string(buf)
+}
+
+func liveForkTestMode(t *testing.T, ctx context.Context, file *vfs.FileDescription, want linux.FileMode) {
+	t.Helper()
+	stat, err := file.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_MODE})
+	if err != nil {
+		t.Fatalf("Stat mode: %v", err)
+	}
+	if got := linux.FileMode(stat.Mode) & 0777; got != want {
+		t.Fatalf("mode: got %#o, want %#o", got, want)
+	}
+}
+
+func liveForkTestSize(t *testing.T, ctx context.Context, file *vfs.FileDescription, want uint64) {
+	t.Helper()
+	stat, err := file.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_SIZE})
+	if err != nil {
+		t.Fatalf("Stat size: %v", err)
+	}
+	if stat.Size != want {
+		t.Fatalf("size: got %d, want %d", stat.Size, want)
+	}
 }
 
 func liveForkTestMappedWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value string) {
