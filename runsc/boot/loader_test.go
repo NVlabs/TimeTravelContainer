@@ -365,6 +365,16 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating AIO ring mapping: %v", err)
 	}
+	eligibility, err := l.family.CheckFork(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("checking AIO ring eligibility: %v", err)
+	}
+	if eligibility.Eligible || len(eligibility.Issues) != 1 {
+		t.Fatalf("AIO ring eligibility report: %+v", eligibility)
+	}
+	if issue := eligibility.Issues[0]; issue.PID != 1 || issue.FD != -1 || !strings.Contains(issue.Resource, "aioMappable") {
+		t.Fatalf("AIO ring eligibility issue: %+v", issue)
+	}
 	if _, err := l.family.Fork(&ForkBranchArgs{ID: "aio-ring"}); err == nil {
 		t.Fatal("live fork unexpectedly accepted an AIO ring mapping")
 	} else {

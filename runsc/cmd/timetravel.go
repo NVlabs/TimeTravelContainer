@@ -62,6 +62,7 @@ func (*TimeTravel) Synopsis() string {
 // Usage implements subcommands.Command.Usage.
 func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
+		"timetravel [flags] <container-id> check <branch-id>\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
@@ -118,6 +119,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	switch action {
 	case "branches":
 		output, err = cont.Sandbox.ListBranches()
+	case "check":
+		output, err = cont.Sandbox.CheckFork(f.Arg(2))
 	case "fork":
 		output, err = cont.Sandbox.ForkBranch(&boot.ForkBranchArgs{
 			Source: t.source,

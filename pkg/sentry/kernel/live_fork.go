@@ -58,6 +58,12 @@ type LiveForkOptions struct {
 	Metrics *LiveForkMetrics
 }
 
+// LiveForkValidationOptions controls read-only live-fork eligibility checks.
+type LiveForkValidationOptions struct {
+	// AllowNetworkStack permits validation of an initialized, contained stack.
+	AllowNetworkStack bool
+}
+
 // LiveForkMetrics separates parent preparation, metadata, and child restore
 // costs. Durations include only work performed by Kernel.LiveFork.
 type LiveForkMetrics struct {
@@ -100,10 +106,10 @@ func injectLiveForkFailure(opts LiveForkOptions, stage LiveForkStage) error {
 // fork. PID and FD identify the descriptor-table root through which Resource
 // was reached; Resource may be a transitively referenced object.
 type LiveForkResourceIssue struct {
-	PID      ThreadID
-	FD       int32
-	Resource string
-	Reason   string
+	PID      ThreadID `json:"pid"`
+	FD       int32    `json:"fd"`
+	Resource string   `json:"resource"`
+	Reason   string   `json:"reason"`
 }
 
 // LiveForkResourceError is returned before the parent is changed when its
@@ -128,6 +134,38 @@ func (e *LiveForkResourceError) Error() string {
 		return fmt.Sprintf("live fork resource validation failed with %d issues; first: pid %d mapping resource %s: %s", len(e.Issues), i.PID, i.Resource, i.Reason)
 	}
 	return fmt.Sprintf("live fork resource validation failed with %d issues; first: pid %d fd %d resource %s: %s", len(e.Issues), i.PID, i.FD, i.Resource, i.Reason)
+}
+
+// ValidateLiveFork reports whether k's current resource graph can be live
+// forked. It performs no CoW, VFS save, state streaming, or child allocation.
+// Preconditions: k must be paused for the duration of the call.
+func (k *Kernel) ValidateLiveFork(ctx context.Context, opts LiveForkValidationOptions) error {
+	if !k.IsPaused() {
+		return fmt.Errorf("live fork validation requires a paused kernel")
+	}
+	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil && !opts.AllowNetworkStack {
+		return fmt.Errorf("live fork does not yet support a network stack")
+	}
+	return k.quiescePausedAnd(ctx, func() error {
+		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			stack := rootNS.Stack()
+			stack.Pause()
+			defer stack.Resume()
+			if err := k.validateLiveForkNetwork(stack); err != nil {
+				return err
+			}
+		}
+		return k.validateLiveForkResourcesAndMappings()
+	})
+}
+
+// validateLiveForkResourcesAndMappings applies the authoritative resource
+// checks. k must be paused and inside quiescePausedAnd.
+func (k *Kernel) validateLiveForkResourcesAndMappings() error {
+	if err := k.validateLiveForkResources(); err != nil {
+		return err
+	}
+	return k.validateLiveForkMappings()
 }
 
 // LiveFork creates a paused Kernel by streaming only state metadata from k.
@@ -169,10 +207,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				return err
 			}
 		}
-		if err := k.validateLiveForkResources(); err != nil {
-			return err
-		}
-		if err := k.validateLiveForkMappings(); err != nil {
+		if err := k.validateLiveForkResourcesAndMappings(); err != nil {
 			return err
 		}
 		if opts.Metrics != nil {

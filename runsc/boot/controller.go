@@ -96,6 +96,9 @@ const (
 	// ContMgrForkBranch creates an in-memory branch of a paused instant.
 	ContMgrForkBranch = "containerManager.ForkBranch"
 
+	// ContMgrCheckFork validates a branch without creating a child.
+	ContMgrCheckFork = "containerManager.CheckFork"
+
 	// ContMgrListBranches lists all in-memory branches in the sandbox family.
 	ContMgrListBranches = "containerManager.ListBranches"
 
@@ -946,6 +949,16 @@ func (cm *containerManager) ForkBranch(args *ForkBranchArgs, out *BranchInfo) er
 		return err
 	}
 	*out = *info
+	return nil
+}
+
+// CheckFork validates one branch without creating a child.
+func (cm *containerManager) CheckFork(args *BranchArgs, out *ForkEligibility) error {
+	result, err := cm.l.family.CheckFork(args.ID)
+	if err != nil {
+		return err
+	}
+	*out = *result
 	return nil
 }
 

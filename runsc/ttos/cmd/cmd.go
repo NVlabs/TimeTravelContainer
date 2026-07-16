@@ -244,6 +244,7 @@ Commands:
   ps [--all|--quiet]              List container branches in a flat table
   top [--json] TARGET             Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
+  fork --check [--json] SOURCE    Validate SOURCE without creating a branch
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
@@ -1132,15 +1133,44 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
+	check := fs.Bool("check", false, "report source eligibility without forking")
+	jsonOutput := fs.Bool("json", false, "emit eligibility as JSON (requires --check)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 || fs.NArg() > 2 {
-		return errors.New("usage: ttos fork [--paused] SOURCE [DEST]")
+		return errors.New("usage: ttos fork [--paused] SOURCE [DEST] | ttos fork --check [--json] SOURCE")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return fmt.Errorf("invalid source: %w", err)
+	}
+	if *check {
+		if fs.NArg() != 1 || *paused {
+			return errors.New("fork --check accepts one SOURCE and cannot be combined with --paused")
+		}
+		result, err := backend.checkFork(source)
+		if err != nil {
+			return fmt.Errorf("checking %s: %w", source, err)
+		}
+		if *jsonOutput {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		} else {
+			if err := writeForkEligibility(stdout, source, result); err != nil {
+				return err
+			}
+		}
+		if !result.Eligible {
+			return exitStatus{code: 1}
+		}
+		return nil
+	}
+	if *jsonOutput {
+		return errors.New("--json requires --check")
 	}
 	destinationValue := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	if fs.NArg() == 2 {
@@ -1156,6 +1186,34 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	fmt.Fprintf(stdout, "%s@%s\n", source.container, branch.ID)
 	return nil
+}
+
+func writeForkEligibility(w io.Writer, source selector, result ForkEligibility) error {
+	state := "ineligible"
+	if result.Eligible {
+		state = "eligible"
+	}
+	if _, err := fmt.Fprintf(w, "%s %s\n", source, state); err != nil {
+		return err
+	}
+	if result.Reason != "" {
+		if _, err := fmt.Fprintf(w, "reason: %s\n", result.Reason); err != nil {
+			return err
+		}
+	}
+	if len(result.Issues) == 0 {
+		return nil
+	}
+	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "PID\tFD\tRESOURCE\tREASON")
+	for _, issue := range result.Issues {
+		fd := strconv.Itoa(int(issue.FD))
+		if issue.FD < 0 {
+			fd = "mapping"
+		}
+		fmt.Fprintf(table, "%d\t%s\t%s\t%s\n", issue.PID, fd, issue.Resource, issue.Reason)
+	}
+	return table.Flush()
 }
 
 func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool) error {
@@ -1483,6 +1541,21 @@ type Family struct {
 	Error    string   `json:"error,omitempty"`
 }
 
+// ForkResourceIssue identifies one resource that blocks a live fork.
+type ForkResourceIssue struct {
+	PID      int32  `json:"pid"`
+	FD       int32  `json:"fd"`
+	Resource string `json:"resource"`
+	Reason   string `json:"reason"`
+}
+
+// ForkEligibility is a stable read-only fork validation report.
+type ForkEligibility struct {
+	Eligible bool                `json:"eligible"`
+	Issues   []ForkResourceIssue `json:"issues,omitempty"`
+	Reason   string              `json:"reason,omitempty"`
+}
+
 // ProcessInfo is stable branch-local process information returned by ttos top.
 type ProcessInfo struct {
 	UID     uint32  `json:"uid"`
@@ -1511,6 +1584,7 @@ type backend interface {
 	processes(target selector) ([]ProcessInfo, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
+	checkFork(target selector) (ForkEligibility, error)
 	resume(target selector) error
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
@@ -2415,6 +2489,18 @@ func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
 		return nil, fmt.Errorf("decoding branch process list: %w", err)
 	}
 	return processes, nil
+}
+
+func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
+	output, err := b.command("timetravel", target.container, "check", target.branch)
+	if err != nil {
+		return ForkEligibility{}, err
+	}
+	var result ForkEligibility
+	if err := json.Unmarshal(output, &result); err != nil {
+		return ForkEligibility{}, fmt.Errorf("decoding fork eligibility: %w", err)
+	}
+	return result, nil
 }
 
 func (b *runtimeBackend) signal(target selector, signal int, all bool) error {

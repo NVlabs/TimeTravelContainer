@@ -92,6 +92,16 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent.Unpause()
 
 	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	eligibility, err := family.CheckFork(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("CheckFork: %v", err)
+	}
+	if !eligibility.Eligible || len(eligibility.Issues) != 0 || eligibility.Reason != "" {
+		t.Fatalf("CheckFork returned %+v", eligibility)
+	}
+	if branches := family.List(); len(branches) != 1 || branches[0].State != BranchRunning || parent.IsPaused() {
+		t.Fatalf("CheckFork changed running family: branches=%+v paused=%t", branches, parent.IsPaused())
+	}
 	child, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)

@@ -172,6 +172,44 @@ func TestCommandsUseQualifiedBranches(t *testing.T) {
 	}
 }
 
+func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
+	b := &fakeBackend{checkResult: ForkEligibility{Eligible: true}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"fork", "--check", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("eligible check status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.checkTarget != (selector{container: "web", branch: "main"}) || b.forkDestination != "" {
+		t.Errorf("check target=%+v fork destination=%q", b.checkTarget, b.forkDestination)
+	}
+	if got, want := stdout.String(), "web@main eligible\n"; got != want {
+		t.Errorf("eligible output=%q, want %q", got, want)
+	}
+
+	b.checkResult = ForkEligibility{
+		Reason: "live fork resource validation failed",
+		Issues: []ForkResourceIssue{{PID: 1, FD: -1, Resource: "aioMappable", Reason: "unsupported mapping"}},
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"fork", "--check", "web"}, &stdout, &stderr, b); status != 1 {
+		t.Fatalf("ineligible check status=%d, stderr=%q", status, stderr.String())
+	}
+	for _, text := range []string{"web@main ineligible", "reason:", "mapping", "aioMappable", "unsupported mapping"} {
+		if !strings.Contains(stdout.String(), text) {
+			t.Errorf("ineligible output %q does not contain %q", stdout.String(), text)
+		}
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"fork", "--check", "--json", "web"}, &stdout, &stderr, b); status != 1 {
+		t.Fatalf("JSON ineligible check status=%d, stderr=%q", status, stderr.String())
+	}
+	var got ForkEligibility
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || !reflect.DeepEqual(got, b.checkResult) {
+		t.Errorf("eligibility JSON=%+v err=%v, want %+v", got, err, b.checkResult)
+	}
+}
+
 func TestForkGeneratesDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -776,6 +814,10 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "c
 	echo '[{"uid":1000,"pid":7,"ppid":1,"pgid":7,"threads":[7,8],"c":3,"tty":"?","stime":"12:34","time":"9ms","cmd":"worker"}]'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "check" ] && [ "$6" = "child" ]; then
+	echo '{"eligible":true}'
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
 	exit 0
 fi
@@ -840,6 +882,13 @@ exit 2
 	}
 	if len(processes) != 1 || processes[0].PID != 7 || processes[0].UID != 1000 || processes[0].Cmd != "worker" {
 		t.Errorf("processes returned %+v", processes)
+	}
+	eligibility, err := b.checkFork(selector{container: "web", branch: "child"})
+	if err != nil {
+		t.Fatalf("checkFork: %v", err)
+	}
+	if !eligibility.Eligible || len(eligibility.Issues) != 0 {
+		t.Errorf("checkFork returned %+v", eligibility)
 	}
 	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
 		t.Fatalf("signal: %v", err)
@@ -959,6 +1008,8 @@ type fakeBackend struct {
 	families          []Family
 	processTarget     selector
 	processList       []ProcessInfo
+	checkTarget       selector
+	checkResult       ForkEligibility
 	err               error
 	forkSource        selector
 	forkDestination   string
@@ -1057,6 +1108,11 @@ func (b *fakeBackend) listFamilies() ([]Family, error) {
 func (b *fakeBackend) processes(target selector) ([]ProcessInfo, error) {
 	b.processTarget = target
 	return b.processList, b.err
+}
+
+func (b *fakeBackend) checkFork(target selector) (ForkEligibility, error) {
+	b.checkTarget = target
+	return b.checkResult, b.err
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {

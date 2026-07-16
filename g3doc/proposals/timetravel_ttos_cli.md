@@ -159,8 +159,13 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] `ttos ls --json` with a stable machine-readable schema.
 - [x] Mark deleted historical parents in tree output without reparenting their
       descendants.
-- [ ] Display structured fork-ineligibility issues before attempting a fork.
-- [ ] Add `ttos fork --check SOURCE` for a read-only eligibility report.
+- [x] Display structured PID/FD-or-mapping fork-ineligibility issues before
+      attempting a fork.
+- [x] Add `ttos fork --check [--json] SOURCE` as a read-only eligibility
+      report with script-friendly success/failure status.
+      The report is an advisory snapshot of the current pre-mutation network,
+      resource, and mapping graph. A subsequent fork can still lose a race or
+      fail a later VFS/state-serialization check.
 - [ ] Add shell completion for family, branch, image, volume, and session names.
 
 ### Exec
@@ -473,7 +478,8 @@ process, fork its branch, and then attach independently to both branches.
 - [x] Initial containerd-backed image pull/unpack and managed image-root storage.
 - [ ] Full run/create/start/stop/rm/inspect/logs/exec/attach UX.
 - [x] Initial fork/pause/resume and beautified branch tree.
-- [ ] Read-only fork eligibility check and richer branch-tree diagnostics.
+- [x] Read-only fork eligibility check.
+- [ ] Richer branch-tree diagnostics.
 - [ ] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
 
