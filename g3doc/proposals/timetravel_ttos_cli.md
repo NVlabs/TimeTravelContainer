@@ -21,9 +21,10 @@ tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
 more paths, and their state forks CoW with each live branch. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
-validation as an external resource. An opt-in non-TTY internal-console
-substrate now provides
-branch-local Sentry pipes, nonblocking control RPCs, and explicit stdin close.
+validation as an external resource. An opt-in internal-console substrate now provides branch-local Sentry pipes for
+non-TTY containers and Sentry devpts PTYs for terminal containers, with
+nonblocking control RPCs, explicit stdin close, terminal resize, and saved
+console state.
 A persistent, single-consumer `runsc console-follow` sidecar drains each branch
 into a Docker-multiplexed host log with frame-safe bounded rotation (defaulting
 to two 16 MiB generations and configurable with Docker-style `--log-opt
@@ -32,7 +33,7 @@ all|N]` replay, tail, or follow rotations independently. This supports optional
 stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground
 `run`/`start`, detached output draining, and multiple output readers without
 placing host FDs in the guest resource graph. `ttosd`, daemon-owned stdin
-ownership, TTY detach, detached and TTY exec, persistent managed-volume
+ownership, detached and TTY exec, persistent managed-volume
 backing, and managed OverlayFS volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
@@ -151,7 +152,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       and `--mount type=volume,...`, including repeated aliases of one volume.
 - [ ] Add CPU, memory, process-count, and other resource-limit flags.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
-- [ ] Support `-t` after the internal detachable console is implemented.
+- [x] Support `run/create -t` with a detachable Sentry-internal PTY, Docker-style
+      combined `-it`/`-dit`, raw interactive attach, resize propagation, and
+      branch-local terminal state.
 - [x] `ttos create` as persistent image-root and OCI-bundle preparation.
 - [x] `ttos start CONTAINER` for created/exited base containers, detached by
       default with optional `--attach`. Multiple detached containers start in
@@ -257,7 +260,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
 - [x] Support Docker-like detach keys for non-TTY stdin attachment, including
       Ctrl-P, Ctrl-Q by default and `ttos attach --detach-keys` overrides.
-- [ ] Support TTY detach, terminal resize, and signal forwarding.
+- [x] Support TTY detach keys, terminal resize/SIGWINCH propagation, and
+      line-discipline signal delivery from an attached raw terminal.
 - [x] Initial noninteractive streaming suitable for pipelines.
 - [x] Allow multiple independent stdout/stderr readers without consuming each
       other's output; one locked sidecar is the sole Sentry-pipe reader.
@@ -321,7 +325,7 @@ state still forks entirely in memory.
 - [ ] Add terminal metadata and detached exec-session IDs.
 - [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
-- [ ] For interactive processes, allocate a Sentry devpts PTY and install its
+- [x] For init interactive processes, allocate a Sentry devpts PTY and install its
       slave as guest stdio.
 - [x] Keep pipe peers in the branch-local Kernel console registry, not
       in a host `FileDescription`.
@@ -343,7 +347,8 @@ state still forks entirely in memory.
       replace the sidecar's polling RPC loop with readiness-driven transport.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
-- [ ] Clone PTY termios, foreground process group, window size, and hangup state.
+- [x] Clone init-console PTY termios, foreground process group, window size,
+      queues, and hangup state.
 - [x] Ensure post-fork non-TTY input and output cannot cross branches and that a
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
@@ -548,7 +553,8 @@ grandchild branches without PID or wait-status crossover.
 - [ ] Detached exec and reattach.
 - [ ] Internal devpts interactive console, resize, signals, and detach keys.
 - [x] Non-TTY console state fork and branch-local I/O.
-- [ ] PTY console state fork and branch-local I/O.
+- [x] Init PTY console state fork and branch-local I/O. Exec-session PTYs remain
+      TODO.
 
 Gate: a user can detach from a still-running interactive or noninteractive
 process, fork its branch, and then attach independently to both branches.

@@ -521,14 +521,14 @@ func TestValidateImageRemovalRequiresForceWhenInUse(t *testing.T) {
 func TestRunParsesDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-d", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got := stdout.String(); got != "demo\n" {
 		t.Errorf("run output=%q, want demo", got)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -612,10 +612,10 @@ func TestRunForwardsContainerExitStatus(t *testing.T) {
 func TestCreateAndStart(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "-it", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	stdout.Reset()

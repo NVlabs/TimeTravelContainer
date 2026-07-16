@@ -133,6 +133,9 @@ const (
 	// ContMgrConsoleCloseStdin closes branch-local internal console input.
 	ContMgrConsoleCloseStdin = "containerManager.ConsoleCloseStdin"
 
+	// ContMgrConsoleResize changes a branch-local PTY console's window size.
+	ContMgrConsoleResize = "containerManager.ConsoleResize"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -1059,6 +1062,11 @@ func (cm *containerManager) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWri
 // ConsoleCloseStdin closes input to a branch-local internal console.
 func (cm *containerManager) ConsoleCloseStdin(args *ConsoleCloseStdinArgs, _ *struct{}) error {
 	return cm.l.family.ConsoleCloseStdin(args)
+}
+
+// ConsoleResize changes a branch-local PTY console's window size.
+func (cm *containerManager) ConsoleResize(args *ConsoleResizeArgs, _ *struct{}) error {
+	return cm.l.family.ConsoleResize(args)
 }
 
 // Wait waits for the init process in the given container.

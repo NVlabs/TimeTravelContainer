@@ -139,6 +139,12 @@ func (mfd *masterFileDescription) Write(ctx context.Context, src usermem.IOSeque
 	return mfd.t.ld.inputQueueWrite(ctx, src)
 }
 
+// SetInternalConsoleWindowSize changes the PTY window size without requiring a
+// task syscall context. It is used by the branch-local console control plane.
+func (mfd *masterFileDescription) SetInternalConsoleWindowSize(size linux.Winsize) {
+	mfd.t.ld.setWindowSizeValue(size)
+}
+
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)

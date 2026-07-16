@@ -47,6 +47,7 @@ type PrepareOptions struct {
 	Platform           string
 	ConsoleLogMaxBytes int64
 	ConsoleLogMaxFiles int
+	OpenStdin          bool
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -68,6 +69,8 @@ type ContainerInfo struct {
 	NetworkMode        string          `json:"network_mode,omitempty"`
 	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
 	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
+	Terminal           bool            `json:"terminal,omitempty"`
+	OpenStdin          bool            `json:"open_stdin,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -164,6 +167,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		NetworkMode:        networkMode,
 		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
 		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
+		Terminal:           opts.Terminal,
+		OpenStdin:          opts.OpenStdin,
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}

@@ -40,13 +40,18 @@ const (
 	InternalConsoleStderr InternalConsoleStream = 2
 )
 
-// InternalConsole owns the control-side peers of three Sentry-internal pipes.
-// The process-side endpoints live in its FDTable. Both sides are serialized as
-// part of Kernel state, so live fork duplicates queued data and connectivity.
+// InternalConsole owns either the control-side peers of three Sentry-internal
+// pipes or the master of a Sentry-internal PTY. The process-side endpoints live
+// in its FDTable. Both sides are serialized as part of Kernel state, so live
+// fork duplicates queued data and connectivity.
 //
 // +stateify savable
 type InternalConsole struct {
 	mu sync.Mutex `state:"nosave"`
+
+	terminal    bool
+	stdinClosed bool
+	master      *vfs.FileDescription
 
 	stdin  *vfs.FileDescription
 	stdout *vfs.FileDescription
@@ -132,6 +137,53 @@ func (k *Kernel) NewInternalConsoleFDTable(ctx context.Context, id string) (*FDT
 	return fdTable, nil
 }
 
+// NewInternalTTYConsoleFDTable installs replica as the process stdin, stdout, and
+// stderr and registers master as its nonblocking control endpoint. master and
+// replica are borrowed; the caller retains its references.
+func (k *Kernel) NewInternalTTYConsoleFDTable(ctx context.Context, id string, master, replica *vfs.FileDescription) (*FDTable, error) {
+	if id == "" {
+		return nil, fmt.Errorf("internal console ID must not be empty")
+	}
+	if master == nil || replica == nil {
+		return nil, fmt.Errorf("internal PTY master and replica must not be nil")
+	}
+	if err := master.SetStatusFlags(ctx, auth.CredentialsFromContext(ctx), master.StatusFlags()|linux.O_NONBLOCK); err != nil {
+		return nil, fmt.Errorf("making internal PTY master nonblocking: %w", err)
+	}
+
+	k.internalConsolesMu.Lock()
+	if _, ok := k.internalConsoles[id]; ok {
+		k.internalConsolesMu.Unlock()
+		return nil, fmt.Errorf("internal console %q already exists", id)
+	}
+	if k.internalConsoles == nil {
+		k.internalConsoles = make(map[string]*InternalConsole)
+	}
+	master.IncRef()
+	console := &InternalConsole{terminal: true, master: master}
+	k.internalConsoles[id] = console
+	k.internalConsolesMu.Unlock()
+
+	fdTable := k.NewFDTable()
+	for guestFD := range 3 {
+		replaced, err := fdTable.NewFDAt(ctx, int32(guestFD), replica, FDFlags{})
+		if replaced != nil {
+			replaced.DecRef(ctx)
+		}
+		if err != nil {
+			fdTable.DecRef(ctx)
+			k.internalConsolesMu.Lock()
+			if k.internalConsoles[id] == console {
+				delete(k.internalConsoles, id)
+			}
+			k.internalConsolesMu.Unlock()
+			master.DecRef(ctx)
+			return nil, fmt.Errorf("installing internal PTY fd %d: %w", guestFD, err)
+		}
+	}
+	return fdTable, nil
+}
+
 func (k *Kernel) internalConsole(id string) (*InternalConsole, error) {
 	k.internalConsolesMu.Lock()
 	console := k.internalConsoles[id]
@@ -157,8 +209,15 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 	var file *vfs.FileDescription
 	switch stream {
 	case InternalConsoleStdout:
-		file = console.stdout
+		if console.terminal {
+			file = console.master
+		} else {
+			file = console.stdout
+		}
 	case InternalConsoleStderr:
+		if console.terminal {
+			return nil, true, false, nil
+		}
 		file = console.stderr
 	default:
 		return nil, false, false, fmt.Errorf("invalid internal console stream %d", stream)
@@ -169,6 +228,9 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 		return nil, false, true, nil
 	}
 	if err != nil {
+		if console.terminal && linuxerr.Equals(linuxerr.EIO, err) && file.Readiness(waiter.EventHUp)&waiter.EventHUp != 0 {
+			return nil, true, false, nil
+		}
 		return nil, false, false, err
 	}
 	eof = n == 0
@@ -194,10 +256,14 @@ func (k *Kernel) WriteInternalConsole(ctx context.Context, id string, data []byt
 	}
 	console.mu.Lock()
 	defer console.mu.Unlock()
-	if console.stdin == nil {
+	if console.stdinClosed || (!console.terminal && console.stdin == nil) {
 		return 0, false, fmt.Errorf("internal console %q stdin is closed", id)
 	}
-	written, err := console.stdin.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
+	input := console.stdin
+	if console.terminal {
+		input = console.master
+	}
+	written, err := input.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
 	if linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return int(written), true, nil
 	}
@@ -213,10 +279,46 @@ func (k *Kernel) CloseInternalConsoleStdin(ctx context.Context, id string) error
 	}
 	console.mu.Lock()
 	defer console.mu.Unlock()
+	if console.stdinClosed {
+		return nil
+	}
+	if console.terminal {
+		_, err := console.master.Write(ctx, usermem.BytesIOSequence([]byte{4}), vfs.WriteOptions{})
+		if err != nil {
+			return err
+		}
+		console.stdinClosed = true
+		return nil
+	}
 	if console.stdin != nil {
 		console.stdin.DecRef(ctx)
 		console.stdin = nil
 	}
+	console.stdinClosed = true
+	return nil
+}
+
+type internalConsoleWindowSizer interface {
+	SetInternalConsoleWindowSize(size linux.Winsize)
+}
+
+// ResizeInternalConsole changes the window size of a PTY-backed console and
+// delivers SIGWINCH to its foreground process group when the size changed.
+func (k *Kernel) ResizeInternalConsole(ctx context.Context, id string, size linux.Winsize) error {
+	console, err := k.internalConsole(id)
+	if err != nil {
+		return err
+	}
+	console.mu.Lock()
+	defer console.mu.Unlock()
+	if !console.terminal {
+		return fmt.Errorf("internal console %q is not a terminal", id)
+	}
+	sizer, ok := console.master.Impl().(internalConsoleWindowSizer)
+	if !ok {
+		return fmt.Errorf("internal console %q master %T does not support resize", id, console.master.Impl())
+	}
+	sizer.SetInternalConsoleWindowSize(size)
 	return nil
 }
 
@@ -226,6 +328,10 @@ func (k *Kernel) releaseInternalConsoles(ctx context.Context) {
 	k.internalConsoles = nil
 	k.internalConsolesMu.Unlock()
 	for _, console := range consoles {
+		if console.terminal {
+			console.master.DecRef(ctx)
+			continue
+		}
 		if console.stdin != nil {
 			console.stdin.DecRef(ctx)
 		}

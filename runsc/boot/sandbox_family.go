@@ -155,6 +155,16 @@ type ConsoleCloseStdinArgs struct {
 	ConsoleID string
 }
 
+// ConsoleResizeArgs changes a branch-local PTY console's window size.
+type ConsoleResizeArgs struct {
+	BranchID  string
+	ConsoleID string
+	Rows      uint16
+	Cols      uint16
+	XPixels   uint16
+	YPixels   uint16
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -883,6 +893,33 @@ func (f *SandboxFamily) ConsoleCloseStdin(args *ConsoleCloseStdinArgs) error {
 	}
 	f.mu.Unlock()
 	return b.k.CloseInternalConsoleStdin(b.k.SupervisorContext(), args.ConsoleID)
+}
+
+// ConsoleResize changes a PTY window while serializing against branch
+// lifecycle operations and live fork.
+func (f *SandboxFamily) ConsoleResize(args *ConsoleResizeArgs) error {
+	if args == nil {
+		return fmt.Errorf("missing internal console resize arguments")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	return b.k.ResizeInternalConsole(b.k.SupervisorContext(), args.ConsoleID, linux.Winsize{
+		Row:    args.Rows,
+		Col:    args.Cols,
+		Xpixel: args.XPixels,
+		Ypixel: args.YPixels,
+	})
 }
 
 // beginControl acquires a Kernel-lifetime lease for a branch-local operation.

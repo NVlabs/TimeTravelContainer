@@ -52,6 +52,10 @@ type TimeTravel struct {
 	consoleStream     string
 	consoleMaxBytes   int
 	consoleData       string
+	consoleRows       int
+	consoleCols       int
+	consoleXPixels    int
+	consoleYPixels    int
 	consoleLog        string
 	consoleReadyFD    int
 	consoleWaitStatus string
@@ -74,7 +78,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin|console-follow <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -88,6 +92,10 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consoleStream, "stream", "stdout", "console output stream: stdout or stderr")
 	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
 	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
+	f.IntVar(&t.consoleRows, "rows", 0, "terminal window rows for console-resize")
+	f.IntVar(&t.consoleCols, "cols", 0, "terminal window columns for console-resize")
+	f.IntVar(&t.consoleXPixels, "x-pixels", 0, "terminal window width in pixels for console-resize")
+	f.IntVar(&t.consoleYPixels, "y-pixels", 0, "terminal window height in pixels for console-resize")
 	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
 	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled after console-follow connects")
 	f.StringVar(&t.consoleWaitStatus, "console-wait-status", "", "host path where console-follow atomically records init wait status")
@@ -195,6 +203,29 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.CloseConsoleStdin(&boot.ConsoleCloseStdinArgs{
 			BranchID:  f.Arg(2),
 			ConsoleID: t.consoleID,
+		})
+	case "console-resize":
+		values := []struct {
+			name  string
+			value int
+		}{
+			{"rows", t.consoleRows},
+			{"cols", t.consoleCols},
+			{"x-pixels", t.consoleXPixels},
+			{"y-pixels", t.consoleYPixels},
+		}
+		for _, value := range values {
+			if value.value < 0 || value.value > 65535 {
+				util.Fatalf("--%s=%d is outside 0..65535", value.name, value.value)
+			}
+		}
+		err = cont.Sandbox.ResizeConsole(&boot.ConsoleResizeArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
+			Rows:      uint16(t.consoleRows),
+			Cols:      uint16(t.consoleCols),
+			XPixels:   uint16(t.consoleXPixels),
+			YPixels:   uint16(t.consoleYPixels),
 		})
 	case "console-follow":
 		type branchWaitResult struct {

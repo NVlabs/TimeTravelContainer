@@ -230,17 +230,22 @@ func (l *lineDiscipline) windowSize(t *kernel.Task, args arch.SyscallArguments) 
 }
 
 func (l *lineDiscipline) setWindowSize(t *kernel.Task, args arch.SyscallArguments) error {
-	l.sizeMu.Lock()
-	defer l.sizeMu.Unlock()
-	oldSize := l.size
-	_, err := l.size.CopyIn(t, args[2].Pointer())
-	if err != nil {
+	var size linux.Winsize
+	if _, err := size.CopyIn(t, args[2].Pointer()); err != nil {
 		return err
 	}
-	if oldSize != l.size {
+	l.setWindowSizeValue(size)
+	return nil
+}
+
+func (l *lineDiscipline) setWindowSizeValue(size linux.Winsize) {
+	l.sizeMu.Lock()
+	oldSize := l.size
+	l.size = size
+	l.sizeMu.Unlock()
+	if oldSize != size {
 		l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGWINCH))
 	}
-	return nil
 }
 
 func (l *lineDiscipline) masterReadiness() waiter.EventMask {

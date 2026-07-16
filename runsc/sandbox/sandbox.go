@@ -2144,6 +2144,14 @@ func (s *Sandbox) CloseConsoleStdin(args *boot.ConsoleCloseStdinArgs) error {
 	return nil
 }
 
+// ResizeConsole changes a branch-local PTY console's window size.
+func (s *Sandbox) ResizeConsole(args *boot.ConsoleResizeArgs) error {
+	if err := s.call(boot.ContMgrConsoleResize, args, nil); err != nil {
+		return fmt.Errorf("resizing internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return nil
+}
+
 // Usage sends the collect call for a container in the sandbox.
 func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)

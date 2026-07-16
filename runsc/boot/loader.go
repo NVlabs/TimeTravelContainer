@@ -786,7 +786,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating init process for root container: %w", err)
 	}
 	l.root.procArgs = procArgs
-	if args.Spec.Annotations[InternalConsoleAnnotation] != "" {
+	if args.Spec.Annotations[InternalConsoleAnnotation] != "" && !args.Spec.Process.Terminal {
 		fdTable, err := l.newInternalConsoleFDTable(&l.root)
 		if err != nil {
 			return nil, fmt.Errorf("preparing root internal console: %w", err)
@@ -1418,7 +1418,26 @@ func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable
 		return nil, fmt.Errorf("internal console annotation is empty")
 	}
 	if info.spec.Process.Terminal {
-		return nil, fmt.Errorf("internal PTY consoles are not implemented")
+		if info.procArgs.MountNamespace == nil {
+			return nil, fmt.Errorf("internal PTY requires an initialized mount namespace")
+		}
+		ctx := info.procArgs.NewContext(l.k)
+		master, replica, tty, err := devpts.NewInternalPTY(ctx, l.k.VFS(), info.procArgs.MountNamespace)
+		if err != nil {
+			return nil, err
+		}
+		defer master.DecRef(ctx)
+		defer replica.DecRef(ctx)
+		fdTable, err := l.k.NewInternalTTYConsoleFDTable(ctx, consoleID, master, replica)
+		if err != nil {
+			return nil, err
+		}
+		if err := l.k.ResizeInternalConsole(ctx, consoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
+			fdTable.DecRef(ctx)
+			return nil, fmt.Errorf("setting default internal PTY size: %w", err)
+		}
+		info.procArgs.TTY = tty
+		return fdTable, nil
 	}
 	if len(info.passFDs) != 0 {
 		return nil, fmt.Errorf("internal console does not yet support donated file descriptors")
@@ -1437,7 +1456,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	var err error
 	if consoleID != "" {
 		fdTable = info.procArgs.FDTable
-		if fdTable == nil {
+		if fdTable == nil && !info.spec.Process.Terminal {
 			fdTable, err = l.newInternalConsoleFDTable(info)
 		}
 	} else {
@@ -1491,6 +1510,13 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	mntr := l.newContainerMounter(info)
 	if err := setupContainerVFS(ctx, info, mntr, &info.procArgs); err != nil {
 		return nil, nil, err
+	}
+	if consoleID != "" && info.spec.Process.Terminal {
+		fdTable, err = l.newInternalConsoleFDTable(info)
+		if err != nil {
+			return nil, nil, fmt.Errorf("creating internal PTY: %w", err)
+		}
+		info.procArgs.FDTable = fdTable
 	}
 	defer func() {
 		for cg := range info.procArgs.InitialCgroups {

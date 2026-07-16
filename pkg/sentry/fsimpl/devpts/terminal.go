@@ -15,10 +15,14 @@
 package devpts
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -51,8 +55,9 @@ var _ kernel.TTYOperations = (*Terminal)(nil)
 // OpenTTY implements kernel.TTYOperations.OpenTTY.
 func (t *Terminal) OpenTTY(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	tsk := kernel.TaskFromContext(ctx)
-	if tsk == nil {
-		return nil, linuxerr.EIO
+	creds := auth.CredentialsFromContext(ctx)
+	if tsk != nil {
+		creds = tsk.Credentials()
 	}
 	t.root.mu.Lock()
 	ri, ok := t.root.replicas[t.replicaKTTY.Index()]
@@ -64,10 +69,10 @@ func (t *Terminal) OpenTTY(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry
 		inode: ri,
 	}
 	fd.LockFD.Init(&ri.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, tsk.Credentials(), mnt, vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, creds, mnt, vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
-	if opts.Flags&linux.O_NOCTTY == 0 {
+	if tsk != nil && opts.Flags&linux.O_NOCTTY == 0 {
 		// Opening a replica sets the process' controlling TTY when
 		// possible. An error indicates it cannot be set, and is
 		// ignored silently. See Linux tty_open().
@@ -75,4 +80,42 @@ func (t *Terminal) OpenTTY(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry
 	}
 	ri.t.ld.replicaOpen()
 	return &fd.vfsfd, nil
+}
+
+// NewInternalPTY allocates a PTY from mntns's devpts instance without
+// requiring an existing task. It returns references to the control-side
+// master and process-side replica; the caller must release both references.
+// tty is the controlling terminal associated with replica.
+func NewInternalPTY(ctx context.Context, vfsObj *vfs.VirtualFilesystem, mntns *vfs.MountNamespace) (master, replica *vfs.FileDescription, tty *kernel.TTY, err error) {
+	root := mntns.Root(ctx)
+	if !root.Ok() {
+		return nil, nil, nil, fmt.Errorf("mount namespace has no root")
+	}
+	defer root.DecRef(ctx)
+	creds := auth.CredentialsFromContext(ctx)
+	master, err = vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse("/dev/ptmx"),
+		FollowFinalSymlink: true,
+	}, &vfs.OpenOptions{Flags: linux.O_RDWR | linux.O_NONBLOCK | linux.O_NOCTTY})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("opening /dev/ptmx: %w", err)
+	}
+	mfd, ok := master.Impl().(*masterFileDescription)
+	if !ok {
+		master.DecRef(ctx)
+		return nil, nil, nil, fmt.Errorf("/dev/ptmx returned %T, want devpts master", master.Impl())
+	}
+	replicaPath := fmt.Sprintf("/dev/pts/%d", mfd.t.n)
+	replica, err = vfsObj.OpenAt(ctx, creds, &vfs.PathOperation{
+		Root:  root,
+		Start: root,
+		Path:  fspath.Parse(replicaPath),
+	}, &vfs.OpenOptions{Flags: linux.O_RDWR})
+	if err != nil {
+		master.DecRef(ctx)
+		return nil, nil, nil, fmt.Errorf("opening %s: %w", replicaPath, err)
+	}
+	return master, replica, mfd.t.replicaKTTY, nil
 }

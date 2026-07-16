@@ -302,6 +302,89 @@ func TestLiveForkMountsCompatible(t *testing.T) {
 	}
 }
 
+// TestRunInternalTTYLiveFork verifies that a terminal container uses a fully
+// Sentry-owned PTY and that live fork duplicates both endpoints and queued data.
+func TestRunInternalTTYLiveFork(t *testing.T) {
+	spec := testSpec()
+	spec.Process.Args = []string{"/bin/sleep", "30"}
+	spec.Process.Terminal = true
+	spec.Mounts = []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+	}
+	const consoleID = "init"
+	spec.Annotations = map[string]string{InternalConsoleAnnotation: consoleID}
+	conf := testConfig()
+	conf.DirectFS = false
+	l, cleanup, err := createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.NoOverlay})
+	if err != nil {
+		t.Fatalf("creating terminal loader: %v", err)
+	}
+	defer cleanup()
+	defer l.Destroy()
+
+	if _, _, _, err := l.k.ReadInternalConsole(l.k.SupervisorContext(), consoleID, kernel.InternalConsoleStdout, 1); err == nil {
+		t.Fatal("internal PTY unexpectedly exists before the container VFS is mounted")
+	}
+	resultCh := make(chan error, 1)
+	go func() { resultCh <- <-l.ctrl.manager.startResultChan }()
+	if err := l.Run(); err != nil {
+		t.Fatalf("running terminal container: %v", err)
+	}
+	if err := <-resultCh; err != nil {
+		t.Fatalf("start result: %v", err)
+	}
+
+	ctx := l.k.SupervisorContext()
+	parentTask := l.k.GlobalInit().Leader()
+	if parentTask.ThreadGroup().TTY() == nil {
+		t.Fatal("terminal process has no controlling TTY")
+	}
+	parentStdin := liveForkTestFD(t, l.k, 0)
+	parentStdout := liveForkTestFD(t, l.k, 1)
+	parentStderr := liveForkTestFD(t, l.k, 2)
+	if parentStdin.Impl() != parentStdout.Impl() || parentStdout.Impl() != parentStderr.Impl() {
+		t.Fatal("terminal stdin, stdout, and stderr do not share one replica")
+	}
+	liveForkTestWrite(t, parentTask, parentStdout, "fork-output")
+	if data, eof, wouldBlock, err := l.k.ReadInternalConsole(ctx, consoleID, kernel.InternalConsoleStderr, 1); err != nil || !eof || wouldBlock || len(data) != 0 {
+		t.Fatalf("terminal stderr probe: got %q eof=%t wouldBlock=%t err=%v", data, eof, wouldBlock, err)
+	}
+
+	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "tty-child"})
+	if err != nil {
+		t.Fatalf("forking terminal container: %v", err)
+	}
+	child, err := l.family.branch(childInfo.ID)
+	if err != nil {
+		t.Fatalf("looking up terminal child: %v", err)
+	}
+	childCtx := child.k.SupervisorContext()
+	childTask := child.k.GlobalInit().Leader()
+	childStdin := liveForkTestFD(t, child.k, 0)
+	childStdout := liveForkTestFD(t, child.k, 1)
+	if parentStdout.Impl() == childStdout.Impl() {
+		t.Fatal("parent and child share the internal PTY replica object")
+	}
+	if parentTask.ThreadGroup().TTY() == childTask.ThreadGroup().TTY() {
+		t.Fatal("parent and child share the controlling TTY object")
+	}
+	liveForkTestConsoleRead(t, l.k, ctx, consoleID, kernel.InternalConsoleStdout, "fork-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, consoleID, kernel.InternalConsoleStdout, "fork-output")
+	liveForkTestWrite(t, childTask, childStdout, "child-output")
+	liveForkTestConsoleRead(t, child.k, childCtx, consoleID, kernel.InternalConsoleStdout, "child-output")
+	liveForkTestConsoleWouldBlock(t, l.k, ctx, consoleID, kernel.InternalConsoleStdout)
+
+	liveForkTestConsoleWriteInput(t, child.k, childCtx, consoleID, "child-input\n")
+	liveForkTestRead(t, childTask, childStdin, "child-input\n")
+	if got := parentStdin.Readiness(waiter.EventIn); got&waiter.EventIn != 0 {
+		t.Fatalf("child PTY input became readable in parent: readiness=%#x", got)
+	}
+}
+
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
 func TestRunLiveForkNetworkNone(t *testing.T) {
 	hostBind := t.TempDir()

@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -400,6 +401,53 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
+// expandCombinedShortBools implements Docker-style boolean clusters such as
+// -it and -dit while preserving everything after the image/container operand.
+func expandCombinedShortBools(args []string, boolNames string, valueNames ...string) []string {
+	bools := make(map[byte]bool, len(boolNames))
+	for i := range boolNames {
+		bools[boolNames[i]] = true
+	}
+	values := make(map[string]bool, len(valueNames))
+	for _, name := range valueNames {
+		values[name] = true
+	}
+	expanded := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || !strings.HasPrefix(arg, "-") || arg == "-" {
+			expanded = append(expanded, args[i:]...)
+			break
+		}
+		if values[arg] {
+			expanded = append(expanded, arg)
+			if i+1 < len(args) {
+				i++
+				expanded = append(expanded, args[i])
+			}
+			continue
+		}
+		if len(arg) > 2 && arg[0] == '-' && arg[1] != '-' {
+			cluster := arg[1:]
+			valid := true
+			for j := range cluster {
+				if !bools[cluster[j]] {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				for j := range cluster {
+					expanded = append(expanded, "-"+string(cluster[j]))
+				}
+				continue
+			}
+		}
+		expanded = append(expanded, arg)
+	}
+	return expanded
+}
+
 type mountRequests struct {
 	host    []ttosbundle.HostMount
 	managed []ttosbundle.ManagedVolume
@@ -738,6 +786,7 @@ type runRequest struct {
 	managedVolumes     []ttosbundle.ManagedVolume
 	detach             bool
 	interactive        bool
+	terminal           bool
 }
 
 type execRequest struct {
@@ -754,6 +803,7 @@ type exitStatus struct{ code int }
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--volume", "-v", "--mount", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -787,12 +837,6 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos run [OPTIONS] IMAGE [COMMAND...]")
 	}
-	if *terminal {
-		return errors.New("-t/--tty requires the detachable internal console, which is not implemented yet")
-	}
-	if *detach && *interactive {
-		return errors.New("detached interactive containers require the internal console, which is not implemented yet")
-	}
 	networkMode, err := parseNetworkMode(*networkModeValue)
 	if err != nil {
 		return err
@@ -825,6 +869,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
 		interactive:        *interactive,
+		terminal:           *terminal,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -848,10 +893,15 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--volume", "-v", "--mount", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
 	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	interactive := fs.Bool("interactive", false, "keep stdin open")
+	fs.BoolVar(interactive, "i", false, "keep stdin open")
+	terminal := fs.Bool("tty", false, "allocate a terminal")
+	fs.BoolVar(terminal, "t", false, "allocate a terminal")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -905,6 +955,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		managedVolumes:     parsedMounts.managed,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
+		interactive:        *interactive,
+		terminal:           *terminal,
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "entrypoint" {
@@ -922,6 +974,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "ai")
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	attach := fs.Bool("attach", false, "attach stdout and stderr and wait")
@@ -1039,6 +1092,18 @@ func makeRawTerminal(input io.Reader) (func() error, error) {
 	}, nil
 }
 
+func hostTerminalSize(input io.Reader) (cols, rows int, ok bool, err error) {
+	file, ok := input.(*os.File)
+	if !ok || !term.IsTerminal(int(file.Fd())) {
+		return 0, 0, false, nil
+	}
+	cols, rows, err = term.GetSize(int(file.Fd()))
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("reading attached terminal size: %w", err)
+	}
+	return cols, rows, true, nil
+}
+
 func runAttach(args []string, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1100,6 +1165,7 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 }
 
 func runExec(args []string, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "it", "--workdir", "-w", "--user", "-u", "--env", "-e")
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	interactive := fs.Bool("interactive", false, "keep stdin open")
@@ -2829,6 +2895,7 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,
+			Terminal:       request.terminal,
 			NetworkMode:    request.networkMode,
 			Entrypoint:     request.entrypoint,
 			ManagedVolumes: request.managedVolumes,
@@ -2838,11 +2905,12 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 		Platform:           request.platform,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
+		OpenStdin:          request.interactive,
 	})
 	if err != nil {
 		return 1, err
 	}
-	status, err := b.launch(request.name, prepared.BundleDir, request.networkMode, request.detach, request.interactive)
+	status, err := b.launch(request.name, prepared.BundleDir, request.networkMode, request.detach, request.interactive, request.terminal)
 	if err == nil {
 		b.recordLaunchState(request.name, request.detach, status)
 	}
@@ -2859,6 +2927,7 @@ func (b *runtimeBackend) create(request runRequest) error {
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,
+			Terminal:       request.terminal,
 			NetworkMode:    request.networkMode,
 			Entrypoint:     request.entrypoint,
 			HostMounts:     request.hostMounts,
@@ -2868,6 +2937,7 @@ func (b *runtimeBackend) create(request runRequest) error {
 		Platform:           request.platform,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
+		OpenStdin:          request.interactive,
 	})
 	return err
 }
@@ -2881,7 +2951,7 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err := b.removeStoppedRuntime(name); err != nil {
 		return 1, err
 	}
-	status, err := b.launch(name, info.BundleDir, info.NetworkMode, detach, interactive)
+	status, err := b.launch(name, info.BundleDir, info.NetworkMode, detach, interactive, info.Terminal)
 	if err == nil {
 		b.recordLaunchState(name, detach, status)
 	}
@@ -3171,6 +3241,18 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 	if err != nil {
 		return 0, err
 	}
+	store := ttosbundle.Store{Root: b.dataRoot}
+	containerInfo, err := store.LoadContainer(target.container)
+	if err != nil {
+		return 0, err
+	}
+	if containerInfo.Terminal {
+		if err := b.resizeConsoleFromHost(target); err != nil {
+			return 0, err
+		}
+		stopResize := b.watchConsoleResize(target)
+		defer stopResize()
+	}
 	_, maxFiles, err := b.consoleRetention(target.container)
 	if err != nil {
 		return 0, err
@@ -3185,9 +3267,12 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 				retErr = fmt.Errorf("releasing stdin ownership for %s: %w", target, err)
 			}
 		}()
-		restore, err := makeRawTerminal(b.stdin)
-		if err != nil {
-			return 0, err
+		var restore func() error
+		if containerInfo.Terminal {
+			restore, err = makeRawTerminal(b.stdin)
+			if err != nil {
+				return 0, err
+			}
 		}
 		if restore != nil {
 			defer func() {
@@ -3607,6 +3692,45 @@ func consoleDrainStoppedError(errorPath string) error {
 	return fmt.Errorf("console drain stopped before output EOF: %s", message)
 }
 
+func (b *runtimeBackend) resizeConsoleFromHost(target selector) error {
+	cols, rows, ok, err := hostTerminalSize(b.stdin)
+	if err != nil || !ok {
+		return err
+	}
+	_, err = b.command(
+		"timetravel", "--console", "init",
+		"--rows", strconv.Itoa(rows), "--cols", strconv.Itoa(cols),
+		target.container, "console-resize", target.branch,
+	)
+	return err
+}
+
+func (b *runtimeBackend) watchConsoleResize(target selector) func() {
+	file, ok := b.stdin.(*os.File)
+	if !ok || !term.IsTerminal(int(file.Fd())) {
+		return func() {}
+	}
+	resizeSignals := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(resizeSignals, syscall.SIGWINCH)
+	go func() {
+		for {
+			select {
+			case <-resizeSignals:
+				if err := b.resizeConsoleFromHost(target); err != nil && b.stderr != nil {
+					fmt.Fprintf(b.stderr, "ttos: warning: resizing console for %s: %v\n", target, err)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(resizeSignals)
+		close(done)
+	}
+}
+
 func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWriteResult, error) {
 	encoded := base64.StdEncoding.EncodeToString(data)
 	output, err := b.command("timetravel", "--console", "init", "--data-base64", encoded, target.container, "console-write", target.branch)
@@ -3826,8 +3950,8 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Data: map[string]string{"LowerDir": container.RootFS, "UpperDir": "sentry-memory"},
 		},
 		Config: InspectConfig{
-			Hostname: hostname, User: configUser, AttachStdout: true, AttachStderr: true,
-			Tty: process.Terminal, Env: append([]string(nil), process.Env...), Cmd: configCmd,
+			Hostname: hostname, User: configUser, AttachStdin: container.OpenStdin, AttachStdout: true, AttachStderr: true,
+			Tty: process.Terminal, OpenStdin: container.OpenStdin, Env: append([]string(nil), process.Env...), Cmd: configCmd,
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
 		},
 		HostConfig: InspectHostConfig{
@@ -3945,18 +4069,26 @@ func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args
 	return 0, nil
 }
 
-func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, interactive bool) (int, error) {
+func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, interactive, terminal bool) (int, error) {
 	status, err := b.runConfiguredCommandForNetwork(networkMode, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
 	}
 	target := selector{container: name, branch: defaultBranchID}
-	if _, err := b.ensureConsoleDrain(target, true); err != nil {
-		_, cleanupErr := b.command("delete", "--force", name)
-		if cleanupErr != nil {
-			return 1, fmt.Errorf("starting console drain before container start: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+	startDrain := func(phase string) error {
+		if _, err := b.ensureConsoleDrain(target, true); err != nil {
+			return fmt.Errorf("starting console drain %s container start: %w", phase, err)
 		}
-		return 1, fmt.Errorf("starting console drain before container start: %w", err)
+		return nil
+	}
+	if !terminal {
+		if err := startDrain("before"); err != nil {
+			_, cleanupErr := b.command("delete", "--force", name)
+			if cleanupErr != nil {
+				return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			}
+			return 1, err
+		}
 	}
 	status, err = b.runConfiguredCommandForNetwork(networkMode, "start", name)
 	if err != nil || status != 0 {
@@ -3968,6 +4100,15 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
 		return status, err
+	}
+	if terminal {
+		if err := startDrain("after"); err != nil {
+			_, cleanupErr := b.command("delete", "--force", name)
+			if cleanupErr != nil {
+				return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			}
+			return 1, err
+		}
 	}
 	if detach {
 		return 0, nil
