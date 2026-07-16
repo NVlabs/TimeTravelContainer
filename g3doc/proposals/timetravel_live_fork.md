@@ -2,6 +2,10 @@
 
 Status: design draft for the first implementation.
 
+Follow-on product, mount, volume, exec, attach/detach, image-management, and
+Docker-like CLI work is tracked in
+[timetravel_ttos_cli.md](timetravel_ttos_cli.md).
+
 ## Summary
 
 TimeTravelOS adds an in-memory operation that forks a paused gVisor sandbox
