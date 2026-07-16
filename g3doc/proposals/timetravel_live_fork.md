@@ -674,6 +674,30 @@ registration, source pause, Kernel clone, child task start, and final branch
 publication. Each path removes the placeholder, terminates/releases any child,
 restores the source's prior run state, and permits an immediate retry.
 
+Successful fork results carry nanosecond-resolution timings for source pause,
+total source downtime, validation, parent CoW/VFS preparation, metadata
+streaming, child restore and task start, child resume, source resume, and total
+API latency. The
+`BenchmarkSandboxFamilyFork` benchmark reports each component independently so
+optimization can follow profiles rather than conflating pause time with child
+startup or teardown.
+
+An initial profile showed metadata dominating a bare-sandbox fork because the
+state wire codec performs many 1-10 byte operations and the prototype connected
+it directly to a synchronous `io.Pipe`. Live fork now places a bounded 64 KiB
+buffer at each side of the pipe; metadata remains streamed in memory without an
+unbounded full-state buffer or filesystem I/O.
+
+One development-host snapshot (Intel Xeon Platinum 8488C, systrap, five bare
+forks) improved from about 9.25 ms/fork before buffering to 3.95 ms/fork after
+buffering. The latter decomposed into about 3.85 ms metadata streaming, 44 us
+child task start, 23 us child restore, 6.9 us parent preparation, and 3.94 ms
+total source downtime. These numbers are diagnostic rather than an acceptance
+threshold. A separate one-iteration anonymous-memory sanity sweep measured
+about 617 us at 1 MiB resident and 305 us at 1 GiB resident; the noisy inversion
+is not a throughput claim, but it confirms that fork latency did not grow with
+the number of resident bytes because those pages were not copied.
+
 Gate: a branch tree can be repeatedly forked and destroyed in arbitrary order
 without page leaks, use-after-free, or cross-branch state changes.
 

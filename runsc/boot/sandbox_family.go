@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/control"
@@ -45,6 +46,19 @@ type BranchInfo struct {
 	ID       string
 	ParentID string
 	State    BranchState
+	// ForkMetrics is populated for branches created by Fork.
+	ForkMetrics SandboxForkMetrics
+}
+
+// SandboxForkMetrics breaks total API latency into family and Kernel work.
+type SandboxForkMetrics struct {
+	SourcePause    time.Duration
+	SourceDowntime time.Duration
+	Kernel         kernel.LiveForkMetrics
+	ChildStart     time.Duration
+	ChildResume    time.Duration
+	SourceResume   time.Duration
+	Total          time.Duration
 }
 
 // ForkBranchArgs selects the source and destination of an in-memory fork.
@@ -97,6 +111,7 @@ type sandboxBranch struct {
 	k        *kernel.Kernel
 	watchdog *watchdog.Watchdog
 	state    BranchState
+	metrics  SandboxForkMetrics
 }
 
 // SandboxFamily owns all in-memory branches in one sentry process.
@@ -205,7 +220,7 @@ func (f *SandboxFamily) List() []BranchInfo {
 	defer f.mu.Unlock()
 	out := make([]BranchInfo, 0, len(f.branches))
 	for _, b := range f.branches {
-		out = append(out, BranchInfo{ID: b.id, ParentID: b.parentID, State: b.state})
+		out = append(out, BranchInfo{ID: b.id, ParentID: b.parentID, State: b.state, ForkMetrics: b.metrics})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -214,6 +229,8 @@ func (f *SandboxFamily) List() []BranchInfo {
 // Fork creates a child from args.Source. Both branches remain paused unless
 // their requested/prior state says otherwise.
 func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
+	forkStarted := time.Now()
+	var metrics SandboxForkMetrics
 	if args == nil {
 		return nil, fmt.Errorf("missing live-fork arguments")
 	}
@@ -262,14 +279,21 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	f.mu.Unlock()
 
 	if !sourceWasPaused {
+		pauseStarted := time.Now()
 		source.k.Pause()
+		metrics.SourcePause = time.Since(pauseStarted)
 	}
+	sourcePausedAt := time.Now()
 	resumeSource := func() error {
 		if sourceWasPaused {
 			return nil
 		}
+		resumeStarted := time.Now()
 		source.k.Unpause()
-		return control.PostResume(source.k, nil)
+		err := control.PostResume(source.k, nil)
+		metrics.SourceResume += time.Since(resumeStarted)
+		metrics.SourceDowntime = time.Since(sourcePausedAt)
+		return err
 	}
 	if err := f.injectForkFailure(SandboxForkStageSourcePaused); err != nil {
 		resumeErr := resumeSource()
@@ -283,6 +307,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		Clocks:                         sentrytime.NewCalibratedClocks(),
 		AllowNetworkStack:              f.allowNetworkStack,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+		Metrics:                        &metrics.Kernel,
 	})
 	if err != nil {
 		resumeErr := resumeSource()
@@ -299,6 +324,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		}
 		return fail(err)
 	}
+	childStartStarted := time.Now()
 	if err := child.StartPaused(); err != nil {
 		// StartPaused failure is an invariant violation, but ensure ownership of
 		// the child's shared MemoryFile is still released.
@@ -306,6 +332,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		_ = resumeSource()
 		return fail(fmt.Errorf("starting branch %q paused: %w", args.ID, err))
 	}
+	metrics.ChildStart = time.Since(childStartStarted)
 	cleanupStartedChild := func(dog *watchdog.Watchdog) {
 		if dog != nil {
 			dog.Stop()
@@ -345,6 +372,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return fail(err)
 	}
 	if !args.Paused {
+		childResumeStarted := time.Now()
 		child.Unpause()
 		if err := control.PostResume(child, nil); err != nil {
 			child.Pause()
@@ -352,6 +380,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 			_ = resumeSource()
 			return fail(fmt.Errorf("resuming branch %q: %w", args.ID, err))
 		}
+		metrics.ChildResume = time.Since(childResumeStarted)
 		f.mu.Lock()
 		childBranch.state = kernelBranchState(child)
 		f.mu.Unlock()
@@ -363,7 +392,9 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 
 	f.mu.Lock()
 	source.state = kernelBranchState(source.k)
-	info := BranchInfo{ID: childBranch.id, ParentID: childBranch.parentID, State: childBranch.state}
+	metrics.Total = time.Since(forkStarted)
+	childBranch.metrics = metrics
+	info := BranchInfo{ID: childBranch.id, ParentID: childBranch.parentID, State: childBranch.state, ForkMetrics: metrics}
 	f.mu.Unlock()
 	return &info, nil
 }

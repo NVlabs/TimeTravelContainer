@@ -15,9 +15,11 @@
 package kernel
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -51,6 +53,19 @@ type LiveForkOptions struct {
 	// transaction stage. It exists to verify rollback and source reusability;
 	// production callers should leave it nil.
 	TestOnlyFailureInjector func(LiveForkStage) error
+
+	// Metrics, when non-nil, receives a timing breakdown for this attempt.
+	Metrics *LiveForkMetrics
+}
+
+// LiveForkMetrics separates parent preparation, metadata, and child restore
+// costs. Durations include only work performed by Kernel.LiveFork.
+type LiveForkMetrics struct {
+	Validation        time.Duration
+	ParentPreparation time.Duration
+	MetadataStream    time.Duration
+	ChildRestore      time.Duration
+	Total             time.Duration
 }
 
 // LiveForkStage identifies a completed live-fork transaction stage.
@@ -125,6 +140,13 @@ func (e *LiveForkResourceError) Error() string {
 //
 // Preconditions: k must be paused for the duration of the call.
 func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, error) {
+	started := time.Now()
+	if opts.Metrics != nil {
+		*opts.Metrics = LiveForkMetrics{}
+		defer func() {
+			opts.Metrics.Total = time.Since(started)
+		}()
+	}
 	if !k.IsPaused() {
 		return nil, fmt.Errorf("live fork requires a paused kernel")
 	}
@@ -137,6 +159,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() error {
+		validationStarted := time.Now()
 		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 			stack := rootNS.Stack()
 			stack.SetRemoveConf(false)
@@ -152,9 +175,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := k.validateLiveForkMappings(); err != nil {
 			return err
 		}
+		if opts.Metrics != nil {
+			opts.Metrics.Validation = time.Since(validationStarted)
+		}
 		if err := injectLiveForkFailure(opts, LiveForkStageValidated); err != nil {
 			return err
 		}
+		preparationStarted := time.Now()
 		k.prepareSharedMemoryForLiveFork(ctx)
 		if err := injectLiveForkFailure(opts, LiveForkStageSharedMemoryPrepared); err != nil {
 			return err
@@ -193,6 +220,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 
 		k.prepareMemoryManagersForLiveFork()
 		k.mf.MarkSavable()
+		if opts.Metrics != nil {
+			opts.Metrics.ParentPreparation = time.Since(preparationStarted)
+		}
 		if err := injectLiveForkFailure(opts, LiveForkStageMemoryPrepared); err != nil {
 			return err
 		}
@@ -226,14 +256,19 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			pgalloc.CtxLiveForkClone:           true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 		})
+		metadataStarted := time.Now()
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
+		}
+		if opts.Metrics != nil {
+			opts.Metrics.MetadataStream = time.Since(metadataStarted)
 		}
 		childLoaded = true
 		if err := injectLiveForkFailure(opts, LiveForkStageMetadataLoaded); err != nil {
 			return err
 		}
 
+		restoreStarted := time.Now()
 		if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
 			return err
 		}
@@ -262,6 +297,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		child.Pause()
+		if opts.Metrics != nil {
+			opts.Metrics.ChildRestore = time.Since(restoreStarted)
+		}
 		if err := injectLiveForkFailure(opts, LiveForkStageChildPaused); err != nil {
 			return err
 		}
@@ -492,12 +530,17 @@ func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel
 	reader, writer := io.Pipe()
 	saveErrCh := make(chan error, 1)
 	go func() {
-		_, err := state.Save(saveCtx, writer, parent)
+		bufferedWriter := bufio.NewWriterSize(writer, 64<<10)
+		_, err := state.Save(saveCtx, bufferedWriter, parent)
+		if err == nil {
+			err = bufferedWriter.Flush()
+		}
 		writer.CloseWithError(err)
 		saveErrCh <- err
 	}()
 
-	_, loadErr := state.Load(loadCtx, reader, child)
+	bufferedReader := bufio.NewReaderSize(reader, 64<<10)
+	_, loadErr := state.Load(loadCtx, bufferedReader, child)
 	if loadErr != nil {
 		reader.CloseWithError(loadErr)
 	} else {

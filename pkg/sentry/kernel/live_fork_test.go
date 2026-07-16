@@ -99,8 +99,10 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	parent.SetHostMount(parent.PipeMount())
 	parent.Pause()
 
+	var metrics kernel.LiveForkMetrics
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks: sentrytime.NewCalibratedClocks(),
+		Clocks:  sentrytime.NewCalibratedClocks(),
+		Metrics: &metrics,
 	})
 	if err != nil {
 		t.Fatalf("LiveFork: %v", err)
@@ -114,6 +116,9 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	}
 	if parent.RootPIDNamespace() == child.RootPIDNamespace() {
 		t.Error("parent and child share a PID namespace object")
+	}
+	if metrics.Total <= 0 || metrics.MetadataStream <= 0 || metrics.ChildRestore <= 0 {
+		t.Errorf("incomplete live-fork metrics: %+v", metrics)
 	}
 	parentInitID := parent.RootPIDNamespace().IDOfThreadGroup(parent.GlobalInit())
 	childInitID := child.RootPIDNamespace().IDOfThreadGroup(child.GlobalInit())

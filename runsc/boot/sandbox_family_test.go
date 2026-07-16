@@ -16,7 +16,9 @@ package boot
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 )
@@ -97,6 +99,9 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if child.ID != "child" || child.ParentID != DefaultBranchID || child.State != BranchPaused {
 		t.Fatalf("Fork returned %+v", child)
 	}
+	if child.ForkMetrics.Total <= 0 || child.ForkMetrics.Kernel.MetadataStream <= 0 || child.ForkMetrics.ChildStart <= 0 {
+		t.Fatalf("incomplete fork metrics: %+v", child.ForkMetrics)
+	}
 	branches := family.List()
 	if len(branches) != 2 || branches[0].ID != "child" || branches[1].ID != DefaultBranchID {
 		t.Fatalf("List after fork: %+v", branches)
@@ -151,6 +156,59 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
 		t.Fatalf("List after destroy: %+v", got)
 	}
+
+	parent.Pause()
+	parent.Release()
+}
+
+func BenchmarkSandboxFamilyFork(b *testing.B) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		b.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		b.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+
+	var totals SandboxForkMetrics
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("bench-%d", i)
+		child, err := family.Fork(&ForkBranchArgs{ID: id, Paused: true})
+		if err != nil {
+			b.Fatalf("Fork %d: %v", i, err)
+		}
+		b.StopTimer()
+		totals.SourcePause += child.ForkMetrics.SourcePause
+		totals.SourceDowntime += child.ForkMetrics.SourceDowntime
+		totals.Kernel.Validation += child.ForkMetrics.Kernel.Validation
+		totals.Kernel.ParentPreparation += child.ForkMetrics.Kernel.ParentPreparation
+		totals.Kernel.MetadataStream += child.ForkMetrics.Kernel.MetadataStream
+		totals.Kernel.ChildRestore += child.ForkMetrics.Kernel.ChildRestore
+		totals.ChildStart += child.ForkMetrics.ChildStart
+		totals.SourceResume += child.ForkMetrics.SourceResume
+		totals.Total += child.ForkMetrics.Total
+		if err := family.Destroy(id); err != nil {
+			b.Fatalf("Destroy %d: %v", i, err)
+		}
+		b.StartTimer()
+	}
+	b.StopTimer()
+	perOp := func(d time.Duration) float64 { return float64(d.Nanoseconds()) / float64(b.N) }
+	b.ReportMetric(perOp(totals.SourcePause), "source-pause-ns/op")
+	b.ReportMetric(perOp(totals.SourceDowntime), "source-downtime-ns/op")
+	b.ReportMetric(perOp(totals.Kernel.Validation), "validation-ns/op")
+	b.ReportMetric(perOp(totals.Kernel.ParentPreparation), "preparation-ns/op")
+	b.ReportMetric(perOp(totals.Kernel.MetadataStream), "metadata-ns/op")
+	b.ReportMetric(perOp(totals.Kernel.ChildRestore), "restore-ns/op")
+	b.ReportMetric(perOp(totals.ChildStart), "child-start-ns/op")
+	b.ReportMetric(perOp(totals.SourceResume), "source-resume-ns/op")
+	b.ReportMetric(perOp(totals.Total), "api-ns/op")
 
 	parent.Pause()
 	parent.Release()
