@@ -38,11 +38,24 @@ const (
 	// live fork. Restored page owners must acquire references to existing
 	// MemoryFile ranges instead of relying on MemoryFile restore to create them.
 	CtxLiveForkClone
+
+	// CtxLiveForkSource indicates that save preparation is for an in-memory
+	// live fork. Mutable filesystem objects must establish CoW before metadata
+	// serialization begins.
+	CtxLiveForkSource
 )
 
 // IsLiveForkClone returns true if ctx is loading an in-memory live fork.
 func IsLiveForkClone(ctx context.Context) bool {
 	if v := ctx.Value(CtxLiveForkClone); v != nil {
+		return v.(bool)
+	}
+	return false
+}
+
+// IsLiveForkSource returns true if ctx is preparing an in-memory live fork.
+func IsLiveForkSource(ctx context.Context) bool {
+	if v := ctx.Value(CtxLiveForkSource); v != nil {
 		return v.(bool)
 	}
 	return false

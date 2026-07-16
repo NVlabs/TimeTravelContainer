@@ -115,6 +115,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		saveCtx := context.WithValues(k.SupervisorContext(), map[any]any{
 			pgalloc.CtxMemoryFile:              k.mf,
 			pgalloc.CtxMemoryFileMap:           mfs,
+			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {

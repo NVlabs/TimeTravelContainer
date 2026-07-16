@@ -387,7 +387,7 @@ Initial policy:
 |---|---|
 | Private anonymous mappings | Clone with existing MM CoW |
 | Internal pipe/eventfd/epoll graph | Clone after object-graph tests |
-| Tmpfs/memfd/POSIX SHM | Clone after tmpfs page CoW |
+| Tmpfs/memfd/POSIX SHM | Memfd page CoW implemented; broader tmpfs tests pending |
 | Overlay upper on tmpfs | Clone after tmpfs and overlay tests |
 | Read-only immutable gofer lower | Share with explicit hook |
 | SysV SHM | Reject until branch page map is implemented |
@@ -505,6 +505,26 @@ sockets, and queued SCM_RIGHTS. A real-loader test checks direct and
 epoll-reachable host eventfd rejection, then removes the resource and completes
 a valid fork. Mapping, ioctl-held, and filesystem-specific closure still need
 the same explicit treatment in later phases.
+
+The first Phase 4 tmpfs slice is implemented for main-MemoryFile-backed regular
+files, including memfd. Each tmpfs filesystem maintains a runtime registry that
+also covers open-unlinked files. Live-fork preparation invalidates existing
+translations and marks present logical pages as shared without copying them;
+state load acquires one child MemoryFile reference per file-owned range.
+Syscall writes and partial-page truncation allocate and copy only touched shared
+pages. The real-loader test verifies initial memfd equality, parent `pwrite`
+divergence, child mapped-write divergence, and parent page lifetime after child
+destruction.
+
+The current mmap mechanism conservatively detaches a shared tmpfs page on its
+first post-fork mapping fault, even when that fault requests only read access.
+This avoids stale writable or sibling translations because `Mappable.Translate`
+runs under MM fault locks and cannot synchronously invalidate every mapping in
+the same branch. It preserves fork-time scaling and page-granular sharing, but
+true write-fault-only tmpfs CoW requires an MM/Mappable handshake that performs
+branch-wide invalidation before installing the writable translation. Private
+tmpfs MemoryFiles, complete truncate/fallocate/mapping stress, directory and
+metadata divergence, and OverlayFS upper behavior remain in Phase 4.
 
 ## Implementation phases and gates
 

@@ -36,16 +36,20 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/signalfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	unixtransport "gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
@@ -413,6 +417,18 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUnix1 := liveForkTestFD(t, l.k, unixFDs[0])
 	parentUnix2 := liveForkTestFD(t, l.k, unixFDs[1])
 	liveForkTestWrite(t, parentTask, parentUnix1, "seed")
+	memfdFile, err := tmpfs.NewMemfd(parentTask, parentTask.Credentials(), l.k.ShmMount(), false, "live-fork")
+	if err != nil {
+		t.Fatalf("creating memfd: %v", err)
+	}
+	const memfdFD = int32(19)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, memfdFD, memfdFile, kernel.FDFlags{}); err != nil {
+		memfdFile.DecRef(parentTask)
+		t.Fatalf("installing memfd: %v", err)
+	}
+	memfdFile.DecRef(parentTask)
+	parentMemfd := liveForkTestFD(t, l.k, memfdFD)
+	liveForkTestPWrite(t, parentTask, parentMemfd, 0, "seed")
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -448,6 +464,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childInotify := childInotifyFile.Impl().(*vfs.Inotify)
 	childUnix1 := liveForkTestFD(t, child.k, unixFDs[0])
 	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
+	childMemfd := liveForkTestFD(t, child.k, memfdFD)
 
 	// Pipe endpoints still alias one queue inside a branch, but queues and
 	// readiness are duplicated across branches.
@@ -593,6 +610,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestRead(t, childTask, childUnix2, "child")
 	liveForkTestWouldBlock(t, parentTask, parentUnix2)
 	liveForkTestWouldBlock(t, childTask, childUnix2)
+
+	// Tmpfs syscall writes and mapped shared writes detach MemoryFile pages
+	// without copying file contents at the fork boundary.
+	liveForkTestPRead(t, parentTask, parentMemfd, 0, "seed")
+	liveForkTestPRead(t, childTask, childMemfd, 0, "seed")
+	liveForkTestPWrite(t, parentTask, parentMemfd, 0, "prnt")
+	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
+	liveForkTestPRead(t, childTask, childMemfd, 0, "seed")
+	liveForkTestMappedWrite(t, childTask, childMemfd, "chld")
+	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
+	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
@@ -603,6 +631,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentRoot.DecRef(ctx)
 	parentUnix1.DecRef(parentTask)
 	parentUnix2.DecRef(parentTask)
+	parentMemfd.DecRef(parentTask)
 	childReader.DecRef(childCtx)
 	childWriter.DecRef(childCtx)
 	childEvent.DecRef(childCtx)
@@ -613,6 +642,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childRoot.DecRef(childCtx)
 	childUnix1.DecRef(childTask)
 	childUnix2.DecRef(childTask)
+	childMemfd.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -643,6 +673,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err := l.family.Destroy(childInfo.ID); err != nil {
 		t.Fatalf("destroying child: %v", err)
 	}
+	parentMemfd = liveForkTestFD(t, l.k, memfdFD)
+	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
+	parentMemfd.DecRef(parentTask)
 
 	l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	l.k.Unpause()
@@ -767,6 +800,51 @@ func liveForkInotifyWouldBlock(t *testing.T, ctx context.Context, file *vfs.File
 	n, err := file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 	if n != 0 || !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		t.Fatalf("empty inotify Read: got (%d, %v), want (0, EWOULDBLOCK)", n, err)
+	}
+}
+
+func liveForkTestPWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, offset int64, value string) {
+	t.Helper()
+	n, err := file.PWrite(ctx, usermem.BytesIOSequence([]byte(value)), offset, vfs.WriteOptions{})
+	if err != nil || n != int64(len(value)) {
+		t.Fatalf("PWrite(%q, %d): got (%d, %v)", value, offset, n, err)
+	}
+}
+
+func liveForkTestPRead(t *testing.T, ctx context.Context, file *vfs.FileDescription, offset int64, want string) {
+	t.Helper()
+	buf := make([]byte, len(want))
+	n, err := file.PRead(ctx, usermem.BytesIOSequence(buf), offset, vfs.ReadOptions{})
+	if err != nil || n != int64(len(buf)) || string(buf) != want {
+		t.Fatalf("PRead(%d): got (%q, %d, %v), want %q", offset, buf, n, err, want)
+	}
+}
+
+func liveForkTestMappedWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value string) {
+	t.Helper()
+	opts := memmap.MMapOpts{
+		Length:   hostarch.PageSize,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.ReadWrite,
+	}
+	if err := file.ConfigureMMap(ctx, &opts); err != nil {
+		t.Fatalf("ConfigureMMap: %v", err)
+	}
+	defer opts.MappingIdentity.DecRef(ctx)
+	mr := memmap.MappableRange{Start: 0, End: hostarch.PageSize}
+	translations, err := opts.Mappable.Translate(ctx, mr, mr, hostarch.Write)
+	if err != nil || len(translations) != 1 {
+		t.Fatalf("Translate: got (%d translations, %v), want (1, nil)", len(translations), err)
+	}
+	translation := translations[0]
+	fr := memmap.FileRange{Start: translation.Offset, End: translation.Offset + uint64(len(value))}
+	blocks, err := translation.File.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	n, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte(value))))
+	if err != nil || n != uint64(len(value)) {
+		t.Fatalf("mapped write %q: got (%d, %v)", value, n, err)
 	}
 }
 

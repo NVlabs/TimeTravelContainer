@@ -63,6 +63,17 @@ func (d *dentry) loadParent(_ goContext.Context, parent *dentry) {
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
+	if pgalloc.IsLiveForkSource(ctx) {
+		fs.liveForkMu.Lock()
+		files := make([]*regularFile, 0, len(fs.liveForkFiles))
+		for file := range fs.liveForkFiles {
+			files = append(files, file)
+		}
+		for _, file := range files {
+			file.prepareLiveFork()
+		}
+		fs.liveForkMu.Unlock()
+	}
 	resourceID := fs.mf.ResourceID()
 	if !resourceID.Ok() {
 		return nil

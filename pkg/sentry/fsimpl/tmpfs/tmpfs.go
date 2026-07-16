@@ -104,6 +104,11 @@ type filesystem struct {
 	// required by genericfstree.
 	ancestryMu sync.RWMutex `state:"nosave"`
 
+	// liveForkMu protects liveForkFiles. The registry includes unlinked files
+	// that remain reachable through an FD or mapping.
+	liveForkMu    sync.Mutex                `state:"nosave"`
+	liveForkFiles map[*regularFile]struct{} `state:"nosave"`
+
 	nextInoMinusOne atomicbitops.Uint64 // accessed using atomic memory operations
 
 	root *dentry
@@ -400,6 +405,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		maxSizeInPages:   maxSizeInPages,
 		maxInodes:        maxInodes,
 		allowXattrPrefix: allowXattrPrefix,
+		liveForkFiles:    make(map[*regularFile]struct{}),
 	}
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
 	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
@@ -745,6 +751,7 @@ func (i *inode) decRef(ctx context.Context) {
 				impl.inode.fs.unaccountPages(1)
 			}
 		case *regularFile:
+			impl.inode.fs.unregisterLiveForkFile(impl)
 			// Release memory used by regFile to store data. Since regFile is
 			// no longer usable, we don't need to grab any locks or update any
 			// metadata.
