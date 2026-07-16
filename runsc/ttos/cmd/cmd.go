@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/runsc/flag"
+	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -46,10 +47,11 @@ type options struct {
 	runsc      string
 	containerd string
 	namespace  string
+	dataRoot   string
 }
 
 // Run executes ttos with args and returns a process exit status.
-func Run(args []string, stdout, stderr io.Writer) int {
+func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	opts, args, done, err := parseGlobalOptions(args, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttos: %v\n", err)
@@ -67,6 +69,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		runsc:      opts.runsc,
 		containerd: opts.containerd,
 		namespace:  opts.namespace,
+		dataRoot:   opts.dataRoot,
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
 	})
 }
 
@@ -76,6 +82,7 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 		runsc:      runscPath(),
 		containerd: containerdAddress(),
 		namespace:  defaultImageNamespace,
+		dataRoot:   dataRoot(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -134,6 +141,18 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 				return opts, nil, false, errors.New("--namespace requires a name")
 			}
 			args = args[1:]
+		case arg == "--data-root":
+			if len(args) < 2 || args[1] == "" {
+				return opts, nil, false, errors.New("--data-root requires a path")
+			}
+			opts.dataRoot = args[1]
+			args = args[2:]
+		case strings.HasPrefix(arg, "--data-root="):
+			opts.dataRoot = strings.TrimPrefix(arg, "--data-root=")
+			if opts.dataRoot == "" {
+				return opts, nil, false, errors.New("--data-root requires a path")
+			}
+			args = args[1:]
 		case strings.HasPrefix(arg, "-"):
 			return opts, nil, false, fmt.Errorf("unknown global option %q", arg)
 		default:
@@ -173,6 +192,19 @@ func containerdAddress() string {
 	return defaultContainerdSocket
 }
 
+func dataRoot() string {
+	if root := os.Getenv("TTOS_DATA_ROOT"); root != "" {
+		return root
+	}
+	if root := os.Getenv("XDG_DATA_HOME"); root != "" {
+		return filepath.Join(root, "ttos")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "share", "ttos")
+	}
+	return filepath.Join(os.TempDir(), "ttos")
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage: ttos [GLOBAL OPTIONS] COMMAND
 
@@ -183,9 +215,11 @@ Global options:
   --runsc PATH                   TimeTravel-enabled runsc executable
   --containerd PATH              containerd socket
   --namespace NAME               containerd namespace (default: ttos)
+  --data-root PATH               image, bundle, and metadata directory
 
 Commands:
   pull [OPTIONS] IMAGE           Pull and unpack an OCI/Docker image
+  run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   ls [--tree|--json]              List container families and branch trees
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
@@ -204,6 +238,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	switch args[0] {
 	case "pull":
 		err = runPull(args[1:], stdout, stderr, backend)
+	case "run":
+		err = runContainer(args[1:], stdout, stderr, backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "fork":
@@ -227,10 +263,110 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		return 2
 	}
 	if err != nil {
+		var status exitStatus
+		if errors.As(err, &status) {
+			return status.code
+		}
 		fmt.Fprintf(stderr, "ttos: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+type stringSlice []string
+
+func (s *stringSlice) String() string { return fmt.Sprintf("%q", *s) }
+func (s *stringSlice) Get() any       { return s }
+func (s *stringSlice) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
+type runRequest struct {
+	name        string
+	reference   string
+	platform    string
+	args        []string
+	env         []string
+	cwd         string
+	user        string
+	hostname    string
+	entrypoint  []string
+	detach      bool
+	interactive bool
+}
+
+type exitStatus struct{ code int }
+
+func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
+
+func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	name := fs.String("name", "", "assign a container name")
+	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	detach := fs.Bool("detach", false, "run in the background")
+	fs.BoolVar(detach, "d", false, "run in the background")
+	interactive := fs.Bool("interactive", false, "keep stdin open")
+	fs.BoolVar(interactive, "i", false, "keep stdin open")
+	terminal := fs.Bool("tty", false, "allocate a terminal")
+	fs.BoolVar(terminal, "t", false, "allocate a terminal")
+	cwd := fs.String("workdir", "", "working directory inside the container")
+	fs.StringVar(cwd, "w", "", "working directory inside the container")
+	user := fs.String("user", "", "username or UID[:GID]")
+	fs.StringVar(user, "u", "", "username or UID[:GID]")
+	hostname := fs.String("hostname", "", "container hostname")
+	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
+	var env stringSlice
+	fs.Var(&env, "env", "set environment variable NAME=VALUE")
+	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: ttos run [OPTIONS] IMAGE [COMMAND...]")
+	}
+	if *terminal {
+		return errors.New("-t/--tty requires the detachable internal console, which is not implemented yet")
+	}
+	if *detach && *interactive {
+		return errors.New("detached interactive containers require the internal console, which is not implemented yet")
+	}
+	containerName := *name
+	if containerName == "" {
+		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	}
+	request := runRequest{
+		name:        containerName,
+		reference:   fs.Arg(0),
+		platform:    *platform,
+		args:        append([]string(nil), fs.Args()[1:]...),
+		env:         append([]string(nil), env...),
+		cwd:         *cwd,
+		user:        *user,
+		hostname:    *hostname,
+		detach:      *detach,
+		interactive: *interactive,
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "entrypoint" {
+			request.entrypoint = []string{*entrypoint}
+			if *entrypoint == "" {
+				request.entrypoint = []string{}
+			}
+		}
+	})
+	status, err := backend.run(request)
+	if err != nil {
+		return err
+	}
+	if status != 0 {
+		return exitStatus{code: status}
+	}
+	if request.detach {
+		fmt.Fprintln(stdout, request.name)
+	}
+	return nil
 }
 
 func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -562,6 +698,7 @@ type Family struct {
 
 type backend interface {
 	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
+	run(request runRequest) (int, error)
 	listFamilies() ([]Family, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
@@ -576,6 +713,56 @@ type runtimeBackend struct {
 	runsc      string
 	containerd string
 	namespace  string
+	dataRoot   string
+	stdin      io.Reader
+	stdout     io.Writer
+	stderr     io.Writer
+}
+
+func (b *runtimeBackend) run(request runRequest) (int, error) {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
+		SpecOptions: ttosbundle.SpecOptions{
+			Name:       request.name,
+			Args:       request.args,
+			Env:        request.env,
+			Cwd:        request.cwd,
+			User:       request.user,
+			Hostname:   request.hostname,
+			Entrypoint: request.entrypoint,
+		},
+		Reference: request.reference,
+		Platform:  request.platform,
+	})
+	if err != nil {
+		return 1, err
+	}
+	args := []string{
+		"--root", b.root,
+		"--rootless=true",
+		"--network=none",
+		"--directfs=false",
+		"--overlay2=all:memory",
+		"run", "--bundle", prepared.BundleDir,
+	}
+	if request.detach {
+		args = append(args, "--detach")
+	}
+	args = append(args, request.name)
+	command := exec.Command(b.runsc, args...)
+	if request.interactive && !request.detach {
+		command.Stdin = b.stdin
+	}
+	command.Stdout = b.stdout
+	command.Stderr = b.stderr
+	if err := command.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, fmt.Errorf("starting runsc: %w", err)
+	}
+	return 0, nil
 }
 
 func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {

@@ -11,6 +11,7 @@ go_library(
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
         "//runsc/flag",
+        "//runsc/ttos/bundle",
         "//runsc/ttos/images",
         "//runsc/version",
     ],

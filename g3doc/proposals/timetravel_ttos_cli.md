@@ -4,9 +4,10 @@ Status: TODO roadmap following the live-fork prototype.
 
 Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
-sandboxes through runsc's JSON command surface and pulls OCI/Docker images
-through containerd. Image-backed run/create lifecycle, `ttosd`, exec, attach,
-mounts, and managed volumes remain TODO.
+sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
+containerd, and generates rootless image-backed OCI bundles for `ttos run`.
+Create/start lifecycle, `ttosd`, exec, attach, mounts, and managed volumes
+remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -87,7 +88,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### Container lifecycle
 
-- [ ] `ttos run [OPTIONS] IMAGE [COMMAND...]`.
+- [x] `ttos run [OPTIONS] IMAGE [COMMAND...]` (initial foreground/detached,
+      non-TTY slice with no additional mounts).
 - [ ] Support `--name`, environment variables, working directory, user,
       entrypoint override, resource limits, hostname, and rootless execution.
 - [ ] Support foreground, `--detach`, and interactive `-i`/`-t` modes.
@@ -277,8 +279,12 @@ Reject            unsupported, externally mutable, or host/device-backed
       collection.
 - [ ] Select a rootless-compatible snapshotter; prefer an immutable directory
       lower that can be exposed to runsc through a read-only gofer.
-- [ ] Construct OCI specs and mount manifests from image config plus `ttos run`
-      options.
+- [x] Cache content-addressed directory roots and construct the initial OCI
+      spec from image config plus `ttos run` options.
+- [ ] Preserve distinct image UID/GID ownership in rootless materialization,
+      for example with an EROFS lower or an explicit ownership metadata scheme.
+- [ ] Construct the full mount manifest once allowed mount classes are
+      implemented.
 - [ ] Place an in-memory OverlayFS upper over the immutable image lower by
       default.
 - [ ] Track containerd content/snapshot leases for every live family and release
@@ -378,4 +384,3 @@ bundle.
 - [ ] Whether stopped branch filesystem state may be retained without retaining
       its Kernel and memory.
 - [ ] Initial direct-runsc versus extended-containerd-shim deployment model.
-

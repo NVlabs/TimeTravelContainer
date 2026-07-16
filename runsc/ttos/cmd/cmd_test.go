@@ -185,6 +185,35 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 	}
 }
 
+func TestRunParsesDockerStyleOptions(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	args := []string{"run", "--name", "demo", "-d", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "busybox:1.36", "echo", "ok"}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); got != "demo\n" {
+		t.Errorf("run output=%q, want demo", got)
+	}
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" {
+		t.Errorf("run request=%+v", b.runRequest)
+	}
+	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
+		t.Errorf("run args=%q, want %q", got, want)
+	}
+	if got, want := strings.Join(b.runRequest.entrypoint, " "), "/entry"; got != want {
+		t.Errorf("entrypoint=%q, want %q", got, want)
+	}
+}
+
+func TestRunForwardsContainerExitStatus(t *testing.T) {
+	b := &fakeBackend{runStatus: 42}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"run", "busybox", "false"}, &stdout, &stderr, b); status != 42 {
+		t.Fatalf("run status=%d, want 42; stderr=%q", status, stderr.String())
+	}
+}
+
 func TestListJSON(t *testing.T) {
 	b := &fakeBackend{families: []Family{{ID: "web", State: "running", Branches: []Branch{{ID: "main", State: "running"}}}}}
 	var stdout, stderr bytes.Buffer
@@ -333,6 +362,13 @@ type fakeBackend struct {
 	pullSnapshotter string
 	pullUnpack      bool
 	pullInfo        ttosimages.Info
+	runRequest      runRequest
+	runStatus       int
+}
+
+func (b *fakeBackend) run(request runRequest) (int, error) {
+	b.runRequest = request
+	return b.runStatus, b.err
 }
 
 func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {

@@ -18,6 +18,7 @@ require (
 	github.com/containerd/fifo v1.1.0
 	github.com/containerd/go-runc v1.1.0
 	github.com/containerd/log v0.1.0
+	github.com/containerd/platforms v1.0.0-rc.1
 	github.com/containerd/plugin v1.0.0
 	github.com/containerd/ttrpc v1.2.7
 	github.com/containerd/typeurl/v2 v2.2.3
@@ -62,7 +63,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/containerd/continuity v0.4.5 // indirect
-	github.com/containerd/platforms v1.0.0-rc.1 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect

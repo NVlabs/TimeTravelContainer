@@ -151,6 +151,7 @@ use_repo(
     "com_github_containerd_fifo",
     "com_github_containerd_go_runc",
     "com_github_containerd_log",
+    "com_github_containerd_platforms",
     "com_github_containerd_plugin",
     "com_github_containerd_ttrpc",
     "com_github_containerd_typeurl_v2",
