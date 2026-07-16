@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"golang.org/x/term"
@@ -240,6 +241,8 @@ Commands:
   inspect CONTAINER...           Show persistent and live branch state
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
+  ps [--all|--quiet]              List container branches in a flat table
+  top [--json] TARGET             Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
@@ -276,6 +279,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runRemove(args[1:], stdout, stderr, backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
+	case "ps":
+		err = runPs(args[1:], stdout, stderr, backend)
+	case "top":
+		err = runTop(args[1:], stdout, stderr, backend)
 	case "fork":
 		err = runFork(args[1:], stdout, stderr, backend)
 	case "pause":
@@ -1044,6 +1051,83 @@ func runList(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	all := fs.Bool("all", false, "show created and exited branches")
+	fs.BoolVar(all, "a", false, "show created and exited branches")
+	quiet := fs.Bool("quiet", false, "only display branch-qualified selectors")
+	fs.BoolVar(quiet, "q", false, "only display branch-qualified selectors")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: ttos ps [--all] [--quiet]")
+	}
+	families, err := backend.listFamilies()
+	if err != nil {
+		return fmt.Errorf("listing container families: %w", err)
+	}
+	var table *tabwriter.Writer
+	if !*quiet {
+		table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(table, "CONTAINER\tBRANCH\tSTATE\tPARENT")
+	}
+	for _, family := range families {
+		for _, branch := range family.Branches {
+			if !*all && branch.State != "running" && branch.State != "paused" {
+				continue
+			}
+			if *quiet {
+				fmt.Fprintf(stdout, "%s@%s\n", family.ID, branch.ID)
+				continue
+			}
+			parent := branch.ParentID
+			if parent == "" {
+				parent = "-"
+			}
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", family.ID, branch.ID, branch.State, parent)
+		}
+	}
+	if table != nil {
+		return table.Flush()
+	}
+	return nil
+}
+
+func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("top", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos top [--json] CONTAINER[@BRANCH]")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	processes, err := backend.processes(target)
+	if err != nil {
+		return fmt.Errorf("listing processes in %s: %w", target, err)
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(processes)
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "UID\tPID\tPPID\tPGID\tC\tTTY\tSTIME\tTIME\tCMD")
+	for _, process := range processes {
+		fmt.Fprintf(table, "%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+			process.UID, process.PID, process.PPID, process.PGID, process.C,
+			process.TTY, process.STime, process.Time, process.Cmd)
+	}
+	return table.Flush()
+}
+
 func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1399,6 +1483,20 @@ type Family struct {
 	Error    string   `json:"error,omitempty"`
 }
 
+// ProcessInfo is stable branch-local process information returned by ttos top.
+type ProcessInfo struct {
+	UID     uint32  `json:"uid"`
+	PID     int32   `json:"pid"`
+	PPID    int32   `json:"ppid"`
+	PGID    int32   `json:"pgid"`
+	Threads []int32 `json:"threads"`
+	C       int32   `json:"c"`
+	TTY     string  `json:"tty"`
+	STime   string  `json:"stime"`
+	Time    string  `json:"time"`
+	Cmd     string  `json:"cmd"`
+}
+
 type backend interface {
 	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
 	create(request runRequest) error
@@ -1410,6 +1508,7 @@ type backend interface {
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
 	listFamilies() ([]Family, error)
+	processes(target selector) ([]ProcessInfo, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
 	resume(target selector) error
@@ -2304,6 +2403,18 @@ func (b *runtimeBackend) resume(target selector) error {
 func (b *runtimeBackend) destroy(target selector) error {
 	_, err := b.command("timetravel", target.container, "destroy", target.branch)
 	return err
+}
+
+func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
+	output, err := b.command("timetravel", target.container, "ps", target.branch)
+	if err != nil {
+		return nil, err
+	}
+	var processes []ProcessInfo
+	if err := json.Unmarshal(output, &processes); err != nil {
+		return nil, fmt.Errorf("decoding branch process list: %w", err)
+	}
+	return processes, nil
 }
 
 func (b *runtimeBackend) signal(target selector, signal int, all bool) error {

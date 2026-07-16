@@ -138,8 +138,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       stdout/stderr streams and backed by branch-local persistent console logs.
 - [ ] Add Docker-compatible `--tail`, `--since`, `--until`, timestamps, details,
       configurable retention, and explicit logging-driver policy.
-- [ ] `ttos ps` for host-side container families and `ttos top` for processes
-      inside a selected branch.
+- [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
+      `ttos top [--json] CONTAINER[@BRANCH]` process listing.
+- [ ] Add Docker-compatible `ps` filters, formatting, size/latest options, and
+      pass-through process-selection options for `top`.
 
 ### TimeTravel lifecycle
 

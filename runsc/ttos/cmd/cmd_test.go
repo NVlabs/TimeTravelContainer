@@ -82,6 +82,58 @@ func TestWriteTree(t *testing.T) {
 	}
 }
 
+func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
+	b := &fakeBackend{families: []Family{
+		{ID: "web", State: "running", Branches: []Branch{
+			{ID: "main", State: "running"},
+			{ID: "child", ParentID: "main", State: "paused"},
+			{ID: "old", ParentID: "main", State: "exited"},
+		}},
+		{ID: "prepared", State: "created", Branches: []Branch{{ID: "main", State: "created"}}},
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"ps", "--quiet"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@main\nweb@child\n"; got != want {
+		t.Errorf("ps --quiet=%q, want %q", got, want)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"ps", "--all", "--quiet"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps --all status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@main\nweb@child\nweb@old\nprepared@main\n"; got != want {
+		t.Errorf("ps --all --quiet=%q, want %q", got, want)
+	}
+}
+
+func TestTopTableAndJSON(t *testing.T) {
+	b := &fakeBackend{processList: []ProcessInfo{{
+		UID: 1000, PID: 7, PPID: 1, PGID: 7, Threads: []int32{7, 8},
+		C: 3, TTY: "?", STime: "12:34", Time: "9ms", Cmd: "worker",
+	}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"top", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("top status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.processTarget != (selector{container: "web", branch: "child"}) {
+		t.Errorf("top target=%+v", b.processTarget)
+	}
+	for _, text := range []string{"UID", "PID", "CMD", "1000", "worker"} {
+		if !strings.Contains(stdout.String(), text) {
+			t.Errorf("top output %q does not contain %q", stdout.String(), text)
+		}
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"top", "--json", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("top --json status=%d, stderr=%q", status, stderr.String())
+	}
+	var got []ProcessInfo
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || !reflect.DeepEqual(got, b.processList) {
+		t.Errorf("top JSON=%+v err=%v, want %+v", got, err, b.processList)
+	}
+}
+
 func TestCommandsUseQualifiedBranches(t *testing.T) {
 	b := &fakeBackend{families: []Family{{ID: "web", State: "running", Branches: []Branch{{ID: "main", State: "running"}}}}}
 	var stdout, stderr bytes.Buffer
@@ -720,6 +772,10 @@ fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "16777216" ] && [ "${10}" = "web" ] && [ "${11}" = "console-follow" ] && [ "${12}" = "child" ]; then
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "child" ]; then
+	echo '[{"uid":1000,"pid":7,"ppid":1,"pgid":7,"threads":[7,8],"c":3,"tty":"?","stime":"12:34","time":"9ms","cmd":"worker"}]'
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
 	exit 0
 fi
@@ -777,6 +833,13 @@ exit 2
 	}
 	if _, err := os.Stat(staleRotatedLog); !os.IsNotExist(err) {
 		t.Errorf("stale rotated log still exists: %v", err)
+	}
+	processes, err := b.processes(selector{container: "web", branch: "child"})
+	if err != nil {
+		t.Fatalf("processes: %v", err)
+	}
+	if len(processes) != 1 || processes[0].PID != 7 || processes[0].UID != 1000 || processes[0].Cmd != "worker" {
+		t.Errorf("processes returned %+v", processes)
 	}
 	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
 		t.Fatalf("signal: %v", err)
@@ -894,6 +957,8 @@ type signalCall struct {
 
 type fakeBackend struct {
 	families          []Family
+	processTarget     selector
+	processList       []ProcessInfo
 	err               error
 	forkSource        selector
 	forkDestination   string
@@ -987,6 +1052,11 @@ func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool)
 
 func (b *fakeBackend) listFamilies() ([]Family, error) {
 	return b.families, b.err
+}
+
+func (b *fakeBackend) processes(target selector) ([]ProcessInfo, error) {
+	b.processTarget = target
+	return b.processList, b.err
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
