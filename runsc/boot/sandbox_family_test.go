@@ -15,10 +15,66 @@
 package boot
 
 import (
+	"errors"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 )
+
+func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
+	stages := []SandboxForkStage{
+		SandboxForkStagePlaceholderRegistered,
+		SandboxForkStageSourcePaused,
+		SandboxForkStageKernelCloned,
+		SandboxForkStageChildStarted,
+		SandboxForkStageBranchReady,
+	}
+	for _, stage := range stages {
+		t.Run(string(stage), func(t *testing.T) {
+			parent, err := testutil.Boot()
+			if err != nil {
+				t.Fatalf("Boot: %v", err)
+			}
+			parent.PipeMount().IncRef()
+			parent.SetHostMount(parent.PipeMount())
+			parent.Pause()
+			if err := parent.StartPaused(); err != nil {
+				t.Fatalf("StartPaused: %v", err)
+			}
+			parent.Unpause()
+
+			injected := errors.New("injected sandbox-family fork failure")
+			failOnce := true
+			family := NewSandboxFamily(parent, SandboxFamilyOptions{
+				TestOnlyForkFailureInjector: func(completed SandboxForkStage) error {
+					if failOnce && completed == stage {
+						failOnce = false
+						return injected
+					}
+					return nil
+				},
+			})
+			if child, err := family.Fork(&ForkBranchArgs{ID: "failed", Paused: true}); child != nil || !errors.Is(err, injected) {
+				t.Fatalf("Fork failure at %s: got child=%+v err=%v", stage, child, err)
+			}
+			if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID || got[0].State != BranchRunning {
+				t.Fatalf("family after failure at %s: %+v", stage, got)
+			}
+			child, err := family.Fork(&ForkBranchArgs{ID: "retry", Paused: true})
+			if err != nil {
+				t.Fatalf("Fork retry after %s: %v", stage, err)
+			}
+			if child.State != BranchPaused {
+				t.Fatalf("retry child after %s: %+v", stage, child)
+			}
+			if err := family.Destroy(child.ID); err != nil {
+				t.Fatalf("Destroy retry after %s: %v", stage, err)
+			}
+			parent.Pause()
+			parent.Release()
+		})
+	}
+}
 
 func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent, err := testutil.Boot()

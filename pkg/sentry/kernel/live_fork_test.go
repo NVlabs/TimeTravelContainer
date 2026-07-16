@@ -15,12 +15,80 @@
 package kernel_test
 
 import (
+	"errors"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 )
+
+var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
+
+func TestLiveForkFailureCleanup(t *testing.T) {
+	stages := []kernel.LiveForkStage{
+		kernel.LiveForkStageValidated,
+		kernel.LiveForkStageSharedMemoryPrepared,
+		kernel.LiveForkStageMappingsInvalidated,
+		kernel.LiveForkStageVFSPrepared,
+		kernel.LiveForkStageMemoryPrepared,
+		kernel.LiveForkStageOwnerAcquired,
+		kernel.LiveForkStageChildInitialized,
+		kernel.LiveForkStageMetadataLoaded,
+		kernel.LiveForkStageVDSOPrivatized,
+		kernel.LiveForkStageNetworkRestored,
+		kernel.LiveForkStageVFSRestored,
+		kernel.LiveForkStageChildPaused,
+	}
+	for _, stage := range stages {
+		t.Run(string(stage), func(t *testing.T) {
+			parent, err := testutil.Boot()
+			if err != nil {
+				t.Fatalf("Boot: %v", err)
+			}
+			parent.PipeMount().IncRef()
+			parent.SetHostMount(parent.PipeMount())
+			parent.Pause()
+
+			child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+				Clocks: sentrytime.NewCalibratedClocks(),
+				TestOnlyFailureInjector: func(completed kernel.LiveForkStage) error {
+					if completed == stage {
+						return errInjectedLiveForkFailure
+					}
+					return nil
+				},
+			})
+			if child != nil || !errors.Is(err, errInjectedLiveForkFailure) {
+				t.Fatalf("LiveFork failure at %s: got child=%p err=%v", stage, child, err)
+			}
+			if !parent.IsPaused() {
+				t.Fatalf("parent resumed after failure at %s", stage)
+			}
+
+			// A successful retry proves that save hooks, CoW transitions, owner
+			// references, and partial child state were all left reusable.
+			child, err = parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+				Clocks: sentrytime.NewCalibratedClocks(),
+			})
+			if err != nil {
+				t.Fatalf("LiveFork retry after %s: %v", stage, err)
+			}
+			if err := parent.StartPaused(); err != nil {
+				t.Fatalf("parent.StartPaused after %s: %v", stage, err)
+			}
+			if err := child.StartPaused(); err != nil {
+				t.Fatalf("child.StartPaused after %s: %v", stage, err)
+			}
+			parent.Unpause()
+			child.Unpause()
+			parent.Pause()
+			child.Pause()
+			child.Release()
+			parent.Release()
+		})
+	}
+}
 
 func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	parent, err := testutil.Boot()

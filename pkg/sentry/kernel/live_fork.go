@@ -46,6 +46,39 @@ type LiveForkOptions struct {
 	// AllowSharedFilesystemResources permits clone-aware filesystems to borrow
 	// resources that the caller has proven immutable or otherwise share-safe.
 	AllowSharedFilesystemResources bool
+
+	// TestOnlyFailureInjector may return an error to abort immediately after a
+	// transaction stage. It exists to verify rollback and source reusability;
+	// production callers should leave it nil.
+	TestOnlyFailureInjector func(LiveForkStage) error
+}
+
+// LiveForkStage identifies a completed live-fork transaction stage.
+type LiveForkStage string
+
+const (
+	LiveForkStageValidated            LiveForkStage = "validated"
+	LiveForkStageSharedMemoryPrepared LiveForkStage = "shared-memory-prepared"
+	LiveForkStageMappingsInvalidated  LiveForkStage = "mappings-invalidated"
+	LiveForkStageVFSPrepared          LiveForkStage = "vfs-prepared"
+	LiveForkStageMemoryPrepared       LiveForkStage = "memory-prepared"
+	LiveForkStageOwnerAcquired        LiveForkStage = "owner-acquired"
+	LiveForkStageChildInitialized     LiveForkStage = "child-initialized"
+	LiveForkStageMetadataLoaded       LiveForkStage = "metadata-loaded"
+	LiveForkStageVDSOPrivatized       LiveForkStage = "vdso-privatized"
+	LiveForkStageNetworkRestored      LiveForkStage = "network-restored"
+	LiveForkStageVFSRestored          LiveForkStage = "vfs-restored"
+	LiveForkStageChildPaused          LiveForkStage = "child-paused"
+)
+
+func injectLiveForkFailure(opts LiveForkOptions, stage LiveForkStage) error {
+	if opts.TestOnlyFailureInjector == nil {
+		return nil
+	}
+	if err := opts.TestOnlyFailureInjector(stage); err != nil {
+		return fmt.Errorf("live fork aborted after %s: %w", stage, err)
+	}
+	return nil
 }
 
 // LiveForkResourceIssue describes one resource that prevents an in-memory
@@ -119,13 +152,22 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := k.validateLiveForkMappings(); err != nil {
 			return err
 		}
+		if err := injectLiveForkFailure(opts, LiveForkStageValidated); err != nil {
+			return err
+		}
 		k.prepareSharedMemoryForLiveFork(ctx)
+		if err := injectLiveForkFailure(opts, LiveForkStageSharedMemoryPrepared); err != nil {
+			return err
+		}
 		// Discard PMAs backed by files that state serialization cannot encode,
 		// such as a gofer MmapCachedFile. The VMAs remain and refault from their
 		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
 		// for the same reason as in Kernel.SaveTo.
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
+		}
+		if err := injectLiveForkFailure(opts, LiveForkStageMappingsInvalidated); err != nil {
+			return err
 		}
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
 		var fsResources vfs.LiveForkFilesystemResources
@@ -142,12 +184,18 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)
+		if err := injectLiveForkFailure(opts, LiveForkStageVFSPrepared); err != nil {
+			return err
+		}
 		if len(mfs) != 0 {
 			return fmt.Errorf("live fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
 		k.prepareMemoryManagersForLiveFork()
 		k.mf.MarkSavable()
+		if err := injectLiveForkFailure(opts, LiveForkStageMemoryPrepared); err != nil {
+			return err
+		}
 
 		k.mf.IncOwner()
 		ownerTransferred := false
@@ -162,10 +210,16 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				k.mf.Destroy()
 			}
 		}()
+		if err := injectLiveForkFailure(opts, LiveForkStageOwnerAcquired); err != nil {
+			return err
+		}
 
 		child = &Kernel{Platform: k.Platform}
 		child.SetMemoryFile(k.mf)
 		child.initRuntimeFields()
+		if err := injectLiveForkFailure(opts, LiveForkStageChildInitialized); err != nil {
+			return err
+		}
 		loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
 			pgalloc.CtxMemoryFile:              k.mf,
 			pgalloc.CtxMemoryFileMap:           mfs,
@@ -176,11 +230,17 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		childLoaded = true
+		if err := injectLiveForkFailure(opts, LiveForkStageMetadataLoaded); err != nil {
+			return err
+		}
 
 		if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
 			return err
 		}
 		child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+		if err := injectLiveForkFailure(opts, LiveForkStageVDSOPrivatized); err != nil {
+			return err
+		}
 		if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 			sourceStack := k.rootNetworkNamespace.Stack()
 			cloner, ok := sourceStack.(inet.LiveForkStackConfigCloner)
@@ -192,10 +252,19 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			}
 			rootNS.Stack().Restore()
 		}
+		if err := injectLiveForkFailure(opts, LiveForkStageNetworkRestored); err != nil {
+			return err
+		}
 		if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 			return vfs.PrependErrMsg("VFS live-fork restore failed", err)
 		}
+		if err := injectLiveForkFailure(opts, LiveForkStageVFSRestored); err != nil {
+			return err
+		}
 		child.Pause()
+		if err := injectLiveForkFailure(opts, LiveForkStageChildPaused); err != nil {
+			return err
+		}
 		ownerTransferred = true
 		return nil
 	})

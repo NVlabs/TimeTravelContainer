@@ -663,6 +663,17 @@ structures only after correctness and measurement.
 Every successful child owns its complete Kernel and backing references, so an
 ancestor may be destroyed while descendants continue to run and fork.
 
+The Kernel transaction exposes a test-only failure injector after validation,
+parent CoW preparation, owner acquisition, metadata decode, each child restore
+phase, and final pause. Every injected failure must leave the source paused and
+able to complete another fork; partially acquired MemoryFile owners and loaded
+child graphs are released before the error returns.
+
+The family transaction separately injects failures after placeholder
+registration, source pause, Kernel clone, child task start, and final branch
+publication. Each path removes the placeholder, terminates/releases any child,
+restores the source's prior run state, and permits an immediate retry.
+
 Gate: a branch tree can be repeatedly forked and destroyed in arbitrary order
 without page leaks, use-after-free, or cross-branch state changes.
 

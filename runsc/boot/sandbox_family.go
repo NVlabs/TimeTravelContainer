@@ -112,6 +112,7 @@ type SandboxFamily struct {
 	allowNetworkStack              bool
 	allowSharedFilesystemResources bool
 	watchdogOpts                   *watchdog.Opts
+	testOnlyForkFailureInjector    func(SandboxForkStage) error
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -119,7 +120,21 @@ type SandboxFamilyOptions struct {
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
 	WatchdogOpts                   *watchdog.Opts
+	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
+	// Production callers should leave it nil.
+	TestOnlyForkFailureInjector func(SandboxForkStage) error
 }
+
+// SandboxForkStage identifies a completed family-level fork stage.
+type SandboxForkStage string
+
+const (
+	SandboxForkStagePlaceholderRegistered SandboxForkStage = "placeholder-registered"
+	SandboxForkStageSourcePaused          SandboxForkStage = "source-paused"
+	SandboxForkStageKernelCloned          SandboxForkStage = "kernel-cloned"
+	SandboxForkStageChildStarted          SandboxForkStage = "child-started"
+	SandboxForkStageBranchReady           SandboxForkStage = "branch-ready"
+)
 
 // NewSandboxFamily creates a family containing k as its default branch.
 func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamily {
@@ -127,6 +142,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
+		testOnlyForkFailureInjector:    opts.TestOnlyForkFailureInjector,
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
 				id:    DefaultBranchID,
@@ -135,6 +151,16 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 			},
 		},
 	}
+}
+
+func (f *SandboxFamily) injectForkFailure(stage SandboxForkStage) error {
+	if f.testOnlyForkFailureInjector == nil {
+		return nil
+	}
+	if err := f.testOnlyForkFailureInjector(stage); err != nil {
+		return fmt.Errorf("sandbox fork aborted after %s: %w", stage, err)
+	}
+	return nil
 }
 
 func kernelBranchState(k *kernel.Kernel) BranchState {
@@ -220,6 +246,9 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		f.mu.Unlock()
 		return nil, err
 	}
+	if err := f.injectForkFailure(SandboxForkStagePlaceholderRegistered); err != nil {
+		return fail(err)
+	}
 
 	source.opMu.Lock()
 	defer source.opMu.Unlock()
@@ -242,6 +271,13 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		source.k.Unpause()
 		return control.PostResume(source.k, nil)
 	}
+	if err := f.injectForkFailure(SandboxForkStageSourcePaused); err != nil {
+		resumeErr := resumeSource()
+		if resumeErr != nil {
+			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		}
+		return fail(err)
+	}
 
 	child, err := source.k.LiveFork(source.k.SupervisorContext(), kernel.LiveForkOptions{
 		Clocks:                         sentrytime.NewCalibratedClocks(),
@@ -255,12 +291,39 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		}
 		return fail(fmt.Errorf("forking branch %q from %q: %w", args.ID, sourceID, err))
 	}
+	if err := f.injectForkFailure(SandboxForkStageKernelCloned); err != nil {
+		child.Release()
+		resumeErr := resumeSource()
+		if resumeErr != nil {
+			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		}
+		return fail(err)
+	}
 	if err := child.StartPaused(); err != nil {
 		// StartPaused failure is an invariant violation, but ensure ownership of
 		// the child's shared MemoryFile is still released.
 		child.Release()
 		_ = resumeSource()
 		return fail(fmt.Errorf("starting branch %q paused: %w", args.ID, err))
+	}
+	cleanupStartedChild := func(dog *watchdog.Watchdog) {
+		if dog != nil {
+			dog.Stop()
+		}
+		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		if child.IsPaused() {
+			child.Unpause()
+		}
+		child.WaitExited()
+		child.Release()
+	}
+	if err := f.injectForkFailure(SandboxForkStageChildStarted); err != nil {
+		cleanupStartedChild(nil)
+		resumeErr := resumeSource()
+		if resumeErr != nil {
+			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		}
+		return fail(err)
 	}
 	var childWatchdog *watchdog.Watchdog
 	if f.watchdogOpts != nil {
@@ -273,17 +336,19 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	childBranch.watchdog = childWatchdog
 	childBranch.state = BranchPaused
 	f.mu.Unlock()
+	if err := f.injectForkFailure(SandboxForkStageBranchReady); err != nil {
+		cleanupStartedChild(childWatchdog)
+		resumeErr := resumeSource()
+		if resumeErr != nil {
+			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		}
+		return fail(err)
+	}
 	if !args.Paused {
 		child.Unpause()
 		if err := control.PostResume(child, nil); err != nil {
-			if childWatchdog != nil {
-				childWatchdog.Stop()
-			}
 			child.Pause()
-			child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
-			child.Unpause()
-			child.WaitExited()
-			child.Release()
+			cleanupStartedChild(childWatchdog)
 			_ = resumeSource()
 			return fail(fmt.Errorf("resuming branch %q: %w", args.ID, err))
 		}
@@ -292,15 +357,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		f.mu.Unlock()
 	}
 	if err := resumeSource(); err != nil {
-		if childWatchdog != nil {
-			childWatchdog.Stop()
-		}
-		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
-		if child.IsPaused() {
-			child.Unpause()
-		}
-		child.WaitExited()
-		child.Release()
+		cleanupStartedChild(childWatchdog)
 		return fail(fmt.Errorf("resuming source branch %q: %w", sourceID, err))
 	}
 
