@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -491,6 +492,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUDPClient := liveForkTestFD(t, l.k, udpFDs[0])
 	parentUDPServer := liveForkTestFD(t, l.k, udpFDs[1])
 	liveForkTestWrite(t, parentTask, parentUDPClient, "seed")
+	tcpClientFile, tcpServerFile := liveForkTestTCPPair(t, parentTask, 31003)
+	const tcpClientFD = int32(24)
+	tcpFDs, err := parentTask.FDTable().NewFDs(parentTask, tcpClientFD, []*vfs.FileDescription{tcpClientFile, tcpServerFile}, kernel.FDFlags{})
+	tcpClientFile.DecRef(parentTask)
+	tcpServerFile.DecRef(parentTask)
+	if err != nil {
+		t.Fatalf("installing loopback TCP pair: %v", err)
+	}
+	parentTCPClient := liveForkTestFD(t, l.k, tcpFDs[0])
+	parentTCPServer := liveForkTestFD(t, l.k, tcpFDs[1])
+	liveForkTestWrite(t, parentTask, parentTCPClient, "seed")
 	memfdFile, err := tmpfs.NewMemfd(parentTask, parentTask.Credentials(), l.k.ShmMount(), false, "live-fork")
 	if err != nil {
 		t.Fatalf("creating memfd: %v", err)
@@ -557,6 +569,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childTask := child.k.GlobalInit().Leader()
 	childUDPClient := liveForkTestFD(t, child.k, udpFDs[0])
 	childUDPServer := liveForkTestFD(t, child.k, udpFDs[1])
+	childTCPClient := liveForkTestFD(t, child.k, tcpFDs[0])
+	childTCPServer := liveForkTestFD(t, child.k, tcpFDs[1])
 	liveForkTestMMRead(t, childTask, shmAddr1, "seed")
 	liveForkTestMMRead(t, childTask, shmAddr2, "seed")
 	liveForkTestMMWrite(t, childTask, shmAddr1, "chld")
@@ -731,6 +745,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestRead(t, childTask, childUDPServer, "chld")
 	liveForkTestWouldBlock(t, parentTask, parentUDPServer)
 
+	// Established loopback TCP stream state and unread receive data follow the
+	// same branch-local semantics as the UDP endpoint graph.
+	liveForkTestRead(t, parentTask, parentTCPServer, "seed")
+	liveForkTestRead(t, childTask, childTCPServer, "seed")
+	liveForkTestWrite(t, parentTask, parentTCPClient, "parn")
+	liveForkTestReadEventually(t, parentTask, parentTCPServer, "parn")
+	liveForkTestWouldBlock(t, childTask, childTCPServer)
+	liveForkTestWrite(t, childTask, childTCPClient, "chld")
+	liveForkTestReadEventually(t, childTask, childTCPServer, "chld")
+	liveForkTestWouldBlock(t, parentTask, parentTCPServer)
+
 	// Tmpfs syscall writes and mapped shared writes detach MemoryFile pages
 	// without copying file contents at the fork boundary.
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "seed")
@@ -801,6 +826,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childCopiedUpFile.DecRef(childCtx)
 
 	liveForkTestWrite(t, childTask, childUDPClient, "fork")
+	liveForkTestWrite(t, childTask, childTCPClient, "fork")
+	liveForkTestWaitReadable(t, childTCPServer)
 	grandchildInfo, err := l.family.Fork(&ForkBranchArgs{Source: childInfo.ID, ID: "grandchild", Paused: true})
 	if err != nil {
 		t.Fatalf("recursively forking child: %v", err)
@@ -812,11 +839,18 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildTask := grandchild.k.GlobalInit().Leader()
 	grandchildUDPClient := liveForkTestFD(t, grandchild.k, udpFDs[0])
 	grandchildUDPServer := liveForkTestFD(t, grandchild.k, udpFDs[1])
+	grandchildTCPClient := liveForkTestFD(t, grandchild.k, tcpFDs[0])
+	grandchildTCPServer := liveForkTestFD(t, grandchild.k, tcpFDs[1])
 	liveForkTestRead(t, childTask, childUDPServer, "fork")
 	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "fork")
 	liveForkTestWrite(t, grandchildTask, grandchildUDPClient, "grnd")
 	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "grnd")
 	liveForkTestWouldBlock(t, childTask, childUDPServer)
+	liveForkTestRead(t, childTask, childTCPServer, "fork")
+	liveForkTestRead(t, grandchildTask, grandchildTCPServer, "fork")
+	liveForkTestWrite(t, grandchildTask, grandchildTCPClient, "grnd")
+	liveForkTestReadEventually(t, grandchildTask, grandchildTCPServer, "grnd")
+	liveForkTestWouldBlock(t, childTask, childTCPServer)
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "chld")
 	liveForkTestMMWrite(t, grandchildTask, shmAddr2, "grnd")
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
@@ -836,6 +870,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildOverlayFile.DecRef(grandchildTask)
 	grandchildUDPClient.DecRef(grandchildTask)
 	grandchildUDPServer.DecRef(grandchildTask)
+	grandchildTCPClient.DecRef(grandchildTask)
+	grandchildTCPServer.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
 	}
@@ -851,6 +887,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUnix2.DecRef(parentTask)
 	parentUDPClient.DecRef(parentTask)
 	parentUDPServer.DecRef(parentTask)
+	parentTCPClient.DecRef(parentTask)
+	parentTCPServer.DecRef(parentTask)
 	parentMemfd.DecRef(parentTask)
 	parentOverlayFile.DecRef(parentTask)
 	parentTruncateFile.DecRef(parentTask)
@@ -866,6 +904,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUnix2.DecRef(childTask)
 	childUDPClient.DecRef(childTask)
 	childUDPServer.DecRef(childTask)
+	childTCPClient.DecRef(childTask)
+	childTCPServer.DecRef(childTask)
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
 	childTruncateFile.DecRef(childTask)
@@ -934,6 +974,38 @@ func liveForkTestRead(t *testing.T, ctx context.Context, file *vfs.FileDescripti
 	}
 }
 
+func liveForkTestReadEventually(t *testing.T, ctx context.Context, file *vfs.FileDescription, want string) {
+	t.Helper()
+	buf := make([]byte, len(want))
+	read := 0
+	for attempts := 0; attempts < 10000 && read < len(buf); attempts++ {
+		n, err := file.Read(ctx, usermem.BytesIOSequence(buf[read:]), vfs.ReadOptions{})
+		read += int(n)
+		if err != nil && !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+			t.Fatalf("Read: got (%q, %d, %v), want %q", buf[:read], read, err, want)
+		}
+		if read == len(buf) {
+			if !bytes.Equal(buf, []byte(want)) {
+				t.Fatalf("Read: got %q, want %q", buf, want)
+			}
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("Read: timed out after reading %q, want %q", buf[:read], want)
+}
+
+func liveForkTestWaitReadable(t *testing.T, file *vfs.FileDescription) {
+	t.Helper()
+	for attempts := 0; attempts < 10000; attempts++ {
+		if file.Readiness(waiter.EventIn)&waiter.EventIn != 0 {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("timed out waiting for readable file")
+}
+
 func liveForkTestWouldBlock(t *testing.T, ctx context.Context, file *vfs.FileDescription) {
 	t.Helper()
 	buf := make([]byte, 1)
@@ -977,6 +1049,63 @@ func liveForkTestUDPPair(t *testing.T, task *kernel.Task, clientPort, serverPort
 	connect("client", client, serverPort)
 	connect("server", server, clientPort)
 	return client, server
+}
+
+func liveForkTestTCPPair(t *testing.T, task *kernel.Task, serverPort uint16) (*vfs.FileDescription, *vfs.FileDescription) {
+	t.Helper()
+	newSocket := func(name string) *vfs.FileDescription {
+		file, err := socket.New(task, linux.AF_INET, linux.SOCK_STREAM, unix.IPPROTO_TCP)
+		if err != nil {
+			t.Fatalf("creating loopback TCP %s: %v", name, err)
+		}
+		if err := file.SetStatusFlags(task, task.Credentials(), file.StatusFlags()|linux.O_NONBLOCK); err != nil {
+			file.DecRef(task)
+			t.Fatalf("making loopback TCP %s nonblocking: %v", name, err)
+		}
+		return file
+	}
+	listener := newSocket("listener")
+	listenerSocket := listener.Impl().(socket.Socket)
+	if err := listenerSocket.Bind(task, liveForkTestIPv4Sockaddr(serverPort)); err != nil {
+		listener.DecRef(task)
+		t.Fatalf("binding loopback TCP listener: %v", err)
+	}
+	if err := listenerSocket.Listen(task, 1); err != nil {
+		listener.DecRef(task)
+		t.Fatalf("listening on loopback TCP socket: %v", err)
+	}
+	client := newSocket("client")
+	if err := client.Impl().(socket.Socket).Connect(task, liveForkTestIPv4Sockaddr(serverPort), false); err != nil && !linuxerr.Equals(linuxerr.EINPROGRESS, err.ToError()) {
+		listener.DecRef(task)
+		client.DecRef(task)
+		t.Fatalf("connecting loopback TCP client: %v", err)
+	}
+
+	acceptedFD := int32(-1)
+	for attempts := 0; attempts < 1000; attempts++ {
+		fd, _, _, err := listenerSocket.Accept(task, false, linux.SOCK_NONBLOCK, false)
+		if err == nil {
+			acceptedFD = fd
+			break
+		}
+		if !linuxerr.Equals(linuxerr.ErrWouldBlock, err.ToError()) {
+			listener.DecRef(task)
+			client.DecRef(task)
+			t.Fatalf("accepting loopback TCP connection: %v", err)
+		}
+		runtime.Gosched()
+	}
+	listener.DecRef(task)
+	if acceptedFD < 0 {
+		client.DecRef(task)
+		t.Fatal("loopback TCP connection was not accepted")
+	}
+	accepted := task.FDTable().Remove(task, acceptedFD)
+	if accepted == nil {
+		client.DecRef(task)
+		t.Fatalf("accepted loopback TCP FD %d disappeared", acceptedFD)
+	}
+	return client, accepted
 }
 
 func liveForkTestIPv4Sockaddr(port uint16) []byte {

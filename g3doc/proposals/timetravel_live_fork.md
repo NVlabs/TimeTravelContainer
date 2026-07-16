@@ -195,9 +195,9 @@ The child must therefore receive an external stop before `StartPaused()` starts
 its task goroutines.
 
 Checkpoint-only package-global state requires audit. Registered loopback UDP
-endpoints now pass recursive-fork tests, but dangling TCP endpoint registries
-remain a Phase 7 audit target and should be rejected if they cannot be proven
-Kernel-local.
+and established TCP endpoints now pass recursive-fork tests, but all remaining
+package-global registries remain Phase 7 audit targets and should be rejected if
+they cannot be proven Kernel-local.
 
 ### `pkg/state`
 
@@ -570,10 +570,11 @@ opt in only through that same validator. Because NICs, routes, and firewall
 objects are intentionally omitted from normal state serialization, live fork
 reconstructs fresh child loopback link/NIC/address/route objects and independent
 unmodified default iptables before restoring endpoints. The real-loader gate
-uses two connected nonblocking UDP sockets: unread datagrams clone into parent,
-child, and grandchild queues, while later sends and readiness remain local to
-the originating branch. Hostinet, plugin stacks, external links, secondary
-network namespaces, modified firewall state, and packet-mmap VMAs still reject.
+uses connected nonblocking UDP sockets and an established TCP stream: unread
+datagrams and stream bytes clone into parent, child, and grandchild receive
+queues, while later sends and readiness remain local to the originating branch.
+Hostinet, plugin stacks, external links, secondary network namespaces, modified
+firewall state, and packet-mmap VMAs still reject.
 
 ## Implementation phases and gates
 
