@@ -231,16 +231,18 @@ func TestLiveForkMountsCompatible(t *testing.T) {
 	spec.Mounts = []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc"},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs"},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"mode=1777"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro"}},
 	}
 	if !liveForkMountsCompatible(spec, conf) {
 		t.Fatal("proc/tmpfs/read-only-sysfs mounts rejected")
 	}
-	spec.Mounts[2].Options = nil
+	spec.Mounts[4].Options = nil
 	if liveForkMountsCompatible(spec, conf) {
 		t.Fatal("writable sysfs mount accepted")
 	}
-	spec.Mounts[2] = specs.Mount{Destination: "/host", Type: "bind", Source: "/host", Options: []string{"ro"}}
+	spec.Mounts[4] = specs.Mount{Destination: "/host", Type: "bind", Source: "/host", Options: []string{"ro"}}
 	if liveForkMountsCompatible(spec, conf) {
 		t.Fatal("bind mount accepted before immutable-gofer eligibility is implemented")
 	}
@@ -254,6 +256,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	spec.Mounts = []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 	}
 	conf := testConfig()
@@ -564,15 +568,23 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	truncateFile.DecRef(parentTask)
 	parentTruncateFile := liveForkTestFD(t, l.k, truncateFD)
-	devMountFile := liveForkTestCreateFile(t, parentTask, "dev/ttos-mount-state")
+	devMountFile := liveForkTestCreateFile(t, parentTask, "dev/shm/ttos-mount-state")
 	const devMountFD = int32(26)
 	if _, err := parentTask.FDTable().NewFDAt(parentTask, devMountFD, devMountFile, kernel.FDFlags{}); err != nil {
 		devMountFile.DecRef(parentTask)
-		t.Fatalf("installing /dev tmpfs file: %v", err)
+		t.Fatalf("installing /dev/shm tmpfs file: %v", err)
 	}
 	devMountFile.DecRef(parentTask)
 	parentDevMountFile := liveForkTestFD(t, l.k, devMountFD)
 	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "seed")
+	ptyMaster := liveForkTestOpenPath(t, parentTask, "dev/ptmx", linux.O_RDWR|linux.O_NONBLOCK)
+	const ptyMasterFD = int32(27)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, ptyMasterFD, ptyMaster, kernel.FDFlags{}); err != nil {
+		ptyMaster.DecRef(parentTask)
+		t.Fatalf("installing internal PTY master: %v", err)
+	}
+	ptyMaster.DecRef(parentTask)
+	parentPTYMaster := liveForkTestFD(t, l.k, ptyMasterFD)
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
@@ -624,6 +636,10 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
 	childDevMountFile := liveForkTestFD(t, child.k, devMountFD)
+	childPTYMaster := liveForkTestFD(t, child.k, ptyMasterFD)
+	if parentPTYMaster.Impl() == childPTYMaster.Impl() {
+		t.Fatal("parent and child share the same internal PTY master object")
+	}
 	for _, check := range []struct {
 		task *kernel.Task
 		path string
@@ -1368,9 +1384,10 @@ func liveForkTestOpenPath(t *testing.T, task *kernel.Task, path string, flags ui
 	root := task.MountNamespace().Root(ctx)
 	defer root.DecRef(ctx)
 	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse(path),
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(path),
+		FollowFinalSymlink: flags&linux.O_NOFOLLOW == 0,
 	}, &vfs.OpenOptions{Flags: flags})
 	if err != nil {
 		t.Fatalf("opening %q: %v", path, err)

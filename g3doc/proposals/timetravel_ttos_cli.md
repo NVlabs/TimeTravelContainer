@@ -7,9 +7,10 @@ Implementation status: an initial lightweight `ttos` client is available at
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
 initial run/create/start/inspect/list/remove lifecycle with persistent metadata,
-plus synchronous non-TTY exec into a selected live branch. `ttosd`, detached
-and TTY exec, attach, devpts and other remaining mount classes, and managed
-volumes remain TODO.
+plus synchronous non-TTY exec into a selected live branch. Generated bundles
+include procfs, restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`,
+and a private devpts instance with `/dev/ptmx`. `ttosd`, detached and TTY exec,
+attach, read-only host binds, and managed volumes remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -222,7 +223,7 @@ host clients connect transiently through the control plane.
 - [ ] Ensure post-fork input and output cannot cross branches.
 - [ ] Test detach caused by normal command, detach keys, client crash, daemon
       restart, and network/socket failure.
-- [ ] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
+- [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 
 ## Mount eligibility framework
@@ -251,8 +252,11 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ### tmpfs, procfs, and sysfs
 
-- [x] Admit main-`MemoryFile` tmpfs mounts as the initial `Clone` class and
-      verify file contents diverge CoW across branches.
+- [x] Admit main-`MemoryFile` tmpfs mounts, including `/dev/shm`, as the initial
+      `Clone` class and verify file contents diverge CoW across branches.
+- [x] Admit a private devpts mount, verify `/dev/ptmx` follows the standard
+      symlink into it, and verify an open internal PTY is cloned rather than
+      shared across branches.
 - [ ] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
       truncate, fallocate, and mount flags across branches.
 - [ ] Admit procfs only after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,
@@ -365,7 +369,7 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 - [ ] Per-mount eligibility framework.
 - [x] Initial tmpfs, procfs, and restricted read-only sysfs mounts.
-- [ ] devpts and `/dev/ptmx` mounts for the internal TTY console.
+- [x] devpts and `/dev/ptmx` mounts for the internal TTY console.
 - [ ] Multiple immutable read-only gofer binds.
 - [ ] Managed tmpfs/OverlayFS submount volumes.
 

@@ -44,6 +44,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
@@ -848,7 +849,7 @@ func liveForkMountsCompatible(spec *specs.Spec, conf *config.Config) bool {
 	}
 	for _, mount := range spec.Mounts {
 		switch mount.Type {
-		case proc.Name, tmpfs.Name:
+		case devpts.Name, proc.Name, tmpfs.Name:
 		case sys.Name:
 			readOnly := false
 			for _, option := range mount.Options {
