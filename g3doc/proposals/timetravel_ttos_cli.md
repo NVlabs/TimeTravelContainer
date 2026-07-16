@@ -396,6 +396,9 @@ Reject            unsupported, externally mutable, or host/device-backed
       them only after the last branch is destroyed.
 - [ ] Keep branch-local mutable filesystem state owned by the Sentry, not by a
       host snapshotter that cannot participate in live fork.
+- [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
+      Python, and nginx images, covering rootless prerequisites, OCI startup,
+      Docker-like lifecycle commands, live fork, and managed-volume CoW.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 
@@ -502,7 +505,7 @@ bundle.
 - [x] Drain to a persistent host log instead of blocking guest output merely
       because no console client is attached; the initial policy keeps a 16 MiB
       current generation plus one retained generation.
-- [ ] Expose log size and generation-count policy in the user-facing CLI.
+- [x] Expose log size and generation-count policy in the user-facing CLI.
 - [x] Support multiple simultaneous output readers.
 - [x] Use one exclusive manager-level stdin owner per branch.
 - [ ] Define daemon-reconciled stdin lease takeover behavior.
