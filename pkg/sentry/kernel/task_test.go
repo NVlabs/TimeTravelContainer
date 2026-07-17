@@ -20,6 +20,26 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 )
 
+func TestTaskLimitReached(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		max, live uint64
+		want      bool
+	}{
+		{name: "unlimited", max: 0, live: 100, want: false},
+		{name: "below limit", max: 3, live: 2, want: false},
+		{name: "at limit", max: 3, live: 3, want: true},
+		{name: "above limit", max: 3, live: 4, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ts := TaskSet{maxLiveTasks: test.max, liveTasks: uint32(test.live)}
+			if got := ts.taskLimitReachedLocked(); got != test.want {
+				t.Errorf("taskLimitReachedLocked()=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestTaskCPU(t *testing.T) {
 	for _, test := range []struct {
 		mask sched.CPUSet

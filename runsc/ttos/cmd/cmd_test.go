@@ -523,7 +523,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -532,6 +532,9 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
 		t.Errorf("run request=%+v", b.runRequest)
+	}
+	if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 23 {
+		t.Errorf("pids limit=%v, want 23", b.runRequest.pidsLimit)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
 		t.Errorf("run args=%q, want %q", got, want)
@@ -622,6 +625,7 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 				"--label", "suite=direct",
 				"-l", "direct-only=value",
 				"--name", "demo",
+				"--pids-limit", "17",
 				"busybox:1.36",
 			}
 			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
@@ -647,6 +651,9 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 			}
 			if !reflect.DeepEqual(b.runRequest.labels, wantLabels) {
 				t.Errorf("labels=%q, want %q", b.runRequest.labels, wantLabels)
+			}
+			if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 17 {
+				t.Errorf("pids limit=%v, want 17", b.runRequest.pidsLimit)
 			}
 			wantOutput := ""
 			if command == "create" {
@@ -705,6 +712,7 @@ func TestRunAndCreateRejectInvalidStopPolicy(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--stop-signal", "SIGINVALID", "busybox"},
 		{"create", "--stop-timeout", "-2", "busybox"},
+		{"run", "--pids-limit", "-2", "busybox"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
@@ -1432,9 +1440,10 @@ func TestBuildInspectInfo(t *testing.T) {
 	started := created.Add(time.Second)
 	exit := 23
 	stopTimeout := 4
+	pidsLimit := int64(23)
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1491,6 +1500,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if info.Config.StopSignal != "SIGUSR1" || info.HostConfig.StopTimeout == nil || *info.HostConfig.StopTimeout != 4 {
 		t.Errorf("inspect stop policy=(%q, %v), want (SIGUSR1, 4)", info.Config.StopSignal, info.HostConfig.StopTimeout)
+	}
+	if info.HostConfig.PidsLimit == nil || *info.HostConfig.PidsLimit != pidsLimit {
+		t.Errorf("inspect pids limit=%v, want %d", info.HostConfig.PidsLimit, pidsLimit)
 	}
 	if !info.HostConfig.AutoRemove {
 		t.Error("inspect omitted auto-remove policy")

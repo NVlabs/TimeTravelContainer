@@ -519,6 +519,10 @@ type InitKernelArgs struct {
 	// unlimited.
 	MaxFDLimit int32
 
+	// MaxTasks limits the number of simultaneously live tasks in the TaskSet.
+	// Both processes and threads consume one task. Zero means unlimited.
+	MaxTasks uint64
+
 	// Cgroup2FSInit initializes the cgroup2fs filesystem singleton.
 	Cgroup2FSInit func(ctx context.Context, k *Kernel, vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error)
 }
@@ -554,6 +558,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.featureSet = args.FeatureSet
 	k.timekeeper = args.Timekeeper
 	k.tasks = newTaskSet(args.RootPIDNamespace)
+	k.tasks.maxLiveTasks = args.MaxTasks
 	k.rootUserNamespace = args.RootUserNamespace
 	k.rootUTSNamespace = args.RootUTSNamespace
 	k.rootIPCNamespace = args.RootIPCNamespace

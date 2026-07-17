@@ -36,6 +36,8 @@ const (
 	TmpfsConfigAnnotation = "dev.timetravelos.config.tmpfs"
 	// StopSignalAnnotation records the effective image or CLI stop signal.
 	StopSignalAnnotation = "dev.timetravelos.config.stop-signal"
+	// PidsLimitAnnotation enables TTOS Sentry-side enforcement of linux.resources.pids.
+	PidsLimitAnnotation = "dev.timetravelos.resource.pids-limit"
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -74,6 +76,7 @@ type SpecOptions struct {
 	NetworkMode      string
 	ReadonlyRootfs   bool
 	StopSignal       string
+	PidsLimit        *int64
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -109,6 +112,9 @@ type FilesystemMount struct {
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
 func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
+	if opts.PidsLimit != nil && *opts.PidsLimit < -1 {
+		return nil, fmt.Errorf("pids limit must be -1 or greater")
+	}
 	rootfs, err := filepath.Abs(opts.RootFS)
 	if err != nil {
 		return nil, fmt.Errorf("resolving rootfs path: %w", err)
@@ -184,6 +190,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		"dev.gvisor.spec.rootfs.overlay":    "memory",
 		"dev.timetravelos.internal-console": "init",
 		"dev.timetravelos.config.network":   networkMode,
+	}
+	var resources *specs.LinuxResources
+	if opts.PidsLimit != nil && *opts.PidsLimit > 0 {
+		resources = &specs.LinuxResources{Pids: &specs.LinuxPids{Limit: *opts.PidsLimit}}
+		annotations[PidsLimitAnnotation] = "sentry"
 	}
 	ownerManifest := ownership.ManifestPath(rootfs)
 	if _, err := ownership.Read(ownerManifest); err == nil {
@@ -357,7 +368,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		},
 		Hostname:    hostname,
 		Mounts:      mounts,
-		Linux:       &specs.Linux{Namespaces: namespaces},
+		Linux:       &specs.Linux{Namespaces: namespaces, Resources: resources},
 		Annotations: annotations,
 	}, nil
 }

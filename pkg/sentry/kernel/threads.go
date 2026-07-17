@@ -82,6 +82,12 @@ type TaskSet struct {
 	// not exited. liveTasks is protected by mu.
 	liveTasks uint32
 
+	// maxLiveTasks is the maximum number of tasks whose goroutines may be live
+	// in this TaskSet. Zero means unlimited. maxLiveTasks is immutable after
+	// Kernel.Init and is saved so restored and live-forked kernels retain an
+	// independent copy of the limit.
+	maxLiveTasks uint64
+
 	// If noNewTasksIfZeroLive is true and liveTasks is zero, calls to
 	// Kernel.NewTask() will fail. noNewTasksIfZeroLive is protected by mu.
 	noNewTasksIfZeroLive bool

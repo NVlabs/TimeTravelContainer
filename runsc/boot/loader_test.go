@@ -228,6 +228,34 @@ func createLoaderWithGoferMountConfs(conf *config.Config, spec *specs.Spec, moun
 	return l, cleanupGofers, nil
 }
 
+// TestTTOSMaxTasks validates TTOS-specific activation of sandbox-wide task limits.
+func TestTTOSMaxTasks(t *testing.T) {
+	positive := &specs.LinuxPids{Limit: 7}
+	nonPositive := &specs.LinuxPids{Limit: 0}
+	for _, test := range []struct {
+		name    string
+		spec    *specs.Spec
+		want    uint64
+		wantErr bool
+	}{
+		{name: "nil spec"},
+		{name: "ordinary OCI resources are not sandbox-wide", spec: &specs.Spec{Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}},
+		{name: "marker requires resources", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}}, wantErr: true},
+		{name: "marker requires positive limit", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: nonPositive}}}, wantErr: true},
+		{name: "TTOS limit", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ttosMaxTasks(test.spec)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ttosMaxTasks() error=%v, wantErr=%t", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Errorf("ttosMaxTasks()=%d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 // TestRun runs a simple application in a sandbox and checks that it succeeds.
 func TestRun(t *testing.T) {
 	l, cleanup, err := createLoader(testConfig(), testSpec())

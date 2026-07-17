@@ -84,6 +84,7 @@ type ContainerInfo struct {
 	AutoRemove         bool            `json:"auto_remove,omitempty"`
 	StopSignal         string          `json:"stop_signal,omitempty"`
 	StopTimeout        *int            `json:"stop_timeout,omitempty"`
+	PidsLimit          *int64          `json:"pids_limit,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -92,6 +93,14 @@ type ContainerInfo struct {
 }
 
 func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
 	if value == nil {
 		return nil
 	}
@@ -122,6 +131,9 @@ type VolumeInfo struct {
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
 	if opts.StopTimeout != nil && *opts.StopTimeout < -1 {
 		return Prepared{}, fmt.Errorf("stop timeout must be -1 or greater")
+	}
+	if opts.PidsLimit != nil && *opts.PidsLimit < -1 {
+		return Prepared{}, fmt.Errorf("pids limit must be -1 or greater")
 	}
 	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
 	if err != nil {
@@ -193,6 +205,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		AutoRemove:         opts.AutoRemove,
 		StopSignal:         spec.Annotations[StopSignalAnnotation],
 		StopTimeout:        cloneIntPointer(opts.StopTimeout),
+		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -310,6 +323,9 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	}
 	if *info.StopTimeout < -1 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid stop timeout %d", key, *info.StopTimeout)
+	}
+	if info.PidsLimit != nil && *info.PidsLimit < -1 {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid pids limit %d", key, *info.PidsLimit)
 	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)

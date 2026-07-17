@@ -179,7 +179,13 @@ the `main` branch and leave `ttos` responsible for branch operations.
       create/start/restart/fork and project them through inspect.
 - [x] Support family-local named tmpfs volumes through `-v NAME:CONTAINER[:ro]`
       and `--mount type=volume,...`, including repeated aliases of one volume.
-- [ ] Add CPU, memory, process-count, and other resource-limit flags.
+- [x] Support Docker `run/create --pids-limit`, persist it in OCI and
+      Docker inspect metadata, and enforce it inside the Sentry for both processes
+      and threads without requiring delegated host cgroups. Live forks inherit an
+      independent limit and current task charge in every branch.
+- [ ] Add CPU, memory, and other resource-limit flags. Rootless enforcement must
+      use delegated host cgroup v2 controllers or equivalent Sentry accounting;
+      do not expose parse-only limits.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
 - [x] Support `run/create -t` with a detachable Sentry-internal PTY, Docker-style
       combined `-it`/`-dit`, raw interactive attach, resize propagation, and
@@ -521,7 +527,8 @@ Reject            unsupported, externally mutable, or host/device-backed
       Docker-like lifecycle commands and inspect across created, running,
       forked, paused, and exited states; live fork; managed-volume CoW;
       read-only host binds; distinct Redis lower-layer ownership; exact quick-exit
-      console integrity; and the explicit no-userns fallback.
+      console integrity; Sentry-enforced PID limits across live fork; and the
+      explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 

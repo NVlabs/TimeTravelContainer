@@ -481,7 +481,27 @@ const (
 
 // InternalConsoleAnnotation requests Sentry-internal, detachable stdio and
 // names the console session registered for the container init process.
-const InternalConsoleAnnotation = "dev.timetravelos.internal-console"
+const (
+	InternalConsoleAnnotation = "dev.timetravelos.internal-console"
+	ttosPidsLimitAnnotation   = "dev.timetravelos.resource.pids-limit"
+)
+
+func ttosMaxTasks(spec *specs.Spec) (uint64, error) {
+	if spec == nil {
+		return 0, nil
+	}
+	if _, ok := spec.Annotations[ttosPidsLimitAnnotation]; !ok {
+		return 0, nil
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
+		return 0, fmt.Errorf("%s requires linux.resources.pids", ttosPidsLimitAnnotation)
+	}
+	limit := spec.Linux.Resources.Pids.Limit
+	if limit <= 0 {
+		return 0, fmt.Errorf("%s requires a positive PID limit, got %d", ttosPidsLimitAnnotation, limit)
+	}
+	return uint64(limit), nil
+}
 
 func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.UserNamespace) *auth.Credentials {
 	// Create capabilities.
@@ -718,6 +738,10 @@ func New(args Args) (*Loader, error) {
 		cpufs = afs
 	}
 
+	maxTasks, err := ttosMaxTasks(args.Spec)
+	if err != nil {
+		return nil, err
+	}
 	maxFDLimit := kernel.MaxFdLimit
 	if args.Spec.Linux != nil && args.Spec.Linux.Sysctl != nil {
 		if val, ok := args.Spec.Linux.Sysctl["fs.nr_open"]; ok {
@@ -745,6 +769,7 @@ func New(args Args) (*Loader, error) {
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           maxFDLimit,
+		MaxTasks:             maxTasks,
 		Cgroup2FSInit:        cgroup2fs.NewFilesystem,
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)

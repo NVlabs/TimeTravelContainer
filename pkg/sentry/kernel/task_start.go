@@ -126,6 +126,10 @@ type TaskConfig struct {
 	cloneIntoCgroup bool
 }
 
+func (ts *TaskSet) taskLimitReachedLocked() bool {
+	return ts.maxLiveTasks != 0 && uint64(ts.liveTasks) >= ts.maxLiveTasks
+}
+
 // NewTask creates a new task defined by cfg.
 //
 // NewTask does not start the returned task; the caller must call Task.Start.
@@ -337,6 +341,9 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		// a syscall, so it's safe to return a non-errno error that is more
 		// explanatory.
 		return nil, fmt.Errorf("task creation disabled after Kernel.WaitExited() may have returned")
+	}
+	if ts.taskLimitReachedLocked() {
+		return nil, linuxerr.EAGAIN
 	}
 
 	if err := ts.assignTIDsLocked(t); err != nil {

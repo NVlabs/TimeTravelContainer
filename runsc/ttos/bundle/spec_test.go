@@ -31,6 +31,7 @@ import (
 )
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
+	pidsLimit := int64(23)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
 		t.Fatal(err)
@@ -64,6 +65,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		RootFS:         root,
 		ReadonlyRootfs: true,
 		StopSignal:     "SIGUSR1",
+		PidsLimit:      &pidsLimit,
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
 		Labels:         map[string]string{"empty": "", "extra": "value", "suite": "run"},
@@ -132,6 +134,12 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := spec.Annotations["dev.timetravelos.config.network"]; got != "none" {
 		t.Errorf("network annotation=%q, want none", got)
+	}
+	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil || spec.Linux.Resources.Pids.Limit != pidsLimit {
+		t.Errorf("pids resources=%+v, want limit %d", spec.Linux.Resources, pidsLimit)
+	}
+	if got := spec.Annotations[PidsLimitAnnotation]; got != "sentry" {
+		t.Errorf("pids enforcement annotation=%q, want sentry", got)
 	}
 	wantVolumeAnnotations := map[string]string{
 		"dev.gvisor.spec.mount.ttos0.source":  "ttos-volume-cache",
@@ -240,6 +248,18 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), StopSignal: "SIGINVALID"}); err == nil {
 		t.Error("BuildSpec accepted an invalid stop signal")
+	}
+	invalidPidsLimit := int64(-2)
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), PidsLimit: &invalidPidsLimit}); err == nil {
+		t.Error("BuildSpec accepted an invalid pids limit")
+	}
+	unlimitedPids := int64(-1)
+	unlimitedSpec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), PidsLimit: &unlimitedPids})
+	if err != nil {
+		t.Fatalf("BuildSpec rejected unlimited pids: %v", err)
+	}
+	if unlimitedSpec.Linux.Resources != nil || unlimitedSpec.Annotations[PidsLimitAnnotation] != "" {
+		t.Errorf("unlimited pids unexpectedly enabled enforcement: resources=%+v annotation=%q", unlimitedSpec.Linux.Resources, unlimitedSpec.Annotations[PidsLimitAnnotation])
 	}
 }
 

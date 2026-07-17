@@ -32,6 +32,9 @@ covers:
   volumes remain writable;
 - image `STOPSIGNAL` inheritance plus Docker `--stop-signal` and
   `--stop-timeout` inspect persistence, graceful-stop delivery, and final exit-code reconciliation;
+- Docker `--pids-limit` OCI and inspect persistence, Sentry-side process and
+  thread enforcement without delegated host cgroups, and branch-local limit and
+  task-charge inheritance across live fork;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
 - Alpine dynamic linking and package-tool startup;

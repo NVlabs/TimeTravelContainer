@@ -83,6 +83,7 @@ MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
 STOP_POLICY="$PREFIX-stop-policy"
+PIDS_LIMIT="$PREFIX-pids-limit"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
 
@@ -108,7 +109,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -248,6 +249,64 @@ ttos rm "$PREFIX-alpine"
 ttos run --name "$PREFIX-python" "$PYTHON_IMAGE" python3 -c \
   'import json, sqlite3, threading; db=sqlite3.connect(":memory:"); db.execute("create table t(v)"); db.execute("insert into t values (7)"); assert db.execute("select v from t").fetchone()[0] == 7; t=threading.Thread(target=lambda: json.dumps({"ok": True})); t.start(); t.join(); print("python-ok")'
 ttos rm "$PREFIX-python"
+
+echo "== rootless Sentry PID limit and branch-local inheritance =="
+ttos run --name "$PIDS_LIMIT" --detach --pids-limit 3 "$PYTHON_IMAGE" python3 -c "
+import errno, os, signal
+children = []
+def release(signum, frame):
+    if children:
+        pid = children.pop()
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        print(\"pids-released\", flush=True)
+signal.signal(signal.SIGUSR1, release)
+for _ in range(2):
+    pid = os.fork()
+    if pid == 0:
+        signal.pause()
+        os._exit(0)
+    children.append(pid)
+try:
+    pid = os.fork()
+except OSError as error:
+    assert error.errno == errno.EAGAIN, error
+    print(\"pids-ready\", flush=True)
+else:
+    if pid == 0:
+        os._exit(99)
+    raise RuntimeError(\"third fork unexpectedly succeeded\")
+while True:
+    signal.pause()
+"
+deadline=$(( $(date +%s) + 15 ))
+until ttos logs "$PIDS_LIMIT" | grep -q pids-ready; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "PID-limited container did not reach its cap"
+  sleep 1
+done
+[ "$(ttos inspect -f "{{.HostConfig.PidsLimit}}" "$PIDS_LIMIT")" = 3 ] ||
+  fail "inspect did not retain --pids-limit"
+if ttos exec "$PIDS_LIMIT" true >/dev/null 2>&1; then
+  fail "exec bypassed a full PID limit"
+fi
+ttos fork --check "$PIDS_LIMIT"
+ttos fork "$PIDS_LIMIT" "$PIDS_LIMIT@child"
+if ttos exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
+  fail "live-forked child lost its full PID limit"
+fi
+ttos kill --signal SIGUSR1 "$PIDS_LIMIT" >/dev/null
+deadline=$(( $(date +%s) + 15 ))
+until ttos logs "$PIDS_LIMIT" | grep -q pids-released; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "parent branch did not release a PID slot"
+  sleep 1
+done
+ttos exec "$PIDS_LIMIT" true
+if ttos exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
+  fail "parent PID release leaked into the child branch"
+fi
+ttos stop --time 1 "$PIDS_LIMIT@child" "$PIDS_LIMIT"
+ttos branch rm "$PIDS_LIMIT@child"
+ttos rm "$PIDS_LIMIT"
 
 ttos create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 [ "$(ttos inspect -f '{{.Config.StopSignal}}' "$PREFIX-nginx")" = SIGQUIT ] ||

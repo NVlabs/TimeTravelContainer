@@ -1103,6 +1103,7 @@ type runRequest struct {
 	readonlyRootfs     bool
 	stopSignal         string
 	stopTimeout        int
+	pidsLimit          *int64
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -1152,7 +1153,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1168,6 +1169,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
 	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
 	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
+	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1199,6 +1201,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *stopTimeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
 	}
+	if *pidsLimit < -1 {
+		return errors.New("pids limit must be -1 or greater")
+	}
 	if flagWasSet(fs, "stop-signal") {
 		if _, err := parseSignal(*stopSignal); err != nil {
 			return err
@@ -1231,6 +1236,11 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
+	var effectivePidsLimit *int64
+	if flagWasSet(fs, "pids-limit") {
+		value := *pidsLimit
+		effectivePidsLimit = &value
+	}
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
@@ -1250,6 +1260,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
+		pidsLimit:          effectivePidsLimit,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1278,7 +1289,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1292,6 +1303,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
 	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
 	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
+	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1323,6 +1335,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *stopTimeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
 	}
+	if *pidsLimit < -1 {
+		return errors.New("pids limit must be -1 or greater")
+	}
 	if flagWasSet(fs, "stop-signal") {
 		if _, err := parseSignal(*stopSignal); err != nil {
 			return err
@@ -1355,6 +1370,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	}
+	var effectivePidsLimit *int64
+	if flagWasSet(fs, "pids-limit") {
+		value := *pidsLimit
+		effectivePidsLimit = &value
+	}
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
@@ -1374,6 +1394,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
+		pidsLimit:          effectivePidsLimit,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -1852,6 +1873,7 @@ type InspectHostConfig struct {
 	AutoRemove     bool              `json:"AutoRemove"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	StopTimeout    *int              `json:"StopTimeout"`
+	PidsLimit      *int64            `json:"PidsLimit"`
 	Runtime        string            `json:"Runtime"`
 	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
 }
@@ -3612,6 +3634,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			NetworkMode:      request.networkMode,
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
+			PidsLimit:        request.pidsLimit,
 			Entrypoint:       request.entrypoint,
 			ManagedVolumes:   request.managedVolumes,
 			HostMounts:       request.hostMounts,
@@ -3655,6 +3678,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			NetworkMode:      request.networkMode,
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
+			PidsLimit:        request.pidsLimit,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			ManagedVolumes:   request.managedVolumes,
@@ -4899,7 +4923,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
