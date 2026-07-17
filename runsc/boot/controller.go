@@ -136,6 +136,9 @@ const (
 	// ContMgrConsoleRead reads branch-local internal console output.
 	ContMgrConsoleRead = "containerManager.ConsoleRead"
 
+	// ContMgrConsoleWait waits for branch-local internal console readiness.
+	ContMgrConsoleWait = "containerManager.ConsoleWait"
+
 	// ContMgrConsoleWrite writes branch-local internal console input.
 	ContMgrConsoleWrite = "containerManager.ConsoleWrite"
 
@@ -1089,6 +1092,11 @@ func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *u
 // ConsoleRead reads output from a branch-local internal console.
 func (cm *containerManager) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResult) error {
 	return cm.l.family.ConsoleRead(args, out)
+}
+
+// ConsoleWait waits for branch-local internal console I/O readiness.
+func (cm *containerManager) ConsoleWait(args *ConsoleWaitArgs, out *ConsoleWaitResult) error {
+	return cm.l.family.ConsoleWait(args, out)
 }
 
 // ConsoleWrite writes input to a branch-local internal console.

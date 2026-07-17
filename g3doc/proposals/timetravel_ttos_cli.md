@@ -462,8 +462,9 @@ state still forks entirely in memory.
       in a host `FileDescription`.
 - [x] Add branch-serialized nonblocking console read/write RPCs.
 - [x] Add branch-serialized stdin close and verify that the guest observes EOF.
-- [ ] Add readiness waiting and cancellation. Resize is implemented for init and
-      attached exec PTYs.
+- [x] Add bounded, cancellable pipe/PTY readiness waits for stdin, stdout, and
+      stderr. Live fork cancels and joins active host waiters before serialization;
+      resize is implemented for init and attached exec PTYs.
 - [x] Add a long-lived low-level multiplexed `console-follow` stream so one
       process drains both outputs without spawning one `runsc` per read.
 - [x] Start one advisory-locked sidecar per branch, persist its stream, diagnose
@@ -475,8 +476,9 @@ state still forks entirely in memory.
       preserve exact stdout/stderr plus one EOF per stream for immediate exits.
       The image matrix stress-checks 256 KiB per stream in both foreground and
       persistent-log paths.
-- [ ] Move sidecar ownership into `ttosd`, add restart reconciliation, and
-      replace the sidecar's polling RPC loop with readiness-driven transport.
+- [ ] Move sidecar process ownership into `ttosd`. Restart reconciliation is
+      implemented, and console I/O now uses readiness-driven transport instead
+      of polling RPCs.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
 - [x] Clone init- and exec-console PTY termios, foreground process groups,

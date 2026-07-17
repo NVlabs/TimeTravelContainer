@@ -21,6 +21,9 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
@@ -76,6 +79,143 @@ func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 			parent.Release()
 		})
 	}
+}
+
+func TestSandboxFamilyConsoleWaitReadinessAndLifecycleIndependence(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	const consoleID = "readiness-test"
+	fdTable, err := parent.NewInternalConsoleFDTable(parent.SupervisorContext(), consoleID)
+	if err != nil {
+		t.Fatalf("NewInternalConsoleFDTable: %v", err)
+	}
+	fdTableReleased := false
+	defer func() {
+		if !fdTableReleased {
+			fdTable.DecRef(parent.SupervisorContext())
+		}
+		_ = parent.RemoveInternalConsole(parent.SupervisorContext(), consoleID)
+	}()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+
+	var timeoutResult ConsoleWaitResult
+	if err := family.ConsoleWait(&ConsoleWaitArgs{
+		BranchID: DefaultBranchID, ConsoleID: consoleID,
+		Want: kernel.InternalConsoleReadiness{Stdout: true}, Timeout: 5 * time.Millisecond,
+	}, &timeoutResult); err != nil {
+		t.Fatalf("ConsoleWait timeout: %v", err)
+	}
+	if !timeoutResult.TimedOut || timeoutResult.Ready.Stdout {
+		t.Fatalf("ConsoleWait timeout result: %+v", timeoutResult)
+	}
+
+	var stdinResult ConsoleWaitResult
+	if err := family.ConsoleWait(&ConsoleWaitArgs{
+		BranchID: DefaultBranchID, ConsoleID: consoleID,
+		Want: kernel.InternalConsoleReadiness{Stdin: true}, Timeout: 0,
+	}, &stdinResult); err != nil {
+		t.Fatalf("ConsoleWait stdin: %v", err)
+	}
+	if stdinResult.TimedOut || !stdinResult.Ready.Stdin {
+		t.Fatalf("ConsoleWait stdin result: %+v", stdinResult)
+	}
+
+	cancelledWait := make(chan error, 1)
+	go func() {
+		var result ConsoleWaitResult
+		cancelledWait <- family.ConsoleWait(&ConsoleWaitArgs{
+			BranchID: DefaultBranchID, ConsoleID: consoleID,
+			Want: kernel.InternalConsoleReadiness{Stdout: true}, Timeout: time.Second,
+		}, &result)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	branch, err := family.branch(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("finding default branch: %v", err)
+	}
+	branch.opMu.Lock()
+	family.cancelConsoleWaits(branch)
+	branch.opMu.Unlock()
+	select {
+	case err := <-cancelledWait:
+		if err != nil {
+			t.Fatalf("cancelled ConsoleWait: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("console waiter cancellation did not join")
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		var result ConsoleWaitResult
+		err := family.ConsoleWait(&ConsoleWaitArgs{
+			BranchID: DefaultBranchID, ConsoleID: consoleID,
+			Want: kernel.InternalConsoleReadiness{Stdout: true}, Timeout: time.Second,
+		}, &result)
+		if err == nil && (result.TimedOut || !result.Ready.Stdout) {
+			err = fmt.Errorf("unexpected readiness result: %+v", result)
+		}
+		waitDone <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case err := <-waitDone:
+		t.Fatalf("ConsoleWait returned before readiness: %v", err)
+	default:
+	}
+
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- family.Pause(DefaultBranchID) }()
+	select {
+	case err := <-pauseDone:
+		if err != nil {
+			t.Fatalf("Pause during ConsoleWait: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Pause blocked behind ConsoleWait")
+	}
+	if err := family.Resume(DefaultBranchID); err != nil {
+		t.Fatalf("Resume during ConsoleWait: %v", err)
+	}
+
+	stdout, _ := fdTable.Get(1)
+	if stdout == nil {
+		t.Fatal("internal console stdout FD is missing")
+	}
+	const output = "readiness-output"
+	written, err := stdout.Write(parent.SupervisorContext(), usermem.BytesIOSequence([]byte(output)), vfs.WriteOptions{})
+	stdout.DecRef(parent.SupervisorContext())
+	if err != nil || written != int64(len(output)) {
+		t.Fatalf("writing internal console stdout: wrote %d, err=%v", written, err)
+	}
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("ConsoleWait wakeup: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("ConsoleWait did not wake after guest output became readable")
+	}
+	data, eof, wouldBlock, err := parent.ReadInternalConsole(parent.SupervisorContext(), consoleID, kernel.InternalConsoleStdout, len(output))
+	if err != nil || eof || wouldBlock || string(data) != output {
+		t.Fatalf("reading readiness output: data=%q eof=%t wouldBlock=%t err=%v", data, eof, wouldBlock, err)
+	}
+	fdTable.DecRef(parent.SupervisorContext())
+	fdTableReleased = true
 }
 
 func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {

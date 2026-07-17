@@ -5341,6 +5341,11 @@ func (b *runtimeBackend) writeConsole(target selector, consoleID string, data []
 	return result, nil
 }
 
+func (b *runtimeBackend) waitConsoleWritable(target selector, consoleID string) error {
+	_, err := b.command("timetravel", "--console", consoleID, "--wait-stdin", "--wait-timeout=1s", target.container, "console-wait", target.branch)
+	return err
+}
+
 func (b *runtimeBackend) writeConsoleAll(target selector, consoleID string, data []byte) error {
 	for written := 0; written < len(data); {
 		result, err := b.writeConsole(target, consoleID, data[written:])
@@ -5349,7 +5354,9 @@ func (b *runtimeBackend) writeConsoleAll(target selector, consoleID string, data
 		}
 		written += result.N
 		if result.WouldBlock || result.N == 0 {
-			time.Sleep(2 * time.Millisecond)
+			if err := b.waitConsoleWritable(target, consoleID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

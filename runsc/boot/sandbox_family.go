@@ -140,6 +140,22 @@ type ConsoleReadResult struct {
 	WouldBlock bool
 }
 
+// ConsoleWaitArgs waits for branch-local console I/O readiness. A zero timeout
+// performs a nonblocking readiness check.
+type ConsoleWaitArgs struct {
+	BranchID  string
+	ConsoleID string
+	Want      kernel.InternalConsoleReadiness
+	Timeout   time.Duration
+}
+
+// ConsoleWaitResult reports which requested operations are ready. TimedOut is
+// true when no operation became ready before the requested timeout.
+type ConsoleWaitResult struct {
+	Ready    kernel.InternalConsoleReadiness
+	TimedOut bool
+}
+
 // ConsoleWriteArgs writes to a branch-local internal console's stdin.
 type ConsoleWriteArgs struct {
 	BranchID  string
@@ -215,6 +231,11 @@ type execSession struct {
 	tg   *kernel.ThreadGroup
 }
 
+type consoleWaitLease struct {
+	cancel chan struct{}
+	done   chan struct{}
+}
+
 type sandboxBranch struct {
 	opMu sync.Mutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
@@ -231,6 +252,7 @@ type sandboxBranch struct {
 	metrics   SandboxForkMetrics
 
 	execSessions map[string]*execSession
+	consoleWaits map[*consoleWaitLease]struct{}
 }
 
 // SandboxFamily owns all in-memory branches in one sentry process.
@@ -611,6 +633,10 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	sourceWasPaused := source.k.IsPaused()
 	f.mu.Unlock()
 
+	// Waiter queues are part of pipe and PTY state. Remove host-side console
+	// waiters before cloning so no control callback is inherited by the child.
+	f.cancelConsoleWaits(source)
+
 	if !sourceWasPaused {
 		pauseStarted := time.Now()
 		source.k.Pause()
@@ -831,6 +857,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 	paused := b.k.IsPaused()
 	dog := b.watchdog
 	f.mu.Unlock()
+	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 
 	if dog != nil {
@@ -1178,6 +1205,29 @@ func (f *SandboxFamily) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResul
 	return nil
 }
 
+// ConsoleWait blocks on Sentry endpoint readiness without retaining the branch
+// operation mutex, so pause, resume, and live fork remain independent. The
+// control lease keeps the selected Kernel alive until the bounded wait returns.
+func (f *SandboxFamily) ConsoleWait(args *ConsoleWaitArgs, out *ConsoleWaitResult) error {
+	if args == nil || out == nil {
+		return fmt.Errorf("missing internal console wait arguments or result")
+	}
+	if args.Timeout < 0 || args.Timeout > 30*time.Second {
+		return fmt.Errorf("internal console wait timeout %s is outside 0..30s", args.Timeout)
+	}
+	b, lease, done, err := f.beginConsoleWait(args.BranchID)
+	if err != nil {
+		return err
+	}
+	defer done()
+	ready, timedOut, err := b.k.WaitInternalConsole(b.k.SupervisorContext(), args.ConsoleID, args.Want, args.Timeout, lease.cancel)
+	if err != nil {
+		return err
+	}
+	*out = ConsoleWaitResult{Ready: ready, TimedOut: timedOut}
+	return nil
+}
+
 // ConsoleWrite performs one nonblocking write while serializing against fork,
 // pause, resume, and destroy of the selected branch.
 func (f *SandboxFamily) ConsoleWrite(args *ConsoleWriteArgs, out *ConsoleWriteResult) error {
@@ -1274,6 +1324,60 @@ func (f *SandboxFamily) ConsoleRemove(args *ConsoleRemoveArgs) error {
 	}
 	f.mu.Unlock()
 	return b.k.RemoveInternalConsole(b.k.SupervisorContext(), args.ConsoleID)
+}
+
+// beginConsoleWait registers a cancellable Kernel-lifetime lease while holding
+// opMu. Live fork and teardown can therefore cancel and join every endpoint
+// waiter without racing a new registration.
+func (f *SandboxFamily) beginConsoleWait(id string) (*sandboxBranch, *consoleWaitLease, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, nil, fmt.Errorf("branch %q is %s", id, state)
+	}
+	lease := &consoleWaitLease{cancel: make(chan struct{}), done: make(chan struct{})}
+	if b.consoleWaits == nil {
+		b.consoleWaits = make(map[*consoleWaitLease]struct{})
+	}
+	b.consoleWaits[lease] = struct{}{}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	b.opMu.Unlock()
+	finish := func() {
+		f.mu.Lock()
+		delete(b.consoleWaits, lease)
+		f.mu.Unlock()
+		close(lease.done)
+		b.controlOps.Done()
+	}
+	return b, lease, finish, nil
+}
+
+// cancelConsoleWaits cancels and joins active endpoint waiter registrations.
+// The caller must hold b.opMu, preventing new registrations until it returns.
+func (f *SandboxFamily) cancelConsoleWaits(b *sandboxBranch) {
+	f.mu.Lock()
+	leases := make([]*consoleWaitLease, 0, len(b.consoleWaits))
+	for lease := range b.consoleWaits {
+		leases = append(leases, lease)
+		close(lease.cancel)
+	}
+	f.mu.Unlock()
+	for _, lease := range leases {
+		<-lease.done
+	}
 }
 
 // beginControl acquires a Kernel-lifetime lease for a branch-local operation.

@@ -422,7 +422,12 @@ func (ex *Exec) pumpInternalConsoleInput(c *container.Container, branchID, conso
 			}
 			written += result.N
 			if result.WouldBlock || result.N == 0 {
-				time.Sleep(2 * time.Millisecond)
+				if _, err := c.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
+					BranchID: branchID, ConsoleID: consoleID,
+					Want: kernel.InternalConsoleReadiness{Stdin: true}, Timeout: time.Second,
+				}); err != nil {
+					return
+				}
 			}
 		}
 		if readErr != nil {
@@ -467,12 +472,24 @@ func (ex *Exec) pumpInternalConsoleOutput(c *container.Container, branchID, cons
 				progress = true
 			}
 			stream.eof = result.EOF
+			if result.EOF {
+				progress = true
+			}
 		}
 		if allEOF {
 			return nil
 		}
 		if !progress {
-			time.Sleep(2 * time.Millisecond)
+			if _, err := c.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
+				BranchID: branchID, ConsoleID: consoleID,
+				Want: kernel.InternalConsoleReadiness{
+					Stdout: !streams[0].eof,
+					Stderr: !streams[1].eof,
+				},
+				Timeout: time.Second,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 }

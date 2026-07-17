@@ -2153,6 +2153,15 @@ func (s *Sandbox) ReadConsole(args *boot.ConsoleReadArgs) (boot.ConsoleReadResul
 	return result, nil
 }
 
+// WaitConsole waits for branch-local internal-console I/O readiness.
+func (s *Sandbox) WaitConsole(args *boot.ConsoleWaitArgs) (boot.ConsoleWaitResult, error) {
+	var result boot.ConsoleWaitResult
+	if err := s.call(boot.ContMgrConsoleWait, args, &result); err != nil {
+		return boot.ConsoleWaitResult{}, fmt.Errorf("waiting for internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return result, nil
+}
+
 // WriteConsole performs one nonblocking branch-local internal-console write.
 func (s *Sandbox) WriteConsole(args *boot.ConsoleWriteArgs) (boot.ConsoleWriteResult, error) {
 	var result boot.ConsoleWriteResult

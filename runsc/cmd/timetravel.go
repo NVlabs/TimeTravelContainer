@@ -53,6 +53,10 @@ type TimeTravel struct {
 	consoleStream         string
 	consoleMaxBytes       int
 	consoleData           string
+	consoleWaitStdout     bool
+	consoleWaitStderr     bool
+	consoleWaitStdin      bool
+	consoleWaitTimeout    time.Duration
 	consoleRows           int
 	consoleCols           int
 	consoleXPixels        int
@@ -82,7 +86,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -97,6 +101,10 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consoleStream, "stream", "stdout", "console output stream: stdout or stderr")
 	f.IntVar(&t.consoleMaxBytes, "max-bytes", 65536, "maximum bytes returned by console-read")
 	f.StringVar(&t.consoleData, "data-base64", "", "base64-encoded bytes written by console-write")
+	f.BoolVar(&t.consoleWaitStdout, "wait-stdout", false, "wait for console stdout readability")
+	f.BoolVar(&t.consoleWaitStderr, "wait-stderr", false, "wait for console stderr readability")
+	f.BoolVar(&t.consoleWaitStdin, "wait-stdin", false, "wait for console stdin writability")
+	f.DurationVar(&t.consoleWaitTimeout, "wait-timeout", time.Second, "maximum console readiness wait")
 	f.IntVar(&t.consoleRows, "rows", 0, "terminal window rows for console-resize")
 	f.IntVar(&t.consoleCols, "cols", 0, "terminal window columns for console-resize")
 	f.IntVar(&t.consoleXPixels, "x-pixels", 0, "terminal window width in pixels for console-resize")
@@ -254,6 +262,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			ConsoleID: t.consoleID,
 			Stream:    stream,
 			MaxBytes:  t.consoleMaxBytes,
+		})
+	case "console-wait":
+		output, err = cont.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
+			Want: kernel.InternalConsoleReadiness{
+				Stdout: t.consoleWaitStdout,
+				Stderr: t.consoleWaitStderr,
+				Stdin:  t.consoleWaitStdin,
+			},
+			Timeout: t.consoleWaitTimeout,
 		})
 	case "console-write":
 		data, decodeErr := base64.StdEncoding.DecodeString(t.consoleData)
@@ -517,7 +536,18 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 			return finish(nil)
 		}
 		if !progress {
-			time.Sleep(2 * time.Millisecond)
+			_, err := s.WaitConsole(&boot.ConsoleWaitArgs{
+				BranchID:  branchID,
+				ConsoleID: consoleID,
+				Want: kernel.InternalConsoleReadiness{
+					Stdout: !streams[0].eof,
+					Stderr: !streams[1].eof,
+				},
+				Timeout: time.Second,
+			})
+			if err != nil {
+				return finish(err)
+			}
 		}
 	}
 }

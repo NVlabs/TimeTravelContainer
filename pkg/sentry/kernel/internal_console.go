@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -39,6 +40,14 @@ const (
 	// InternalConsoleStderr is the console's standard error stream.
 	InternalConsoleStderr InternalConsoleStream = 2
 )
+
+// InternalConsoleReadiness identifies control-side console operations that can
+// make progress without blocking.
+type InternalConsoleReadiness struct {
+	Stdout bool
+	Stderr bool
+	Stdin  bool
+}
 
 // InternalConsole owns either the control-side peers of three Sentry-internal
 // pipes or the master of a Sentry-internal PTY. The process-side endpoints live
@@ -242,6 +251,144 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 		eof = ready&waiter.EventHUp != 0 && ready&waiter.ReadableEvents == 0
 	}
 	return buf[:n], eof, false, nil
+}
+
+// WaitInternalConsole waits until at least one requested control-side operation
+// can make progress. It retains endpoint references while sleeping, so branch
+// lifecycle operations remain independent of the wait. timedOut is true when no
+// requested operation became ready before timeout.
+func (k *Kernel) WaitInternalConsole(ctx context.Context, id string, want InternalConsoleReadiness, timeout time.Duration, cancel <-chan struct{}) (ready InternalConsoleReadiness, timedOut bool, err error) {
+	if !want.Stdout && !want.Stderr && !want.Stdin {
+		return ready, false, fmt.Errorf("internal console wait requests no operations")
+	}
+	if timeout < 0 {
+		return ready, false, fmt.Errorf("internal console wait timeout %s is negative", timeout)
+	}
+
+	type waitTarget struct {
+		file       *vfs.FileDescription
+		mask       waiter.EventMask
+		stdoutMask waiter.EventMask
+		stderrMask waiter.EventMask
+		stdinMask  waiter.EventMask
+	}
+	var targets []waitTarget
+	addTarget := func(file *vfs.FileDescription, stdoutMask, stderrMask, stdinMask waiter.EventMask) {
+		mask := stdoutMask | stderrMask | stdinMask
+		for i := range targets {
+			if targets[i].file == file {
+				targets[i].mask |= mask
+				targets[i].stdoutMask |= stdoutMask
+				targets[i].stderrMask |= stderrMask
+				targets[i].stdinMask |= stdinMask
+				return
+			}
+		}
+		targets = append(targets, waitTarget{file: file, mask: mask, stdoutMask: stdoutMask, stderrMask: stderrMask, stdinMask: stdinMask})
+	}
+
+	// Pin every selected endpoint before releasing the console registry lock.
+	// RemoveInternalConsole may then proceed without invalidating this wait.
+	k.internalConsolesMu.Lock()
+	console := k.internalConsoles[id]
+	if console == nil {
+		k.internalConsolesMu.Unlock()
+		return ready, false, fmt.Errorf("internal console %q does not exist", id)
+	}
+	console.mu.Lock()
+	k.internalConsolesMu.Unlock()
+	if want.Stdout {
+		if console.terminal {
+			addTarget(console.master, waiter.ReadableEvents|waiter.EventHUp|waiter.EventErr, 0, 0)
+		} else {
+			addTarget(console.stdout, waiter.ReadableEvents|waiter.EventHUp|waiter.EventErr, 0, 0)
+		}
+	}
+	if want.Stderr {
+		if console.terminal {
+			// A terminal has one combined output stream; stderr reads report EOF.
+			ready.Stderr = true
+		} else {
+			addTarget(console.stderr, 0, waiter.ReadableEvents|waiter.EventHUp|waiter.EventErr, 0)
+		}
+	}
+	if want.Stdin {
+		if console.stdinClosed || (!console.terminal && console.stdin == nil) {
+			// Let the caller retry and observe the definitive closed-input error.
+			ready.Stdin = true
+		} else if console.terminal {
+			addTarget(console.master, 0, 0, waiter.WritableEvents|waiter.EventHUp|waiter.EventErr)
+		} else {
+			addTarget(console.stdin, 0, 0, waiter.WritableEvents|waiter.EventHUp|waiter.EventErr)
+		}
+	}
+	for i := range targets {
+		targets[i].file.IncRef()
+	}
+	console.mu.Unlock()
+	defer func() {
+		for i := range targets {
+			targets[i].file.DecRef(ctx)
+		}
+	}()
+
+	updateReadiness := func() bool {
+		for i := range targets {
+			target := &targets[i]
+			events := target.file.Readiness(target.mask)
+			ready.Stdout = ready.Stdout || events&target.stdoutMask != 0
+			ready.Stderr = ready.Stderr || events&target.stderrMask != 0
+			ready.Stdin = ready.Stdin || events&target.stdinMask != 0
+		}
+		return ready.Stdout || ready.Stderr || ready.Stdin
+	}
+
+	notify := make(chan struct{}, 1)
+	entries := make([]waiter.Entry, len(targets))
+	registered := 0
+	defer func() {
+		for i := 0; i < registered; i++ {
+			targets[i].file.EventUnregister(&entries[i])
+		}
+	}()
+	for i := range targets {
+		entries[i] = waiter.NewFunctionEntry(targets[i].mask, func(waiter.EventMask) {
+			select {
+			case notify <- struct{}{}:
+			default:
+			}
+		})
+		if err := targets[i].file.EventRegister(&entries[i]); err != nil {
+			return ready, false, fmt.Errorf("registering internal console readiness: %w", err)
+		}
+		registered++
+	}
+
+	// Check after registration to close the usual readiness-registration race.
+	if updateReadiness() {
+		return ready, false, nil
+	}
+	if timeout == 0 {
+		return ready, true, nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-notify:
+			if updateReadiness() {
+				return ready, false, nil
+			}
+		case <-cancel:
+			// Lifecycle cancellation is a spurious wakeup to callers; they retry the
+			// nonblocking operation after fork or teardown releases opMu.
+			return ready, false, nil
+		case <-ctx.Done():
+			return ready, false, ctx.Err()
+		case <-timer.C:
+			return ready, true, nil
+		}
+	}
 }
 
 // WriteInternalConsole writes data to the process's standard input without
