@@ -1206,6 +1206,21 @@ func parseLogSize(value string) (int64, error) {
 	return result, nil
 }
 
+func parseNanoCPUs(value string) (int64, error) {
+	cpus, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(cpus) || math.IsInf(cpus, 0) || cpus < 0 {
+		return 0, fmt.Errorf("invalid CPU limit %q", value)
+	}
+	if cpus > float64(math.MaxInt64)/1_000_000_000 {
+		return 0, fmt.Errorf("CPU limit %q is too large", value)
+	}
+	nano := int64(math.Round(cpus * 1_000_000_000))
+	if nano > 0 && nano < 10_000_000 {
+		return 0, fmt.Errorf("CPU limit %q is below Docker minimum 0.01", value)
+	}
+	return nano, nil
+}
+
 type runRequest struct {
 	name               string
 	reference          string
@@ -1235,6 +1250,11 @@ type runRequest struct {
 	stopSignal         string
 	stopTimeout        int
 	pidsLimit          *int64
+	memoryLimit        *int64
+	nanoCPUs           *int64
+	cpuShares          *uint64
+	cpuPeriod          *uint64
+	cpuQuota           *int64
 	ulimits            []ttosbundle.Ulimit
 	shmSize            int64
 	groupAdd           []string
@@ -1289,7 +1309,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1306,6 +1326,12 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
 	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
+	memoryValue := fs.String("memory", "0", "memory limit")
+	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	cpusValue := fs.String("cpus", "0", "number of CPUs")
+	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
+	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
+	cpuQuota := fs.Int64("cpu-quota", 0, "limit CPU CFS quota; -1 means unlimited")
 	shmSizeValue := fs.String("shm-size", "64m", "size of /dev/shm")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
@@ -1352,6 +1378,18 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *pidsLimit < -1 {
 		return errors.New("pids limit must be -1 or greater")
 	}
+	if *cpuShares != 0 && (*cpuShares < 2 || *cpuShares > 262144) {
+		return errors.New("CPU shares must be between 2 and 262144")
+	}
+	if *cpuPeriod != 0 && (*cpuPeriod < 1000 || *cpuPeriod > 1000000) {
+		return errors.New("CPU period must be between 1000 and 1000000 microseconds")
+	}
+	if *cpuQuota != 0 && *cpuQuota != -1 && *cpuQuota < 1000 {
+		return errors.New("CPU quota must be -1 or at least 1000 microseconds")
+	}
+	if flagWasSet(fs, "cpus") && (flagWasSet(fs, "cpu-period") || flagWasSet(fs, "cpu-quota")) {
+		return errors.New("--cpus cannot be combined with --cpu-period or --cpu-quota")
+	}
 	if flagWasSet(fs, "stop-signal") {
 		if _, err := parseSignal(*stopSignal); err != nil {
 			return err
@@ -1392,6 +1430,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedMemoryLimit, err := ttosbundle.ParseMemoryLimit(*memoryValue)
+	if err != nil {
+		return err
+	}
+	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
+	if err != nil {
+		return err
+	}
 	parsedCapAdd, err := ttosbundle.NormalizeCapabilities(capAddValues)
 	if err != nil {
 		return err
@@ -1425,6 +1471,23 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		value := *pidsLimit
 		effectivePidsLimit = &value
 	}
+	var effectiveMemoryLimit, effectiveNanoCPUs, effectiveCPUQuota *int64
+	var effectiveCPUShares, effectiveCPUPeriod *uint64
+	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
+		effectiveMemoryLimit = &parsedMemoryLimit
+	}
+	if flagWasSet(fs, "cpus") {
+		effectiveNanoCPUs = &parsedNanoCPUs
+	}
+	if flagWasSet(fs, "cpu-shares") {
+		effectiveCPUShares = cpuShares
+	}
+	if flagWasSet(fs, "cpu-period") {
+		effectiveCPUPeriod = cpuPeriod
+	}
+	if flagWasSet(fs, "cpu-quota") {
+		effectiveCPUQuota = cpuQuota
+	}
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
@@ -1450,6 +1513,11 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
+		memoryLimit:        effectiveMemoryLimit,
+		nanoCPUs:           effectiveNanoCPUs,
+		cpuShares:          effectiveCPUShares,
+		cpuPeriod:          effectiveCPUPeriod,
+		cpuQuota:           effectiveCPUQuota,
 		ulimits:            parsedUlimits,
 		shmSize:            parsedShmSize,
 		groupAdd:           append([]string(nil), groupAddValues...),
@@ -1484,7 +1552,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1499,6 +1567,12 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
 	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
+	memoryValue := fs.String("memory", "0", "memory limit")
+	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	cpusValue := fs.String("cpus", "0", "number of CPUs")
+	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
+	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
+	cpuQuota := fs.Int64("cpu-quota", 0, "limit CPU CFS quota; -1 means unlimited")
 	shmSizeValue := fs.String("shm-size", "64m", "size of /dev/shm")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
@@ -1545,6 +1619,18 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *pidsLimit < -1 {
 		return errors.New("pids limit must be -1 or greater")
 	}
+	if *cpuShares != 0 && (*cpuShares < 2 || *cpuShares > 262144) {
+		return errors.New("CPU shares must be between 2 and 262144")
+	}
+	if *cpuPeriod != 0 && (*cpuPeriod < 1000 || *cpuPeriod > 1000000) {
+		return errors.New("CPU period must be between 1000 and 1000000 microseconds")
+	}
+	if *cpuQuota != 0 && *cpuQuota != -1 && *cpuQuota < 1000 {
+		return errors.New("CPU quota must be -1 or at least 1000 microseconds")
+	}
+	if flagWasSet(fs, "cpus") && (flagWasSet(fs, "cpu-period") || flagWasSet(fs, "cpu-quota")) {
+		return errors.New("--cpus cannot be combined with --cpu-period or --cpu-quota")
+	}
 	if flagWasSet(fs, "stop-signal") {
 		if _, err := parseSignal(*stopSignal); err != nil {
 			return err
@@ -1585,6 +1671,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedMemoryLimit, err := ttosbundle.ParseMemoryLimit(*memoryValue)
+	if err != nil {
+		return err
+	}
+	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
+	if err != nil {
+		return err
+	}
 	parsedCapAdd, err := ttosbundle.NormalizeCapabilities(capAddValues)
 	if err != nil {
 		return err
@@ -1618,6 +1712,23 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		value := *pidsLimit
 		effectivePidsLimit = &value
 	}
+	var effectiveMemoryLimit, effectiveNanoCPUs, effectiveCPUQuota *int64
+	var effectiveCPUShares, effectiveCPUPeriod *uint64
+	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
+		effectiveMemoryLimit = &parsedMemoryLimit
+	}
+	if flagWasSet(fs, "cpus") {
+		effectiveNanoCPUs = &parsedNanoCPUs
+	}
+	if flagWasSet(fs, "cpu-shares") {
+		effectiveCPUShares = cpuShares
+	}
+	if flagWasSet(fs, "cpu-period") {
+		effectiveCPUPeriod = cpuPeriod
+	}
+	if flagWasSet(fs, "cpu-quota") {
+		effectiveCPUQuota = cpuQuota
+	}
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
@@ -1643,6 +1754,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
+		memoryLimit:        effectiveMemoryLimit,
+		nanoCPUs:           effectiveNanoCPUs,
+		cpuShares:          effectiveCPUShares,
+		cpuPeriod:          effectiveCPUPeriod,
+		cpuQuota:           effectiveCPUQuota,
 		ulimits:            parsedUlimits,
 		shmSize:            parsedShmSize,
 		groupAdd:           append([]string(nil), groupAddValues...),
@@ -2223,6 +2339,11 @@ type InspectHostConfig struct {
 	ReadonlyRootfs bool                `json:"ReadonlyRootfs"`
 	StopTimeout    *int                `json:"StopTimeout"`
 	PidsLimit      *int64              `json:"PidsLimit"`
+	Memory         int64               `json:"Memory"`
+	NanoCPUs       int64               `json:"NanoCpus"`
+	CPUShares      uint64              `json:"CpuShares"`
+	CPUPeriod      uint64              `json:"CpuPeriod"`
+	CPUQuota       int64               `json:"CpuQuota"`
 	ShmSize        int64               `json:"ShmSize"`
 	GroupAdd       []string            `json:"GroupAdd"`
 	CapAdd         []string            `json:"CapAdd"`
@@ -2408,6 +2529,11 @@ func inspectHostConfigTemplateValues(config InspectHostConfig) map[string]any {
 		"ReadonlyRootfs": config.ReadonlyRootfs,
 		"StopTimeout":    config.StopTimeout,
 		"PidsLimit":      config.PidsLimit,
+		"Memory":         config.Memory,
+		"NanoCpus":       config.NanoCPUs,
+		"CpuShares":      config.CPUShares,
+		"CpuPeriod":      config.CPUPeriod,
+		"CpuQuota":       config.CPUQuota,
 		"ShmSize":        config.ShmSize,
 		"GroupAdd":       config.GroupAdd,
 		"CapAdd":         config.CapAdd,
@@ -4100,6 +4226,11 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
+			MemoryLimit:      request.memoryLimit,
+			NanoCPUs:         request.nanoCPUs,
+			CPUShares:        request.cpuShares,
+			CPUPeriod:        request.cpuPeriod,
+			CPUQuota:         request.cpuQuota,
 			ShmSize:          &request.shmSize,
 			GroupAdd:         request.groupAdd,
 			CapAdd:           request.capAdd,
@@ -4160,6 +4291,11 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
+			MemoryLimit:      request.memoryLimit,
+			NanoCPUs:         request.nanoCPUs,
+			CPUShares:        request.cpuShares,
+			CPUPeriod:        request.cpuPeriod,
+			CPUQuota:         request.cpuQuota,
 			ShmSize:          &request.shmSize,
 			GroupAdd:         request.groupAdd,
 			CapAdd:           request.capAdd,
@@ -5646,6 +5782,23 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		value := ttosbundle.DefaultStopTimeoutSeconds
 		stopTimeout = &value
 	}
+	memory, nanoCPUs, cpuQuota := int64(0), int64(0), int64(0)
+	cpuShares, cpuPeriod := uint64(0), uint64(0)
+	if container.MemoryLimit != nil {
+		memory = *container.MemoryLimit
+	}
+	if container.NanoCPUs != nil {
+		nanoCPUs = *container.NanoCPUs
+	}
+	if container.CPUShares != nil {
+		cpuShares = *container.CPUShares
+	}
+	if container.CPUPeriod != nil {
+		cpuPeriod = *container.CPUPeriod
+	}
+	if container.CPUQuota != nil {
+		cpuQuota = *container.CPUQuota
+	}
 	shmSize := ttosbundle.DefaultShmSizeBytes
 	if container.ShmSize != nil {
 		shmSize = *container.ShmSize
@@ -5685,7 +5838,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
@@ -5857,10 +6010,139 @@ func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args
 	return 0, nil
 }
 
+func verifyCgroupV2Resources(pid int, procCgroup []byte, mountRoot, expectedPath string, resources *specs.LinuxResources) error {
+	var actualPath string
+	for _, line := range strings.Split(string(procCgroup), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" {
+			actualPath = parts[2]
+			break
+		}
+	}
+	if actualPath == "" {
+		return errors.New("host does not expose a unified cgroup v2 membership")
+	}
+	actualClean := filepath.Clean("/" + strings.TrimPrefix(actualPath, "/"))
+	expectedClean := filepath.Clean("/" + strings.TrimPrefix(expectedPath, "/"))
+	if actualClean != expectedClean && !strings.HasSuffix(actualClean, expectedClean) {
+		return fmt.Errorf("sandbox is in cgroup %q, want suffix %q", actualClean, expectedClean)
+	}
+	dir := filepath.Join(mountRoot, strings.TrimPrefix(actualClean, "/"))
+	read := func(name string) (string, error) {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return "", fmt.Errorf("reading %s: %w", name, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	procs, err := read("cgroup.procs")
+	if err != nil {
+		return err
+	}
+	wantPID := strconv.Itoa(pid)
+	foundPID := false
+	for _, candidate := range strings.Fields(procs) {
+		if candidate == wantPID {
+			foundPID = true
+			break
+		}
+	}
+	if !foundPID {
+		return fmt.Errorf("sandbox PID %d is not a member of cgroup %q", pid, actualClean)
+	}
+	if resources.Memory != nil && resources.Memory.Limit != nil && *resources.Memory.Limit > 0 {
+		got, err := read("memory.max")
+		if err != nil {
+			return err
+		}
+		want := strconv.FormatInt(*resources.Memory.Limit, 10)
+		if got != want {
+			return fmt.Errorf("memory.max=%q, want %q", got, want)
+		}
+	}
+	if resources.CPU != nil {
+		cpu := resources.CPU
+		if cpu.Quota != nil || cpu.Period != nil {
+			period := uint64(100000)
+			if cpu.Period != nil && *cpu.Period != 0 {
+				period = *cpu.Period
+			}
+			quota := "max"
+			if cpu.Quota != nil && *cpu.Quota > 0 {
+				quota = strconv.FormatInt(*cpu.Quota, 10)
+			}
+			want := quota + " " + strconv.FormatUint(period, 10)
+			got, err := read("cpu.max")
+			if err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf("cpu.max=%q, want %q", got, want)
+			}
+		}
+		if cpu.Shares != nil && *cpu.Shares > 0 {
+			want := 1 + ((*cpu.Shares-2)*9999)/262142
+			got, err := read("cpu.weight")
+			if err != nil {
+				return err
+			}
+			if got != strconv.FormatUint(want, 10) {
+				return fmt.Errorf("cpu.weight=%q, want %d", got, want)
+			}
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error {
+	data, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		return fmt.Errorf("reading OCI config for resource verification: %w", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return fmt.Errorf("decoding OCI config for resource verification: %w", err)
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.CgroupsPath == "" {
+		return nil
+	}
+	resources := spec.Linux.Resources
+	hasLimit := resources.Memory != nil && resources.Memory.Limit != nil && *resources.Memory.Limit > 0 || resources.CPU != nil
+	if !hasLimit {
+		return nil
+	}
+	stateJSON, err := b.command("state", name)
+	if err != nil {
+		return fmt.Errorf("loading sandbox state for resource verification: %w", err)
+	}
+	var state specs.State
+	if err := json.Unmarshal(stateJSON, &state); err != nil {
+		return fmt.Errorf("decoding sandbox state for resource verification: %w", err)
+	}
+	if state.Pid <= 0 {
+		return fmt.Errorf("sandbox state has invalid PID %d", state.Pid)
+	}
+	procCgroup, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", state.Pid))
+	if err != nil {
+		return fmt.Errorf("reading sandbox cgroup membership: %w", err)
+	}
+	if err := verifyCgroupV2Resources(state.Pid, procCgroup, "/sys/fs/cgroup", spec.Linux.CgroupsPath, resources); err != nil {
+		return fmt.Errorf("hard host resource enforcement unavailable: %w", err)
+	}
+	return nil
+}
+
 func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, interactive, terminal bool) (int, error) {
 	status, err := b.runConfiguredCommandForNetwork(networkMode, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
+	}
+	if err := b.verifyHostResourceLimits(name, bundleDir); err != nil {
+		_, cleanupErr := b.command("delete", "--force", name)
+		if cleanupErr != nil {
+			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+		}
+		return 1, err
 	}
 	target := selector{container: name, branch: defaultBranchID}
 	startDrain := func(phase string) error {

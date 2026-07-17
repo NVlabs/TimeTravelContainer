@@ -34,6 +34,9 @@ import (
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	pidsLimit := int64(23)
+	memoryLimit := int64(256 * 1024 * 1024)
+	nanoCPUs := int64(1_500_000_000)
+	cpuShares := uint64(512)
 	shmSize := int64(32 * 1024 * 1024)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
@@ -71,6 +74,10 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		ConsoleSize:    &specs.Box{Height: 37, Width: 91},
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
+		MemoryLimit:    &memoryLimit,
+		NanoCPUs:       &nanoCPUs,
+		CPUShares:      &cpuShares,
+		CgroupsPath:    "ttos/demo-id",
 		ShmSize:        &shmSize,
 		GroupAdd:       []string{"manual", "901", "manual"},
 		CapAdd:         []string{"sys_admin"},
@@ -158,6 +165,15 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil || spec.Linux.Resources.Pids.Limit != pidsLimit {
 		t.Errorf("pids resources=%+v, want limit %d", spec.Linux.Resources, pidsLimit)
+	}
+	if spec.Linux.CgroupsPath != "ttos/demo-id" {
+		t.Errorf("cgroups path=%q, want ttos/demo-id", spec.Linux.CgroupsPath)
+	}
+	if spec.Linux.Resources.Memory == nil || spec.Linux.Resources.Memory.Limit == nil || *spec.Linux.Resources.Memory.Limit != memoryLimit {
+		t.Errorf("memory resources=%+v, want limit %d", spec.Linux.Resources.Memory, memoryLimit)
+	}
+	if cpu := spec.Linux.Resources.CPU; cpu == nil || cpu.Quota == nil || *cpu.Quota != 150000 || cpu.Period == nil || *cpu.Period != 100000 || cpu.Shares == nil || *cpu.Shares != cpuShares {
+		t.Errorf("CPU resources=%+v", cpu)
 	}
 	wantRlimits := []specs.POSIXRlimit{
 		{Type: "RLIMIT_CORE", Soft: 0, Hard: ^uint64(0)},
@@ -487,6 +503,10 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	invalidPidsLimit := int64(-2)
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), PidsLimit: &invalidPidsLimit}); err == nil {
 		t.Error("BuildSpec accepted an invalid pids limit")
+	}
+	invalidMemoryLimit := int64(-1)
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), MemoryLimit: &invalidMemoryLimit}); err == nil {
+		t.Error("BuildSpec accepted an invalid memory limit")
 	}
 	unlimitedPids := int64(-1)
 	unlimitedSpec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), PidsLimit: &unlimitedPids})

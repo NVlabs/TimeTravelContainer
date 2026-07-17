@@ -109,6 +109,11 @@ type ContainerInfo struct {
 	StopSignal         string            `json:"stop_signal,omitempty"`
 	StopTimeout        *int              `json:"stop_timeout,omitempty"`
 	PidsLimit          *int64            `json:"pids_limit,omitempty"`
+	MemoryLimit        *int64            `json:"memory_limit,omitempty"`
+	NanoCPUs           *int64            `json:"nano_cpus,omitempty"`
+	CPUShares          *uint64           `json:"cpu_shares,omitempty"`
+	CPUPeriod          *uint64           `json:"cpu_period,omitempty"`
+	CPUQuota           *int64            `json:"cpu_quota,omitempty"`
 	ShmSize            *int64            `json:"shm_size,omitempty"`
 	GroupAdd           []string          `json:"group_add,omitempty"`
 	CapAdd             []string          `json:"cap_add,omitempty"`
@@ -134,6 +139,14 @@ func cloneIntPointer(value *int) *int {
 }
 
 func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneUint64Pointer(value *uint64) *uint64 {
 	if value == nil {
 		return nil
 	}
@@ -386,8 +399,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if opts.StopTimeout != nil && *opts.StopTimeout < -1 {
 		return Prepared{}, fmt.Errorf("stop timeout must be -1 or greater")
 	}
-	if opts.PidsLimit != nil && *opts.PidsLimit < -1 {
-		return Prepared{}, fmt.Errorf("pids limit must be -1 or greater")
+	if err := validateResourceLimits(opts.SpecOptions); err != nil {
+		return Prepared{}, err
 	}
 	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
 	if err != nil {
@@ -450,6 +463,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	opts.HostMounts = append(opts.HostMounts, internalMounts...)
 	opts.SpecOptions.RootFS = rootfs
+	if hasHardResourceLimits(opts.SpecOptions) {
+		opts.SpecOptions.CgroupsPath = filepath.Join("ttos", id)
+	}
 	spec, err := BuildSpec(imageInfo.Image, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
@@ -496,6 +512,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopSignal:         spec.Annotations[StopSignalAnnotation],
 		StopTimeout:        cloneIntPointer(opts.StopTimeout),
 		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
+		MemoryLimit:        cloneInt64Pointer(opts.MemoryLimit),
+		NanoCPUs:           cloneInt64Pointer(opts.NanoCPUs),
+		CPUShares:          cloneUint64Pointer(opts.CPUShares),
+		CPUPeriod:          cloneUint64Pointer(opts.CPUPeriod),
+		CPUQuota:           cloneInt64Pointer(opts.CPUQuota),
 		ShmSize:            cloneInt64Pointer(&shmSize),
 		GroupAdd:           append([]string(nil), opts.GroupAdd...),
 		CapAdd:             append([]string(nil), opts.CapAdd...),
@@ -727,8 +748,8 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if *info.ShmSize < 0 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid shared memory size %d", key, *info.ShmSize)
 	}
-	if info.PidsLimit != nil && *info.PidsLimit < -1 {
-		return ContainerInfo{}, fmt.Errorf("container %q has invalid pids limit %d", key, *info.PidsLimit)
+	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid resource limits: %w", key, err)
 	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)

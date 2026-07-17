@@ -539,7 +539,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -551,6 +551,15 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 23 {
 		t.Errorf("pids limit=%v, want 23", b.runRequest.pidsLimit)
+	}
+	if b.runRequest.memoryLimit == nil || *b.runRequest.memoryLimit != 128*1024*1024 {
+		t.Errorf("memory limit=%v, want 128 MiB", b.runRequest.memoryLimit)
+	}
+	if b.runRequest.nanoCPUs == nil || *b.runRequest.nanoCPUs != 1_500_000_000 {
+		t.Errorf("NanoCPUs=%v, want 1500000000", b.runRequest.nanoCPUs)
+	}
+	if b.runRequest.cpuShares == nil || *b.runRequest.cpuShares != 512 {
+		t.Errorf("CPU shares=%v, want 512", b.runRequest.cpuShares)
 	}
 	if got, want := b.runRequest.shmSize, int64(32*1024*1024); got != want {
 		t.Errorf("shared memory size=%d, want %d", got, want)
@@ -664,6 +673,9 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 				"-l", "direct-only=value",
 				"--name", "demo",
 				"--pids-limit", "17",
+				"--memory", "64m",
+				"--cpu-period", "200000",
+				"--cpu-quota", "-1",
 				"--ulimit", "stack=8388608",
 				"--group-add", "4242",
 				"--cap-add", "chown",
@@ -703,6 +715,12 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 			}
 			if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 17 {
 				t.Errorf("pids limit=%v, want 17", b.runRequest.pidsLimit)
+			}
+			if b.runRequest.memoryLimit == nil || *b.runRequest.memoryLimit != 64*1024*1024 {
+				t.Errorf("memory limit=%v, want 64 MiB", b.runRequest.memoryLimit)
+			}
+			if b.runRequest.cpuPeriod == nil || *b.runRequest.cpuPeriod != 200000 || b.runRequest.cpuQuota == nil || *b.runRequest.cpuQuota != -1 {
+				t.Errorf("CPU period/quota=(%v, %v), want (200000, -1)", b.runRequest.cpuPeriod, b.runRequest.cpuQuota)
 			}
 			if got, want := b.runRequest.groupAdd, []string{"4242"}; !reflect.DeepEqual(got, want) {
 				t.Errorf("group add=%q, want %q", got, want)
@@ -832,6 +850,11 @@ func TestRunAndCreateRejectInvalidStopPolicy(t *testing.T) {
 		{"run", "--stop-signal", "SIGINVALID", "busybox"},
 		{"create", "--stop-timeout", "-2", "busybox"},
 		{"run", "--pids-limit", "-2", "busybox"},
+		{"run", "--memory", "-1", "busybox"},
+		{"create", "--memory", "1m", "busybox"},
+		{"create", "--cpus", "0.001", "busybox"},
+		{"run", "--cpu-shares", "1", "busybox"},
+		{"run", "--cpus", "1", "--cpu-quota", "50000", "busybox"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
@@ -1672,6 +1695,11 @@ func TestBuildInspectInfo(t *testing.T) {
 	exit := 23
 	stopTimeout := 4
 	pidsLimit := int64(23)
+	memoryLimit := int64(256 * 1024 * 1024)
+	nanoCPUs := int64(1_500_000_000)
+	cpuShares := uint64(512)
+	cpuPeriod := uint64(100000)
+	cpuQuota := int64(150000)
 	shmSize := int64(32 * 1024 * 1024)
 	groupAdd := []string{"wheel", "4242"}
 	capAdd := []string{"SYS_ADMIN"}
@@ -1683,7 +1711,7 @@ func TestBuildInspectInfo(t *testing.T) {
 	dnsOptions := []string{"ndots:2", "rotate"}
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", LogDriver: "json-file", ConsoleLogMaxBytes: 65536, ConsoleLogMaxFiles: 3, AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, ExtraHosts: extraHosts, DNS: dns, DNSSearch: dnsSearch, DNSOptions: dnsOptions, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", LogDriver: "json-file", ConsoleLogMaxBytes: 65536, ConsoleLogMaxFiles: 3, AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, MemoryLimit: &memoryLimit, NanoCPUs: &nanoCPUs, CPUShares: &cpuShares, CPUPeriod: &cpuPeriod, CPUQuota: &cpuQuota, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, ExtraHosts: extraHosts, DNS: dns, DNSSearch: dnsSearch, DNSOptions: dnsOptions, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1749,6 +1777,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if info.HostConfig.PidsLimit == nil || *info.HostConfig.PidsLimit != pidsLimit {
 		t.Errorf("inspect pids limit=%v, want %d", info.HostConfig.PidsLimit, pidsLimit)
+	}
+	if info.HostConfig.Memory != memoryLimit || info.HostConfig.NanoCPUs != nanoCPUs || info.HostConfig.CPUShares != cpuShares || info.HostConfig.CPUPeriod != cpuPeriod || info.HostConfig.CPUQuota != cpuQuota {
+		t.Errorf("inspect resources=%+v", info.HostConfig)
 	}
 	if !reflect.DeepEqual(info.HostConfig.GroupAdd, groupAdd) || !reflect.DeepEqual(info.HostConfig.CapAdd, capAdd) || !reflect.DeepEqual(info.HostConfig.CapDrop, capDrop) {
 		t.Errorf("inspect groups/capabilities=(%q, %q, %q)", info.HostConfig.GroupAdd, info.HostConfig.CapAdd, info.HostConfig.CapDrop)
@@ -2137,6 +2168,53 @@ func TestReadConsoleWaitStatus(t *testing.T) {
 	}
 	if _, _, err := readConsoleWaitStatus(path); err == nil {
 		t.Fatal("invalid status was accepted")
+	}
+}
+
+func TestVerifyCgroupV2Resources(t *testing.T) {
+	const pid = 4242
+	root := t.TempDir()
+	dir := filepath.Join(root, "user.slice", "ttos", "demo")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, value string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	memory := int64(256 * 1024 * 1024)
+	quota := int64(150000)
+	period := uint64(100000)
+	shares := uint64(512)
+	resources := &specs.LinuxResources{
+		Memory: &specs.LinuxMemory{Limit: &memory},
+		CPU:    &specs.LinuxCPU{Quota: &quota, Period: &period, Shares: &shares},
+	}
+	write("cgroup.procs", "7\n4242\n")
+	write("memory.max", "268435456\n")
+	write("cpu.max", "150000 100000\n")
+	write("cpu.weight", "20\n")
+	membership := []byte("0::/user.slice/ttos/demo\n")
+	if err := verifyCgroupV2Resources(pid, membership, root, "ttos/demo", resources); err != nil {
+		t.Fatalf("verifyCgroupV2Resources: %v", err)
+	}
+
+	write("memory.max", "max\n")
+	if err := verifyCgroupV2Resources(pid, membership, root, "ttos/demo", resources); err == nil || !strings.Contains(err.Error(), "memory.max") {
+		t.Fatalf("wrong memory.max error=%v", err)
+	}
+	write("memory.max", "268435456\n")
+	if err := verifyCgroupV2Resources(pid, []byte("1:cpu:/legacy\n"), root, "ttos/demo", resources); err == nil || !strings.Contains(err.Error(), "unified cgroup v2") {
+		t.Fatalf("missing cgroup v2 error=%v", err)
+	}
+	if err := verifyCgroupV2Resources(pid, membership, root, "ttos/other", resources); err == nil || !strings.Contains(err.Error(), "want suffix") {
+		t.Fatalf("wrong cgroup path error=%v", err)
+	}
+	write("cgroup.procs", "7\n")
+	if err := verifyCgroupV2Resources(pid, membership, root, "ttos/demo", resources); err == nil || !strings.Contains(err.Error(), "is not a member") {
+		t.Fatalf("missing PID error=%v", err)
 	}
 }
 

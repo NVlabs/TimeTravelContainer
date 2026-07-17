@@ -232,12 +232,15 @@ the `main` branch and leave `ttos` responsible for branch operations.
       Docker resource names, infinity, duplicate last-value-wins behavior, OCI
       projection, and persistent inspect metadata. Sentry enforcement applies to
       the init process and exec sessions, and live forks inherit the limits.
-- [ ] Add CPU, memory, and other resource-limit flags. Internal Sentry
-      `memory.max` and total-memory reporting are not hard enforcement. The initial
-      implementation must therefore install OCI limits in delegated host cgroup v2,
-      then verify the sandbox process actual `memory.max` and `cpu.max` after
-      `create` but before `start`; fail and clean up when delegation is unavailable.
-      A future equivalent may use hard Sentry accounting.
+- [x] Support Docker `run/create --memory|-m`, `--cpus`, `--cpu-shares`,
+      `--cpu-period`, and `--cpu-quota`, including Docker-compatible validation,
+      OCI and inspect persistence, and hard host enforcement in a collision-safe
+      cgroup v2 child. After `runsc create` and before `start`, TTOS proves the
+      sandbox PID membership and verifies the actual `memory.max`, `cpu.max`, and
+      `cpu.weight`; unavailable delegation or any mismatch fails closed and deletes
+      the runtime container. Since all live branches currently inhabit one Sentry
+      host process, CPU and memory limits account the whole sandbox family. Future
+      Sentry hard accounting is required for independent per-branch limits.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
 - [x] Support `run/create -t` with a detachable Sentry-internal PTY, Docker-style
       combined `-it`/`-dit`, raw interactive attach, resize propagation, and

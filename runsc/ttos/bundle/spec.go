@@ -56,6 +56,8 @@ const (
 	DefaultStopTimeoutSeconds = 10
 	// DefaultShmSizeBytes matches Docker's default /dev/shm size.
 	DefaultShmSizeBytes int64 = 64 * 1024 * 1024
+	// MinimumMemoryLimitBytes matches Docker's Linux minimum hard memory limit.
+	MinimumMemoryLimitBytes int64 = 6 * 1024 * 1024
 )
 
 var defaultCapabilities = []string{
@@ -91,6 +93,12 @@ type SpecOptions struct {
 	ReadonlyRootfs   bool
 	StopSignal       string
 	PidsLimit        *int64
+	MemoryLimit      *int64
+	NanoCPUs         *int64
+	CPUShares        *uint64
+	CPUPeriod        *uint64
+	CPUQuota         *int64
+	CgroupsPath      string
 	ShmSize          *int64
 	GroupAdd         []string
 	CapAdd           []string
@@ -343,6 +351,64 @@ func ParseShmSize(value string) (int64, error) {
 	return bytes, nil
 }
 
+// ParseMemoryLimit parses Docker's --memory byte syntax.
+func ParseMemoryLimit(value string) (int64, error) {
+	bytes, err := units.RAMInBytes(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory limit %q: %w", value, err)
+	}
+	if bytes < 0 {
+		return 0, fmt.Errorf("memory limit cannot be negative: %d", bytes)
+	}
+	if bytes != 0 && bytes < MinimumMemoryLimitBytes {
+		return 0, fmt.Errorf("minimum memory limit allowed is 6 MiB")
+	}
+	return bytes, nil
+}
+
+func hasHardResourceLimits(opts SpecOptions) bool {
+	return opts.MemoryLimit != nil && *opts.MemoryLimit > 0 ||
+		opts.NanoCPUs != nil && *opts.NanoCPUs > 0 ||
+		opts.CPUShares != nil && *opts.CPUShares > 0 ||
+		opts.CPUPeriod != nil && *opts.CPUPeriod > 0 ||
+		opts.CPUQuota != nil && *opts.CPUQuota != 0
+}
+
+func validateResourceLimits(opts SpecOptions) error {
+	if opts.PidsLimit != nil && *opts.PidsLimit < -1 {
+		return fmt.Errorf("pids limit must be -1 or greater")
+	}
+	if opts.MemoryLimit != nil {
+		if *opts.MemoryLimit < 0 {
+			return fmt.Errorf("memory limit must be zero or greater")
+		}
+		if *opts.MemoryLimit != 0 && *opts.MemoryLimit < MinimumMemoryLimitBytes {
+			return fmt.Errorf("minimum memory limit allowed is 6 MiB")
+		}
+	}
+	if opts.NanoCPUs != nil {
+		if *opts.NanoCPUs < 0 {
+			return fmt.Errorf("NanoCPUs must be zero or greater")
+		}
+		if *opts.NanoCPUs != 0 && *opts.NanoCPUs < 10_000_000 {
+			return fmt.Errorf("CPU limit is below Docker minimum 0.01")
+		}
+		if opts.CPUPeriod != nil || opts.CPUQuota != nil {
+			return fmt.Errorf("NanoCPUs cannot be combined with CPU period or quota")
+		}
+	}
+	if opts.CPUShares != nil && *opts.CPUShares != 0 && (*opts.CPUShares < 2 || *opts.CPUShares > 262144) {
+		return fmt.Errorf("CPU shares must be between 2 and 262144")
+	}
+	if opts.CPUPeriod != nil && *opts.CPUPeriod != 0 && (*opts.CPUPeriod < 1000 || *opts.CPUPeriod > 1000000) {
+		return fmt.Errorf("CPU period must be between 1000 and 1000000 microseconds")
+	}
+	if opts.CPUQuota != nil && *opts.CPUQuota != 0 && *opts.CPUQuota != -1 && *opts.CPUQuota < 1000 {
+		return fmt.Errorf("CPU quota must be -1 or at least 1000 microseconds")
+	}
+	return nil
+}
+
 func effectiveShmSize(value *int64) (int64, error) {
 	if value == nil {
 		return DefaultShmSizeBytes, nil
@@ -378,8 +444,8 @@ func buildRlimits(configured []Ulimit) ([]specs.POSIXRlimit, error) {
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
 func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
-	if opts.PidsLimit != nil && *opts.PidsLimit < -1 {
-		return nil, fmt.Errorf("pids limit must be -1 or greater")
+	if err := validateResourceLimits(opts); err != nil {
+		return nil, err
 	}
 	rootfs, err := filepath.Abs(opts.RootFS)
 	if err != nil {
@@ -486,6 +552,42 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if opts.PidsLimit != nil && *opts.PidsLimit > 0 {
 		resources = &specs.LinuxResources{Pids: &specs.LinuxPids{Limit: *opts.PidsLimit}}
 		annotations[PidsLimitAnnotation] = "sentry"
+	}
+	if opts.MemoryLimit != nil && *opts.MemoryLimit > 0 {
+		if resources == nil {
+			resources = &specs.LinuxResources{}
+		}
+		resources.Memory = &specs.LinuxMemory{Limit: cloneInt64Pointer(opts.MemoryLimit)}
+	}
+	cpu := &specs.LinuxCPU{}
+	hasCPU := false
+	if opts.CPUShares != nil && *opts.CPUShares > 0 {
+		value := *opts.CPUShares
+		cpu.Shares = &value
+		hasCPU = true
+	}
+	if opts.NanoCPUs != nil && *opts.NanoCPUs > 0 {
+		period := uint64(100000)
+		quota := (*opts.NanoCPUs/1_000_000_000)*int64(period) + (*opts.NanoCPUs%1_000_000_000)*int64(period)/1_000_000_000
+		cpu.Period = &period
+		cpu.Quota = &quota
+		hasCPU = true
+	}
+	if opts.CPUPeriod != nil && *opts.CPUPeriod > 0 {
+		value := *opts.CPUPeriod
+		cpu.Period = &value
+		hasCPU = true
+	}
+	if opts.CPUQuota != nil && *opts.CPUQuota != 0 {
+		value := *opts.CPUQuota
+		cpu.Quota = &value
+		hasCPU = true
+	}
+	if hasCPU {
+		if resources == nil {
+			resources = &specs.LinuxResources{}
+		}
+		resources.CPU = cpu
 	}
 	ownerManifest := ownership.ManifestPath(rootfs)
 	var rootOwners *ownership.Manifest
@@ -713,7 +815,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		},
 		Hostname:    hostname,
 		Mounts:      mounts,
-		Linux:       &specs.Linux{Namespaces: namespaces, Resources: resources},
+		Linux:       &specs.Linux{Namespaces: namespaces, Resources: resources, CgroupsPath: opts.CgroupsPath},
 		Annotations: annotations,
 	}, nil
 }
