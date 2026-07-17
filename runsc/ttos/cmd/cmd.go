@@ -73,10 +73,15 @@ type options struct {
 	namespace             string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	daemonSocket          string
+	direct                bool
 }
 
 // Run executes ttos with args and returns a process exit status.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 0 && args[0] == "_daemon-serve" {
+		return RunDaemon(args[1:], stdout, stderr)
+	}
 	opts, args, done, err := parseGlobalOptions(args, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttos: %v\n", err)
@@ -92,26 +97,28 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if opts.unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttos: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
 	}
-	return runCommand(args, stdout, stderr, &runtimeBackend{
-		root:                  opts.root,
-		runsc:                 opts.runsc,
-		containerd:            opts.containerd,
-		namespace:             opts.namespace,
-		dataRoot:              opts.dataRoot,
-		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
-		stdin:                 stdin,
-		stdout:                stdout,
-		stderr:                stderr,
-	})
+	if args[0] == "daemon" {
+		return runDaemonControl(opts, args[1:], stdout, stderr)
+	}
+	if opts.direct {
+		return runCommand(args, stdout, stderr, directBackend(opts, stdin, stdout, stderr))
+	}
+	status, err := runViaDaemon(opts, args, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttos: daemon transport: %v\n", err)
+		return 1
+	}
+	return status
 }
 
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
 	opts := options{
-		root:       runtimeRoot(),
-		runsc:      runscPath(),
-		containerd: containerdAddress(),
-		namespace:  defaultImageNamespace,
-		dataRoot:   dataRoot(),
+		root:         runtimeRoot(),
+		runsc:        runscPath(),
+		containerd:   containerdAddress(),
+		namespace:    defaultImageNamespace,
+		dataRoot:     dataRoot(),
+		daemonSocket: defaultDaemonSocket(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -182,6 +189,21 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 				return opts, nil, false, errors.New("--data-root requires a path")
 			}
 			args = args[1:]
+		case arg == "--daemon-socket":
+			if len(args) < 2 || args[1] == "" {
+				return opts, nil, false, errors.New("--daemon-socket requires a path")
+			}
+			opts.daemonSocket = args[1]
+			args = args[2:]
+		case strings.HasPrefix(arg, "--daemon-socket="):
+			opts.daemonSocket = strings.TrimPrefix(arg, "--daemon-socket=")
+			if opts.daemonSocket == "" {
+				return opts, nil, false, errors.New("--daemon-socket requires a path")
+			}
+			args = args[1:]
+		case arg == "--direct":
+			opts.direct = true
+			args = args[1:]
 		case arg == "--unsafe-no-host-isolation":
 			opts.unsafeNoHostIsolation = true
 			args = args[1:]
@@ -248,6 +270,8 @@ Global options:
   --containerd PATH              containerd socket
   --namespace NAME               containerd namespace (default: ttos)
   --data-root PATH               image, bundle, and metadata directory
+  --daemon-socket PATH           per-user ttosd Unix socket
+  --direct                       bypass ttosd for recovery/debugging
   --unsafe-no-host-isolation     run without host namespaces/chroots (unsafe)
 
 Commands:
@@ -279,6 +303,7 @@ Commands:
   branch rm TARGET...             Destroy one or more non-main branches
   volume COMMAND                   Manage family-local tmpfs volumes
   completion SHELL                 Generate Bash, Zsh, or Fish completion
+  daemon start|status|stop          Manage the rootless per-user service
 
 Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
 run immediately unless --paused is set; omitting DEST generates a branch ID.

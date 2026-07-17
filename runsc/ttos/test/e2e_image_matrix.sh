@@ -456,6 +456,21 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   sleep 1
 done
 
+echo "== daemon restart reconciliation =="
+ttos daemon status | grep -q '"version":1' || fail "ttosd did not report API version 1"
+ttos daemon stop
+if ttos daemon status >/dev/null 2>&1; then
+  fail "ttosd remained reachable after stop"
+fi
+[ "$(ttos inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
+  fail "autostarted ttosd did not reconcile the running container"
+ttos daemon status | grep -q '"version":1' || fail "ttosd did not autostart after restart"
+deadline=$(( $(date +%s) + 15 ))
+while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
+  sleep 1
+done
+
 ttos container restart --force --time 2 "$LIFECYCLE"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do

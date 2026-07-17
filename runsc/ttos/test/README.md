@@ -4,6 +4,9 @@
 unmodified public Docker images through the complete TTOS path. It currently
 covers:
 
+- default rootless `ttosd` autostart over a versioned per-user Unix API,
+  full command streaming through the daemon, status/stop controls, and live
+  sandbox plus console-drainer reconciliation after a daemon restart;
 - Docker-compatible run/create pull policies: explicit refresh with
   `--pull=always`, cached startup with `--pull=never`, missing-image rejection,
   and default local reuse after the initial matrix pull;
@@ -113,7 +116,7 @@ for untrusted containers.
 Build and invoke the matrix with:
 
 ```shell
-bazel build //runsc:runsc //runsc/ttos:ttos \
+bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \
   //runsc/ttos/test:e2e_image_matrix
 
 TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
@@ -138,5 +141,6 @@ references and the containerd namespace can be overridden with
 removed on success or failure; pulled content remains managed by the selected containerd namespace.
 
 A passing result is stronger than the unit suite: it proves image pulling,
-layer extraction, OCI generation, rootless runsc startup, nontrivial userspace,
-console sidecars, and TimeTravel branch operations on the executing host.
+layer extraction, OCI generation, rootless runsc startup, versioned daemon
+transport and restart recovery, nontrivial userspace, console sidecars, and
+TimeTravel branch operations on the executing host.

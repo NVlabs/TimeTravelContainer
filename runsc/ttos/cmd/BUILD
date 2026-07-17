@@ -7,8 +7,8 @@ package(
 
 go_library(
     name = "cmd",
-    srcs = ["cmd.go", "completion.go"],
-    visibility = ["//runsc/ttos:__subpackages__"],
+    srcs = ["cmd.go", "completion.go", "daemon.go"],
+    visibility = ["//runsc/ttos:__subpackages__", "//runsc/ttosd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
         "//runsc/flag",
@@ -25,7 +25,7 @@ go_library(
 go_test(
     name = "cmd_test",
     size = "small",
-    srcs = ["cmd_test.go"],
+    srcs = ["cmd_test.go", "daemon_test.go"],
     library = ":cmd",
     deps = [
         "//runsc/ttos/console",

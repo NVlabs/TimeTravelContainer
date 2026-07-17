@@ -56,9 +56,11 @@ alias, not a promise of host JSON files). Docker-style `labels`, `labels-regex`,
 `env`, and `env-regex` selectors resolve immutable attributes from the final
 container configuration and `logs --details` prefixes them in sorted order;
 `none` disables `ttos logs` while the
-private attach transport remains available. `ttosd`, daemon-owned stdin
-ownership, persistent managed-volume backing, and managed OverlayFS volumes
-remain TODO.
+private attach transport remains available. A rootless per-user `ttosd` now
+autostarts on a versioned Unix-socket API, proxies command streams, and
+reconciles persisted families plus missing console drainers after restart;
+`--direct` remains an explicit recovery path. Persistent managed-volume
+backing, lifecycle events, and transactional mutations remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -447,8 +449,10 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [ ] Test client crash during stdin, sidecar crash/restart, daemon restart, and
-      control-socket failure.
+- [x] Test daemon stop/autostart while a container remains live, including
+      persisted-state and console-drainer reconciliation.
+- [ ] Test client crash during stdin, sidecar crash/restart, and control-socket
+      failure.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 
@@ -606,23 +610,25 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Initial per-branch console sidecars and logs survive the CLI process that
       launched them; advisory locks prevent duplicate pipe consumers and log
       readers diagnose premature sidecar exit.
-- [ ] Implement a local Unix-domain control service so console sessions,
-      background pulls, event streams, and state survive individual CLI
-      processes.
-- [ ] Provide a rootless per-user socket and state directory by default.
-- [ ] Persist family configuration, image references, managed-volume metadata,
-      lineage, and tombstones; do not persist live memory as part of ordinary
-      operation.
-- [ ] Reconcile persisted metadata with containerd, runsc sandboxes, and shim
-      processes after daemon restart.
+- [x] Implement a local Unix-domain control service with streamed stdin,
+      stdout, and stderr so commands and state ownership survive individual CLI
+      processes. Background pulls run in daemon request workers; event streams
+      remain pending.
+- [x] Provide an autostarted rootless per-user socket and private runtime
+      directory by default, with peer-UID checks and a `0600` socket.
+- [x] Persist family configuration, image references, managed-volume metadata,
+      lineage, and tombstones; live memory remains exclusively in the Sentry.
+- [x] Reconcile persisted metadata with containerd inventory and live runsc
+      sandboxes after daemon restart, and restart missing branch/exec console
+      drainers. The current direct-runsc backend has no shim process.
 - [ ] Provide events for branch creation, pause, resume, exit, destroy, exec,
       attach, and eligibility changes.
 - [ ] Serialize conflicting lifecycle operations and make commands idempotent.
-- [ ] Add a versioned local API so the CLI and daemon may be upgraded
-      independently.
-- [x] Use direct runsc invocation for the first lightweight client; later extend
-      `containerd-shim-runsc-v1`, keeping the API boundary compatible with moving
-      branch control into the shim later.
+- [x] Add a versioned framed local API with explicit version rejection so the
+      CLI and daemon may be upgraded independently.
+- [x] Keep direct runsc invocation behind the daemon API and an explicit
+      `--direct` recovery path; later extend `containerd-shim-runsc-v1` while
+      preserving the branch-control API boundary.
 
 ## Docker and containerd compatibility
 
