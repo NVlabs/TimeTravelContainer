@@ -308,7 +308,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Add durable `ttos events [--json] [-f|--follow]` with Docker-style
       `--since`/`--until`, type/action/subject filters, a versioned JSONL
       schema, daemon-restart persistence, and nonprinting disconnect heartbeats.
-- [ ] Add Docker `ps --size` writable/virtual size accounting.
+- [x] Add Docker `ps --size` writable/virtual size accounting. Running and
+      paused writable branches read logical allocated bytes directly from the
+      branch-local Sentry OverlayFS tmpfs upper without walking or serializing
+      it; read-only roots and created branches report zero writable bytes, and
+      exited branches report unavailable writable state because their in-memory
+      upper has been released.
 - [x] Add Docker-style process-selection formatting for `top`, including the
       common all/full selectors and explicit `-o` column lists backed only by
       authoritative Sentry process fields.

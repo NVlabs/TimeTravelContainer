@@ -512,6 +512,21 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 	return fsstat, nil
 }
 
+// UpperLayerAllocatedBytes returns logical allocated bytes in the writable
+// upper filesystem. TTOS root overlays use a Sentry-owned tmpfs upper.
+func (fs *filesystem) UpperLayerAllocatedBytes() (uint64, error) {
+	if !fs.opts.UpperRoot.Ok() {
+		return 0, fmt.Errorf("overlay filesystem has no writable upper layer")
+	}
+	usage, ok := fs.opts.UpperRoot.Mount().Filesystem().Impl().(interface {
+		AllocatedBytes() uint64
+	})
+	if !ok {
+		return 0, fmt.Errorf("overlay upper filesystem does not expose allocated-byte accounting")
+	}
+	return usage.AllocatedBytes(), nil
+}
+
 func (fs *filesystem) newDirIno(orig layerDevNoAndIno) uint64 {
 	fs.dirInoCacheMu.Lock()
 	defer fs.dirInoCacheMu.Unlock()

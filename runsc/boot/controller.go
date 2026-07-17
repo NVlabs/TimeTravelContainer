@@ -115,6 +115,9 @@ const (
 	// ContMgrBranchProcesses lists processes in one in-memory branch.
 	ContMgrBranchProcesses = "containerManager.BranchProcesses"
 
+	// ContMgrBranchRootfsSize gets writable rootfs usage in one branch.
+	ContMgrBranchRootfsSize = "containerManager.BranchRootfsSize"
+
 	// ContMgrBranchSignal sends a signal within one in-memory branch.
 	ContMgrBranchSignal = "containerManager.BranchSignal"
 
@@ -1008,6 +1011,11 @@ func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 // BranchProcesses returns processes from one branch.
 func (cm *containerManager) BranchProcesses(args *BranchProcessesArgs, out *[]*control.Process) error {
 	return cm.l.family.Processes(args.BranchID, args.CID, out)
+}
+
+// BranchRootfsSize returns writable rootfs usage from one branch.
+func (cm *containerManager) BranchRootfsSize(args *BranchRootfsSizeArgs, out *control.RootfsSize) error {
+	return cm.l.family.RootfsSize(args.BranchID, args.CID, out)
 }
 
 // BranchSignal sends a signal within one branch.

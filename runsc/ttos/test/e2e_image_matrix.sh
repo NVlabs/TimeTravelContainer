@@ -663,6 +663,13 @@ PS_CHILD=$(ttos ps --filter branch=child --filter status=running --filter ancest
 ttos ps --filter branch=child --format json |
   grep -q '"created_at":"' ||
   fail "ps JSON omitted the child creation timestamp"
+PS_SIZE=$(ttos ps --filter branch=child --size --format '{{.SizeRW}}|{{.SizeRootFS}}')
+PS_SIZE_RW=${PS_SIZE%%|*}
+PS_SIZE_ROOT=${PS_SIZE#*|}
+case "$PS_SIZE_RW:$PS_SIZE_ROOT" in
+  *[!0-9:]*|:*) fail "ps --size returned nonnumeric accounting: $PS_SIZE" ;;
+esac
+[ "$PS_SIZE_ROOT" -gt "$PS_SIZE_RW" ] || fail "ps --size virtual size did not include the image: $PS_SIZE"
 
 ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 ttos exec "$LIFECYCLE@child" sh -c "echo child >/cow-host/value; echo child-created >/cow-host/child-only"

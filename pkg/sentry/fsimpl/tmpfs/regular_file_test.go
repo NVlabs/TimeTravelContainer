@@ -22,6 +22,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -45,6 +46,9 @@ func TestSimpleWriteRead(t *testing.T) {
 	}
 	if n != int64(len(data)) {
 		t.Errorf("fd.Write got short write length %d, want %d", n, len(data))
+	}
+	if got, want := fd.Impl().(*regularFileFD).inode().fs.AllocatedBytes(), uint64(hostarch.PageSize); got != want {
+		t.Errorf("AllocatedBytes after write: got %d, want %d", got, want)
 	}
 	if got, want := fd.Impl().(*regularFileFD).off, int64(len(data)); got != want {
 		t.Errorf("fd.Write left offset at %d, want %d", got, want)

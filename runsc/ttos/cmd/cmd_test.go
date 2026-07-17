@@ -115,6 +115,48 @@ func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
 	}
 }
 
+func TestPsSizeUsesBranchAccounting(t *testing.T) {
+	b := &fakeBackend{
+		families: []Family{
+			{Name: "web", ImageSize: 1000000, Branches: []Branch{
+				{ID: "main", State: "running"},
+				{ID: "child", State: "paused"},
+				{ID: "old", State: "exited"},
+			}},
+			{Name: "prepared", ImageSize: 2000000, Branches: []Branch{{ID: "main", State: "created"}}},
+		},
+		rootfsSizes: map[selector]uint64{
+			{container: "web", branch: "main"}:  4096,
+			{container: "web", branch: "child"}: 8192,
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"ps", "--all", "--size", "--format", "{{.Names}}|{{.Size}}|{{.SizeRW}}|{{.SizeRootFS}}"}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps --size status=%d, stderr=%q", status, stderr.String())
+	}
+	want := "web@main|4.1kB (virtual 1MB)|4096|1004096\n" +
+		"web@child|8.19kB (virtual 1.01MB)|8192|1008192\n" +
+		"web@old|- (virtual 1MB)|0|1000000\n" +
+		"prepared@main|0B (virtual 2MB)|0|2000000\n"
+	if got := stdout.String(); got != want {
+		t.Errorf("ps --size=%q, want %q", got, want)
+	}
+	wantCalls := []selector{{container: "web", branch: "main"}, {container: "web", branch: "child"}}
+	if !reflect.DeepEqual(b.sizeCalls, wantCalls) {
+		t.Errorf("size calls=%+v, want %+v", b.sizeCalls, wantCalls)
+	}
+
+	b.sizeCalls = nil
+	stdout.Reset()
+	if status := runCommand([]string{"ps", "--size", "--quiet"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps --size --quiet status=%d, stderr=%q", status, stderr.String())
+	}
+	if len(b.sizeCalls) != 0 {
+		t.Errorf("quiet ps performed invisible size calls: %+v", b.sizeCalls)
+	}
+}
+
 func TestPsDockerFiltersLatestAndFormatting(t *testing.T) {
 	base := time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC)
 	digest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -2353,6 +2395,10 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "c
 	echo '[{"uid":1000,"pid":7,"ppid":1,"pgid":7,"threads":[7,8],"c":3,"tty":"?","stime":"12:34","time":"9ms","cmd":"worker"}]'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "size" ] && [ "$6" = "child" ]; then
+	echo '{"writable_bytes":32768}'
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "check" ] && [ "$6" = "child" ]; then
 	echo '{"eligible":true}'
 	exit 0
@@ -2382,7 +2428,7 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
 	}
@@ -2410,8 +2456,17 @@ exit 2
 	if err != nil {
 		t.Fatalf("listFamilies: %v", err)
 	}
-	if len(families) != 1 || families[0].ID != "web" || len(families[0].Branches) != 1 || families[0].Branches[0].ID != "main" {
+	if len(families) != 1 || families[0].ID != "web" || families[0].ImageSize != 2217006 || len(families[0].Branches) != 1 || families[0].Branches[0].ID != "main" {
 		t.Fatalf("listFamilies returned %+v", families)
+	}
+	if got, err := b.rootfsSize(selector{container: "web", branch: "child"}); err != nil || got != 32768 {
+		t.Fatalf("rootfsSize(child)=(%d, %v), want (32768, nil)", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"root":{"readonly":true}}`), 0600); err != nil {
+		t.Fatalf("writing read-only config: %v", err)
+	}
+	if got, err := b.rootfsSize(selector{container: "web", branch: "main"}); err != nil || got != 0 {
+		t.Fatalf("rootfsSize(read-only main)=(%d, %v), want (0, nil)", got, err)
 	}
 	inspected, err := b.inspect("web")
 	if err != nil {
@@ -2802,6 +2857,9 @@ type fakeBackend struct {
 	families          []Family
 	processTarget     selector
 	processList       []ProcessInfo
+	rootfsSizes       map[selector]uint64
+	sizeCalls         []selector
+	sizeErr           error
 	checkTarget       selector
 	checkResult       ForkEligibility
 	err               error
@@ -2958,6 +3016,14 @@ func (b *fakeBackend) listFamilies() ([]Family, error) {
 func (b *fakeBackend) processes(target selector) ([]ProcessInfo, error) {
 	b.processTarget = target
 	return b.processList, b.err
+}
+
+func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {
+	b.sizeCalls = append(b.sizeCalls, target)
+	if b.sizeErr != nil {
+		return 0, b.sizeErr
+	}
+	return b.rootfsSizes[target], nil
 }
 
 func (b *fakeBackend) checkFork(target selector) (ForkEligibility, error) {

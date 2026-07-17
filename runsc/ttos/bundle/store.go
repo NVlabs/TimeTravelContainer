@@ -92,6 +92,7 @@ type ContainerInfo struct {
 	Name               string            `json:"name"`
 	Reference          string            `json:"reference"`
 	Digest             string            `json:"digest"`
+	ImageSize          int64             `json:"image_size,omitempty"`
 	LeaseID            string            `json:"lease_id,omitempty"`
 	Platform           string            `json:"platform"`
 	BundleDir          string            `json:"bundle_dir"`
@@ -507,6 +508,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Name:               opts.Name,
 		Reference:          imageInfo.Reference,
 		Digest:             pulled.Digest,
+		ImageSize:          pulled.Size,
 		LeaseID:            leaseID,
 		Platform:           imageInfo.Platform,
 		BundleDir:          bundleDir,

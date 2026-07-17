@@ -97,6 +97,12 @@ type BranchProcessesArgs struct {
 	CID      string
 }
 
+// BranchRootfsSizeArgs selects a container rootfs inside one live branch.
+type BranchRootfsSizeArgs struct {
+	BranchID string
+	CID      string
+}
+
 // BranchWaitArgs selects a process inside one live branch. PID 0 selects the
 // container init process.
 type BranchWaitArgs struct {
@@ -896,6 +902,16 @@ func (f *SandboxFamily) Processes(id, cid string, out *[]*control.Process) error
 	}
 	defer done()
 	return control.Processes(b.k, cid, out)
+}
+
+// RootfsSize returns branch-local logical writable-layer usage.
+func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) error {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return control.RootfsUpperLayerSize(b.k, cid, out)
 }
 
 // Signal sends a signal within one branch. Foreground process-group delivery

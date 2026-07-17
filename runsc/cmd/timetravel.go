@@ -84,7 +84,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> check <branch-id>\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
-		"timetravel [flags] <container-id> ps|signal|wait <branch-id>\n" +
+		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
@@ -204,6 +204,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.DestroyBranch(f.Arg(2))
 	case "ps":
 		output, err = cont.Sandbox.BranchProcesses(f.Arg(2), cont.ID)
+	case "size":
+		output, err = cont.Sandbox.BranchRootfsSize(f.Arg(2), cont.ID)
 	case "signal":
 		mode := boot.DeliverToProcess
 		if t.all {

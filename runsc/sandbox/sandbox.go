@@ -2092,6 +2092,16 @@ func (s *Sandbox) BranchProcesses(branchID, cid string) ([]*control.Process, err
 	return processes, nil
 }
 
+// BranchRootfsSize gets logical writable rootfs usage in one branch.
+func (s *Sandbox) BranchRootfsSize(branchID, cid string) (control.RootfsSize, error) {
+	args := &boot.BranchRootfsSizeArgs{BranchID: branchID, CID: cid}
+	var size control.RootfsSize
+	if err := s.call(boot.ContMgrBranchRootfsSize, args, &size); err != nil {
+		return control.RootfsSize{}, fmt.Errorf("getting rootfs size in live branch %q: %w", branchID, err)
+	}
+	return size, nil
+}
+
 // SignalBranch sends a signal within one in-memory branch.
 func (s *Sandbox) SignalBranch(args *boot.BranchSignalArgs) error {
 	if err := s.call(boot.ContMgrBranchSignal, args, nil); err != nil {

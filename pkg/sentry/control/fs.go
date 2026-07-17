@@ -34,6 +34,37 @@ type Fs struct {
 	Kernel *kernel.Kernel
 }
 
+// RootfsSize is logical writable-layer usage for a container root filesystem.
+type RootfsSize struct {
+	WritableBytes uint64 `json:"writable_bytes"`
+}
+
+// RootfsUpperLayerSize returns allocated bytes in the container writable
+// overlay upper without walking, serializing, or faulting in file contents.
+func RootfsUpperLayerSize(k *kernel.Kernel, containerID string, out *RootfsSize) error {
+	f := Fs{Kernel: k}
+	ctx := k.SupervisorContext()
+	mntns, err := f.mountNamespaceForContainer(containerID)
+	if err != nil {
+		return err
+	}
+	defer mntns.DecRef(ctx)
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	usage, ok := root.Mount().Filesystem().Impl().(interface {
+		UpperLayerAllocatedBytes() (uint64, error)
+	})
+	if !ok {
+		return fmt.Errorf("rootfs is not a writable overlay filesystem")
+	}
+	bytes, err := usage.UpperLayerAllocatedBytes()
+	if err != nil {
+		return err
+	}
+	out.WritableBytes = bytes
+	return nil
+}
+
 // TarRootfsUpperLayerOpts contains options for the TarRootfsUpperLayer RPC.
 type TarRootfsUpperLayerOpts struct {
 	// ContainerID identifies which container's rootfs upper layer should be

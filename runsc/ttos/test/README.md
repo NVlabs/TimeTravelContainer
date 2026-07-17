@@ -84,8 +84,8 @@ covers:
   over versioned timestamped records, including filtering and legacy-record decoding;
 - `exec`, selective stdin/stdout/stderr `attach`, `fork --check`, live `fork`,
   `pause`, `resume`, `ps`, `top`, and the lineage tree, including
-  branch/status/ancestor `ps` filters, templates, latest selection, and JSON
-  creation timestamps;
+  branch/status/ancestor `ps` filters, templates, latest selection, JSON
+  creation timestamps, and branch-local writable/virtual `ps --size` accounting;
 - attached exec fork rejection while imported host stdio is live, immediate
   eligibility recovery after exit, and detached exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;

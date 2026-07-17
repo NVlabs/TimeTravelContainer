@@ -2896,11 +2896,13 @@ func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
 	latest := fs.Bool("latest", false, "show only the most recently created branch")
 	fs.BoolVar(latest, "l", false, "show only the most recently created branch")
 	noTrunc := fs.Bool("no-trunc", false, "do not truncate image IDs")
+	sizeOutput := fs.Bool("size", false, "display total file sizes")
+	fs.BoolVar(sizeOutput, "s", false, "display total file sizes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return errors.New("usage: ttos ps [--all] [--quiet] [--filter KEY=VALUE] [--format TEMPLATE] [--latest|--last N]")
+		return errors.New("usage: ttos ps [--all] [--quiet] [--size] [--filter KEY=VALUE] [--format TEMPLATE] [--latest|--last N]")
 	}
 	if *last < -1 {
 		return errors.New("ps --last must be -1 or greater")
@@ -2954,14 +2956,26 @@ func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 		return nil
 	}
+	if *sizeOutput {
+		if err := populatePsSizes(rows, backend); err != nil {
+			return err
+		}
+	}
 	if *format != "" {
 		return writePsFormat(stdout, rows, *format)
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "CONTAINER\tBRANCH\tIMAGE\tSTATE\tCREATED\tPARENT")
+	if *sizeOutput {
+		fmt.Fprintln(table, "CONTAINER\tBRANCH\tIMAGE\tSTATE\tCREATED\tPARENT\tSIZE")
+	} else {
+		fmt.Fprintln(table, "CONTAINER\tBRANCH\tIMAGE\tSTATE\tCREATED\tPARENT")
+	}
 	for _, row := range rows {
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			row.Container, row.Branch, row.Image, row.State, row.RunningFor, row.Parent)
+		if *sizeOutput {
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", row.Container, row.Branch, row.Image, row.State, row.RunningFor, row.Parent, row.Size)
+		} else {
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\n", row.Container, row.Branch, row.Image, row.State, row.RunningFor, row.Parent)
+		}
 	}
 	return table.Flush()
 }
@@ -2979,9 +2993,41 @@ type psRow struct {
 	CreatedAt  string   `json:"created_at"`
 	RunningFor string   `json:"running_for"`
 	Volumes    []string `json:"volumes,omitempty"`
+	Size       string   `json:"size,omitempty"`
+	SizeRW     uint64   `json:"size_rw,omitempty"`
+	SizeRootFS uint64   `json:"size_root_fs,omitempty"`
 
-	created time.Time
-	digest  string
+	created   time.Time
+	digest    string
+	imageSize int64
+}
+
+func populatePsSizes(rows []psRow, backend backend) error {
+	for i := range rows {
+		row := &rows[i]
+		imageSize := uint64(0)
+		if row.imageSize > 0 {
+			imageSize = uint64(row.imageSize)
+		}
+		known := row.State == "created"
+		writable := uint64(0)
+		if row.State == "running" || row.State == "paused" {
+			var err error
+			writable, err = backend.rootfsSize(selector{container: row.Container, branch: row.Branch})
+			if err != nil {
+				return fmt.Errorf("getting size for %s: %w", row.ID, err)
+			}
+			known = true
+		}
+		row.SizeRootFS = imageSize + writable
+		if known {
+			row.SizeRW = writable
+			row.Size = fmt.Sprintf("%s (virtual %s)", formatImageSize(int64(writable)), formatImageSize(int64(row.SizeRootFS)))
+		} else {
+			row.Size = fmt.Sprintf("- (virtual %s)", formatImageSize(int64(imageSize)))
+		}
+	}
+	return nil
 }
 
 func familyDisplayName(family Family) string {
@@ -3051,6 +3097,7 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 				Volumes:    append([]string(nil), family.Volumes...),
 				created:    created,
 				digest:     family.Digest,
+				imageSize:  family.ImageSize,
 			})
 		}
 	}
@@ -3165,7 +3212,7 @@ func writePsFormat(w io.Writer, rows []psRow, format string) error {
 			ID: "ID", Names: "NAMES", Container: "CONTAINER", Branch: "BRANCH",
 			Image: "IMAGE", ImageID: "IMAGE ID", State: "STATE", Status: "STATUS",
 			Parent: "PARENT", CreatedAt: "CREATED AT", RunningFor: "CREATED",
-			Volumes: []string{"VOLUMES"},
+			Volumes: []string{"VOLUMES"}, Size: "SIZE",
 		}
 		if err := executePsTemplate(w, tmpl, header); err != nil {
 			return err
@@ -4005,6 +4052,7 @@ type Family struct {
 	Name       string    `json:"name,omitempty"`
 	Image      string    `json:"image,omitempty"`
 	Digest     string    `json:"digest,omitempty"`
+	ImageSize  int64     `json:"image_size,omitempty"`
 	State      string    `json:"state"`
 	CreatedAt  time.Time `json:"created_at"`
 	SandboxPID int       `json:"sandbox_pid,omitempty"`
@@ -4108,6 +4156,7 @@ type backend interface {
 	remove(name string, force, volumes bool) error
 	listFamilies() ([]Family, error)
 	processes(target selector) ([]ProcessInfo, error)
+	rootfsSize(target selector) (uint64, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
 	checkFork(target selector) (ForkEligibility, error)
@@ -6439,6 +6488,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			Name:      container.Name,
 			Image:     container.Reference,
 			Digest:    container.Digest,
+			ImageSize: container.ImageSize,
 			State:     state,
 			CreatedAt: container.CreatedAt,
 			Volumes:   volumes,
@@ -6453,6 +6503,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family.Name = persistent.Name
 				family.Image = persistent.Image
 				family.Digest = persistent.Digest
+				family.ImageSize = persistent.ImageSize
 				family.CreatedAt = persistent.CreatedAt
 				family.Volumes = persistent.Volumes
 				family.Branches = mergeBranchHistory(persistent.Branches, family.Branches)
@@ -6883,6 +6934,30 @@ func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
 		return nil, fmt.Errorf("decoding branch process list: %w", err)
 	}
 	return processes, nil
+}
+
+func (b *runtimeBackend) rootfsSize(target selector) (uint64, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return 0, err
+	}
+	if b.dataRoot != "" {
+		spec, specErr := b.containerStore().LoadSpec(resolved.container)
+		if specErr == nil && spec.Root != nil && spec.Root.Readonly {
+			return 0, nil
+		}
+	}
+	output, err := b.command("timetravel", resolved.container, "size", resolved.branch)
+	if err != nil {
+		return 0, err
+	}
+	var size struct {
+		WritableBytes uint64 `json:"writable_bytes"`
+	}
+	if err := json.Unmarshal(output, &size); err != nil {
+		return 0, fmt.Errorf("decoding branch rootfs size: %w", err)
+	}
+	return size.WritableBytes, nil
 }
 
 func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {

@@ -138,6 +138,13 @@ type filesystem struct {
 	ovlWhiteout *deviceFile
 }
 
+// AllocatedBytes returns the logical number of bytes allocated by this tmpfs.
+// It intentionally reports branch-local logical usage after a live fork even
+// when the underlying MemoryFile pages are physically shared copy-on-write.
+func (fs *filesystem) AllocatedBytes() uint64 {
+	return fs.pagesUsed.Load() * hostarch.PageSize
+}
+
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
 	return Name
