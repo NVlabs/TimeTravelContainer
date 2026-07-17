@@ -1113,14 +1113,24 @@ func ParseMountOptions(opts []string) *vfs.MountOptions {
 		switch o {
 		case "ro":
 			mountOpts.ReadOnly = true
+		case "rw":
+			mountOpts.ReadOnly = false
 		case "noatime":
 			mountOpts.Flags.NoATime = true
+		case "atime", "relatime", "strictatime":
+			mountOpts.Flags.NoATime = false
 		case "noexec":
 			mountOpts.Flags.NoExec = true
+		case "exec":
+			mountOpts.Flags.NoExec = false
 		case "nosuid":
 			mountOpts.Flags.NoSUID = true
-		case "rw", "atime", "exec":
-			// These use the default value and don't need to be set.
+		case "suid":
+			mountOpts.Flags.NoSUID = false
+		case "nodev":
+			mountOpts.Flags.NoDev = true
+		case "dev":
+			mountOpts.Flags.NoDev = false
 		case "bind", "rbind":
 			// These are the same as a mount with type="bind".
 		default:

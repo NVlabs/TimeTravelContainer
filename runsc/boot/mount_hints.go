@@ -243,6 +243,9 @@ func (m *MountHint) checkCompatible(replica *specs.Mount) error {
 	if masterOpts.Flags.NoSUID && !replicaOpts.Flags.NoSUID {
 		return fmt.Errorf("cannot mount suid enabled shared mount because master is nosuid, mount: %+v", replica)
 	}
+	if masterOpts.Flags.NoDev && !replicaOpts.Flags.NoDev {
+		return fmt.Errorf("cannot mount device-enabled shared mount because master is nodev, mount: %+v", replica)
+	}
 	return nil
 }
 

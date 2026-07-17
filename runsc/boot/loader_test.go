@@ -1025,6 +1025,29 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	devMountFile.DecRef(parentTask)
 	parentDevMountFile := liveForkTestFD(t, l.k, devMountFD)
 	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "seed")
+	tmpfsHardlink := liveForkTestCreateFile(t, parentTask, "dev/shm/tmpfs-hardlink-source")
+	liveForkTestPWrite(t, parentTask, tmpfsHardlink, 0, "seed")
+	tmpfsHardlink.DecRef(parentTask)
+	liveForkTestLink(t, parentTask, "dev/shm/tmpfs-hardlink-source", "dev/shm/tmpfs-hardlink-alias")
+	tmpfsUnlinked := liveForkTestCreateFile(t, parentTask, "dev/shm/tmpfs-unlinked")
+	liveForkTestPWrite(t, parentTask, tmpfsUnlinked, 0, "seed")
+	const tmpfsUnlinkedFD = int32(31)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, tmpfsUnlinkedFD, tmpfsUnlinked, kernel.FDFlags{}); err != nil {
+		tmpfsUnlinked.DecRef(parentTask)
+		t.Fatalf("installing open-unlinked tmpfs file: %v", err)
+	}
+	tmpfsUnlinked.DecRef(parentTask)
+	liveForkTestUnlink(t, parentTask, "dev/shm/tmpfs-unlinked")
+	parentTmpfsUnlinked := liveForkTestFD(t, l.k, tmpfsUnlinkedFD)
+	tmpfsTruncate := liveForkTestCreateFile(t, parentTask, "dev/shm/tmpfs-truncate")
+	liveForkTestPWrite(t, parentTask, tmpfsTruncate, 0, "seed")
+	const tmpfsTruncateFD = int32(32)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, tmpfsTruncateFD, tmpfsTruncate, kernel.FDFlags{}); err != nil {
+		tmpfsTruncate.DecRef(parentTask)
+		t.Fatalf("installing truncate tmpfs file: %v", err)
+	}
+	tmpfsTruncate.DecRef(parentTask)
+	parentTmpfsTruncate := liveForkTestFD(t, l.k, tmpfsTruncateFD)
 	managedVolumeFile := liveForkTestCreateFile(t, parentTask, "managed/state")
 	const managedVolumeFD = int32(28)
 	if _, err := parentTask.FDTable().NewFDAt(parentTask, managedVolumeFD, managedVolumeFile, kernel.FDFlags{}); err != nil {
@@ -1146,6 +1169,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
 	childDevMountFile := liveForkTestFD(t, child.k, devMountFD)
+	childTmpfsUnlinked := liveForkTestFD(t, child.k, tmpfsUnlinkedFD)
+	childTmpfsTruncate := liveForkTestFD(t, child.k, tmpfsTruncateFD)
 	childManagedVolume := liveForkTestFD(t, child.k, managedVolumeFD)
 	childManagedAlias := liveForkTestOpenPath(t, childTask, "managed-alias/state", linux.O_RDWR)
 	childConsoleStdin := liveForkTestFD(t, child.k, consoleBaseFD)
@@ -1393,14 +1418,61 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
 
 	// An explicit tmpfs submount uses the Kernel MemoryFile and therefore
-	// detaches pages independently just like memfd and the root overlay upper.
+	// detaches syscall and mapped writes without eager copying. Its inode graph,
+	// metadata, unlinked open files, allocation state, and mount flags are also
+	// branch-local.
+	wantTmpfsMountFlags := uint64(linux.ST_NOSUID | linux.ST_NOEXEC | linux.ST_NODEV)
+	for name, file := range map[string]*vfs.FileDescription{"parent": parentDevMountFile, "child": childDevMountFile} {
+		if got := file.Mount().MountFlags(); got != wantTmpfsMountFlags {
+			t.Errorf("%s /dev/shm mount flags: got %#x, want %#x", name, got, wantTmpfsMountFlags)
+		}
+	}
 	liveForkTestPRead(t, parentTask, parentDevMountFile, 0, "seed")
 	liveForkTestPRead(t, childTask, childDevMountFile, 0, "seed")
 	liveForkTestPWrite(t, parentTask, parentDevMountFile, 0, "prnt")
 	liveForkTestPRead(t, childTask, childDevMountFile, 0, "seed")
-	liveForkTestPWrite(t, childTask, childDevMountFile, 0, "chld")
+	liveForkTestMappedWrite(t, childTask, childDevMountFile, "chld")
 	liveForkTestPRead(t, parentTask, parentDevMountFile, 0, "prnt")
 	liveForkTestPRead(t, childTask, childDevMountFile, 0, "chld")
+	if err := parentDevMountFile.SetStat(ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: uint16(linux.ModeRegular | 0600)}}); err != nil {
+		t.Fatalf("changing parent tmpfs mode: %v", err)
+	}
+	liveForkTestMode(t, ctx, parentDevMountFile, 0600)
+	liveForkTestMode(t, childCtx, childDevMountFile, 0644)
+
+	parentTmpfsHardlink := liveForkTestOpenPath(t, parentTask, "dev/shm/tmpfs-hardlink-alias", linux.O_RDWR)
+	childTmpfsHardlink := liveForkTestOpenPath(t, childTask, "dev/shm/tmpfs-hardlink-alias", linux.O_RDWR)
+	liveForkTestPWrite(t, parentTask, parentTmpfsHardlink, 0, "PARN")
+	liveForkTestPathRead(t, parentTask, "dev/shm/tmpfs-hardlink-source", "PARN")
+	liveForkTestPRead(t, childTask, childTmpfsHardlink, 0, "seed")
+	liveForkTestUnlink(t, childTask, "dev/shm/tmpfs-hardlink-alias")
+	liveForkTestPathMissing(t, childTask, "dev/shm/tmpfs-hardlink-alias")
+	liveForkTestPathRead(t, childTask, "dev/shm/tmpfs-hardlink-source", "seed")
+	liveForkTestPathRead(t, parentTask, "dev/shm/tmpfs-hardlink-alias", "PARN")
+	parentTmpfsHardlink.DecRef(ctx)
+	childTmpfsHardlink.DecRef(childCtx)
+
+	liveForkTestPRead(t, parentTask, parentTmpfsUnlinked, 0, "seed")
+	liveForkTestPRead(t, childTask, childTmpfsUnlinked, 0, "seed")
+	liveForkTestPWrite(t, parentTask, parentTmpfsUnlinked, 0, "PUNL")
+	liveForkTestMappedWrite(t, childTask, childTmpfsUnlinked, "CUNL")
+	liveForkTestPRead(t, parentTask, parentTmpfsUnlinked, 0, "PUNL")
+	liveForkTestPRead(t, childTask, childTmpfsUnlinked, 0, "CUNL")
+	liveForkTestPathMissing(t, parentTask, "dev/shm/tmpfs-unlinked")
+	liveForkTestPathMissing(t, childTask, "dev/shm/tmpfs-unlinked")
+
+	if err := childTmpfsTruncate.SetStat(childCtx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: 2}}); err != nil {
+		t.Fatalf("truncating child tmpfs file: %v", err)
+	}
+	liveForkTestPRead(t, parentTask, parentTmpfsTruncate, 0, "seed")
+	liveForkTestPRead(t, childTask, childTmpfsTruncate, 0, "se")
+	liveForkTestSize(t, ctx, parentTmpfsTruncate, 4)
+	liveForkTestSize(t, childCtx, childTmpfsTruncate, 2)
+	if err := parentTmpfsTruncate.Allocate(ctx, 0, hostarch.PageSize, hostarch.PageSize); err != nil {
+		t.Fatalf("allocating sparse parent tmpfs range: %v", err)
+	}
+	liveForkTestSize(t, ctx, parentTmpfsTruncate, 2*hostarch.PageSize)
+	liveForkTestSize(t, childCtx, childTmpfsTruncate, 2)
 
 	// The writable root uses a branch-local tmpfs OverlayFS upper over the
 	// shared immutable gofer lower. Contents, open-unlinked files, and directory
@@ -1495,10 +1567,23 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, parentTask, shmAddr1, "prnt")
 	grandchildMemfd := liveForkTestFD(t, grandchild.k, memfdFD)
 	grandchildOverlayFile := liveForkTestFD(t, grandchild.k, overlayFD)
+	grandchildDevMountFile := liveForkTestFD(t, grandchild.k, devMountFD)
+	grandchildTmpfsUnlinked := liveForkTestFD(t, grandchild.k, tmpfsUnlinkedFD)
+	grandchildTmpfsTruncate := liveForkTestFD(t, grandchild.k, tmpfsTruncateFD)
 	grandchildConsoleStdin := liveForkTestFD(t, grandchild.k, consoleBaseFD)
 	grandchildConsoleStdout := liveForkTestFD(t, grandchild.k, consoleBaseFD+1)
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "chld")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
+	liveForkTestPRead(t, grandchildTask, grandchildDevMountFile, 0, "chld")
+	liveForkTestPRead(t, grandchildTask, grandchildTmpfsUnlinked, 0, "CUNL")
+	liveForkTestPRead(t, grandchildTask, grandchildTmpfsTruncate, 0, "se")
+	if got := grandchildDevMountFile.Mount().MountFlags(); got != wantTmpfsMountFlags {
+		t.Errorf("grandchild /dev/shm mount flags: got %#x, want %#x", got, wantTmpfsMountFlags)
+	}
+	liveForkTestPWrite(t, grandchildTask, grandchildDevMountFile, 0, "grnd")
+	liveForkTestMappedWrite(t, grandchildTask, grandchildTmpfsUnlinked, "GUNL")
+	liveForkTestPRead(t, childTask, childDevMountFile, 0, "chld")
+	liveForkTestPRead(t, childTask, childTmpfsUnlinked, 0, "CUNL")
 	grandchildManagedVolume := liveForkTestFD(t, grandchild.k, managedVolumeFD)
 	grandchildManagedAlias := liveForkTestOpenPath(t, grandchildTask, "managed-alias/state", linux.O_RDWR)
 	grandchildReadonlyFile := liveForkTestFD(t, grandchild.k, readonlyFileFD)
@@ -1546,6 +1631,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
 	childTruncateFile.DecRef(childTask)
+	childDevMountFile.DecRef(childTask)
+	childTmpfsUnlinked.DecRef(childTask)
+	childTmpfsTruncate.DecRef(childTask)
 	childManagedVolume.DecRef(childTask)
 	childManagedAlias.DecRef(childTask)
 	childConsoleStdin.DecRef(childTask)
@@ -1613,6 +1701,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
+	liveForkTestPRead(t, grandchildTask, grandchildDevMountFile, 0, "grnd")
+	liveForkTestPRead(t, grandchildTask, grandchildTmpfsUnlinked, 0, "GUNL")
+	liveForkTestPRead(t, grandchildTask, grandchildTmpfsTruncate, 0, "se")
 	liveForkTestMMReadContext(t, grandchildCtx, grandchildTask, readonlyMapAddr, "hoMUTATED")
 	liveForkTestRead(t, grandchildCtx, grandchildReadonlyFile, "D")
 	_ = liveForkTestNextDirent(t, grandchildCtx, grandchildReadonlyDir)
@@ -1635,6 +1726,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestReadEventually(t, grandchildTask, grandchildTCPServer, "stay")
 	grandchildMemfd.DecRef(grandchildTask)
 	grandchildOverlayFile.DecRef(grandchildTask)
+	grandchildDevMountFile.DecRef(grandchildTask)
+	grandchildTmpfsUnlinked.DecRef(grandchildTask)
+	grandchildTmpfsTruncate.DecRef(grandchildTask)
 	grandchildUDPClient.DecRef(grandchildTask)
 	grandchildUDPServer.DecRef(grandchildTask)
 	grandchildTCPClient.DecRef(grandchildTask)
@@ -1724,6 +1818,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentMemfd.DecRef(parentTask)
 	parentOverlayFile.DecRef(parentTask)
 	parentTruncateFile.DecRef(parentTask)
+	parentDevMountFile.DecRef(parentTask)
+	parentTmpfsUnlinked.DecRef(parentTask)
+	parentTmpfsTruncate.DecRef(parentTask)
 	parentMemfd = liveForkTestFD(t, l.k, memfdFD)
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
 	parentMemfd.DecRef(parentTask)

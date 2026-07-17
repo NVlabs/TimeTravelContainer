@@ -280,18 +280,18 @@ func TestHintsCheckCompatible(t *testing.T) {
 		},
 		{
 			name:        "same",
-			masterOpts:  []string{"ro", "noatime", "noexec"},
-			replicaOpts: []string{"ro", "noatime", "noexec"},
+			masterOpts:  []string{"ro", "noatime", "noexec", "nodev"},
+			replicaOpts: []string{"ro", "noatime", "noexec", "nodev"},
 		},
 		{
 			name:        "compatible",
-			masterOpts:  []string{"rw", "atime", "exec"},
-			replicaOpts: []string{"ro", "noatime", "noexec"},
+			masterOpts:  []string{"rw", "atime", "exec", "dev"},
+			replicaOpts: []string{"ro", "noatime", "noexec", "nodev"},
 		},
 		{
 			name:        "unsupported",
-			masterOpts:  []string{"nofoo", "nodev"},
-			replicaOpts: []string{"foo", "dev"},
+			masterOpts:  []string{"nofoo"},
+			replicaOpts: []string{"foo"},
 		},
 		{
 			name:        "incompatible-ro",
@@ -310,6 +310,12 @@ func TestHintsCheckCompatible(t *testing.T) {
 			masterOpts:  []string{"noexec"},
 			replicaOpts: []string{"exec"},
 			err:         "noexec",
+		},
+		{
+			name:        "incompatible-nodev",
+			masterOpts:  []string{"nodev"},
+			replicaOpts: []string{"dev"},
+			err:         "nodev",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

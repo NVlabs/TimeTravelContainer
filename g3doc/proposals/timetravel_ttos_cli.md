@@ -484,8 +484,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       mounts from Docker-style CLI flags; verify mode/size, inspect projection,
       restart persistence, fork eligibility, and parent/child tmpfs CoW with an
       unmodified Alpine image.
-- [ ] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
-      truncate, fallocate, and mount flags across branches.
+- [x] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
+      truncate, fallocate, and mount flags across branches. Standard OCI mount
+      flags now use last-option-wins parsing; `nodev` is enforced and retained
+      through recursive live forks.
 - [ ] Admit procfs only after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,
       namespaces, mounts, clocks, and `/proc/net` resolve through the child
       Kernel rather than the source Kernel.

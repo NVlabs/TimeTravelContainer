@@ -22,6 +22,17 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 )
 
+func TestParseMountOptions(t *testing.T) {
+	restricted := ParseMountOptions([]string{"ro", "noatime", "noexec", "nosuid", "nodev"})
+	if !restricted.ReadOnly || !restricted.Flags.NoATime || !restricted.Flags.NoExec || !restricted.Flags.NoSUID || !restricted.Flags.NoDev {
+		t.Fatalf("restricted mount options: %+v", restricted)
+	}
+	permissive := ParseMountOptions([]string{"ro", "noatime", "noexec", "nosuid", "nodev", "rw", "strictatime", "exec", "suid", "dev"})
+	if permissive.ReadOnly || permissive.Flags.NoATime || permissive.Flags.NoExec || permissive.Flags.NoSUID || permissive.Flags.NoDev {
+		t.Fatalf("last-option-wins mount options: %+v", permissive)
+	}
+}
+
 func TestGetMountAccessType(t *testing.T) {
 	const source = "foo"
 	for _, tst := range []struct {
