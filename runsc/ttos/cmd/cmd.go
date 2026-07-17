@@ -869,6 +869,15 @@ type runRequest struct {
 	terminal           bool
 }
 
+type attachRequest struct {
+	target     selector
+	execID     string
+	stdin      bool
+	stdout     bool
+	stderr     bool
+	detachKeys []byte
+}
+
 type execRequest struct {
 	detach         bool
 	execID         string
@@ -1221,28 +1230,44 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	interactive := fs.Bool("interactive", false, "forward stdin")
 	fs.BoolVar(interactive, "i", false, "forward stdin")
+	noStdin := fs.Bool("no-stdin", false, "do not forward stdin")
+	noStdout := fs.Bool("no-stdout", false, "do not attach stdout")
+	noStderr := fs.Bool("no-stderr", false, "do not attach stderr")
 	execID := fs.String("exec", "", "attach to a managed exec session")
 	detachKeysValue := fs.String("detach-keys", "ctrl-p,ctrl-q", "override the key sequence for detaching")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos attach [-i] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos attach [-i|--no-stdin] [--no-stdout] [--no-stderr] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
+	}
+	if *interactive && *noStdin {
+		return errors.New("--interactive and --no-stdin cannot be used together")
+	}
+	request := attachRequest{
+		execID: *execID,
+		stdin:  *interactive,
+		stdout: !*noStdout,
+		stderr: !*noStderr,
+	}
+	if !request.stdin && !request.stdout && !request.stderr {
+		return errors.New("attach requires at least one of stdin, stdout, or stderr")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	detachKeys, err := parseDetachKeys(*detachKeysValue)
+	request.target = target
+	request.detachKeys, err = parseDetachKeys(*detachKeysValue)
 	if err != nil {
 		return err
 	}
-	if *execID != "" {
-		if _, err := parseExecSelector(target.String() + ":" + *execID); err != nil {
+	if request.execID != "" {
+		if _, err := parseExecSelector(target.String() + ":" + request.execID); err != nil {
 			return err
 		}
 	}
-	status, err := backend.attach(target, *execID, *interactive, detachKeys)
+	status, err := backend.attach(request)
 	if err != nil {
 		if errors.Is(err, errDetached) {
 			return nil
@@ -2956,7 +2981,7 @@ type backend interface {
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
-	attach(target selector, execID string, interactive bool, detachKeys []byte) (uint32, error)
+	attach(request attachRequest) (uint32, error)
 	logs(target selector, execID string, follow bool, tail int) error
 	exec(request execRequest) (int, error)
 	execSessions(target selector) ([]runscExecSession, error)
@@ -3588,7 +3613,9 @@ func readConsoleWaitStatus(path string) (uint32, bool, error) {
 	return uint32(status), true, nil
 }
 
-func (b *runtimeBackend) attach(target selector, execID string, interactive bool, detachKeys []byte) (status uint32, retErr error) {
+func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr error) {
+	target := request.target
+	execID := request.execID
 	var paths ttosbundle.ConsolePaths
 	consoleID := "init"
 	terminal := false
@@ -3627,7 +3654,7 @@ func (b *runtimeBackend) attach(target selector, execID string, interactive bool
 	if err != nil {
 		return 0, err
 	}
-	if interactive {
+	if request.stdin {
 		inputLock, err := acquireConsoleStdin(paths.StdinLock, target)
 		if err != nil {
 			return 0, err
@@ -3679,12 +3706,19 @@ func (b *runtimeBackend) attach(target selector, execID string, interactive bool
 		}()
 	}
 	inputErrCh := make(chan error, 1)
-	if interactive {
-		go func() { inputErrCh <- b.pumpConsoleInput(target, consoleID, detachKeys) }()
+	if request.stdin {
+		go func() { inputErrCh <- b.pumpConsoleInput(target, consoleID, request.detachKeys) }()
+	}
+	var stdout, stderr io.Writer
+	if request.stdout {
+		stdout = b.stdout
+	}
+	if request.stderr {
+		stderr = b.stderr
 	}
 	var waitErr error
 	for {
-		progress, err := follower.drain(b.stdout, b.stderr)
+		progress, err := follower.drain(stdout, stderr)
 		if err != nil {
 			return 0, err
 		}
@@ -4516,7 +4550,7 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 	if detach {
 		return 0, nil
 	}
-	waitStatus, err := b.attach(target, "", interactive, defaultDetachKeys)
+	waitStatus, err := b.attach(attachRequest{target: target, stdin: interactive, stdout: true, stderr: true, detachKeys: defaultDetachKeys})
 	if err != nil {
 		if errors.Is(err, errDetached) {
 			return 0, nil

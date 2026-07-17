@@ -27,9 +27,10 @@ covers:
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
-- `exec`, `fork --check`, live `fork`, `pause`, `resume`, `ps`, `top`, and the
-  lineage tree, including branch/status/ancestor `ps` filters, templates,
-  latest selection, and JSON creation timestamps;
+- `exec`, selective stdin/stdout/stderr `attach`, `fork --check`, live `fork`,
+  `pause`, `resume`, `ps`, `top`, and the lineage tree, including
+  branch/status/ancestor `ps` filters, templates, latest selection, and JSON
+  creation timestamps;
 - managed-volume copy-on-write isolation between a parent and child branch;
 - read-only host bind visibility and write rejection;
 - graceful stop, branch removal, container removal, and volume removal.

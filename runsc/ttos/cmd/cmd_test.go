@@ -773,11 +773,54 @@ func TestAttach(t *testing.T) {
 	if status != 7 {
 		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.attached != (selector{container: "demo", branch: "child"}) || b.attachExecID != "exec-one" || !b.attachInteractive {
-		t.Errorf("attach target=%+v exec=%q interactive=%t", b.attached, b.attachExecID, b.attachInteractive)
+	if b.attached.target != (selector{container: "demo", branch: "child"}) || b.attached.execID != "exec-one" || !b.attached.stdin || !b.attached.stdout || !b.attached.stderr {
+		t.Errorf("attach request=%+v", b.attached)
 	}
-	if got, want := b.attachDetachKeys, []byte{1, 'z'}; !bytes.Equal(got, want) {
+	if got, want := b.attached.detachKeys, []byte{1, 'z'}; !bytes.Equal(got, want) {
 		t.Errorf("attach detach keys=%v, want %v", got, want)
+	}
+}
+
+func TestAttachStreamSelection(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		stdin  bool
+		stdout bool
+		stderr bool
+	}{
+		{name: "output", args: []string{"--no-stdin"}, stdout: true, stderr: true},
+		{name: "stdin-only", args: []string{"-i", "--no-stdout", "--no-stderr"}, stdin: true},
+		{name: "stdout-only", args: []string{"--no-stderr"}, stdout: true},
+		{name: "stderr-only", args: []string{"--no-stdout"}, stderr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"attach"}, test.args...)
+			args = append(args, "demo")
+			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
+			}
+			if b.attached.stdin != test.stdin || b.attached.stdout != test.stdout || b.attached.stderr != test.stderr {
+				t.Errorf("attach streams=(stdin=%t stdout=%t stderr=%t), want (%t %t %t)",
+					b.attached.stdin, b.attached.stdout, b.attached.stderr, test.stdin, test.stdout, test.stderr)
+			}
+		})
+	}
+	for _, args := range [][]string{
+		{"attach", "--no-stdout", "--no-stderr", "demo"},
+		{"attach", "-i", "--no-stdin", "demo"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.attached.target.container != "" {
+			t.Errorf("rejected attach reached backend with %+v", b.attached)
+		}
 	}
 }
 
@@ -787,7 +830,7 @@ func TestAttachDetachIsSuccess(t *testing.T) {
 	if status := runCommand([]string{"attach", "-i", "demo"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 	}
-	if got, want := b.attachDetachKeys, defaultDetachKeys; !bytes.Equal(got, want) {
+	if got, want := b.attached.detachKeys, defaultDetachKeys; !bytes.Equal(got, want) {
 		t.Errorf("default detach keys=%v, want %v", got, want)
 	}
 }
@@ -2080,10 +2123,7 @@ type fakeBackend struct {
 	startCalls        []startCall
 	startDetach       bool
 	startInteractive  bool
-	attached          selector
-	attachExecID      string
-	attachInteractive bool
-	attachDetachKeys  []byte
+	attached          attachRequest
 	logsTarget        selector
 	logsExecID        string
 	logsFollow        bool
@@ -2122,11 +2162,9 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 	return b.runStatus, b.err
 }
 
-func (b *fakeBackend) attach(target selector, execID string, interactive bool, detachKeys []byte) (uint32, error) {
-	b.attached = target
-	b.attachExecID = execID
-	b.attachInteractive = interactive
-	b.attachDetachKeys = append([]byte(nil), detachKeys...)
+func (b *fakeBackend) attach(request attachRequest) (uint32, error) {
+	b.attached = request
+	b.attached.detachKeys = append([]byte(nil), request.detachKeys...)
 	return b.waitStatus, b.err
 }
 

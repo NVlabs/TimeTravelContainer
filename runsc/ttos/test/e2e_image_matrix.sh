@@ -67,6 +67,7 @@ printf "%s\n" "# environment file" "FROM_FILE=file" "TTOS_E2E_HOST_IMPORT" >"$EN
 printf "%s\n" "# label file" "suite=file" "file-only=value" "empty" >"$LABEL_FILE"
 PREFIX="e2e-$$"
 LIFECYCLE="$PREFIX-lifecycle"
+ATTACH_INPUT="$PREFIX-attach-input"
 CONSOLE_STRESS="$PREFIX-console-stress"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
@@ -96,7 +97,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE" "$ATTACH_INPUT"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -124,7 +125,7 @@ ttos create --name "$PREFIX-busybox" \
   --env-file "$ENV_FILE" --env FROM_FILE=direct \
   --label-file "$LABEL_FILE" --label suite=create \
   "$BUSYBOX_IMAGE" sh -c \
-  'test "$FROM_FILE" = direct && test "$TTOS_E2E_HOST_IMPORT" = host-import && test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok'
+  'test "$FROM_FILE" = direct && test "$TTOS_E2E_HOST_IMPORT" = host-import && test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok && echo busybox-err >&2'
 [ "$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{.Path}}|{{len .TTOS.Branches}}' "$PREFIX-busybox")" = \
   "created|docker.io/library/busybox:1.36|sh|1" ] ||
   fail "created-container inspect did not expose Docker config and TTOS branch state"
@@ -137,6 +138,22 @@ ttos start --attach "$PREFIX-busybox"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
   "exited|0|false" ] ||
   fail "exited-container inspect did not expose exit state"
+ATTACH_STDOUT="$TTOS_E2E_ROOT/attach.stdout"
+ATTACH_STDERR="$TTOS_E2E_ROOT/attach.stderr"
+ttos attach --no-stderr "$PREFIX-busybox" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+grep -qx 'busybox-ok' "$ATTACH_STDOUT" || fail "stdout-only attach omitted stdout"
+[ -z "$(sed '/^ttos: warning:/d' "$ATTACH_STDERR")" ] || fail "stdout-only attach leaked stderr"
+ttos attach --no-stdout "$PREFIX-busybox" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+[ ! -s "$ATTACH_STDOUT" ] || fail "stderr-only attach leaked stdout"
+[ "$(sed '/^ttos: warning:/d' "$ATTACH_STDERR")" = busybox-err ] || fail "stderr-only attach omitted stderr"
+
+ttos run --name "$ATTACH_INPUT" --detach --interactive "$BUSYBOX_IMAGE" sh -c \
+  'IFS= read -r value; test "$value" = stdin-ok; echo hidden-stdout; echo hidden-stderr >&2' >/dev/null
+printf 'stdin-ok\n' | ttos attach --interactive --no-stdout --no-stderr "$ATTACH_INPUT" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+[ ! -s "$ATTACH_STDOUT" ] || fail "stdin-only attach leaked stdout"
+[ -z "$(sed '/^ttos: warning:/d' "$ATTACH_STDERR")" ] || fail "stdin-only attach leaked stderr"
+[ "$(ttos inspect -f '{{.State.ExitCode}}' "$ATTACH_INPUT")" = 0 ] || fail "stdin-only attach did not deliver input"
+ttos rm "$ATTACH_INPUT"
 ttos container restart --time 1 "$PREFIX-busybox"
 [ "$(ttos container wait "$PREFIX-busybox")" = "0" ] ||
   fail "restart/wait did not preserve the BusyBox command exit status"

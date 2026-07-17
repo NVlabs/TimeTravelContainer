@@ -270,7 +270,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       with stdout/stderr streaming, optional `-i`, and exit-status forwarding.
 - [x] `ttos attach --exec EXEC_ID CONTAINER[@BRANCH]` and
       `ttos logs --exec EXEC_ID CONTAINER[@BRANCH]` for managed exec sessions.
-- [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
+- [x] Support output-only and combined attachment by default/with `-i`, plus
+      stdin-only, stdout-only, and stderr-only selection through `--no-stdin`,
+      `--no-stdout`, and `--no-stderr`. Unselected output is still drained so
+      console retention and wait behavior remain correct.
 - [x] Support Docker-like detach keys for non-TTY stdin attachment, including
       Ctrl-P, Ctrl-Q by default and `ttos attach --detach-keys` overrides.
 - [x] Support TTY detach keys, terminal resize/SIGWINCH propagation, and
