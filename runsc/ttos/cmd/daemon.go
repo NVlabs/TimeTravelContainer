@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -52,11 +53,12 @@ type daemonWireOptions struct {
 }
 
 type daemonRequest struct {
-	Version int               `json:"version"`
-	Action  string            `json:"action"`
-	Options daemonWireOptions `json:"options,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Stdin   bool              `json:"stdin,omitempty"`
+	Version   int               `json:"version"`
+	Action    string            `json:"action"`
+	RequestID string            `json:"request_id,omitempty"`
+	Options   daemonWireOptions `json:"options,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	Stdin     bool              `json:"stdin,omitempty"`
 }
 
 type daemonServer struct {
@@ -332,11 +334,53 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
+	if request.RequestID != "" && daemonCommandNeedsMutationLock(request.Args) {
+		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
+		if err != nil {
+			unlock()
+			stdinReader.Close()
+			writeError(err)
+			return
+		}
+		if replay {
+			unlock()
+			stdinReader.Close()
+			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+			return
+		}
+		var mutationStdout, mutationStderr bytes.Buffer
+		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
+		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
+		s.recordCommandEvents(opts.dataRoot, request.Args, status)
+		completed, err := completeDaemonMutation(opts.dataRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
+		if err != nil {
+			fmt.Fprintf(&mutationStderr, "ttosd: %v; command outcome is indeterminate\n", err)
+			status = 1
+		} else {
+			record = completed
+		}
+		unlock()
+		stdinReader.Close()
+		if err == nil {
+			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+		} else {
+			writeDaemonBufferedResult(conn, &writeMu, mutationStdout.Bytes(), mutationStderr.Bytes(), status)
+		}
+		return
+	}
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	unlock()
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
+}
+
+func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stderr []byte, status int) {
+	stdoutWriter := daemonFrameWriter{conn: conn, mu: writeMu, typ: daemonFrameStdout}
+	stderrWriter := daemonFrameWriter{conn: conn, mu: writeMu, typ: daemonFrameStderr}
+	_, _ = stdoutWriter.Write(stdout)
+	_, _ = stderrWriter.Write(stderr)
+	_ = writeDaemonStatus(conn, writeMu, status)
 }
 
 func daemonCommandNeedsMutationLock(args []string) bool {
@@ -548,29 +592,70 @@ func daemonCommandUsesStdin(args []string) bool {
 }
 
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	conn, err := connectDaemon(opts.daemonSocket)
-	if err != nil {
-		if err := startDaemonProcess(opts.daemonSocket); err != nil {
-			return 1, err
-		}
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			conn, err = connectDaemon(opts.daemonSocket)
-			if err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				return 1, fmt.Errorf("connecting to autostarted daemon: %w", err)
-			}
-			time.Sleep(25 * time.Millisecond)
-		}
-	}
-	defer conn.Close()
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args),
 	}
-	return exchangeDaemon(conn, request, stdin, stdout, stderr)
+	if daemonCommandNeedsMutationLock(args) && opts.dataRoot != "" {
+		requestID, err := newDaemonRequestID()
+		if err != nil {
+			return 1, err
+		}
+		request.RequestID = requestID
+	}
+	attempts := 1
+	if request.RequestID != "" && !request.Stdin {
+		attempts = 2
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		conn, err := connectOrStartDaemon(opts.daemonSocket)
+		if err != nil {
+			return 1, err
+		}
+		commandStdout, commandStderr := stdout, stderr
+		var bufferedStdout, bufferedStderr bytes.Buffer
+		if request.RequestID != "" {
+			commandStdout, commandStderr = &bufferedStdout, &bufferedStderr
+		}
+		status, err := exchangeDaemon(conn, request, stdin, commandStdout, commandStderr)
+		conn.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if request.RequestID != "" {
+			if _, err := stdout.Write(bufferedStdout.Bytes()); err != nil {
+				return 1, err
+			}
+			if _, err := stderr.Write(bufferedStderr.Bytes()); err != nil {
+				return 1, err
+			}
+		}
+		return status, nil
+	}
+	return 1, lastErr
+}
+
+func connectOrStartDaemon(socket string) (net.Conn, error) {
+	conn, err := connectDaemon(socket)
+	if err == nil {
+		return conn, nil
+	}
+	if err := startDaemonProcess(socket); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, err = connectDaemon(socket)
+		if err == nil {
+			return conn, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("connecting to autostarted daemon: %w", err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 func connectDaemon(socket string) (net.Conn, error) {

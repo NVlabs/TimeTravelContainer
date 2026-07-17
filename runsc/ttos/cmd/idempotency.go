@@ -1,0 +1,188 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+const daemonMutationSchemaVersion = 1
+
+type daemonMutationRecord struct {
+	Version     int       `json:"version"`
+	RequestID   string    `json:"request_id"`
+	Fingerprint string    `json:"fingerprint"`
+	State       string    `json:"state"`
+	Status      int       `json:"status,omitempty"`
+	Stdout      []byte    `json:"stdout,omitempty"`
+	Stderr      []byte    `json:"stderr,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+
+func newDaemonRequestID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generating daemon request ID: %w", err)
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
+func daemonMutationFingerprint(request daemonRequest) (string, error) {
+	value := struct {
+		Version int               `json:"version"`
+		Action  string            `json:"action"`
+		Options daemonWireOptions `json:"options"`
+		Args    []string          `json:"args"`
+		Stdin   bool              `json:"stdin"`
+	}{request.Version, request.Action, request.Options, request.Args, request.Stdin}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func daemonMutationPath(dataRoot, requestID string) (string, error) {
+	decoded, err := hex.DecodeString(requestID)
+	if err != nil || len(decoded) != 16 {
+		return "", fmt.Errorf("invalid daemon request ID %q", requestID)
+	}
+	if dataRoot == "" {
+		return "", errors.New("idempotent daemon mutation requires a data root")
+	}
+	return filepath.Join(dataRoot, "daemon", "requests", requestID+".json"), nil
+}
+
+func loadDaemonMutation(path string) (daemonMutationRecord, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return daemonMutationRecord{}, err
+	}
+	var record daemonMutationRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return daemonMutationRecord{}, err
+	}
+	if record.Version != daemonMutationSchemaVersion {
+		return daemonMutationRecord{}, fmt.Errorf("unsupported daemon mutation record version %d", record.Version)
+	}
+	if record.State != "pending" && record.State != "completed" {
+		return daemonMutationRecord{}, fmt.Errorf("invalid daemon mutation state %q", record.State)
+	}
+	return record, nil
+}
+
+func writeDurableJSON(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := writeDaemonBytes(temp, data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = directory.Sync()
+	closeErr := directory.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func beginDaemonMutation(dataRoot string, request daemonRequest) (daemonMutationRecord, bool, error) {
+	path, err := daemonMutationPath(dataRoot, request.RequestID)
+	if err != nil {
+		return daemonMutationRecord{}, false, err
+	}
+	fingerprint, err := daemonMutationFingerprint(request)
+	if err != nil {
+		return daemonMutationRecord{}, false, err
+	}
+	record, err := loadDaemonMutation(path)
+	if err == nil {
+		if record.RequestID != request.RequestID || record.Fingerprint != fingerprint {
+			return daemonMutationRecord{}, false, fmt.Errorf("daemon request ID %s was reused for a different command", request.RequestID)
+		}
+		if record.State == "completed" {
+			return record, true, nil
+		}
+		return daemonMutationRecord{}, false, fmt.Errorf("daemon request %s has an indeterminate outcome after daemon interruption; inspect state before retrying with a new request", request.RequestID)
+	}
+	if !os.IsNotExist(err) {
+		return daemonMutationRecord{}, false, fmt.Errorf("loading daemon mutation record: %w", err)
+	}
+	record = daemonMutationRecord{
+		Version: daemonMutationSchemaVersion, RequestID: request.RequestID,
+		Fingerprint: fingerprint, State: "pending", CreatedAt: time.Now().UTC(),
+	}
+	if err := writeDurableJSON(path, &record); err != nil {
+		return daemonMutationRecord{}, false, fmt.Errorf("persisting daemon mutation intent: %w", err)
+	}
+	return record, false, nil
+}
+
+func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status int, stdout, stderr []byte) (daemonMutationRecord, error) {
+	path, err := daemonMutationPath(dataRoot, record.RequestID)
+	if err != nil {
+		return daemonMutationRecord{}, err
+	}
+	record.State = "completed"
+	record.Status = status
+	record.Stdout = append([]byte(nil), stdout...)
+	record.Stderr = append([]byte(nil), stderr...)
+	record.CompletedAt = time.Now().UTC()
+	if err := writeDurableJSON(path, &record); err != nil {
+		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation result: %w", err)
+	}
+	return record, nil
+}

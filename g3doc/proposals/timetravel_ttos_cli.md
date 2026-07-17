@@ -125,8 +125,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Store initial desired configuration and lifecycle metadata separately
       from transient Sentry state so created/stopped containers can be listed,
       inspected, restarted, and removed.
-- [ ] Move persistent state behind `ttosd` and make updates transactional;
-      direct-CLI metadata now persists complete branch lineage and tombstones.
+- [x] Move default persistent-state ownership behind `ttosd`; metadata files
+      use synchronized temp-file replacement, and structural requests use a
+      durable intent/result journal. Keep `--direct` as an explicit recovery
+      path rather than a second background owner.
 
 ## `ttos` command surface
 
@@ -628,7 +630,12 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       resume, exit, destroy, exec, attach, image operations, and eligibility
       check observations. `ttos events` supports text/JSON output, time bounds,
       filters, and follow streaming across daemon restarts.
-- [ ] Serialize conflicting lifecycle operations and make commands idempotent.
+- [x] Serialize conflicting structural operations per data root and make
+      daemon request delivery idempotent. Completed requests replay their exact
+      status and output; interrupted pending requests fail closed with an
+      indeterminate-outcome diagnostic instead of being blindly repeated.
+- [ ] Bound and compact the completed-request journal, and add an operator
+      workflow for inspecting and resolving interrupted pending intents.
 - [x] Add a versioned framed local API with explicit version rejection so the
       CLI and daemon may be upgraded independently.
 - [x] Keep direct runsc invocation behind the daemon API and an explicit

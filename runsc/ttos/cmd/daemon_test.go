@@ -17,6 +17,7 @@ package cmd
 import (
 	"bytes"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -141,6 +142,31 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	})
 	if status != 0 || !strings.Contains(stdout, "_ttos_completion()") || stderr != "" {
 		t.Fatalf("completion response: status=%d stdout=%q stderr=%q", status, stdout, stderr)
+	}
+
+	dataRoot := t.TempDir()
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := daemonRequest{
+		Version: daemonAPIVersion, Action: "command", RequestID: requestID,
+		Options: daemonWireOptions{DataRoot: dataRoot}, Args: []string{"volume", "create"},
+	}
+	status, firstStdout, stderr := exchange(mutation)
+	if status != 0 || firstStdout == "" || stderr != "" {
+		t.Fatalf("first mutation: status=%d stdout=%q stderr=%q", status, firstStdout, stderr)
+	}
+	status, replayStdout, stderr := exchange(mutation)
+	if status != 0 || replayStdout != firstStdout || stderr != "" {
+		t.Fatalf("replayed mutation: status=%d stdout=%q want=%q stderr=%q", status, replayStdout, firstStdout, stderr)
+	}
+	volumes, err := os.ReadDir(filepath.Join(dataRoot, "volumes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != 1 {
+		t.Fatalf("idempotent mutation created %d volumes, want 1", len(volumes))
 	}
 
 	status, _, stderr = exchange(daemonRequest{Version: daemonAPIVersion + 1, Action: "ping"})
