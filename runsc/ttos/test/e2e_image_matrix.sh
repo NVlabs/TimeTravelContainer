@@ -525,6 +525,27 @@ echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warnin
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_COW_FIXTURE" || fail "fork check warning omitted managed CoW lower"
 echo "$FORK_CHECK_JSON" | grep -q "branch-local memory CoW upper" || fail "fork check omitted managed-overlay semantics"
 echo "$FORK_CHECK_JSON" | grep -q "cannot enforce" || fail "immutable-source warning overstated enforcement"
+
+echo "== attached exec eligibility recovery =="
+ttos exec "$LIFECYCLE" rm -f /state/attached-exec-ready /state/attached-exec-release
+ttos exec "$LIFECYCLE" sh -c \
+  'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done' \
+  >"$TTOS_E2E_ROOT/attached-exec.out" 2>"$TTOS_E2E_ROOT/attached-exec.err" &
+ATTACHED_EXEC_HOST_PID=$!
+deadline=$(( $(date +%s) + 15 ))
+while ! ttos exec "$LIFECYCLE" test -e /state/attached-exec-ready >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
+  sleep 1
+done
+if ttos fork --check "$LIFECYCLE" >"$TTOS_E2E_ROOT/attached-check.out" 2>"$TTOS_E2E_ROOT/attached-check.err"; then
+  fail "live fork accepted an attached exec with imported host stdio"
+fi
+grep -Eq '\*host.fileDescription' "$TTOS_E2E_ROOT/attached-check.out" "$TTOS_E2E_ROOT/attached-check.err" ||
+  fail "attached-exec rejection did not identify its imported host resource"
+ttos exec "$LIFECYCLE" touch /state/attached-exec-release
+wait "$ATTACHED_EXEC_HOST_PID" || fail "attached exec did not exit successfully"
+ttos fork --check "$LIFECYCLE" >/dev/null || fail "fork eligibility did not recover after attached exec exit"
+
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 echo host-mutated >"$HOST_FIXTURE/value"
 echo host-mutated-two >"$HOST_FIXTURE_TWO/value"
@@ -633,6 +654,29 @@ if ttos fork "$LIFECYCLE@main" "$LIFECYCLE@child" >"$TTOS_E2E_ROOT/lineage-reuse
 fi
 grep -q "retained by immutable lineage" "$TTOS_E2E_ROOT/lineage-reuse.err" ||
   fail "branch ID reuse rejection lacked a lineage diagnostic"
+
+echo "== branch-native detached exec bookkeeping =="
+EXEC_SELECTOR=$(ttos exec --detach "$LIFECYCLE" sh -c 'exec sleep 300')
+EXEC_ID=${EXEC_SELECTOR##*:}
+[ -n "$EXEC_ID" ] || fail "detached exec did not return a session ID"
+ttos fork "$LIFECYCLE" "$LIFECYCLE@process-child" >/dev/null
+ttos fork "$LIFECYCLE@process-child" "$LIFECYCLE@process-grandchild" >/dev/null
+for branch in main process-child process-grandchild; do
+  SESSION_JSON=$(ttos exec ls --json "$LIFECYCLE@$branch")
+  echo "$SESSION_JSON" | grep -q "\"id\": \"$EXEC_ID\"" || fail "branch $branch lost cloned exec session $EXEC_ID"
+  echo "$SESSION_JSON" | grep -q '"state": "running"' || fail "branch $branch did not retain a running exec session"
+done
+ttos exec kill "$LIFECYCLE@process-grandchild:$EXEC_ID" >/dev/null
+[ "$(ttos exec wait "$LIFECYCLE@process-grandchild:$EXEC_ID")" = 137 ] || fail "grandchild exec wait status crossed branches"
+ttos exec ls --json "$LIFECYCLE@process-child" | grep -q '"state": "running"' || fail "grandchild signal reached child exec"
+ttos exec ls --json "$LIFECYCLE@main" | grep -q '"state": "running"' || fail "grandchild signal reached parent exec"
+ttos exec kill "$LIFECYCLE@process-child:$EXEC_ID" >/dev/null
+[ "$(ttos exec wait "$LIFECYCLE@process-child:$EXEC_ID")" = 137 ] || fail "child exec wait status crossed branches"
+ttos exec ls --json "$LIFECYCLE@main" | grep -q '"state": "running"' || fail "child signal reached parent exec"
+ttos exec kill "$LIFECYCLE@main:$EXEC_ID" >/dev/null
+[ "$(ttos exec wait "$LIFECYCLE@main:$EXEC_ID")" = 137 ] || fail "parent exec wait status was not retained"
+ttos branch rm "$LIFECYCLE@process-grandchild"
+ttos branch rm "$LIFECYCLE@process-child"
 
 ttos stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||

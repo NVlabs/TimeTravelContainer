@@ -74,6 +74,9 @@ covers:
   `pause`, `resume`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, and JSON
   creation timestamps;
+- attached exec fork rejection while imported host stdio is live, immediate
+  eligibility recovery after exit, and detached exec-session ID/PID cloning
+  through parent, child, and grandchild with branch-local signal/wait status;
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
   child branch;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,

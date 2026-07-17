@@ -646,7 +646,7 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Initial tmpfs, procfs, and restricted read-only sysfs mounts.
 - [x] devpts and `/dev/ptmx` mounts for the internal TTY console.
 - [x] Initial immutable read-only gofer bind.
-- [ ] Multiple immutable read-only gofer binds and exhaustive access coverage.
+- [x] Multiple immutable read-only gofer binds and parent/child access coverage.
 - [x] Managed tmpfs submount volumes.
 - [x] Managed OverlayFS submount volumes.
 
@@ -655,9 +655,9 @@ read-only binds, and managed volumes forks without hand-editing its spec.
 
 ### Milestone B: branch-native exec
 
-- [ ] Branch-local process bookkeeping and branch-aware execute/wait/signal.
+- [x] Branch-local process bookkeeping and branch-aware execute/wait/signal.
 - [x] Synchronous non-TTY `ttos exec` with branch-aware execute/wait.
-- [ ] Eligibility recovery after an attached exec process exits and its imported
+- [x] Eligibility recovery after an attached exec process exits and its imported
       host FDs are released.
 
 Gate: commands can be launched and observed independently in parent, child, and
