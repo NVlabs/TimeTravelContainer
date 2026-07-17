@@ -499,10 +499,12 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] Initial integration coverage reads the bind in parent, child, and
       grandchild branches, rejects writes, recursively forks it, and keeps the
       grandchild functional after deleting its source branch.
-- [ ] Test multiple simultaneous read-only binds, open files, directory cursors,
-      executable mappings, recursive fork, and descendant-first or
-      ancestor-first destruction.
-- [ ] Document read-only host binds as shared external views, not snapshots:
+- [x] Test multiple simultaneous read-only binds, recursive fork, host mutation
+      visibility, and source-branch deletion while a descendant remains live.
+- [ ] Test open files, directory cursors, executable mappings, and exhaustive
+      descendant-first or ancestor-first destruction orders.
+- [x] Document and expose read-only host binds as shared external views, not
+      snapshots: TTOS inspect metadata and fork-check warnings state that
       host-side mutations may become visible to every branch.
 - [ ] Add an opt-in immutable-source assertion and diagnostics, without claiming
       the runtime can prevent an independent host writer.

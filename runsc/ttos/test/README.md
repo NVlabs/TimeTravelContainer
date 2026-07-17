@@ -76,7 +76,8 @@ covers:
   creation timestamps;
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
   child branch;
-- read-only host bind visibility and write rejection;
+- simultaneous read-only host binds, write rejection, shared-view fork warnings,
+  and host-side mutation visibility in parent and child;
 - graceful stop, branch removal, container removal, and volume removal.
 
 The test requires network access for image pulls and an accessible containerd

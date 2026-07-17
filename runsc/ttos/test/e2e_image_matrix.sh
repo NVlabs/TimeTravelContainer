@@ -64,8 +64,10 @@ fi
 DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
 HOST_FIXTURE="$TTOS_E2E_ROOT/host-fixture"
-mkdir -p "$HOST_FIXTURE"
+HOST_FIXTURE_TWO="$TTOS_E2E_ROOT/host-fixture-two"
+mkdir -p "$HOST_FIXTURE" "$HOST_FIXTURE_TWO"
 echo host-readonly >"$HOST_FIXTURE/value"
+echo host-readonly-two >"$HOST_FIXTURE_TWO/value"
 ENV_FILE="$TTOS_E2E_ROOT/container.env"
 LABEL_FILE="$TTOS_E2E_ROOT/container.labels"
 TTOS_E2E_HOST_IMPORT=host-import
@@ -428,6 +430,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 --log-opt labels=suite --log-opt env=FROM_FILE \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
+  --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly" \
   --tmpfs /scratch:mode=0700,size=1m \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=sysfs,target=/alt-sys,readonly \
@@ -486,6 +489,7 @@ if ttos exec "$LIFECYCLE" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&
 fi
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
 [ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
+[ "$(ttos exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-readonly-two" ] || fail "second read-only host bind was not readable"
 [ "$(ttos exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
 ttos exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
   fail "additional procfs/sysfs mounts were not readable"
@@ -494,7 +498,17 @@ if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null
   fail "read-only host bind accepted a write"
 fi
 ttos fork --check "$LIFECYCLE_PREFIX"
+FORK_CHECK_JSON=$(ttos fork --check --json "$LIFECYCLE_PREFIX")
+echo "$FORK_CHECK_JSON" | grep -q '"warnings"' || fail "fork check omitted shared-view warnings"
+echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE" || fail "fork check warning omitted first host bind"
+echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warning omitted second host bind"
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
+echo host-mutated >"$HOST_FIXTURE/value"
+echo host-mutated-two >"$HOST_FIXTURE_TWO/value"
+[ "$(ttos exec "$LIFECYCLE" cat /host-fixture/value)" = "host-mutated" ] || fail "parent did not observe host-side mutation"
+[ "$(ttos exec "$LIFECYCLE@child" cat /host-fixture/value)" = "host-mutated" ] || fail "child did not observe shared host-side mutation"
+[ "$(ttos exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-mutated-two" ] || fail "parent did not observe second host mutation"
+[ "$(ttos exec "$LIFECYCLE@child" cat /host-fixture-two/value)" = "host-mutated-two" ] || fail "child did not observe second shared host mutation"
 [ "$(ttos exec "$LIFECYCLE" sh -c "ulimit -n")" = 256 ] || fail "parent exec did not inherit RLIMIT_NOFILE"
 [ "$(ttos exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "parent branch lost /dev/shm size"
 ttos exec "$LIFECYCLE" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "parent exec lost configured groups or capabilities"
@@ -517,11 +531,13 @@ INSPECT_JSON="$TTOS_E2E_ROOT/lifecycle-inspect.json"
 ttos inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
 grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"
 grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
+grep -q "\"Source\":\"$HOST_FIXTURE_TWO\"" "$INSPECT_JSON" || fail "inspect omitted the second read-only host bind"
+grep -q '"semantics":"shared-external-view"' "$INSPECT_JSON" || fail "TTOS inspect omitted shared external-view semantics"
 grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch processes"
 grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
 grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
-[ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "4|1" ] || fail "internal network files leaked into Docker mount inspection"
+[ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "5|2" ] || fail "internal network files leaked into Docker mount inspection"
 
 FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
 echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"

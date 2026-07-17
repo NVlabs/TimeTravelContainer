@@ -287,7 +287,7 @@ func TestCommandsUseQualifiedBranches(t *testing.T) {
 }
 
 func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
-	b := &fakeBackend{checkResult: ForkEligibility{Eligible: true}}
+	b := &fakeBackend{checkResult: ForkEligibility{Eligible: true, Warnings: []ForkWarning{{Resource: "/host/data -> /data", Reason: "shared external view"}}}}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"fork", "--check", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("eligible check status=%d, stderr=%q", status, stderr.String())
@@ -295,7 +295,7 @@ func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
 	if b.checkTarget != (selector{container: "web", branch: "main"}) || b.forkDestination != "" {
 		t.Errorf("check target=%+v fork destination=%q", b.checkTarget, b.forkDestination)
 	}
-	if got, want := stdout.String(), "web@main eligible\n"; got != want {
+	if got, want := stdout.String(), "web@main eligible\nwarning: /host/data -> /data: shared external view\n"; got != want {
 		t.Errorf("eligible output=%q, want %q", got, want)
 	}
 
@@ -1708,6 +1708,10 @@ func TestBuildInspectInfo(t *testing.T) {
 	if len(info.Mounts) != 5 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Name != "cache" || !info.Mounts[1].RW || info.Mounts[2].Type != "tmpfs" || !info.Mounts[2].RW || info.Mounts[3].Type != "proc" || info.Mounts[3].RW || info.Mounts[4].Type != "sysfs" || info.Mounts[4].RW {
 		t.Errorf("mounts=%+v", info.Mounts)
 	}
+	if got := info.TTOS.ExternalViews; len(got) != 1 || got[0].Source != "/host/data" || got[0].Destination != "/data" || !got[0].Readonly || got[0].Semantics != "shared-external-view" {
+		t.Errorf("external views=%+v", got)
+	}
+
 	if got := info.HostConfig.Binds; !reflect.DeepEqual(got, []string{"/host/data:/data:ro"}) {
 		t.Errorf("binds=%q", got)
 	}

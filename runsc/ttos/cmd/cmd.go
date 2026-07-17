@@ -2160,6 +2160,14 @@ type InspectMount struct {
 	Propagation string `json:"Propagation"`
 }
 
+// InspectExternalView describes a read-only host resource shared by every branch.
+type InspectExternalView struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Readonly    bool   `json:"readonly"`
+	Semantics   string `json:"semantics"`
+}
+
 // InspectGraphDriver describes TTOS's immutable lower root and Sentry-memory upper layer.
 type InspectGraphDriver struct {
 	Name string            `json:"Name"`
@@ -2177,10 +2185,11 @@ type InspectBranch struct {
 
 // TTOSInspectInfo contains state with no direct Docker analogue.
 type TTOSInspectInfo struct {
-	Container    ttosbundle.ContainerInfo `json:"container"`
-	Runtime      *Family                  `json:"runtime,omitempty"`
-	Branches     []InspectBranch          `json:"branches"`
-	RuntimeError string                   `json:"runtime_error,omitempty"`
+	Container     ttosbundle.ContainerInfo `json:"container"`
+	Runtime       *Family                  `json:"runtime,omitempty"`
+	Branches      []InspectBranch          `json:"branches"`
+	ExternalViews []InspectExternalView    `json:"external_views,omitempty"`
+	RuntimeError  string                   `json:"runtime_error,omitempty"`
 }
 
 // InspectInfo combines a Docker-compatible main-container view with TTOS lineage.
@@ -3061,6 +3070,11 @@ func writeForkEligibility(w io.Writer, source selector, result ForkEligibility) 
 			return err
 		}
 	}
+	for _, warning := range result.Warnings {
+		if _, err := fmt.Fprintf(w, "warning: %s: %s\n", warning.Resource, warning.Reason); err != nil {
+			return err
+		}
+	}
 	if len(result.Issues) == 0 {
 		return nil
 	}
@@ -3612,9 +3626,16 @@ type ForkResourceIssue struct {
 	Reason   string `json:"reason"`
 }
 
+// ForkWarning reports a non-blocking observable sharing property.
+type ForkWarning struct {
+	Resource string `json:"resource"`
+	Reason   string `json:"reason"`
+}
+
 // ForkEligibility is a stable read-only fork validation report.
 type ForkEligibility struct {
 	Eligible bool                `json:"eligible"`
+	Warnings []ForkWarning       `json:"warnings,omitempty"`
 	Issues   []ForkResourceIssue `json:"issues,omitempty"`
 	Reason   string              `json:"reason,omitempty"`
 }
@@ -5340,6 +5361,12 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		args = append(args, process.Args[1:]...)
 	}
 	mounts, binds, volumes, tmpfs := inspectMounts(spec)
+	externalViews := make([]InspectExternalView, 0)
+	for _, mount := range mounts {
+		if mount.Type == "bind" {
+			externalViews = append(externalViews, InspectExternalView{Source: mount.Source, Destination: mount.Destination, Readonly: !mount.RW, Semantics: "shared-external-view"})
+		}
+	}
 	hostname := container.Name
 	configUser := inspectUser(process.User)
 	configCmd := append([]string(nil), process.Args...)
@@ -5425,7 +5452,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
-			Container: container, Runtime: family, Branches: branches, RuntimeError: runtimeErr,
+			Container: container, Runtime: family, Branches: branches, ExternalViews: externalViews, RuntimeError: runtimeErr,
 		},
 	}
 }
@@ -6165,6 +6192,20 @@ func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
 	var result ForkEligibility
 	if err := json.Unmarshal(output, &result); err != nil {
 		return ForkEligibility{}, fmt.Errorf("decoding fork eligibility: %w", err)
+	}
+	spec, err := b.containerStore().LoadSpec(target.container)
+	if err != nil {
+		return ForkEligibility{}, fmt.Errorf("loading mounts for fork diagnostics: %w", err)
+	}
+	mounts, _, _, _ := inspectMounts(spec)
+	for _, mount := range mounts {
+		if mount.Type != "bind" {
+			continue
+		}
+		result.Warnings = append(result.Warnings, ForkWarning{
+			Resource: mount.Source + " -> " + mount.Destination,
+			Reason:   "shared external view; independent host mutations may become visible in every branch",
+		})
 	}
 	return result, nil
 }
