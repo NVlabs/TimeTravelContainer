@@ -17,6 +17,8 @@ go_library(
         "//runsc/ttos/ownership",
         "@com_github_containerd_containerd_v2//client",
         "@com_github_containerd_containerd_v2//core/content",
+        "@com_github_containerd_containerd_v2//core/leases",
+        "@com_github_containerd_errdefs//:go_default_library",
         "@com_github_containerd_containerd_v2//core/images",
         "@com_github_containerd_containerd_v2//core/remotes/docker",
         "@com_github_containerd_containerd_v2//pkg/archive",

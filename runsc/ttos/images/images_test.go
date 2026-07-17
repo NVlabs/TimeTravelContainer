@@ -39,6 +39,13 @@ func TestContentReuse(t *testing.T) {
 	}
 }
 
+func TestContainerLeaseID(t *testing.T) {
+	containerID := strings.Repeat("a", 64)
+	if got, want := ContainerLeaseID(containerID), "ttos-"+containerID; got != want {
+		t.Fatalf("ContainerLeaseID=%q, want %q", got, want)
+	}
+}
+
 func TestNormalizeReference(t *testing.T) {
 	tests := []struct {
 		input string

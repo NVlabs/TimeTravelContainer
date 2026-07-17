@@ -232,7 +232,7 @@ the `main` branch and leave `ttos` responsible for branch operations.
       Docker resource names, infinity, duplicate last-value-wins behavior, OCI
       projection, and persistent inspect metadata. Sentry enforcement applies to
       the init process and exec sessions, and live forks inherit the limits.
-- [x] Support Docker `run/create --memory|-m`, `--cpus`, `--cpu-shares`,
+- [x] Support Docker `run/create --memory`/`-m`, `--cpus`, `--cpu-shares`,
       `--cpu-period`, and `--cpu-quota`, including Docker-compatible validation,
       OCI and inspect persistence, and hard host enforcement in a collision-safe
       cgroup v2 child. After `runsc create` and before `start`, TTOS proves the
@@ -619,10 +619,13 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       client from scratch.
 - [x] Use target-guarded synchronous containerd image deletion APIs for image
       removal and newly unreachable content collection.
-- [ ] Add containerd leases for materialization and live-family content
-      retention.
-- [ ] Select a rootless-compatible snapshotter; prefer an immutable directory
-      lower that can be exposed to runsc through a read-only gofer.
+- [x] Add deterministic containerd content leases for every prepared family. The
+      image target is pinned transactionally after materialization, the lease ID is
+      persisted for recovery and inspection, failed prepares roll it back, and family
+      removal releases it synchronously only after runtime teardown.
+- [x] Use no host snapshotter for execution: TTOS materializes a content-addressed,
+      caller-owned immutable directory lower that is exposed through a read-only gofer.
+      This avoids requiring a rootful or FUSE snapshotter in the live-fork path.
 - [x] Cache content-addressed directory roots and construct the initial OCI
       spec from image config plus `ttos run` options.
 - [x] Preserve distinct image UID/GID ownership in rootless materialization with
@@ -635,10 +638,12 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       implemented.
 - [x] Place an in-memory OverlayFS upper over the immutable image lower by
       default.
-- [ ] Track containerd content/snapshot leases for every live family and release
-      them only after the last branch is destroyed.
-- [ ] Keep branch-local mutable filesystem state owned by the Sentry, not by a
-      host snapshotter that cannot participate in live fork.
+- [x] Track the image-target content lease for every family and release it only
+      during family removal, after all live branches have been destroyed. TTOS does not
+      create containerd snapshot resources in the current directory-lower design.
+- [x] Keep root and managed-volume mutable state in Sentry tmpfs/OverlayFS
+      memory so it participates in live fork; containerd and host snapshotters own no
+      branch-local writable layer.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
       Python, nginx, and Redis images, covering rootless prerequisites, OCI startup,
       Docker-like lifecycle commands and inspect across created, running,
@@ -697,8 +702,9 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [ ] Preserve the standard OCI runtime command surface for external managers.
 - [ ] Prototype a containerd shim extension or side-channel API for branch
       lifecycle without changing the standard task-v2 API.
-- [ ] Ensure containerd does not garbage-collect image snapshots while any
-      TimeTravel branch still references their immutable lower.
+- [x] Keep the image target and its referenced content leased while any branch
+      in the family may reference the materialized immutable lower. No containerd
+      snapshot is used by the current execution backend.
 - [ ] Consider a future nerdctl/Docker-compatible flag layer only after the
       branch-native `ttos` model is stable.
 

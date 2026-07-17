@@ -92,6 +92,7 @@ type ContainerInfo struct {
 	Name               string            `json:"name"`
 	Reference          string            `json:"reference"`
 	Digest             string            `json:"digest"`
+	LeaseID            string            `json:"lease_id,omitempty"`
 	Platform           string            `json:"platform"`
 	BundleDir          string            `json:"bundle_dir"`
 	RootFS             string            `json:"rootfs"`
@@ -452,8 +453,14 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	keep := false
+	leaseID := ""
 	defer func() {
 		if !keep {
+			if leaseID != "" {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: leaseID})
+				cancel()
+			}
 			os.RemoveAll(containerDir)
 		}
 	}()
@@ -472,6 +479,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
+		return Prepared{}, err
+	}
+	leaseID = images.ContainerLeaseID(id)
+	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: leaseID, Digest: pulled.Digest}); err != nil {
 		return Prepared{}, err
 	}
 	for _, volume := range opts.ManagedVolumes {
@@ -496,6 +507,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Name:               opts.Name,
 		Reference:          imageInfo.Reference,
 		Digest:             pulled.Digest,
+		LeaseID:            leaseID,
 		Platform:           imageInfo.Platform,
 		BundleDir:          bundleDir,
 		RootFS:             rootfs,
@@ -919,6 +931,11 @@ func (s Store) RemoveContainer(name string) error {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
+	}
+	if info.LeaseID != "" {
+		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: info.LeaseID}); err != nil {
+			return fmt.Errorf("releasing image content for container %q: %w", name, err)
+		}
 	}
 	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
 		return fmt.Errorf("removing container %q: %w", name, err)

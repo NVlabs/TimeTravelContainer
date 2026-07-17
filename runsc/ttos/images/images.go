@@ -26,7 +26,9 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/errdefs"
 	distref "github.com/distribution/reference"
 )
 
@@ -45,6 +47,14 @@ type PullOptions struct {
 	Platform    string
 	Snapshotter string
 	Unpack      bool
+}
+
+// ContentLeaseOptions identifies a durable TTOS family lease over one image target.
+type ContentLeaseOptions struct {
+	Address   string
+	Namespace string
+	LeaseID   string
+	Digest    string
 }
 
 // ListOptions identifies the containerd image store to query.
@@ -280,6 +290,52 @@ func Resolve(infos []Info, identifier string) ([]Info, error) {
 		return matches, nil
 	}
 	panic("unreachable")
+}
+
+// ContainerLeaseID returns the deterministic containerd lease identity for a TTOS family.
+func ContainerLeaseID(containerID string) string {
+	return "ttos-" + containerID
+}
+
+// CreateContentLease pins an image target and its referenced content for a TTOS family.
+func CreateContentLease(ctx context.Context, opts ContentLeaseOptions) error {
+	if opts.LeaseID == "" || opts.Digest == "" {
+		return errors.New("content lease requires an ID and image digest")
+	}
+	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	if err != nil {
+		return fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+	}
+	defer client.Close()
+	manager := client.LeasesService()
+	lease, err := manager.Create(ctx, leases.WithID(opts.LeaseID), leases.WithLabels(map[string]string{
+		"dev.timetravelos.kind":  "sandbox-family",
+		"dev.timetravelos.image": opts.Digest,
+	}))
+	if err != nil {
+		return fmt.Errorf("creating content lease %q: %w", opts.LeaseID, err)
+	}
+	if err := manager.AddResource(ctx, lease, leases.Resource{Type: "content", ID: opts.Digest}); err != nil {
+		_ = manager.Delete(ctx, lease, leases.SynchronousDelete)
+		return fmt.Errorf("pinning image target %s in lease %q: %w", opts.Digest, opts.LeaseID, err)
+	}
+	return nil
+}
+
+// DeleteContentLease releases one family lease and synchronously collects newly unreachable content.
+func DeleteContentLease(ctx context.Context, opts ContentLeaseOptions) error {
+	if opts.LeaseID == "" {
+		return nil
+	}
+	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	if err != nil {
+		return fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+	}
+	defer client.Close()
+	if err := client.LeasesService().Delete(ctx, leases.Lease{ID: opts.LeaseID}, leases.SynchronousDelete); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("deleting content lease %q: %w", opts.LeaseID, err)
+	}
+	return nil
 }
 
 // Delete removes one exact named image record and synchronously asks
