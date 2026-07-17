@@ -298,7 +298,7 @@ Commands:
   rm [--force] CONTAINER...      Remove container metadata and runtime state
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
-  top [--json] TARGET             Show processes in one live branch
+  top [--json] TARGET [PS OPTS]   Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
   fork --check [--json] SOURCE    Validate SOURCE without creating a branch
   pause TARGET...                 Pause one or more branches
@@ -3191,17 +3191,193 @@ func executePsTemplate(w io.Writer, tmpl *template.Template, row psRow) error {
 	return err
 }
 
+type topColumn struct {
+	key   string
+	title string
+}
+
+func defaultTopColumns() []topColumn {
+	return []topColumn{{"uid", "UID"}, {"pid", "PID"}, {"ppid", "PPID"}, {"pgid", "PGID"}, {"c", "C"}, {"tty", "TTY"}, {"stime", "STIME"}, {"time", "TIME"}, {"cmd", "CMD"}}
+}
+
+func fullTopColumns() []topColumn {
+	return []topColumn{{"uid", "UID"}, {"pid", "PID"}, {"ppid", "PPID"}, {"c", "C"}, {"stime", "STIME"}, {"tty", "TTY"}, {"time", "TIME"}, {"cmd", "CMD"}}
+}
+
+func parseTopColumnList(value string) ([]topColumn, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, errors.New("top -o requires at least one column")
+	}
+	var specs []string
+	if strings.Contains(value, ",") {
+		specs = strings.Split(value, ",")
+	} else {
+		specs = strings.Fields(value)
+	}
+	columns := make([]topColumn, 0, len(specs))
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		name, title, hasTitle := strings.Cut(spec, "=")
+		name = strings.ToLower(strings.TrimSpace(name))
+		canonical, defaultTitle := "", ""
+		switch name {
+		case "uid", "euid":
+			canonical, defaultTitle = "uid", "UID"
+		case "user":
+			canonical, defaultTitle = "uid", "USER"
+		case "pid":
+			canonical, defaultTitle = "pid", "PID"
+		case "ppid":
+			canonical, defaultTitle = "ppid", "PPID"
+		case "pgid", "pgrp":
+			canonical, defaultTitle = "pgid", "PGID"
+		case "nlwp", "thcount":
+			canonical, defaultTitle = "nlwp", "NLWP"
+		case "c":
+			canonical, defaultTitle = "c", "C"
+		case "pcpu", "%cpu":
+			canonical, defaultTitle = "c", "%CPU"
+		case "tty", "tt":
+			canonical, defaultTitle = "tty", "TTY"
+		case "stime":
+			canonical, defaultTitle = "stime", "STIME"
+		case "start":
+			canonical, defaultTitle = "stime", "START"
+		case "time", "cputime":
+			canonical, defaultTitle = "time", "TIME"
+		case "cmd":
+			canonical, defaultTitle = "cmd", "CMD"
+		case "comm", "command", "args":
+			canonical, defaultTitle = "cmd", "COMMAND"
+		default:
+			return nil, fmt.Errorf("unsupported top column %q; Sentry reports uid,pid,ppid,pgid,nlwp,c,tty,stime,time,cmd", name)
+		}
+		if hasTitle {
+			defaultTitle = strings.TrimSpace(title)
+		}
+		columns = append(columns, topColumn{key: canonical, title: defaultTitle})
+	}
+	return columns, nil
+}
+
+func parseTopProcessOptions(args []string) ([]topColumn, error) {
+	columns := defaultTopColumns()
+	explicit := false
+	appendColumns := func(value string) error {
+		parsed, err := parseTopColumnList(strings.TrimPrefix(value, "="))
+		if err != nil {
+			return err
+		}
+		if !explicit {
+			columns = nil
+			explicit = true
+		}
+		columns = append(columns, parsed...)
+		return nil
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-e" || arg == "-A":
+			// The Sentry process RPC already returns every process in the branch.
+		case arg == "-f" || arg == "-ef" || arg == "-fe":
+			if !explicit {
+				columns = fullTopColumns()
+			}
+		case arg == "-o" || arg == "--format" || arg == "-eo" || arg == "-Ao":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("top %s requires a column list", arg)
+			}
+			i++
+			if err := appendColumns(args[i]); err != nil {
+				return nil, err
+			}
+		case strings.HasPrefix(arg, "--format="):
+			if err := appendColumns(strings.TrimPrefix(arg, "--format=")); err != nil {
+				return nil, err
+			}
+		case strings.HasPrefix(arg, "-eo") && len(arg) > 3:
+			if err := appendColumns(strings.TrimPrefix(arg, "-eo")); err != nil {
+				return nil, err
+			}
+		case strings.HasPrefix(arg, "-o") && len(arg) > 2:
+			if err := appendColumns(strings.TrimPrefix(arg, "-o")); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported top process option %q; use -e, -A, -f, -ef, or -o COLUMN[,COLUMN...]", arg)
+		}
+	}
+	return columns, nil
+}
+
+func topColumnValue(process ProcessInfo, key string) string {
+	switch key {
+	case "uid":
+		return strconv.FormatUint(uint64(process.UID), 10)
+	case "pid":
+		return strconv.FormatInt(int64(process.PID), 10)
+	case "ppid":
+		return strconv.FormatInt(int64(process.PPID), 10)
+	case "pgid":
+		return strconv.FormatInt(int64(process.PGID), 10)
+	case "nlwp":
+		return strconv.Itoa(len(process.Threads))
+	case "c":
+		return strconv.FormatInt(int64(process.C), 10)
+	case "tty":
+		return process.TTY
+	case "stime":
+		return process.STime
+	case "time":
+		return process.Time
+	case "cmd":
+		return process.Cmd
+	default:
+		panic("unvalidated top column " + key)
+	}
+}
+
+func writeTopTable(w io.Writer, processes []ProcessInfo, columns []topColumn) error {
+	table := tabwriter.NewWriter(w, 0, 4, 2, byte(32), 0)
+	for i, column := range columns {
+		if i != 0 {
+			fmt.Fprint(table, "\t")
+		}
+		fmt.Fprint(table, column.title)
+	}
+	fmt.Fprintln(table)
+	for _, process := range processes {
+		for i, column := range columns {
+			if i != 0 {
+				fmt.Fprint(table, "\t")
+			}
+			fmt.Fprint(table, topColumnValue(process, column.key))
+		}
+		fmt.Fprintln(table)
+	}
+	return table.Flush()
+}
+
 func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
-	fs := flag.NewFlagSet("top", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
-	if err := fs.Parse(args); err != nil {
+	jsonOutput := false
+	if len(args) != 0 && args[0] == "--json" {
+		jsonOutput = true
+		args = args[1:]
+	}
+	if len(args) < 1 {
+		return errors.New("usage: ttos top [--json] CONTAINER[@BRANCH] [PS OPTIONS]")
+	}
+	target, err := parseSelector(args[0])
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("usage: ttos top [--json] CONTAINER[@BRANCH]")
+	processOptions := args[1:]
+	if jsonOutput && len(processOptions) != 0 {
+		return errors.New("top --json cannot be combined with process formatting options")
 	}
-	target, err := parseSelector(fs.Arg(0))
+	columns, err := parseTopProcessOptions(processOptions)
 	if err != nil {
 		return err
 	}
@@ -3209,19 +3385,12 @@ func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return fmt.Errorf("listing processes in %s: %w", target, err)
 	}
-	if *jsonOutput {
+	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(processes)
 	}
-	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "UID\tPID\tPPID\tPGID\tC\tTTY\tSTIME\tTIME\tCMD")
-	for _, process := range processes {
-		fmt.Fprintf(table, "%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
-			process.UID, process.PID, process.PPID, process.PGID, process.C,
-			process.TTY, process.STime, process.Time, process.Cmd)
-	}
-	return table.Flush()
+	return writeTopTable(stdout, processes, columns)
 }
 
 func runFork(args []string, stdout, stderr io.Writer, backend backend) error {

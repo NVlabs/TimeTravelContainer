@@ -246,6 +246,42 @@ func TestTopTableAndJSON(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || !reflect.DeepEqual(got, b.processList) {
 		t.Errorf("top JSON=%+v err=%v, want %+v", got, err, b.processList)
 	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"top", "web@child", "-eo", "pid,ppid,nlwp,pcpu,comm"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("top -eo status=%d, stderr=%q", status, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 || !reflect.DeepEqual(strings.Fields(lines[0]), []string{"PID", "PPID", "NLWP", "%CPU", "COMMAND"}) || !reflect.DeepEqual(strings.Fields(lines[1]), []string{"7", "1", "2", "3", "worker"}) {
+		t.Errorf("top -eo output=%q", stdout.String())
+	}
+
+	stdout.Reset()
+	if status := runCommand([]string{"top", "web@child", "-o", "user=OWNER", "-opid,args"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("top repeated -o status=%d, stderr=%q", status, stderr.String())
+	}
+	lines = strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 || !reflect.DeepEqual(strings.Fields(lines[0]), []string{"OWNER", "PID", "COMMAND"}) || !reflect.DeepEqual(strings.Fields(lines[1]), []string{"1000", "7", "worker"}) {
+		t.Errorf("top repeated -o output=%q", stdout.String())
+	}
+}
+
+func TestTopRejectsUnsupportedProcessOptions(t *testing.T) {
+	for _, args := range [][]string{
+		{"top", "web", "aux"},
+		{"top", "web", "-o", "pid,rss"},
+		{"top", "web", "-o"},
+		{"top", "--json", "web", "-ef"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("%q status=%d, want 1", args, status)
+		}
+		if b.processTarget != (selector{}) {
+			t.Errorf("%q queried backend before rejecting options", args)
+		}
+	}
 }
 
 func TestCommandsUseQualifiedBranches(t *testing.T) {

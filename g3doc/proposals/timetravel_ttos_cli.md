@@ -308,8 +308,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Add durable `ttos events [--json] [-f|--follow]` with Docker-style
       `--since`/`--until`, type/action/subject filters, a versioned JSONL
       schema, daemon-restart persistence, and nonprinting disconnect heartbeats.
-- [ ] Add writable/virtual size accounting and pass-through process-selection
-      options for `top`.
+- [ ] Add Docker `ps --size` writable/virtual size accounting.
+- [x] Add Docker-style process-selection formatting for `top`, including the
+      common all/full selectors and explicit `-o` column lists backed only by
+      authoritative Sentry process fields.
 
 ### TimeTravel lifecycle
 
@@ -745,7 +747,10 @@ grandchild branches without PID or wait-status crossover.
 - [x] Persistent configurable log size/generation retention.
 - [x] Daemon-owned framed stdin/stdout/stderr and terminal-control transport,
       including restart reconciliation.
-- [ ] Define daemon-owned stdin lease takeover and stale-client behavior.
+- [x] Define daemon-owned stdin lease takeover and stale-client behavior:
+      client EOF releases ownership; a competing owner is rejected; explicit
+      `attach -i --takeover` cancels and joins the old request before granting the
+      keyed container/branch/exec lease.
 - [x] Detached exec creation with fork-aware per-session output drains.
 - [x] Reattach, retained logs, and exec-session detach keys.
 - [x] Internal devpts interactive consoles for init and attached exec, including
@@ -759,10 +764,13 @@ process, fork its branch, and then attach independently to both branches.
 ### Milestone D: Docker-like `ttos`
 
 - [x] Initial containerd-backed image pull/unpack and managed image-root storage.
-- [ ] Full run/create/start/stop/rm/inspect/logs/exec/attach UX.
+- [x] Full run/create/start/stop/rm/inspect/logs/exec/attach command
+      surface, exercised through Docker-style aliases and the five-image matrix.
 - [x] Initial fork/pause/resume and beautified branch tree.
 - [x] Read-only fork eligibility check.
-- [ ] Richer branch-tree diagnostics.
+- [x] Rich branch-tree diagnostics with PID 1 state, CoW state, immutable lineage
+      and deletion tombstones, creation/deletion times, fork timings, and structured
+      fork-ineligibility reports.
 - [x] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
 
@@ -772,7 +780,9 @@ bundle.
 
 ## Open semantic decisions
 
-- [ ] Exact `start` behavior for an exited in-memory branch.
+- [x] Define `start` for an exited main branch as OCI recreation from the immutable
+      image and persistent configuration. The prior in-memory root and managed-volume
+      contents are not retained after sandbox-family teardown.
 - [x] Output attachment does not reject or migrate with fork: every branch owns
       one drain, while host readers remain attached only to the selected log.
 - [x] Drain to a persistent host log instead of blocking guest output merely
@@ -781,9 +791,14 @@ bundle.
 - [x] Expose log size and generation-count policy in the user-facing CLI.
 - [x] Support multiple simultaneous output readers.
 - [x] Use one exclusive manager-level stdin owner per branch.
-- [ ] Define daemon-reconciled stdin lease takeover behavior.
+- [x] Daemon-reconciled stdin leases are process-local ownership records: daemon
+      death closes clients, restart begins with no stale owner, and `--takeover`
+      provides explicit replacement while a daemon remains alive.
 - [x] Host-mutation semantics and warnings for shared read-only binds.
-- [ ] Managed-volume sharing across unrelated families.
-- [ ] Whether stopped branch filesystem state may be retained without retaining
-      its Kernel and memory.
-- [ ] Initial direct-runsc versus extended-containerd-shim deployment model.
+- [x] Do not share managed-volume contents across unrelated families. A name is a
+      configuration identity; each family instantiates its own forkable tmpfs.
+- [x] Do not retain stopped branch filesystem state without its Kernel and memory;
+      branch-local writable state exists only for the live sandbox family.
+- [x] Use the per-user `ttosd` API as the default deployment, keep direct runsc as
+      an explicit recovery path, and defer a task-v2 shim extension until branch
+      lifecycle integration is required by external managers.
