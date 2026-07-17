@@ -72,6 +72,11 @@ func NewFilesystem(vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
 	return fs.Filesystem.VFSFilesystem(), nil
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "Sentry-owned socket filesystem state is cloned per branch"}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)

@@ -108,6 +108,11 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "procfs resolves through branch-local kernel namespaces and task state"}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)

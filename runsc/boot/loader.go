@@ -46,8 +46,6 @@ import (
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
@@ -781,15 +779,9 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("setting watchdog action: %w", err)
 	}
 	l.watchdog = watchdog.New(l.k, dogOpts)
-	rootFilesystemContained := args.Spec.Root != nil && args.Spec.Root.Readonly
-	if len(args.GoferMountConfs) != 0 && args.GoferMountConfs[0].Upper == specutils.MemoryOverlay {
-		// Memory overlays have a Sentry-owned tmpfs upper and configure their
-		// gofer lower read-only.
-		rootFilesystemContained = true
-	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
-		AllowSharedFilesystemResources: rootFilesystemContained && liveForkMountsCompatible(args.Spec, args.Conf),
+		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
 	})
 
@@ -876,39 +868,6 @@ func New(args Args) (*Loader, error) {
 	}
 
 	return l, nil
-}
-
-// liveForkMountsCompatible reports whether every explicit OCI mount belongs to
-// the initial Sentry-owned live-fork allowlist. Filesystem state is still
-// validated by Kernel.LiveFork before the source is modified.
-func liveForkMountsCompatible(spec *specs.Spec, conf *config.Config) bool {
-	if specutils.TPUProxyEnabled(spec, conf) || specutils.NVProxyEnabled(spec, conf) {
-		return false
-	}
-	for _, mount := range spec.Mounts {
-		specutils.MaybeConvertToBindMount(&mount)
-		switch mount.Type {
-		case devpts.Name, proc.Name, tmpfs.Name:
-		case Bind:
-			if conf.DirectFS || !specutils.IsReadonlyMount(mount.Options) {
-				return false
-			}
-		case sys.Name:
-			readOnly := false
-			for _, option := range mount.Options {
-				if option == "ro" {
-					readOnly = true
-					break
-				}
-			}
-			if !readOnly {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.

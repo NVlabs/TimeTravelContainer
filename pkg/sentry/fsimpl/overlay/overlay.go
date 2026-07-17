@@ -457,6 +457,11 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 	return vfs.MakeVirtualDentry(newmnt, d), nil
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "Sentry overlay metadata and writable upper state are cloned with page CoW"}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	vfsObj := fs.vfsfs.VirtualFilesystem()

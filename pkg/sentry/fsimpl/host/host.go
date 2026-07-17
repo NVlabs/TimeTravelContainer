@@ -389,6 +389,11 @@ type filesystem struct {
 	devMinor uint32
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "host-FD carrier state is cloned; each imported host FD is validated separately"}
+}
+
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)

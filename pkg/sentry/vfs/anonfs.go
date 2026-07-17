@@ -94,6 +94,11 @@ type anonDentry struct {
 	watches Watches
 }
 
+// LiveForkFilesystemEligibility implements FilesystemImplLiveForkExtension.
+func (*anonFilesystem) LiveForkFilesystemEligibility() LiveForkFilesystemEligibility {
+	return LiveForkFilesystemEligibility{Decision: LiveForkFilesystemClone, Reason: "anonfs carrier state is cloned; each anonymous file description is validated separately"}
+}
+
 // Release implements FilesystemImpl.Release.
 func (fs *anonFilesystem) Release(ctx context.Context) {
 }

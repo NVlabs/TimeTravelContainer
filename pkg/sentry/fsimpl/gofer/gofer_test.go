@@ -16,14 +16,47 @@ package gofer
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+func TestLiveForkFilesystemEligibility(t *testing.T) {
+	id := checkpoint.ResourceID{ContainerName: "container", Path: "/data"}
+	for _, tc := range []struct {
+		name     string
+		fs       filesystem
+		decision vfs.LiveForkFilesystemDecision
+		reason   string
+	}{
+		{name: "directfs", fs: filesystem{opts: filesystemOptions{directfs: directfsOpts{enabled: true}}, iopts: InternalFilesystemOptions{ReadOnly: true, UniqueID: id}}, decision: vfs.LiveForkFilesystemReject, reason: "directfs"},
+		{name: "writable server", fs: filesystem{iopts: InternalFilesystemOptions{UniqueID: id}}, decision: vfs.LiveForkFilesystemReject, reason: "not read-only"},
+		{name: "missing identity", fs: filesystem{iopts: InternalFilesystemOptions{ReadOnly: true}}, decision: vfs.LiveForkFilesystemReject, reason: "no stable resource ID"},
+		{name: "read-only lisafs", fs: filesystem{iopts: InternalFilesystemOptions{ReadOnly: true, UniqueID: id}}, decision: vfs.LiveForkFilesystemShareExternal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.fs.LiveForkFilesystemEligibility()
+			if got.Decision != tc.decision {
+				t.Errorf("decision: got %q, want %q", got.Decision, tc.decision)
+			}
+			if tc.reason != "" && !strings.Contains(got.Reason, tc.reason) {
+				t.Errorf("reason %q does not contain %q", got.Reason, tc.reason)
+			}
+			if tc.decision == vfs.LiveForkFilesystemShareExternal {
+				if !got.ReadOnly || !got.RequiresReadOnlyMount || got.StableIdentity != id.String() {
+					t.Errorf("share-external eligibility: %+v", got)
+				}
+			}
+		})
+	}
+}
 
 func TestDestroyIdempotent(t *testing.T) {
 	ctx := contexttest.Context(t)

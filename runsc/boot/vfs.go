@@ -553,6 +553,7 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 				InternalMount: true,
 				Data:          strings.Join(data, ","),
 				InternalData: gofer.InternalFilesystemOptions{
+					ReadOnly: c.root.Readonly || rootfsConf.ShouldUseOverlayfs(),
 					UniqueID: checkpoint.ResourceID{
 						ContainerName: c.containerName,
 						Path:          "/",
@@ -1059,6 +1060,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		}
 		data = append(data, goferMountData(m.goferFD.Release(), getMountAccessType(conf, m.hint), conf, m.hint != nil && m.hint.SuppressDirectFS)...)
 		internalData = gofer.InternalFilesystemOptions{
+			ReadOnly: specutils.IsReadonlyMount(m.mount.Options),
 			UniqueID: checkpoint.ResourceID{
 				ContainerName: containerName,
 				Path:          m.mount.Destination,

@@ -340,6 +340,18 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 	return subs, nil
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	if fs.enableTPUProxyPaths {
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "sysfs exposes host-backed TPU proxy paths"}
+	}
+	return vfs.LiveForkFilesystemEligibility{
+		Decision:              vfs.LiveForkFilesystemClone,
+		RequiresReadOnlyMount: true,
+		Reason:                "restricted Sentry-owned sysfs state is branch-local",
+	}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)

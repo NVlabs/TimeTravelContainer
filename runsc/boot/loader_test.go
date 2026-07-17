@@ -293,43 +293,6 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestLiveForkMountsCompatible(t *testing.T) {
-	conf := testConfig()
-	spec := testSpec()
-	spec.Mounts = []specs.Mount{
-		{Destination: "/proc", Type: "proc", Source: "proc"},
-		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs"},
-		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
-		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"mode=1777"}},
-		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro"}},
-	}
-	if !liveForkMountsCompatible(spec, conf) {
-		t.Fatal("proc/tmpfs/read-only-sysfs mounts rejected")
-	}
-	spec.Mounts[4].Options = nil
-	if liveForkMountsCompatible(spec, conf) {
-		t.Fatal("writable sysfs mount accepted")
-	}
-	spec.Mounts[4] = specs.Mount{Destination: "/host", Type: "bind", Source: "/host", Options: []string{"ro"}}
-	conf.DirectFS = false
-	if !liveForkMountsCompatible(spec, conf) {
-		t.Fatal("read-only lisafs bind mount rejected")
-	}
-	spec.Mounts[4] = specs.Mount{Destination: "/host", Type: "none", Source: "/host", Options: []string{"rbind", "ro"}}
-	if !liveForkMountsCompatible(spec, conf) {
-		t.Fatal("read-only rbind mount rejected")
-	}
-	spec.Mounts[4].Options = []string{"rbind", "rw"}
-	if liveForkMountsCompatible(spec, conf) {
-		t.Fatal("writable bind mount accepted")
-	}
-	spec.Mounts[4].Options = []string{"rbind", "ro"}
-	conf.DirectFS = true
-	if liveForkMountsCompatible(spec, conf) {
-		t.Fatal("directfs bind mount accepted")
-	}
-}
-
 // TestRunInternalTTYLiveFork verifies that a terminal container uses a fully
 // Sentry-owned PTY and that live fork duplicates both endpoints and queued data.
 func TestRunInternalTTYLiveFork(t *testing.T) {
@@ -684,10 +647,76 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("start result: %v", err)
 	}
 
+	var sharedExternalMounts int
+	for _, eligibility := range l.k.VFS().LiveForkFilesystemEligibilities(l.k.SupervisorContext()) {
+		switch eligibility.Decision {
+		case vfs.LiveForkFilesystemClone:
+		case vfs.LiveForkFilesystemShareExternal:
+			sharedExternalMounts++
+			if !eligibility.ReadOnly {
+				t.Errorf("shared live-fork mount is writable: %+v", eligibility)
+			}
+			if strings.HasPrefix(eligibility.StableIdentity, "mount:") {
+				t.Errorf("shared live-fork mount has only fallback identity: %+v", eligibility)
+			}
+		case vfs.LiveForkFilesystemReject:
+			t.Errorf("live-fork mount is unclassified or rejected: %+v", eligibility)
+		default:
+			t.Errorf("live-fork mount has invalid decision: %+v", eligibility)
+		}
+	}
+	if sharedExternalMounts != 2 {
+		t.Errorf("shared external live-fork mounts: got %d, want root lower and read-only bind", sharedExternalMounts)
+	}
+
 	// The annotated init stdio is entirely Sentry-owned and remains forkable.
 	l.k.Pause()
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
+	l.family.allowSharedFilesystemResources = false
+	eligibility, err := l.family.CheckFork(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("checking rejected shared filesystems: %v", err)
+	}
+	if eligibility.Eligible || len(eligibility.Issues) != 2 {
+		t.Fatalf("shared-filesystem eligibility report: %+v", eligibility)
+	}
+	for _, issue := range eligibility.Issues {
+		if issue.PID != 0 || issue.FD != -1 || !strings.Contains(issue.Resource, "filesystem \"9p\"") || !strings.Contains(issue.Reason, "not authorized") {
+			t.Errorf("shared-filesystem eligibility issue: %+v", issue)
+		}
+	}
+	l.family.allowSharedFilesystemResources = true
+
+	mounts := l.k.VFS().GetAllMounts(ctx)
+	var sysMount *vfs.Mount
+	for _, mount := range mounts {
+		if mount.Filesystem().FilesystemType().Name() == "sysfs" {
+			sysMount = mount
+		} else {
+			mount.DecRef(ctx)
+		}
+	}
+	if sysMount == nil {
+		t.Fatal("restricted sysfs mount is missing")
+	}
+	if err := l.k.VFS().SetMountReadOnly(sysMount, false); err != nil {
+		sysMount.DecRef(ctx)
+		t.Fatalf("temporarily making sysfs writable: %v", err)
+	}
+	eligibility, err = l.family.CheckFork(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("checking writable sysfs rejection: %v", err)
+	}
+	if eligibility.Eligible || len(eligibility.Issues) != 1 || !strings.Contains(eligibility.Issues[0].Resource, "sysfs") || !strings.Contains(eligibility.Issues[0].Reason, "read-only mount") {
+		t.Fatalf("writable sysfs eligibility report: %+v", eligibility)
+	}
+	if err := l.k.VFS().SetMountReadOnly(sysMount, true); err != nil {
+		sysMount.DecRef(ctx)
+		t.Fatalf("restoring read-only sysfs: %v", err)
+	}
+	sysMount.DecRef(ctx)
+
 	networkStack := l.k.RootNetworkNamespace().Stack().(*sentrynetstack.Stack)
 	if err := (&Network{Stack: networkStack.Stack, Kernel: l.k}).CreateLinksAndRoutes(&CreateLinksAndRoutesArgs{
 		LoopbackLinks: []LoopbackLink{DefaultLoopbackLink},
@@ -698,7 +727,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating AIO ring mapping: %v", err)
 	}
-	eligibility, err := l.family.CheckFork(DefaultBranchID)
+	eligibility, err = l.family.CheckFork(DefaultBranchID)
 	if err != nil {
 		t.Fatalf("checking AIO ring eligibility: %v", err)
 	}

@@ -38,6 +38,28 @@ import (
 )
 
 var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
+var _ vfs.FilesystemImplLiveForkExtension = (*filesystem)(nil)
+
+// LiveForkFilesystemEligibility classifies the external gofer resource. Mount
+// read-only state is validated by VFS for every mount of this filesystem.
+func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	if fs.opts.directfs.enabled {
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "directfs exposes host file descriptors that cannot be cloned"}
+	}
+	if !fs.iopts.ReadOnly {
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "gofer server connection is not read-only"}
+	}
+	if !fs.iopts.UniqueID.Ok() {
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "gofer filesystem has no stable resource ID"}
+	}
+	return vfs.LiveForkFilesystemEligibility{
+		Decision:              vfs.LiveForkFilesystemShareExternal,
+		RequiresReadOnlyMount: true,
+		ReadOnly:              true,
+		StableIdentity:        fs.iopts.UniqueID.String(),
+		Reason:                "read-only LISAFS client and root handle are borrowed by the child",
+	}
+}
 
 // +stateify savable
 type savedDentryRW struct {

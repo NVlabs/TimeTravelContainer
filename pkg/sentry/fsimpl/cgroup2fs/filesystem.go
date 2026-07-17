@@ -116,6 +116,11 @@ func (fs *filesystem) EverMounted() bool {
 	return fs.mounted.Load() != 0
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "Sentry-owned cgroup v2 state is cloned per branch"}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	if fs.root != nil {

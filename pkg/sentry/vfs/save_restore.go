@@ -17,6 +17,7 @@ package vfs
 import (
 	goContext "context"
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -46,6 +47,129 @@ func PrependErrMsg(prefix string, err error) error {
 	default:
 		return fmt.Errorf("%s: %w", prefix, err)
 	}
+}
+
+// LiveForkFilesystemDecision describes how one mounted filesystem participates
+// in an in-memory fork.
+type LiveForkFilesystemDecision string
+
+const (
+	// LiveForkFilesystemClone means all observable state is serialized into a
+	// branch-local filesystem graph, with file pages shared copy-on-write.
+	LiveForkFilesystemClone LiveForkFilesystemDecision = "clone"
+	// LiveForkFilesystemShareExternal means the cloned graph borrows a
+	// read-only external resource. The caller must explicitly allow sharing.
+	LiveForkFilesystemShareExternal LiveForkFilesystemDecision = "share-external"
+	// LiveForkFilesystemReject means that the filesystem cannot be live-forked.
+	LiveForkFilesystemReject LiveForkFilesystemDecision = "reject"
+)
+
+// LiveForkFilesystemEligibility is an implementation-level decision.
+// StableIdentity identifies external resources across the save/load boundary.
+type LiveForkFilesystemEligibility struct {
+	Decision              LiveForkFilesystemDecision
+	RequiresReadOnlyMount bool
+	ReadOnly              bool
+	StableIdentity        string
+	Reason                string
+}
+
+// FilesystemImplLiveForkExtension is implemented by filesystems that have
+// explicitly classified their live-fork behavior. Unclassified filesystems are
+// rejected by default. The method must be read-only.
+type FilesystemImplLiveForkExtension interface {
+	LiveForkFilesystemEligibility() LiveForkFilesystemEligibility
+}
+
+// LiveForkFilesystemRecord records the decision for one mounted or otherwise
+// referenced filesystem. MountID is zero when the filesystem is reachable only
+// through another filesystem, such as a gofer lower hidden by OverlayFS.
+type LiveForkFilesystemRecord struct {
+	MountID        uint64
+	Mounted        bool
+	FilesystemType string
+	ReadOnly       bool
+	Decision       LiveForkFilesystemDecision
+	StableIdentity string
+	Reason         string
+}
+
+// LiveForkFilesystemEligibilities classifies every mounted and otherwise
+// referenced filesystem in vfs. The operation is read-only.
+func (vfs *VirtualFilesystem) LiveForkFilesystemEligibilities(ctx context.Context) []LiveForkFilesystemRecord {
+	mounts := vfs.GetAllMounts(ctx)
+	defer func() {
+		for _, mount := range mounts {
+			mount.DecRef(ctx)
+		}
+	}()
+	filesystems := vfs.GetFilesystems()
+	defer func() {
+		for _, fs := range filesystems {
+			fs.DecRef(ctx)
+		}
+	}()
+
+	classify := func(fs *Filesystem, mountID uint64, mounted, mountReadOnly bool) LiveForkFilesystemRecord {
+		record := LiveForkFilesystemRecord{
+			MountID:        mountID,
+			Mounted:        mounted,
+			FilesystemType: fs.FilesystemType().Name(),
+			ReadOnly:       mountReadOnly,
+			Decision:       LiveForkFilesystemReject,
+			StableIdentity: fmt.Sprintf("filesystem:%s", fs.FilesystemType().Name()),
+			Reason:         "filesystem implementation has not classified its live-fork behavior",
+		}
+		if mounted {
+			record.StableIdentity = fmt.Sprintf("mount:%d", mountID)
+		}
+		requiresReadOnlyMount := false
+		if ext, ok := fs.Impl().(FilesystemImplLiveForkExtension); ok {
+			eligibility := ext.LiveForkFilesystemEligibility()
+			requiresReadOnlyMount = eligibility.RequiresReadOnlyMount
+			record.Decision = eligibility.Decision
+			record.Reason = eligibility.Reason
+			if !mounted {
+				record.ReadOnly = eligibility.ReadOnly
+			}
+			if eligibility.StableIdentity != "" {
+				record.StableIdentity = eligibility.StableIdentity
+			}
+			if record.Decision == LiveForkFilesystemShareExternal && !eligibility.ReadOnly {
+				record.Decision = LiveForkFilesystemReject
+				record.Reason = "external filesystem resource is not read-only"
+			}
+		}
+		if mounted && !mountReadOnly && requiresReadOnlyMount {
+			record.Decision = LiveForkFilesystemReject
+			record.Reason = "filesystem requires a read-only mount"
+		}
+		return record
+	}
+
+	records := make([]LiveForkFilesystemRecord, 0, len(mounts)+len(filesystems))
+	mountedFilesystems := make(map[*Filesystem]struct{})
+	for _, mount := range mounts {
+		fs := mount.Filesystem()
+		mountedFilesystems[fs] = struct{}{}
+		records = append(records, classify(fs, mount.ID, true, mount.ReadOnly()))
+	}
+	for _, fs := range filesystems {
+		if _, ok := mountedFilesystems[fs]; ok {
+			continue
+		}
+		records = append(records, classify(fs, 0, false, false))
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].MountID != records[j].MountID {
+			return records[i].MountID < records[j].MountID
+		}
+		if records[i].FilesystemType != records[j].FilesystemType {
+			return records[i].FilesystemType < records[j].FilesystemType
+		}
+		return records[i].StableIdentity < records[j].StableIdentity
+	})
+	return records
 }
 
 // FilesystemImplSaveRestoreExtension is an optional extension to

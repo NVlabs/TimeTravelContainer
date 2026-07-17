@@ -62,6 +62,10 @@ type LiveForkOptions struct {
 type LiveForkValidationOptions struct {
 	// AllowNetworkStack permits validation of an initialized, contained stack.
 	AllowNetworkStack bool
+
+	// AllowSharedFilesystemResources permits read-only filesystems that have
+	// explicitly classified their external resources as shareable.
+	AllowSharedFilesystemResources bool
 }
 
 // LiveForkMetrics separates parent preparation, metadata, and child restore
@@ -155,6 +159,9 @@ func (k *Kernel) ValidateLiveFork(ctx context.Context, opts LiveForkValidationOp
 				return err
 			}
 		}
+		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
+			return err
+		}
 		return k.validateLiveForkResourcesAndMappings()
 	})
 }
@@ -206,6 +213,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			if err := k.validateLiveForkNetwork(stack); err != nil {
 				return err
 			}
+		}
+		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
+			return err
 		}
 		if err := k.validateLiveForkResourcesAndMappings(); err != nil {
 			return err
@@ -345,6 +355,41 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		return nil, err
 	}
 	return child, nil
+}
+
+// validateLiveForkFilesystems rejects every mounted filesystem that has not
+// explicitly opted into cloning, or whose external resource is not authorized.
+// It runs before any live-fork CoW or VFS save mutation.
+func (k *Kernel) validateLiveForkFilesystems(ctx context.Context, allowShared bool) error {
+	var issues []LiveForkResourceIssue
+	for _, eligibility := range k.vfs.LiveForkFilesystemEligibilities(ctx) {
+		reason := ""
+		switch eligibility.Decision {
+		case vfs.LiveForkFilesystemClone:
+			continue
+		case vfs.LiveForkFilesystemShareExternal:
+			if allowShared {
+				continue
+			}
+			reason = "sharing an external filesystem resource was not authorized"
+		case vfs.LiveForkFilesystemReject:
+			reason = eligibility.Reason
+		default:
+			reason = fmt.Sprintf("invalid live-fork decision %q", eligibility.Decision)
+		}
+		resource := fmt.Sprintf("mount %d filesystem %q identity %q", eligibility.MountID, eligibility.FilesystemType, eligibility.StableIdentity)
+		if !eligibility.Mounted {
+			resource = fmt.Sprintf("referenced filesystem %q identity %q", eligibility.FilesystemType, eligibility.StableIdentity)
+		}
+		if eligibility.Reason != "" && reason != eligibility.Reason {
+			reason = fmt.Sprintf("%s: %s", reason, eligibility.Reason)
+		}
+		issues = append(issues, LiveForkResourceIssue{PID: 0, FD: -1, Resource: resource, Reason: reason})
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	return &LiveForkResourceError{Issues: issues}
 }
 
 // validateLiveForkNetwork verifies that stack is a contained root netstack and

@@ -507,7 +507,8 @@ func (f *SandboxFamily) CheckFork(sourceID string) (*ForkEligibility, error) {
 		source.k.Pause()
 	}
 	validationErr := source.k.ValidateLiveFork(source.k.SupervisorContext(), kernel.LiveForkValidationOptions{
-		AllowNetworkStack: f.allowNetworkStack,
+		AllowNetworkStack:              f.allowNetworkStack,
+		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 	})
 	if !sourceWasPaused {
 		source.k.Unpause()

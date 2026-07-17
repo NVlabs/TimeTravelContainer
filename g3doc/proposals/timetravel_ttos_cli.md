@@ -445,24 +445,30 @@ state still forks entirely in memory.
 
 ## Mount eligibility framework
 
-The initial loader now has a narrow OCI-spec allowlist for procfs, main-
-`MemoryFile` tmpfs, and read-only Sentry sysfs. Replace this transitional gate
-with an explicit decision for each reachable filesystem and mount:
+Live-fork preflight now walks both live mounts and otherwise referenced VFS
+filesystems, including image-root gofer lowers hidden beneath OverlayFS. Each
+filesystem implementation explicitly returns one of:
 
 ```text
 Clone             mutable Sentry-owned state, copied using page CoW
-ShareImmutable    explicitly immutable external lower/resource
+ShareExternal     explicitly read-only external lower/resource with stable identity
 Reject            unsupported, externally mutable, or host/device-backed
 ```
 
-- [ ] Add a VFS live-fork mount/filesystem eligibility interface returning the
+Unclassified filesystems reject by default. Gofer instances must carry a
+stable resource ID, prove that their server connection is read-only, disable
+directfs, and be mounted read-only when visible in the mount table. Restricted
+sysfs also requires a read-only mount. `CheckFork` and `LiveFork` run the same
+closure validation before shared-memory or address-space CoW preparation.
+
+- [x] Add a VFS live-fork mount/filesystem eligibility interface returning the
       decision, stable identity, and rejection reason.
-- [ ] Collect all mount decisions before any parent CoW mutation.
+- [x] Collect all mount decisions before any parent CoW mutation.
 - [ ] Include mount path, filesystem type, source class, and reason in
       structured eligibility errors.
 - [x] Replace the blanket `len(spec.Mounts) == 0` gate with an initial
       conservative allowlist that rejects every unclassified mount.
-- [ ] Replace the spec-level allowlist with closure validation over every
+- [x] Replace the spec-level allowlist with closure validation over every
       reachable mounted filesystem and resource.
 - [ ] Verify recursive forks and arbitrary destruction orders for every allowed
       mount class.
@@ -619,7 +625,7 @@ Reject            unsupported, externally mutable, or host/device-backed
 
 ### Milestone A: normal OCI bundles
 
-- [ ] Per-mount eligibility framework.
+- [x] Per-mount eligibility framework.
 - [x] Initial tmpfs, procfs, and restricted read-only sysfs mounts.
 - [x] devpts and `/dev/ptmx` mounts for the internal TTY console.
 - [x] Initial immutable read-only gofer bind.

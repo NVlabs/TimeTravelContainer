@@ -463,6 +463,11 @@ func (fs *filesystem) effectiveRootCgroup() kernel.Cgroup {
 	}
 }
 
+// LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
+func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "Sentry-owned cgroup v1 state is cloned per branch"}
+}
+
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	k := kernel.KernelFromContext(ctx)

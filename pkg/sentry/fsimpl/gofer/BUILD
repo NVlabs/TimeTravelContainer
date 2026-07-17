@@ -143,8 +143,10 @@ go_test(
     deps = [
         "//pkg/abi/linux",
         "//pkg/lisafs",
+        "//pkg/sentry/checkpoint",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/ktime",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/vfs",
     ],
 )

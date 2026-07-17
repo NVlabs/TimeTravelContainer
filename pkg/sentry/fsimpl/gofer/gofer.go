@@ -411,6 +411,11 @@ const (
 //
 // +stateify savable
 type InternalFilesystemOptions struct {
+	// ReadOnly records that the gofer server connection itself was configured
+	// without write access. This remains meaningful when the mount is hidden
+	// beneath OverlayFS and no longer appears in the live mount table.
+	ReadOnly bool
+
 	// If UniqueID is non-empty, it is used to reassociate the filesystem with
 	// a new server FD during restoration from checkpoint.
 	UniqueID checkpoint.ResourceID
