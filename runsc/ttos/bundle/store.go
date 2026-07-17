@@ -15,12 +15,14 @@
 package bundle
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,6 +42,7 @@ const (
 	imageRootFormatVersion = "v3"
 	containerIDBytes       = 32
 	volumeIDBytes          = 32
+	volumeSnapshotFile     = "snapshot.tar"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
 )
@@ -321,15 +324,17 @@ type VolumeUsage struct {
 	Readonly    bool   `json:"readonly,omitempty"`
 }
 
-// VolumeInfo is persistent metadata for a family-local managed volume. Volume
-// contents live in Sentry tmpfs and are not checkpointed to this store. Usage
-// is populated dynamically by volume inspect --usage and is never persisted.
+// VolumeInfo is persistent metadata for a managed volume. Live contents remain in
+// Sentry tmpfs; an explicit commit or import may publish a tar seed in this store.
+// Usage is populated dynamically by volume inspect --usage and is never persisted.
 type VolumeInfo struct {
-	Name       string         `json:"name"`
-	Driver     string         `json:"driver"`
-	QuotaBytes int64          `json:"quota_bytes,omitempty"`
-	CreatedAt  time.Time      `json:"created_at"`
-	Usage      *[]VolumeUsage `json:"usage,omitempty"`
+	Name              string         `json:"name"`
+	Driver            string         `json:"driver"`
+	QuotaBytes        int64          `json:"quota_bytes,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	SnapshotBytes     int64          `json:"snapshot_bytes,omitempty"`
+	SnapshotUpdatedAt *time.Time     `json:"snapshot_updated_at,omitempty"`
+	Usage             *[]VolumeUsage `json:"usage,omitempty"`
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -469,6 +474,14 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			return Prepared{}, err
 		}
 		opts.ManagedVolumes[i].QuotaBytes = info.QuotaBytes
+		if info.SnapshotUpdatedAt != nil {
+			snapshot, err := s.VolumeSnapshotPath(info.Name)
+			if err != nil {
+				return Prepared{}, err
+			}
+			opts.ManagedVolumes[i].SeedTar = snapshot
+			opts.ManagedVolumes[i].NoCopy = true
+		}
 	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
@@ -1188,6 +1201,84 @@ func (s Store) EnsureVolumeWithQuota(name string, quotaBytes int64) (VolumeInfo,
 	return VolumeInfo{}, err
 }
 
+// VolumeSnapshotPath returns the private persistent seed path for name.
+func (s Store) VolumeSnapshotPath(name string) (string, error) {
+	if err := validateVolumeName(name); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.Root, "volumes", name, volumeSnapshotFile), nil
+}
+
+func validateVolumeSnapshot(file *os.File) error {
+	reader := tar.NewReader(file)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		clean := filepath.Clean(header.Name)
+		if filepath.IsAbs(header.Name) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("archive entry %q escapes the volume root", header.Name)
+		}
+	}
+	_, err := file.Seek(0, io.SeekStart)
+	return err
+}
+
+// ImportVolumeSnapshot atomically replaces the persistent seed for name.
+func (s Store) ImportVolumeSnapshot(name, sourcePath string) error {
+	if _, err := s.LoadVolume(name); err != nil {
+		return err
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("opening volume snapshot %q: %w", sourcePath, err)
+	}
+	defer source.Close()
+	if info, err := source.Stat(); err != nil {
+		return fmt.Errorf("stating volume snapshot %q: %w", sourcePath, err)
+	} else if !info.Mode().IsRegular() {
+		return fmt.Errorf("volume snapshot %q is not a regular file", sourcePath)
+	}
+	if err := validateVolumeSnapshot(source); err != nil {
+		return fmt.Errorf("validating volume snapshot %q: %w", sourcePath, err)
+	}
+
+	destination, err := s.VolumeSnapshotPath(name)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".snapshot-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary volume snapshot: %w", err)
+	}
+	tempPath := temp.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			temp.Close()
+			os.Remove(tempPath)
+		}
+	}()
+	if _, err := io.Copy(temp, source); err != nil {
+		return fmt.Errorf("copying volume snapshot: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("syncing volume snapshot: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("closing volume snapshot: %w", err)
+	}
+	if err := os.Rename(tempPath, destination); err != nil {
+		return fmt.Errorf("publishing volume snapshot: %w", err)
+	}
+	keep = true
+	return nil
+}
+
 // LoadVolume returns persistent managed-volume metadata.
 func (s Store) LoadVolume(name string) (VolumeInfo, error) {
 	if err := validateVolumeName(name); err != nil {
@@ -1209,6 +1300,15 @@ func (s Store) LoadVolume(name string) (VolumeInfo, error) {
 	}
 	if info.Name != name || info.Driver != "local-tmpfs" {
 		return VolumeInfo{}, fmt.Errorf("volume %q has invalid metadata", name)
+	}
+	if snapshot, err := s.VolumeSnapshotPath(name); err == nil {
+		if stat, statErr := os.Stat(snapshot); statErr == nil {
+			updated := stat.ModTime().UTC()
+			info.SnapshotBytes = stat.Size()
+			info.SnapshotUpdatedAt = &updated
+		} else if !os.IsNotExist(statErr) {
+			return VolumeInfo{}, fmt.Errorf("stating volume %q snapshot: %w", name, statErr)
+		}
 	}
 	return info, nil
 }

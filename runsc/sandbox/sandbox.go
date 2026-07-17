@@ -993,6 +993,17 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", specutils.RootfsTarUpperPath(args.Spec), os.O_RDONLY, lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
+	mountTarPaths, err := specutils.MountTarPaths(args.Spec)
+	if err != nil {
+		return err
+	}
+	for _, seed := range mountTarPaths {
+		file, err := os.Open(seed.Path)
+		if err != nil {
+			return fmt.Errorf("opening tar seed for mount %q: %w", seed.Source, err)
+		}
+		donations.DonateAndClose("mount-tar-fds", file)
+	}
 
 	// Pass gofer mount configs.
 	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())

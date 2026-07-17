@@ -62,8 +62,9 @@ container configuration and `logs --details` prefixes them in sorted order;
 private attach transport remains available. A rootless per-user `ttosd` now
 autostarts on a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
-`--direct` remains an explicit recovery path. Persistent managed-volume
-backing, lifecycle events, and transactional mutations remain TODO.
+`--direct` remains an explicit recovery path. Explicit managed-volume
+commit/import seeds, lifecycle events, and transactional mutations are
+implemented; automatic volume commit during family teardown remains TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -265,9 +266,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] `ttos restart CONTAINER...` for created, exited, running, or paused base
       containers, including TERM/timeout/KILL behavior. Restart rejects an
       individual branch because destroyed in-memory branches cannot be
-      reconstructed. Live descendants or in-memory managed volumes require
-      explicit `--force`; persistent volume restart parity remains blocked on
-      persistent managed-volume backing.
+      reconstructed. Live descendants require explicit `--force`; managed
+      volumes can be retained with `volume commit` before restart. Automatic
+      lifecycle commit parity remains TODO.
 - [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
 - [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
 - [x] Initial `ttos rm CONTAINER`: remove stopped/created family metadata,
@@ -622,12 +623,16 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Initial family-local semantics: attaching a name instantiates one tmpfs
       per sandbox family; the same name in unrelated families does not share
       data.
-- [ ] Retain managed-volume contents across sandbox-family teardown. The first
-      slice persists metadata only; contents remain entirely in Sentry memory.
+- [x] Retain explicitly committed managed-volume contents across sandbox-family
+      teardown. `ttos volume commit CONTAINER[@BRANCH] VOLUME` atomically
+      publishes the selected live branch as the volume's persistent seed.
 - [x] Add tar export of a selected branch's managed volume without making
       disk checkpointing part of live fork.
-- [ ] Add commit/import of a selected export as the persistent seed for a new
-      sandbox family.
+- [x] Add `ttos volume import --input TAR VOLUME` and automatically seed a new
+      sandbox family's Sentry-owned tmpfs from the validated archive.
+- [ ] Automatically commit the selected main-branch volume state during ordinary
+      stop/remove/restart lifecycle transitions, with an explicit policy for
+      live descendants and forced teardown.
 
 ## Image and storage backend
 
@@ -685,8 +690,9 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       request workers.
 - [x] Provide an autostarted rootless per-user socket and private runtime
       directory by default, with peer-UID checks and a `0600` socket.
-- [x] Persist family configuration, image references, managed-volume metadata,
-      lineage, and tombstones; live memory remains exclusively in the Sentry.
+- [x] Persist family configuration, image references, managed-volume metadata and
+      optional committed tar seeds, lineage, and tombstones; live branch memory
+      remains exclusively in the Sentry.
 - [x] Reconcile persisted metadata with containerd inventory and live runsc
       sandboxes after daemon restart, and restart missing branch/exec console
       drainers. The current direct-runsc backend has no shim process.
@@ -796,8 +802,9 @@ bundle.
 ## Open semantic decisions
 
 - [x] Define `start` for an exited main branch as OCI recreation from the immutable
-      image and persistent configuration. The prior in-memory root and managed-volume
-      contents are not retained after sandbox-family teardown.
+      image and persistent configuration. Managed volumes start from their latest
+      explicitly committed or imported seed; uncommitted in-memory branch changes
+      are not retained after sandbox-family teardown.
 - [x] Output attachment does not reject or migrate with fork: every branch owns
       one drain, while host readers remain attached only to the selected log.
 - [x] Drain to a persistent host log instead of blocking guest output merely

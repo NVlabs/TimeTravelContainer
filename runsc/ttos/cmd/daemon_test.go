@@ -89,6 +89,8 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"image", "pull", "alpine"}, true},
 		{[]string{"volume", "create", "cache"}, true},
 		{[]string{"volume", "export", "--output", "/tmp/cache.tar", "demo", "cache"}, true},
+		{[]string{"volume", "import", "--input", "/tmp/cache.tar", "cache"}, true},
+		{[]string{"volume", "commit", "demo", "cache"}, true},
 		{[]string{"branch", "remove", "demo"}, true},
 		{[]string{"run", "-d", "alpine"}, true},
 		{[]string{"run", "--detach=false", "alpine"}, false},

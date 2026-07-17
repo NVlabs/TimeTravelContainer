@@ -222,7 +222,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return nil, nil
 	case "volume":
 		if len(rest) == 0 {
-			return []string{"create", "export", "inspect", "ls", "rm"}, nil
+			return []string{"commit", "create", "export", "import", "inspect", "ls", "rm"}, nil
 		}
 		if rest[0] == "inspect" || rest[0] == "rm" || rest[0] == "remove" {
 			return volumeCompletionCandidates(backend)

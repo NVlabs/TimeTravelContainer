@@ -15,9 +15,11 @@
 package bundle
 
 import (
+	"archive/tar"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
@@ -881,6 +884,81 @@ func TestVolumeStoreLifecycle(t *testing.T) {
 	}
 	if volumes, err := store.ListVolumes(); err != nil || len(volumes) != 0 {
 		t.Fatalf("volumes after remove=%+v, err=%v", volumes, err)
+	}
+}
+
+func TestVolumeSnapshotImportIsAtomicAndValidated(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	if _, err := store.CreateVolume("cache"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	writeTar := func(path, name, contents string) {
+		t.Helper()
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer := tar.NewWriter(file)
+		if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(contents))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte(contents)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	good := filepath.Join(root, "good.tar")
+	writeTar(good, "./state", "branch-state")
+	if err := store.ImportVolumeSnapshot("cache", good); err != nil {
+		t.Fatalf("ImportVolumeSnapshot: %v", err)
+	}
+	info, err := store.LoadVolume("cache")
+	if err != nil {
+		t.Fatalf("LoadVolume: %v", err)
+	}
+	if info.SnapshotBytes == 0 || info.SnapshotUpdatedAt == nil {
+		t.Fatalf("snapshot metadata=%+v", info)
+	}
+	snapshot, err := store.VolumeSnapshotPath("cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(root, "bad.tar")
+	writeTar(bad, "../escape", "rejected")
+	if err := store.ImportVolumeSnapshot("cache", bad); err == nil {
+		t.Fatal("ImportVolumeSnapshot accepted an escaping archive entry")
+	}
+	got, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Error("rejected import replaced the prior snapshot")
+	}
+}
+
+func TestBuildSpecVolumeSeed(t *testing.T) {
+	seed := filepath.Join(t.TempDir(), "snapshot.tar")
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{
+		RootFS:         t.TempDir(),
+		ManagedVolumes: []ManagedVolume{{Name: "cache", Destination: "/cache", SeedTar: seed}},
+	})
+	if err != nil {
+		t.Fatalf("BuildSpec: %v", err)
+	}
+	want := fmt.Sprintf(`{"ttos-volume-cache":%q}`, seed)
+	if got := spec.Annotations[specutils.AnnotationMountTar]; got != want {
+		t.Errorf("mount tar annotation=%q, want %q", got, want)
 	}
 }
 

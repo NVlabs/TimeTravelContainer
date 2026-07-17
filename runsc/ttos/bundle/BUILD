@@ -14,6 +14,7 @@ go_library(
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
         "//pkg/abi/linux",
+        "//runsc/specutils",
         "//runsc/ttos/console",
         "//runsc/ttos/images",
         "//runsc/ttos/ownership",

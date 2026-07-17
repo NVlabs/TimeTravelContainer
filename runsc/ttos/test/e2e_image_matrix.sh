@@ -101,6 +101,8 @@ HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
 QUOTA_VOLUME="$PREFIX-quota"
 QUOTA_CONTAINER="$PREFIX-quota-container"
+QUOTA_RESTORED="$PREFIX-quota-restored"
+QUOTA_IMPORTED="$PREFIX-quota-imported"
 
 ttos() {
   if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
@@ -126,7 +128,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" "$QUOTA_VOLUME" >/dev/null 2>&1 || true
@@ -480,7 +482,14 @@ if ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/overflow bs=409
 fi
 [ "$(ttos exec "$QUOTA_CONTAINER" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "parent managed-volume quota size is incorrect"
 [ "$(ttos exec "$QUOTA_CONTAINER@child" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "child managed-volume quota size is incorrect"
+ttos volume commit "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME" >/dev/null
+ttos volume inspect "$QUOTA_VOLUME" | grep -q '"snapshot_bytes":' || fail "volume commit did not publish snapshot metadata"
 ttos rm --force "$QUOTA_CONTAINER"
+ttos run --name "$QUOTA_RESTORED" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota" "$BUSYBOX_IMAGE" sh -c 'test -f /quota/child; test ! -e /quota/parent; test "$(wc -c </quota/child)" -eq 4096'
+ttos rm "$QUOTA_RESTORED"
+ttos volume import --input "$TTOS_E2E_ROOT/quota-parent.tar" "$QUOTA_VOLUME" >/dev/null
+ttos run --name "$QUOTA_IMPORTED" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota" "$BUSYBOX_IMAGE" sh -c 'test -f /quota/base; test ! -e /quota/child; test ! -e /quota/parent'
+ttos rm "$QUOTA_IMPORTED"
 ttos volume rm "$QUOTA_VOLUME"
 
 echo "== detached lifecycle, managed-volume CoW, and live fork =="

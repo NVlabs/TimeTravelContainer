@@ -73,6 +73,9 @@ const (
 	//	"dev.gvisor.tar.rootfs.upper.<container-name>": "<path>"
 	AnnotationRootfsUpperTar = "dev.gvisor.tar.rootfs.upper"
 
+	// AnnotationMountTar maps shared mount sources to tar seed paths.
+	AnnotationMountTar = "dev.gvisor.tar.mounts"
+
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
 	// Usage:
@@ -280,6 +283,25 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		if strings.HasPrefix(annotation, mountHintPrefix) && strings.HasSuffix(annotation, ".source") && source != "" {
 			spec.Annotations[annotation] = absPath(bundleDir, source)
 		}
+	}
+	if encoded := spec.Annotations[AnnotationMountTar]; encoded != "" {
+		var seeds map[string]string
+		if err := json.Unmarshal([]byte(encoded), &seeds); err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationMountTar, err)
+		}
+		normalized := make(map[string]string, len(seeds))
+		for source, seed := range seeds {
+			source = absPath(bundleDir, source)
+			if _, ok := normalized[source]; ok {
+				return fmt.Errorf("%s contains duplicate normalized source %q", AnnotationMountTar, source)
+			}
+			normalized[source] = seed
+		}
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationMountTar, err)
+		}
+		spec.Annotations[AnnotationMountTar] = string(encoded)
 	}
 
 	if containerName := containerNameNoRemap(spec); len(containerName) > 0 {
@@ -913,6 +935,36 @@ func RootfsTarUpperPath(spec *specs.Spec) string {
 		return ""
 	}
 	return spec.Annotations[AnnotationRootfsUpperTar]
+}
+
+// MountTarPath associates one shared mount source with a host tar path.
+type MountTarPath struct {
+	Source string
+	Path   string
+}
+
+// MountTarPaths returns shared mount tar seeds in deterministic source order.
+func MountTarPaths(spec *specs.Spec) ([]MountTarPath, error) {
+	if spec == nil || spec.Annotations == nil || spec.Annotations[AnnotationMountTar] == "" {
+		return nil, nil
+	}
+	var paths map[string]string
+	if err := json.Unmarshal([]byte(spec.Annotations[AnnotationMountTar]), &paths); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", AnnotationMountTar, err)
+	}
+	sources := make([]string, 0, len(paths))
+	for source, path := range paths {
+		if source == "" || path == "" {
+			return nil, fmt.Errorf("%s contains an empty source or path", AnnotationMountTar)
+		}
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+	result := make([]MountTarPath, 0, len(sources))
+	for _, source := range sources {
+		result = append(result, MountTarPath{Source: source, Path: paths[source]})
+	}
+	return result, nil
 }
 
 // AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and

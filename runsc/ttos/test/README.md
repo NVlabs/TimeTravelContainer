@@ -93,7 +93,9 @@ covers:
   child branch, including persisted `volume create --opt size=BYTES` quotas and
   independent quota enforcement after live fork, `volume inspect --usage
   CONTAINER[@BRANCH]` assertions for branch-local logical-byte divergence, and
-  branch-selected `volume export` tar isolation;
+  branch-selected `volume export` tar isolation, atomic `volume commit` of a
+  selected live branch, teardown and restoration into a new sandbox family,
+  validated `volume import`, and replacement-seed semantics;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

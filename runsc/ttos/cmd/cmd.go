@@ -3869,7 +3869,7 @@ func parseVolumeQuotaOptions(options []string) (int64, error) {
 
 func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttos volume create|ls|inspect|export|rm [OPTIONS]")
+		return errors.New("usage: ttos volume create|ls|inspect|import|commit|export|rm [OPTIONS]")
 	}
 	switch args[0] {
 	case "create":
@@ -3971,6 +3971,40 @@ func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(volumes)
+	case "import":
+		fs := flag.NewFlagSet("volume import", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		inputPath := fs.String("input", "", "absolute host path to a tar archive")
+		fs.StringVar(inputPath, "i", "", "absolute host path to a tar archive")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 || *inputPath == "" {
+			return errors.New("usage: ttos volume import --input PATH VOLUME")
+		}
+		if !filepath.IsAbs(*inputPath) {
+			return fmt.Errorf("volume import input path %q must be absolute", *inputPath)
+		}
+		info, err := backend.importVolume(fs.Arg(0), filepath.Clean(*inputPath))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, info.Name)
+		return nil
+	case "commit":
+		if len(args) != 3 {
+			return errors.New("usage: ttos volume commit CONTAINER[@BRANCH] VOLUME")
+		}
+		target, err := parseSelector(args[1])
+		if err != nil {
+			return err
+		}
+		info, err := backend.commitVolume(target, args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, info.Name)
+		return nil
 	case "export":
 		fs := flag.NewFlagSet("volume export", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -4244,6 +4278,8 @@ type backend interface {
 	inspectVolume(name string) (ttosbundle.VolumeInfo, error)
 	volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error)
 	exportVolume(target selector, name, outputPath string) error
+	importVolume(name, inputPath string) (ttosbundle.VolumeInfo, error)
+	commitVolume(target selector, name string) (ttosbundle.VolumeInfo, error)
 	removeVolume(name string) error
 }
 
@@ -6586,6 +6622,29 @@ func (b *runtimeBackend) exportVolume(target selector, name, outputPath string) 
 		return fmt.Errorf("publishing volume export %q: %w", outputPath, err)
 	}
 	return nil
+}
+
+func (b *runtimeBackend) importVolume(name, inputPath string) (ttosbundle.VolumeInfo, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	if err := store.ImportVolumeSnapshot(name, inputPath); err != nil {
+		return ttosbundle.VolumeInfo{}, err
+	}
+	return store.LoadVolume(name)
+}
+
+func (b *runtimeBackend) commitVolume(target selector, name string) (ttosbundle.VolumeInfo, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	if _, err := store.LoadVolume(name); err != nil {
+		return ttosbundle.VolumeInfo{}, err
+	}
+	snapshot, err := store.VolumeSnapshotPath(name)
+	if err != nil {
+		return ttosbundle.VolumeInfo{}, err
+	}
+	if err := b.exportVolume(target, name, snapshot); err != nil {
+		return ttosbundle.VolumeInfo{}, err
+	}
+	return store.LoadVolume(name)
 }
 
 func (b *runtimeBackend) removeVolume(name string) error {

@@ -1984,6 +1984,20 @@ func TestVolumeCommands(t *testing.T) {
 	if b.volumeExportTarget != (selector{container: "demo", branch: "child"}) || b.volumeExportName != "cache" || b.volumeExportPath != exportPath || stdout.String() != exportPath+"\n" {
 		t.Errorf("export target=%+v name=%q path=%q output=%q", b.volumeExportTarget, b.volumeExportName, b.volumeExportPath, stdout.String())
 	}
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "import", "--input", exportPath, "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume import status=%d stderr=%q", status, stderr.String())
+	}
+	if b.volumeImportName != "cache" || b.volumeImportPath != exportPath || stdout.String() != "cache\n" {
+		t.Errorf("import name=%q path=%q output=%q", b.volumeImportName, b.volumeImportPath, stdout.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "commit", "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume commit status=%d stderr=%q", status, stderr.String())
+	}
+	if b.volumeCommitTarget != (selector{container: "demo", branch: "child"}) || b.volumeCommitName != "cache" || stdout.String() != "cache\n" {
+		t.Errorf("commit target=%+v name=%q output=%q", b.volumeCommitTarget, b.volumeCommitName, stdout.String())
+	}
 
 	stdout.Reset()
 	if status := runCommand([]string{"volume", "rm", "cache"}, &stdout, &stderr, b); status != 0 {
@@ -2966,6 +2980,10 @@ type fakeBackend struct {
 	volumeExportTarget selector
 	volumeExportName   string
 	volumeExportPath   string
+	volumeImportName   string
+	volumeImportPath   string
+	volumeCommitTarget selector
+	volumeCommitName   string
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3180,6 +3198,18 @@ func (b *fakeBackend) exportVolume(target selector, name, outputPath string) err
 	b.volumeExportName = name
 	b.volumeExportPath = outputPath
 	return b.err
+}
+
+func (b *fakeBackend) importVolume(name, inputPath string) (ttosbundle.VolumeInfo, error) {
+	b.volumeImportName = name
+	b.volumeImportPath = inputPath
+	return ttosbundle.VolumeInfo{Name: name}, b.err
+}
+
+func (b *fakeBackend) commitVolume(target selector, name string) (ttosbundle.VolumeInfo, error) {
+	b.volumeCommitTarget = target
+	b.volumeCommitName = name
+	return ttosbundle.VolumeInfo{Name: name}, b.err
 }
 
 func (b *fakeBackend) removeVolume(name string) error {

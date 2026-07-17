@@ -105,6 +105,9 @@ type Boot struct {
 	// overlayfs mount for certain gofer mounts.
 	goferFilestoreFDs sandboxsetup.IntFlags
 
+	// mountTarFDs are ordered tar seeds for shared mounts.
+	mountTarFDs sandboxsetup.IntFlags
+
 	// goferMountConfs contains information about how the gofer mounts have been
 	// configured. The first entry is for rootfs and the following entries are
 	// for bind mounts in Spec.Mounts (in the same order).
@@ -270,6 +273,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
+	f.Var(&b.mountTarFDs, "mount-tar-fds", "ordered tar seed FDs for shared mounts")
 	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
 	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
@@ -619,6 +623,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		FSRestoreFDs:             b.fsRestoreFDs.GetFDs(),
 		FSRestoreCheckpointGofer: b.fsRestoreCheckpointGofer,
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
+		MountTarFDs:              b.mountTarFDs.GetArray(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {

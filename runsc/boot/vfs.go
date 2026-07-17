@@ -447,6 +447,9 @@ type containerMounter struct {
 	// rootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
+
+	// mountTarFDs are consumed when shared tmpfs masters are created.
+	mountTarFDs map[string]*fd.FD
 }
 
 // +checklocks:l.mu
@@ -463,6 +466,7 @@ func (l *Loader) newContainerMounter(info *containerInfo) *containerMounter {
 		containerID:       info.cid,
 		containerName:     info.containerName,
 		rootfsUpperTarFD:  info.rootfsUpperTarFD,
+		mountTarFDs:       info.mountTarFDs,
 	}
 }
 
@@ -856,6 +860,14 @@ func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec,
 
 	if err := c.mountTmp(ctx, spec, conf, creds, mns); err != nil {
 		return fmt.Errorf(`mount submount "/tmp": %w`, err)
+	}
+	if len(c.mountTarFDs) != 0 {
+		hints := make([]string, 0, len(c.l.mountHints.Mounts))
+		for name, hint := range c.l.mountHints.Mounts {
+			hints = append(hints, fmt.Sprintf("%s=%q", name, hint.Mount.Source))
+		}
+		sort.Strings(hints)
+		return fmt.Errorf("not all mount tar FDs were consumed: %v; mount hints: %v", c.mountTarFDs, hints)
 	}
 	return nil
 }
@@ -1580,6 +1592,22 @@ func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Sp
 	}
 	if len(fsName) == 0 {
 		return nil, fmt.Errorf("mount type not supported %q", mntInfo.hint.Mount.Type)
+	}
+	if tarFD := c.mountTarFDs[mntInfo.hint.Mount.Source]; tarFD != nil {
+		if fsName != tmpfs.Name {
+			return nil, fmt.Errorf("tar seed for shared mount %q requires tmpfs, got %q", mntInfo.hint.Mount.Source, fsName)
+		}
+		tmpfsOpts := tmpfs.FilesystemOpts{}
+		if opts.GetFilesystemOptions.InternalData != nil {
+			var ok bool
+			tmpfsOpts, ok = opts.GetFilesystemOptions.InternalData.(tmpfs.FilesystemOpts)
+			if !ok || tmpfsOpts.SourceTar != nil {
+				return nil, fmt.Errorf("shared mount %q has incompatible tmpfs internal data", mntInfo.hint.Mount.Source)
+			}
+		}
+		tmpfsOpts.SourceTar = tarFD.ReleaseToFile("mount-tar-" + mntInfo.hint.Mount.Source)
+		opts.GetFilesystemOptions.InternalData = tmpfsOpts
+		delete(c.mountTarFDs, mntInfo.hint.Mount.Source)
 	}
 	return c.l.k.VFS().MountDisconnected(ctx, creds, "", fsName, opts)
 }

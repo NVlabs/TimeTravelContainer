@@ -31,6 +31,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
@@ -132,6 +133,7 @@ type ManagedVolume struct {
 	Name        string `json:"name"`
 	Destination string `json:"destination"`
 	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
+	SeedTar     string `json:"-"`
 	Readonly    bool   `json:"readonly,omitempty"`
 	// Anonymous records that Name was generated for a source-less Docker
 	// volume request or an image VOLUME declaration.
@@ -753,6 +755,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	}
 	volumeSources := make(map[string]string)
 	volumeOptions := make(map[string][]string)
+	volumeSeeds := make(map[string]string)
 	for _, volume := range opts.ManagedVolumes {
 		if err := validateVolumeName(volume.Name); err != nil {
 			return nil, err
@@ -786,11 +789,28 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 				annotations[hint+"copyup"] = "true"
 			}
 		}
+		if volume.SeedTar != "" {
+			seed := filepath.Clean(volume.SeedTar)
+			if !filepath.IsAbs(seed) {
+				return nil, fmt.Errorf("managed volume %q seed tar path %q is not absolute", volume.Name, volume.SeedTar)
+			}
+			if existing := volumeSeeds[source]; existing != "" && existing != seed {
+				return nil, fmt.Errorf("managed volume %q has conflicting seed tar paths", volume.Name)
+			}
+			volumeSeeds[source] = seed
+		}
 		mountOptions := append([]string(nil), volumeOptions[volume.Name]...)
 		if volume.Readonly {
 			mountOptions[0] = "ro"
 		}
 		mounts = append(mounts, specs.Mount{Destination: destination, Type: "tmpfs", Source: source, Options: mountOptions})
+	}
+	if len(volumeSeeds) != 0 {
+		encoded, err := json.Marshal(volumeSeeds)
+		if err != nil {
+			return nil, fmt.Errorf("encoding managed volume seed paths: %w", err)
+		}
+		annotations[specutils.AnnotationMountTar] = string(encoded)
 	}
 
 	return &specs.Spec{
