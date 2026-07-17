@@ -1099,6 +1099,7 @@ type runRequest struct {
 	consoleLogMaxFiles int
 	managedVolumes     []ttosbundle.ManagedVolume
 	autoRemove         bool
+	readonlyRootfs     bool
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -1151,6 +1152,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	terminal := fs.Bool("tty", false, "allocate a terminal")
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
 	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
+	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1222,6 +1224,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
+		readonlyRootfs:     *readonlyRootfs,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1261,6 +1264,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	terminal := fs.Bool("tty", false, "allocate a terminal")
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
 	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
+	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1332,6 +1336,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
+		readonlyRootfs:     *readonlyRootfs,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -3541,6 +3546,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
+			ReadonlyRootfs:   request.readonlyRootfs,
 			Entrypoint:       request.entrypoint,
 			ManagedVolumes:   request.managedVolumes,
 			HostMounts:       request.hostMounts,
@@ -3581,6 +3587,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
+			ReadonlyRootfs:   request.readonlyRootfs,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			ManagedVolumes:   request.managedVolumes,

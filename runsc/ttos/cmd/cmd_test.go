@@ -523,14 +523,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -1420,7 +1420,7 @@ func TestBuildInspectInfo(t *testing.T) {
 		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
-		Root: &specs.Root{Readonly: false},
+		Root: &specs.Root{Readonly: true},
 		Process: &specs.Process{
 			Args: []string{"/bin/sh", "-c", "sleep 10"}, Env: []string{"A=1"}, Cwd: "/work",
 			User: specs.User{UID: 123, GID: 456},
@@ -1468,6 +1468,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if got := info.HostConfig.Tmpfs["/scratch"]; got != "mode=0700,size=1m" {
 		t.Errorf("tmpfs inspect option=%q", got)
+	}
+	if !info.HostConfig.ReadonlyRootfs {
+		t.Error("inspect omitted read-only rootfs policy")
 	}
 	if !info.HostConfig.AutoRemove {
 		t.Error("inspect omitted auto-remove policy")

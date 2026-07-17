@@ -160,6 +160,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       `none` remains the fork-safe default. Host networking deliberately has no
       port-publishing layer and is ineligible for live fork because it exposes
       the external host network stack.
+- [x] Support Docker `run/create --read-only`, persist it in the OCI root and
+      Docker inspect view, and retain it across start/restart/live fork while
+      writable tmpfs and managed-volume submounts remain usable and fork CoW.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
 - [x] Support Docker-compatible `--tmpfs DEST[:OPTIONS]` and

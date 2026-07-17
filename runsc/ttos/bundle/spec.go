@@ -64,6 +64,7 @@ type SpecOptions struct {
 	Hostname         string
 	Terminal         bool
 	NetworkMode      string
+	ReadonlyRootfs   bool
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -310,7 +311,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		Version: specs.Version,
 		Root: &specs.Root{
 			Path:     rootfs,
-			Readonly: false,
+			Readonly: opts.ReadonlyRootfs,
 		},
 		Process: &specs.Process{
 			Terminal: opts.Terminal,

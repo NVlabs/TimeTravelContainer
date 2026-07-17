@@ -59,12 +59,13 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Labels:     map[string]string{"keep": "yes", "suite": "image"},
 	}}
 	spec, err := BuildSpec(image, SpecOptions{
-		Name:       "demo",
-		RootFS:     root,
-		Args:       []string{"override", "arg"},
-		Env:        []string{"A=run", "B", "C=new"},
-		Labels:     map[string]string{"empty": "", "extra": "value", "suite": "run"},
-		HostMounts: []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
+		Name:           "demo",
+		RootFS:         root,
+		ReadonlyRootfs: true,
+		Args:           []string{"override", "arg"},
+		Env:            []string{"A=run", "B", "C=new"},
+		Labels:         map[string]string{"empty": "", "extra": "value", "suite": "run"},
+		HostMounts:     []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
 		FilesystemMounts: []FilesystemMount{
 			{Type: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}, HostConfig: true, InspectOptions: "mode=0700,size=1m"},
 			{Type: "proc", Destination: "/alt-proc", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
@@ -77,6 +78,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("BuildSpec: %v", err)
+	}
+	if !spec.Root.Readonly {
+		t.Error("root filesystem is writable")
 	}
 	if got, want := spec.Process.Args, []string{"/entry", "override", "arg"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("args=%q, want %q", got, want)

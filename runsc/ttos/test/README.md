@@ -27,6 +27,9 @@ covers:
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
 - BusyBox process/procfs/sysfs startup;
+- Docker `--read-only` rootfs persistence through restart and live fork,
+  including write rejection in both branches while custom tmpfs and managed
+  volumes remain writable;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
 - Alpine dynamic linking and package-tool startup;

@@ -286,7 +286,7 @@ ttos rm "$CONSOLE_STRESS"
 
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
-LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach \
+LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
@@ -328,6 +328,10 @@ PROCESS_OUTPUT=$(ttos exec --process "$PROCESS_JSON" "$LIFECYCLE")
 echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supplementary groups missing: $PROCESS_OUTPUT"
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
+[ "$(ttos inspect -f "{{.HostConfig.ReadonlyRootfs}}" "$LIFECYCLE")" = true ] || fail "inspect omitted read-only rootfs policy"
+if ttos exec "$LIFECYCLE" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&1; then
+  fail "read-only root filesystem accepted a parent write"
+fi
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
 [ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
 [ "$(ttos exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
@@ -371,6 +375,9 @@ ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
 
+if ttos exec "$LIFECYCLE@child" sh -c "echo forbidden >/child-root-forbidden" >/dev/null 2>&1; then
+  fail "read-only root filesystem accepted a child write"
+fi
 ttos exec "$LIFECYCLE@child" sh -c "echo scratch-child >/scratch/value"
 [ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "child write leaked into parent tmpfs"
 [ "$(ttos exec "$LIFECYCLE@child" cat /scratch/value)" = "scratch-child" ] || fail "child tmpfs write was not retained"
