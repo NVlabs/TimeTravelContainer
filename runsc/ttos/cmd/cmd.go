@@ -1042,6 +1042,20 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
+func parseLogDriver(value string, options []string) (string, error) {
+	switch value {
+	case "local", "json-file":
+		return value, nil
+	case "none":
+		if len(options) != 0 {
+			return "", errors.New("logging options are not supported with the none log driver")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("unsupported log driver %q; supported drivers are local, json-file, and none", value)
+	}
+}
+
 func parseLogOptions(values []string) (int64, int, error) {
 	maxBytes := defaultConsoleLogMax
 	maxFiles := defaultConsoleLogFiles
@@ -1126,6 +1140,7 @@ type runRequest struct {
 	user               string
 	hostname           string
 	networkMode        string
+	logDriver          string
 	extraHosts         []string
 	dns                []string
 	dnsSearch          []string
@@ -1195,7 +1210,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1219,6 +1234,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
 	var env, envFiles, labels, labelFiles stringSlice
@@ -1281,6 +1297,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
+	if err != nil {
+		return err
+	}
 	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
 	if err != nil {
 		return err
@@ -1338,6 +1358,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
 		dns:                parsedDNS,
 		dnsSearch:          parsedDNSSearch,
@@ -1383,7 +1404,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1405,6 +1426,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
 	var env, envFiles, labels, labelFiles stringSlice
@@ -1467,6 +1489,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	logDriver, err := parseLogDriver(*logDriverValue, logOptions)
+	if err != nil {
+		return err
+	}
 	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
 	if err != nil {
 		return err
@@ -1524,6 +1550,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
 		dns:                parsedDNS,
 		dnsSearch:          parsedDNSSearch,
@@ -2076,10 +2103,17 @@ type InspectConfig struct {
 	StopSignal   string              `json:"StopSignal"`
 }
 
+// InspectLogConfig is the Docker-compatible logging configuration view.
+type InspectLogConfig struct {
+	Type   string            `json:"Type"`
+	Config map[string]string `json:"Config"`
+}
+
 // InspectHostConfig is the subset of Docker host configuration implemented by TTOS.
 type InspectHostConfig struct {
 	Binds          []string            `json:"Binds"`
 	NetworkMode    string              `json:"NetworkMode"`
+	LogConfig      InspectLogConfig    `json:"LogConfig"`
 	ExtraHosts     []string            `json:"ExtraHosts"`
 	DNS            []string            `json:"Dns"`
 	DNSSearch      []string            `json:"DnsSearch"`
@@ -2249,6 +2283,7 @@ func inspectHostConfigTemplateValues(config InspectHostConfig) map[string]any {
 	return map[string]any{
 		"Binds":          config.Binds,
 		"NetworkMode":    config.NetworkMode,
+		"LogConfig":      config.LogConfig,
 		"ExtraHosts":     config.ExtraHosts,
 		"Dns":            config.DNS,
 		"DnsSearch":      config.DNSSearch,
@@ -3916,6 +3951,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		Reference:          request.reference,
 		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
+		LogDriver:          request.logDriver,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
@@ -3969,6 +4005,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		Reference:          request.reference,
 		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
+		LogDriver:          request.logDriver,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
@@ -4769,6 +4806,13 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	target = resolved
+	container, err := (ttosbundle.Store{Root: b.dataRoot}).LoadContainer(target.container)
+	if err != nil {
+		return err
+	}
+	if container.LogDriver == "none" {
+		return fmt.Errorf("configured logging driver %q does not support reading", container.LogDriver)
+	}
 	var paths ttosbundle.ConsolePaths
 	if options.ExecID == "" {
 		paths, err = b.ensureConsoleDrain(target, false)
@@ -5303,6 +5347,19 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 	if container.ShmSize != nil {
 		shmSize = *container.ShmSize
 	}
+	logConfig := InspectLogConfig{Type: container.LogDriver, Config: map[string]string{}}
+	if container.LogDriver != "none" {
+		maxBytes := container.ConsoleLogMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = defaultConsoleLogMax
+		}
+		maxFiles := container.ConsoleLogMaxFiles
+		if maxFiles < 1 {
+			maxFiles = defaultConsoleLogFiles
+		}
+		logConfig.Config["max-size"] = strconv.FormatInt(maxBytes, 10)
+		logConfig.Config["max-file"] = strconv.Itoa(maxFiles)
+	}
 	return InspectInfo{
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
@@ -5322,7 +5379,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{

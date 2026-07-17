@@ -527,7 +527,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -584,6 +584,9 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(b.runRequest.filesystemMounts, wantFilesystems) {
 		t.Errorf("filesystem mounts=%+v, want %+v", b.runRequest.filesystemMounts, wantFilesystems)
+	}
+	if b.runRequest.logDriver != "json-file" {
+		t.Errorf("log driver=%q, want json-file", b.runRequest.logDriver)
 	}
 	if b.runRequest.consoleLogMaxBytes != 1572864 || b.runRequest.consoleLogMaxFiles != 4 {
 		t.Errorf("log retention=(%d, %d), want (1572864, 4)", b.runRequest.consoleLogMaxBytes, b.runRequest.consoleLogMaxFiles)
@@ -875,6 +878,32 @@ func TestRunRejectsInvalidLogOptions(t *testing.T) {
 		}
 		if b.runRequest.reference != "" {
 			t.Errorf("--log-opt %q invoked backend with %+v", option, b.runRequest)
+		}
+	}
+}
+
+func TestRunAndCreateValidateLogDrivers(t *testing.T) {
+	for _, command := range []string{"run", "create"} {
+		for _, args := range [][]string{
+			{command, "--log-driver", "journald", "busybox"},
+			{command, "--log-driver", "none", "--log-opt", "max-file=2", "busybox"},
+		} {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+				t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+			}
+			if b.runRequest.reference != "" {
+				t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+			}
+		}
+		b := &fakeBackend{containerID: strings.Repeat("b", 64)}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand([]string{command, "--log-driver", "none", "busybox"}, &stdout, &stderr, b); status != 0 {
+			t.Fatalf("%s --log-driver none status=%d, stderr=%q", command, status, stderr.String())
+		}
+		if b.runRequest.logDriver != "none" {
+			t.Errorf("%s log driver=%q, want none", command, b.runRequest.logDriver)
 		}
 	}
 }
@@ -1628,7 +1657,7 @@ func TestBuildInspectInfo(t *testing.T) {
 	dnsOptions := []string{"ndots:2", "rotate"}
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, ExtraHosts: extraHosts, DNS: dns, DNSSearch: dnsSearch, DNSOptions: dnsOptions, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", LogDriver: "json-file", ConsoleLogMaxBytes: 65536, ConsoleLogMaxFiles: 3, AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, ExtraHosts: extraHosts, DNS: dns, DNSSearch: dnsSearch, DNSOptions: dnsOptions, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1703,6 +1732,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	if !info.HostConfig.AutoRemove {
 		t.Error("inspect omitted auto-remove policy")
 	}
+	if info.HostConfig.LogConfig.Type != "json-file" || info.HostConfig.LogConfig.Config["max-size"] != "65536" || info.HostConfig.LogConfig.Config["max-file"] != "3" {
+		t.Errorf("log config=%+v", info.HostConfig.LogConfig)
+	}
 	if info.HostConfig.NetworkMode != "host" {
 		t.Errorf("network mode=%q, want host", info.HostConfig.NetworkMode)
 	}
@@ -1716,6 +1748,14 @@ func TestBuildInspectInfo(t *testing.T) {
 	if got, want := networkTemplate.String(), "203.0.113.53|example.test|ndots:2|33554432\n"; got != want {
 		t.Errorf("Docker DNS inspect template=%q, want %q", got, want)
 	}
+	var logTemplate bytes.Buffer
+	if err := writeInspectFormat(&logTemplate, []InspectInfo{info}, `{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}|{{index .HostConfig.LogConfig.Config "max-file"}}`); err != nil {
+		t.Fatalf("Docker log-config inspect template: %v", err)
+	}
+	if got, want := logTemplate.String(), "json-file|65536|3\n"; got != want {
+		t.Errorf("Docker log-config inspect template=%q, want %q", got, want)
+	}
+
 	if _, ok := info.Config.Volumes["/cache"]; !ok {
 		t.Errorf("volumes=%v", info.Config.Volumes)
 	}

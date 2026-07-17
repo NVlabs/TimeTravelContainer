@@ -644,6 +644,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
 	}
+	if containers[0].LogDriver != DefaultLogDriver {
+		t.Errorf("legacy log driver=%q, want %q", containers[0].LogDriver, DefaultLogDriver)
+	}
 	if containers[0].NetworkMode != "none" {
 		t.Errorf("legacy network mode=%q, want none", containers[0].NetworkMode)
 	}

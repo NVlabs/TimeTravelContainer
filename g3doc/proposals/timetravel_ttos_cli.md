@@ -44,7 +44,11 @@ max-size=...` and `max-file=...`); `ttos attach` and `ttos logs [-f] [--tail
 all|N]` replay, tail, or follow rotations independently. This supports optional
 stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground
 `run`/`start`, detached output draining, and multiple output readers without
-placing host FDs in the guest resource graph. `ttosd`, daemon-owned stdin
+placing host FDs in the guest resource graph. `run` and `create` accept an explicit
+`--log-driver local|json-file|none` policy. `local` and `json-file` both use
+TTOS versioned timestamped records (the latter is a Docker CLI compatibility
+alias, not a promise of host JSON files); `none` disables `ttos logs` while the
+private attach transport remains available. `ttosd`, daemon-owned stdin
 ownership, persistent managed-volume backing, and managed OverlayFS volumes
 remain TODO.
 
@@ -258,8 +262,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Add Docker-compatible `logs --since`, `--until`, and `--timestamps` over
       versioned timestamped records while continuing to decode legacy records.
       Accept `--details`; it emits no attributes until configurable log attributes exist.
-- [ ] Add explicit logging-driver policy and configurable attributes for
-      `logs --details`.
+- [x] Add explicit `local`, `json-file`, and `none` logging-driver policy,
+      persisted configuration, Docker inspect projection, and `none` read rejection.
+- [ ] Add configurable attributes for `logs --details`.
 - [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
       `ttos top [--json] CONTAINER[@BRANCH]` process listing.
 - [x] Add Docker-style `ps --filter/-f` for name, ID, status, ancestor image,

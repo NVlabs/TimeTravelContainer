@@ -38,6 +38,8 @@ const (
 	imageRootFormatVersion = "v3"
 	containerIDBytes       = 32
 	volumeIDBytes          = 32
+	// DefaultLogDriver is the persistent logging policy used when none is specified.
+	DefaultLogDriver = "local"
 )
 
 // Store owns persistent image roots and generated container bundles.
@@ -53,6 +55,7 @@ type PrepareOptions struct {
 	Reference          string
 	Platform           string
 	PullPolicy         string
+	LogDriver          string
 	ConsoleLogMaxBytes int64
 	ConsoleLogMaxFiles int
 	OpenStdin          bool
@@ -92,6 +95,7 @@ type ContainerInfo struct {
 	Volumes            []ManagedVolume `json:"volumes,omitempty"`
 	Branches           []BranchInfo    `json:"branches,omitempty"`
 	NetworkMode        string          `json:"network_mode,omitempty"`
+	LogDriver          string          `json:"log_driver,omitempty"`
 	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
 	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
 	Terminal           bool            `json:"terminal,omitempty"`
@@ -295,6 +299,15 @@ type VolumeInfo struct {
 // Prepare resolves or pulls content, creates or reuses an immutable root, and
 // writes a new container bundle. Existing container names are rejected.
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
+	logDriver := opts.LogDriver
+	if logDriver == "" {
+		logDriver = DefaultLogDriver
+	}
+	switch logDriver {
+	case "local", "json-file", "none":
+	default:
+		return Prepared{}, fmt.Errorf("unsupported log driver %q", logDriver)
+	}
 	if opts.StopTimeout != nil && *opts.StopTimeout < -1 {
 		return Prepared{}, fmt.Errorf("stop timeout must be -1 or greater")
 	}
@@ -393,6 +406,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		RootFS:             rootfs,
 		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		NetworkMode:        networkMode,
+		LogDriver:          logDriver,
 		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
 		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
 		Terminal:           opts.Terminal,
@@ -607,6 +621,14 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
+	if info.LogDriver == "" {
+		info.LogDriver = DefaultLogDriver
+	}
+	switch info.LogDriver {
+	case "local", "json-file", "none":
+	default:
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid log driver %q", key, info.LogDriver)
+	}
 	if info.StopSignal == "" {
 		info.StopSignal = DefaultStopSignal
 	}

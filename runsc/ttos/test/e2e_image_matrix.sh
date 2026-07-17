@@ -79,6 +79,7 @@ AUTO_FOREGROUND="$PREFIX-auto-foreground"
 AUTO_DETACHED="$PREFIX-auto-detached"
 AUTO_CREATED="$PREFIX-auto-created"
 CONSOLE_STRESS="$PREFIX-console-stress"
+NOLOG="$PREFIX-nolog"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
@@ -111,7 +112,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -399,6 +400,18 @@ EXPECTED_B=$( \
 [ "$(sed '/^ttos: warning:/d' "$STRESS_LOG_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "persisted stderr content changed"
 ttos rm "$CONSOLE_STRESS"
 
+echo "== explicit logging drivers =="
+ttos create --name "$NOLOG" --log-driver none "$BUSYBOX_IMAGE" sh -c "echo hidden" >/dev/null
+[ "$(ttos inspect -f '{{.HostConfig.LogConfig.Type}}' "$NOLOG")" = "none" ] ||
+  fail "inspect omitted the none log driver"
+ttos start "$NOLOG" >/dev/null
+if ttos logs "$NOLOG" >"$TTOS_E2E_ROOT/nolog.out" 2>"$TTOS_E2E_ROOT/nolog.err"; then
+  fail "logs accepted a container configured with the none log driver"
+fi
+grep -q "does not support reading" "$TTOS_E2E_ROOT/nolog.err" ||
+  fail "none log-driver rejection lacked a compatibility diagnostic"
+ttos rm --force "$NOLOG"
+
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
 LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
@@ -409,7 +422,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --dns 203.0.113.53 --dns-search example.test --dns-option ndots:2 \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
-  --log-opt max-size=64k --log-opt max-file=3 \
+  --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --tmpfs /scratch:mode=0700,size=1m \
@@ -455,6 +468,8 @@ echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supple
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
 [ "$(ttos inspect -f "{{.HostConfig.ShmSize}}" "$LIFECYCLE")" = 33554432 ] || fail "inspect omitted shared memory size"
+[ "$(ttos inspect -f '{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}|{{index .HostConfig.LogConfig.Config "max-file"}}' "$LIFECYCLE")" = "json-file|65536|3" ] ||
+  fail "inspect omitted json-file retention policy"
 [ "$(ttos inspect -f '{{index .HostConfig.GroupAdd 0}}|{{index .HostConfig.CapAdd 0}}|{{index .HostConfig.CapDrop 0}}' "$LIFECYCLE")" = "4242|SYS_PTRACE|NET_RAW" ] ||
   fail "inspect omitted supplementary groups or capability changes"
 [ "$(ttos exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] ||
