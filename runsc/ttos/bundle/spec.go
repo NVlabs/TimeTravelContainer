@@ -45,6 +45,8 @@ const (
 	PidsLimitAnnotation = "dev.timetravelos.resource.pids-limit"
 	// InternalMountsAnnotation identifies TTOS-generated implementation mounts.
 	InternalMountsAnnotation = "dev.timetravelos.config.internal-mounts"
+	// ImmutableHostMountsAnnotation records user-attested immutable host sources.
+	ImmutableHostMountsAnnotation = "dev.timetravelos.config.immutable-host-mounts"
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -105,10 +107,11 @@ type SpecOptions struct {
 // Writable host paths require a managed CoW volume and are intentionally not
 // represented by this type yet.
 type HostMount struct {
-	Source      string
-	Destination string
-	Readonly    bool
-	Internal    bool
+	Source          string
+	Destination     string
+	Readonly        bool
+	Internal        bool
+	ImmutableSource bool
 }
 
 // ManagedVolume describes a family-local Sentry tmpfs. Repeated attachments of
@@ -600,10 +603,21 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		})
 	}
 	internalMounts := make([]string, 0)
+	immutableHostMounts := make([]string, 0)
 	for _, mount := range opts.HostMounts {
+		if mount.ImmutableSource && !mount.Internal {
+			immutableHostMounts = append(immutableHostMounts, filepath.Clean(mount.Destination))
+		}
 		if mount.Internal {
 			internalMounts = append(internalMounts, filepath.Clean(mount.Destination))
 		}
+	}
+	if len(immutableHostMounts) != 0 {
+		encoded, err := json.Marshal(immutableHostMounts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding immutable host mount destinations: %w", err)
+		}
+		annotations[ImmutableHostMountsAnnotation] = string(encoded)
 	}
 	if len(internalMounts) != 0 {
 		encoded, err := json.Marshal(internalMounts)

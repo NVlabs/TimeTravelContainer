@@ -506,8 +506,9 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] Document and expose read-only host binds as shared external views, not
       snapshots: TTOS inspect metadata and fork-check warnings state that
       host-side mutations may become visible to every branch.
-- [ ] Add an opt-in immutable-source assertion and diagnostics, without claiming
-      the runtime can prevent an independent host writer.
+- [x] Add the `immutable-source` bind option as a persisted user attestation.
+      Inspect and fork diagnostics distinguish it from ordinary shared views and
+      explicitly state that TTOS cannot prevent an independent host writer.
 
 ### Managed volumes
 

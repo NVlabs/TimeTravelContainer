@@ -77,7 +77,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
 		Labels:         map[string]string{"empty": "", "extra": "value", "suite": "run"},
-		HostMounts:     []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
+		HostMounts:     []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true, ImmutableSource: true}},
 		FilesystemMounts: []FilesystemMount{
 			{Type: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}, HostConfig: true, InspectOptions: "mode=0700,size=1m"},
 			{Type: "proc", Destination: "/alt-proc", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
@@ -91,6 +91,10 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSpec: %v", err)
 	}
+	if got, want := spec.Annotations[ImmutableHostMountsAnnotation], `["/mnt/fixture"]`; got != want {
+		t.Errorf("immutable host mounts annotation=%q, want %q", got, want)
+	}
+
 	if !spec.Root.Readonly {
 		t.Error("root filesystem is writable")
 	}

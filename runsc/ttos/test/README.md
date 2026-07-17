@@ -77,7 +77,8 @@ covers:
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
   child branch;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
-  and host-side mutation visibility in parent and child;
+  host-side mutation visibility in parent and child, and an explicitly unenforced
+  `immutable-source` attestation;
 - graceful stop, branch removal, container removal, and volume removal.
 
 The test requires network access for image pulls and an accessible containerd

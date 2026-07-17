@@ -527,7 +527,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -564,7 +564,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	wantMounts := []ttosbundle.HostMount{
 		{Source: "/host/a", Destination: "/host-data", Readonly: true},
-		{Source: "/host/b", Destination: "/config", Readonly: true},
+		{Source: "/host/b", Destination: "/config", Readonly: true, ImmutableSource: true},
 	}
 	if !reflect.DeepEqual(b.runRequest.hostMounts, wantMounts) {
 		t.Errorf("host mounts=%+v, want %+v", b.runRequest.hostMounts, wantMounts)
@@ -908,6 +908,16 @@ func TestRunAndCreateValidateLogDrivers(t *testing.T) {
 		if b.runRequest.logDriver != "none" {
 			t.Errorf("%s log driver=%q, want none", command, b.runRequest.logDriver)
 		}
+	}
+}
+
+func TestParseImmutableHostMountAssertion(t *testing.T) {
+	mounts, err := parseHostMounts([]string{"/host/a:/data:ro,immutable-source"}, []string{"type=bind,source=/host/b,target=/config,readonly,immutable-source=true"})
+	if err != nil {
+		t.Fatalf("parseHostMounts: %v", err)
+	}
+	if len(mounts) != 2 || !mounts[0].ImmutableSource || !mounts[1].ImmutableSource {
+		t.Errorf("immutable host mounts=%+v", mounts)
 	}
 }
 

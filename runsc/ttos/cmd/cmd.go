@@ -927,6 +927,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER:ro", value)
 		}
 		readonly := false
+		immutableSource := false
 		if len(parts) == 3 {
 			for _, option := range strings.Split(parts[2], ",") {
 				switch option {
@@ -934,13 +935,15 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 					readonly = true
 				case "rw":
 					readonly = false
+				case "immutable-source":
+					immutableSource = true
 				case "":
 				default:
 					return nil, fmt.Errorf("unsupported volume option %q in %q", option, value)
 				}
 			}
 		}
-		mount, err := normalizeHostMount(parts[0], parts[1], readonly)
+		mount, err := normalizeHostMount(parts[0], parts[1], readonly, immutableSource)
 		if err != nil {
 			return nil, err
 		}
@@ -951,6 +954,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 		source := ""
 		destination := ""
 		readonly := false
+		immutableSource := false
 		seen := make(map[string]struct{})
 		for _, field := range strings.Split(value, ",") {
 			key, raw, found := strings.Cut(field, "=")
@@ -959,6 +963,9 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 				switch key {
 				case "ro", "readonly":
 					readonly = true
+					continue
+				case "immutable-source":
+					immutableSource = true
 					continue
 				default:
 					return nil, fmt.Errorf("invalid --mount field %q in %q", field, value)
@@ -991,6 +998,12 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 					return nil, fmt.Errorf("invalid readonly value %q in %q", raw, value)
 				}
 				readonly = parsed
+			case "immutable-source":
+				parsed, err := strconv.ParseBool(raw)
+				if err != nil {
+					return nil, fmt.Errorf("invalid immutable-source value %q in %q", raw, value)
+				}
+				immutableSource = parsed
 			default:
 				return nil, fmt.Errorf("unsupported --mount field %q in %q", key, value)
 			}
@@ -1001,7 +1014,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 			}
 			return nil, fmt.Errorf("--mount %q must specify type=bind", value)
 		}
-		mount, err := normalizeHostMount(source, destination, readonly)
+		mount, err := normalizeHostMount(source, destination, readonly, immutableSource)
 		if err != nil {
 			return nil, err
 		}
@@ -1010,7 +1023,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, 
 	return mounts, nil
 }
 
-func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.HostMount, error) {
+func normalizeHostMount(source, destination string, readonly, immutableSource bool) (ttosbundle.HostMount, error) {
 	if source == "" || destination == "" {
 		return ttosbundle.HostMount{}, errors.New("host bind mount requires both source and destination")
 	}
@@ -1030,7 +1043,7 @@ func normalizeHostMount(source, destination string, readonly bool) (ttosbundle.H
 	if !readonly {
 		return ttosbundle.HostMount{}, fmt.Errorf("writable host bind %q:%q requires a managed CoW volume; add :ro for a shared read-only view", source, destination)
 	}
-	return ttosbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: true}, nil
+	return ttosbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: true, ImmutableSource: immutableSource}, nil
 }
 
 func parseNetworkMode(value string) (string, error) {
@@ -2162,10 +2175,11 @@ type InspectMount struct {
 
 // InspectExternalView describes a read-only host resource shared by every branch.
 type InspectExternalView struct {
-	Source      string `json:"source"`
-	Destination string `json:"destination"`
-	Readonly    bool   `json:"readonly"`
-	Semantics   string `json:"semantics"`
+	Source                  string `json:"source"`
+	Destination             string `json:"destination"`
+	Readonly                bool   `json:"readonly"`
+	ImmutableSourceAsserted bool   `json:"immutable_source_asserted,omitempty"`
+	Semantics               string `json:"semantics"`
 }
 
 // InspectGraphDriver describes TTOS's immutable lower root and Sentry-memory upper layer.
@@ -5249,6 +5263,21 @@ func inspectUser(user specs.User) string {
 	return strconv.FormatUint(uint64(user.UID), 10) + ":" + strconv.FormatUint(uint64(user.GID), 10)
 }
 
+func immutableHostMountDestinations(spec *specs.Spec) map[string]struct{} {
+	result := make(map[string]struct{})
+	if spec == nil || spec.Annotations == nil {
+		return result
+	}
+	var destinations []string
+	if json.Unmarshal([]byte(spec.Annotations[ttosbundle.ImmutableHostMountsAnnotation]), &destinations) != nil {
+		return result
+	}
+	for _, destination := range destinations {
+		result[filepath.Clean(destination)] = struct{}{}
+	}
+	return result
+}
+
 func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struct{}, map[string]string) {
 	mounts := []InspectMount{}
 	binds := []string{}
@@ -5362,9 +5391,15 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 	}
 	mounts, binds, volumes, tmpfs := inspectMounts(spec)
 	externalViews := make([]InspectExternalView, 0)
+	immutableHostMounts := immutableHostMountDestinations(spec)
 	for _, mount := range mounts {
 		if mount.Type == "bind" {
-			externalViews = append(externalViews, InspectExternalView{Source: mount.Source, Destination: mount.Destination, Readonly: !mount.RW, Semantics: "shared-external-view"})
+			_, immutableSource := immutableHostMounts[filepath.Clean(mount.Destination)]
+			semantics := "shared-external-view"
+			if immutableSource {
+				semantics = "user-asserted-immutable-external-view"
+			}
+			externalViews = append(externalViews, InspectExternalView{Source: mount.Source, Destination: mount.Destination, Readonly: !mount.RW, ImmutableSourceAsserted: immutableSource, Semantics: semantics})
 		}
 	}
 	hostname := container.Name
@@ -6198,13 +6233,19 @@ func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
 		return ForkEligibility{}, fmt.Errorf("loading mounts for fork diagnostics: %w", err)
 	}
 	mounts, _, _, _ := inspectMounts(spec)
+	immutableHostMounts := immutableHostMountDestinations(spec)
 	for _, mount := range mounts {
 		if mount.Type != "bind" {
 			continue
 		}
+		_, immutableSource := immutableHostMounts[filepath.Clean(mount.Destination)]
+		reason := "shared external view; independent host mutations may become visible in every branch"
+		if immutableSource {
+			reason = "user asserted that this shared external source is immutable; TTOS cannot enforce the assertion against independent host writers"
+		}
 		result.Warnings = append(result.Warnings, ForkWarning{
 			Resource: mount.Source + " -> " + mount.Destination,
-			Reason:   "shared external view; independent host mutations may become visible in every branch",
+			Reason:   reason,
 		})
 	}
 	return result, nil

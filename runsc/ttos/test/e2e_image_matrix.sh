@@ -430,7 +430,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 --log-opt labels=suite --log-opt env=FROM_FILE \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
-  --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly" \
+  --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly,immutable-source" \
   --tmpfs /scratch:mode=0700,size=1m \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=sysfs,target=/alt-sys,readonly \
@@ -502,6 +502,7 @@ FORK_CHECK_JSON=$(ttos fork --check --json "$LIFECYCLE_PREFIX")
 echo "$FORK_CHECK_JSON" | grep -q '"warnings"' || fail "fork check omitted shared-view warnings"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE" || fail "fork check warning omitted first host bind"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warning omitted second host bind"
+echo "$FORK_CHECK_JSON" | grep -q "cannot enforce" || fail "immutable-source warning overstated enforcement"
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 echo host-mutated >"$HOST_FIXTURE/value"
 echo host-mutated-two >"$HOST_FIXTURE_TWO/value"
@@ -533,6 +534,8 @@ grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the mana
 grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
 grep -q "\"Source\":\"$HOST_FIXTURE_TWO\"" "$INSPECT_JSON" || fail "inspect omitted the second read-only host bind"
 grep -q '"semantics":"shared-external-view"' "$INSPECT_JSON" || fail "TTOS inspect omitted shared external-view semantics"
+grep -q '"semantics":"user-asserted-immutable-external-view"' "$INSPECT_JSON" || fail "TTOS inspect omitted immutable-source attestation"
+grep -q '"immutable_source_asserted":true' "$INSPECT_JSON" || fail "TTOS inspect omitted immutable-source assertion flag"
 grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch processes"
 grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
