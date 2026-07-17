@@ -466,3 +466,26 @@ func BenchmarkMountSyncMapRemove(b *testing.B) {
 		ms.Delete(mount.saveKey())
 	}
 }
+
+func TestFormatProcMountOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		readOnly bool
+		flags    MountFlags
+		want     string
+	}{
+		{name: "read-write", want: "rw"},
+		{
+			name:     "all restrictions",
+			readOnly: true,
+			flags:    MountFlags{NoATime: true, NoExec: true, NoSUID: true, NoDev: true},
+			want:     "ro,noatime,noexec,nosuid,nodev",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatProcMountOptions(tc.readOnly, tc.flags); got != tc.want {
+				t.Errorf("formatProcMountOptions(%t, %+v)=%q, want %q", tc.readOnly, tc.flags, got, tc.want)
+			}
+		})
+	}
+}

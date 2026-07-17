@@ -500,7 +500,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Keep host binds and TPU/NVIDIA device proxies rejected by the initial
       allowlist; other mirrored host sysfs paths remain rejected until
       separately proven branch-local or immutable.
-- [ ] Test nested and repeated procfs/sysfs mounts and bind-remount flags.
+- [x] Test nested and repeated procfs/sysfs mounts and bind-remount flags.
+      The unmodified-image matrix now verifies alternate and nested mountpoints,
+      read-only volume aliases, host-bind remounts, and recursive-fork retention;
+      proc mount rendering also preserves `nodev` and the leading `rw`/`ro` option.
 
 ### Read-only host paths
 

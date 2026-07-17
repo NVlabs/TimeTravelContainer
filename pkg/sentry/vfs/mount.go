@@ -1591,19 +1591,7 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		}
 
 		mntOpts := mnt.Options()
-		opts := "rw"
-		if mntOpts.ReadOnly {
-			opts = "ro"
-		}
-		if mntOpts.Flags.NoATime {
-			opts = ",noatime"
-		}
-		if mntOpts.Flags.NoExec {
-			opts += ",noexec"
-		}
-		if mntOpts.Flags.NoSUID {
-			opts += ",nosuid"
-		}
+		opts := formatProcMountOptions(mntOpts.ReadOnly, mntOpts.Flags)
 		if mopts := mnt.fs.Impl().MountOptions(); mopts != "" {
 			opts += "," + mopts
 		}
@@ -1616,6 +1604,26 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		fmt.Fprintf(buf, "%s %s %s %s %d %d\n", "none", path, mnt.fs.FilesystemType().Name(), opts, 0, 0)
 	}
 	return nil
+}
+
+func formatProcMountOptions(readOnly bool, flags MountFlags) string {
+	opts := "rw"
+	if readOnly {
+		opts = "ro"
+	}
+	if flags.NoATime {
+		opts += ",noatime"
+	}
+	if flags.NoExec {
+		opts += ",noexec"
+	}
+	if flags.NoSUID {
+		opts += ",nosuid"
+	}
+	if flags.NoDev {
+		opts += ",nodev"
+	}
+	return opts
 }
 
 // GenerateProcMountInfo emits the contents of /proc/[pid]/mountinfo for vfs to
@@ -1727,19 +1735,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		fmt.Fprintf(buf, "%s ", manglePath(pathFromRoot))
 
 		// (6) Mount options.
-		opts := "rw"
-		if mnt.ReadOnly() {
-			opts = "ro"
-		}
-		if mnt.flags.NoATime {
-			opts += ",noatime"
-		}
-		if mnt.flags.NoExec {
-			opts += ",noexec"
-		}
-		if mnt.flags.NoSUID {
-			opts += ",nosuid"
-		}
+		opts := formatProcMountOptions(mnt.ReadOnly(), mnt.flags)
 		fmt.Fprintf(buf, "%s ", opts)
 
 		// (7) Optional fields: zero or more fields of the form "tag[:value]".

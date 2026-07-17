@@ -841,3 +841,35 @@ func TestTPUProxyEnabled(t *testing.T) {
 		})
 	}
 }
+
+func TestFixSpecNormalizesMountHintSources(t *testing.T) {
+	const bundleDir = "/bundle"
+	spec := specs.Spec{
+		Root: &specs.Root{Path: "rootfs"},
+		Mounts: []specs.Mount{
+			{Source: "volumes/cache"},
+			{Source: "/host/data"},
+		},
+		Annotations: map[string]string{
+			"dev.gvisor.spec.mount.cache.source": "volumes/cache",
+			"dev.gvisor.spec.mount.host.source":  "/host/data",
+			"dev.gvisor.spec.mount.cache.type":   "tmpfs",
+			"example.source":                     "relative-but-not-a-mount-hint",
+		},
+	}
+	if err := fixSpec(&spec, bundleDir, nil); err != nil {
+		t.Fatalf("fixSpec: %v", err)
+	}
+	if got, want := spec.Mounts[0].Source, "/bundle/volumes/cache"; got != want {
+		t.Errorf("relative mount source=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations["dev.gvisor.spec.mount.cache.source"], "/bundle/volumes/cache"; got != want {
+		t.Errorf("relative hint source=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations["dev.gvisor.spec.mount.host.source"], "/host/data"; got != want {
+		t.Errorf("absolute hint source=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations["example.source"], "relative-but-not-a-mount-hint"; got != want {
+		t.Errorf("unrelated annotation=%q, want %q", got, want)
+	}
+}

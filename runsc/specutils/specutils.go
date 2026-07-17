@@ -272,6 +272,15 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 			m.Source = absPath(bundleDir, m.Source)
 		}
 	}
+	// Mount hints identify mounts by source. Keep hint sources in sync with the
+	// OCI mount sources normalized above; otherwise a bundle-relative source no
+	// longer matches after fixSpec and repeated shared mounts become independent.
+	const mountHintPrefix = "dev.gvisor.spec.mount."
+	for annotation, source := range spec.Annotations {
+		if strings.HasPrefix(annotation, mountHintPrefix) && strings.HasSuffix(annotation, ".source") && source != "" {
+			spec.Annotations[annotation] = absPath(bundleDir, source)
+		}
+	}
 
 	if containerName := containerNameNoRemap(spec); len(containerName) > 0 {
 		// If we know the container name, then check to see if seccomp
