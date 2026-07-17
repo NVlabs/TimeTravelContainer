@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +57,7 @@ type PrepareOptions struct {
 	Platform           string
 	PullPolicy         string
 	LogDriver          string
+	LogOptions         map[string]string
 	ConsoleLogMaxBytes int64
 	ConsoleLogMaxFiles int
 	OpenStdin          bool
@@ -85,39 +87,41 @@ type BranchInfo struct {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	ID                 string          `json:"id"`
-	Name               string          `json:"name"`
-	Reference          string          `json:"reference"`
-	Digest             string          `json:"digest"`
-	Platform           string          `json:"platform"`
-	BundleDir          string          `json:"bundle_dir"`
-	RootFS             string          `json:"rootfs"`
-	Volumes            []ManagedVolume `json:"volumes,omitempty"`
-	Branches           []BranchInfo    `json:"branches,omitempty"`
-	NetworkMode        string          `json:"network_mode,omitempty"`
-	LogDriver          string          `json:"log_driver,omitempty"`
-	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
-	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
-	Terminal           bool            `json:"terminal,omitempty"`
-	OpenStdin          bool            `json:"open_stdin,omitempty"`
-	AutoRemove         bool            `json:"auto_remove,omitempty"`
-	StopSignal         string          `json:"stop_signal,omitempty"`
-	StopTimeout        *int            `json:"stop_timeout,omitempty"`
-	PidsLimit          *int64          `json:"pids_limit,omitempty"`
-	ShmSize            *int64          `json:"shm_size,omitempty"`
-	GroupAdd           []string        `json:"group_add,omitempty"`
-	CapAdd             []string        `json:"cap_add,omitempty"`
-	CapDrop            []string        `json:"cap_drop,omitempty"`
-	Ulimits            []Ulimit        `json:"ulimits,omitempty"`
-	ExtraHosts         []string        `json:"extra_hosts,omitempty"`
-	DNS                []string        `json:"dns,omitempty"`
-	DNSSearch          []string        `json:"dns_search,omitempty"`
-	DNSOptions         []string        `json:"dns_options,omitempty"`
-	State              string          `json:"state"`
-	ExitStatus         *int            `json:"exit_status,omitempty"`
-	CreatedAt          time.Time       `json:"created_at"`
-	StartedAt          *time.Time      `json:"started_at,omitempty"`
-	ExitedAt           *time.Time      `json:"exited_at,omitempty"`
+	ID                 string            `json:"id"`
+	Name               string            `json:"name"`
+	Reference          string            `json:"reference"`
+	Digest             string            `json:"digest"`
+	Platform           string            `json:"platform"`
+	BundleDir          string            `json:"bundle_dir"`
+	RootFS             string            `json:"rootfs"`
+	Volumes            []ManagedVolume   `json:"volumes,omitempty"`
+	Branches           []BranchInfo      `json:"branches,omitempty"`
+	NetworkMode        string            `json:"network_mode,omitempty"`
+	LogDriver          string            `json:"log_driver,omitempty"`
+	LogOptions         map[string]string `json:"log_options,omitempty"`
+	LogAttributes      map[string]string `json:"log_attributes,omitempty"`
+	ConsoleLogMaxBytes int64             `json:"console_log_max_bytes,omitempty"`
+	ConsoleLogMaxFiles int               `json:"console_log_max_files,omitempty"`
+	Terminal           bool              `json:"terminal,omitempty"`
+	OpenStdin          bool              `json:"open_stdin,omitempty"`
+	AutoRemove         bool              `json:"auto_remove,omitempty"`
+	StopSignal         string            `json:"stop_signal,omitempty"`
+	StopTimeout        *int              `json:"stop_timeout,omitempty"`
+	PidsLimit          *int64            `json:"pids_limit,omitempty"`
+	ShmSize            *int64            `json:"shm_size,omitempty"`
+	GroupAdd           []string          `json:"group_add,omitempty"`
+	CapAdd             []string          `json:"cap_add,omitempty"`
+	CapDrop            []string          `json:"cap_drop,omitempty"`
+	Ulimits            []Ulimit          `json:"ulimits,omitempty"`
+	ExtraHosts         []string          `json:"extra_hosts,omitempty"`
+	DNS                []string          `json:"dns,omitempty"`
+	DNSSearch          []string          `json:"dns_search,omitempty"`
+	DNSOptions         []string          `json:"dns_options,omitempty"`
+	State              string            `json:"state"`
+	ExitStatus         *int              `json:"exit_status,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	StartedAt          *time.Time        `json:"started_at,omitempty"`
+	ExitedAt           *time.Time        `json:"exited_at,omitempty"`
 }
 
 func cloneIntPointer(value *int) *int {
@@ -296,6 +300,74 @@ type VolumeInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func selectLogAttributes(options map[string]string, spec *specs.Spec) (map[string]string, error) {
+	labels := make(map[string]string)
+	if spec != nil && spec.Annotations != nil {
+		if value := spec.Annotations["dev.timetravelos.config.labels"]; value != "" {
+			if err := json.Unmarshal([]byte(value), &labels); err != nil {
+				return nil, fmt.Errorf("decoding labels for log attributes: %w", err)
+			}
+		}
+	}
+	environment := make(map[string]string)
+	if spec != nil && spec.Process != nil {
+		for _, assignment := range spec.Process.Env {
+			if key, value, ok := strings.Cut(assignment, "="); ok {
+				environment[key] = value
+			}
+		}
+	}
+	attributes := make(map[string]string)
+	addNames := func(optionNames []string, source map[string]string) {
+		for _, optionName := range optionNames {
+			for _, name := range strings.Split(options[optionName], ",") {
+				name = strings.TrimSpace(name)
+				if value, ok := source[name]; ok {
+					attributes[name] = value
+				}
+			}
+		}
+	}
+	addRegex := func(optionNames []string, source map[string]string) error {
+		for _, optionName := range optionNames {
+			pattern := options[optionName]
+			if pattern == "" {
+				continue
+			}
+			compiled, err := regexp.Compile(pattern)
+			if err != nil {
+				return fmt.Errorf("invalid log option %s=%q: %w", optionName, pattern, err)
+			}
+			for name, value := range source {
+				if compiled.MatchString(name) {
+					attributes[name] = value
+				}
+			}
+		}
+		return nil
+	}
+	addNames([]string{"labels", "label"}, labels)
+	if err := addRegex([]string{"labels-regex", "label-regex"}, labels); err != nil {
+		return nil, err
+	}
+	addNames([]string{"env"}, environment)
+	if err := addRegex([]string{"env-regex"}, environment); err != nil {
+		return nil, err
+	}
+	return attributes, nil
+}
+
 // Prepare resolves or pulls content, creates or reuses an immutable root, and
 // writes a new container bundle. Existing container names are rejected.
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
@@ -379,6 +451,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
+	if err != nil {
+		return Prepared{}, err
+	}
 	for _, volume := range opts.ManagedVolumes {
 		if _, err := s.EnsureVolume(volume.Name); err != nil {
 			return Prepared{}, err
@@ -407,6 +483,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		NetworkMode:        networkMode,
 		LogDriver:          logDriver,
+		LogOptions:         cloneStringMap(opts.LogOptions),
+		LogAttributes:      logAttributes,
 		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
 		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
 		Terminal:           opts.Terminal,

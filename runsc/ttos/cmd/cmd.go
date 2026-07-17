@@ -1056,7 +1056,9 @@ func parseLogDriver(value string, options []string) (string, error) {
 	}
 }
 
-func parseLogOptions(values []string) (int64, int, error) {
+func parseLogOptions(values []string) (int64, int, map[string]string, error) {
+	config := make(map[string]string)
+
 	maxBytes := defaultConsoleLogMax
 	maxFiles := defaultConsoleLogFiles
 	for _, option := range values {
@@ -1064,26 +1066,38 @@ func parseLogOptions(values []string) (int64, int, error) {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		if !found || key == "" || value == "" {
-			return 0, 0, fmt.Errorf("invalid --log-opt %q; want KEY=VALUE", option)
+			return 0, 0, nil, fmt.Errorf("invalid --log-opt %q; want KEY=VALUE", option)
 		}
 		switch key {
 		case "max-size":
 			parsed, err := parseLogSize(value)
 			if err != nil {
-				return 0, 0, fmt.Errorf("invalid --log-opt max-size=%q: %w", value, err)
+				return 0, 0, nil, fmt.Errorf("invalid --log-opt max-size=%q: %w", value, err)
 			}
 			maxBytes = parsed
 		case "max-file":
 			parsed, err := strconv.Atoi(value)
 			if err != nil || parsed < 1 {
-				return 0, 0, fmt.Errorf("invalid --log-opt max-file=%q: must be a positive integer", value)
+				return 0, 0, nil, fmt.Errorf("invalid --log-opt max-file=%q: must be a positive integer", value)
 			}
 			maxFiles = parsed
+		case "labels", "label", "env":
+			for _, name := range strings.Split(value, ",") {
+				if strings.TrimSpace(name) == "" {
+					return 0, 0, nil, fmt.Errorf("invalid --log-opt %s=%q: attribute names must not be empty", key, value)
+				}
+			}
+			config[key] = value
+		case "labels-regex", "label-regex", "env-regex":
+			if _, err := regexp.Compile(value); err != nil {
+				return 0, 0, nil, fmt.Errorf("invalid --log-opt %s=%q: %w", key, value, err)
+			}
+			config[key] = value
 		default:
-			return 0, 0, fmt.Errorf("unsupported --log-opt %q; supported options are max-size and max-file", key)
+			return 0, 0, nil, fmt.Errorf("unsupported --log-opt %q; supported options are max-size, max-file, labels, labels-regex, env, and env-regex", key)
 		}
 	}
-	return maxBytes, maxFiles, nil
+	return maxBytes, maxFiles, config, nil
 }
 
 func parseLogSize(value string) (int64, error) {
@@ -1150,6 +1164,7 @@ type runRequest struct {
 	filesystemMounts   []ttosbundle.FilesystemMount
 	consoleLogMaxBytes int64
 	consoleLogMaxFiles int
+	logOptions         map[string]string
 	managedVolumes     []ttosbundle.ManagedVolume
 	autoRemove         bool
 	readonlyRootfs     bool
@@ -1251,7 +1266,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
-	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
+	fs.Var(&logOptions, "log-opt", "set logging option (max-size, max-file, labels, labels-regex, env, or env-regex)")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
 	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
@@ -1301,7 +1316,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
-	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
+	logMaxBytes, logMaxFiles, parsedLogOptions, err := parseLogOptions(logOptions)
 	if err != nil {
 		return err
 	}
@@ -1378,6 +1393,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		capDrop:            parsedCapDrop,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
+		logOptions:         parsedLogOptions,
 		detach:             *detach,
 		interactive:        *interactive,
 		terminal:           *terminal,
@@ -1443,7 +1459,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
-	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
+	fs.Var(&logOptions, "log-opt", "set logging option (max-size, max-file, labels, labels-regex, env, or env-regex)")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
 	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
@@ -1493,7 +1509,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	logMaxBytes, logMaxFiles, err := parseLogOptions(logOptions)
+	logMaxBytes, logMaxFiles, parsedLogOptions, err := parseLogOptions(logOptions)
 	if err != nil {
 		return err
 	}
@@ -1570,6 +1586,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		capDrop:            parsedCapDrop,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
+		logOptions:         parsedLogOptions,
 		interactive:        *interactive,
 		terminal:           *terminal,
 	}
@@ -3952,6 +3969,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
 		LogDriver:          request.logDriver,
+		LogOptions:         request.logOptions,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
@@ -4006,6 +4024,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
 		LogDriver:          request.logDriver,
+		LogOptions:         request.logOptions,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
@@ -4729,12 +4748,24 @@ type consoleLogOutput struct {
 	since      *time.Time
 	until      *time.Time
 	timestamps bool
+	details    string
 	lineStart  map[byte]bool
 }
 
-func newConsoleLogOutput(options logsOptions) *consoleLogOutput {
+func newConsoleLogOutput(options logsOptions, attributes map[string]string) *consoleLogOutput {
+	attributeNames := make([]string, 0, len(attributes))
+	for name := range attributes {
+		attributeNames = append(attributeNames, name)
+	}
+	sort.Strings(attributeNames)
+	details := make([]string, 0, len(attributeNames))
+	if options.Details {
+		for _, name := range attributeNames {
+			details = append(details, name+"="+attributes[name])
+		}
+	}
 	return &consoleLogOutput{
-		since: options.Since, until: options.Until, timestamps: options.Timestamps,
+		since: options.Since, until: options.Until, timestamps: options.Timestamps, details: strings.Join(details, ","),
 		lineStart: map[byte]bool{ttosconsole.StreamStdout: true, ttosconsole.StreamStderr: true},
 	}
 }
@@ -4764,14 +4795,22 @@ func (o *consoleLogOutput) write(frame ttosconsole.Frame, stdout, stderr io.Writ
 	if output == nil || len(frame.Data) == 0 {
 		return nil
 	}
-	if !o.timestamps {
+	if !o.timestamps && o.details == "" {
 		return writeConsoleFrameData(frame, output)
 	}
 	data := frame.Data
 	for len(data) != 0 {
 		if o.lineStart[frame.Stream] {
-			timestamp := frame.Timestamp.UTC().Format(time.RFC3339Nano) + " "
-			if err := writeLogData(output, frame.Stream, []byte(timestamp)); err != nil {
+			var prefix strings.Builder
+			if o.timestamps {
+				prefix.WriteString(frame.Timestamp.UTC().Format(time.RFC3339Nano))
+				prefix.WriteByte(' ')
+			}
+			if o.details != "" {
+				prefix.WriteString(o.details)
+				prefix.WriteByte(' ')
+			}
+			if err := writeLogData(output, frame.Stream, []byte(prefix.String())); err != nil {
 				return err
 			}
 			o.lineStart[frame.Stream] = false
@@ -4835,7 +4874,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	defer follower.file.Close()
-	output := newConsoleLogOutput(options)
+	output := newConsoleLogOutput(options, container.LogAttributes)
 	initial := true
 	for {
 		var progress bool
@@ -5348,6 +5387,9 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		shmSize = *container.ShmSize
 	}
 	logConfig := InspectLogConfig{Type: container.LogDriver, Config: map[string]string{}}
+	for key, value := range container.LogOptions {
+		logConfig.Config[key] = value
+	}
 	if container.LogDriver != "none" {
 		maxBytes := container.ConsoleLogMaxBytes
 		if maxBytes <= 0 {

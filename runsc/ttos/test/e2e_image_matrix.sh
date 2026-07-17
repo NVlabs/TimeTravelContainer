@@ -422,7 +422,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --dns 203.0.113.53 --dns-search example.test --dns-option ndots:2 \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
-  --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 \
+  --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 --log-opt labels=suite --log-opt env=FROM_FILE \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --tmpfs /scratch:mode=0700,size=1m \
@@ -468,7 +468,7 @@ echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supple
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
 [ "$(ttos inspect -f "{{.HostConfig.ShmSize}}" "$LIFECYCLE")" = 33554432 ] || fail "inspect omitted shared memory size"
-[ "$(ttos inspect -f '{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}|{{index .HostConfig.LogConfig.Config "max-file"}}' "$LIFECYCLE")" = "json-file|65536|3" ] ||
+[ "$(ttos inspect -f '{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}|{{index .HostConfig.LogConfig.Config "max-file"}}|{{index .HostConfig.LogConfig.Config "labels"}}|{{index .HostConfig.LogConfig.Config "env"}}' "$LIFECYCLE")" = "json-file|65536|3|suite|FROM_FILE" ] ||
   fail "inspect omitted json-file retention policy"
 [ "$(ttos inspect -f '{{index .HostConfig.GroupAdd 0}}|{{index .HostConfig.CapAdd 0}}|{{index .HostConfig.CapDrop 0}}' "$LIFECYCLE")" = "4242|SYS_PTRACE|NET_RAW" ] ||
   fail "inspect omitted supplementary groups or capability changes"
@@ -553,7 +553,7 @@ ttos ls --tree
 ttos logs --tail 2 "$LIFECYCLE"
 ttos logs --tail 2 "$LIFECYCLE@child"
 TIMESTAMPED_LOGS=$(ttos logs --timestamps --details --since 24h --until 0s "$LIFECYCLE@child")
-echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ tick:" || fail "timestamped logs omitted RFC3339 timestamps: $TIMESTAMPED_LOGS"
+echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ FROM_FILE=lifecycle,suite=lifecycle tick:" || fail "timestamped detailed logs omitted attributes: $TIMESTAMPED_LOGS"
 [ -z "$(ttos logs --since 4102444800 "$LIFECYCLE@child")" ] || fail "logs --since included records older than its boundary"
 [ -z "$(ttos logs --until 24h "$LIFECYCLE@child")" ] || fail "logs --until included records newer than its boundary"
 

@@ -575,6 +575,26 @@ func TestWriteJSONAtomicallyReplacesMetadata(t *testing.T) {
 	}
 }
 
+func TestSelectLogAttributes(t *testing.T) {
+	spec := &specs.Spec{
+		Process:     &specs.Process{Env: []string{"APP_ENV=image", "TRACE_ID=abc", "APP_ENV=runtime"}},
+		Annotations: map[string]string{"dev.timetravelos.config.labels": `{"suite":"fast","owner":"ttos","skip":"no"}`},
+	}
+	got, err := selectLogAttributes(map[string]string{
+		"labels": "suite", "labels-regex": "^owner$", "env": "APP_ENV", "env-regex": "^TRACE_",
+	}, spec)
+	if err != nil {
+		t.Fatalf("selectLogAttributes: %v", err)
+	}
+	want := map[string]string{"suite": "fast", "owner": "ttos", "APP_ENV": "runtime", "TRACE_ID": "abc"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("attributes=%q, want %q", got, want)
+	}
+	if _, err := selectLogAttributes(map[string]string{"env-regex": "["}, spec); err == nil {
+		t.Fatal("selectLogAttributes accepted an invalid regex")
+	}
+}
+
 func TestStoreLifecycleMetadata(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

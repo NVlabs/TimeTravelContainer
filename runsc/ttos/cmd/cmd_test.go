@@ -527,7 +527,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -587,6 +587,9 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if b.runRequest.logDriver != "json-file" {
 		t.Errorf("log driver=%q, want json-file", b.runRequest.logDriver)
+	}
+	if got, want := b.runRequest.logOptions, map[string]string{"env": "A", "labels": "suite"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("log options=%q, want %q", got, want)
 	}
 	if b.runRequest.consoleLogMaxBytes != 1572864 || b.runRequest.consoleLogMaxFiles != 4 {
 		t.Errorf("log retention=(%d, %d), want (1572864, 4)", b.runRequest.consoleLogMaxBytes, b.runRequest.consoleLogMaxFiles)
@@ -870,7 +873,7 @@ func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
 }
 
 func TestRunRejectsInvalidLogOptions(t *testing.T) {
-	for _, option := range []string{"max-size=0", "max-size=nope", "max-file=0", "unknown=value", "missing"} {
+	for _, option := range []string{"max-size=0", "max-size=nope", "max-file=0", "labels=one,,two", "env-regex=[", "unknown=value", "missing"} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
 		if status := runCommand([]string{"run", "--log-opt", option, "busybox"}, &stdout, &stderr, b); status != 1 {
@@ -1183,7 +1186,7 @@ func TestParseLogTime(t *testing.T) {
 func TestConsoleLogOutputFiltersAndPrefixesLines(t *testing.T) {
 	since := time.Date(2026, 7, 17, 1, 0, 0, 0, time.UTC)
 	until := since.Add(2 * time.Second)
-	output := newConsoleLogOutput(logsOptions{Since: &since, Until: &until, Timestamps: true})
+	output := newConsoleLogOutput(logsOptions{Since: &since, Until: &until, Timestamps: true, Details: true}, map[string]string{"zeta": "two", "alpha": "one"})
 	var stdout, stderr bytes.Buffer
 	frames := []ttosconsole.Frame{
 		{Stream: ttosconsole.StreamStdout, Timestamp: since.Add(-time.Second), Data: []byte("old\n")},
@@ -1197,11 +1200,11 @@ func TestConsoleLogOutputFiltersAndPrefixesLines(t *testing.T) {
 			t.Fatalf("write(%+v): %v", frame, err)
 		}
 	}
-	wantStdout := "2026-07-17T01:00:00Z one\n2026-07-17T01:00:00Z two-continued\n2026-07-17T01:00:01Z three\n"
+	wantStdout := "2026-07-17T01:00:00Z alpha=one,zeta=two one\n2026-07-17T01:00:00Z alpha=one,zeta=two two-continued\n2026-07-17T01:00:01Z alpha=one,zeta=two three\n"
 	if got := stdout.String(); got != wantStdout {
 		t.Errorf("stdout=%q, want %q", got, wantStdout)
 	}
-	if got, want := stderr.String(), "2026-07-17T01:00:02Z problem\n"; got != want {
+	if got, want := stderr.String(), "2026-07-17T01:00:02Z alpha=one,zeta=two problem\n"; got != want {
 		t.Errorf("stderr=%q, want %q", got, want)
 	}
 }

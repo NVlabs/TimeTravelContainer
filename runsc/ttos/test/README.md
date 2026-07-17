@@ -66,7 +66,8 @@ covers:
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
 - persisted `local`, `json-file`, and `none` log-driver policy, Docker inspect
-  projection, and rejection of log reads for `none`;
+  projection, rejection of log reads for `none`, and label/environment attributes
+  in `logs --details`;
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
   over versioned timestamped records, including filtering and legacy-record decoding;
 - `exec`, selective stdin/stdout/stderr `attach`, `fork --check`, live `fork`,
