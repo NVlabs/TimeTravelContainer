@@ -431,8 +431,9 @@ a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
 - [x] Add staged failure injection after namespace selection, session reservation,
       internal-console creation, process creation, and session publication; rollback
       kills an unpublished process and removes provisional session/console state.
-- [ ] Add lower-level donated-FD import failures plus client-disconnect and wait-cleanup
-      injection.
+- [x] Add deterministic post-donated-FD-import failure injection and prove the
+      provisional Sentry FD table is released before a successful live fork.
+- [ ] Add exec client-disconnect and wait-cleanup injection.
 - [x] Deterministically test the full exec operation lease against same-branch
       pause, resume, fork, and destroy, while proving sibling pause/resume remains
       independent.

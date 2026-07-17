@@ -299,6 +299,7 @@ const (
 	SandboxExecStageNamespaceSelected SandboxExecStage = "namespace-selected"
 	SandboxExecStageSessionReserved   SandboxExecStage = "session-reserved"
 	SandboxExecStageConsoleCreated    SandboxExecStage = "console-created"
+	SandboxExecStageFilesImported     SandboxExecStage = "files-imported"
 	SandboxExecStageProcessCreated    SandboxExecStage = "process-created"
 	SandboxExecStageSessionPublished  SandboxExecStage = "session-published"
 )

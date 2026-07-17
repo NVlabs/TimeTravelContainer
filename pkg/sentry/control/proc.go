@@ -194,7 +194,7 @@ func (args *ExecArgs) String() string {
 
 // Exec runs a new task.
 func (proc *Proc) Exec(args *ExecArgs, waitStatus *uint32) error {
-	newTG, _, _, err := proc.execAsync(args)
+	newTG, _, _, err := proc.execAsync(args, ExecAsyncHooks{})
 	if err != nil {
 		return err
 	}
@@ -205,16 +205,27 @@ func (proc *Proc) Exec(args *ExecArgs, waitStatus *uint32) error {
 	return nil
 }
 
+// ExecAsyncHooks contains test-only transaction hooks for the non-RPC exec
+// implementation. Production callers should pass the zero value.
+type ExecAsyncHooks struct {
+	AfterFileImport func() error
+}
+
 // ExecAsync runs a new task, but doesn't wait for it to finish. It is defined
 // as a function rather than a method to avoid exposing execAsync as an RPC.
 func ExecAsync(proc *Proc, args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
-	return proc.execAsync(args)
+	return proc.execAsync(args, ExecAsyncHooks{})
+}
+
+// ExecAsyncWithHooks is ExecAsync with test-only transaction hooks.
+func ExecAsyncWithHooks(proc *Proc, args *ExecArgs, hooks ExecAsyncHooks) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
+	return proc.execAsync(args, hooks)
 }
 
 // execAsync runs a new task, but doesn't wait for it to finish. It returns the
 // newly created thread group and its PID. If the stdio FDs are TTYs, then a
 // TTYFileOperations that wraps the TTY is also returned.
-func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
+func (proc *Proc) execAsync(args *ExecArgs, hooks ExecAsyncHooks) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
 	creds := auth.NewUserCredentials(
 		args.KUID,
 		args.KGID,
@@ -336,6 +347,11 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		}
 		if ttyFile != nil {
 			initArgs.TTY = ttyFile.TTY()
+		}
+		if hooks.AfterFileImport != nil {
+			if err := hooks.AfterFileImport(); err != nil {
+				return nil, 0, nil, err
+			}
 		}
 	}
 

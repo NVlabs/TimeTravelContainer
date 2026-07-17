@@ -382,6 +382,40 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		}
 	}
 
+	stdinFile, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("opening donated stdin: %v", err)
+	}
+	defer stdinFile.Close()
+	outputFile, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("opening donated output: %v", err)
+	}
+	defer outputFile.Close()
+	injectedImportFailure := errors.New("injected post-import failure")
+	l.family.testOnlyExecFailureInjector = func(completed SandboxExecStage) error {
+		if completed == SandboxExecStageFilesImported {
+			return injectedImportFailure
+		}
+		return nil
+	}
+	_, err = l.executeAsync(&control.ExecArgs{
+		Filename: "/bin/sleep", Argv: []string{"/bin/sleep", "30"},
+		Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
+		KUID: auth.RootKUID, KGID: auth.RootKGID,
+		ContainerID: l.sandboxID,
+		FilePayload: control.NewFilePayload(map[int]*os.File{0: stdinFile, 1: outputFile, 2: outputFile}, nil),
+	})
+	l.family.testOnlyExecFailureInjector = nil
+	if !errors.Is(err, injectedImportFailure) {
+		t.Fatalf("donated-FD post-import failure: %v", err)
+	}
+	if sessions, err := l.family.ExecSessions(&ExecSessionsArgs{BranchID: DefaultBranchID, CID: l.sandboxID}); err != nil {
+		t.Fatalf("listing sessions after donated-FD failure: %v", err)
+	} else if len(sessions) != 0 {
+		t.Fatalf("sessions leaked after donated-FD failure: %+v", sessions)
+	}
+
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
 	if parentTask.ThreadGroup().TTY() == nil {

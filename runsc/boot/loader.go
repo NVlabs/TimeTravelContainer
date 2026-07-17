@@ -1782,7 +1782,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 
 	// Start the process.
 	proc := control.Proc{Kernel: targetKernel}
-	newTG, tgid, ttyFile, err := control.ExecAsync(&proc, args)
+	newTG, tgid, ttyFile, err := control.ExecAsyncWithHooks(&proc, args, control.ExecAsyncHooks{
+		AfterFileImport: func() error {
+			return l.family.injectExecFailure(SandboxExecStageFilesImported)
+		},
+	})
 	if err != nil {
 		return 0, err
 	}
