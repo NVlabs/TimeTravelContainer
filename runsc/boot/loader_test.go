@@ -681,9 +681,20 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if eligibility.Eligible || len(eligibility.Issues) != 2 {
 		t.Fatalf("shared-filesystem eligibility report: %+v", eligibility)
 	}
+	sharedPaths := map[string]bool{"": false, "/readonly": false}
 	for _, issue := range eligibility.Issues {
-		if issue.PID != 0 || issue.FD != -1 || !strings.Contains(issue.Resource, "filesystem \"9p\"") || !strings.Contains(issue.Reason, "not authorized") {
+		if issue.PID != 0 || issue.FD != -1 || issue.FilesystemType != "9p" || issue.SourceClass != "external-gofer" || !strings.Contains(issue.Resource, "filesystem \"9p\"") || !strings.Contains(issue.Reason, "not authorized") {
 			t.Errorf("shared-filesystem eligibility issue: %+v", issue)
+		}
+		if _, ok := sharedPaths[issue.MountPath]; !ok {
+			t.Errorf("unexpected shared-filesystem mount path %q: %+v", issue.MountPath, issue)
+		} else {
+			sharedPaths[issue.MountPath] = true
+		}
+	}
+	for path, seen := range sharedPaths {
+		if !seen {
+			t.Errorf("missing shared-filesystem eligibility path %q", path)
 		}
 	}
 	l.family.allowSharedFilesystemResources = true
@@ -708,7 +719,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checking writable sysfs rejection: %v", err)
 	}
-	if eligibility.Eligible || len(eligibility.Issues) != 1 || !strings.Contains(eligibility.Issues[0].Resource, "sysfs") || !strings.Contains(eligibility.Issues[0].Reason, "read-only mount") {
+	if eligibility.Eligible || len(eligibility.Issues) != 1 || eligibility.Issues[0].MountPath != "/sys" || eligibility.Issues[0].FilesystemType != "sysfs" || eligibility.Issues[0].SourceClass != "sentry-owned" || !strings.Contains(eligibility.Issues[0].Resource, "sysfs") || !strings.Contains(eligibility.Issues[0].Reason, "read-only mount") {
 		t.Fatalf("writable sysfs eligibility report: %+v", eligibility)
 	}
 	if err := l.k.VFS().SetMountReadOnly(sysMount, true); err != nil {

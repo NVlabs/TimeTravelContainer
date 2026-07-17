@@ -301,14 +301,14 @@ func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
 
 	b.checkResult = ForkEligibility{
 		Reason: "live fork resource validation failed",
-		Issues: []ForkResourceIssue{{PID: 1, FD: -1, Resource: "aioMappable", Reason: "unsupported mapping"}},
+		Issues: []ForkResourceIssue{{PID: 0, FD: -1, MountPath: "/sys", FilesystemType: "sysfs", SourceClass: "sentry-owned", Resource: "mount \"/sys\" filesystem \"sysfs\"", Reason: "read-only mount required"}},
 	}
 	stdout.Reset()
 	stderr.Reset()
 	if status := runCommand([]string{"fork", "--check", "web"}, &stdout, &stderr, b); status != 1 {
 		t.Fatalf("ineligible check status=%d, stderr=%q", status, stderr.String())
 	}
-	for _, text := range []string{"web@main ineligible", "reason:", "mapping", "aioMappable", "unsupported mapping"} {
+	for _, text := range []string{"web@main ineligible", "reason:", "mapping", "/sys", "sysfs", "read-only mount required"} {
 		if !strings.Contains(stdout.String(), text) {
 			t.Errorf("ineligible output %q does not contain %q", stdout.String(), text)
 		}

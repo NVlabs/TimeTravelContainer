@@ -391,7 +391,7 @@ type filesystem struct {
 
 // LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
 func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
-	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "host-FD carrier state is cloned; each imported host FD is validated separately"}
+	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, SourceClass: "host-fd-carrier", Reason: "host-FD carrier state is cloned; each imported host FD is validated separately"}
 }
 
 func (fs *filesystem) Release(ctx context.Context) {

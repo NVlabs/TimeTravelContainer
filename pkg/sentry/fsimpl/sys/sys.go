@@ -343,11 +343,12 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 // LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
 func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
 	if fs.enableTPUProxyPaths {
-		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "sysfs exposes host-backed TPU proxy paths"}
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, SourceClass: "host-device-proxy", Reason: "sysfs exposes host-backed TPU proxy paths"}
 	}
 	return vfs.LiveForkFilesystemEligibility{
 		Decision:              vfs.LiveForkFilesystemClone,
 		RequiresReadOnlyMount: true,
+		SourceClass:           "sentry-owned",
 		Reason:                "restricted Sentry-owned sysfs state is branch-local",
 	}
 }

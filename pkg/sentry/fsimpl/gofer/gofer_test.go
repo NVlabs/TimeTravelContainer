@@ -50,7 +50,7 @@ func TestLiveForkFilesystemEligibility(t *testing.T) {
 				t.Errorf("reason %q does not contain %q", got.Reason, tc.reason)
 			}
 			if tc.decision == vfs.LiveForkFilesystemShareExternal {
-				if !got.ReadOnly || !got.RequiresReadOnlyMount || got.StableIdentity != id.String() {
+				if !got.ReadOnly || !got.RequiresReadOnlyMount || got.StableIdentity != id.String() || got.SourceClass != "external-gofer" {
 					t.Errorf("share-external eligibility: %+v", got)
 				}
 			}

@@ -44,19 +44,20 @@ var _ vfs.FilesystemImplLiveForkExtension = (*filesystem)(nil)
 // read-only state is validated by VFS for every mount of this filesystem.
 func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
 	if fs.opts.directfs.enabled {
-		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "directfs exposes host file descriptors that cannot be cloned"}
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, SourceClass: "external-gofer", Reason: "directfs exposes host file descriptors that cannot be cloned"}
 	}
 	if !fs.iopts.ReadOnly {
-		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "gofer server connection is not read-only"}
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, SourceClass: "external-gofer", Reason: "gofer server connection is not read-only"}
 	}
 	if !fs.iopts.UniqueID.Ok() {
-		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, Reason: "gofer filesystem has no stable resource ID"}
+		return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemReject, SourceClass: "external-gofer", Reason: "gofer filesystem has no stable resource ID"}
 	}
 	return vfs.LiveForkFilesystemEligibility{
 		Decision:              vfs.LiveForkFilesystemShareExternal,
 		RequiresReadOnlyMount: true,
 		ReadOnly:              true,
 		StableIdentity:        fs.iopts.UniqueID.String(),
+		SourceClass:           "external-gofer",
 		Reason:                "read-only LISAFS client and root handle are borrowed by the child",
 	}
 }

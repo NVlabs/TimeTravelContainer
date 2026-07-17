@@ -459,12 +459,12 @@ Unclassified filesystems reject by default. Gofer instances must carry a
 stable resource ID, prove that their server connection is read-only, disable
 directfs, and be mounted read-only when visible in the mount table. Restricted
 sysfs also requires a read-only mount. `CheckFork` and `LiveFork` run the same
-closure validation before shared-memory or address-space CoW preparation.
+closure validation before shared-memory or address-space CoW preparation. Rejections carry the guest mount path (empty for a hidden referenced lower), filesystem type, source class, stable resource description, and reason through the runsc RPC and `ttos fork --check --json`.
 
 - [x] Add a VFS live-fork mount/filesystem eligibility interface returning the
       decision, stable identity, and rejection reason.
 - [x] Collect all mount decisions before any parent CoW mutation.
-- [ ] Include mount path, filesystem type, source class, and reason in
+- [x] Include mount path, filesystem type, source class, and reason in
       structured eligibility errors.
 - [x] Replace the blanket `len(spec.Mounts) == 0` gate with an initial
       conservative allowlist that rejects every unclassified mount.

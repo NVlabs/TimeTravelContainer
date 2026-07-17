@@ -110,10 +110,13 @@ func injectLiveForkFailure(opts LiveForkOptions, stage LiveForkStage) error {
 // fork. PID and FD identify the descriptor-table root through which Resource
 // was reached; Resource may be a transitively referenced object.
 type LiveForkResourceIssue struct {
-	PID      ThreadID `json:"pid"`
-	FD       int32    `json:"fd"`
-	Resource string   `json:"resource"`
-	Reason   string   `json:"reason"`
+	PID            ThreadID `json:"pid"`
+	FD             int32    `json:"fd"`
+	MountPath      string   `json:"mount_path,omitempty"`
+	FilesystemType string   `json:"filesystem_type,omitempty"`
+	SourceClass    string   `json:"source_class,omitempty"`
+	Resource       string   `json:"resource"`
+	Reason         string   `json:"reason"`
 }
 
 // LiveForkResourceError is returned before the parent is changed when its
@@ -378,13 +381,24 @@ func (k *Kernel) validateLiveForkFilesystems(ctx context.Context, allowShared bo
 			reason = fmt.Sprintf("invalid live-fork decision %q", eligibility.Decision)
 		}
 		resource := fmt.Sprintf("mount %d filesystem %q identity %q", eligibility.MountID, eligibility.FilesystemType, eligibility.StableIdentity)
+		if eligibility.MountPath != "" {
+			resource = fmt.Sprintf("mount %q (id %d) filesystem %q identity %q", eligibility.MountPath, eligibility.MountID, eligibility.FilesystemType, eligibility.StableIdentity)
+		}
 		if !eligibility.Mounted {
 			resource = fmt.Sprintf("referenced filesystem %q identity %q", eligibility.FilesystemType, eligibility.StableIdentity)
 		}
 		if eligibility.Reason != "" && reason != eligibility.Reason {
 			reason = fmt.Sprintf("%s: %s", reason, eligibility.Reason)
 		}
-		issues = append(issues, LiveForkResourceIssue{PID: 0, FD: -1, Resource: resource, Reason: reason})
+		issues = append(issues, LiveForkResourceIssue{
+			PID:            0,
+			FD:             -1,
+			MountPath:      eligibility.MountPath,
+			FilesystemType: eligibility.FilesystemType,
+			SourceClass:    eligibility.SourceClass,
+			Resource:       resource,
+			Reason:         reason,
+		})
 	}
 	if len(issues) == 0 {
 		return nil
@@ -527,15 +541,15 @@ func (k *Kernel) validateLiveForkResources() error {
 					fsType := current.Mount().Filesystem().FilesystemType().Name()
 					switch fsType {
 					case "none", "sockfs":
-						issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), "anonymous or socket resource has not opted in"})
+						issues = append(issues, LiveForkResourceIssue{PID: root.pid, FD: fd, Resource: fmt.Sprintf("%T", impl), Reason: "anonymous or socket resource has not opted in"})
 					case "host", "fuse":
-						issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), fmt.Sprintf("filesystem %q is host-backed", fsType)})
+						issues = append(issues, LiveForkResourceIssue{PID: root.pid, FD: fd, Resource: fmt.Sprintf("%T", impl), Reason: fmt.Sprintf("filesystem %q is host-backed", fsType)})
 					}
 					return
 				}
 				referenced, err := validator.ValidateLiveFork()
 				if err != nil {
-					issues = append(issues, LiveForkResourceIssue{root.pid, fd, fmt.Sprintf("%T", impl), err.Error()})
+					issues = append(issues, LiveForkResourceIssue{PID: root.pid, FD: fd, Resource: fmt.Sprintf("%T", impl), Reason: err.Error()})
 					return
 				}
 				for _, next := range referenced {

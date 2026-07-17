@@ -65,12 +65,14 @@ const (
 )
 
 // LiveForkFilesystemEligibility is an implementation-level decision.
-// StableIdentity identifies external resources across the save/load boundary.
+// StableIdentity identifies external resources across the save/load boundary,
+// and SourceClass names the implementation-defined origin of filesystem data.
 type LiveForkFilesystemEligibility struct {
 	Decision              LiveForkFilesystemDecision
 	RequiresReadOnlyMount bool
 	ReadOnly              bool
 	StableIdentity        string
+	SourceClass           string
 	Reason                string
 }
 
@@ -82,12 +84,15 @@ type FilesystemImplLiveForkExtension interface {
 }
 
 // LiveForkFilesystemRecord records the decision for one mounted or otherwise
-// referenced filesystem. MountID is zero when the filesystem is reachable only
-// through another filesystem, such as a gofer lower hidden by OverlayFS.
+// referenced filesystem. MountID is zero and MountPath is empty when the
+// filesystem is reachable only through another filesystem, such as a gofer
+// lower hidden by OverlayFS.
 type LiveForkFilesystemRecord struct {
 	MountID        uint64
+	MountPath      string
 	Mounted        bool
 	FilesystemType string
+	SourceClass    string
 	ReadOnly       bool
 	Decision       LiveForkFilesystemDecision
 	StableIdentity string
@@ -110,11 +115,38 @@ func (vfs *VirtualFilesystem) LiveForkFilesystemEligibilities(ctx context.Contex
 		}
 	}()
 
-	classify := func(fs *Filesystem, mountID uint64, mounted, mountReadOnly bool) LiveForkFilesystemRecord {
+	mountPath := func(mount *Mount) string {
+		vfs.lockMounts()
+		ns := mount.ns
+		if ns == nil || !ns.TryIncRef() {
+			vfs.unlockMounts(ctx)
+			return ""
+		}
+		vfs.unlockMounts(ctx)
+		defer ns.DecRef(ctx)
+
+		vfsRoot := ns.Root(ctx)
+		if !vfsRoot.Ok() {
+			return ""
+		}
+		defer vfsRoot.DecRef(ctx)
+		mountRoot := VirtualDentry{mount: mount, dentry: mount.Root()}
+		mountRoot.IncRef()
+		defer mountRoot.DecRef(ctx)
+		path, err := vfs.PathnameReachable(ctx, vfsRoot, mountRoot)
+		if err != nil {
+			return ""
+		}
+		return path
+	}
+
+	classify := func(fs *Filesystem, mountID uint64, mountPath string, mounted, mountReadOnly bool) LiveForkFilesystemRecord {
 		record := LiveForkFilesystemRecord{
 			MountID:        mountID,
+			MountPath:      mountPath,
 			Mounted:        mounted,
 			FilesystemType: fs.FilesystemType().Name(),
+			SourceClass:    "unclassified",
 			ReadOnly:       mountReadOnly,
 			Decision:       LiveForkFilesystemReject,
 			StableIdentity: fmt.Sprintf("filesystem:%s", fs.FilesystemType().Name()),
@@ -128,6 +160,7 @@ func (vfs *VirtualFilesystem) LiveForkFilesystemEligibilities(ctx context.Contex
 			eligibility := ext.LiveForkFilesystemEligibility()
 			requiresReadOnlyMount = eligibility.RequiresReadOnlyMount
 			record.Decision = eligibility.Decision
+			record.SourceClass = eligibility.SourceClass
 			record.Reason = eligibility.Reason
 			if !mounted {
 				record.ReadOnly = eligibility.ReadOnly
@@ -138,6 +171,16 @@ func (vfs *VirtualFilesystem) LiveForkFilesystemEligibilities(ctx context.Contex
 			if record.Decision == LiveForkFilesystemShareExternal && !eligibility.ReadOnly {
 				record.Decision = LiveForkFilesystemReject
 				record.Reason = "external filesystem resource is not read-only"
+			}
+		}
+		if record.SourceClass == "" {
+			switch record.Decision {
+			case LiveForkFilesystemClone:
+				record.SourceClass = "sentry-owned"
+			case LiveForkFilesystemShareExternal:
+				record.SourceClass = "external-read-only"
+			default:
+				record.SourceClass = "unclassified"
 			}
 		}
 		if mounted && !mountReadOnly && requiresReadOnlyMount {
@@ -152,13 +195,13 @@ func (vfs *VirtualFilesystem) LiveForkFilesystemEligibilities(ctx context.Contex
 	for _, mount := range mounts {
 		fs := mount.Filesystem()
 		mountedFilesystems[fs] = struct{}{}
-		records = append(records, classify(fs, mount.ID, true, mount.ReadOnly()))
+		records = append(records, classify(fs, mount.ID, mountPath(mount), true, mount.ReadOnly()))
 	}
 	for _, fs := range filesystems {
 		if _, ok := mountedFilesystems[fs]; ok {
 			continue
 		}
-		records = append(records, classify(fs, 0, false, false))
+		records = append(records, classify(fs, 0, "", false, false))
 	}
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].MountID != records[j].MountID {

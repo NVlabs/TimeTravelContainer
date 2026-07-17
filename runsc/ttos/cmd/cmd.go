@@ -3634,10 +3634,13 @@ type Family struct {
 
 // ForkResourceIssue identifies one resource that blocks a live fork.
 type ForkResourceIssue struct {
-	PID      int32  `json:"pid"`
-	FD       int32  `json:"fd"`
-	Resource string `json:"resource"`
-	Reason   string `json:"reason"`
+	PID            int32  `json:"pid"`
+	FD             int32  `json:"fd"`
+	MountPath      string `json:"mount_path,omitempty"`
+	FilesystemType string `json:"filesystem_type,omitempty"`
+	SourceClass    string `json:"source_class,omitempty"`
+	Resource       string `json:"resource"`
+	Reason         string `json:"reason"`
 }
 
 // ForkWarning reports a non-blocking observable sharing property.
