@@ -425,8 +425,9 @@ a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
       kills an unpublished process and removes provisional session/console state.
 - [ ] Add lower-level donated-FD import failures plus client-disconnect and wait-cleanup
       injection.
-- [ ] Test exec concurrently with pause, resume, fork, destroy, and sibling
-      activity.
+- [x] Deterministically test the full exec operation lease against same-branch
+      pause, resume, fork, and destroy, while proving sibling pause/resume remains
+      independent.
 
 ## Internal console architecture
 

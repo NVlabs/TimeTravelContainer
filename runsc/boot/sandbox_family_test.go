@@ -78,6 +78,106 @@ func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	child, err := family.Fork(&ForkBranchArgs{ID: "exec-target"})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	holdExec := func() func() {
+		_, release, err := family.beginRunningControl(child.ID)
+		if err != nil {
+			t.Fatalf("beginRunningControl: %v", err)
+		}
+		return release
+	}
+	assertBlocked := func(done <-chan error, operation string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			t.Fatalf("%s completed while exec lease was held: %v", operation, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	wait := func(done <-chan error, operation string) error {
+		t.Helper()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s remained blocked after exec lease release", operation)
+			return nil
+		}
+	}
+
+	release := holdExec()
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- family.Resume(child.ID) }()
+	assertBlocked(resumeDone, "resume")
+	if err := family.Pause(DefaultBranchID); err != nil {
+		t.Fatalf("pausing sibling while exec lease held: %v", err)
+	}
+	if err := family.Resume(DefaultBranchID); err != nil {
+		t.Fatalf("resuming sibling while exec lease held: %v", err)
+	}
+	release()
+	if err := wait(resumeDone, "resume"); err == nil {
+		t.Fatal("concurrent resume unexpectedly accepted a running branch")
+	}
+
+	release = holdExec()
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- family.Pause(child.ID) }()
+	assertBlocked(pauseDone, "pause")
+	release()
+	if err := wait(pauseDone, "pause"); err != nil {
+		t.Fatalf("pause after exec lease: %v", err)
+	}
+	if err := family.Resume(child.ID); err != nil {
+		t.Fatalf("resuming target: %v", err)
+	}
+
+	release = holdExec()
+	forkDone := make(chan error, 1)
+	go func() {
+		_, err := family.Fork(&ForkBranchArgs{Source: child.ID, ID: "grandchild", Paused: true})
+		forkDone <- err
+	}()
+	assertBlocked(forkDone, "fork")
+	release()
+	if err := wait(forkDone, "fork"); err != nil {
+		t.Fatalf("fork after exec lease: %v", err)
+	}
+	if err := family.Destroy("grandchild"); err != nil {
+		t.Fatalf("destroying grandchild: %v", err)
+	}
+
+	release = holdExec()
+	destroyDone := make(chan error, 1)
+	go func() { destroyDone <- family.Destroy(child.ID) }()
+	assertBlocked(destroyDone, "destroy")
+	release()
+	if err := wait(destroyDone, "destroy"); err != nil {
+		t.Fatalf("destroy after exec lease: %v", err)
+	}
+}
+
 func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
