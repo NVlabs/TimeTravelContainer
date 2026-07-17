@@ -641,8 +641,11 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       daemon request delivery idempotent. Completed requests replay their exact
       status and output; interrupted pending requests fail closed with an
       indeterminate-outcome diagnostic instead of being blindly repeated.
-- [ ] Bound and compact the completed-request journal, and add an operator
-      workflow for inspecting and resolving interrupted pending intents.
+- [x] Bound the completed-request journal to the newest 2,048 results per
+      data root with durable compaction; never remove pending intents
+      automatically.
+- [ ] Add an operator workflow for inspecting and resolving interrupted pending
+      intents.
 - [x] Add a versioned framed local API with explicit version rejection so the
       CLI and daemon may be upgraded independently.
 - [x] Keep direct runsc invocation behind the daemon API and an explicit

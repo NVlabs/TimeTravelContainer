@@ -23,10 +23,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
-const daemonMutationSchemaVersion = 1
+const (
+	daemonMutationSchemaVersion = 1
+	daemonMutationRetention     = 2048
+)
 
 type daemonMutationRecord struct {
 	Version     int       `json:"version"`
@@ -184,5 +188,64 @@ func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status
 	if err := writeDurableJSON(path, &record); err != nil {
 		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation result: %w", err)
 	}
+	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
 	return record, nil
+}
+
+func compactDaemonMutations(dataRoot string, keepCompleted int) error {
+	if keepCompleted < 0 {
+		return fmt.Errorf("completed daemon mutation retention must not be negative")
+	}
+	dir := filepath.Join(dataRoot, "daemon", "requests")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	type completedMutation struct {
+		path string
+		time time.Time
+	}
+	completed := make([]completedMutation, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		record, err := loadDaemonMutation(path)
+		if err != nil || record.State != "completed" {
+			continue
+		}
+		when := record.CompletedAt
+		if when.IsZero() {
+			when = record.CreatedAt
+		}
+		completed = append(completed, completedMutation{path: path, time: when})
+	}
+	if len(completed) <= keepCompleted {
+		return nil
+	}
+	sort.Slice(completed, func(i, j int) bool {
+		if completed[i].time.Equal(completed[j].time) {
+			return completed[i].path < completed[j].path
+		}
+		return completed[i].time.Before(completed[j].time)
+	})
+	for _, entry := range completed[:len(completed)-keepCompleted] {
+		if err := os.Remove(entry.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = directory.Sync()
+	closeErr := directory.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
