@@ -155,7 +155,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
       Pulls discover `DOCKER_CONFIG` or `~/.docker/config.json`, support inline
       auth/token entries plus per-registry and global credential helpers, and
       resolve secrets only in the containerd registry callback.
-- [ ] Show pull/unpack progress and content reuse.
+- [x] Show pull completion, unpack completion/skipping, and measured content-store
+      downloaded-versus-reused byte totals. Quiet mode remains digest-only.
 - [x] `ttos images` with reference, digest, platform, unpacked state, size, and
       creation time.
 - [x] `ttos image inspect`, `ttos image rm`, and content garbage collection.

@@ -2519,6 +2519,14 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 		return nil
 	}
 	fmt.Fprintf(stdout, "Pulled %s\nDigest: %s\nPlatform: %s\n", info.Reference, info.Digest, info.Platform)
+	if info.PullStats != nil {
+		fmt.Fprintf(stdout, "Content: %d bytes downloaded, %d bytes reused\n", info.PullStats.DownloadedBytes, info.PullStats.ReusedBytes)
+	}
+	if info.Unpacked {
+		fmt.Fprintln(stdout, "Unpack: complete")
+	} else {
+		fmt.Fprintln(stdout, "Unpack: skipped")
+	}
 	return nil
 }
 

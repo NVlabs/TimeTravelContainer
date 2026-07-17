@@ -367,6 +367,7 @@ func TestPullNormalizesDockerReference(t *testing.T) {
 		Reference: "docker.io/library/ubuntu:latest",
 		Digest:    "sha256:1234",
 		Platform:  "linux/amd64",
+		PullStats: &ttosimages.PullStats{DownloadedBytes: 1024, ReusedBytes: 2048},
 	}}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"pull", "ubuntu"}, &stdout, &stderr, b); status != 0 {
@@ -375,7 +376,7 @@ func TestPullNormalizesDockerReference(t *testing.T) {
 	if b.pullReference != "docker.io/library/ubuntu:latest" || b.pullSnapshotter != "native" || b.pullUnpack {
 		t.Errorf("pull call: reference=%q snapshotter=%q unpack=%t", b.pullReference, b.pullSnapshotter, b.pullUnpack)
 	}
-	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\n"
+	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\nContent: 1024 bytes downloaded, 2048 bytes reused\nUnpack: skipped\n"
 	if got := stdout.String(); got != want {
 		t.Errorf("pull output=%q, want %q", got, want)
 	}

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	distref "github.com/distribution/reference"
@@ -64,15 +65,53 @@ type DeleteOptions struct {
 
 // Info describes a pulled platform-specific image.
 type Info struct {
-	Reference   string    `json:"reference"`
-	Digest      string    `json:"digest"`
-	MediaType   string    `json:"media_type"`
-	Size        int64     `json:"size"`
-	Platform    string    `json:"platform"`
-	Snapshotter string    `json:"snapshotter,omitempty"`
-	Unpacked    bool      `json:"unpacked"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Reference   string     `json:"reference"`
+	Digest      string     `json:"digest"`
+	MediaType   string     `json:"media_type"`
+	Size        int64      `json:"size"`
+	Platform    string     `json:"platform"`
+	Snapshotter string     `json:"snapshotter,omitempty"`
+	Unpacked    bool       `json:"unpacked"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	PullStats   *PullStats `json:"pull_stats,omitempty"`
+}
+
+// PullStats summarizes committed content reuse observed during one pull.
+type PullStats struct {
+	DownloadedBytes int64 `json:"downloaded_bytes"`
+	ReusedBytes     int64 `json:"reused_bytes"`
+}
+
+func snapshotContent(ctx context.Context, store content.Store) (map[string]int64, error) {
+	snapshot := make(map[string]int64)
+	if err := store.Walk(ctx, func(info content.Info) error {
+		snapshot[info.Digest.String()] = info.Size
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func contentReuse(before, after map[string]int64, total int64) PullStats {
+	var downloaded int64
+	for digest, size := range after {
+		if _, existed := before[digest]; !existed && size > 0 {
+			downloaded += size
+		}
+	}
+	if downloaded > total {
+		downloaded = total
+	}
+	if downloaded < 0 {
+		downloaded = 0
+	}
+	reused := total - downloaded
+	if reused < 0 {
+		reused = 0
+	}
+	return PullStats{DownloadedBytes: downloaded, ReusedBytes: reused}
 }
 
 // NormalizeReference applies Docker's familiar-name and default-tag rules.
@@ -95,6 +134,8 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 		return Info{}, fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
 	}
 	defer client.Close()
+
+	contentBefore, snapshotErr := snapshotContent(ctx, client.ContentStore())
 
 	var remoteOpts []containerd.RemoteOpt
 	credentials, configured, err := dockerCredentialCallback()
@@ -127,6 +168,13 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 		return Info{}, fmt.Errorf("reading config for %q: %w", reference, err)
 	}
 	platform := strings.TrimSuffix(spec.OS+"/"+spec.Architecture+"/"+spec.Variant, "/")
+	var pullStats *PullStats
+	if snapshotErr == nil {
+		if contentAfter, err := snapshotContent(ctx, client.ContentStore()); err == nil {
+			stats := contentReuse(contentBefore, contentAfter, size)
+			pullStats = &stats
+		}
+	}
 	target := image.Target()
 	metadata := image.Metadata()
 	return Info{
@@ -139,6 +187,7 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 		Unpacked:    opts.Unpack,
 		CreatedAt:   imageCreatedAt(metadata.CreatedAt, spec.Created),
 		UpdatedAt:   metadata.UpdatedAt,
+		PullStats:   pullStats,
 	}, nil
 }
 

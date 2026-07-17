@@ -25,6 +25,20 @@ import (
 	"time"
 )
 
+func TestContentReuse(t *testing.T) {
+	before := map[string]int64{"sha256:old": 60}
+	after := map[string]int64{"sha256:old": 60, "sha256:new": 40}
+	if got, want := contentReuse(before, after, 100), (PullStats{DownloadedBytes: 40, ReusedBytes: 60}); got != want {
+		t.Fatalf("contentReuse=%+v, want %+v", got, want)
+	}
+	if got := contentReuse(after, after, 100); got.DownloadedBytes != 0 || got.ReusedBytes != 100 {
+		t.Fatalf("full reuse=%+v", got)
+	}
+	if got := contentReuse(nil, map[string]int64{"extra": 120}, 100); got.DownloadedBytes != 100 || got.ReusedBytes != 0 {
+		t.Fatalf("capped download=%+v", got)
+	}
+}
+
 func TestNormalizeReference(t *testing.T) {
 	tests := []struct {
 		input string

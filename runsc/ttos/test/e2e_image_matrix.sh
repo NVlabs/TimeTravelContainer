@@ -131,6 +131,13 @@ echo "== pulling public image matrix =="
 for image in "$BUSYBOX_IMAGE" "$ALPINE_IMAGE" "$PYTHON_IMAGE" "$NGINX_IMAGE" "$REDIS_IMAGE"; do
   ttos pull "$image"
 done
+PULL_REUSE="$TTOS_E2E_ROOT/pull-reuse.out"
+ttos pull "$BUSYBOX_IMAGE" >"$PULL_REUSE"
+grep -Eq '^Content: 0 bytes downloaded, [1-9][0-9]* bytes reused$' "$PULL_REUSE" || fail "repeat pull did not report content reuse"
+PULL_QUIET="$TTOS_E2E_ROOT/pull-quiet.out"
+ttos pull -q "$BUSYBOX_IMAGE" >"$PULL_QUIET"
+[ "$(wc -l <"$PULL_QUIET")" -eq 1 ] || fail "quiet pull emitted multiple lines"
+grep -Eq '^sha256:[0-9a-f]{64}$' "$PULL_QUIET" || fail "quiet pull emitted more than the digest"
 
 echo "== image inventory =="
 IMAGE_LIST="$TTOS_E2E_ROOT/images.json"
