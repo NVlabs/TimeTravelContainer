@@ -470,7 +470,7 @@ closure validation before shared-memory or address-space CoW preparation.
       conservative allowlist that rejects every unclassified mount.
 - [x] Replace the spec-level allowlist with closure validation over every
       reachable mounted filesystem and resource.
-- [ ] Verify recursive forks and arbitrary destruction orders for every allowed
+- [x] Verify recursive forks and arbitrary destruction orders for every allowed
       mount class.
 
 ### tmpfs, procfs, and sysfs
@@ -510,7 +510,7 @@ closure validation before shared-memory or address-space CoW preparation.
 - [x] Test inherited open files and branch-local offsets, directory cursors, and
       read/execute mappings across recursive forks, including host mutation and
       deletion of the source branch while its descendant remains functional.
-- [ ] Test exhaustive descendant-first and ancestor-first destruction orders.
+- [x] Test exhaustive descendant-first and ancestor-first destruction orders.
 - [x] Document and expose read-only host binds as shared external views, not
       snapshots: TTOS inspect metadata and fork-check warnings state that
       host-side mutations may become visible to every branch.

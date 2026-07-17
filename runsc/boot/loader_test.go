@@ -1637,6 +1637,65 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
 		t.Fatalf("destroying grandchild: %v", err)
 	}
+
+	// Exercise the only other destruction ordering available for a three-level
+	// family. The preceding chain deleted its middle ancestor first; this chain
+	// deletes the leaf first, then its source. Every admitted OCI mount class
+	// must remain usable from the surviving branch after each release.
+	assertMountClosure := func(t *testing.T, branch *sandboxBranch) {
+		t.Helper()
+		task := branch.k.GlobalInit().Leader()
+		branchCtx := branch.k.SupervisorContext()
+		for _, path := range []string{"proc/1/status", "sys"} {
+			file := liveForkTestOpenPath(t, task, path, linux.O_RDONLY)
+			file.DecRef(branchCtx)
+		}
+		pty := liveForkTestOpenPath(t, task, "dev/ptmx", linux.O_RDWR|linux.O_NONBLOCK)
+		pty.DecRef(branchCtx)
+		liveForkTestPathRead(t, task, overlayPath, "prnt")
+		liveForkTestPathRead(t, task, "dev/shm/ttos-mount-state", "prnt")
+		liveForkTestPathRead(t, task, "managed/state", "prnt")
+		liveForkTestPathRead(t, task, "managed-alias/state", "prnt")
+		liveForkTestPathRead(t, task, "readonly/fixture", "hoMUTATED")
+		liveForkTestPathWriteDenied(t, task, "readonly/fixture")
+		liveForkTestPathRead(t, task, "etc/hostname", originalLower)
+	}
+
+	reverseChildInfo, err := l.family.Fork(&ForkBranchArgs{ID: "reverse-child", Paused: true})
+	if err != nil {
+		t.Fatalf("forking reverse-order child: %v", err)
+	}
+	reverseChild, err := l.family.branch(reverseChildInfo.ID)
+	if err != nil {
+		t.Fatalf("looking up reverse-order child: %v", err)
+	}
+	reverseGrandchildInfo, err := l.family.Fork(&ForkBranchArgs{Source: reverseChildInfo.ID, ID: "reverse-grandchild", Paused: true})
+	if err != nil {
+		t.Fatalf("forking reverse-order grandchild: %v", err)
+	}
+	reverseGrandchild, err := l.family.branch(reverseGrandchildInfo.ID)
+	if err != nil {
+		t.Fatalf("looking up reverse-order grandchild: %v", err)
+	}
+	t.Run("descendant-first grandchild", func(t *testing.T) {
+		assertMountClosure(t, reverseGrandchild)
+	})
+	if err := l.family.Destroy(reverseGrandchildInfo.ID); err != nil {
+		t.Fatalf("destroying reverse-order grandchild first: %v", err)
+	}
+	t.Run("descendant-first surviving child", func(t *testing.T) {
+		assertMountClosure(t, reverseChild)
+	})
+	if err := l.family.Destroy(reverseChildInfo.ID); err != nil {
+		t.Fatalf("destroying reverse-order child second: %v", err)
+	}
+	defaultBranch, err := l.family.branch(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("looking up default branch after reverse-order destruction: %v", err)
+	}
+	t.Run("descendant-first surviving parent", func(t *testing.T) {
+		assertMountClosure(t, defaultBranch)
+	})
 	parentReader.DecRef(ctx)
 	parentWriter.DecRef(ctx)
 	parentEvent.DecRef(ctx)
