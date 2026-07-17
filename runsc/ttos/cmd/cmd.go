@@ -3826,6 +3826,10 @@ type backend interface {
 	removeVolume(name string) error
 }
 
+type consoleSidecarOwner interface {
+	OwnConsoleSidecar(key string, command *exec.Cmd) error
+}
+
 type runtimeBackend struct {
 	root                  string
 	runsc                 string
@@ -3836,6 +3840,7 @@ type runtimeBackend struct {
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
+	consoleSidecars       consoleSidecarOwner
 }
 
 func (b *runtimeBackend) containerStore() ttosbundle.Store {
@@ -5237,7 +5242,13 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		command.Wait()
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("waiting for console drain readiness for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
 	}
-	if err := command.Process.Release(); err != nil {
+	if b.consoleSidecars != nil {
+		if err := b.consoleSidecars.OwnConsoleSidecar(paths.Lock, command); err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return ttosbundle.ConsolePaths{}, fmt.Errorf("transferring console drain ownership for %s: %w", target, err)
+		}
+	} else if err := command.Process.Release(); err != nil {
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("releasing console drain process for %s: %w", target, err)
 	}
 	return paths, nil

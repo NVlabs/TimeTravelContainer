@@ -80,12 +80,46 @@ type daemonServer struct {
 
 	stdinMu     sync.Mutex
 	stdinLeases map[string]*daemonStdinLease
+
+	sidecarMu sync.Mutex
+	sidecars  map[string]*exec.Cmd
 }
 
 type daemonFrameWriter struct {
 	conn net.Conn
 	mu   *sync.Mutex
 	typ  byte
+}
+
+// OwnConsoleSidecar tracks and reaps one ready console follower. Followers are
+// intentionally not killed when the daemon shuts down: they retain the advisory
+// lock and continue draining until a restarted daemon reconciles the family.
+func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd) error {
+	s.sidecarMu.Lock()
+	if _, ok := s.sidecars[key]; ok {
+		s.sidecarMu.Unlock()
+		return fmt.Errorf("console sidecar %q is already daemon-owned", key)
+	}
+	if s.sidecars == nil {
+		s.sidecars = make(map[string]*exec.Cmd)
+	}
+	s.sidecars[key] = command
+	s.sidecarMu.Unlock()
+	go func() {
+		_ = command.Wait()
+		s.sidecarMu.Lock()
+		if s.sidecars[key] == command {
+			delete(s.sidecars, key)
+		}
+		s.sidecarMu.Unlock()
+	}()
+	return nil
+}
+
+func (s *daemonServer) ownedConsoleSidecars() int {
+	s.sidecarMu.Lock()
+	defer s.sidecarMu.Unlock()
+	return len(s.sidecars)
 }
 
 func (w daemonFrameWriter) Write(data []byte) (int, error) {
@@ -350,6 +384,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+	backend.consoleSidecars = s
 	if request.Args[0] == "events" {
 		status := 0
 		if err := s.streamEvents(opts.dataRoot, request.Args[1:], backend.stdout); err != nil {
@@ -378,6 +413,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		var mutationStdout, mutationStderr bytes.Buffer
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
+		mutationBackend.consoleSidecars = s
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
 		completed, err := completeDaemonMutation(opts.dataRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())

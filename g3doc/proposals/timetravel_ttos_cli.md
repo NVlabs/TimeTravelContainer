@@ -476,9 +476,10 @@ state still forks entirely in memory.
       preserve exact stdout/stderr plus one EOF per stream for immediate exits.
       The image matrix stress-checks 256 KiB per stream in both foreground and
       persistent-log paths.
-- [ ] Move sidecar process ownership into `ttosd`. Restart reconciliation is
-      implemented, and console I/O now uses readiness-driven transport instead
-      of polling RPCs.
+- [x] Make `ttosd` own, track, and reap console sidecars that it launches.
+      Followers intentionally survive daemon exit under their advisory locks; a
+      restarted daemon reconciles them, and console I/O uses readiness-driven
+      transport instead of polling RPCs.
 - [x] Clone unread non-TTY console data and pipe connectivity during live fork,
       including recursively forked branches.
 - [x] Clone init- and exec-console PTY termios, foreground process groups,

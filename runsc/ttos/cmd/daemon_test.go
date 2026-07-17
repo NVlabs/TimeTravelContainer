@@ -18,11 +18,44 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatalf("starting sidecar fixture: %v", err)
+	}
+	server := &daemonServer{}
+	if err := server.OwnConsoleSidecar("console-lock", command); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("OwnConsoleSidecar: %v", err)
+	}
+	if got := server.ownedConsoleSidecars(); got != 1 {
+		t.Fatalf("owned sidecars=%d, want 1", got)
+	}
+	if err := server.OwnConsoleSidecar("console-lock", exec.Command("true")); err == nil {
+		t.Fatal("duplicate console sidecar ownership succeeded")
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatalf("stopping sidecar fixture: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for server.ownedConsoleSidecars() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := server.ownedConsoleSidecars(); got != 0 {
+		t.Fatalf("owned sidecars after exit=%d, want 0", got)
+	}
+	if command.ProcessState == nil {
+		t.Fatalf("sidecar was not reaped: state=%v", command.ProcessState)
+	}
+}
 
 func TestDaemonCommandUsesStdin(t *testing.T) {
 	for _, test := range []struct {
