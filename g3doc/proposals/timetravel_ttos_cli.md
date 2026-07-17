@@ -15,7 +15,9 @@ Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
 `start` and `wait` accept multiple containers and preserve argument-order
 output. Container inspect uses Docker-shaped JSON and Go templates while adding
 a `TTOS` section with the family tree, fork timings, per-branch processes, and
-optional live-fork eligibility reports. Effective Docker entrypoint, command,
+optional live-fork eligibility reports. Bash, Zsh, and Fish completion scripts
+resolve live families/branches, images, volumes, and exec sessions.
+Effective Docker entrypoint, command,
 user, and image labels are retained in the generated bundle for later
 inspection. Generated bundles include procfs, restricted read-only sysfs,
 tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
@@ -289,7 +291,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
       The report is an advisory snapshot of the current pre-mutation network,
       resource, and mapping graph. A subsequent fork can still lose a race or
       fail a later VFS/state-serialization check.
-- [ ] Add shell completion for family, branch, image, volume, and session names.
+- [x] Add Bash, Zsh, and Fish completion for family, branch, image, volume,
+      and session names.
 
 ### Exec
 

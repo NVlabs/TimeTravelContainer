@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -2867,5 +2868,59 @@ func TestMergeBranchHistoryPreservesTombstones(t *testing.T) {
 	rows := psRows([]Family{{ID: strings.Repeat("a", 64), Name: "demo", Image: "busybox:latest", Branches: merged}}, now, false)
 	if len(rows) != 3 {
 		t.Errorf("Docker ps rows included tombstone: %+v", rows)
+	}
+}
+
+func TestCompletionScripts(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh", "fish"} {
+		t.Run(shell, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if status := runCommand([]string{"completion", shell}, &stdout, &stderr, &fakeBackend{}); status != 0 {
+				t.Fatalf("status=%d stderr=%q", status, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "command ttos") || !strings.Contains(stdout.String(), "_complete") {
+				t.Errorf("completion script=%q does not invoke dynamic completion", stdout.String())
+			}
+		})
+	}
+}
+
+func TestDynamicCompletionUsesTTOSObjects(t *testing.T) {
+	b := &fakeBackend{
+		families: []Family{{Name: "demo", Branches: []Branch{
+			{ID: "main", State: "running"}, {ID: "child", State: "paused"}, {ID: "old", State: "deleted"},
+		}}},
+		imageList:       []ImageInfo{{Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc"}},
+		volumes:         []ttosbundle.VolumeInfo{{Name: "cache"}},
+		execSessionList: []runscExecSession{{ID: "exec-123", State: "running"}},
+	}
+	tests := []struct {
+		args    []string
+		want    []string
+		notWant string
+	}{
+		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
+		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
+		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
+		{args: []string{"_complete", "volume", "rm", "ca"}, want: []string{"cache"}},
+		{args: []string{"_complete", "exec", "wait", "demo@main", "exec-"}, want: []string{"exec-123"}},
+	}
+	for _, test := range tests {
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(test.args, &stdout, &stderr, b); status != 0 {
+			t.Fatalf("%v status=%d stderr=%q", test.args, status, stderr.String())
+		}
+		lines := strings.Fields(stdout.String())
+		for _, want := range test.want {
+			if !slices.Contains(lines, want) {
+				t.Errorf("%v output=%q, want %q", test.args, stdout.String(), want)
+			}
+		}
+		if test.notWant != "" && slices.Contains(lines, test.notWant) {
+			t.Errorf("%v output=%q unexpectedly contains %q", test.args, stdout.String(), test.notWant)
+		}
+	}
+	if b.execControlTarget != (selector{container: "demo", branch: "main"}) {
+		t.Errorf("exec completion target=%+v", b.execControlTarget)
 	}
 }

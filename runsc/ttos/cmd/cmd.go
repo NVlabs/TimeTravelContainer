@@ -278,6 +278,7 @@ Commands:
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
   volume COMMAND                   Manage family-local tmpfs volumes
+  completion SHELL                 Generate Bash, Zsh, or Fish completion
 
 Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
 run immediately unless --paused is set; omitting DEST generates a branch ID.
@@ -339,6 +340,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runBranch(args[1:], stdout, backend)
 	case "volume":
 		err = runVolume(args[1:], stdout, stderr, backend)
+	case "completion":
+		err = runCompletion(args[1:], stdout)
+	case "_complete":
+		err = runDynamicCompletion(args[1:], stdout, backend)
 	case "help":
 		printUsage(stdout)
 		return 0
