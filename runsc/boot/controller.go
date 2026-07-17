@@ -1078,7 +1078,7 @@ func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *u
 		}
 		return nil
 	}
-	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ConsoleID, args.FilePayload.Files[0], ready, exited, released)
+	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, args.FilePayload.Files[0], ready, exited, released)
 	if err != nil {
 		return err
 	}

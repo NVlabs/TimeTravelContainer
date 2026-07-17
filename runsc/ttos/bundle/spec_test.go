@@ -260,6 +260,18 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if info, err := os.Stat(filepath.Dir(paths.Log)); err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
 		t.Errorf("console directory: info=%v err=%v", info, err)
 	}
+	execPaths, err := store.ExecConsolePaths("demo", "test-a", "exec-1")
+	if err != nil {
+		t.Fatalf("ExecConsolePaths: %v", err)
+	}
+	wantExecBase := filepath.Join(containerDir, "console", "exec", "test-a", "exec-1")
+	if execPaths.Log != wantExecBase+".log" || execPaths.WaitStatus != wantExecBase+".wait-status" {
+		t.Errorf("exec console paths=%+v, want base %q", execPaths, wantExecBase)
+	}
+	if _, err := store.ExecConsolePaths("demo", "test-a", "../escape"); err == nil {
+		t.Fatal("ExecConsolePaths accepted invalid exec ID")
+	}
+
 	if _, err := store.BranchConsolePaths("demo", "../escape"); err == nil {
 		t.Fatal("BranchConsolePaths accepted invalid branch")
 	}

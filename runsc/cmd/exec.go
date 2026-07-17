@@ -219,9 +219,31 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// write the child's PID to the pid file. So when the container returns, the
 	// child process will also return and signal containerd.
 	if ex.detach {
+		if e.ExecID != "" {
+			if ex.pidFile != "" {
+				util.Fatalf("--pid-file is unsupported for managed detached exec sessions")
+			}
+			return ex.execManagedDetached(conf, c, e, waitStatus)
+		}
 		return ex.execChildAndWait(waitStatus)
 	}
 	return ex.exec(conf, c, e, waitStatus)
+}
+
+// execManagedDetached creates a managed Sentry-owned session without leaving a
+// host shim attached to its console. TTOS starts the sole persistent drainer.
+func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
+	pid, err := c.Execute(conf, e)
+	if err != nil {
+		return util.Errorf("executing managed detached process: %v", err)
+	}
+	if ex.internalPidFile != "" {
+		if err := WritePidFile(ex.internalPidFile, int(pid)); err != nil {
+			return util.Errorf("writing internal pid file: %v", err)
+		}
+	}
+	*waitStatus = 0
+	return subcommands.ExitSuccess
 }
 
 func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {

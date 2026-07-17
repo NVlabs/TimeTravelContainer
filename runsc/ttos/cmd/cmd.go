@@ -18,7 +18,9 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 
 	"gvisor.dev/gvisor/runsc/flag"
 	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
@@ -302,7 +305,7 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	case "logs":
 		err = runLogs(args[1:], stderr, backend)
 	case "exec":
-		err = runExec(args[1:], stderr, backend)
+		err = runExec(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -366,7 +369,7 @@ func runContainerNamespace(args []string, stdout, stderr io.Writer, backend back
 	case "logs":
 		return runLogs(args[1:], stderr, backend)
 	case "exec":
-		return runExec(args[1:], stderr, backend)
+		return runExec(args[1:], stdout, stderr, backend)
 	case "inspect":
 		return runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -790,6 +793,8 @@ type runRequest struct {
 }
 
 type execRequest struct {
+	detach      bool
+	execID      string
 	target      selector
 	args        []string
 	env         []string
@@ -1165,10 +1170,13 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-func runExec(args []string, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--workdir", "-w", "--user", "-u", "--env", "-e")
+func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e")
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	detach := fs.Bool("detach", false, "run in the background")
+	fs.BoolVar(detach, "d", false, "run in the background")
+
 	interactive := fs.Bool("interactive", false, "keep stdin open")
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
 	terminal := fs.Bool("tty", false, "allocate a terminal")
@@ -1190,7 +1198,17 @@ func runExec(args []string, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	execID := ""
+	if *detach {
+		execID, err = newExecID()
+		if err != nil {
+			return err
+		}
+	}
+
 	status, err := backend.exec(execRequest{
+		detach:      *detach,
+		execID:      execID,
 		target:      target,
 		args:        append([]string(nil), fs.Args()[1:]...),
 		env:         append([]string(nil), env...),
@@ -1205,7 +1223,18 @@ func runExec(args []string, stderr io.Writer, backend backend) error {
 	if status != 0 {
 		return exitStatus{code: status}
 	}
+	if *detach {
+		fmt.Fprintf(stdout, "%s@%s:%s\n", target.container, target.branch, execID)
+	}
 	return nil
+}
+
+func newExecID() (string, error) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generating exec session ID: %w", err)
+	}
+	return "exec-" + hex.EncodeToString(random[:]), nil
 }
 
 // InspectState is the Docker-compatible lifecycle view of the main branch.
@@ -2979,6 +3008,15 @@ func (b *runtimeBackend) removeStoppedRuntime(name string) error {
 
 func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	args := []string{"--root", b.root, "exec", "--branch", request.target.branch}
+	consoleID := ""
+	if request.detach {
+		if request.execID == "" {
+			return 1, fmt.Errorf("detached exec requires a stable session ID")
+		}
+		consoleID = "ttos-" + request.execID
+		args = append(args, "--detach", "--exec-id", request.execID, "--internal-console", consoleID)
+	}
+
 	for _, value := range request.env {
 		args = append(args, "--env", value)
 	}
@@ -2989,17 +3027,19 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 		args = append(args, "--user", request.user)
 	}
 	if request.terminal {
-		consoleID := fmt.Sprintf("ttos-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
-		args = append(args, "--internal-console", consoleID)
+		if !request.detach {
+			consoleID = fmt.Sprintf("ttos-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
+			args = append(args, "--internal-console", consoleID)
+		}
 		args = append(args, "--internal-console-terminal")
-		if request.interactive {
+		if request.interactive && !request.detach {
 			args = append(args, "--internal-console-stdin")
 		}
 	}
 	args = append(args, request.target.container)
 	args = append(args, request.args...)
 	command := exec.Command(b.runsc, args...)
-	if request.interactive || request.terminal {
+	if !request.detach && (request.interactive || request.terminal) {
 		command.Stdin = b.stdin
 	}
 	command.Stdout = b.stdout
@@ -3010,6 +3050,19 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 			return exitErr.ExitCode(), nil
 		}
 		return 1, fmt.Errorf("executing runsc: %w", err)
+	}
+	if request.detach {
+		session, err := b.execSession(request.target, request.execID)
+		if err != nil {
+			return 1, err
+		}
+		if _, err := b.ensureExecConsoleDrain(request.target, session.ID, session.ConsoleID, true); err != nil {
+			cleanupErr := b.signalExecSession(request.target, request.execID, int(linux.SIGKILL))
+			if cleanupErr != nil {
+				return 1, fmt.Errorf("starting exec console drain: %w (session cleanup also failed: %v)", err, cleanupErr)
+			}
+			return 1, fmt.Errorf("starting exec console drain: %w; detached session was killed", err)
+		}
 	}
 	return 0, nil
 }
@@ -3559,6 +3612,19 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 	if err != nil {
 		return ttosbundle.ConsolePaths{}, err
 	}
+	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset)
+}
+
+func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, consoleID string, reset bool) (ttosbundle.ConsolePaths, error) {
+	store := ttosbundle.Store{Root: b.dataRoot}
+	paths, err := store.ExecConsolePaths(target.container, target.branch, execID)
+	if err != nil {
+		return ttosbundle.ConsolePaths{}, err
+	}
+	return b.ensureConsoleDrainPaths(target, execID, consoleID, paths, reset)
+}
+
+func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consoleID string, paths ttosbundle.ConsolePaths, reset bool) (ttosbundle.ConsolePaths, error) {
 	lockFile, err := os.OpenFile(paths.Lock, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("opening console drain lock: %w", err)
@@ -3624,16 +3690,20 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttosbu
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("creating console readiness pipe: %w", err)
 	}
 	defer readyReader.Close()
-	command := exec.Command(b.runsc,
+	commandArgs := []string{
 		"--root", b.root,
-		"timetravel", "--console", "init",
+		"timetravel", "--console", consoleID,
 		"--console-log", paths.Log,
 		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
 		"--console-log-max-files", strconv.Itoa(maxFiles),
 		"--console-wait-status", paths.WaitStatus,
 		"--console-ready-fd", "4",
-		target.container, "console-follow", target.branch,
-	)
+	}
+	if execID != "" {
+		commandArgs = append(commandArgs, "--exec-id", execID)
+	}
+	commandArgs = append(commandArgs, target.container, "console-follow", target.branch)
+	command := exec.Command(b.runsc, commandArgs...)
 	command.Stderr = errorFile
 	// The inherited duplicate keeps the advisory lock held for exactly the
 	// lifetime of the drainer, preventing multiple consumers of one pipe.
@@ -4315,6 +4385,47 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 	return families, nil
 }
 
+type runscExecSession struct {
+	ID          string    `json:"id"`
+	ContainerID string    `json:"container_id"`
+	PID         int32     `json:"pid"`
+	ConsoleID   string    `json:"console_id"`
+	Terminal    bool      `json:"terminal"`
+	State       string    `json:"state"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExitStatus  *uint32   `json:"exit_status,omitempty"`
+}
+
+func (b *runtimeBackend) execSessions(target selector) ([]runscExecSession, error) {
+	output, err := b.command("timetravel", target.container, "exec-list", target.branch)
+	if err != nil {
+		return nil, err
+	}
+	var sessions []runscExecSession
+	if err := json.Unmarshal(output, &sessions); err != nil {
+		return nil, fmt.Errorf("decoding exec sessions for %s: %w", target, err)
+	}
+	return sessions, nil
+}
+
+func (b *runtimeBackend) execSession(target selector, execID string) (runscExecSession, error) {
+	sessions, err := b.execSessions(target)
+	if err != nil {
+		return runscExecSession{}, err
+	}
+	for _, session := range sessions {
+		if session.ID == execID {
+			return session, nil
+		}
+	}
+	return runscExecSession{}, fmt.Errorf("exec session %q does not exist in %s", execID, target)
+}
+
+func (b *runtimeBackend) signalExecSession(target selector, execID string, signal int) error {
+	_, err := b.command("timetravel", "--exec-id", execID, "--signal", strconv.Itoa(signal), target.container, "exec-signal", target.branch)
+	return err
+}
+
 type runscBranchInfo struct {
 	ID          string    `json:"ID"`
 	ParentID    string    `json:"ParentID"`
@@ -4363,6 +4474,27 @@ func (b *runtimeBackend) fork(source selector, destination string, paused bool) 
 		}
 		return Branch{}, fmt.Errorf("starting console drain after fork: %w; forked branch was destroyed", err)
 	}
+	sessions, err := b.execSessions(target)
+	if err != nil {
+		cleanupErr := b.destroy(target)
+		if cleanupErr != nil {
+			return Branch{}, fmt.Errorf("listing cloned exec sessions after fork: %w (cleanup also failed: %v)", err, cleanupErr)
+		}
+		return Branch{}, fmt.Errorf("listing cloned exec sessions after fork: %w; forked branch was destroyed", err)
+	}
+	for _, session := range sessions {
+		if session.State != "running" {
+			continue
+		}
+		if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, true); err != nil {
+			cleanupErr := b.destroy(target)
+			if cleanupErr != nil {
+				return Branch{}, fmt.Errorf("starting cloned exec console drain %q: %w (cleanup also failed: %v)", session.ID, err, cleanupErr)
+			}
+			return Branch{}, fmt.Errorf("starting cloned exec console drain %q: %w; forked branch was destroyed", session.ID, err)
+		}
+	}
+
 	return branchView(info), nil
 }
 

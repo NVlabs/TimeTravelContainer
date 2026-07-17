@@ -1039,6 +1039,22 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	}
 }
 
+func TestExecDetachReturnsQualifiedSessionID(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "-dit", "demo@child", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("detached exec status=%d, stderr=%q", status, stderr.String())
+	}
+	request := b.execRequest
+	if !request.detach || !request.interactive || !request.terminal || !strings.HasPrefix(request.execID, "exec-") {
+		t.Fatalf("detached exec request=%+v", request)
+	}
+	want := "demo@child:" + request.execID + "\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("detached exec output=%q, want %q", got, want)
+	}
+}
+
 func TestExecForwardsProcessExitStatus(t *testing.T) {
 	b := &fakeBackend{execStatus: 23}
 	var stdout, stderr bytes.Buffer
@@ -1491,6 +1507,11 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$6" = "child" ]; then
+	echo '[]'
+	exit 0
+fi
+
 if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-ready-fd" ] && [ "${15}" = "4" ] && [ "${16}" = "web" ] && [ "${17}" = "console-follow" ] && [ "${18}" = "child" ]; then
 	touch "$0.retention"
 	printf 1 >&4

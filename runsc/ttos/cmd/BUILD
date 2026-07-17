@@ -10,6 +10,7 @@ go_library(
     srcs = ["cmd.go"],
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
+        "//pkg/abi/linux",
         "//runsc/flag",
         "//runsc/ttos/bundle",
         "//runsc/ttos/console",

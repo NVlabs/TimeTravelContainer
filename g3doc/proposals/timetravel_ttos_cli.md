@@ -248,7 +248,7 @@ the `main` branch and leave `ttos` responsible for branch operations.
       exit-status forwarding; optionally import stdin with `-i`.
 - [x] Support TTY-interactive `-t` commands through the internal console (`-i`
       without a TTY is supported for synchronous exec).
-- [ ] Support `--detach`, returning a stable branch-qualified execution ID.
+- [x] Support `--detach`, returning a stable branch-qualified execution ID.
 - [x] Add a Sentry-owned branch-local exec registry with stable IDs, terminal
       metadata, retained exit status, and low-level list, wait, and signal RPCs.
 - [ ] Add `ttos exec ls`, `ttos exec wait`, `ttos exec kill`, and reattach by
@@ -328,7 +328,7 @@ state still forks entirely in memory.
 - [x] Define a saved branch-local non-TTY console object with a stable session
       ID and stdin/stdout/stderr queues.
 - [x] Add terminal metadata to the Sentry-owned managed exec registry.
-- [ ] Allocate and expose detached exec-session IDs in `ttos`.
+- [x] Allocate and expose detached exec-session IDs in `ttos`.
 - [x] For non-TTY processes, install internal Sentry pipes or equivalent queue
       endpoints at guest FDs 0, 1, and 2.
 - [x] For init interactive processes, allocate a Sentry devpts PTY and install its
@@ -556,10 +556,13 @@ grandchild branches without PID or wait-status crossover.
 - [x] Initial direct-CLI non-TTY host-side streaming and attach command.
 - [x] Persistent single-consumer branch sidecars, multi-reader log replay/follow,
       and detached output draining without fork-inhibiting host FDs.
+- [x] Persistent single-consumer exec-session sidecars, stable IDs and PIDs
+      across fork, and independent retained exit status per branch.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
 - [x] Persistent configurable log size/generation retention.
 - [ ] Daemon-owned stdin leases and daemon-owned transport/reconciliation.
-- [ ] Detached exec, reattach, and exec-session detach keys.
+- [x] Detached exec creation with fork-aware per-session output drains.
+- [ ] Reattach and exec-session detach keys.
 - [x] Internal devpts interactive consoles for init and attached exec, including
       host-size propagation and branch-local PTY signal semantics.
 - [x] Non-TTY console state fork and branch-local I/O.

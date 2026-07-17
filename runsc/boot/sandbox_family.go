@@ -110,6 +110,7 @@ type ConsoleFollowArgs struct {
 	BranchID  string
 	CID       string
 	ConsoleID string
+	ExecID    string
 }
 
 // BranchSignalArgs selects signal recipients inside one live branch.
@@ -958,10 +959,10 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 	return b.k.SendExternalSignalThreadGroup(session.tg, &linux.SignalInfo{Signo: args.Signo})
 }
 
-// FollowConsole coordinates a client-side console drainer with init lifetime.
+// FollowConsole coordinates a client-side console drainer with process lifetime.
 // It holds a branch control lease until output has been drained, preventing
 // Sentry shutdown from racing the client's final ConsoleRead calls.
-func (f *SandboxFamily) FollowConsole(id, cid, consoleID string, finalWriter io.Writer, ready func() error, exited func(uint32) error, released func() error) (uint32, error) {
+func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, exited func(uint32) error, released func() error) (uint32, error) {
 	b, done, err := f.beginControl(id)
 	if err != nil {
 		return 0, err
@@ -972,21 +973,51 @@ func (f *SandboxFamily) FollowConsole(id, cid, consoleID string, finalWriter io.
 			return 0, fmt.Errorf("acknowledging console follower registration: %w", err)
 		}
 	}
-	if id == "" || id == DefaultBranchID {
-		<-f.defaultStarted
-	}
-	tg, err := branchThreadGroup(b.k, cid, 0)
-	if err != nil {
-		return 0, err
+	var tg *kernel.ThreadGroup
+	if execID == "" {
+		if id == "" || id == DefaultBranchID {
+			<-f.defaultStarted
+		}
+		tg, err = branchThreadGroup(b.k, cid, 0)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		f.mu.Lock()
+		session := b.execSessions[execID]
+		if session != nil && session.info.ContainerID != cid {
+			session = nil
+		}
+		if session != nil && session.info.ConsoleID != consoleID {
+			f.mu.Unlock()
+			return 0, fmt.Errorf("exec session %q uses console %q, not %q", execID, session.info.ConsoleID, consoleID)
+		}
+		if session != nil {
+			tg = session.tg
+		}
+		f.mu.Unlock()
+		if tg == nil {
+			return 0, fmt.Errorf("exec session %q does not exist in branch %q", execID, id)
+		}
 	}
 	tg.WaitExited()
 	status := uint32(tg.ExitStatus())
+	if execID != "" {
+		f.mu.Lock()
+		if session := b.execSessions[execID]; session != nil && session.tg == tg {
+			session.info.State = ExecSessionExited
+			session.info.ExitStatus = &status
+		}
+		f.mu.Unlock()
+	}
 	if exited != nil {
 		if err := exited(status); err != nil {
-			return 0, fmt.Errorf("reporting console init exit: %w", err)
+			return 0, fmt.Errorf("reporting console process exit: %w", err)
 		}
 	}
-	b.k.WaitExited()
+	if execID == "" {
+		b.k.WaitExited()
+	}
 	if released != nil {
 		if err := released(); err != nil {
 			return 0, fmt.Errorf("waiting for client console-read handoff: %w", err)
@@ -1025,7 +1056,7 @@ func (f *SandboxFamily) FollowConsole(id, cid, consoleID string, finalWriter io.
 				stream.eof = true
 			}
 			if wouldBlock {
-				return 0, fmt.Errorf("internal console stream %d would block after branch exit", stream.stream)
+				return 0, fmt.Errorf("internal console stream %d would block after process exit and client handoff", stream.stream)
 			}
 		}
 		if allEOF {

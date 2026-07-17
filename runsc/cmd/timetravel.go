@@ -313,6 +313,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 					FilePayload: urpc.FilePayload{Files: files},
 					BranchID:    f.Arg(2),
 					CID:         cont.ID,
+					ExecID:      t.execID,
 					ConsoleID:   t.consoleID,
 				})
 				_ = finalWriter.Close()
