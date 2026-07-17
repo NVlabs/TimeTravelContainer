@@ -227,9 +227,12 @@ ttos fork "$ANON_VOLUME" "$ANON_VOLUME@child" >/dev/null
 ttos exec "$ANON_VOLUME@child" sh -c 'test -s /etc/passwd; echo child >/etc/branch'
 [ "$(ttos exec "$ANON_VOLUME" cat /etc/branch)" = parent ] || fail "anonymous-volume child write leaked into parent"
 [ "$(ttos exec "$ANON_VOLUME@child" cat /etc/branch)" = child ] || fail "anonymous-volume child write was not retained"
-ttos stop --time 1 "$ANON_VOLUME@child" "$ANON_VOLUME"
-ttos branch rm "$ANON_VOLUME@child"
-ttos rm --volumes "$ANON_VOLUME"
+if ttos rm --volumes "$ANON_VOLUME" >"$TTOS_E2E_ROOT/descendant-rm.out" 2>"$TTOS_E2E_ROOT/descendant-rm.err"; then
+  fail "unforced rm accepted a live family with a descendant"
+fi
+grep -q "stop it or use --force" "$TTOS_E2E_ROOT/descendant-rm.err" ||
+  fail "unforced descendant removal lacked a force diagnostic"
+ttos rm --force --volumes "$ANON_VOLUME"
 if ttos volume inspect "$ANON_NAME" >/dev/null 2>&1; then
   fail "rm --volumes retained an anonymous volume"
 fi

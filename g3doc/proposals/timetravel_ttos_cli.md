@@ -245,8 +245,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial `ttos rm CONTAINER`: remove stopped/created family metadata,
       reject a live family unless `--force` is given, and require `branch rm`
       for an individual non-main branch.
-- [ ] Finalize forced-removal and tombstone policy for live descendant
-      branches once persistent lineage is implemented.
+- [x] Finalize removal policy: `branch rm` retains immutable lineage tombstones;
+      unforced family removal rejects any live family; forced family removal tears
+      down main and all descendants and deletes the container-local lineage record.
 - [x] Docker-shaped `ttos inspect CONTAINER...` covering identity, image,
       process configuration, lifecycle state, sandbox PID, graph driver, and
       user mounts. Support Docker-style `--format/-f`, line-delimited
