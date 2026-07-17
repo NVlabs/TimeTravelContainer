@@ -1023,7 +1023,7 @@ func TestConsoleDrainHealth(t *testing.T) {
 func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	args := []string{"exec", "-it", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "demo@child", "sh", "-c", "echo ok"}
+	args := []string{"exec", "-it", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--additional-gids", "12", "--additional-gids", "34", "--cap", "CAP_CHOWN", "--cap", "CAP_SYS_PTRACE", "demo@child", "sh", "-c", "echo ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
 	}
@@ -1034,8 +1034,49 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	if got := strings.Join(request.env, " "); got != "A=1" {
 		t.Errorf("exec env=%q", got)
 	}
+	if got, want := request.additionalGIDs, []string{"12", "34"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("exec additional GIDs=%v, want %v", got, want)
+	}
+	if got, want := request.capabilities, []string{"CAP_CHOWN", "CAP_SYS_PTRACE"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("exec capabilities=%v, want %v", got, want)
+	}
 	if got := strings.Join(request.args, " "); got != "sh -c echo ok" {
 		t.Errorf("exec args=%q", got)
+	}
+}
+
+func TestExecProcessFileControlsCompleteProcess(t *testing.T) {
+	dir := t.TempDir()
+	processPath := filepath.Join(dir, "process.json")
+	data, err := json.Marshal(specs.Process{
+		Terminal: true,
+		Args:     []string{"sh", "-c", "echo process"},
+		Cwd:      "/work",
+		User:     specs.User{UID: 123, GID: 456, AdditionalGids: []uint32{12, 34}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(processPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "-di", "--process", processPath, "demo@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("exec --process status=%d, stderr=%q", status, stderr.String())
+	}
+	request := b.execRequest
+	if request.processPath != processPath || !request.detach || !request.interactive || !request.terminal || len(request.args) != 0 {
+		t.Fatalf("exec --process request=%+v", request)
+	}
+	b = &fakeBackend{}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"exec", "--process", processPath, "--env", "A=1", "demo"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("exec --process accepted a CLI process override")
+	}
+	if b.execRequest.processPath != "" {
+		t.Fatalf("rejected --process invocation reached backend: %+v", b.execRequest)
 	}
 }
 
@@ -1708,7 +1749,11 @@ if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
    [ "$6" = "--env" ] && [ "$7" = "A=1" ] &&
    [ "$8" = "--cwd" ] && [ "$9" = "/work" ] &&
    [ "${10}" = "--user" ] && [ "${11}" = "123:456" ] &&
-   [ "${12}" = "web" ] && [ "${13}" = "echo" ] && [ "${14}" = "ok" ]; then
+   [ "${12}" = "--additional-gids" ] && [ "${13}" = "12" ] &&
+   [ "${14}" = "--additional-gids" ] && [ "${15}" = "34" ] &&
+   [ "${16}" = "--cap" ] && [ "${17}" = "CAP_CHOWN" ] &&
+   [ "${18}" = "--cap" ] && [ "${19}" = "CAP_SYS_PTRACE" ] &&
+   [ "${20}" = "web" ] && [ "${21}" = "echo" ] && [ "${22}" = "ok" ]; then
 	echo branch-output
 	exit 0
 fi
@@ -1721,17 +1766,46 @@ exit 2
 	var stdout, stderr bytes.Buffer
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
 	status, err := b.exec(execRequest{
-		target: selector{container: "web", branch: "child"},
-		args:   []string{"echo", "ok"},
-		env:    []string{"A=1"},
-		cwd:    "/work",
-		user:   "123:456",
+		target:         selector{container: "web", branch: "child"},
+		args:           []string{"echo", "ok"},
+		env:            []string{"A=1"},
+		cwd:            "/work",
+		user:           "123:456",
+		additionalGIDs: []string{"12", "34"},
+		capabilities:   []string{"CAP_CHOWN", "CAP_SYS_PTRACE"},
 	})
 	if err != nil || status != 0 {
 		t.Fatalf("exec returned status=%d err=%v stderr=%q", status, err, stderr.String())
 	}
 	if stdout.String() != "branch-output\n" {
 		t.Errorf("stdout=%q", stdout.String())
+	}
+}
+
+func TestRuntimeBackendExecForwardsProcessFile(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
+   [ "$3" = "exec" ] && [ "$4" = "--branch" ] && [ "$5" = "child" ] &&
+   [ "$6" = "--process" ] && [ "$7" = "/process.json" ] &&
+   [ "$8" = "web" ] && [ -z "$9" ]; then
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	var stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, stderr: &stderr}
+	status, err := b.exec(execRequest{
+		target:      selector{container: "web", branch: "child"},
+		processPath: "/process.json",
+	})
+	if err != nil || status != 0 {
+		t.Fatalf("exec --process returned status=%d err=%v stderr=%q", status, err, stderr.String())
 	}
 }
 

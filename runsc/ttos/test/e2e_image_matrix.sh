@@ -163,6 +163,11 @@ ttos rm "$HOSTNET"
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'
 ttos rm "$PREFIX-alpine"
+ttos run --name "$PREFIX-alpine" --user 123:456 "$ALPINE_IMAGE" sh -c \
+  'test "$(stat -c %a /)" = 755 && test -r /etc/os-release && \
+   touch /dev/shm/nonroot-ok && test "$(stat -c %u:%g /dev/shm/nonroot-ok)" = 123:456 && \
+   echo alpine-nonroot-ok'
+ttos rm "$PREFIX-alpine"
 
 ttos run --name "$PREFIX-python" "$PYTHON_IMAGE" python3 -c \
   'import json, sqlite3, threading; db=sqlite3.connect(":memory:"); db.execute("create table t(v)"); db.execute("insert into t values (7)"); assert db.execute("select v from t").fetchone()[0] == 7; t=threading.Thread(target=lambda: json.dumps({"ok": True})); t.start(); t.join(); print("python-ok")'
@@ -225,6 +230,18 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "restarted detached init did not produce console output"
   sleep 1
 done
+
+EXEC_GROUPS=$(ttos exec --user 123:456 --additional-gids 4242 --additional-gids 4243 "$LIFECYCLE" /bin/busybox id)
+echo "$EXEC_GROUPS" | grep -q "4242,4243" || fail "exec supplementary groups missing: $EXEC_GROUPS"
+ttos exec --cap CAP_SYS_ADMIN "$LIFECYCLE" sh -c \
+  'set -- $(grep ^CapEff: /proc/self/status); value=$2; [ $((0x$value & 0x200000)) -ne 0 ]'
+PROCESS_JSON="$TTOS_E2E_ROOT/process.json"
+printf '%s\n' \
+  '{"terminal":false,"user":{"uid":123,"gid":456,"additionalGids":[4342,4343]},"args":["sh","-c","id; echo mark:$MARK"],"env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","MARK=process-ok"],"cwd":"/"}' \
+  >"$PROCESS_JSON"
+PROCESS_OUTPUT=$(ttos exec --process "$PROCESS_JSON" "$LIFECYCLE")
+echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supplementary groups missing: $PROCESS_OUTPUT"
+echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
 [ "$(ttos exec "$LIFECYCLE" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"

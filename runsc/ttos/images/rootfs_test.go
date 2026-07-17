@@ -66,6 +66,23 @@ func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
 	}
 }
 
+func TestPrepareEmptyRootNormalizesGuestRootMode(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareEmptyRoot(root); err != nil {
+		t.Fatalf("prepareEmptyRoot: %v", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0755); got != want {
+		t.Errorf("root mode=%#o, want %#o", got, want)
+	}
+}
+
 func TestPrepareEmptyRootRejectsContents(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "existing"), []byte("x"), 0600); err != nil {

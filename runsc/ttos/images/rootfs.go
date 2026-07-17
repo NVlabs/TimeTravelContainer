@@ -144,6 +144,13 @@ func prepareEmptyRoot(root string) error {
 	} else if err != io.EOF {
 		return fmt.Errorf("checking rootfs destination %q: %w", root, err)
 	}
+	// Storage parents are private, but the directory itself becomes guest /.
+	// Normalize an existing cache directory so host metadata does not make the
+	// guest root unsearchable by non-root users. A layer entry for . may still
+	// override this default during extraction.
+	if err := os.Chmod(root, 0755); err != nil {
+		return fmt.Errorf("setting rootfs destination mode: %w", err)
+	}
 	return nil
 }
 

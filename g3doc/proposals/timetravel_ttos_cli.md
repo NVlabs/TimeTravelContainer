@@ -244,8 +244,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial `ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND...` selecting a
       live branch through `runsc exec --branch`.
 - [x] Support environment, cwd, and UID/GID overrides in the initial CLI.
-- [ ] Add supplementary groups, capabilities, and an OCI process JSON input to
-      `ttos exec`.
+- [x] Add supplementary groups, capabilities, and an OCI process JSON input to
+      `ttos exec`; process JSON controls the complete process and terminal mode.
 - [x] Support synchronous non-TTY commands with output streaming and
       exit-status forwarding; optionally import stdin with `-i`.
 - [x] Support TTY-interactive `-t` commands through the internal console (`-i`
@@ -472,6 +472,8 @@ Reject            unsupported, externally mutable, or host/device-backed
       a versioned sidecar manifest served only by the immutable root gofer
       connection. Physical files remain caller-owned; guest stat and Sentry
       permission checks receive the OCI-layer IDs without subordinate ranges.
+      Materialized roots default to guest mode 0755 so non-root image users can
+      traverse `/` regardless of private host cache-parent modes.
 - [ ] Construct the full mount manifest once allowed mount classes are
       implemented.
 - [x] Place an in-memory OverlayFS upper over the immutable image lower by

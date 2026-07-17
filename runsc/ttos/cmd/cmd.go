@@ -794,15 +794,18 @@ type runRequest struct {
 }
 
 type execRequest struct {
-	detach      bool
-	execID      string
-	target      selector
-	args        []string
-	env         []string
-	cwd         string
-	user        string
-	interactive bool
-	terminal    bool
+	detach         bool
+	execID         string
+	target         selector
+	args           []string
+	env            []string
+	cwd            string
+	user           string
+	additionalGIDs []string
+	capabilities   []string
+	processPath    string
+	interactive    bool
+	terminal       bool
 }
 
 type exitStatus struct{ code int }
@@ -1195,12 +1198,11 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 	}
 
-	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e")
+	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e", "--additional-gids", "--cap", "--process")
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	detach := fs.Bool("detach", false, "run in the background")
 	fs.BoolVar(detach, "d", false, "run in the background")
-
 	interactive := fs.Bool("interactive", false, "keep stdin open")
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
 	terminal := fs.Bool("tty", false, "allocate a terminal")
@@ -1209,18 +1211,33 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
-	var env stringSlice
+	var env, additionalGIDs, capabilities stringSlice
 	fs.Var(&env, "env", "set environment variable NAME=VALUE")
 	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	fs.Var(&additionalGIDs, "additional-gids", "add a supplementary numeric GID")
+	fs.Var(&capabilities, "cap", "add a Linux capability to the process")
+	processPath := fs.String("process", "", "OCI process JSON file (replaces command and process overrides)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() < 2 {
-		return errors.New("usage: ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND [ARG...]")
+	usingProcess := *processPath != ""
+	if (!usingProcess && fs.NArg() < 2) || (usingProcess && fs.NArg() != 1) {
+		return errors.New("usage: ttos exec [OPTIONS] CONTAINER[@BRANCH] COMMAND [ARG...] | ttos exec [OPTIONS] --process FILE CONTAINER[@BRANCH]")
+	}
+	if usingProcess && (len(env) != 0 || *cwd != "" || *user != "" || len(additionalGIDs) != 0 || len(capabilities) != 0 || *terminal) {
+		return errors.New("--process cannot be combined with --env, --workdir, --user, --additional-gids, --cap, or --tty")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
+	}
+	resolvedProcessPath := ""
+	processTerminal := false
+	if usingProcess {
+		resolvedProcessPath, processTerminal, err = loadExecProcess(*processPath)
+		if err != nil {
+			return err
+		}
 	}
 	execID := ""
 	if *detach {
@@ -1229,17 +1246,19 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 	}
-
 	status, err := backend.exec(execRequest{
-		detach:      *detach,
-		execID:      execID,
-		target:      target,
-		args:        append([]string(nil), fs.Args()[1:]...),
-		env:         append([]string(nil), env...),
-		cwd:         *cwd,
-		user:        *user,
-		interactive: *interactive,
-		terminal:    *terminal,
+		detach:         *detach,
+		execID:         execID,
+		target:         target,
+		args:           append([]string(nil), fs.Args()[1:]...),
+		env:            append([]string(nil), env...),
+		cwd:            *cwd,
+		user:           *user,
+		additionalGIDs: append([]string(nil), additionalGIDs...),
+		capabilities:   append([]string(nil), capabilities...),
+		processPath:    resolvedProcessPath,
+		interactive:    *interactive,
+		terminal:       *terminal || processTerminal,
 	})
 	if err != nil {
 		return err
@@ -1251,6 +1270,29 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		fmt.Fprintf(stdout, "%s@%s:%s\n", target.container, target.branch, execID)
 	}
 	return nil
+}
+
+func loadExecProcess(name string) (string, bool, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving process file %q: %w", name, err)
+	}
+	file, err := os.Open(abs)
+	if err != nil {
+		return "", false, fmt.Errorf("opening process file %q: %w", name, err)
+	}
+	defer file.Close()
+	var process specs.Process
+	if err := json.NewDecoder(file).Decode(&process); err != nil {
+		return "", false, fmt.Errorf("decoding process file %q: %w", name, err)
+	}
+	if process.Cwd == "" || !filepath.IsAbs(process.Cwd) {
+		return "", false, fmt.Errorf("process file %q has non-absolute cwd %q", name, process.Cwd)
+	}
+	if len(process.Args) == 0 {
+		return "", false, fmt.Errorf("process file %q has no arguments", name)
+	}
+	return abs, process.Terminal, nil
 }
 
 func runExecList(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -3161,6 +3203,15 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	if request.user != "" {
 		args = append(args, "--user", request.user)
 	}
+	for _, gid := range request.additionalGIDs {
+		args = append(args, "--additional-gids", gid)
+	}
+	for _, capability := range request.capabilities {
+		args = append(args, "--cap", capability)
+	}
+	if request.processPath != "" {
+		args = append(args, "--process", request.processPath)
+	}
 	if request.terminal {
 		if !request.detach {
 			consoleID = fmt.Sprintf("ttos-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
@@ -3172,7 +3223,9 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 		}
 	}
 	args = append(args, request.target.container)
-	args = append(args, request.args...)
+	if request.processPath == "" {
+		args = append(args, request.args...)
+	}
 	command := exec.Command(b.runsc, args...)
 	if !request.detach && (request.interactive || request.terminal) {
 		command.Stdin = b.stdin
