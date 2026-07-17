@@ -46,7 +46,7 @@ func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct
 		e.Lock()
 		if e.boundSocketFD != nil {
 			e.Unlock()
-			return fmt.Errorf("Unix endpoint is bound to a host socket")
+			return fmt.Errorf("unix endpoint is bound to a host socket")
 		}
 		accepted := make([]*connectionedEndpoint, 0, len(e.acceptedChan))
 		for range len(e.acceptedChan) {
@@ -65,7 +65,7 @@ func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct
 		}
 		return nil
 	default:
-		return fmt.Errorf("unsupported Unix endpoint type %T", ep)
+		return fmt.Errorf("unsupported unix endpoint type %T", ep)
 	}
 }
 
@@ -83,7 +83,7 @@ func validateLiveForkBaseEndpoint(e *baseEndpoint) error {
 	case *connectedEndpoint:
 		return validateLiveForkQueue(c.writeQueue)
 	default:
-		return fmt.Errorf("host-backed Unix connected endpoint %T", connected)
+		return fmt.Errorf("host-backed unix connected endpoint %T", connected)
 	}
 }
 
@@ -98,11 +98,11 @@ func validateLiveForkReceiver(receiver Receiver) error {
 		hasRights := r.control.Rights != nil
 		r.mu.Unlock()
 		if hasRights {
-			return fmt.Errorf("Unix stream receiver has pending SCM_RIGHTS")
+			return fmt.Errorf("unix stream receiver has pending SCM_RIGHTS")
 		}
 		return validateLiveForkQueue(r.readQueue)
 	default:
-		return fmt.Errorf("host-backed Unix receiver %T", receiver)
+		return fmt.Errorf("host-backed unix receiver %T", receiver)
 	}
 }
 
@@ -114,7 +114,7 @@ func validateLiveForkQueue(q *queue) error {
 	defer q.mu.Unlock()
 	for m := q.dataList.Front(); m != nil; m = m.Next() {
 		if m.Control.Rights != nil {
-			return fmt.Errorf("Unix receive queue contains SCM_RIGHTS")
+			return fmt.Errorf("unix receive queue contains SCM_RIGHTS")
 		}
 	}
 	return nil

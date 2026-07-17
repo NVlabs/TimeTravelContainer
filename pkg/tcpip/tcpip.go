@@ -2491,8 +2491,8 @@ func (s NICStats) FillIn() NICStats {
 
 // Clone copies the current counter values into the zero-valued counters in dst.
 // The destination must have been initialized with FillIn or InitStatCounters.
-func (src *NICStats) Clone(dst *NICStats) {
-	cloneNICStats(reflect.ValueOf(dst).Elem(), reflect.ValueOf(src).Elem())
+func (s *NICStats) Clone(dst *NICStats) {
+	cloneNICStats(reflect.ValueOf(dst).Elem(), reflect.ValueOf(s).Elem())
 }
 
 func cloneNICStats(dst, src reflect.Value) {

@@ -52,8 +52,6 @@ func MountNamespaceFromContext(ctx goContext.Context) *MountNamespace {
 	return nil
 }
 
-// RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used
-// by ctx. If ctx is not associated with a RestoreFilesystemFDMap, returns nil.
 // LiveForkFilesystemResources maps stable filesystem IDs to implementation-
 // specific resources borrowed by an in-process clone.
 type LiveForkFilesystemResources map[checkpoint.ResourceID]any
@@ -64,6 +62,8 @@ func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFiles
 	return resources
 }
 
+// RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used
+// by ctx. If ctx is not associated with a RestoreFilesystemFDMap, returns nil.
 func RestoreFilesystemFDMapFromContext(ctx goContext.Context) map[checkpoint.ResourceID]int {
 	fdmap, ok := ctx.Value(CtxRestoreFilesystemFDMap).(map[checkpoint.ResourceID]int)
 	if !ok {
