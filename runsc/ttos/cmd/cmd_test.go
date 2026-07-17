@@ -17,6 +17,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1794,6 +1795,22 @@ func TestStopEscalatesToKill(t *testing.T) {
 	}
 }
 
+func TestStopAcceptsGracefulExitRacingWithKill(t *testing.T) {
+	timeout := 0
+	b := &fakeBackend{
+		waitRelease: make(chan struct{}),
+		killErr:     errors.New("control socket closed"),
+		inspectInfo: InspectInfo{
+			Config:     InspectConfig{StopSignal: "SIGTERM"},
+			HostConfig: InspectHostConfig{StopTimeout: &timeout},
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop race status=%d, stderr=%q", status, stderr.String())
+	}
+}
+
 func TestStopTimeoutOverride(t *testing.T) {
 	configuredTimeout := 30
 	b := &fakeBackend{
@@ -2546,6 +2563,7 @@ type fakeBackend struct {
 	checkTarget       selector
 	checkResult       ForkEligibility
 	err               error
+	killErr           error
 	forkSource        selector
 	forkDestination   string
 	forkPaused        bool
@@ -2736,8 +2754,13 @@ func (b *fakeBackend) destroy(target selector) error {
 
 func (b *fakeBackend) signal(target selector, signal int, all bool) error {
 	b.signals = append(b.signals, signalCall{target: target, signal: signal, all: all})
-	if signal == 9 && b.waitRelease != nil {
-		close(b.waitRelease)
+	if signal == 9 {
+		if b.waitRelease != nil {
+			close(b.waitRelease)
+		}
+		if b.killErr != nil {
+			return b.killErr
+		}
 	}
 	return b.err
 }
@@ -2812,5 +2835,37 @@ func TestParseAnonymousManagedVolumes(t *testing.T) {
 	}
 	if _, err := parseMountRequests([]string{"relative"}, nil, nil); err == nil {
 		t.Fatal("relative anonymous volume destination was accepted")
+	}
+}
+
+func TestMergeBranchHistoryPreservesTombstones(t *testing.T) {
+	now := time.Now().UTC()
+	history := []Branch{
+		{ID: "main", State: "running", CreatedAt: now},
+		{ID: "deleted-parent", ParentID: "main", State: "deleted", CreatedAt: now, DeletedAt: &now},
+		{ID: "child", ParentID: "deleted-parent", State: "running", CreatedAt: now},
+	}
+	live := []Branch{
+		{ID: "main", State: "running", CreatedAt: now},
+		{ID: "child", ParentID: "deleted-parent", State: "paused", CreatedAt: now},
+		{ID: "grandchild", ParentID: "child", State: "running", CreatedAt: now},
+	}
+	merged := mergeBranchHistory(history, live)
+	if len(merged) != 4 {
+		t.Fatalf("merged branches=%+v, want four", merged)
+	}
+	byID := make(map[string]Branch)
+	for _, branch := range merged {
+		byID[branch.ID] = branch
+	}
+	if byID["deleted-parent"].State != "deleted" || byID["deleted-parent"].DeletedAt == nil {
+		t.Errorf("tombstone was lost: %+v", byID["deleted-parent"])
+	}
+	if byID["child"].State != "paused" || byID["child"].ParentID != "deleted-parent" {
+		t.Errorf("live child did not override lifecycle state while retaining parent: %+v", byID["child"])
+	}
+	rows := psRows([]Family{{ID: strings.Repeat("a", 64), Name: "demo", Image: "busybox:latest", Branches: merged}}, now, false)
+	if len(rows) != 3 {
+		t.Errorf("Docker ps rows included tombstone: %+v", rows)
 	}
 }

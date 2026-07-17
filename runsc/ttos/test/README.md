@@ -12,11 +12,12 @@ covers:
 - Docker-compatible 64-hex container IDs from `create` and detached `run`,
   distinct persisted names, 12-character `ps` IDs, and lifecycle lookup by
   exact name, full ID, and unambiguous ID prefix;
-- Docker-compatible foreground and detached `run --rm`, including anonymous-volume cleanup, plus persisted
-  `create --rm` cleanup after a later detached start;
+- Docker-compatible foreground and detached `run --rm`, including anonymous-volume
+  cleanup, plus persisted `create --rm` cleanup after a later detached start;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
-  configuration, env-file/host-import environment overrides, merged labels,
+  configuration, persistent immutable branch lineage and deletion tombstones,
+  env-file/host-import environment overrides, merged labels,
   user mounts, sandbox PID, per-branch processes and timings, and explicit
   fork-eligibility reports;
 - Docker-style `container` aliases, multi-container detached `start`, concurrent

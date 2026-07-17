@@ -607,6 +607,40 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if spec.Process == nil || !reflect.DeepEqual(spec.Process.Args, []string{"true"}) {
 		t.Errorf("loaded spec=%+v", spec)
 	}
+	if len(containers[0].Branches) != 1 || containers[0].Branches[0].ID != "main" || containers[0].Branches[0].State != "exited" {
+		t.Errorf("legacy branch history=%+v, want exited main", containers[0].Branches)
+	}
+	childCreated := time.Now().UTC()
+	child := BranchInfo{ID: "child", ParentID: "main", State: "running", CreatedAt: childCreated, ForkTotalNS: 123}
+	if err := store.RecordBranch("demo", child); err != nil {
+		t.Fatalf("RecordBranch: %v", err)
+	}
+	if err := store.RecordBranch("demo", BranchInfo{ID: "grandchild", ParentID: "child", State: "paused", CreatedAt: childCreated.Add(time.Second)}); err != nil {
+		t.Fatalf("RecordBranch grandchild: %v", err)
+	}
+	if err := store.MarkBranchDeleted("demo", "child"); err != nil {
+		t.Fatalf("MarkBranchDeleted: %v", err)
+	}
+	withHistory, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatalf("LoadContainer with lineage: %v", err)
+	}
+	if len(withHistory.Branches) != 3 || withHistory.Branches[1].State != "deleted" || withHistory.Branches[1].DeletedAt == nil || withHistory.Branches[2].ParentID != "child" {
+		t.Fatalf("persisted lineage=%+v", withHistory.Branches)
+	}
+	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "other", State: "running"}); err == nil {
+		t.Fatal("RecordBranch accepted a changed historical parent")
+	}
+	if err := store.UpdateState("demo", "exited", &status); err != nil {
+		t.Fatalf("UpdateState with descendants: %v", err)
+	}
+	withHistory, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatalf("LoadContainer after family exit: %v", err)
+	}
+	if withHistory.Branches[1].State != "deleted" || withHistory.Branches[2].State != "exited" {
+		t.Errorf("family exit states=%+v, want tombstone plus exited descendant", withHistory.Branches)
+	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
 	}

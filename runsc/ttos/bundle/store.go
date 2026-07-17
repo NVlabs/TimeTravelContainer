@@ -68,6 +68,18 @@ type Prepared struct {
 	Container ContainerInfo
 }
 
+// BranchInfo is immutable branch lineage plus its last known lifecycle state.
+type BranchInfo struct {
+	ID               string     `json:"id"`
+	ParentID         string     `json:"parent_id,omitempty"`
+	State            string     `json:"state"`
+	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS int64      `json:"source_downtime_ns,omitempty"`
+	KernelForkNS     int64      `json:"kernel_fork_ns,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+}
+
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
 	ID                 string          `json:"id"`
@@ -78,6 +90,7 @@ type ContainerInfo struct {
 	BundleDir          string          `json:"bundle_dir"`
 	RootFS             string          `json:"rootfs"`
 	Volumes            []ManagedVolume `json:"volumes,omitempty"`
+	Branches           []BranchInfo    `json:"branches,omitempty"`
 	NetworkMode        string          `json:"network_mode,omitempty"`
 	ConsoleLogMaxBytes int64           `json:"console_log_max_bytes,omitempty"`
 	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
@@ -400,6 +413,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}
+	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
 		value := DefaultStopTimeoutSeconds
 		metadata.StopTimeout = &value
@@ -569,6 +583,25 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if info.State == "" {
 		info.State = "created"
 	}
+	if len(info.Branches) == 0 {
+		info.Branches = []BranchInfo{{ID: "main", State: info.State, CreatedAt: info.CreatedAt}}
+	}
+	seenBranches := make(map[string]struct{}, len(info.Branches))
+	for _, branch := range info.Branches {
+		if err := validateObjectName("branch", branch.ID); err != nil {
+			return ContainerInfo{}, fmt.Errorf("container %q has invalid branch metadata: %w", key, err)
+		}
+		if branch.ID == branch.ParentID {
+			return ContainerInfo{}, fmt.Errorf("container %q branch %q is its own parent", key, branch.ID)
+		}
+		if _, ok := seenBranches[branch.ID]; ok {
+			return ContainerInfo{}, fmt.Errorf("container %q contains duplicate branch %q", key, branch.ID)
+		}
+		seenBranches[branch.ID] = struct{}{}
+	}
+	if _, ok := seenBranches["main"]; !ok {
+		return ContainerInfo{}, fmt.Errorf("container %q branch metadata omits main", key)
+	}
 	networkMode, err := normalizeNetworkMode(info.NetworkMode)
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
@@ -656,6 +689,19 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 	now := time.Now().UTC()
 	info.State = state
 	info.ExitStatus = exitStatus
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.ID == "main" {
+			branch.State = state
+		}
+		if state == "running" && branch.ID != "main" && branch.State != "deleted" {
+			branch.State = "deleted"
+			branch.DeletedAt = &now
+		}
+		if state == "exited" && branch.State != "deleted" {
+			branch.State = "exited"
+		}
+	}
 	switch state {
 	case "running":
 		info.StartedAt = &now
@@ -668,6 +714,78 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 		return fmt.Errorf("updating container %q: %w", name, err)
 	}
 	return nil
+}
+
+// RecordBranch appends one immutable branch identity or refreshes its lifecycle data.
+func (s Store) RecordBranch(name string, branch BranchInfo) error {
+	if err := validateObjectName("branch", branch.ID); err != nil {
+		return err
+	}
+	if branch.ID == branch.ParentID {
+		return fmt.Errorf("branch %q cannot be its own parent", branch.ID)
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ID != branch.ID {
+			continue
+		}
+		if info.Branches[i].ParentID != branch.ParentID {
+			return fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
+		}
+		info.Branches[i] = branch
+		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	}
+	info.Branches = append(info.Branches, branch)
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// UpdateBranchState changes only the last known lifecycle state of a recorded branch.
+func (s Store) UpdateBranchState(name, branchID, state string) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ID != branchID {
+			continue
+		}
+		if info.Branches[i].State == "deleted" {
+			return fmt.Errorf("branch %q is deleted", branchID)
+		}
+		info.Branches[i].State = state
+		if branchID == "main" {
+			info.State = state
+		}
+		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	}
+	return fmt.Errorf("branch %q is not recorded", branchID)
+}
+
+// MarkBranchDeleted retains branch lineage while marking its runtime state gone.
+func (s Store) MarkBranchDeleted(name, branchID string) error {
+	if branchID == "main" {
+		return errors.New("main branch is removed with its container family")
+	}
+	if err := validateObjectName("branch", branchID); err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for i := range info.Branches {
+		if info.Branches[i].ID == branchID {
+			info.Branches[i].State = "deleted"
+			info.Branches[i].DeletedAt = &now
+			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		}
+	}
+	info.Branches = append(info.Branches, BranchInfo{ID: branchID, State: "deleted", CreatedAt: now, DeletedAt: &now})
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // RemoveContainer removes persistent configuration for name. Shared image

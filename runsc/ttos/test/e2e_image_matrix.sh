@@ -538,10 +538,22 @@ ttos ls --tree
 ttos logs --tail 2 "$LIFECYCLE"
 ttos logs --tail 2 "$LIFECYCLE@child"
 
-ttos stop --time 2 "$LIFECYCLE@child" "$LIFECYCLE"
+# Persist immutable lineage when an intermediate source branch is deleted.
+ttos fork "$LIFECYCLE@child" "$LIFECYCLE@grandchild"
+ttos branch rm "$LIFECYCLE@child"
+LINEAGE_TREE=$(ttos ls --tree)
+echo "$LINEAGE_TREE" | grep -q "child deleted" || fail "tree omitted the deleted intermediate branch"
+echo "$LINEAGE_TREE" | grep -q "grandchild running" || fail "tree omitted the live grandchild below its tombstone"
+if ttos fork "$LIFECYCLE@main" "$LIFECYCLE@child" >"$TTOS_E2E_ROOT/lineage-reuse.out" 2>"$TTOS_E2E_ROOT/lineage-reuse.err"; then
+  fail "fork reused a branch ID retained by immutable lineage"
+fi
+grep -q "retained by immutable lineage" "$TTOS_E2E_ROOT/lineage-reuse.err" ||
+  fail "branch ID reuse rejection lacked a lineage diagnostic"
+
+ttos stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
   fail "inspect did not report the stopped family as exited"
-ttos branch rm "$LIFECYCLE@child"
+ttos branch rm "$LIFECYCLE@grandchild"
 ttos rm "$LIFECYCLE_ID"
 ttos volume rm "$VOLUME"
 

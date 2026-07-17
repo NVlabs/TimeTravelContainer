@@ -8,7 +8,7 @@ sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd with Docker config and credential-helper authentication, generates
 rootless image-backed OCI bundles, and implements the
 initial run/create/start/wait/restart/inspect/list/remove lifecycle with
-persistent metadata, plus synchronous, detached, and TTY exec into a selected
+persistent metadata and immutable branch lineage/tombstones, plus synchronous, detached, and TTY exec into a selected
 live branch, with branch-local managed-session list, wait, signal, log, and
 reattach support.
 Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
@@ -86,18 +86,19 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ## Object and state model
 
-- [ ] Define a stable family ID and user-facing container name.
+- [x] Define a stable 64-hex family ID and distinct user-facing container name.
 - [x] Define branch selectors, initially `<container>@<branch>`, with `main` as
       the default branch.
-- [ ] Define immutable branch creation lineage. `ParentID` remains historical
+- [x] Define immutable branch creation lineage. `ParentID` remains historical
       even if an ancestor is destroyed.
-- [ ] Persist branch tombstones or lineage metadata so `ttos ls --tree` can show
+- [x] Persist branch tombstones and lineage metadata so `ttos ls --tree` can show
       descendants whose source branch was deleted.
-- [ ] Add an `exited` branch state and reconcile runtime state after virtual PID
+- [x] Add an `exited` branch state and reconcile runtime state after virtual PID
       1 exits.
-- [ ] Distinguish family state, branch state, and exec-session state.
-- [ ] Define `stop` as process termination, not suspension; `pause`/`resume`
-      retain memory and kernel state.
+- [x] Distinguish family state, branch state, and exec-session state.
+- [x] Define `stop` as process termination, not suspension; `pause`/`resume`
+      retain memory and kernel state. The current `main` init remains the sandbox
+      lifetime anchor, so its exit quiesces and exits all descendant branches.
 - [x] Define initial `start` semantics: a created or exited base container
       starts from its persistent OCI bundle and immutable image root; destroyed
       in-memory branch state is not reconstructed.
@@ -106,8 +107,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Store initial desired configuration and lifecycle metadata separately
       from transient Sentry state so created/stopped containers can be listed,
       inspected, restarted, and removed.
-- [ ] Move persistent state behind `ttosd`, make updates transactional, and
-      persist complete branch lineage rather than only the base container.
+- [ ] Move persistent state behind `ttosd` and make updates transactional;
+      direct-CLI metadata now persists complete branch lineage and tombstones.
 
 ## `ttos` command surface
 
@@ -503,8 +504,9 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] Reject writable host binds without a managed CoW upper.
 - [x] Initial named-volume attachment, read-only aliases, metadata inspection,
       listing, in-use removal rejection, and removal.
-- [ ] Add anonymous volumes, ownership initialization, quotas, and richer
-      inspection.
+- [x] Add anonymous volumes, image-path ownership initialization, Docker copy-up
+      and `volume-nocopy`, inspect projection, and `rm -v`/`--rm` cleanup.
+- [ ] Add managed-volume quotas and richer usage inspection.
 - [x] Initial family-local semantics: attaching a name instantiates one tmpfs
       per sandbox family; the same name in unrelated families does not share
       data.

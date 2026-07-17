@@ -2651,6 +2651,9 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 		}
 		displayName := familyDisplayName(family)
 		for _, branch := range family.Branches {
+			if branch.State == "deleted" {
+				continue
+			}
 			created := branch.CreatedAt
 			if created.IsZero() {
 				created = family.CreatedAt
@@ -3234,7 +3237,18 @@ func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend
 		return nil
 	case <-timer.C:
 		if err := backend.signal(target, signalKill, false); err != nil {
-			return fmt.Errorf("stopping %s with SIGKILL: %w", target, err)
+			// The graceful signal may have won the timeout race and torn down
+			// the control socket before SIGKILL was delivered. Accept a
+			// concurrently successful wait instead of reporting a false failure.
+			select {
+			case result := <-waited:
+				if result.err == nil {
+					return nil
+				}
+				return fmt.Errorf("stopping %s with SIGKILL: %w (wait also failed: %v)", target, err, result.err)
+			case <-time.After(250 * time.Millisecond):
+				return fmt.Errorf("stopping %s with SIGKILL: %w", target, err)
+			}
 		}
 		result := <-waited
 		if result.err != nil {
@@ -3442,13 +3456,14 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttos ls --json.
 type Branch struct {
-	ID               string    `json:"id"`
-	ParentID         string    `json:"parent_id,omitempty"`
-	State            string    `json:"state"`
-	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID               string     `json:"id"`
+	ParentID         string     `json:"parent_id,omitempty"`
+	State            string     `json:"state"`
+	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS int64      `json:"source_downtime_ns,omitempty"`
+	KernelForkNS     int64      `json:"kernel_fork_ns,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
 }
 
 // Family is stable family metadata returned by ttos ls --json.
@@ -5422,7 +5437,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			State:     state,
 			CreatedAt: container.CreatedAt,
 			Volumes:   volumes,
-			Branches:  []Branch{{ID: defaultBranchID, State: state, CreatedAt: container.CreatedAt}},
+			Branches:  persistentBranches(container.Branches),
 		}
 	}
 	if runtimeErr == nil {
@@ -5435,6 +5450,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family.Digest = persistent.Digest
 				family.CreatedAt = persistent.CreatedAt
 				family.Volumes = persistent.Volumes
+				family.Branches = mergeBranchHistory(persistent.Branches, family.Branches)
 				for i := range family.Branches {
 					if family.Branches[i].ID == defaultBranchID {
 						family.Branches[i].CreatedAt = persistent.CreatedAt
@@ -5454,16 +5470,18 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			byID[family.ID] = family
 		}
 		for _, container := range containers {
-			if container.State == "running" {
+			if container.State == "running" || container.State == "paused" {
 				if _, ok := runtimeIDs[container.ID]; ok {
 					continue
 				}
 				_ = store.UpdateState(container.ID, "exited", nil)
 				family := byID[container.ID]
 				family.State = "exited"
-				family.Branches = []Branch{{
-					ID: defaultBranchID, State: "exited", CreatedAt: container.CreatedAt,
-				}}
+				for i := range family.Branches {
+					if family.Branches[i].State != "deleted" {
+						family.Branches[i].State = "exited"
+					}
+				}
 				byID[container.ID] = family
 			}
 		}
@@ -5619,6 +5637,37 @@ type runscBranchInfo struct {
 	} `json:"ForkMetrics"`
 }
 
+func persistentBranchView(info ttosbundle.BranchInfo) Branch {
+	return Branch{
+		ID: info.ID, ParentID: info.ParentID, State: info.State, CreatedAt: info.CreatedAt, DeletedAt: info.DeletedAt,
+		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
+	}
+}
+
+func persistentBranches(infos []ttosbundle.BranchInfo) []Branch {
+	branches := make([]Branch, 0, len(infos))
+	for _, info := range infos {
+		branches = append(branches, persistentBranchView(info))
+	}
+	return branches
+}
+
+func mergeBranchHistory(history, live []Branch) []Branch {
+	byID := make(map[string]Branch, len(history)+len(live))
+	for _, branch := range history {
+		byID[branch.ID] = branch
+	}
+	for _, branch := range live {
+		byID[branch.ID] = branch
+	}
+	merged := make([]Branch, 0, len(byID))
+	for _, branch := range byID {
+		merged = append(merged, branch)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
+	return merged
+}
+
 func branchView(info runscBranchInfo) Branch {
 	return Branch{
 		ID:               info.ID,
@@ -5632,11 +5681,16 @@ func branchView(info runscBranchInfo) Branch {
 }
 
 func (b *runtimeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
-	resolved, _, err := b.resolveSelector(source)
+	resolved, containerInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return Branch{}, err
 	}
 	source = resolved
+	for _, historical := range containerInfo.Branches {
+		if historical.ID == destination {
+			return Branch{}, fmt.Errorf("branch name %q is retained by immutable lineage", destination)
+		}
+	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
@@ -5649,6 +5703,20 @@ func (b *runtimeBackend) fork(source selector, destination string, paused bool) 
 	var info runscBranchInfo
 	if err := json.Unmarshal(output, &info); err != nil {
 		return Branch{}, fmt.Errorf("decoding runsc fork result: %w", err)
+	}
+	branch := branchView(info)
+	if b.dataRoot != "" {
+		record := ttosbundle.BranchInfo{
+			ID: branch.ID, ParentID: branch.ParentID, State: branch.State, CreatedAt: branch.CreatedAt,
+			ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
+		}
+		if err := b.containerStore().RecordBranch(source.container, record); err != nil {
+			_, cleanupErr := b.command("timetravel", source.container, "destroy", destination)
+			if cleanupErr != nil {
+				return Branch{}, fmt.Errorf("persisting fork lineage: %w (cleanup also failed: %v)", err, cleanupErr)
+			}
+			return Branch{}, fmt.Errorf("persisting fork lineage: %w; forked branch was destroyed", err)
+		}
 	}
 	target := selector{container: source.container, branch: destination}
 	if _, err := b.ensureConsoleDrain(target, true); err != nil {
@@ -5679,7 +5747,7 @@ func (b *runtimeBackend) fork(source selector, destination string, paused bool) 
 		}
 	}
 
-	return branchView(info), nil
+	return branch, nil
 }
 
 func (b *runtimeBackend) pause(target selector) error {
@@ -5689,6 +5757,9 @@ func (b *runtimeBackend) pause(target selector) error {
 	}
 	target = resolved
 	_, err = b.command("timetravel", target.container, "pause", target.branch)
+	if err == nil && b.dataRoot != "" {
+		err = b.containerStore().UpdateBranchState(target.container, target.branch, "paused")
+	}
 	return err
 }
 
@@ -5699,6 +5770,9 @@ func (b *runtimeBackend) resume(target selector) error {
 	}
 	target = resolved
 	_, err = b.command("timetravel", target.container, "resume", target.branch)
+	if err == nil && b.dataRoot != "" {
+		err = b.containerStore().UpdateBranchState(target.container, target.branch, "running")
+	}
 	return err
 }
 
@@ -5708,37 +5782,43 @@ func (b *runtimeBackend) destroy(target selector) error {
 		return err
 	}
 	target = resolved
-	if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
-		return nil
-	} else {
-		destroyErr := err
-		families, listErr := b.listRuntimeFamilies()
-		if listErr != nil {
-			return destroyErr
-		}
-		for _, family := range families {
-			if family.ID != target.container {
-				continue
+	destroyRuntime := func() error {
+		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
+			return nil
+		} else {
+			destroyErr := err
+			families, listErr := b.listRuntimeFamilies()
+			if listErr != nil {
+				return destroyErr
 			}
-			// Stopping main tears down the Sentry and all in-memory child
-			// branches. Removing one of those branches afterwards is already
-			// satisfied even though the control socket no longer exists.
-			if family.State == "stopped" || family.State == "exited" {
-				return nil
+			for _, family := range families {
+				if family.ID != target.container {
+					continue
+				}
+				// Stopping main tears down the Sentry and all in-memory children.
+				if family.State == "stopped" || family.State == "exited" {
+					return nil
+				}
+				return destroyErr
 			}
-			return destroyErr
+			if b.dataRoot == "" {
+				return destroyErr
+			}
+			if _, err := b.containerStore().LoadContainer(target.container); err != nil {
+				return destroyErr
+			}
+			return nil
 		}
-		// A known persistent family absent from runsc state has no in-memory
-		// branch left to destroy. Do not turn a misspelled container name into
-		// an apparent success.
-		if b.dataRoot == "" {
-			return destroyErr
-		}
-		if _, err := (ttosbundle.Store{Root: b.dataRoot}).LoadContainer(target.container); err != nil {
-			return destroyErr
-		}
-		return nil
 	}
+	if err := destroyRuntime(); err != nil {
+		return err
+	}
+	if b.dataRoot != "" {
+		if err := b.containerStore().MarkBranchDeleted(target.container, target.branch); err != nil {
+			return fmt.Errorf("persisting deletion of %s: %w", target, err)
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
@@ -5820,11 +5900,14 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 }
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	if target.branch != defaultBranchID {
+		if err := store.UpdateBranchState(target.container, target.branch, "exited"); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttos: warning: recording branch exit state for %s: %v\n", target, err)
+		}
 		return
 	}
 	exitStatus := waitStatusExitCode(status)
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	if err := store.UpdateState(target.container, "exited", &exitStatus); err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttos: warning: recording exit state for %s: %v\n", target, err)
 	}
