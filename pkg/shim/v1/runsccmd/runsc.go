@@ -107,6 +107,17 @@ func (r *Runsc) State(context context.Context, id string) (*runc.Container, erro
 	return &c, nil
 }
 
+// TimeTravel invokes the additive runsc branch-control command and returns its
+// JSON response.
+func (r *Runsc) TimeTravel(context context.Context, args ...string) ([]byte, error) {
+	command := append([]string{"timetravel"}, args...)
+	data, stderr, err := cmdOutput(r.command(context, command...), false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, stderr)
+	}
+	return data, nil
+}
+
 // CreateOpts is a set of options to Runsc.Create().
 type CreateOpts struct {
 	runc.IO

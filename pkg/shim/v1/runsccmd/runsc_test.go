@@ -85,3 +85,34 @@ exit 0
 		t.Fatalf("stdin resources: got %+v, want memory limit %d", got.Memory, limit)
 	}
 }
+
+func TestRunscTimeTravelCLI(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "timetravel-args.txt")
+	script := filepath.Join(dir, "fake-runsc-timetravel")
+	scriptBody := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >%q
+printf '{"branches":["main","child"]}\n'
+`, argsLog)
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Runsc{Command: script, Root: filepath.Join(dir, "root")}
+	output, err := r.TimeTravel(ctx, "--source", "child", "--paused", "cid-1", "fork", "grandchild")
+	if err != nil {
+		t.Fatalf("TimeTravel: %v", err)
+	}
+	if strings.TrimSpace(string(output)) != `{"branches":["main","child"]}` {
+		t.Fatalf("output=%q", output)
+	}
+	rawArgs, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "timetravel --source child --paused cid-1 fork grandchild"
+	if !strings.Contains(string(rawArgs), want) {
+		t.Fatalf("argv=%q, want suffix %q", rawArgs, want)
+	}
+}

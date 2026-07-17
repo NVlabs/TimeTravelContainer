@@ -752,13 +752,18 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       tree and that `ttos` remains the source of truth for forks.
 - [x] Preserve the standard OCI runtime command surface for external managers;
       TimeTravel control remains an additive `runsc timetravel` subcommand.
-- [ ] Prototype a containerd shim extension or side-channel API for branch
-      lifecycle without changing the standard task-v2 API.
+- [x] Prototype a containerd shim side-channel API for branch lifecycle without
+      changing the standard task-v2 API. The versioned TTRPC service
+      `gvisor.timetravel.v1.Branches` is registered on the existing shim socket
+      and exposes `List`, `Check`, `Fork`, `Pause`, `Resume`, and `Destroy`; its
+      public Go client delegates to `runsc timetravel` while task-v2 is unchanged.
 - [x] Keep the image target and its referenced content leased while any branch
       in the family may reference the materialized immutable lower. No containerd
       snapshot is used by the current execution backend.
-- [ ] Consider a future nerdctl/Docker-compatible flag layer only after the
-      branch-native `ttos` model is stable.
+- [x] Consider a future nerdctl/Docker-compatible flag layer only after the
+      branch-native `ttos` model is stable. Decision: keep `ttos` as the
+      Docker-compatible command surface rather than wrapping nerdctl; containerd
+      adapters may use the additive shim service without owning the branch tree.
 
 ## Delivery sequence
 

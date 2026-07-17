@@ -48,6 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	ttosshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -172,6 +173,43 @@ func (s *runscService) getContainer(id string) (*Container, error) {
 		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "container not created")
 	}
 	return c, nil
+}
+
+func timeTravelArgs(operation string, req *ttosshim.Request) ([]string, error) {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	switch operation {
+	case "List":
+		return []string{req.ContainerID, "branches"}, nil
+	case "Check", "Pause", "Resume", "Destroy":
+		return []string{req.ContainerID, strings.ToLower(operation), branch}, nil
+	case "Fork":
+		var args []string
+		if req.Source != "" {
+			args = append(args, "--source", req.Source)
+		}
+		if req.Paused {
+			args = append(args, "--paused")
+		}
+		return append(args, req.ContainerID, "fork", req.Destination), nil
+	default:
+		return nil, fmt.Errorf("unsupported TimeTravel operation %q", operation)
+	}
+}
+
+// ControlTimeTravel implements the additive shim branch API without changing
+// containerd task-v2 semantics.
+func (s *runscService) ControlTimeTravel(ctx context.Context, operation string, req *ttosshim.Request) ([]byte, error) {
+	if _, err := s.getContainer(req.ContainerID); err != nil {
+		return nil, err
+	}
+	args, err := timeTravelArgs(operation, req)
+	if err != nil {
+		return nil, err
+	}
+	return s.runtime.TimeTravel(ctx, args...)
 }
 
 // Create creates a new initial process and container with the underlying OCI

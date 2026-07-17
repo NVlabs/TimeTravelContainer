@@ -50,6 +50,49 @@ When you are done, restart containerd to pick up the changes.
 sudo systemctl restart containerd
 ```
 
+## TimeTravelOS branch side channel
+
+The TimeTravelOS shim adds a versioned TTRPC service to the existing shim Unix
+socket. It does not add methods to containerd task-v2 and does not change the
+meaning of standard containerd pause, resume, exec, or lifecycle operations.
+Containerd continues to control the `main` task; TTOS remains authoritative for
+the live branch tree.
+
+The service name is `gvisor.timetravel.v1.Branches`. It carries validated JSON
+in protobuf `Any` envelopes and provides these methods:
+
+- `List`: requires `container_id`.
+- `Check`, `Pause`, `Resume`, and `Destroy`: require `container_id`; `branch`
+  defaults to `main`.
+- `Fork`: requires `container_id` and `destination`; `source` defaults to
+  `main`, and `paused` requests a paused child.
+
+Successful replies use type URL
+`type.googleapis.com/gvisor.timetravel.v1.JSONResult` and contain the JSON
+returned by `runsc timetravel`; successful commands with no payload return
+`{}`. The public Go package `gvisor.dev/gvisor/pkg/shim/v1/timetravel` provides
+the request type and a typed call helper:
+
+```go
+conn, err := net.Dial("unix", shimAddress)
+if err != nil {
+    return err
+}
+client := ttrpc.NewClient(conn)
+defer client.Close()
+result, err := timetravel.Call(ctx, client, "Fork", timetravel.Request{
+    ContainerID: "demo",
+    Source: "main",
+    Destination: "child",
+    Paused: true,
+})
+```
+
+An adapter obtains the per-sandbox shim address from containerd runtime
+metadata, then connects with the same local permissions as an ordinary shim
+client. The current `ttos` daemon remains on its direct-runsc backend; this
+side channel is the integration boundary for a future containerd-backed daemon.
+
 ## Debug
 
 When `shim_debug` is enabled in `/etc/containerd/config.toml`, containerd will

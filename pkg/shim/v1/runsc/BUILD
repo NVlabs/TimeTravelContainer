@@ -26,6 +26,7 @@ go_library(
         "//pkg/shim/v1/proc",
         "//pkg/shim/v1/runsccmd",
         "//pkg/shim/v1/runtimeoptions",
+        "//pkg/shim/v1/timetravel",
         "//pkg/shim/v1/utils",
         "//runsc/specutils",
         "@com_github_burntsushi_toml//:go_default_library",
@@ -74,6 +75,7 @@ go_test(
     ],
     library = ":runsc",
     deps = [
+        "//pkg/shim/v1/timetravel",
         "//pkg/shim/v1/utils",
         "@com_github_containerd_cgroups_v3//cgroup2:go_default_library",
         "@com_github_containerd_containerd_api//runtime/task/v2:go_default_library",
