@@ -20,6 +20,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func TestParseMountOptions(t *testing.T) {
@@ -187,6 +188,24 @@ func TestCgroupfsCPUDefaults(t *testing.T) {
 			}
 			if got := defaults["cpu.cfs_period_us"]; got != tc.wantPeriod {
 				t.Errorf("period = %d, want %d", got, tc.wantPeriod)
+			}
+		})
+	}
+}
+
+func TestGoferSubmountReadOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info mountInfo
+		want bool
+	}{
+		{name: "writable", info: mountInfo{mount: &specs.Mount{Options: []string{"rw"}}}},
+		{name: "OCI read-only", info: mountInfo{mount: &specs.Mount{Options: []string{"ro"}}}, want: true},
+		{name: "memory overlay lower", info: mountInfo{mount: &specs.Mount{Options: []string{"rw"}}, goferMountConf: specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.MemoryOverlay}}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := goferSubmountReadOnly(&tc.info); got != tc.want {
+				t.Errorf("goferSubmountReadOnly(%+v)=%t, want %t", tc.info, got, tc.want)
 			}
 		})
 	}

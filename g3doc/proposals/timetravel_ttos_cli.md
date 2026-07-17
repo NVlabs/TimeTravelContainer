@@ -29,7 +29,12 @@ devpts instance with `/dev/ptmx`. Docker-compatible `--shm-size` configures the
 mode, size, and access options; TTOS extensions
 `--mount type=proc|procfs|sysfs` add alternate Sentry virtual-filesystem
 views. Existing host paths can be attached read-only with Docker-style `-v`
-or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
+or `--mount` syntax. An explicit `:cow,immutable-source` or
+`--mount type=bind,...,cow,immutable-source` TTOS extension instead places a
+branch-local Sentry-memory OverlayFS upper over the user-attested immutable host
+lower; ordinary writable Docker binds remain rejected to avoid silently changing
+their host-write semantics.
+Named managed tmpfs volumes can be attached at one or
 more paths, and their state forks CoW with each live branch. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
@@ -194,6 +199,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       and finish time into persistent inspect metadata.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
+- [x] Support explicit managed host CoW binds through
+      `-v HOST:CONTAINER:cow,immutable-source` and
+      `--mount type=bind,...,cow,immutable-source`; ordinary writable binds
+      remain rejected because their Docker host-write semantics are incompatible.
 - [x] Support Docker-compatible `--shm-size` byte units with Docker's 64 MiB
       default, persistent `HostConfig.ShmSize` inspect output, and retention
       across create/start/restart/live fork.
@@ -530,9 +539,9 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 
 - [x] `ttos volume create NAME` for a forkable managed volume.
 - [x] Support pure tmpfs managed volumes.
-- [ ] Support immutable image/host lower plus main-MemoryFile tmpfs OverlayFS
+- [x] Support a user-attested immutable host lower plus main-MemoryFile tmpfs OverlayFS
       upper.
-- [ ] Generalize the already-supported root OverlayFS live-fork tests to
+- [x] Generalize the already-supported root OverlayFS live-fork tests to
       arbitrary submounts.
 - [x] Fork every managed tmpfs volume together with its branch and verify
       parent/child/grandchild write isolation.
@@ -639,7 +648,7 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Initial immutable read-only gofer bind.
 - [ ] Multiple immutable read-only gofer binds and exhaustive access coverage.
 - [x] Managed tmpfs submount volumes.
-- [ ] Managed OverlayFS submount volumes.
+- [x] Managed OverlayFS submount volumes.
 
 Gate: an ordinary generated OCI bundle with `/proc`, `/sys`, `/dev`, `/dev/pts`,
 read-only binds, and managed volumes forks without hand-editing its spec.

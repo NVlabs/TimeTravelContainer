@@ -989,6 +989,10 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 	return mnt, nil
 }
 
+func goferSubmountReadOnly(m *mountInfo) bool {
+	return specutils.IsReadonlyMount(m.mount.Options) || m.goferMountConf.ShouldUseOverlayfs()
+}
+
 // getMountNameAndOptions retrieves the fsName, opts, and useOverlay values
 // used for mounts.
 func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName, containerID string, fsr *fsRestore) (string, *vfs.MountOptions, error) {
@@ -1060,7 +1064,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		}
 		data = append(data, goferMountData(m.goferFD.Release(), getMountAccessType(conf, m.hint), conf, m.hint != nil && m.hint.SuppressDirectFS)...)
 		internalData = gofer.InternalFilesystemOptions{
-			ReadOnly: specutils.IsReadonlyMount(m.mount.Options),
+			ReadOnly: goferSubmountReadOnly(m),
 			UniqueID: checkpoint.ResourceID{
 				ContainerName: containerName,
 				Path:          m.mount.Destination,

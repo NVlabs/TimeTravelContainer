@@ -47,6 +47,8 @@ const (
 	InternalMountsAnnotation = "dev.timetravelos.config.internal-mounts"
 	// ImmutableHostMountsAnnotation records user-attested immutable host sources.
 	ImmutableHostMountsAnnotation = "dev.timetravelos.config.immutable-host-mounts"
+	// ManagedCoWHostMountsAnnotation records host binds with branch-local memory uppers.
+	ManagedCoWHostMountsAnnotation = "dev.timetravelos.config.managed-cow-host-mounts"
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -103,15 +105,16 @@ type SpecOptions struct {
 	Ulimits          []Ulimit
 }
 
-// HostMount describes a host path exposed through a read-only gofer bind.
-// Writable host paths require a managed CoW volume and are intentionally not
-// represented by this type yet.
+// HostMount describes a host path exposed through a gofer bind. Writable
+// mounts require ManagedCoW, which keeps the gofer lower read-only and places a
+// branch-local Sentry-memory OverlayFS upper above it.
 type HostMount struct {
 	Source          string
 	Destination     string
 	Readonly        bool
 	Internal        bool
 	ImmutableSource bool
+	ManagedCoW      bool
 }
 
 // ManagedVolume describes a family-local Sentry tmpfs. Repeated attachments of
@@ -576,8 +579,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		annotations[TmpfsConfigAnnotation] = string(encoded)
 	}
 	for _, mount := range opts.HostMounts {
-		if !mount.Readonly {
-			return nil, fmt.Errorf("host mount %q at %q is writable; use a managed CoW volume", mount.Source, mount.Destination)
+		if !mount.Readonly && !mount.ManagedCoW {
+			return nil, fmt.Errorf("host mount %q at %q is writable; use an explicit managed CoW mount", mount.Source, mount.Destination)
+		}
+		if mount.ManagedCoW && (mount.Readonly || !mount.ImmutableSource) {
+			return nil, fmt.Errorf("managed CoW host mount %q at %q requires a writable mount and immutable-source", mount.Source, mount.Destination)
 		}
 		if !filepath.IsAbs(mount.Source) {
 			return nil, fmt.Errorf("host mount source %q is not absolute", mount.Source)
@@ -595,18 +601,26 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("duplicate mount destination %q", destination)
 		}
 		seenDestinations[destination] = struct{}{}
+		options := []string{"rbind", "rw"}
+		if mount.Readonly {
+			options[1] = "ro"
+		}
 		mounts = append(mounts, specs.Mount{
 			Destination: destination,
 			Type:        "bind",
 			Source:      filepath.Clean(mount.Source),
-			Options:     []string{"rbind", "ro"},
+			Options:     options,
 		})
 	}
 	internalMounts := make([]string, 0)
 	immutableHostMounts := make([]string, 0)
+	managedCoWHostMounts := make([]string, 0)
 	for _, mount := range opts.HostMounts {
 		if mount.ImmutableSource && !mount.Internal {
 			immutableHostMounts = append(immutableHostMounts, filepath.Clean(mount.Destination))
+		}
+		if mount.ManagedCoW && !mount.Internal {
+			managedCoWHostMounts = append(managedCoWHostMounts, filepath.Clean(mount.Destination))
 		}
 		if mount.Internal {
 			internalMounts = append(internalMounts, filepath.Clean(mount.Destination))
@@ -618,6 +632,13 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("encoding immutable host mount destinations: %w", err)
 		}
 		annotations[ImmutableHostMountsAnnotation] = string(encoded)
+	}
+	if len(managedCoWHostMounts) != 0 {
+		encoded, err := json.Marshal(managedCoWHostMounts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding managed CoW host mount destinations: %w", err)
+		}
+		annotations[ManagedCoWHostMountsAnnotation] = string(encoded)
 	}
 	if len(internalMounts) != 0 {
 		encoded, err := json.Marshal(internalMounts)

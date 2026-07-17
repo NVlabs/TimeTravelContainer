@@ -982,3 +982,35 @@ func TestBuildSpecVolumeNoCopy(t *testing.T) {
 		t.Errorf("volume mount options=%q, want %q", got, wantOptions)
 	}
 }
+
+func TestBuildSpecManagedCoWHostMount(t *testing.T) {
+	host := t.TempDir()
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	spec, err := BuildSpec(image, SpecOptions{
+		RootFS: t.TempDir(),
+		HostMounts: []HostMount{{
+			Source: host, Destination: "/data", ImmutableSource: true, ManagedCoW: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildSpec: %v", err)
+	}
+	mount := spec.Mounts[len(spec.Mounts)-1]
+	if got, want := mount.Options, []string{"rbind", "rw"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("managed CoW mount options=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations[ImmutableHostMountsAnnotation], `["/data"]`; got != want {
+		t.Errorf("immutable annotation=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations[ManagedCoWHostMountsAnnotation], `["/data"]`; got != want {
+		t.Errorf("managed CoW annotation=%q, want %q", got, want)
+	}
+	for _, invalid := range []HostMount{
+		{Source: host, Destination: "/data", ManagedCoW: true},
+		{Source: host, Destination: "/data", Readonly: true, ImmutableSource: true, ManagedCoW: true},
+	} {
+		if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{invalid}}); err == nil {
+			t.Errorf("BuildSpec accepted invalid managed CoW mount %+v", invalid)
+		}
+	}
+}

@@ -3030,3 +3030,42 @@ func TestDynamicCompletionUsesTTOSObjects(t *testing.T) {
 		t.Errorf("exec completion target=%+v", b.execControlTarget)
 	}
 }
+
+func TestParseManagedCoWHostMount(t *testing.T) {
+	mounts, err := parseHostMounts(
+		[]string{"/host/a:/data:cow,immutable-source"},
+		[]string{"type=bind,source=/host/b,target=/config,managed-cow=true,immutable-source"},
+	)
+	if err != nil {
+		t.Fatalf("parseHostMounts: %v", err)
+	}
+	if len(mounts) != 2 || !mounts[0].ManagedCoW || !mounts[1].ManagedCoW || mounts[0].Readonly || mounts[1].Readonly || !mounts[0].ImmutableSource || !mounts[1].ImmutableSource {
+		t.Errorf("managed CoW host mounts=%+v", mounts)
+	}
+	for _, value := range []string{"/host:/data:cow", "/host:/data:ro,cow,immutable-source"} {
+		if _, err := parseHostMounts([]string{value}, nil); err == nil {
+			t.Errorf("parseHostMounts accepted invalid managed CoW mount %q", value)
+		}
+	}
+}
+
+func TestInspectManagedCoWHostMount(t *testing.T) {
+	spec := &specs.Spec{
+		Process: &specs.Process{},
+		Mounts:  []specs.Mount{{Type: "bind", Source: "/host/lower", Destination: "/data", Options: []string{"rbind", "rw"}}},
+		Annotations: map[string]string{
+			ttosbundle.ImmutableHostMountsAnnotation:  `["/data"]`,
+			ttosbundle.ManagedCoWHostMountsAnnotation: `["/data"]`,
+		},
+	}
+	info := buildInspectInfo(ttosbundle.ContainerInfo{Name: "demo"}, spec, nil, "")
+	if len(info.Mounts) != 1 || !info.Mounts[0].RW || info.Mounts[0].Mode != "rw,cow" {
+		t.Errorf("managed CoW inspect mounts=%+v", info.Mounts)
+	}
+	if got, want := info.HostConfig.Binds, []string{"/host/lower:/data:rw,cow"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("managed CoW binds=%q, want %q", got, want)
+	}
+	if got := info.TTOS.ExternalViews; len(got) != 1 || !got[0].ManagedCoW || !got[0].ImmutableSourceAsserted || got[0].Readonly || got[0].Semantics != "branch-local-cow-over-user-asserted-immutable-host-lower" {
+		t.Errorf("managed CoW external view=%+v", got)
+	}
+}

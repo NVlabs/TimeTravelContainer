@@ -65,9 +65,11 @@ DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
 HOST_FIXTURE="$TTOS_E2E_ROOT/host-fixture"
 HOST_FIXTURE_TWO="$TTOS_E2E_ROOT/host-fixture-two"
-mkdir -p "$HOST_FIXTURE" "$HOST_FIXTURE_TWO"
+HOST_COW_FIXTURE="$TTOS_E2E_ROOT/host-cow-fixture"
+mkdir -p "$HOST_FIXTURE" "$HOST_FIXTURE_TWO" "$HOST_COW_FIXTURE"
 echo host-readonly >"$HOST_FIXTURE/value"
 echo host-readonly-two >"$HOST_FIXTURE_TWO/value"
+echo host-cow-lower >"$HOST_COW_FIXTURE/value"
 ENV_FILE="$TTOS_E2E_ROOT/container.env"
 LABEL_FILE="$TTOS_E2E_ROOT/container.labels"
 TTOS_E2E_HOST_IMPORT=host-import
@@ -432,6 +434,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --volume "$VOLUME:/state-view:ro" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly,immutable-source" \
+  --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host,cow,immutable-source" \
   --tmpfs /scratch:mode=0700,size=1m \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=proc,target=/repeat-proc,readonly \
@@ -440,7 +443,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --mount type=sysfs,target=/repeat-sys,readonly \
   --mount type=sysfs,target=/nested/views/sys,readonly \
   "$ALPINE_IMAGE" sh -c \
-  'grep -Eq "^192\.0\.2\.10[[:space:]]+ttos\.local$" /etc/hosts; grep -Eq "^2001:db8::10[[:space:]]+v6\.local$" /etc/hosts; grep -qx "nameserver 203.0.113.53" /etc/resolv.conf; grep -qx "search example.test" /etc/resolv.conf; grep -qx "options ndots:2" /etc/resolv.conf; echo parent >/state/value; echo scratch-parent >/scratch/value; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /state-view/value; test -r /alt-proc/self/status; test -r /repeat-proc/1/status; test -r /nested/views/proc/self/status; test -r /alt-sys/kernel; test -r /repeat-sys/kernel; test -r /nested/views/sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+  'grep -Eq "^192\.0\.2\.10[[:space:]]+ttos\.local$" /etc/hosts; grep -Eq "^2001:db8::10[[:space:]]+v6\.local$" /etc/hosts; grep -qx "nameserver 203.0.113.53" /etc/resolv.conf; grep -qx "search example.test" /etc/resolv.conf; grep -qx "options ndots:2" /etc/resolv.conf; echo parent >/state/value; echo scratch-parent >/scratch/value; test "$(cat /cow-host/value)" = host-cow-lower; echo parent >/cow-host/value; echo parent-created >/cow-host/created; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /state-view/value; test -r /alt-proc/self/status; test -r /repeat-proc/1/status; test -r /nested/views/proc/self/status; test -r /alt-sys/kernel; test -r /repeat-sys/kernel; test -r /nested/views/sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
 container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
 LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
 LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
@@ -498,6 +501,8 @@ if ttos exec "$LIFECYCLE" sh -c "echo forbidden >/state-view/value" >/dev/null 2
   fail "read-only managed-volume alias accepted a parent write"
 fi
 [ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
+[ "$(ttos exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "managed overlay did not retain the parent copy-up"
+[ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "managed overlay modified its immutable host lower"
 [ "$(ttos exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-readonly-two" ] || fail "second read-only host bind was not readable"
 [ "$(ttos exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
 ttos exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
@@ -517,6 +522,8 @@ FORK_CHECK_JSON=$(ttos fork --check --json "$LIFECYCLE_PREFIX")
 echo "$FORK_CHECK_JSON" | grep -q '"warnings"' || fail "fork check omitted shared-view warnings"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE" || fail "fork check warning omitted first host bind"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warning omitted second host bind"
+echo "$FORK_CHECK_JSON" | grep -q "$HOST_COW_FIXTURE" || fail "fork check warning omitted managed CoW lower"
+echo "$FORK_CHECK_JSON" | grep -q "branch-local memory CoW upper" || fail "fork check omitted managed-overlay semantics"
 echo "$FORK_CHECK_JSON" | grep -q "cannot enforce" || fail "immutable-source warning overstated enforcement"
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 echo host-mutated >"$HOST_FIXTURE/value"
@@ -552,6 +559,9 @@ ttos inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
 grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"
 grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
 grep -q "\"Source\":\"$HOST_FIXTURE_TWO\"" "$INSPECT_JSON" || fail "inspect omitted the second read-only host bind"
+grep -q "\"Source\":\"$HOST_COW_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the managed CoW host lower"
+grep -q '"managed_cow":true' "$INSPECT_JSON" || fail "TTOS inspect omitted managed CoW metadata"
+grep -q '"semantics":"branch-local-cow-over-user-asserted-immutable-host-lower"' "$INSPECT_JSON" || fail "TTOS inspect omitted managed-overlay semantics"
 grep -q '"semantics":"shared-external-view"' "$INSPECT_JSON" || fail "TTOS inspect omitted shared external-view semantics"
 grep -q '"semantics":"user-asserted-immutable-external-view"' "$INSPECT_JSON" || fail "TTOS inspect omitted immutable-source attestation"
 grep -q '"immutable_source_asserted":true' "$INSPECT_JSON" || fail "TTOS inspect omitted immutable-source assertion flag"
@@ -559,7 +569,7 @@ grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch pr
 grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
 grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
-[ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "10|2" ] || fail "internal network files leaked into Docker mount inspection"
+[ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "11|3" ] || fail "internal network files leaked into Docker mount inspection"
 
 FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
 echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"
@@ -573,6 +583,10 @@ ttos ps --filter branch=child --format json |
   fail "ps JSON omitted the child creation timestamp"
 
 ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
+ttos exec "$LIFECYCLE@child" sh -c "echo child >/cow-host/value; echo child-created >/cow-host/child-only"
+[ "$(ttos exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "child managed-overlay write leaked into parent"
+[ "$(ttos exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "child managed-overlay copy-up was not retained"
+[ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "child managed-overlay write reached the host lower"
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
 [ "$(ttos exec "$LIFECYCLE" cat /state-view/value)" = "parent" ] || fail "child write leaked through parent read-only volume alias"
@@ -605,7 +619,12 @@ echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ FROM_FILE
 
 # Persist immutable lineage when an intermediate source branch is deleted.
 ttos fork "$LIFECYCLE@child" "$LIFECYCLE@grandchild"
+[ "$(ttos exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "child" ] || fail "grandchild did not inherit managed-overlay state"
+ttos exec "$LIFECYCLE@grandchild" sh -c "echo grandchild >/cow-host/value; echo grandchild-created >/cow-host/grandchild-only"
+[ "$(ttos exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "grandchild managed-overlay write leaked into child"
+[ "$(ttos exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "grandchild" ] || fail "grandchild managed-overlay write was not retained"
 ttos branch rm "$LIFECYCLE@child"
+[ "$(ttos exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "grandchild" ] || fail "grandchild managed overlay depended on deleted source branch"
 LINEAGE_TREE=$(ttos ls --tree)
 echo "$LINEAGE_TREE" | grep -q "child deleted" || fail "tree omitted the deleted intermediate branch"
 echo "$LINEAGE_TREE" | grep -q "grandchild running" || fail "tree omitted the live grandchild below its tombstone"

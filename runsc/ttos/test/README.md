@@ -79,6 +79,9 @@ covers:
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;
+- explicit managed OverlayFS host submounts, immutable-lower protection, inspect
+  and fork diagnostics, parent/child/grandchild CoW divergence, and continued
+  operation after deletion of the source branch;
 - graceful stop, branch removal, container removal, and volume removal.
 
 The test requires network access for image pulls and an accessible containerd
