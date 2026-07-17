@@ -151,6 +151,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       create/start/restart/fork and expose them through inspect. Also support
       working directory, named or numeric user, entrypoint override, hostname,
       and rootless execution.
+- [x] Support repeated Docker `--group-add`, `--cap-add`, and `--cap-drop` on
+      run/create. Resolve group names from the image root, accept Docker capability
+      spelling and `ALL` merge semantics, persist canonical HostConfig inspect
+      values, and retain Sentry-enforced credentials across restart, exec, and
+      live fork.
 - [x] Keep single-ID user-namespace rootless execution as the default without
       requiring `newuidmap`, `newgidmap`, or subordinate-ID ranges. Provide an
       explicit `--unsafe-no-host-isolation` fallback for trusted workloads on
@@ -536,8 +541,9 @@ Reject            unsupported, externally mutable, or host/device-backed
       Docker-like lifecycle commands and inspect across created, running,
       forked, paused, and exited states; live fork; managed-volume CoW;
       read-only host binds; distinct Redis lower-layer ownership; exact quick-exit
-      console integrity; configurable shared memory, Sentry-enforced PID limits,
-      and Docker ulimits across live fork; and the explicit no-userns fallback.
+      console integrity; configurable shared memory; supplementary groups and
+      capabilities; Sentry-enforced PID limits; Docker ulimits across live fork;
+      and the explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 

@@ -1106,6 +1106,9 @@ type runRequest struct {
 	pidsLimit          *int64
 	ulimits            []ttosbundle.Ulimit
 	shmSize            int64
+	groupAdd           []string
+	capAdd             []string
+	capDrop            []string
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -1155,7 +1158,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1193,9 +1196,12 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
-	var logOptions, ulimitValues stringSlice
+	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
+	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
+	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
+	fs.Var(&capDropValues, "cap-drop", "drop a Linux capability")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1244,6 +1250,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedCapAdd, err := ttosbundle.NormalizeCapabilities(capAddValues)
+	if err != nil {
+		return err
+	}
+	parsedCapDrop, err := ttosbundle.NormalizeCapabilities(capDropValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1275,6 +1289,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		pidsLimit:          effectivePidsLimit,
 		ulimits:            parsedUlimits,
 		shmSize:            parsedShmSize,
+		groupAdd:           append([]string(nil), groupAddValues...),
+		capAdd:             parsedCapAdd,
+		capDrop:            parsedCapDrop,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1303,7 +1320,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1339,9 +1356,12 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
-	var logOptions, ulimitValues stringSlice
+	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
+	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
+	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
+	fs.Var(&capDropValues, "cap-drop", "drop a Linux capability")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1390,6 +1410,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedCapAdd, err := ttosbundle.NormalizeCapabilities(capAddValues)
+	if err != nil {
+		return err
+	}
+	parsedCapDrop, err := ttosbundle.NormalizeCapabilities(capDropValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1421,6 +1449,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		pidsLimit:          effectivePidsLimit,
 		ulimits:            parsedUlimits,
 		shmSize:            parsedShmSize,
+		groupAdd:           append([]string(nil), groupAddValues...),
+		capAdd:             parsedCapAdd,
+		capDrop:            parsedCapDrop,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -1901,6 +1932,9 @@ type InspectHostConfig struct {
 	StopTimeout    *int                `json:"StopTimeout"`
 	PidsLimit      *int64              `json:"PidsLimit"`
 	ShmSize        int64               `json:"ShmSize"`
+	GroupAdd       []string            `json:"GroupAdd"`
+	CapAdd         []string            `json:"CapAdd"`
+	CapDrop        []string            `json:"CapDrop"`
 	Ulimits        []ttosbundle.Ulimit `json:"Ulimits"`
 	Runtime        string              `json:"Runtime"`
 	Tmpfs          map[string]string   `json:"Tmpfs,omitempty"`
@@ -3664,6 +3698,9 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			ShmSize:          &request.shmSize,
+			GroupAdd:         request.groupAdd,
+			CapAdd:           request.capAdd,
+			CapDrop:          request.capDrop,
 			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
 			ManagedVolumes:   request.managedVolumes,
@@ -3710,6 +3747,9 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			ShmSize:          &request.shmSize,
+			GroupAdd:         request.groupAdd,
+			CapAdd:           request.capAdd,
+			CapDrop:          request.capDrop,
 			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
@@ -4959,7 +4999,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{

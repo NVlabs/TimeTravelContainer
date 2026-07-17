@@ -13,6 +13,7 @@ go_library(
     ],
     visibility = ["//runsc/ttos:__subpackages__"],
     deps = [
+        "//pkg/abi/linux",
         "//runsc/ttos/images",
         "//runsc/ttos/ownership",
         "@com_github_docker_go_units//:go_default_library",

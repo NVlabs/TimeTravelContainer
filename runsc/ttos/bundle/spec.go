@@ -28,6 +28,7 @@ import (
 	mobyuser "github.com/moby/sys/user"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
@@ -82,6 +83,9 @@ type SpecOptions struct {
 	StopSignal       string
 	PidsLimit        *int64
 	ShmSize          *int64
+	GroupAdd         []string
+	CapAdd           []string
+	CapDrop          []string
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -146,6 +150,82 @@ func ParseUlimits(values []string) ([]Ulimit, error) {
 		result = append(result, limit)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+// NormalizeCapabilities applies Docker capability spelling and validation.
+// Returned names omit the CAP_ prefix, matching Docker HostConfig inspect.
+func NormalizeCapabilities(values []string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.ToUpper(value)
+		if normalized == "ALL" {
+			result = append(result, normalized)
+			continue
+		}
+		if !strings.HasPrefix(normalized, "CAP_") {
+			normalized = "CAP_" + normalized
+		}
+		if _, ok := linux.CapabilityFromString(normalized); !ok {
+			return nil, fmt.Errorf("unknown capability: %q", normalized)
+		}
+		result = append(result, strings.TrimPrefix(normalized, "CAP_"))
+	}
+	return result, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func allCapabilityNames() []string {
+	capabilities := linux.AllCapabilities()
+	result := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		result = append(result, capability.String())
+	}
+	return result
+}
+
+func buildCapabilities(adds, drops []string) ([]string, error) {
+	capAdd, err := NormalizeCapabilities(adds)
+	if err != nil {
+		return nil, err
+	}
+	capDrop, err := NormalizeCapabilities(drops)
+	if err != nil {
+		return nil, err
+	}
+	if containsString(capAdd, "ALL") {
+		result := make([]string, 0, len(allCapabilityNames()))
+		for _, capability := range allCapabilityNames() {
+			if !containsString(capDrop, strings.TrimPrefix(capability, "CAP_")) {
+				result = append(result, capability)
+			}
+		}
+		return result, nil
+	}
+	if containsString(capDrop, "ALL") {
+		result := make([]string, 0, len(capAdd))
+		for _, capability := range capAdd {
+			result = append(result, "CAP_"+capability)
+		}
+		return result, nil
+	}
+	result := make([]string, 0, len(defaultCapabilities)+len(capAdd))
+	for _, capability := range defaultCapabilities {
+		if !containsString(capDrop, strings.TrimPrefix(capability, "CAP_")) {
+			result = append(result, capability)
+		}
+	}
+	for _, capability := range capAdd {
+		result = append(result, "CAP_"+capability)
+	}
 	return result, nil
 }
 
@@ -247,6 +327,27 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	additionalGIDs := make([]uint32, 0, len(resolvedUser.Sgids))
 	for _, gid := range resolvedUser.Sgids {
 		additionalGIDs = append(additionalGIDs, uint32(gid))
+	}
+	seenGIDs := make(map[uint32]struct{}, len(additionalGIDs)+len(opts.GroupAdd))
+	for _, gid := range additionalGIDs {
+		seenGIDs[gid] = struct{}{}
+	}
+	for _, group := range opts.GroupAdd {
+		gids, err := mobyuser.GetAdditionalGroupsPath([]string{group}, filepath.Join(rootfs, "etc/group"))
+		if err != nil {
+			return nil, fmt.Errorf("resolving additional group %q: %w", group, err)
+		}
+		for _, gid := range gids {
+			value := uint32(gid)
+			if _, ok := seenGIDs[value]; !ok {
+				additionalGIDs = append(additionalGIDs, value)
+				seenGIDs[value] = struct{}{}
+			}
+		}
+	}
+	capabilities, err := buildCapabilities(opts.CapAdd, opts.CapDrop)
+	if err != nil {
+		return nil, err
 	}
 	hostname := opts.Hostname
 	if hostname == "" {
@@ -448,9 +549,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Env:  env,
 			Cwd:  cwd,
 			Capabilities: &specs.LinuxCapabilities{
-				Bounding:  append([]string(nil), defaultCapabilities...),
-				Effective: append([]string(nil), defaultCapabilities...),
-				Permitted: append([]string(nil), defaultCapabilities...),
+				Bounding:  append([]string(nil), capabilities...),
+				Effective: append([]string(nil), capabilities...),
+				Permitted: append([]string(nil), capabilities...),
 			},
 			Rlimits: rlimits,
 		},

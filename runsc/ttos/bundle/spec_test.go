@@ -40,7 +40,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "etc/passwd"), []byte("app:x:123:456::/home/app:/bin/sh\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "etc/group"), []byte("app:x:456:\nextra:x:789:app\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "etc/group"), []byte("app:x:456:\nextra:x:789:app\nmanual:x:900:\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	manifest := ownership.NewManifest()
@@ -68,6 +68,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
 		ShmSize:        &shmSize,
+		GroupAdd:       []string{"manual", "901", "manual"},
+		CapAdd:         []string{"sys_admin"},
+		CapDrop:        []string{"CAP_NET_RAW"},
 		Ulimits:        []Ulimit{{Name: "core", Soft: 0, Hard: -1}, {Name: "nofile", Soft: 64, Hard: 128}},
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
@@ -98,8 +101,12 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if spec.Process.Cwd != "/work" || spec.Hostname != "demo" {
 		t.Errorf("cwd=%q hostname=%q", spec.Process.Cwd, spec.Hostname)
 	}
-	if spec.Process.User.UID != 123 || spec.Process.User.GID != 456 || !reflect.DeepEqual(spec.Process.User.AdditionalGids, []uint32{789}) {
+	if spec.Process.User.UID != 123 || spec.Process.User.GID != 456 || !reflect.DeepEqual(spec.Process.User.AdditionalGids, []uint32{789, 900, 901}) {
 		t.Errorf("user=%+v", spec.Process.User)
+	}
+	wantCapabilities := []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE", "CAP_SYS_ADMIN"}
+	if !reflect.DeepEqual(spec.Process.Capabilities.Bounding, wantCapabilities) || !reflect.DeepEqual(spec.Process.Capabilities.Effective, wantCapabilities) || !reflect.DeepEqual(spec.Process.Capabilities.Permitted, wantCapabilities) {
+		t.Errorf("capabilities=%+v, want %q", spec.Process.Capabilities, wantCapabilities)
 	}
 	wantMounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
@@ -204,6 +211,28 @@ func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
 	return false
 }
 
+func TestDockerCapabilitySemantics(t *testing.T) {
+	normalized, err := NormalizeCapabilities([]string{"sys_admin", "CAP_CHOWN", "all"})
+	if err != nil || !reflect.DeepEqual(normalized, []string{"SYS_ADMIN", "CHOWN", "ALL"}) {
+		t.Fatalf("NormalizeCapabilities=(%q, %v)", normalized, err)
+	}
+	if _, err := NormalizeCapabilities([]string{"not_a_capability"}); err == nil {
+		t.Fatal("NormalizeCapabilities accepted an unknown capability")
+	}
+	onlyChown, err := buildCapabilities([]string{"chown"}, []string{"all"})
+	if err != nil || !reflect.DeepEqual(onlyChown, []string{"CAP_CHOWN"}) {
+		t.Errorf("drop ALL/add CHOWN=(%q, %v)", onlyChown, err)
+	}
+	allButAdmin, err := buildCapabilities([]string{"all"}, []string{"sys_admin"})
+	if err != nil || containsString(allButAdmin, "CAP_SYS_ADMIN") || len(allButAdmin) != len(allCapabilityNames())-1 {
+		t.Errorf("add ALL/drop SYS_ADMIN=(%q, %v)", allButAdmin, err)
+	}
+	all, err := buildCapabilities([]string{"all"}, []string{"all"})
+	if err != nil || !reflect.DeepEqual(all, allCapabilityNames()) {
+		t.Errorf("add ALL/drop ALL=(%q, %v), want all", all, err)
+	}
+}
+
 func TestParseShmSize(t *testing.T) {
 	for value, want := range map[string]int64{"32m": 32 * 1024 * 1024, "1.5g": 1536 * 1024 * 1024, "0": 0} {
 		got, err := ParseShmSize(value)
@@ -288,6 +317,12 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), StopSignal: "SIGINVALID"}); err == nil {
 		t.Error("BuildSpec accepted an invalid stop signal")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), GroupAdd: []string{"missing-group"}}); err == nil {
+		t.Error("BuildSpec accepted an unknown additional group")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), CapAdd: []string{"not-a-capability"}}); err == nil {
+		t.Error("BuildSpec accepted an unknown capability")
 	}
 	invalidShmSize := int64(-1)
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ShmSize: &invalidShmSize}); err == nil {

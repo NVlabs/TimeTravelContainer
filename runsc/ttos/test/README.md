@@ -27,6 +27,9 @@ covers:
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
 - BusyBox process/procfs/sysfs startup;
+- Docker `--group-add` plus `--cap-add`/`--cap-drop` normalization, inspect
+  persistence, init and exec enforcement, restart retention, and live-fork
+  inheritance;
 - Docker `--shm-size` parsing, OCI tmpfs sizing, inspect persistence, restart
   retention, and identical capacity in both sides of a live fork;
 - Docker `--read-only` rootfs persistence through restart and live fork,

@@ -369,6 +369,7 @@ ttos volume create "$VOLUME"
 LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --ulimit nofile=256:256 \
   --shm-size 32m \
+  --group-add 4242 --cap-add sys_ptrace --cap-drop net_raw \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
@@ -378,7 +379,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=sysfs,target=/alt-sys,readonly \
   "$ALPINE_IMAGE" sh -c \
-  'echo parent >/state/value; echo scratch-parent >/scratch/value; test -r /alt-proc/self/status; test -r /alt-sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+  'echo parent >/state/value; echo scratch-parent >/scratch/value; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /alt-proc/self/status; test -r /alt-sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
 container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
 LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
 LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
@@ -411,6 +412,8 @@ echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supple
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
 [ "$(ttos inspect -f "{{.HostConfig.ShmSize}}" "$LIFECYCLE")" = 33554432 ] || fail "inspect omitted shared memory size"
+[ "$(ttos inspect -f '{{index .HostConfig.GroupAdd 0}}|{{index .HostConfig.CapAdd 0}}|{{index .HostConfig.CapDrop 0}}' "$LIFECYCLE")" = "4242|SYS_PTRACE|NET_RAW" ] ||
+  fail "inspect omitted supplementary groups or capability changes"
 [ "$(ttos exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] ||
   fail "restarted container did not retain /dev/shm size"
 [ "$(ttos inspect -f "{{.HostConfig.ReadonlyRootfs}}" "$LIFECYCLE")" = true ] || fail "inspect omitted read-only rootfs policy"
@@ -430,8 +433,10 @@ ttos fork --check "$LIFECYCLE_PREFIX"
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 [ "$(ttos exec "$LIFECYCLE" sh -c "ulimit -n")" = 256 ] || fail "parent exec did not inherit RLIMIT_NOFILE"
 [ "$(ttos exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "parent branch lost /dev/shm size"
+ttos exec "$LIFECYCLE" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "parent exec lost configured groups or capabilities"
 [ "$(ttos exec "$LIFECYCLE@child" sh -c "ulimit -n")" = 256 ] || fail "live-forked child exec did not inherit RLIMIT_NOFILE"
 [ "$(ttos exec "$LIFECYCLE@child" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "live-forked child lost /dev/shm size"
+ttos exec "$LIFECYCLE@child" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "child exec lost configured groups or capabilities"
 
 RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
 [ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||

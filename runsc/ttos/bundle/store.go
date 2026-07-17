@@ -86,6 +86,9 @@ type ContainerInfo struct {
 	StopTimeout        *int            `json:"stop_timeout,omitempty"`
 	PidsLimit          *int64          `json:"pids_limit,omitempty"`
 	ShmSize            *int64          `json:"shm_size,omitempty"`
+	GroupAdd           []string        `json:"group_add,omitempty"`
+	CapAdd             []string        `json:"cap_add,omitempty"`
+	CapDrop            []string        `json:"cap_drop,omitempty"`
 	Ulimits            []Ulimit        `json:"ulimits,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
@@ -213,6 +216,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopTimeout:        cloneIntPointer(opts.StopTimeout),
 		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
 		ShmSize:            cloneInt64Pointer(&shmSize),
+		GroupAdd:           append([]string(nil), opts.GroupAdd...),
+		CapAdd:             append([]string(nil), opts.CapAdd...),
+		CapDrop:            append([]string(nil), opts.CapDrop...),
 		Ulimits:            append([]Ulimit(nil), opts.Ulimits...),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
