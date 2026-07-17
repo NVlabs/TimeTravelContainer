@@ -65,6 +65,8 @@ covers:
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
+- Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
+  over versioned timestamped records, including filtering and legacy-record decoding;
 - `exec`, selective stdin/stdout/stderr `attach`, `fork --check`, live `fork`,
   `pause`, `resume`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, and JSON

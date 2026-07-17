@@ -17,6 +17,7 @@ package console
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestFrameRoundTripAndFragmentation(t *testing.T) {
@@ -52,6 +53,32 @@ func TestFrameRoundTripAndFragmentation(t *testing.T) {
 	}
 }
 
+func TestTimestampedFrameRoundTrip(t *testing.T) {
+	timestamp := time.Date(2026, 7, 17, 1, 2, 3, 456789012, time.UTC)
+	var encoded bytes.Buffer
+	if err := WriteTimestampedFrame(&encoded, StreamStdout, timestamp, []byte("hello")); err != nil {
+		t.Fatalf("WriteTimestampedFrame: %v", err)
+	}
+	frame, consumed, complete, err := DecodeFrame(encoded.Bytes())
+	if err != nil || !complete || consumed != encoded.Len() {
+		t.Fatalf("DecodeFrame: frame=%+v consumed=%d complete=%t err=%v", frame, consumed, complete, err)
+	}
+	if frame.Stream != StreamStdout || string(frame.Data) != "hello" || frame.EOF || !frame.Timestamp.Equal(timestamp) {
+		t.Errorf("frame=%+v, want timestamped stdout payload", frame)
+	}
+	var eof bytes.Buffer
+	if err := WriteTimestampedFrame(&eof, StreamStderr, timestamp, nil); err != nil {
+		t.Fatalf("WriteTimestampedFrame EOF: %v", err)
+	}
+	frame, _, complete, err = DecodeFrame(eof.Bytes())
+	if err != nil || !complete || !frame.EOF || !frame.Timestamp.Equal(timestamp) {
+		t.Errorf("timestamped EOF frame=%+v complete=%t err=%v", frame, complete, err)
+	}
+	if err := WriteTimestampedFrame(&bytes.Buffer{}, StreamStdout, time.Time{}, nil); err == nil {
+		t.Fatal("WriteTimestampedFrame accepted a zero timestamp")
+	}
+}
+
 func TestFrameRejectsInvalidData(t *testing.T) {
 	if err := WriteFrame(&bytes.Buffer{}, 9, []byte("bad")); err == nil {
 		t.Fatal("WriteFrame accepted invalid stream")
@@ -63,9 +90,31 @@ func TestFrameRejectsInvalidData(t *testing.T) {
 	}
 	reserved := make([]byte, HeaderSize)
 	reserved[0] = StreamStdout
-	reserved[1] = 1
+	reserved[1] = 2
 	if _, _, _, err := DecodeFrame(reserved); err == nil {
 		t.Fatal("DecodeFrame accepted reserved bytes")
+	}
+}
+
+func TestCopyFinalFramesPreservesTimestampedRecords(t *testing.T) {
+	timestamp := time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC)
+	var input bytes.Buffer
+	if err := WriteTimestampedFrame(&input, StreamStdout, timestamp, []byte("output")); err != nil {
+		t.Fatalf("WriteTimestampedFrame data: %v", err)
+	}
+	if err := WriteTimestampedFrame(&input, StreamStdout, timestamp, nil); err != nil {
+		t.Fatalf("WriteTimestampedFrame stdout EOF: %v", err)
+	}
+	if err := WriteTimestampedFrame(&input, StreamStderr, timestamp, nil); err != nil {
+		t.Fatalf("WriteTimestampedFrame stderr EOF: %v", err)
+	}
+	want := append([]byte(nil), input.Bytes()...)
+	var got bytes.Buffer
+	if err := CopyFinalFrames(&got, &input, false, false); err != nil {
+		t.Fatalf("CopyFinalFrames: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyFinalFrames wrote %x, want %x", got.Bytes(), want)
 	}
 }
 

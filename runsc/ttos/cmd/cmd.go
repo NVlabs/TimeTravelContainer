@@ -1748,19 +1748,66 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+type logsOptions struct {
+	ExecID     string
+	Follow     bool
+	Tail       int
+	Since      *time.Time
+	Until      *time.Time
+	Timestamps bool
+	Details    bool
+}
+
+func parseLogTime(value string, now time.Time) (time.Time, error) {
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, nil
+	}
+	if duration, err := time.ParseDuration(value); err == nil {
+		if duration < 0 {
+			return time.Time{}, fmt.Errorf("duration must not be negative")
+		}
+		return now.Add(-duration), nil
+	}
+	secondsText, fractionText, hasFraction := strings.Cut(value, ".")
+	seconds, err := strconv.ParseInt(secondsText, 10, 64)
+	if err == nil {
+		nanoseconds := int64(0)
+		if hasFraction {
+			if fractionText == "" || len(fractionText) > 9 || strings.Trim(fractionText, "0123456789") != "" {
+				err = errors.New("invalid fractional seconds")
+			} else {
+				fractionText += strings.Repeat("0", 9-len(fractionText))
+				nanoseconds, err = strconv.ParseInt(fractionText, 10, 32)
+			}
+		}
+		if err == nil {
+			if seconds < 0 {
+				nanoseconds = -nanoseconds
+			}
+			return time.Unix(seconds, nanoseconds).UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("must be an RFC3339 timestamp, Unix timestamp, or Go duration")
+}
+
 func runLogs(args []string, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	follow := fs.Bool("follow", false, "follow log output")
 	fs.BoolVar(follow, "f", false, "follow log output")
 	execID := fs.String("exec", "", "show logs for a managed exec session")
+	sinceValue := fs.String("since", "", "show logs since timestamp or relative duration")
+	untilValue := fs.String("until", "", "show logs before timestamp or relative duration")
+	timestamps := fs.Bool("timestamps", false, "prefix each log line with its timestamp")
+	fs.BoolVar(timestamps, "t", false, "prefix each log line with its timestamp")
+	details := fs.Bool("details", false, "show configured log attributes")
 	tailValue := fs.String("tail", "all", "number of lines to show from the end of the logs")
 	fs.StringVar(tailValue, "n", "all", "number of lines to show from the end of the logs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos logs [-f] [--exec EXEC_ID] [--tail all|N] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos logs [-f] [--exec EXEC_ID] [--tail all|N] [--since TIME] [--until TIME] [-t] [--details] CONTAINER[@BRANCH]")
 	}
 	tail := -1
 	if parsed, err := strconv.Atoi(*tailValue); err == nil && parsed >= 0 {
@@ -1775,7 +1822,24 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 			return err
 		}
 	}
-	if err := backend.logs(target, *execID, *follow, tail); err != nil {
+	now := time.Now()
+	var since, until *time.Time
+	if *sinceValue != "" {
+		parsed, err := parseLogTime(*sinceValue, now)
+		if err != nil {
+			return fmt.Errorf("invalid --since %q: %w", *sinceValue, err)
+		}
+		since = &parsed
+	}
+	if *untilValue != "" {
+		parsed, err := parseLogTime(*untilValue, now)
+		if err != nil {
+			return fmt.Errorf("invalid --until %q: %w", *untilValue, err)
+		}
+		until = &parsed
+	}
+	options := logsOptions{ExecID: *execID, Follow: *follow, Tail: tail, Since: since, Until: until, Timestamps: *timestamps, Details: *details}
+	if err := backend.logs(target, options); err != nil {
 		return fmt.Errorf("reading logs for %s: %w", target, err)
 	}
 	return nil
@@ -3564,7 +3628,7 @@ type backend interface {
 	run(request runRequest) (containerRunResult, error)
 	start(name string, detach, interactive bool) (int, error)
 	attach(request attachRequest) (uint32, error)
-	logs(target selector, execID string, follow bool, tail int) error
+	logs(target selector, options logsOptions) error
 	exec(request execRequest) (int, error)
 	execSessions(target selector) ([]runscExecSession, error)
 	waitExecSession(target selector, execID string) (uint32, error)
@@ -4174,6 +4238,19 @@ func openConsoleLogFollower(path string, maxFilesValues ...int) (*consoleLogFoll
 }
 
 func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
+	return f.drainFrames(func(frame ttosconsole.Frame) error {
+		var output io.Writer
+		switch frame.Stream {
+		case ttosconsole.StreamStdout:
+			output = stdout
+		case ttosconsole.StreamStderr:
+			output = stderr
+		}
+		return writeConsoleFrameData(frame, output)
+	})
+}
+
+func (f *consoleLogFollower) drainFrames(handler func(ttosconsole.Frame) error) (bool, error) {
 	progress := false
 	buf := make([]byte, 64*1024)
 	for {
@@ -4181,7 +4258,7 @@ func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
 		if n != 0 {
 			f.pending = append(f.pending, buf[:n]...)
 			progress = true
-			if err := f.consume(stdout, stderr); err != nil {
+			if err := f.consumeFrames(handler); err != nil {
 				return false, err
 			}
 		}
@@ -4203,7 +4280,7 @@ func (f *consoleLogFollower) drain(stdout, stderr io.Writer) (bool, error) {
 			break
 		}
 	}
-	return progress, f.consume(stdout, stderr)
+	return progress, f.consumeFrames(handler)
 }
 
 func (f *consoleLogFollower) advance() (bool, error) {
@@ -4261,7 +4338,7 @@ func (f *consoleLogFollower) advance() (bool, error) {
 	return false, errors.New("console logs rotated repeatedly while advancing generations")
 }
 
-func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
+func (f *consoleLogFollower) consumeFrames(handler func(ttosconsole.Frame) error) error {
 	for {
 		frame, consumed, complete, err := ttosconsole.DecodeFrame(f.pending)
 		if err != nil {
@@ -4271,24 +4348,31 @@ func (f *consoleLogFollower) consume(stdout, stderr io.Writer) error {
 			break
 		}
 		f.pending = f.pending[consumed:]
-		var output io.Writer
 		switch frame.Stream {
 		case ttosconsole.StreamStdout:
-			output = stdout
 			f.stdoutEOF = frame.EOF
 		case ttosconsole.StreamStderr:
-			output = stderr
 			f.stderrEOF = frame.EOF
 		}
-		if len(frame.Data) != 0 && output != nil {
-			n, err := output.Write(frame.Data)
-			if err != nil {
-				return fmt.Errorf("writing attached stream %d: %w", frame.Stream, err)
-			}
-			if n != len(frame.Data) {
-				return fmt.Errorf("writing attached stream %d: %w", frame.Stream, io.ErrShortWrite)
+		if len(frame.Data) != 0 && handler != nil {
+			if err := handler(frame); err != nil {
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func writeConsoleFrameData(frame ttosconsole.Frame, output io.Writer) error {
+	if output == nil || len(frame.Data) == 0 {
+		return nil
+	}
+	n, err := output.Write(frame.Data)
+	if err != nil {
+		return fmt.Errorf("writing attached stream %d: %w", frame.Stream, err)
+	}
+	if n != len(frame.Data) {
+		return fmt.Errorf("writing attached stream %d: %w", frame.Stream, io.ErrShortWrite)
 	}
 	return nil
 }
@@ -4604,17 +4688,92 @@ func (t *consoleLogTail) flush(stdout, stderr io.Writer) error {
 	return nil
 }
 
-func (b *runtimeBackend) logs(target selector, execID string, follow bool, tail int) error {
+type consoleLogOutput struct {
+	since      *time.Time
+	until      *time.Time
+	timestamps bool
+	lineStart  map[byte]bool
+}
+
+func newConsoleLogOutput(options logsOptions) *consoleLogOutput {
+	return &consoleLogOutput{
+		since: options.Since, until: options.Until, timestamps: options.Timestamps,
+		lineStart: map[byte]bool{ttosconsole.StreamStdout: true, ttosconsole.StreamStderr: true},
+	}
+}
+
+func (o *consoleLogOutput) includes(frame ttosconsole.Frame) bool {
+	if frame.Timestamp.IsZero() {
+		// Legacy records remain readable, but cannot honestly satisfy a time filter.
+		return o.since == nil && o.until == nil
+	}
+	if o.since != nil && frame.Timestamp.Before(*o.since) {
+		return false
+	}
+	if o.until != nil && frame.Timestamp.After(*o.until) {
+		return false
+	}
+	return true
+}
+
+func (o *consoleLogOutput) write(frame ttosconsole.Frame, stdout, stderr io.Writer) error {
+	if !o.includes(frame) {
+		return nil
+	}
+	output := stdout
+	if frame.Stream == ttosconsole.StreamStderr {
+		output = stderr
+	}
+	if output == nil || len(frame.Data) == 0 {
+		return nil
+	}
+	if !o.timestamps {
+		return writeConsoleFrameData(frame, output)
+	}
+	data := frame.Data
+	for len(data) != 0 {
+		if o.lineStart[frame.Stream] {
+			timestamp := frame.Timestamp.UTC().Format(time.RFC3339Nano) + " "
+			if err := writeLogData(output, frame.Stream, []byte(timestamp)); err != nil {
+				return err
+			}
+			o.lineStart[frame.Stream] = false
+		}
+		end := len(data)
+		if newline := bytes.IndexByte(data, byte('\n')); newline >= 0 {
+			end = newline + 1
+			o.lineStart[frame.Stream] = true
+		}
+		if err := writeLogData(output, frame.Stream, data[:end]); err != nil {
+			return err
+		}
+		data = data[end:]
+	}
+	return nil
+}
+
+func writeLogData(output io.Writer, stream byte, data []byte) error {
+	n, err := output.Write(data)
+	if err != nil {
+		return fmt.Errorf("writing log stream %d: %w", stream, err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("writing log stream %d: %w", stream, io.ErrShortWrite)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 	resolved, _, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
 	target = resolved
 	var paths ttosbundle.ConsolePaths
-	if execID == "" {
+	if options.ExecID == "" {
 		paths, err = b.ensureConsoleDrain(target, false)
 	} else {
-		session, sessionErr := b.execSession(target, execID)
+		session, sessionErr := b.execSession(target, options.ExecID)
 		if sessionErr != nil {
 			return sessionErr
 		}
@@ -4632,25 +4791,31 @@ func (b *runtimeBackend) logs(target selector, execID string, follow bool, tail 
 		return err
 	}
 	defer follower.file.Close()
+	output := newConsoleLogOutput(options)
 	initial := true
 	for {
 		var progress bool
-		if initial && tail >= 0 {
-			collector := &consoleLogTail{limit: tail}
-			progress, err = follower.drain(
-				collector.writer(ttosconsole.StreamStdout),
-				collector.writer(ttosconsole.StreamStderr))
+		if initial && options.Tail >= 0 {
+			collector := &consoleLogTail{limit: options.Tail}
+			progress, err = follower.drainFrames(func(frame ttosconsole.Frame) error {
+				return output.write(frame, collector.writer(ttosconsole.StreamStdout), collector.writer(ttosconsole.StreamStderr))
+			})
 			if err == nil {
 				err = collector.flush(b.stdout, b.stderr)
 			}
 		} else {
-			progress, err = follower.drain(b.stdout, b.stderr)
+			progress, err = follower.drainFrames(func(frame ttosconsole.Frame) error {
+				return output.write(frame, b.stdout, b.stderr)
+			})
 		}
 		if err != nil {
 			return err
 		}
 		initial = false
-		if !follow || (follower.stdoutEOF && follower.stderrEOF) {
+		if !options.Follow || (follower.stdoutEOF && follower.stderrEOF) {
+			return nil
+		}
+		if options.Until != nil && !time.Now().Before(*options.Until) {
 			return nil
 		}
 		if !progress {

@@ -537,6 +537,10 @@ ttos top "$LIFECYCLE"
 ttos ls --tree
 ttos logs --tail 2 "$LIFECYCLE"
 ttos logs --tail 2 "$LIFECYCLE@child"
+TIMESTAMPED_LOGS=$(ttos logs --timestamps --details --since 24h --until 0s "$LIFECYCLE@child")
+echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ tick:" || fail "timestamped logs omitted RFC3339 timestamps: $TIMESTAMPED_LOGS"
+[ -z "$(ttos logs --since 4102444800 "$LIFECYCLE@child")" ] || fail "logs --since included records older than its boundary"
+[ -z "$(ttos logs --until 24h "$LIFECYCLE@child")" ] || fail "logs --until included records newer than its boundary"
 
 # Persist immutable lineage when an intermediate source branch is deleted.
 ttos fork "$LIFECYCLE@child" "$LIFECYCLE@grandchild"

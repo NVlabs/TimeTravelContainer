@@ -1112,17 +1112,68 @@ func TestDetachKeyFilterForwardsNearMatchAndFlushesPrefix(t *testing.T) {
 func TestLogs(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"logs", "--follow", "--exec", "exec-one", "--tail", "7", "demo@child"}, &stdout, &stderr, b); status != 0 {
+	since := "2026-07-17T01:02:03.123456789Z"
+	until := "2026-07-17T02:03:04Z"
+	if status := runCommand([]string{"logs", "--follow", "--exec", "exec-one", "--tail", "7", "--since", since, "--until", until, "--timestamps", "--details", "demo@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.logsTarget != (selector{container: "demo", branch: "child"}) || b.logsExecID != "exec-one" || !b.logsFollow || b.logsTail != 7 {
-		t.Errorf("logs target=%+v exec=%q follow=%t tail=%d", b.logsTarget, b.logsExecID, b.logsFollow, b.logsTail)
+	options := b.logsOptions
+	if b.logsTarget != (selector{container: "demo", branch: "child"}) || options.ExecID != "exec-one" || !options.Follow || options.Tail != 7 || !options.Timestamps || !options.Details {
+		t.Errorf("logs target=%+v options=%+v", b.logsTarget, options)
+	}
+	if options.Since == nil || options.Since.Format(time.RFC3339Nano) != since || options.Until == nil || options.Until.Format(time.RFC3339Nano) != until {
+		t.Errorf("logs time options=%+v", options)
 	}
 	if status := runCommand([]string{"logs", "--tail", "invalid", "demo"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs with Docker-compatible invalid tail status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.logsTail != -1 {
-		t.Errorf("invalid --tail selected %d, want all (-1)", b.logsTail)
+	if b.logsOptions.Tail != -1 {
+		t.Errorf("invalid --tail selected %d, want all (-1)", b.logsOptions.Tail)
+	}
+	if status := runCommand([]string{"logs", "--since", "not-a-time", "demo"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("logs accepted an invalid --since value")
+	}
+}
+
+func TestParseLogTime(t *testing.T) {
+	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
+	tests := map[string]time.Time{
+		"2026-07-17T01:02:03.123456789Z": time.Date(2026, 7, 17, 1, 2, 3, 123456789, time.UTC),
+		"60.25":                          time.Unix(60, 250000000).UTC(),
+		"-1.5":                           time.Unix(-1, -500000000).UTC(),
+		"90m":                            now.Add(-90 * time.Minute),
+	}
+	for input, want := range tests {
+		got, err := parseLogTime(input, now)
+		if err != nil || !got.Equal(want) {
+			t.Errorf("parseLogTime(%q)=%v, %v; want %v", input, got, err, want)
+		}
+	}
+}
+
+func TestConsoleLogOutputFiltersAndPrefixesLines(t *testing.T) {
+	since := time.Date(2026, 7, 17, 1, 0, 0, 0, time.UTC)
+	until := since.Add(2 * time.Second)
+	output := newConsoleLogOutput(logsOptions{Since: &since, Until: &until, Timestamps: true})
+	var stdout, stderr bytes.Buffer
+	frames := []ttosconsole.Frame{
+		{Stream: ttosconsole.StreamStdout, Timestamp: since.Add(-time.Second), Data: []byte("old\n")},
+		{Stream: ttosconsole.StreamStdout, Timestamp: since, Data: []byte("one\ntwo")},
+		{Stream: ttosconsole.StreamStdout, Timestamp: since.Add(time.Second), Data: []byte("-continued\nthree\n")},
+		{Stream: ttosconsole.StreamStderr, Timestamp: until, Data: []byte("problem\n")},
+		{Stream: ttosconsole.StreamStderr, Timestamp: until.Add(time.Nanosecond), Data: []byte("new\n")},
+	}
+	for _, frame := range frames {
+		if err := output.write(frame, &stdout, &stderr); err != nil {
+			t.Fatalf("write(%+v): %v", frame, err)
+		}
+	}
+	wantStdout := "2026-07-17T01:00:00Z one\n2026-07-17T01:00:00Z two-continued\n2026-07-17T01:00:01Z three\n"
+	if got := stdout.String(); got != wantStdout {
+		t.Errorf("stdout=%q, want %q", got, wantStdout)
+	}
+	if got, want := stderr.String(), "2026-07-17T01:00:02Z problem\n"; got != want {
+		t.Errorf("stderr=%q, want %q", got, want)
 	}
 }
 
@@ -2600,9 +2651,7 @@ type fakeBackend struct {
 	startInteractive  bool
 	attached          attachRequest
 	logsTarget        selector
-	logsExecID        string
-	logsFollow        bool
-	logsTail          int
+	logsOptions       logsOptions
 	inspectInfo       InspectInfo
 	removed           string
 	removeForce       bool
@@ -2651,11 +2700,9 @@ func (b *fakeBackend) attach(request attachRequest) (uint32, error) {
 	return b.waitStatus, b.err
 }
 
-func (b *fakeBackend) logs(target selector, execID string, follow bool, tail int) error {
+func (b *fakeBackend) logs(target selector, options logsOptions) error {
 	b.logsTarget = target
-	b.logsExecID = execID
-	b.logsFollow = follow
-	b.logsTail = tail
+	b.logsOptions = options
 	return b.err
 }
 

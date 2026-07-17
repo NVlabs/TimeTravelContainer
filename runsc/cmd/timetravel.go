@@ -404,8 +404,9 @@ type consoleDrainResult struct {
 	err       error
 }
 
-// followConsole drains both output streams into Docker-compatible multiplexed
-// frames. It remains connected until both guest writers close.
+// followConsole drains both output streams into versioned TTOS multiplexed
+// frames. DecodeFrame also accepts the legacy Docker-compatible representation.
+// It remains connected until both guest writers close.
 func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) error {
 	return drainConsole(s, branchID, consoleID, writer, ready).err
 }
@@ -446,13 +447,13 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 				return finish(err)
 			}
 			if len(readResult.Data) != 0 {
-				if err := ttosconsole.WriteFrame(writer, stream.frameStream, readResult.Data); err != nil {
+				if err := ttosconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), readResult.Data); err != nil {
 					return finish(fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err))
 				}
 				progress = true
 			}
 			if readResult.EOF {
-				if err := ttosconsole.WriteFrame(writer, stream.frameStream, nil); err != nil {
+				if err := ttosconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), nil); err != nil {
 					return finish(fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err))
 				}
 				stream.eof = true

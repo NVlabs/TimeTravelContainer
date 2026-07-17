@@ -18,12 +18,12 @@ a `TTOS` section with the family tree, fork timings, per-branch processes, and
 optional live-fork eligibility reports. Bash, Zsh, and Fish completion scripts
 resolve live families/branches, images, volumes, and exec sessions. Branch trees
 show Sentry-reported PID 1 state and live CoW-sharing status alongside persisted
-creation/deletion times and immutable lineage. Effective Docker entrypoint,
-command,
-user, and image labels are retained in the generated bundle for later
-inspection. Generated bundles include procfs, restricted read-only sysfs,
-tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
-`/dev/ptmx`. Docker-compatible `--shm-size` configures the fork-safe
+creation/deletion times and immutable lineage. Timestamped retained console
+records support Docker-style log time filters and per-line timestamp output.
+Effective Docker entrypoint, command, user, and image labels are retained in the
+generated bundle for later inspection. Generated bundles include procfs,
+restricted read-only sysfs, tmpfs-backed `/dev` and `/dev/shm`, and a private
+devpts instance with `/dev/ptmx`. Docker-compatible `--shm-size` configures the
 `/dev/shm` tmpfs and is retained across restart and live fork. Docker-compatible
 `--tmpfs` and `--mount type=tmpfs` add arbitrary Sentry-owned tmpfs mounts with
 mode, size, and access options; TTOS extensions
@@ -255,8 +255,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       ordering across the retained and active log generations and `--tail 0 -f`.
 - [x] Persist Docker-style `run/create --log-opt max-size=SIZE` and
       `max-file=COUNT` and apply them to every branch sidecar.
-- [ ] Add Docker-compatible `--since`, `--until`, timestamps, details,
-      and explicit logging-driver policy.
+- [x] Add Docker-compatible `logs --since`, `--until`, and `--timestamps` over
+      versioned timestamped records while continuing to decode legacy records.
+      Accept `--details`; it emits no attributes until configurable log attributes exist.
+- [ ] Add explicit logging-driver policy and configurable attributes for
+      `logs --details`.
 - [x] Initial `ttos ps [-a|-q]` flat family/branch view and branch-qualified
       `ttos top [--json] CONTAINER[@BRANCH]` process listing.
 - [x] Add Docker-style `ps --filter/-f` for name, ID, status, ancestor image,
