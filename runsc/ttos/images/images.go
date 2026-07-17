@@ -25,6 +25,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	distref "github.com/distribution/reference"
 )
 
@@ -96,6 +97,14 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	defer client.Close()
 
 	var remoteOpts []containerd.RemoteOpt
+	credentials, configured, err := dockerCredentialCallback()
+	if err != nil {
+		return Info{}, err
+	}
+	if configured {
+		resolver := docker.NewResolver(docker.ResolverOptions{Credentials: credentials})
+		remoteOpts = append(remoteOpts, containerd.WithResolver(resolver))
+	}
 	if opts.Platform != "" {
 		remoteOpts = append(remoteOpts, containerd.WithPlatform(opts.Platform))
 	}

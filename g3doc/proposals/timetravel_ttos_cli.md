@@ -5,7 +5,8 @@ Status: TODO roadmap following the live-fork prototype.
 Implementation status: an initial lightweight `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
-containerd, generates rootless image-backed OCI bundles, and implements the
+containerd with Docker config and credential-helper authentication, generates
+rootless image-backed OCI bundles, and implements the
 initial run/create/start/wait/restart/inspect/list/remove lifecycle with
 persistent metadata, plus synchronous, detached, and TTY exec into a selected
 live branch, with branch-local managed-session list, wait, signal, log, and
@@ -123,8 +124,11 @@ the `main` branch and leave `ttos` responsible for branch operations.
       default, reusing local tag or unambiguous image-ID records without
       registry access. Support explicit `--pull=always` refresh and
       offline-enforcing `--pull=never`, with requested-platform matching.
-- [ ] Integrate registry authentication and Docker-compatible credential
+- [x] Integrate registry authentication and Docker-compatible credential
       helpers without storing plaintext credentials in the state database.
+      Pulls discover `DOCKER_CONFIG` or `~/.docker/config.json`, support inline
+      auth/token entries plus per-registry and global credential helpers, and
+      resolve secrets only in the containerd registry callback.
 - [ ] Show pull/unpack progress and content reuse.
 - [x] `ttos images` with reference, digest, platform, unpacked state, size, and
       creation time.

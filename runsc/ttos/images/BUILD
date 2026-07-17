@@ -9,6 +9,7 @@ go_library(
     name = "images",
     srcs = [
         "images.go",
+        "credentials.go",
         "rootfs.go",
     ],
     visibility = ["//runsc/ttos:__subpackages__"],
@@ -17,6 +18,7 @@ go_library(
         "@com_github_containerd_containerd_v2//client",
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_containerd_v2//core/images",
+        "@com_github_containerd_containerd_v2//core/remotes/docker",
         "@com_github_containerd_containerd_v2//pkg/archive",
         "@com_github_containerd_containerd_v2//pkg/archive/compression",
         "@com_github_containerd_platforms//:platforms",

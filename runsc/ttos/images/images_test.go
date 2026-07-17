@@ -15,6 +15,10 @@
 package images
 
 import (
+	"encoding/base64"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -106,5 +110,58 @@ func TestImageCreatedAtPrefersOCIConfiguration(t *testing.T) {
 	}
 	if got := imageCreatedAt(stored, nil); !got.Equal(stored) {
 		t.Errorf("imageCreatedAt without config=%v, want %v", got, stored)
+	}
+}
+
+func TestDockerCredentialsInlineAndDockerHubAlias(t *testing.T) {
+	auth := base64.StdEncoding.EncodeToString([]byte("test-user:test-secret"))
+	config := dockerConfigFile{Auths: map[string]dockerAuthConfig{
+		"https://index.docker.io/v1/": {Auth: auth},
+	}}
+	username, secret, err := config.credentials("registry-1.docker.io")
+	if err != nil {
+		t.Fatalf("credentials: %v", err)
+	}
+	if username != "test-user" || secret != "test-secret" {
+		t.Errorf("credentials=%q:%q, want test-user:test-secret", username, secret)
+	}
+}
+
+func TestDockerCredentialHelper(t *testing.T) {
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "docker-credential-fixture")
+	script := "#!/bin/sh\nread server\nprintf \"{\\\"Username\\\":\\\"helper-user\\\",\\\"Secret\\\":\\\"helper-secret\\\"}\n\"\n"
+	if err := os.WriteFile(helper, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	config := dockerConfigFile{CredHelpers: map[string]string{"registry.example": "fixture"}}
+	username, secret, err := config.credentials("registry.example")
+	if err != nil {
+		t.Fatalf("credentials: %v", err)
+	}
+	if username != "helper-user" || secret != "helper-secret" {
+		t.Errorf("credentials=%q:%q, want helper-user:helper-secret", username, secret)
+	}
+}
+
+func TestDockerCredentialCallbackUsesDockerConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DOCKER_CONFIG", dir)
+	auth := base64.StdEncoding.EncodeToString([]byte("configured:secret"))
+	data := []byte(fmt.Sprintf(`{"auths":{"registry.example":{"auth":%q}}}`, auth))
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	callback, configured, err := dockerCredentialCallback()
+	if err != nil {
+		t.Fatalf("dockerCredentialCallback: %v", err)
+	}
+	if !configured {
+		t.Fatal("Docker configuration was not detected")
+	}
+	username, secret, err := callback("registry.example")
+	if err != nil || username != "configured" || secret != "secret" {
+		t.Fatalf("callback credentials=%q:%q err=%v", username, secret, err)
 	}
 }
