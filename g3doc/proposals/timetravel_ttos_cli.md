@@ -501,8 +501,10 @@ Reject            unsupported, externally mutable, or host/device-backed
       grandchild functional after deleting its source branch.
 - [x] Test multiple simultaneous read-only binds, recursive fork, host mutation
       visibility, and source-branch deletion while a descendant remains live.
-- [ ] Test open files, directory cursors, executable mappings, and exhaustive
-      descendant-first or ancestor-first destruction orders.
+- [x] Test inherited open files and branch-local offsets, directory cursors, and
+      read/execute mappings across recursive forks, including host mutation and
+      deletion of the source branch while its descendant remains functional.
+- [ ] Test exhaustive descendant-first and ancestor-first destruction orders.
 - [x] Document and expose read-only host binds as shared external views, not
       snapshots: TTOS inspect metadata and fork-check warnings state that
       host-side mutations may become visible to every branch.
@@ -685,7 +687,7 @@ bundle.
 - [x] Support multiple simultaneous output readers.
 - [x] Use one exclusive manager-level stdin owner per branch.
 - [ ] Define daemon-reconciled stdin lease takeover behavior.
-- [ ] Host-mutation semantics and warnings for shared read-only binds.
+- [x] Host-mutation semantics and warnings for shared read-only binds.
 - [ ] Managed-volume sharing across unrelated families.
 - [ ] Whether stopped branch filesystem state may be retained without retaining
       its Kernel and memory.

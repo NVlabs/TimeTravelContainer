@@ -619,6 +619,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(hostBind, "fixture"), []byte("host-data"), 0644); err != nil {
 		t.Fatalf("writing read-only bind fixture: %v", err)
 	}
+	for _, name := range []string{"alpha", "beta"} {
+		if err := os.WriteFile(filepath.Join(hostBind, name), []byte(name), 0644); err != nil {
+			t.Fatalf("writing read-only directory fixture %q: %v", name, err)
+		}
+	}
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sleep", "30"}
 	spec.Root.Readonly = false
@@ -1011,6 +1016,46 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	ptyMaster.DecRef(parentTask)
 	parentPTYMaster := liveForkTestFD(t, l.k, ptyMasterFD)
 
+	// Keep a regular file, directory cursor, and executable mapping backed by
+	// the read-only host bind alive across every fork boundary.
+	const readonlyFileFD = int32(29)
+	readonlyFile := liveForkTestOpenPath(t, parentTask, "readonly/fixture", linux.O_RDONLY)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, readonlyFileFD, readonlyFile, kernel.FDFlags{}); err != nil {
+		readonlyFile.DecRef(parentTask)
+		t.Fatalf("installing read-only bind file: %v", err)
+	}
+	readonlyFile.DecRef(parentTask)
+	parentReadonlyFile := liveForkTestFD(t, l.k, readonlyFileFD)
+	liveForkTestRead(t, ctx, parentReadonlyFile, "ho")
+
+	const readonlyDirFD = int32(30)
+	readonlyDir := liveForkTestOpenPath(t, parentTask, "readonly", linux.O_RDONLY|linux.O_DIRECTORY)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, readonlyDirFD, readonlyDir, kernel.FDFlags{}); err != nil {
+		readonlyDir.DecRef(parentTask)
+		t.Fatalf("installing read-only bind directory: %v", err)
+	}
+	readonlyDir.DecRef(parentTask)
+	parentReadonlyDir := liveForkTestFD(t, l.k, readonlyDirFD)
+	if got := liveForkTestNextDirent(t, ctx, parentReadonlyDir); got != "." {
+		t.Fatalf("first read-only bind dirent: got %q, want .", got)
+	}
+
+	readonlyMapOpts := memmap.MMapOpts{
+		Length:   hostarch.PageSize,
+		Perms:    hostarch.ReadExecute,
+		MaxPerms: hostarch.ReadExecute,
+		Private:  true,
+	}
+	if err := parentReadonlyFile.ConfigureMMap(ctx, &readonlyMapOpts); err != nil {
+		t.Fatalf("configuring read-only executable mapping: %v", err)
+	}
+	readonlyMapAddr, err := parentTask.MemoryManager().MMap(ctx, readonlyMapOpts)
+	readonlyMapOpts.MappingIdentity.DecRef(ctx)
+	if err != nil {
+		t.Fatalf("mapping read-only executable: %v", err)
+	}
+	liveForkTestMMReadContext(t, ctx, parentTask, readonlyMapAddr, "host-data")
+
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
 	if err != nil {
 		t.Fatalf("forking live loader: %v", err)
@@ -1066,6 +1111,9 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childConsoleStdin := liveForkTestFD(t, child.k, consoleBaseFD)
 	childConsoleStdout := liveForkTestFD(t, child.k, consoleBaseFD+1)
 	childPTYMaster := liveForkTestFD(t, child.k, ptyMasterFD)
+	childReadonlyFile := liveForkTestFD(t, child.k, readonlyFileFD)
+	childReadonlyDir := liveForkTestFD(t, child.k, readonlyDirFD)
+	liveForkTestMMReadContext(t, childCtx, childTask, readonlyMapAddr, "host-data")
 	if parentPTYMaster.Impl() == childPTYMaster.Impl() {
 		t.Fatal("parent and child share the same internal PTY master object")
 	}
@@ -1085,6 +1133,26 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPathRead(t, childTask, "readonly/fixture", "host-data")
 	liveForkTestPathWriteDenied(t, parentTask, "readonly/fixture")
 	liveForkTestPathWriteDenied(t, childTask, "readonly/fixture")
+	if got := liveForkTestNextDirent(t, ctx, parentReadonlyDir); got != ".." {
+		t.Fatalf("parent read-only bind second dirent: got %q, want ..", got)
+	}
+	if got := liveForkTestNextDirent(t, childCtx, childReadonlyDir); got != ".." {
+		t.Fatalf("child read-only bind second dirent: got %q, want ..", got)
+	}
+	parentDirent := liveForkTestNextDirent(t, ctx, parentReadonlyDir)
+	childDirent := liveForkTestNextDirent(t, childCtx, childReadonlyDir)
+	if parentDirent != childDirent {
+		t.Fatalf("read-only bind cursors diverged after fork: parent=%q child=%q", parentDirent, childDirent)
+	}
+	if err := os.WriteFile(filepath.Join(hostBind, "fixture"), []byte("hoMUTATED"), 0644); err != nil {
+		t.Fatalf("mutating read-only bind fixture on host: %v", err)
+	}
+	liveForkTestMMReadContext(t, ctx, parentTask, readonlyMapAddr, "hoMUTATED")
+	liveForkTestMMReadContext(t, childCtx, childTask, readonlyMapAddr, "hoMUTATED")
+	liveForkTestRead(t, ctx, parentReadonlyFile, "MU")
+	liveForkTestRead(t, childCtx, childReadonlyFile, "MU")
+	liveForkTestRead(t, ctx, parentReadonlyFile, "TA")
+	liveForkTestRead(t, childCtx, childReadonlyFile, "TA")
 
 	liveForkTestPRead(t, childTask, childManagedVolume, 0, "seed")
 	liveForkTestPRead(t, childTask, childManagedAlias, 0, "seed")
@@ -1365,6 +1433,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		t.Fatalf("looking up grandchild: %v", err)
 	}
 	grandchildTask := grandchild.k.GlobalInit().Leader()
+	grandchildCtx := grandchild.k.SupervisorContext()
 	grandchildUDPClient := liveForkTestFD(t, grandchild.k, udpFDs[0])
 	grandchildUDPServer := liveForkTestFD(t, grandchild.k, udpFDs[1])
 	grandchildTCPClient := liveForkTestFD(t, grandchild.k, tcpFDs[0])
@@ -1392,7 +1461,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "chld")
 	grandchildManagedVolume := liveForkTestFD(t, grandchild.k, managedVolumeFD)
 	grandchildManagedAlias := liveForkTestOpenPath(t, grandchildTask, "managed-alias/state", linux.O_RDWR)
-	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "host-data")
+	grandchildReadonlyFile := liveForkTestFD(t, grandchild.k, readonlyFileFD)
+	grandchildReadonlyDir := liveForkTestFD(t, grandchild.k, readonlyDirFD)
+	liveForkTestMMReadContext(t, childCtx, childTask, readonlyMapAddr, "hoMUTATED")
+	liveForkTestMMReadContext(t, grandchildCtx, grandchildTask, readonlyMapAddr, "hoMUTATED")
+	liveForkTestRead(t, childCtx, childReadonlyFile, "TE")
+	liveForkTestRead(t, grandchildCtx, grandchildReadonlyFile, "TE")
+	recursiveDirent := liveForkTestNextDirent(t, childCtx, childReadonlyDir)
+	if got := liveForkTestNextDirent(t, grandchildCtx, grandchildReadonlyDir); got != recursiveDirent {
+		t.Fatalf("read-only bind cursor diverged after recursive fork: child=%q grandchild=%q", recursiveDirent, got)
+	}
+	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "hoMUTATED")
 	liveForkTestPathMissing(t, grandchildTask, overlayPath)
 	liveForkTestPathMissing(t, grandchildTask, "parent-only")
 	liveForkTestPRead(t, grandchildTask, grandchildManagedVolume, 0, "chld")
@@ -1431,6 +1510,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childManagedAlias.DecRef(childTask)
 	childConsoleStdin.DecRef(childTask)
 	childConsoleStdout.DecRef(childTask)
+	childReadonlyFile.DecRef(childTask)
+	childReadonlyDir.DecRef(childTask)
 	if err := l.family.Pause(childInfo.ID); err != nil {
 		t.Fatalf("pausing child: %v", err)
 	}
@@ -1492,7 +1573,14 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMRead(t, grandchildTask, shmAddr1, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildMemfd, 0, "grnd")
 	liveForkTestPRead(t, grandchildTask, grandchildOverlayFile, 0, "grnd")
-	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "host-data")
+	liveForkTestMMReadContext(t, grandchildCtx, grandchildTask, readonlyMapAddr, "hoMUTATED")
+	liveForkTestRead(t, grandchildCtx, grandchildReadonlyFile, "D")
+	_ = liveForkTestNextDirent(t, grandchildCtx, grandchildReadonlyDir)
+	liveForkTestRead(t, ctx, parentReadonlyFile, "TE")
+	if got := liveForkTestNextDirent(t, ctx, parentReadonlyDir); got != recursiveDirent {
+		t.Fatalf("parent read-only bind cursor changed with descendant activity: got %q, want %q", got, recursiveDirent)
+	}
+	liveForkTestPathRead(t, grandchildTask, "readonly/fixture", "hoMUTATED")
 	liveForkTestWrite(t, grandchildTask, grandchildUDPClient, "stay")
 	liveForkTestRead(t, grandchildTask, grandchildUDPServer, "stay")
 	liveForkTestWrite(t, grandchildTask, grandchildTCPClient, "stay")
@@ -1513,6 +1601,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	grandchildTCPServer.DecRef(grandchildTask)
 	grandchildManagedVolume.DecRef(grandchildTask)
 	grandchildManagedAlias.DecRef(grandchildTask)
+	grandchildReadonlyFile.DecRef(grandchildTask)
+	grandchildReadonlyDir.DecRef(grandchildTask)
 	grandchildConsoleStdin.DecRef(grandchildTask)
 	grandchildConsoleStdout.DecRef(grandchildTask)
 	if err := l.family.Destroy(grandchildInfo.ID); err != nil {
@@ -1541,6 +1631,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 
 	parentManagedVolume.DecRef(parentTask)
 	parentManagedAlias.DecRef(parentTask)
+	parentReadonlyFile.DecRef(parentTask)
+	parentReadonlyDir.DecRef(parentTask)
 	parentConsoleStdin.DecRef(parentTask)
 	parentConsoleStdout.DecRef(parentTask)
 	parentConsoleStderr.DecRef(parentTask)
@@ -1573,6 +1665,26 @@ func liveForkTestTaskFD(t *testing.T, task *kernel.Task, fd int32) *vfs.FileDesc
 		t.Fatalf("FD %d is missing", fd)
 	}
 	return file
+}
+
+func liveForkTestNextDirent(t *testing.T, ctx context.Context, file *vfs.FileDescription) string {
+	t.Helper()
+	stop := errors.New("one dirent collected")
+	var got string
+	err := file.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
+		if got != "" {
+			return stop
+		}
+		got = dirent.Name
+		return nil
+	}))
+	if err != nil && !errors.Is(err, stop) {
+		t.Fatalf("IterDirents: %v", err)
+	}
+	if got == "" {
+		t.Fatal("IterDirents reached end of directory")
+	}
+	return got
 }
 
 func liveForkTestWrite(t *testing.T, ctx context.Context, file *vfs.FileDescription, value string) {
@@ -2033,8 +2145,13 @@ func liveForkTestMMWrite(t *testing.T, task *kernel.Task, addr hostarch.Addr, va
 
 func liveForkTestMMRead(t *testing.T, task *kernel.Task, addr hostarch.Addr, want string) {
 	t.Helper()
+	liveForkTestMMReadContext(t, task, task, addr, want)
+}
+
+func liveForkTestMMReadContext(t *testing.T, ctx context.Context, task *kernel.Task, addr hostarch.Addr, want string) {
+	t.Helper()
 	got := make([]byte, len(want))
-	if n, err := task.MemoryManager().CopyIn(task, addr, got, usermem.IOOpts{}); err != nil || n != len(got) {
+	if n, err := task.MemoryManager().CopyIn(ctx, addr, got, usermem.IOOpts{}); err != nil || n != len(got) {
 		t.Fatalf("MemoryManager.CopyIn(%#x): got (%q, %d, %v)", addr, got, n, err)
 	}
 	if string(got) != want {
