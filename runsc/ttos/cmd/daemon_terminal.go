@@ -28,19 +28,24 @@ import (
 	"golang.org/x/term"
 )
 
-const daemonTerminalSizeBytes = 8
+const (
+	daemonTerminalSizeBytes = 8
+	daemonStdinWindowBytes  = 1 << 20
+)
 
 type daemonStdinQueue struct {
 	writer *io.PipeWriter
+	ack    func(int) error
 	mu     sync.Mutex
 	chunks [][]byte
+	bytes  int
 	closed bool
 	err    error
 	notify chan struct{}
 }
 
-func newDaemonStdinQueue(writer *io.PipeWriter) *daemonStdinQueue {
-	queue := &daemonStdinQueue{writer: writer, notify: make(chan struct{}, 1)}
+func newDaemonStdinQueue(writer *io.PipeWriter, ack func(int) error) *daemonStdinQueue {
+	queue := &daemonStdinQueue{writer: writer, ack: ack, notify: make(chan struct{}, 1)}
 	go queue.pump()
 	return queue
 }
@@ -48,10 +53,11 @@ func newDaemonStdinQueue(writer *io.PipeWriter) *daemonStdinQueue {
 func (queue *daemonStdinQueue) enqueue(data []byte) bool {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	if queue.closed {
+	if queue.closed || len(data) > daemonStdinWindowBytes-queue.bytes {
 		return false
 	}
 	queue.chunks = append(queue.chunks, append([]byte(nil), data...))
+	queue.bytes += len(data)
 	select {
 	case queue.notify <- struct{}{}:
 	default:
@@ -84,6 +90,15 @@ func (queue *daemonStdinQueue) pump() {
 				queue.writer.CloseWithError(err)
 				return
 			}
+			queue.mu.Lock()
+			queue.bytes -= len(chunk)
+			queue.mu.Unlock()
+			if queue.ack != nil {
+				if err := queue.ack(len(chunk)); err != nil {
+					queue.writer.CloseWithError(err)
+					return
+				}
+			}
 			continue
 		}
 		closed, err := queue.closed, queue.err
@@ -98,6 +113,74 @@ func (queue *daemonStdinQueue) pump() {
 		}
 		<-queue.notify
 	}
+}
+
+type daemonStdinFlow struct {
+	mu          sync.Mutex
+	outstanding int
+	closed      bool
+	notify      chan struct{}
+}
+
+func newDaemonStdinFlow() *daemonStdinFlow {
+	return &daemonStdinFlow{notify: make(chan struct{}, 1)}
+}
+
+func (flow *daemonStdinFlow) reserve(bytes int) error {
+	if bytes < 0 || bytes > daemonStdinWindowBytes {
+		return fmt.Errorf("daemon stdin reservation %d exceeds the %d-byte window", bytes, daemonStdinWindowBytes)
+	}
+	for {
+		flow.mu.Lock()
+		if flow.closed {
+			flow.mu.Unlock()
+			return io.ErrClosedPipe
+		}
+		if bytes <= daemonStdinWindowBytes-flow.outstanding {
+			flow.outstanding += bytes
+			flow.mu.Unlock()
+			return nil
+		}
+		flow.mu.Unlock()
+		<-flow.notify
+	}
+}
+
+func (flow *daemonStdinFlow) acknowledge(bytes int) error {
+	flow.mu.Lock()
+	defer flow.mu.Unlock()
+	if bytes < 0 || bytes > flow.outstanding {
+		return fmt.Errorf("invalid daemon stdin acknowledgement %d with %d bytes outstanding", bytes, flow.outstanding)
+	}
+	flow.outstanding -= bytes
+	select {
+	case flow.notify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (flow *daemonStdinFlow) close() {
+	flow.mu.Lock()
+	flow.closed = true
+	flow.mu.Unlock()
+	select {
+	case flow.notify <- struct{}{}:
+	default:
+	}
+}
+
+func encodeDaemonStdinAcknowledgement(bytes int) []byte {
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(bytes))
+	return payload[:]
+}
+
+func decodeDaemonStdinAcknowledgement(payload []byte) (int, error) {
+	if len(payload) != 4 {
+		return 0, fmt.Errorf("invalid daemon stdin acknowledgement length %d", len(payload))
+	}
+	return int(binary.BigEndian.Uint32(payload)), nil
 }
 
 type daemonTerminalInput struct {

@@ -25,6 +25,65 @@ import (
 	"time"
 )
 
+func TestDaemonStdinFlowControlWindow(t *testing.T) {
+	flow := newDaemonStdinFlow()
+	defer flow.close()
+	if err := flow.reserve(daemonStdinWindowBytes); err != nil {
+		t.Fatal(err)
+	}
+	reserved := make(chan error, 1)
+	go func() { reserved <- flow.reserve(1) }()
+	select {
+	case err := <-reserved:
+		t.Fatalf("reservation passed a full window: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := flow.acknowledge(1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-reserved:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reservation did not resume after acknowledgement")
+	}
+	if err := flow.acknowledge(daemonStdinWindowBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := flow.acknowledge(1); err == nil {
+		t.Fatal("flow accepted acknowledgement with no outstanding bytes")
+	}
+	if err := flow.reserve(daemonStdinWindowBytes + 1); err == nil {
+		t.Fatal("flow accepted a reservation larger than the window")
+	}
+}
+
+func TestDaemonStdinQueueIsBounded(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	queue := newDaemonStdinQueue(writer, nil)
+	if !queue.enqueue(make([]byte, daemonStdinWindowBytes)) {
+		t.Fatal("queue rejected one full window")
+	}
+	if queue.enqueue([]byte{1}) {
+		t.Fatal("queue accepted bytes beyond its window")
+	}
+	queue.closeWithError(nil)
+}
+
+func TestDaemonStdinAcknowledgementCodec(t *testing.T) {
+	payload := encodeDaemonStdinAcknowledgement(32768)
+	got, err := decodeDaemonStdinAcknowledgement(payload)
+	if err != nil || got != 32768 {
+		t.Fatalf("acknowledgement round trip=(%d,%v)", got, err)
+	}
+	if _, err := decodeDaemonStdinAcknowledgement(payload[:3]); err == nil {
+		t.Fatal("decoder accepted malformed acknowledgement")
+	}
+}
+
 func TestDaemonTerminalSizeRoundTrip(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()

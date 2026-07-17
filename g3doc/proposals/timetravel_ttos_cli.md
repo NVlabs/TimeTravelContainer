@@ -378,8 +378,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       settings per container, and report when a reader falls behind retention.
 - [ ] Define explicit output backpressure policy and surface cumulative
       truncation counters through inspect/events.
-- [ ] Bound daemon-side queued stdin and add framed flow control so a client
-      cannot grow manager memory without limit while the guest is not reading.
+- [x] Bound daemon-side queued stdin to a 1 MiB credit window. API v2
+      acknowledges bytes only after the guest pipe accepts them, so resize and
+      other control frames remain responsive while a slow guest backpressures
+      the client without unbounded manager memory.
 - [x] Allow fork while output readers are attached: read RPCs serialize against
       fork, readers follow a host log, and a new child sidecar starts afterward.
 - [x] Keep branches fork-eligible before, during, and after output attachment;

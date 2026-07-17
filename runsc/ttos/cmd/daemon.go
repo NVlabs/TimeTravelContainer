@@ -36,6 +36,7 @@ import (
 const (
 	daemonAPIVersion    = 2
 	daemonFrameStdin    = byte('I')
+	daemonFrameStdinAck = byte('A')
 	daemonFrameEOF      = byte('C')
 	daemonFrameResize   = byte('W')
 	daemonFrameStdout   = byte('O')
@@ -460,7 +461,9 @@ func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
 func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin bool, terminal *daemonTerminalInput) {
 	var stdinQueue *daemonStdinQueue
 	if allowStdin {
-		stdinQueue = newDaemonStdinQueue(writer)
+		stdinQueue = newDaemonStdinQueue(writer, func(bytes int) error {
+			return writeDaemonFrame(terminal.conn, terminal.writeMu, daemonFrameStdinAck, encodeDaemonStdinAcknowledgement(bytes))
+		})
 	}
 	stdinOpen := allowStdin
 	fail := func(err error) {
@@ -476,8 +479,12 @@ func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin 
 		}
 		switch typ {
 		case daemonFrameStdin:
-			if !stdinOpen || !stdinQueue.enqueue(payload) {
+			if !stdinOpen {
 				fail(errors.New("unexpected stdin frame"))
+				return
+			}
+			if !stdinQueue.enqueue(payload) {
+				fail(fmt.Errorf("daemon stdin exceeded the %d-byte flow-control window", daemonStdinWindowBytes))
 				return
 			}
 		case daemonFrameEOF:
@@ -696,12 +703,17 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	if err != nil {
 		return 1, err
 	}
+	stdinFlow := newDaemonStdinFlow()
+	defer stdinFlow.close()
 	if request.Stdin {
 		go func() {
 			buffer := make([]byte, 32<<10)
 			for {
 				n, readErr := stdin.Read(buffer)
 				if n != 0 {
+					if err := stdinFlow.reserve(n); err != nil {
+						return
+					}
 					if err := writeDaemonFrame(conn, &writeMu, daemonFrameStdin, buffer[:n]); err != nil {
 						return
 					}
@@ -732,6 +744,14 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 			}
 		case daemonFrameStderr:
 			if _, err := stderr.Write(payload); err != nil {
+				return 1, err
+			}
+		case daemonFrameStdinAck:
+			bytes, err := decodeDaemonStdinAcknowledgement(payload)
+			if err != nil {
+				return 1, err
+			}
+			if err := stdinFlow.acknowledge(bytes); err != nil {
 				return 1, err
 			}
 		case daemonFrameTerminal:
