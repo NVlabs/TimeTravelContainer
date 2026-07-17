@@ -3469,6 +3469,9 @@ type Branch struct {
 	KernelForkNS     int64      `json:"kernel_fork_ns,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+	InitPID          int32      `json:"init_pid,omitempty"`
+	InitState        string     `json:"init_state,omitempty"`
+	MemorySharing    string     `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttos ls --json.
@@ -5501,6 +5504,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	families := make([]Family, 0, len(byID))
 	for _, family := range byID {
+		enrichPersistentBranchDiagnostics(&family)
 		families = append(families, family)
 	}
 	sort.Slice(families, func(i, j int) bool {
@@ -5511,6 +5515,34 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	return families, nil
+}
+
+func enrichPersistentBranchDiagnostics(family *Family) {
+	for i := range family.Branches {
+		branch := &family.Branches[i]
+		if branch.InitState == "" {
+			switch branch.State {
+			case "created", "creating":
+				branch.InitState = "not-started"
+			case "deleted":
+				branch.InitState = "deleted"
+			case "exited", "stopped", "failed":
+				branch.InitState = "exited"
+			default:
+				branch.InitState = "unknown"
+			}
+		}
+		if branch.MemorySharing == "" {
+			switch branch.State {
+			case "created", "creating":
+				branch.MemorySharing = "unallocated"
+			case "deleted", "exited", "stopped", "failed":
+				branch.MemorySharing = "released"
+			default:
+				branch.MemorySharing = "unknown"
+			}
+		}
+	}
 }
 
 func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
@@ -5629,11 +5661,14 @@ func (b *runtimeBackend) signalExecSession(target selector, execID string, signa
 }
 
 type runscBranchInfo struct {
-	ID          string    `json:"ID"`
-	ParentID    string    `json:"ParentID"`
-	State       string    `json:"State"`
-	CreatedAt   time.Time `json:"CreatedAt"`
-	ForkMetrics struct {
+	ID           string    `json:"ID"`
+	ParentID     string    `json:"ParentID"`
+	State        string    `json:"State"`
+	CreatedAt    time.Time `json:"CreatedAt"`
+	InitPID      int32     `json:"InitPID"`
+	InitState    string    `json:"InitState"`
+	SharesMemory bool      `json:"SharesMemory"`
+	ForkMetrics  struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
 			Total time.Duration `json:"Total"`
@@ -5673,12 +5708,22 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 	return merged
 }
 
+func memorySharingMode(shared bool) string {
+	if shared {
+		return "cow"
+	}
+	return "private"
+}
+
 func branchView(info runscBranchInfo) Branch {
 	return Branch{
 		ID:               info.ID,
 		ParentID:         info.ParentID,
 		State:            info.State,
 		CreatedAt:        info.CreatedAt,
+		InitPID:          info.InitPID,
+		InitState:        info.InitState,
+		MemorySharing:    memorySharingMode(info.SharesMemory),
 		ForkTotalNS:      info.ForkMetrics.Total.Nanoseconds(),
 		SourceDowntimeNS: info.ForkMetrics.SourceDowntime.Nanoseconds(),
 		KernelForkNS:     info.ForkMetrics.Kernel.Total.Nanoseconds(),
@@ -6013,6 +6058,22 @@ func writeBranchNode(w io.Writer, branch Branch, prefix string, last bool, byID 
 		if _, ok := byID[branch.ParentID]; !ok {
 			suffix = fmt.Sprintf(" parent=%s (deleted)", branch.ParentID)
 		}
+	}
+	if branch.InitState != "" {
+		pid := "-"
+		if branch.InitPID != 0 {
+			pid = strconv.FormatInt(int64(branch.InitPID), 10)
+		}
+		suffix += fmt.Sprintf(" pid1=%s(%s)", branch.InitState, pid)
+	}
+	if branch.MemorySharing != "" {
+		suffix += " memory=" + branch.MemorySharing
+	}
+	if !branch.CreatedAt.IsZero() {
+		suffix += " created=" + branch.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if branch.DeletedAt != nil {
+		suffix += " deleted=" + branch.DeletedAt.UTC().Format(time.RFC3339Nano)
 	}
 	if branch.ForkTotalNS != 0 {
 		suffix += fmt.Sprintf(" fork=%s downtime=%s", time.Duration(branch.ForkTotalNS), time.Duration(branch.SourceDowntimeNS))

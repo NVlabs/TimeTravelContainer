@@ -1444,6 +1444,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if len(childProcesses) != 1 || childProcesses[0].PID != 1 {
 		t.Fatalf("child processes: got %+v, want virtual PID 1", childProcesses)
 	}
+	var childListed *BranchInfo
+	for _, listed := range l.family.List() {
+		if listed.ID == childInfo.ID {
+			snapshot := listed
+			childListed = &snapshot
+			break
+		}
+	}
+	if childListed == nil || childListed.InitPID != 1 || childListed.InitState != string(BranchRunning) || !childListed.SharesMemory {
+		t.Errorf("live child diagnostics: %+v", childListed)
+	}
 	if err := l.family.Signal(childInfo.ID, l.root.cid, 0, int32(linux.SIGKILL), DeliverToProcess); err != nil {
 		t.Fatalf("signaling child init: %v", err)
 	}
@@ -1463,6 +1474,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	if statusAgain != status {
 		t.Errorf("second child wait status: got %v, want %v", linux.WaitStatus(statusAgain), ws)
+	}
+	for _, listed := range l.family.List() {
+		if listed.ID == childInfo.ID && (listed.InitPID != 1 || listed.InitState != "exited") {
+			t.Errorf("exited child diagnostics: %+v", listed)
+		}
 	}
 	if got := l.k.GlobalInit().Leader().ExitState(); got != kernel.TaskExitNone {
 		t.Errorf("parent init changed after signaling child: got exit state %v", got)

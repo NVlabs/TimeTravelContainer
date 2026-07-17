@@ -47,10 +47,13 @@ const (
 
 // BranchInfo is the branch metadata exposed over the control socket.
 type BranchInfo struct {
-	ID        string
-	ParentID  string
-	State     BranchState
-	CreatedAt time.Time
+	ID           string
+	ParentID     string
+	State        BranchState
+	CreatedAt    time.Time
+	InitPID      kernel.ThreadID
+	InitState    string
+	SharesMemory bool
 	// ForkMetrics is populated for branches created by Fork.
 	ForkMetrics SandboxForkMetrics
 }
@@ -439,18 +442,41 @@ func (f *SandboxFamily) watchExecSession(branchID, id string, session *execSessi
 func (f *SandboxFamily) List() []BranchInfo {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	liveKernels := 0
+	for _, b := range f.branches {
+		if b.k != nil {
+			liveKernels++
+		}
+	}
 	out := make([]BranchInfo, 0, len(f.branches))
 	for _, b := range f.branches {
+		initPID, initState := branchInitStatus(b)
 		out = append(out, BranchInfo{
-			ID:          b.id,
-			ParentID:    b.parentID,
-			State:       b.state,
-			CreatedAt:   b.createdAt,
-			ForkMetrics: b.metrics,
+			ID:           b.id,
+			ParentID:     b.parentID,
+			State:        b.state,
+			CreatedAt:    b.createdAt,
+			InitPID:      initPID,
+			InitState:    initState,
+			SharesMemory: b.k != nil && liveKernels > 1,
+			ForkMetrics:  b.metrics,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+func branchInitStatus(b *sandboxBranch) (kernel.ThreadID, string) {
+	if b.k == nil {
+		return 0, "not-started"
+	}
+	if b.k.RootPIDNamespace().ThreadGroupWithID(1) != nil {
+		return 1, string(b.state)
+	}
+	if b.k.GlobalInit() != nil {
+		return 1, "exited"
+	}
+	return 0, "not-started"
 }
 
 // CheckFork validates source without creating a branch or changing CoW/VFS

@@ -16,8 +16,10 @@ Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
 output. Container inspect uses Docker-shaped JSON and Go templates while adding
 a `TTOS` section with the family tree, fork timings, per-branch processes, and
 optional live-fork eligibility reports. Bash, Zsh, and Fish completion scripts
-resolve live families/branches, images, volumes, and exec sessions.
-Effective Docker entrypoint, command,
+resolve live families/branches, images, volumes, and exec sessions. Branch trees
+show Sentry-reported PID 1 state and live CoW-sharing status alongside persisted
+creation/deletion times and immutable lineage. Effective Docker entrypoint,
+command,
 user, and image labels are retained in the generated bundle for later
 inspection. Generated bundles include procfs, restricted read-only sysfs,
 tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
@@ -279,8 +281,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial `ttos ls --tree` compact Unicode lineage and lifecycle-state
       output, merging persistent base containers with authoritative live runsc
       branch state.
-- [ ] Extend tree output with PID 1 state, memory sharing, creation time, and
-      the complete persisted lineage/tombstone model.
+- [x] Extend tree output with PID 1 state, live CoW memory sharing, creation and
+      deletion times, and the complete persisted lineage/tombstone model.
 - [x] `ttos ls --json` with a stable machine-readable schema.
 - [x] Mark deleted historical parents in tree output without reparenting their
       descendants.

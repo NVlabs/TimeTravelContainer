@@ -134,6 +134,9 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if !branches[0].CreatedAt.Equal(child.CreatedAt) || !branches[1].CreatedAt.Equal(mainCreatedAt) {
 		t.Errorf("List creation timestamps=%+v, child=%v main=%v", branches, child.CreatedAt, mainCreatedAt)
 	}
+	if !branches[0].SharesMemory || !branches[1].SharesMemory {
+		t.Errorf("forked branches do not report shared CoW backing: %+v", branches)
+	}
 
 	if err := family.Resume("child"); err != nil {
 		t.Fatalf("Resume child: %v", err)

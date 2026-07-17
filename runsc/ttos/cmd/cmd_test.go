@@ -64,25 +64,27 @@ func TestParseSelector(t *testing.T) {
 }
 
 func TestWriteTree(t *testing.T) {
+	created := time.Date(2026, 7, 17, 8, 9, 10, 123, time.UTC)
+	deleted := created.Add(time.Second)
 	families := []Family{{
 		ID:    "web",
 		State: "running",
 		Branches: []Branch{
 			{ID: "retry", ParentID: "test-a", State: "running", ForkTotalNS: 2_000_000, SourceDowntimeNS: 1_000_000},
 			{ID: "test-b", ParentID: "main", State: "paused"},
-			{ID: "main", State: "running"},
+			{ID: "main", State: "running", CreatedAt: created, InitPID: 1, InitState: "running", MemorySharing: "cow"},
 			{ID: "test-a", ParentID: "main", State: "paused"},
-			{ID: "orphan", ParentID: "deleted", State: "running"},
+			{ID: "orphan", ParentID: "deleted", State: "deleted", CreatedAt: created, DeletedAt: &deleted, InitState: "deleted", MemorySharing: "released"},
 		},
 	}}
 	var out bytes.Buffer
 	writeTree(&out, families)
 	want := "web (running)\n" +
-		"├── main running\n" +
+		"├── main running pid1=running(1) memory=cow created=2026-07-17T08:09:10.000000123Z\n" +
 		"│   ├── test-a paused\n" +
 		"│   │   └── retry running fork=2ms downtime=1ms\n" +
 		"│   └── test-b paused\n" +
-		"└── orphan running parent=deleted (deleted)\n"
+		"└── orphan deleted parent=deleted (deleted) pid1=deleted(-) memory=released created=2026-07-17T08:09:10.000000123Z deleted=2026-07-17T08:09:11.000000123Z\n"
 	if got := out.String(); got != want {
 		t.Errorf("writeTree output:\n%s\nwant:\n%s", got, want)
 	}
