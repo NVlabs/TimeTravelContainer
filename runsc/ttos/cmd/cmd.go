@@ -530,13 +530,21 @@ func expandCombinedShortBools(args []string, boolNames string, valueNames ...str
 }
 
 type mountRequests struct {
-	host    []ttosbundle.HostMount
-	managed []ttosbundle.ManagedVolume
+	host       []ttosbundle.HostMount
+	managed    []ttosbundle.ManagedVolume
+	filesystem []ttosbundle.FilesystemMount
 }
 
-func parseMountRequests(volumeSpecs, mountSpecs []string) (mountRequests, error) {
+func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequests, error) {
 	var request mountRequests
 	var hostVolumes, hostMounts []string
+	for _, value := range tmpfsSpecs {
+		mount, err := parseTmpfsMount(value)
+		if err != nil {
+			return mountRequests{}, err
+		}
+		request.filesystem = append(request.filesystem, mount)
+	}
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
 		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
@@ -561,19 +569,26 @@ func parseMountRequests(volumeSpecs, mountSpecs []string) (mountRequests, error)
 		for _, field := range strings.Split(value, ",") {
 			key, raw, found := strings.Cut(field, "=")
 			if found && strings.TrimSpace(key) == "type" {
-				mountType = strings.TrimSpace(raw)
+				mountType = strings.ToLower(strings.TrimSpace(raw))
 				break
 			}
 		}
-		if mountType != "volume" {
+		switch mountType {
+		case "volume":
+			volume, err := parseManagedLongMount(value)
+			if err != nil {
+				return mountRequests{}, err
+			}
+			request.managed = append(request.managed, volume)
+		case "tmpfs", "proc", "procfs", "sysfs":
+			mount, err := parseFilesystemLongMount(value)
+			if err != nil {
+				return mountRequests{}, err
+			}
+			request.filesystem = append(request.filesystem, mount)
+		default:
 			hostMounts = append(hostMounts, value)
-			continue
 		}
-		volume, err := parseManagedLongMount(value)
-		if err != nil {
-			return mountRequests{}, err
-		}
-		request.managed = append(request.managed, volume)
 	}
 	var err error
 	request.host, err = parseHostMounts(hostVolumes, hostMounts)
@@ -581,6 +596,221 @@ func parseMountRequests(volumeSpecs, mountSpecs []string) (mountRequests, error)
 		return mountRequests{}, err
 	}
 	return request, nil
+}
+
+func parseTmpfsMount(value string) (ttosbundle.FilesystemMount, error) {
+	destination, rawOptions, hasOptions := strings.Cut(value, ":")
+	if destination == "" || (hasOptions && rawOptions == "") {
+		return ttosbundle.FilesystemMount{}, fmt.Errorf("invalid tmpfs specification %q; want CONTAINER[:OPTIONS]", value)
+	}
+	readonly := false
+	options := []string{}
+	if hasOptions {
+		for _, option := range strings.Split(rawOptions, ",") {
+			option = strings.TrimSpace(option)
+			key, raw, found := strings.Cut(option, "=")
+			if found {
+				if err := validateTmpfsDataOption(key, raw); err != nil {
+					return ttosbundle.FilesystemMount{}, fmt.Errorf("invalid tmpfs option %q in %q: %w", option, value, err)
+				}
+				options = append(options, option)
+				continue
+			}
+			switch key {
+			case "ro":
+				readonly = true
+			case "rw":
+				readonly = false
+			case "nosuid", "suid", "nodev", "dev", "exec", "noexec", "sync", "async", "dirsync", "atime", "noatime", "diratime", "nodiratime":
+				options = append(options, key)
+			default:
+				return ttosbundle.FilesystemMount{}, fmt.Errorf("unsupported tmpfs option %q in %q", option, value)
+			}
+		}
+	}
+	mount, err := normalizeFilesystemMount("tmpfs", destination, readonly, options)
+	if err != nil {
+		return ttosbundle.FilesystemMount{}, err
+	}
+	mount.HostConfig = true
+	mount.InspectOptions = rawOptions
+	return mount, nil
+}
+
+func validateTmpfsDataOption(key, value string) error {
+	switch key {
+	case "size":
+		return validateTmpfsAmount(value, true)
+	case "nr_inodes", "nr_blocks":
+		return validateTmpfsAmount(value, false)
+	case "mode":
+		_, err := normalizeTmpfsMode(value)
+		return err
+	case "uid", "gid":
+		if _, err := strconv.ParseUint(value, 10, 32); err != nil {
+			return fmt.Errorf("%s must be an unsigned 32-bit integer", key)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported data option %q", key)
+	}
+}
+
+func validateTmpfsAmount(value string, allowPercent bool) error {
+	if value == "" {
+		return errors.New("value must not be empty")
+	}
+	number := value
+	multiplier := uint64(1)
+	suffix := value[len(value)-1]
+	switch strings.ToLower(string(suffix)) {
+	case "k":
+		multiplier = 1 << 10
+	case "m":
+		multiplier = 1 << 20
+	case "g":
+		multiplier = 1 << 30
+	case "t":
+		multiplier = 1 << 40
+	case "p":
+		multiplier = 1 << 50
+	case "e":
+		multiplier = 1 << 60
+	case "%":
+		if !allowPercent {
+			return errors.New("percentages are supported only for size")
+		}
+		multiplier = 0
+	default:
+		suffix = 0
+	}
+	if suffix != 0 {
+		number = value[:len(value)-1]
+	}
+	parsed, err := strconv.ParseUint(number, 10, 64)
+	if err != nil {
+		return errors.New("value must be an unsigned integer with an optional k, m, g, t, p, e, or % suffix")
+	}
+	if multiplier != 0 && parsed > math.MaxUint64/multiplier {
+		return errors.New("value overflows uint64")
+	}
+	return nil
+}
+
+func normalizeTmpfsMode(value string) (string, error) {
+	parsed, err := strconv.ParseUint(strings.TrimPrefix(value, "0o"), 8, 16)
+	if err != nil || parsed > 07777 {
+		return "", fmt.Errorf("mode %q must be octal between 0000 and 7777", value)
+	}
+	return fmt.Sprintf("%04o", parsed), nil
+}
+
+func parseFilesystemLongMount(value string) (ttosbundle.FilesystemMount, error) {
+	mountType := ""
+	destination := ""
+	readonly := false
+	readonlySet := false
+	size := ""
+	mode := ""
+	seen := make(map[string]struct{})
+	for _, field := range strings.Split(value, ",") {
+		key, raw, found := strings.Cut(field, "=")
+		key = strings.TrimSpace(key)
+		if !found {
+			switch key {
+			case "ro", "readonly":
+				if _, ok := seen["readonly"]; ok {
+					return ttosbundle.FilesystemMount{}, fmt.Errorf("duplicate --mount field %q in %q", key, value)
+				}
+				seen["readonly"] = struct{}{}
+				readonly = true
+				readonlySet = true
+				continue
+			default:
+				return ttosbundle.FilesystemMount{}, fmt.Errorf("invalid --mount field %q in %q", field, value)
+			}
+		}
+		raw = strings.TrimSpace(raw)
+		canonical := key
+		switch key {
+		case "dst", "target":
+			canonical = "destination"
+		case "ro":
+			canonical = "readonly"
+		case "src":
+			canonical = "source"
+		}
+		if _, ok := seen[canonical]; ok {
+			return ttosbundle.FilesystemMount{}, fmt.Errorf("duplicate --mount field %q in %q", key, value)
+		}
+		seen[canonical] = struct{}{}
+		switch canonical {
+		case "type":
+			mountType = strings.ToLower(raw)
+		case "destination":
+			destination = raw
+		case "readonly":
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return ttosbundle.FilesystemMount{}, fmt.Errorf("invalid readonly value %q in %q", raw, value)
+			}
+			readonly = parsed
+			readonlySet = true
+		case "tmpfs-size":
+			size = raw
+		case "tmpfs-mode":
+			mode = raw
+		case "source":
+			return ttosbundle.FilesystemMount{}, fmt.Errorf("filesystem mount %q must not specify a source", value)
+		default:
+			return ttosbundle.FilesystemMount{}, fmt.Errorf("unsupported filesystem-mount field %q in %q", key, value)
+		}
+	}
+	if mountType == "procfs" {
+		mountType = "proc"
+	}
+	if mountType == "sysfs" && !readonlySet {
+		readonly = true
+	}
+	options := []string{}
+	if mountType == "tmpfs" {
+		if size != "" {
+			parsed, err := strconv.ParseUint(size, 10, 64)
+			if err != nil {
+				return ttosbundle.FilesystemMount{}, fmt.Errorf("tmpfs-size %q in %q must be an unsigned byte count", size, value)
+			}
+			options = append(options, "size="+strconv.FormatUint(parsed, 10))
+		}
+		if mode != "" {
+			normalized, err := normalizeTmpfsMode(mode)
+			if err != nil {
+				return ttosbundle.FilesystemMount{}, fmt.Errorf("invalid tmpfs-mode in %q: %w", value, err)
+			}
+			options = append(options, "mode="+normalized)
+		}
+	} else if size != "" || mode != "" {
+		return ttosbundle.FilesystemMount{}, fmt.Errorf("%s mount %q does not support tmpfs options", mountType, value)
+	} else {
+		options = []string{"nosuid", "nodev", "noexec"}
+	}
+	return normalizeFilesystemMount(mountType, destination, readonly, options)
+}
+
+func normalizeFilesystemMount(mountType, destination string, readonly bool, options []string) (ttosbundle.FilesystemMount, error) {
+	if mountType != "tmpfs" && mountType != "proc" && mountType != "sysfs" {
+		return ttosbundle.FilesystemMount{}, fmt.Errorf("unsupported filesystem mount type %q", mountType)
+	}
+	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
+		return ttosbundle.FilesystemMount{}, fmt.Errorf("%s mount destination %q must be an absolute non-root path", mountType, destination)
+	}
+	access := "rw"
+	if readonly {
+		access = "ro"
+	}
+	return ttosbundle.FilesystemMount{
+		Type: mountType, Destination: filepath.Clean(destination), Readonly: readonly,
+		Options: append([]string{access}, options...),
+	}, nil
 }
 
 func isHostMountSource(source string) bool {
@@ -863,6 +1093,7 @@ type runRequest struct {
 	networkMode        string
 	entrypoint         []string
 	hostMounts         []ttosbundle.HostMount
+	filesystemMounts   []ttosbundle.FilesystemMount
 	consoleLogMaxBytes int64
 	consoleLogMaxFiles int
 	managedVolumes     []ttosbundle.ManagedVolume
@@ -906,7 +1137,7 @@ type exitStatus struct{ code int }
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -933,10 +1164,11 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "label", "set container metadata KEY[=VALUE]")
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
-	var volumes, mounts stringSlice
+	var volumes, mounts, tmpfsMounts stringSlice
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
+	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
+	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	if err := fs.Parse(args); err != nil {
@@ -957,7 +1189,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
-	parsedMounts, err := parseMountRequests(volumes, mounts)
+	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
 		return err
 	}
@@ -981,6 +1213,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
+		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		consoleLogMaxBytes: logMaxBytes,
@@ -1011,7 +1244,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1036,10 +1269,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "label", "set container metadata KEY[=VALUE]")
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
-	var volumes, mounts stringSlice
+	var volumes, mounts, tmpfsMounts stringSlice
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "attach type=volume|bind,source=SOURCE,target=CONTAINER[,readonly]")
+	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
+	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	if err := fs.Parse(args); err != nil {
@@ -1060,7 +1294,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	parsedMounts, err := parseMountRequests(volumes, mounts)
+	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
 		return err
 	}
@@ -1084,6 +1318,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
+		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		consoleLogMaxBytes: logMaxBytes,
@@ -3286,18 +3521,19 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
-			Name:           request.name,
-			Args:           request.args,
-			Env:            request.env,
-			Labels:         request.labels,
-			Cwd:            request.cwd,
-			User:           request.user,
-			Hostname:       request.hostname,
-			Terminal:       request.terminal,
-			NetworkMode:    request.networkMode,
-			Entrypoint:     request.entrypoint,
-			ManagedVolumes: request.managedVolumes,
-			HostMounts:     request.hostMounts,
+			Name:             request.name,
+			Args:             request.args,
+			Env:              request.env,
+			Labels:           request.labels,
+			Cwd:              request.cwd,
+			User:             request.user,
+			Hostname:         request.hostname,
+			Terminal:         request.terminal,
+			NetworkMode:      request.networkMode,
+			Entrypoint:       request.entrypoint,
+			ManagedVolumes:   request.managedVolumes,
+			HostMounts:       request.hostMounts,
+			FilesystemMounts: request.filesystemMounts,
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
@@ -3324,18 +3560,19 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
-			Name:           request.name,
-			Args:           request.args,
-			Env:            request.env,
-			Labels:         request.labels,
-			Cwd:            request.cwd,
-			User:           request.user,
-			Hostname:       request.hostname,
-			Terminal:       request.terminal,
-			NetworkMode:    request.networkMode,
-			Entrypoint:     request.entrypoint,
-			HostMounts:     request.hostMounts,
-			ManagedVolumes: request.managedVolumes,
+			Name:             request.name,
+			Args:             request.args,
+			Env:              request.env,
+			Labels:           request.labels,
+			Cwd:              request.cwd,
+			User:             request.user,
+			Hostname:         request.hostname,
+			Terminal:         request.terminal,
+			NetworkMode:      request.networkMode,
+			Entrypoint:       request.entrypoint,
+			HostMounts:       request.hostMounts,
+			ManagedVolumes:   request.managedVolumes,
+			FilesystemMounts: request.filesystemMounts,
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
@@ -4413,12 +4650,17 @@ func inspectUser(user specs.User) string {
 	return strconv.FormatUint(uint64(user.UID), 10) + ":" + strconv.FormatUint(uint64(user.GID), 10)
 }
 
-func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struct{}) {
+func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struct{}, map[string]string) {
 	mounts := []InspectMount{}
 	binds := []string{}
 	volumes := make(map[string]struct{})
+	tmpfs := make(map[string]string)
 	if spec == nil {
-		return mounts, binds, volumes
+		return mounts, binds, volumes, tmpfs
+	}
+	dockerTmpfs := make(map[string]string)
+	if encoded := spec.Annotations[ttosbundle.TmpfsConfigAnnotation]; encoded != "" {
+		_ = json.Unmarshal([]byte(encoded), &dockerTmpfs)
 	}
 	for _, mount := range spec.Mounts {
 		readonly := false
@@ -4445,9 +4687,27 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 				Type: "volume", Name: name, Source: name, Destination: mount.Destination,
 				Driver: "local-tmpfs", Mode: mode, RW: !readonly,
 			})
+		case mount.Type == "tmpfs" && mount.Source == "tmpfs" && mount.Destination != "/dev":
+			if inspectOptions, ok := dockerTmpfs[mount.Destination]; ok {
+				tmpfs[mount.Destination] = inspectOptions
+			} else {
+				mounts = append(mounts, InspectMount{
+					Type: "tmpfs", Source: "", Destination: mount.Destination, RW: !readonly,
+				})
+			}
+		case mount.Type == "proc" && mount.Destination != "/proc":
+			mounts = append(mounts, InspectMount{
+				Type: "proc", Source: mount.Source, Destination: mount.Destination,
+				Mode: mode, RW: !readonly,
+			})
+		case mount.Type == "sysfs" && mount.Destination != "/sys":
+			mounts = append(mounts, InspectMount{
+				Type: "sysfs", Source: mount.Source, Destination: mount.Destination,
+				Mode: mode, RW: !readonly,
+			})
 		}
 	}
-	return mounts, binds, volumes
+	return mounts, binds, volumes, tmpfs
 }
 
 func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, family *Family, runtimeErr string) InspectInfo {
@@ -4489,7 +4749,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		path = process.Args[0]
 		args = append(args, process.Args[1:]...)
 	}
-	mounts, binds, volumes := inspectMounts(spec)
+	mounts, binds, volumes, tmpfs := inspectMounts(spec)
 	hostname := container.Name
 	configUser := inspectUser(process.User)
 	configCmd := append([]string(nil), process.Args...)
@@ -4542,7 +4802,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc", Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{

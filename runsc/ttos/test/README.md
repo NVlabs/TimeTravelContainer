@@ -24,6 +24,8 @@ covers:
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
 - BusyBox process/procfs/sysfs startup;
+- Docker-style custom tmpfs mode/size plus alternate private procfs and
+  restricted sysfs mounts, including inspect projection and restart retention;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
@@ -36,7 +38,8 @@ covers:
   `pause`, `resume`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, and JSON
   creation timestamps;
-- managed-volume copy-on-write isolation between a parent and child branch;
+- managed-volume and user tmpfs copy-on-write isolation between a parent and
+  child branch;
 - read-only host bind visibility and write rejection;
 - graceful stop, branch removal, container removal, and volume removal.
 

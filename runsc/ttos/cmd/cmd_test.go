@@ -523,7 +523,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -553,8 +553,40 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	if !reflect.DeepEqual(b.runRequest.managedVolumes, wantVolumes) {
 		t.Errorf("managed volumes=%+v, want %+v", b.runRequest.managedVolumes, wantVolumes)
 	}
+	wantFilesystems := []ttosbundle.FilesystemMount{
+		{Type: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}, HostConfig: true, InspectOptions: "mode=0700,size=1m"},
+		{Type: "tmpfs", Destination: "/worktmp", Options: []string{"rw", "size=2097152", "mode=0750"}},
+		{Type: "proc", Destination: "/alt-proc", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+		{Type: "sysfs", Destination: "/alt-sys", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+	}
+	if !reflect.DeepEqual(b.runRequest.filesystemMounts, wantFilesystems) {
+		t.Errorf("filesystem mounts=%+v, want %+v", b.runRequest.filesystemMounts, wantFilesystems)
+	}
 	if b.runRequest.consoleLogMaxBytes != 1572864 || b.runRequest.consoleLogMaxFiles != 4 {
 		t.Errorf("log retention=(%d, %d), want (1572864, 4)", b.runRequest.consoleLogMaxBytes, b.runRequest.consoleLogMaxFiles)
+	}
+}
+
+func TestParseTmpfsMountDockerOptions(t *testing.T) {
+	const value = "/data:ro,suid,dev,noexec,sync,dirsync,noatime,nodiratime,size=64m,mode=1770,uid=123,gid=456,nr_inodes=400k,nr_blocks=1024"
+	got, err := parseTmpfsMount(value)
+	if err != nil {
+		t.Fatalf("parseTmpfsMount: %v", err)
+	}
+	want := ttosbundle.FilesystemMount{
+		Type: "tmpfs", Destination: "/data", Readonly: true,
+		Options:    []string{"ro", "suid", "dev", "noexec", "sync", "dirsync", "noatime", "nodiratime", "size=64m", "mode=1770", "uid=123", "gid=456", "nr_inodes=400k", "nr_blocks=1024"},
+		HostConfig: true, InspectOptions: strings.TrimPrefix(value, "/data:"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mount=%+v, want %+v", got, want)
+	}
+	lastWins, err := parseTmpfsMount("/data:ro,rw")
+	if err != nil {
+		t.Fatalf("last access mode: %v", err)
+	}
+	if lastWins.Readonly || !reflect.DeepEqual(lastWins.Options, []string{"rw"}) {
+		t.Errorf("last access mode did not win: %+v", lastWins)
 	}
 }
 
@@ -689,6 +721,32 @@ func TestRunRejectsUnmanagedWritableMounts(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "-v", "/host:/data", "busybox"},
 		{"run", "--mount", "type=bind,source=/host,target=/data", "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
+	}
+}
+
+func TestRunRejectsInvalidFilesystemMounts(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--tmpfs", "relative", "busybox"},
+		{"run", "--tmpfs", "/scratch:mode=0899", "busybox"},
+		{"run", "--tmpfs", "/scratch:size=zero", "busybox"},
+		{"run", "--tmpfs", "/scratch:unknown", "busybox"},
+		{"run", "--mount", "type=tmpfs,target=/scratch,source=host", "busybox"},
+		{"run", "--mount", "type=proc,target=relative", "busybox"},
+		{"run", "--mount", "type=proc,target=/alt-proc,size=1m", "busybox"},
+		{"run", "--mount", "type=tmpfs,target=/scratch,tmpfs-size=2m", "busybox"},
+		{"run", "--tmpfs", "/scratch:uid=-1", "busybox"},
+		{"run", "--tmpfs", "/scratch:nr_blocks=10%", "busybox"},
+		{"run", "--mount", "type=sysfs,target=/alt-sys,readonly=maybe", "busybox"},
+		{"run", "--mount", "type=tmpfs,target=/scratch,target=/again", "busybox"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
@@ -1358,6 +1416,10 @@ func TestBuildInspectInfo(t *testing.T) {
 			{Type: "proc", Source: "proc", Destination: "/proc"},
 			{Type: "bind", Source: "/host/data", Destination: "/data", Options: []string{"rbind", "ro"}},
 			{Type: "tmpfs", Source: "ttos-volume-cache", Destination: "/cache", Options: []string{"rw"}},
+			{Type: "tmpfs", Source: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}},
+			{Type: "tmpfs", Source: "tmpfs", Destination: "/worktmp", Options: []string{"rw", "size=2097152", "mode=0750"}},
+			{Type: "proc", Source: "proc", Destination: "/alt-proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+			{Type: "sysfs", Source: "sysfs", Destination: "/alt-sys", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		},
 		Hostname: "custom-host",
 		Annotations: map[string]string{
@@ -1365,6 +1427,7 @@ func TestBuildInspectInfo(t *testing.T) {
 			"dev.timetravelos.config.cmd":        `["-c","sleep 10"]`,
 			"dev.timetravelos.config.user":       "app",
 			"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
+			"dev.timetravelos.config.tmpfs":      `{"/scratch":"mode=0700,size=1m"}`,
 		},
 	}
 	family := &Family{ID: containerID, Name: "demo", State: "running", SandboxPID: 4321, Branches: []Branch{
@@ -1384,11 +1447,14 @@ func TestBuildInspectInfo(t *testing.T) {
 	if !reflect.DeepEqual(info.Config.Entrypoint, []string{"/bin/sh"}) || !reflect.DeepEqual(info.Config.Cmd, []string{"-c", "sleep 10"}) || info.Config.Labels["suite"] != "ttos" {
 		t.Errorf("Docker config reconstruction=%+v", info.Config)
 	}
-	if len(info.Mounts) != 2 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Name != "cache" || !info.Mounts[1].RW {
+	if len(info.Mounts) != 5 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Name != "cache" || !info.Mounts[1].RW || info.Mounts[2].Type != "tmpfs" || !info.Mounts[2].RW || info.Mounts[3].Type != "proc" || info.Mounts[3].RW || info.Mounts[4].Type != "sysfs" || info.Mounts[4].RW {
 		t.Errorf("mounts=%+v", info.Mounts)
 	}
 	if got := info.HostConfig.Binds; !reflect.DeepEqual(got, []string{"/host/data:/data:ro"}) {
 		t.Errorf("binds=%q", got)
+	}
+	if got := info.HostConfig.Tmpfs["/scratch"]; got != "mode=0700,size=1m" {
+		t.Errorf("tmpfs inspect option=%q", got)
 	}
 	if !info.HostConfig.AutoRemove {
 		t.Error("inspect omitted auto-remove policy")

@@ -63,6 +63,11 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Env:        []string{"A=run", "B", "C=new"},
 		Labels:     map[string]string{"empty": "", "extra": "value", "suite": "run"},
 		HostMounts: []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
+		FilesystemMounts: []FilesystemMount{
+			{Type: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}, HostConfig: true, InspectOptions: "mode=0700,size=1m"},
+			{Type: "proc", Destination: "/alt-proc", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+			{Type: "sysfs", Destination: "/alt-sys", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+		},
 		ManagedVolumes: []ManagedVolume{
 			{Name: "cache", Destination: "/cache"},
 			{Name: "cache", Destination: "/cache-ro", Readonly: true},
@@ -89,6 +94,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		{Destination: "/scratch", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "mode=0700", "size=1m"}},
+		{Destination: "/alt-proc", Type: "proc", Source: "proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
+		{Destination: "/alt-sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		{Destination: "/mnt/fixture", Type: "bind", Source: host, Options: []string{"rbind", "ro"}},
 		{Destination: "/cache", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
 		{Destination: "/cache-ro", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"ro", "nosuid", "nodev", "mode=0755"}},
@@ -104,6 +112,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := spec.Annotations["dev.gvisor.spec.rootfs.type"]; got != "bind" {
 		t.Errorf("root type=%q, want bind", got)
+	}
+	if got := spec.Annotations[TmpfsConfigAnnotation]; got != `{"/scratch":"mode=0700,size=1m"}` {
+		t.Errorf("tmpfs configuration annotation=%q", got)
 	}
 	if got := spec.Annotations[ownership.Annotation]; got != ownership.ManifestPath(root) {
 		t.Errorf("ownership annotation=%q, want %q", got, ownership.ManifestPath(root))
@@ -193,6 +204,24 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "/data", Readonly: true}}, ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "/data"}}}); err == nil {
 		t.Error("BuildSpec accepted duplicate host/managed destination")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "ramfs", Destination: "/data"}}}); err == nil {
+		t.Error("BuildSpec accepted unsupported filesystem mount type")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "tmpfs", Destination: "relative"}}}); err == nil {
+		t.Error("BuildSpec accepted relative filesystem mount destination")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "tmpfs", Destination: "/data", Readonly: true, Options: []string{"rw"}}}}); err == nil {
+		t.Error("BuildSpec accepted a conflicting filesystem access option")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "tmpfs", Destination: "/data", Options: []string{"rw", "ro"}}}}); err == nil {
+		t.Error("BuildSpec accepted multiple filesystem access options")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "tmpfs", Destination: "/proc"}}}); err == nil {
+		t.Error("BuildSpec accepted a filesystem mount over a default destination")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "proc", Destination: "/alt-proc", HostConfig: true}}}); err == nil {
+		t.Error("BuildSpec accepted Docker tmpfs projection for procfs")
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), NetworkMode: "bridge"}); err == nil {
 		t.Error("BuildSpec accepted unsupported network mode")

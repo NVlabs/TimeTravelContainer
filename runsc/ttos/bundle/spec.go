@@ -28,7 +28,12 @@ import (
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
-const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+const (
+	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+	// TmpfsConfigAnnotation records Docker --tmpfs inspect configuration.
+	TmpfsConfigAnnotation = "dev.timetravelos.config.tmpfs"
+)
 
 var defaultCapabilities = []string{
 	"CAP_CHOWN",
@@ -49,19 +54,20 @@ var defaultCapabilities = []string{
 
 // SpecOptions contains user-facing overrides for an image's OCI configuration.
 type SpecOptions struct {
-	Name           string
-	RootFS         string
-	Args           []string
-	Env            []string
-	Labels         map[string]string
-	Cwd            string
-	User           string
-	Hostname       string
-	Terminal       bool
-	NetworkMode    string
-	Entrypoint     []string
-	HostMounts     []HostMount
-	ManagedVolumes []ManagedVolume
+	Name             string
+	RootFS           string
+	Args             []string
+	Env              []string
+	Labels           map[string]string
+	Cwd              string
+	User             string
+	Hostname         string
+	Terminal         bool
+	NetworkMode      string
+	Entrypoint       []string
+	HostMounts       []HostMount
+	ManagedVolumes   []ManagedVolume
+	FilesystemMounts []FilesystemMount
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind.
@@ -79,6 +85,16 @@ type ManagedVolume struct {
 	Name        string `json:"name"`
 	Destination string `json:"destination"`
 	Readonly    bool   `json:"readonly,omitempty"`
+}
+
+// FilesystemMount describes a Sentry-implemented tmpfs, procfs, or sysfs mount.
+type FilesystemMount struct {
+	Type           string   `json:"type"`
+	Destination    string   `json:"destination"`
+	Readonly       bool     `json:"readonly,omitempty"`
+	Options        []string `json:"options,omitempty"`
+	HostConfig     bool     `json:"host_config,omitempty"`
+	InspectOptions string   `json:"inspect_options,omitempty"`
 }
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
@@ -188,9 +204,50 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	annotations["dev.timetravelos.config.cmd"] = string(commandJSON)
 	annotations["dev.timetravelos.config.user"] = userSpec
 	annotations["dev.timetravelos.config.labels"] = string(labelsJSON)
-	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes))
+	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes)+len(opts.FilesystemMounts))
 	for _, mount := range mounts {
 		seenDestinations[mount.Destination] = struct{}{}
+	}
+	dockerTmpfs := make(map[string]string)
+	for _, mount := range opts.FilesystemMounts {
+		destination := filepath.Clean(mount.Destination)
+		if !filepath.IsAbs(destination) || destination == "/" {
+			return nil, fmt.Errorf("%s mount destination %q must be an absolute non-root path", mount.Type, mount.Destination)
+		}
+		if _, ok := seenDestinations[destination]; ok {
+			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+		}
+		seenDestinations[destination] = struct{}{}
+		mountType := mount.Type
+		source := mount.Type
+		switch mountType {
+		case "tmpfs", "proc", "sysfs":
+		default:
+			return nil, fmt.Errorf("unsupported filesystem mount type %q", mount.Type)
+		}
+		if mount.HostConfig {
+			if mountType != "tmpfs" {
+				return nil, fmt.Errorf("only tmpfs mounts can use Docker HostConfig projection")
+			}
+			dockerTmpfs[destination] = mount.InspectOptions
+		}
+		options, err := filesystemMountOptions(mount)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, specs.Mount{
+			Destination: destination,
+			Type:        mountType,
+			Source:      source,
+			Options:     options,
+		})
+	}
+	if len(dockerTmpfs) != 0 {
+		encoded, err := json.Marshal(dockerTmpfs)
+		if err != nil {
+			return nil, fmt.Errorf("encoding Docker tmpfs configuration: %w", err)
+		}
+		annotations[TmpfsConfigAnnotation] = string(encoded)
 	}
 	for _, mount := range opts.HostMounts {
 		if !mount.Readonly {
@@ -281,6 +338,31 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		Linux:       &specs.Linux{Namespaces: namespaces},
 		Annotations: annotations,
 	}, nil
+}
+
+func filesystemMountOptions(mount FilesystemMount) ([]string, error) {
+	options := append([]string(nil), mount.Options...)
+	wantAccess := "rw"
+	if mount.Readonly {
+		wantAccess = "ro"
+	}
+	accessIndex := -1
+	for i, option := range options {
+		if option != "ro" && option != "rw" {
+			continue
+		}
+		if accessIndex >= 0 {
+			return nil, fmt.Errorf("%s mount at %q specifies multiple access modes", mount.Type, mount.Destination)
+		}
+		accessIndex = i
+	}
+	if accessIndex < 0 {
+		return append([]string{wantAccess}, options...), nil
+	}
+	if options[accessIndex] != wantAccess {
+		return nil, fmt.Errorf("%s mount at %q has access option %q inconsistent with readonly=%t", mount.Type, mount.Destination, options[accessIndex], mount.Readonly)
+	}
+	return options, nil
 }
 
 func normalizeNetworkMode(mode string) (string, error) {

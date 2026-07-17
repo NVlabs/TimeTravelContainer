@@ -18,8 +18,11 @@ optional live-fork eligibility reports. Effective Docker entrypoint, command,
 user, and image labels are retained in the generated bundle for later
 inspection. Generated bundles include procfs, restricted read-only sysfs,
 tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
-`/dev/ptmx`. Existing host paths can be attached read-only with Docker-style
-`-v` or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
+`/dev/ptmx`. Docker-compatible `--tmpfs` and `--mount type=tmpfs` add arbitrary
+Sentry-owned tmpfs mounts with mode, size, and access options; TTOS extensions
+`--mount type=proc|procfs|sysfs` add alternate Sentry virtual-filesystem
+views. Existing host paths can be attached read-only with Docker-style `-v`
+or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
 more paths, and their state forks CoW with each live branch. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
@@ -155,6 +158,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
       the external host network stack.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
+- [x] Support Docker-compatible `--tmpfs DEST[:OPTIONS]` and
+      `--mount type=tmpfs,target=...` with read/write policy, octal mode, and
+      byte-size limits. Support TTOS extension mounts for alternate private
+      procfs and restricted sysfs views through
+      `--mount type=proc|procfs|sysfs,target=...`; persist all three through
+      create/start/restart/fork and project them through inspect.
 - [x] Support family-local named tmpfs volumes through `-v NAME:CONTAINER[:ro]`
       and `--mount type=volume,...`, including repeated aliases of one volume.
 - [ ] Add CPU, memory, process-count, and other resource-limit flags.
@@ -409,6 +418,10 @@ Reject            unsupported, externally mutable, or host/device-backed
 - [x] Admit a private devpts mount, verify `/dev/ptmx` follows the standard
       symlink into it, and verify an open internal PTY is cloned rather than
       shared across branches.
+- [x] Generate arbitrary user-requested tmpfs, procfs, and restricted sysfs
+      mounts from Docker-style CLI flags; verify mode/size, inspect projection,
+      restart persistence, fork eligibility, and parent/child tmpfs CoW with an
+      unmodified Alpine image.
 - [ ] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
       truncate, fallocate, and mount flags across branches.
 - [ ] Admit procfs only after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,

@@ -288,8 +288,11 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach \
   --log-opt max-size=64k --log-opt max-file=3 \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
+  --tmpfs /scratch:mode=0700,size=1m \
+  --mount type=proc,target=/alt-proc,readonly \
+  --mount type=sysfs,target=/alt-sys,readonly \
   "$ALPINE_IMAGE" sh -c \
-  'echo parent >/state/value; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+  'echo parent >/state/value; echo scratch-parent >/scratch/value; test -r /alt-proc/self/status; test -r /alt-sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
 container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
 LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
 LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
@@ -322,6 +325,10 @@ echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supple
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
+[ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
+[ "$(ttos exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
+ttos exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
+  fail "additional procfs/sysfs mounts were not readable"
 [ "$(ttos exec "$LIFECYCLE" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"
 if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
   fail "read-only host bind accepted a write"
@@ -342,6 +349,9 @@ ttos inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
 grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"
 grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
 grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch processes"
+grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
+grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
+grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
 FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
 echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"
 echo "$FORK_INSPECT" | grep -q 'child=true' || fail "inspect fork check omitted eligible child branch: $FORK_INSPECT"
@@ -356,6 +366,10 @@ ttos ps --filter branch=child --format json |
 ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
+
+ttos exec "$LIFECYCLE@child" sh -c "echo scratch-child >/scratch/value"
+[ "$(ttos exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "child write leaked into parent tmpfs"
+[ "$(ttos exec "$LIFECYCLE@child" cat /scratch/value)" = "scratch-child" ] || fail "child tmpfs write was not retained"
 
 ttos pause "$LIFECYCLE_PREFIX" "$LIFECYCLE_ID@child"
 PAUSED_INSPECT=$(ttos inspect -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$LIFECYCLE")
