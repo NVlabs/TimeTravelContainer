@@ -12,3 +12,13 @@ sh_binary(
         "manual",
     ],
 )
+
+# Manual because it pulls public images and starts a privileged, isolated
+# Docker-in-Docker daemon. The host Docker configuration is not modified.
+sh_binary(
+    name = "e2e_docker_main",
+    srcs = ["e2e_docker_main.sh"],
+    tags = [
+        "manual",
+    ],
+)

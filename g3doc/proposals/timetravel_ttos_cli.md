@@ -108,7 +108,11 @@ ttos CLI
 
 Docker Engine should remain an optional compatibility frontend, not the source
 of truth for TimeTravel branches. A future Docker integration may expose only
-the `main` branch and leave `ttos` responsible for branch operations.
+the `main` branch and leave `ttos` responsible for branch operations. The
+current `runsc install` path is retained for conventional main-only containers,
+but Docker and `ttos` must not concurrently mutate the same sandbox: Docker has
+no object or state representation for branch IDs, lineage, fork eligibility,
+branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ## Object and state model
 
@@ -732,11 +736,13 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 
 ## Docker and containerd compatibility
 
-- [ ] Keep `runsc install`/Docker operation working for the `main` branch where
-      possible.
-- [ ] Document that Docker cannot represent or control the TimeTravel branch
+- [x] Keep `runsc install`/Docker operation working for the `main` branch. The
+      isolated Docker compatibility matrix covers create, start, inspect, logs,
+      exec, pause, unpause, stop, and remove with the modified runtime.
+- [x] Document that Docker cannot represent or control the TimeTravel branch
       tree and that `ttos` remains the source of truth for forks.
-- [ ] Preserve the standard OCI runtime command surface for external managers.
+- [x] Preserve the standard OCI runtime command surface for external managers;
+      TimeTravel control remains an additive `runsc timetravel` subcommand.
 - [ ] Prototype a containerd shim extension or side-channel API for branch
       lifecycle without changing the standard task-v2 API.
 - [x] Keep the image target and its referenced content leased while any branch

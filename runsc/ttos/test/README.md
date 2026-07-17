@@ -161,3 +161,29 @@ A passing result is stronger than the unit suite: it proves image pulling,
 layer extraction, OCI generation, rootless runsc startup, versioned daemon
 transport and restart recovery, nontrivial userspace, console sidecars, and
 TimeTravel branch operations on the executing host.
+
+## Docker main-container compatibility
+
+`e2e_docker_main.sh` verifies that the TimeTravel-enabled `runsc` retains its
+standard OCI runtime surface. It starts an isolated privileged Docker-in-Docker
+daemon, uses `runsc install` to register `runsc-ttos`, and exercises Docker
+create, start, inspect, logs, exec, pause, unpause, stop, and remove against an
+unmodified image. It never changes the host daemon configuration.
+
+```shell
+bazel build //runsc:runsc //runsc/ttos/test:e2e_docker_main
+
+RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+  "$PWD/runsc/ttos/test/e2e_docker_main.sh"
+```
+
+The test requires Docker access, network access for image pulls, and permission
+to launch a privileged container. Override `DIND_IMAGE`, `TEST_IMAGE`, or
+`TEST_NAME` when needed.
+
+Docker sees one ordinary OCI container and can manage only its `main` process
+tree. It cannot represent TTOS branch IDs, lineage, branch-local filesystems,
+fork eligibility, or simultaneous branch lifecycle states. Do not use Docker
+and `ttos` concurrently to mutate the same sandbox. Use Docker compatibility
+for conventional main-only containers; use `ttos` as the sole source of truth
+for every container family that is live-forked.
