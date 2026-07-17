@@ -22,3 +22,12 @@ sh_binary(
         "manual",
     ],
 )
+
+# Hermetic registry integration: both the server and OCI guest are repository-built.
+sh_binary(
+    name = "e2e_local_registry",
+    srcs = ["e2e_local_registry.sh"],
+    tags = [
+        "manual",
+    ],
+)

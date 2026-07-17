@@ -692,8 +692,9 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       console integrity; configurable shared memory; supplementary groups and
       capabilities; Sentry-enforced PID limits; Docker ulimits across live fork;
       and the explicit no-userns fallback.
-- [ ] Add image pull/unpack tests using a local registry and no network-dependent
-      test fixtures.
+- [x] Add image pull and materialization tests using a hermetic local Registry V2
+      server and repository-built static OCI guest, with full-content cache reuse
+      and cached startup after the registry is stopped.
 
 ## `ttosd` and persistence
 

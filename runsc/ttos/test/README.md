@@ -187,3 +187,27 @@ fork eligibility, or simultaneous branch lifecycle states. Do not use Docker
 and `ttos` concurrently to mutate the same sandbox. Use Docker compatibility
 for conventional main-only containers; use `ttos` as the sole source of truth
 for every container family that is live-forked.
+
+## Hermetic local-registry integration
+
+`e2e_local_registry.sh` builds an OCI image around a static repository guest,
+serves it from a tiny localhost Registry V2 fixture, and verifies first-pull
+download accounting, second-pull content reuse, and `--pull=never` startup after
+the registry is stopped. It makes no public network request.
+
+```shell
+bazel build //runsc:runsc //runsc/ttos:ttos \
+  //runsc/ttos/test/registry_fixture:registry_fixture \
+  //runsc/ttos/test/registry_fixture/guest:guest \
+  //runsc/ttos/test:e2e_local_registry
+
+TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
+RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttos/test/registry_fixture/registry_fixture_/registry_fixture" \
+FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttos/test/registry_fixture/guest/guest_/guest" \
+CONTAINERD_ADDRESS=/path/to/containerd.sock \
+  "$PWD/runsc/ttos/test/e2e_local_registry.sh"
+```
+
+The same rootless prerequisite and trusted-workload
+`TTOS_UNSAFE_NO_HOST_ISOLATION=1` fallback as the image matrix apply.
