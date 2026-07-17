@@ -462,6 +462,13 @@ ttos fork "$QUOTA_CONTAINER" child
 ttos exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/child bs=4096 count=1 2>/dev/null"
 [ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "child write changed parent managed-volume usage"
 [ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "child managed-volume usage did not diverge"
+ttos volume export --output "$TTOS_E2E_ROOT/quota-parent.tar" "$QUOTA_CONTAINER" "$QUOTA_VOLUME" >/dev/null
+ttos volume export --output "$TTOS_E2E_ROOT/quota-child.tar" "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME" >/dev/null
+if tar -tf "$TTOS_E2E_ROOT/quota-parent.tar" | grep -qx './child'; then
+  fail "child-only file leaked into parent volume export"
+fi
+tar -tf "$TTOS_E2E_ROOT/quota-child.tar" | grep -qx './child' || fail "child volume export omitted child-only file"
+[ "$(tar -xOf "$TTOS_E2E_ROOT/quota-child.tar" ./child | wc -c)" -eq 4096 ] || fail "child volume export serialized incorrect file data"
 ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/parent bs=4096 count=1 2>/dev/null"
 [ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 65536 ] || fail "parent managed-volume usage did not advance independently"
 [ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "parent write changed child managed-volume usage"

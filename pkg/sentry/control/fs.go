@@ -116,6 +116,40 @@ func FilesystemWritableSize(k *kernel.Kernel, containerID, path string, out *Fil
 	return nil
 }
 
+// TarFilesystem writes the writable state of the filesystem containing path to
+// outFD. For tmpfs this is the complete tree; for OverlayFS it is the upper.
+func TarFilesystem(k *kernel.Kernel, containerID, path string, outFD *os.File) error {
+	f := Fs{Kernel: k}
+	ctx := k.SupervisorContext()
+	mntns, err := f.mountNamespaceForContainer(containerID)
+	if err != nil {
+		return err
+	}
+	defer mntns.DecRef(ctx)
+
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+	vd, err := k.VFS().GetDentryAt(ctx, auth.NewRootCredentials(k.RootUserNamespace()), &vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(path),
+		FollowFinalSymlink: true,
+	}, &vfs.GetDentryOptions{})
+	if err != nil {
+		return fmt.Errorf("resolving filesystem path %q: %w", path, err)
+	}
+	defer vd.DecRef(ctx)
+
+	serializer, ok := vd.Mount().Filesystem().Impl().(vfs.TarSerializer)
+	if !ok {
+		return fmt.Errorf("filesystem at %q does not support tar export", path)
+	}
+	if err := serializer.TarUpperLayer(ctx, outFD); err != nil {
+		return fmt.Errorf("exporting filesystem at %q: %w", path, err)
+	}
+	return nil
+}
+
 // TarRootfsUpperLayerOpts contains options for the TarRootfsUpperLayer RPC.
 type TarRootfsUpperLayerOpts struct {
 	// ContainerID identifies which container's rootfs upper layer should be

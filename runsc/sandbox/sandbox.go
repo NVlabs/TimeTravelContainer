@@ -2112,6 +2112,18 @@ func (s *Sandbox) BranchFilesystemSize(branchID, cid, path string) (control.File
 	return size, nil
 }
 
+// BranchFilesystemTar exports writable state for a mounted filesystem.
+func (s *Sandbox) BranchFilesystemTar(branchID, cid, path string, out *os.File) error {
+	args := &boot.BranchFilesystemTarArgs{
+		BranchID: branchID, CID: cid, Path: path,
+		FilePayload: urpc.FilePayload{Files: []*os.File{out}},
+	}
+	if err := s.call(boot.ContMgrBranchFilesystemTar, args, nil); err != nil {
+		return fmt.Errorf("exporting filesystem at %q in live branch %q: %w", path, branchID, err)
+	}
+	return nil
+}
+
 // SignalBranch sends a signal within one in-memory branch.
 func (s *Sandbox) SignalBranch(args *boot.BranchSignalArgs) error {
 	if err := s.call(boot.ContMgrBranchSignal, args, nil); err != nil {

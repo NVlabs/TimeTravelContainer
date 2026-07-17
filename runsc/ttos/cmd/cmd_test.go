@@ -1976,6 +1976,15 @@ func TestVolumeCommands(t *testing.T) {
 		t.Errorf("usage target=%+v name=%q inspect=%+v", b.volumeUsageTarget, b.volumeUsageName, inspected)
 	}
 
+	exportPath := filepath.Join(t.TempDir(), "cache.tar")
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "export", "--output", exportPath, "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume export status=%d stderr=%q", status, stderr.String())
+	}
+	if b.volumeExportTarget != (selector{container: "demo", branch: "child"}) || b.volumeExportName != "cache" || b.volumeExportPath != exportPath || stdout.String() != exportPath+"\n" {
+		t.Errorf("export target=%+v name=%q path=%q output=%q", b.volumeExportTarget, b.volumeExportName, b.volumeExportPath, stdout.String())
+	}
+
 	stdout.Reset()
 	if status := runCommand([]string{"volume", "rm", "cache"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("volume rm status=%d stderr=%q", status, stderr.String())
@@ -2419,6 +2428,10 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--path" ] && { [ "$5" = "/cache" ] || [ 
 	echo '{"writable_bytes":12288}'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "--path" ] && [ "$5" = "/cache" ] && [ "$6" = "--output" ] && [ "$8" = "web" ] && [ "$9" = "filesystem-tar" ] && [ "${10}" = "child" ]; then
+	printf fake-tar >"$7"
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "check" ] && [ "$6" = "child" ]; then
 	echo '{"eligible":true}'
 	exit 0
@@ -2488,6 +2501,13 @@ exit 2
 	}
 	if len(usage) != 2 || usage[0].Destination != "/cache" || usage[0].UsedBytes != 12288 || usage[0].QuotaBytes != 65536 || usage[0].Readonly || usage[1].Destination != "/cache-ro" || !usage[1].Readonly || usage[1].UsedBytes != 12288 {
 		t.Errorf("volumeUsage(child)=%+v", usage)
+	}
+	exportPath := filepath.Join(dir, "cache.tar")
+	if err := b.exportVolume(selector{container: "web", branch: "child"}, "cache", exportPath); err != nil {
+		t.Fatalf("exportVolume(child): %v", err)
+	}
+	if data, err := os.ReadFile(exportPath); err != nil || string(data) != "fake-tar" {
+		t.Fatalf("exported volume=(%q, %v), want fake-tar", data, err)
 	}
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"root":{"readonly":true}}`), 0600); err != nil {
 		t.Fatalf("writing read-only config: %v", err)
@@ -2936,13 +2956,16 @@ type fakeBackend struct {
 	execControlID     string
 	execControlSignal int
 
-	volumes           []ttosbundle.VolumeInfo
-	ensuredVolume     string
-	volumeQuota       int64
-	removedVolume     string
-	volumeUsageTarget selector
-	volumeUsageName   string
-	volumeUsageResult []ttosbundle.VolumeUsage
+	volumes            []ttosbundle.VolumeInfo
+	ensuredVolume      string
+	volumeQuota        int64
+	removedVolume      string
+	volumeUsageTarget  selector
+	volumeUsageName    string
+	volumeUsageResult  []ttosbundle.VolumeUsage
+	volumeExportTarget selector
+	volumeExportName   string
+	volumeExportPath   string
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3150,6 +3173,13 @@ func (b *fakeBackend) volumeUsage(target selector, name string) ([]ttosbundle.Vo
 	b.volumeUsageTarget = target
 	b.volumeUsageName = name
 	return append([]ttosbundle.VolumeUsage(nil), b.volumeUsageResult...), b.err
+}
+
+func (b *fakeBackend) exportVolume(target selector, name, outputPath string) error {
+	b.volumeExportTarget = target
+	b.volumeExportName = name
+	b.volumeExportPath = outputPath
+	return b.err
 }
 
 func (b *fakeBackend) removeVolume(name string) error {

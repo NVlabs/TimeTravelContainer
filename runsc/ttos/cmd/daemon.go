@@ -469,7 +469,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	case "branch":
 		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
 	case "volume":
-		return len(args) > 1 && (args[1] == "create" || args[1] == "rm" || args[1] == "remove")
+		return len(args) > 1 && (args[1] == "create" || args[1] == "export" || args[1] == "rm" || args[1] == "remove")
 	default:
 		return false
 	}

@@ -121,6 +121,9 @@ const (
 	// ContMgrBranchFilesystemSize gets writable usage for a mounted filesystem.
 	ContMgrBranchFilesystemSize = "containerManager.BranchFilesystemSize"
 
+	// ContMgrBranchFilesystemTar exports one branch-local mounted filesystem.
+	ContMgrBranchFilesystemTar = "containerManager.BranchFilesystemTar"
+
 	// ContMgrBranchSignal sends a signal within one in-memory branch.
 	ContMgrBranchSignal = "containerManager.BranchSignal"
 
@@ -1024,6 +1027,16 @@ func (cm *containerManager) BranchRootfsSize(args *BranchRootfsSizeArgs, out *co
 // BranchFilesystemSize returns writable filesystem usage from one branch.
 func (cm *containerManager) BranchFilesystemSize(args *BranchFilesystemSizeArgs, out *control.FilesystemSize) error {
 	return cm.l.family.FilesystemSize(args.BranchID, args.CID, args.Path, out)
+}
+
+// BranchFilesystemTar exports a mounted filesystem from one branch.
+func (cm *containerManager) BranchFilesystemTar(args *BranchFilesystemTarArgs, _ *struct{}) error {
+	if args == nil || len(args.Files) != 1 {
+		return fmt.Errorf("filesystem tar export requires one output file")
+	}
+	out := args.Files[0]
+	defer out.Close()
+	return cm.l.family.FilesystemTar(args.BranchID, args.CID, args.Path, out)
 }
 
 // BranchSignal sends a signal within one branch.

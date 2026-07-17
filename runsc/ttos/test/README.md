@@ -91,8 +91,9 @@ covers:
   through parent, child, and grandchild with branch-local signal/wait status;
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
   child branch, including persisted `volume create --opt size=BYTES` quotas and
-  independent quota enforcement after live fork, plus `volume inspect --usage
-  CONTAINER[@BRANCH]` assertions for branch-local logical-byte divergence;
+  independent quota enforcement after live fork, `volume inspect --usage
+  CONTAINER[@BRANCH]` assertions for branch-local logical-byte divergence, and
+  branch-selected `volume export` tar isolation;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

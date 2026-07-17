@@ -3869,7 +3869,7 @@ func parseVolumeQuotaOptions(options []string) (int64, error) {
 
 func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttos volume create|ls|inspect|rm [OPTIONS]")
+		return errors.New("usage: ttos volume create|ls|inspect|export|rm [OPTIONS]")
 	}
 	switch args[0] {
 	case "create":
@@ -3971,6 +3971,29 @@ func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(volumes)
+	case "export":
+		fs := flag.NewFlagSet("volume export", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		outputPath := fs.String("output", "", "absolute host path for the tar archive")
+		fs.StringVar(outputPath, "o", "", "absolute host path for the tar archive")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 || *outputPath == "" {
+			return errors.New("usage: ttos volume export --output PATH CONTAINER[@BRANCH] VOLUME")
+		}
+		if !filepath.IsAbs(*outputPath) {
+			return fmt.Errorf("volume export output path %q must be absolute", *outputPath)
+		}
+		target, err := parseSelector(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		if err := backend.exportVolume(target, fs.Arg(1), filepath.Clean(*outputPath)); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, filepath.Clean(*outputPath))
+		return nil
 	case "rm", "remove":
 		if len(args) < 2 {
 			return errors.New("usage: ttos volume rm VOLUME [VOLUME...]")
@@ -4220,6 +4243,7 @@ type backend interface {
 	listVolumes() ([]ttosbundle.VolumeInfo, error)
 	inspectVolume(name string) (ttosbundle.VolumeInfo, error)
 	volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error)
+	exportVolume(target selector, name, outputPath string) error
 	removeVolume(name string) error
 }
 
@@ -6523,6 +6547,45 @@ func (b *runtimeBackend) volumeUsage(target selector, name string) ([]ttosbundle
 	}
 	sort.Slice(usages, func(i, j int) bool { return usages[i].Destination < usages[j].Destination })
 	return usages, nil
+}
+
+func (b *runtimeBackend) exportVolume(target selector, name, outputPath string) error {
+	resolved, container, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	var destination string
+	for _, attachment := range container.Volumes {
+		if attachment.Name == name {
+			destination = attachment.Destination
+			break
+		}
+	}
+	if destination == "" {
+		return fmt.Errorf("volume %q is not attached to %s", name, target)
+	}
+
+	dir := filepath.Dir(outputPath)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(outputPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary volume export: %w", err)
+	}
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("closing temporary volume export: %w", err)
+	}
+	defer os.Remove(tempPath)
+	if _, err := b.command(
+		"timetravel", "--path", destination, "--output", tempPath,
+		resolved.container, "filesystem-tar", resolved.branch,
+	); err != nil {
+		return fmt.Errorf("exporting volume %q from %s: %w", name, target, err)
+	}
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		return fmt.Errorf("publishing volume export %q: %w", outputPath, err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) removeVolume(name string) error {

@@ -624,8 +624,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       data.
 - [ ] Retain managed-volume contents across sandbox-family teardown. The first
       slice persists metadata only; contents remain entirely in Sentry memory.
-- [ ] Add export/commit of a selected branch's managed volume without making
+- [x] Add tar export of a selected branch's managed volume without making
       disk checkpointing part of live fork.
+- [ ] Add commit/import of a selected export as the persistent seed for a new
+      sandbox family.
 
 ## Image and storage backend
 
