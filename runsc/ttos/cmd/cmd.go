@@ -2262,11 +2262,15 @@ type InspectGraphDriver struct {
 
 // InspectBranch enriches stable lineage metadata with observational live state.
 type InspectBranch struct {
-	Metadata        Branch           `json:"metadata"`
-	Processes       []ProcessInfo    `json:"processes,omitempty"`
-	ProcessError    string           `json:"process_error,omitempty"`
-	ForkEligibility *ForkEligibility `json:"fork_eligibility,omitempty"`
-	ForkCheckError  string           `json:"fork_check_error,omitempty"`
+	Metadata                 Branch                                `json:"metadata"`
+	Processes                []ProcessInfo                         `json:"processes,omitempty"`
+	ProcessError             string                                `json:"process_error,omitempty"`
+	OutputRetention          *ttosconsole.RetentionStats           `json:"output_retention,omitempty"`
+	OutputRetentionError     string                                `json:"output_retention_error,omitempty"`
+	ExecOutputRetention      map[string]ttosconsole.RetentionStats `json:"exec_output_retention,omitempty"`
+	ExecOutputRetentionError string                                `json:"exec_output_retention_error,omitempty"`
+	ForkEligibility          *ForkEligibility                      `json:"fork_eligibility,omitempty"`
+	ForkCheckError           string                                `json:"fork_check_error,omitempty"`
 }
 
 // TTOSInspectInfo contains state with no direct Docker analogue.
@@ -5139,6 +5143,9 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		return ttosbundle.ConsolePaths{}, err
 	}
 	if reset {
+		if err := os.Remove(paths.RetentionStats); err != nil && !os.IsNotExist(err) {
+			return ttosbundle.ConsolePaths{}, fmt.Errorf("removing stale console retention stats: %w", err)
+		}
 		if err := os.Remove(paths.WaitStatus); err != nil && !os.IsNotExist(err) {
 			return ttosbundle.ConsolePaths{}, fmt.Errorf("removing stale console wait status: %w", err)
 		}
@@ -5185,6 +5192,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
 		"--console-log-max-files", strconv.Itoa(maxFiles),
 		"--console-wait-status", paths.WaitStatus,
+		"--console-retention-stats", paths.RetentionStats,
 		"--console-ready-fd", "4",
 	}
 	if execID != "" {
@@ -5680,6 +5688,24 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
 	for i := range result.TTOS.Branches {
 		branch := &result.TTOS.Branches[i]
+		paths, retentionErr := store.BranchConsolePaths(containerInfo.ID, branch.Metadata.ID)
+		if retentionErr == nil {
+			stats, statsErr := ttosconsole.ReadRetentionStats(paths.RetentionStats)
+			if statsErr != nil {
+				retentionErr = statsErr
+			} else if stats.EvictedGenerations != 0 || stats.EvictedBytes != 0 {
+				branch.OutputRetention = &stats
+			}
+		}
+		if retentionErr != nil {
+			branch.OutputRetentionError = retentionErr.Error()
+		}
+		execStats, execRetentionErr := store.ListExecConsoleRetentionStats(containerInfo.ID, branch.Metadata.ID)
+		if execRetentionErr != nil {
+			branch.ExecOutputRetentionError = execRetentionErr.Error()
+		} else {
+			branch.ExecOutputRetention = execStats
+		}
 		if branch.Metadata.State != "running" && branch.Metadata.State != "paused" {
 			continue
 		}

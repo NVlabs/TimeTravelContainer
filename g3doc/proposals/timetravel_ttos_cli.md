@@ -387,8 +387,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
       readers follow inode replacement without duplicating frames.
 - [x] Make retention size and generation count configurable, persist the
       settings per container, and report when a reader falls behind retention.
-- [ ] Define explicit output backpressure policy and surface cumulative
-      truncation counters through inspect/events.
+- [x] Define explicit output backpressure policy: the sole sidecar never drops
+      live frames, so a stalled host log eventually backpressures guest writers;
+      only complete historical generations are evicted by bounded retention.
+      Persist cumulative encoded bytes and generation counts for init and managed
+      exec consoles, expose them in `inspect` per branch/exec, and attach the
+      relevant snapshot to daemon lifecycle, logs, inspect, attach, and exec events.
 - [x] Bound daemon-side queued stdin to a 1 MiB credit window. API v2
       acknowledges bytes only after the guest pipe accepts them, so resize and
       other control frames remain responsive while a slow guest backpressures

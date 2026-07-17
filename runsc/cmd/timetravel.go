@@ -43,25 +43,26 @@ import (
 // TimeTravel controls experimental in-memory sandbox branches.
 type TimeTravel struct {
 	containerLoader
-	source            string
-	paused            bool
-	pid               int
-	execID            string
-	signal            int
-	all               bool
-	consoleID         string
-	consoleStream     string
-	consoleMaxBytes   int
-	consoleData       string
-	consoleRows       int
-	consoleCols       int
-	consoleXPixels    int
-	consoleYPixels    int
-	consoleLog        string
-	consoleReadyFD    int
-	consoleWaitStatus string
-	consoleLogMax     int64
-	consoleLogFiles   int
+	source                string
+	paused                bool
+	pid                   int
+	execID                string
+	signal                int
+	all                   bool
+	consoleID             string
+	consoleStream         string
+	consoleMaxBytes       int
+	consoleData           string
+	consoleRows           int
+	consoleCols           int
+	consoleXPixels        int
+	consoleYPixels        int
+	consoleLog            string
+	consoleReadyFD        int
+	consoleWaitStatus     string
+	consoleRetentionStats string
+	consoleLogMax         int64
+	consoleLogFiles       int
 }
 
 // Name implements subcommands.Command.Name.
@@ -102,6 +103,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
 	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled after console-follow connects")
 	f.StringVar(&t.consoleWaitStatus, "console-wait-status", "", "host path where console-follow atomically records init wait status")
+	f.StringVar(&t.consoleRetentionStats, "console-retention-stats", "", "host path for cumulative console retention accounting")
 	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
 }
@@ -261,7 +263,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		var writer io.Writer = &util.Writer{}
 		var logWriter *ttosconsole.RotatingWriter
 		if t.consoleLog != "" {
-			logWriter, err = ttosconsole.NewRotatingWriterWithFiles(t.consoleLog, t.consoleLogMax, t.consoleLogFiles)
+			logWriter, err = ttosconsole.NewRotatingWriterWithStats(t.consoleLog, t.consoleLogMax, t.consoleLogFiles, t.consoleRetentionStats)
 			if err != nil {
 				break
 			}

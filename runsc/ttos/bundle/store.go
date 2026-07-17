@@ -31,6 +31,7 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 	"gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
@@ -285,11 +286,12 @@ func ensureNetworkMountpoints(rootfs string) error {
 // ConsolePaths are persistent host-side files for one branch-local console.
 // None of these files are donated into the sandbox.
 type ConsolePaths struct {
-	Log        string
-	Lock       string
-	StdinLock  string
-	Error      string
-	WaitStatus string
+	Log            string
+	Lock           string
+	StdinLock      string
+	Error          string
+	WaitStatus     string
+	RetentionStats string
 }
 
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
@@ -979,11 +981,12 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	}
 	base := filepath.Join(dir, branch)
 	return ConsolePaths{
-		Log:        base + ".log",
-		Lock:       base + ".lock",
-		StdinLock:  base + ".stdin.lock",
-		Error:      base + ".error.log",
-		WaitStatus: base + ".wait-status",
+		Log:            base + ".log",
+		Lock:           base + ".lock",
+		StdinLock:      base + ".stdin.lock",
+		Error:          base + ".error.log",
+		WaitStatus:     base + ".wait-status",
+		RetentionStats: ttosconsole.RetentionStatsPath(base + ".log"),
 	}, nil
 }
 
@@ -1009,12 +1012,57 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	}
 	base := filepath.Join(dir, execID)
 	return ConsolePaths{
-		Log:        base + ".log",
-		Lock:       base + ".lock",
-		StdinLock:  base + ".stdin.lock",
-		Error:      base + ".error.log",
-		WaitStatus: base + ".wait-status",
+		Log:            base + ".log",
+		Lock:           base + ".lock",
+		StdinLock:      base + ".stdin.lock",
+		Error:          base + ".error.log",
+		WaitStatus:     base + ".wait-status",
+		RetentionStats: ttosconsole.RetentionStatsPath(base + ".log"),
 	}, nil
+}
+
+// ListExecConsoleRetentionStats returns non-zero cumulative retention counters by exec ID.
+func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[string]ttosconsole.RetentionStats, error) {
+	if err := validateName(container); err != nil {
+		return nil, err
+	}
+	if err := validateObjectName("branch", branch); err != nil {
+		return nil, err
+	}
+	info, err := s.LoadContainer(container)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(s.Root, "containers", info.ID, "console", "exec", branch)
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing exec console retention for %q: %w", container, err)
+	}
+	const suffix = ".log.retention.json"
+	statsByExec := make(map[string]ttosconsole.RetentionStats)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+			continue
+		}
+		execID := strings.TrimSuffix(entry.Name(), suffix)
+		if err := validateObjectName("exec session", execID); err != nil {
+			continue
+		}
+		stats, err := ttosconsole.ReadRetentionStats(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("reading exec console retention for %q: %w", execID, err)
+		}
+		if stats.EvictedBytes != 0 || stats.EvictedGenerations != 0 {
+			statsByExec[execID] = stats
+		}
+	}
+	if len(statsByExec) == 0 {
+		return nil, nil
+	}
+	return statsByExec, nil
 }
 
 // CreateVolume creates metadata for a family-local managed tmpfs volume.

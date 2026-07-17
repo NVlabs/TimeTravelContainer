@@ -15,6 +15,7 @@
 package console
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -117,6 +118,51 @@ func TestRotatingWriterSingleFile(t *testing.T) {
 	}
 	if got, want := readFrameStrings(t, path), []string{"new"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("current frames=%q, want %q", got, want)
+	}
+}
+
+func TestRotatingWriterPersistsEvictionStats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console.log")
+	statsPath := RetentionStatsPath(path)
+	var encoded bytes.Buffer
+	if err := WriteFrame(&encoded, StreamStdout, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewRotatingWriterWithStats(path, 10, 2, statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"one", "two", "three"} {
+		if err := WriteFrame(w, StreamStdout, []byte(value)); err != nil {
+			t.Fatalf("WriteFrame(%q): %v", value, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := ReadRetentionStats(statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.EvictedGenerations != 1 || stats.EvictedBytes != int64(encoded.Len()) || stats.UpdatedAt.IsZero() {
+		t.Fatalf("stats=%+v, want one generation and %d bytes", stats, encoded.Len())
+	}
+	w, err = NewRotatingWriterWithStats(path, 10, 2, statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFrame(w, StreamStdout, []byte("four")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = ReadRetentionStats(statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.EvictedGenerations != 2 || stats.EvictedBytes <= int64(encoded.Len()) {
+		t.Fatalf("reopened stats=%+v, want cumulative eviction", stats)
 	}
 }
 

@@ -22,8 +22,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
+	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 )
 
 const daemonEventSchemaVersion = 1
@@ -58,7 +62,50 @@ func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, statu
 		return
 	}
 	for _, event := range commandEvents(args, status) {
+		s.enrichConsoleRetentionEvent(dataRoot, &event)
 		s.recordEvent(dataRoot, event)
+	}
+}
+
+func (s *daemonServer) enrichConsoleRetentionEvent(dataRoot string, event *DaemonEvent) {
+	if event.Subject == "" {
+		return
+	}
+	var target selector
+	var execID string
+	var err error
+	if event.Type == "exec" && strings.Contains(event.Subject, ":") {
+		var execTarget execSelector
+		execTarget, err = parseExecSelector(event.Subject)
+		target = execTarget.target
+		execID = execTarget.execID
+	} else {
+		target, err = parseSelector(event.Subject)
+	}
+	if err != nil {
+		return
+	}
+	store := ttosbundle.Store{Root: dataRoot}
+	var paths ttosbundle.ConsolePaths
+	if execID == "" {
+		paths, err = store.BranchConsolePaths(target.container, target.branch)
+	} else {
+		paths, err = store.ExecConsolePaths(target.container, target.branch, execID)
+	}
+	if err != nil {
+		return
+	}
+	stats, err := ttosconsole.ReadRetentionStats(paths.RetentionStats)
+	if err != nil || (stats.EvictedBytes == 0 && stats.EvictedGenerations == 0) {
+		return
+	}
+	if event.Attributes == nil {
+		event.Attributes = make(map[string]string)
+	}
+	event.Attributes["output_evicted_bytes"] = strconv.FormatInt(stats.EvictedBytes, 10)
+	event.Attributes["output_evicted_generations"] = strconv.FormatUint(stats.EvictedGenerations, 10)
+	if !stats.UpdatedAt.IsZero() {
+		event.Attributes["output_retention_updated_at"] = stats.UpdatedAt.Format(time.RFC3339Nano)
 	}
 }
 
@@ -117,13 +164,17 @@ func commandEvents(args []string, status int) []DaemonEvent {
 		event.Type = "image"
 		event.Action = command
 		event.Subject = lastNonFlag(rest)
-	case "create", "run", "start", "restart", "stop", "kill", "wait", "rm":
+	case "create", "run", "start", "restart", "stop", "kill", "wait", "rm", "logs", "inspect":
 		event.Type = "container"
 		event.Action = command
 		if command == "wait" || command == "rm" {
 			event.Action = map[string]string{"wait": "exit", "rm": "destroy"}[command]
 		}
-		event.Subject = lifecycleTarget(command, rest)
+		if command == "logs" || command == "inspect" {
+			event.Subject = lastNonFlag(rest)
+		} else {
+			event.Subject = lifecycleTarget(command, rest)
+		}
 		if command == "stop" {
 			exitEvent := event
 			exitEvent.Action = "exit"

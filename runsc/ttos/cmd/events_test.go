@@ -17,9 +17,13 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	ttosbundle "gvisor.dev/gvisor/runsc/ttos/bundle"
 )
 
 func TestCommandEventsClassifyManagerOperations(t *testing.T) {
@@ -35,6 +39,7 @@ func TestCommandEventsClassifyManagerOperations(t *testing.T) {
 		{[]string{"exec", "kill", "--signal", "TERM", "demo@child:exec-one"}, "exec", "kill", "demo@child:exec-one"},
 		{[]string{"container", "unpause", "demo@child"}, "branch", "resume", "demo@child"},
 		{[]string{"run", "--name", "web", "nginx"}, "container", "run", "web"},
+		{[]string{"logs", "--tail", "10", "demo"}, "container", "logs", "demo"},
 	} {
 		events := commandEvents(test.args, 0)
 		if len(events) != 1 {
@@ -48,6 +53,54 @@ func TestCommandEventsClassifyManagerOperations(t *testing.T) {
 		if strings.Contains(string(data), "SECRET") {
 			t.Errorf("event leaked command environment: %s", data)
 		}
+	}
+}
+
+func TestDaemonEventIncludesOutputRetentionSnapshot(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(containerDir, "console"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{ID: "demo", Name: "demo", BundleDir: bundleDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := (ttosbundle.Store{Root: root}).BranchConsolePaths("demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statsPath := paths.RetentionStats
+	if err := os.WriteFile(statsPath, []byte(`{"evicted_bytes":99,"evicted_generations":3}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{}
+	event := DaemonEvent{Type: "container", Action: "logs", Subject: "demo"}
+	server.enrichConsoleRetentionEvent(root, &event)
+	if event.Attributes["output_evicted_bytes"] != "99" || event.Attributes["output_evicted_generations"] != "3" {
+		t.Fatalf("retention event attributes=%v", event.Attributes)
+	}
+	execPaths, err := (ttosbundle.Store{Root: root}).ExecConsolePaths("demo", "main", "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(execPaths.RetentionStats, []byte(`{"evicted_bytes":17,"evicted_generations":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	execEvent := DaemonEvent{Type: "exec", Action: "exit", Subject: "demo@main:job"}
+	server.enrichConsoleRetentionEvent(root, &execEvent)
+	if execEvent.Attributes["output_evicted_bytes"] != "17" || execEvent.Attributes["output_evicted_generations"] != "1" {
+		t.Fatalf("exec retention event attributes=%v", execEvent.Attributes)
 	}
 }
 

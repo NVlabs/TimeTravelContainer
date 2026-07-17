@@ -83,6 +83,7 @@ AUTO_FOREGROUND="$PREFIX-auto-foreground"
 AUTO_DETACHED="$PREFIX-auto-detached"
 AUTO_CREATED="$PREFIX-auto-created"
 CONSOLE_STRESS="$PREFIX-console-stress"
+RETENTION="$PREFIX-retention"
 NOLOG="$PREFIX-nolog"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
@@ -116,7 +117,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -406,6 +407,20 @@ EXPECTED_B=$( \
 [ "$(sha256sum "$STRESS_LOG_STDOUT" | awk '{print $1}')" = "$EXPECTED_A" ] || fail "persisted stdout content changed"
 [ "$(sed '/^ttos: warning:/d' "$STRESS_LOG_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "persisted stderr content changed"
 ttos rm "$CONSOLE_STRESS"
+
+echo "== bounded log retention accounting =="
+ttos run --name "$RETENTION" --detach --log-opt max-size=128 --log-opt max-file=1 "$PYTHON_IMAGE" python3 -c 'import sys,time; [(sys.stdout.write("X"*96+"\n"),sys.stdout.flush(),time.sleep(0.02)) for _ in range(8)]' >/dev/null
+ttos wait "$RETENTION" >/dev/null
+RETENTION_INSPECT="$TTOS_E2E_ROOT/retention-inspect.json"
+ttos inspect "$RETENTION" >"$RETENTION_INSPECT"
+grep -Eq '"evicted_bytes": [1-9][0-9]*' "$RETENTION_INSPECT" || fail "inspect omitted evicted output bytes"
+grep -Eq '"evicted_generations": [1-9][0-9]*' "$RETENTION_INSPECT" || fail "inspect omitted evicted output generations"
+ttos logs "$RETENTION" >/dev/null
+RETENTION_EVENTS="$TTOS_E2E_ROOT/retention-events.jsonl"
+ttos events --json --filter action=logs >"$RETENTION_EVENTS"
+grep -q "\"subject\":\"$RETENTION\"" "$RETENTION_EVENTS" || fail "events omitted retention log subject"
+grep -q '"output_evicted_bytes":"' "$RETENTION_EVENTS" || fail "events omitted output eviction snapshot"
+ttos rm "$RETENTION"
 
 echo "== explicit logging drivers =="
 ttos create --name "$NOLOG" --log-driver none "$BUSYBOX_IMAGE" sh -c "echo hidden" >/dev/null

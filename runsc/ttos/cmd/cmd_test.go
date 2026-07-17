@@ -2225,7 +2225,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-ready-fd" ] && [ "${15}" = "4" ] && [ "${16}" = "web" ] && [ "${17}" = "console-follow" ] && [ "${18}" = "child" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-retention-stats" ] && [ "${16}" = "--console-ready-fd" ] && [ "${17}" = "4" ] && [ "${18}" = "web" ] && [ "${19}" = "console-follow" ] && [ "${20}" = "child" ]; then
 	touch "$0.retention"
 	printf 1 >&4
 	exit 0
@@ -2278,6 +2278,10 @@ exit 2
 	if err := os.MkdirAll(consoleDir, 0700); err != nil {
 		t.Fatalf("creating console directory: %v", err)
 	}
+	retentionData := []byte(`{"evicted_bytes":1234,"evicted_generations":2,"updated_at":"2026-07-17T00:00:00Z"}`)
+	if err := os.WriteFile(ttosconsole.RetentionStatsPath(filepath.Join(consoleDir, "main.log")), retentionData, 0600); err != nil {
+		t.Fatalf("writing retention stats: %v", err)
+	}
 	staleRotatedLog := filepath.Join(consoleDir, "child.log"+ttosconsole.RotatedSuffix)
 	if err := os.WriteFile(staleRotatedLog, []byte("stale"), 0600); err != nil {
 		t.Fatalf("writing stale rotated log: %v", err)
@@ -2298,7 +2302,7 @@ exit 2
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}
-	if inspected.State.Status != "running" || inspected.State.Pid != 4321 || len(inspected.TTOS.Branches) != 1 || len(inspected.TTOS.Branches[0].Processes) != 1 || inspected.TTOS.Branches[0].Processes[0].PID != 1 {
+	if inspected.State.Status != "running" || inspected.State.Pid != 4321 || len(inspected.TTOS.Branches) != 1 || len(inspected.TTOS.Branches[0].Processes) != 1 || inspected.TTOS.Branches[0].Processes[0].PID != 1 || inspected.TTOS.Branches[0].OutputRetention == nil || inspected.TTOS.Branches[0].OutputRetention.EvictedBytes != 1234 {
 		t.Errorf("runtime-enriched inspect=%+v", inspected)
 	}
 	child, err := b.fork(selector{container: "web", branch: "main"}, "child", true)
