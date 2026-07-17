@@ -762,7 +762,7 @@ ttos pause "$LIFECYCLE_PREFIX" "$LIFECYCLE_ID@child"
 PAUSED_INSPECT=$(ttos inspect -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$LIFECYCLE")
 echo "$PAUSED_INSPECT" | grep -q 'main=paused' || fail "inspect did not report paused main branch: $PAUSED_INSPECT"
 echo "$PAUSED_INSPECT" | grep -q 'child=paused' || fail "inspect did not report paused child branch: $PAUSED_INSPECT"
-ttos resume "$LIFECYCLE" "$LIFECYCLE@child"
+ttos unpause "$LIFECYCLE" "$LIFECYCLE@child"
 ttos ps --all
 ttos top "$LIFECYCLE"
 ttos ls --tree

@@ -83,7 +83,7 @@ covers:
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
   over versioned timestamped records, including filtering and legacy-record decoding;
 - `exec`, selective stdin/stdout/stderr `attach`, `fork --check`, live `fork`,
-  `pause`, `resume`, `ps`, `top`, and the lineage tree, including
+  `pause`, `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, JSON
   creation timestamps, and branch-local writable/virtual `ps --size` accounting;
 - attached exec fork rejection while imported host stdio is live, immediate

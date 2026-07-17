@@ -303,6 +303,7 @@ Commands:
   fork --check [--json] SOURCE    Validate SOURCE without creating a branch
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
+  unpause TARGET...               Resume branches (Docker alias)
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
@@ -358,7 +359,7 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runFork(args[1:], stdout, stderr, backend)
 	case "pause":
 		err = runPauseResume(args[1:], stdout, backend, true)
-	case "resume":
+	case "resume", "unpause":
 		err = runPauseResume(args[1:], stdout, backend, false)
 	case "kill":
 		err = runKill(args[1:], stdout, stderr, backend)

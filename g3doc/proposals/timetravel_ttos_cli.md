@@ -332,7 +332,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
       web@test-a`.
 - [x] Support `--paused`, defaulting according to a documented policy.
 - [x] `ttos pause CONTAINER[@BRANCH]`.
-- [x] `ttos resume CONTAINER[@BRANCH]`.
+- [x] `ttos resume CONTAINER[@BRANCH]` and Docker-compatible top-level and
+      `ttos container unpause` aliases.
 - [x] `ttos branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
 - [x] Initial `ttos ls --tree` compact Unicode lineage and lifecycle-state
       output, merging persistent base containers with authoritative live runsc

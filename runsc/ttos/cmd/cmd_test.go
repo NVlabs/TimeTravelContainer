@@ -356,6 +356,15 @@ func TestCommandsUseQualifiedBranches(t *testing.T) {
 	}
 
 	stdout.Reset()
+	b.resumed = selector{}
+	if status := runCommand([]string{"unpause", "web@test-a"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("unpause status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.resumed != (selector{container: "web", branch: "test-a"}) {
+		t.Errorf("unpause target=%+v", b.resumed)
+	}
+
+	stdout.Reset()
 	if status := runCommand([]string{"branch", "rm", "web@test-a"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("branch rm status=%d, stderr=%q", status, stderr.String())
 	}
@@ -3321,6 +3330,8 @@ func TestDynamicCompletionUsesTTOSObjects(t *testing.T) {
 		notWant string
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
+		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
+		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
 		{args: []string{"_complete", "volume", "rm", "ca"}, want: []string{"cache"}},

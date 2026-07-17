@@ -26,7 +26,7 @@ var topLevelCompletionCommands = []string{
 	"attach", "branch", "completion", "container", "create", "daemon", "events", "exec", "fork",
 	"help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
 	"ps", "pull", "restart", "resume", "rm", "rmi", "run", "start", "stop",
-	"top", "volume", "wait",
+	"top", "unpause", "volume", "wait",
 }
 
 const bashCompletion = `# bash completion for ttos
@@ -193,6 +193,9 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 	}
 	command := words[0]
 	rest := words[1:]
+	if command == "unpause" {
+		command = "resume"
+	}
 	if command == "container" {
 		if len(rest) == 0 {
 			return []string{"attach", "create", "exec", "inspect", "kill", "logs", "ls", "pause", "restart", "rm", "run", "start", "stop", "top", "unpause", "wait"}, nil

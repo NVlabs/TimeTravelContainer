@@ -141,6 +141,9 @@ func commandEvents(args []string, status int) []DaemonEvent {
 	}
 	command := args[0]
 	rest := args[1:]
+	if command == "unpause" {
+		command = "resume"
+	}
 	if command == "container" && len(rest) != 0 {
 		command = rest[0]
 		rest = rest[1:]
