@@ -163,6 +163,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Support Docker `run/create --read-only`, persist it in the OCI root and
       Docker inspect view, and retain it across start/restart/live fork while
       writable tmpfs and managed-volume submounts remain usable and fork CoW.
+- [x] Support Docker `run/create --stop-signal` and `--stop-timeout`, inherit
+      image `STOPSIGNAL` when no override is supplied, persist both values in
+      container metadata and Docker inspect, and honor them in `stop` and
+      `restart` unless a command-level timeout override is supplied.
+      Successful main-branch waits also reconcile the final exit state, code,
+      and finish time into persistent inspect metadata.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
 - [x] Support Docker-compatible `--tmpfs DEST[:OPTIONS]` and

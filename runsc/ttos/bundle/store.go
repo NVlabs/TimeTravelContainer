@@ -55,6 +55,7 @@ type PrepareOptions struct {
 	ConsoleLogMaxFiles int
 	OpenStdin          bool
 	AutoRemove         bool
+	StopTimeout        *int
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -81,11 +82,21 @@ type ContainerInfo struct {
 	Terminal           bool            `json:"terminal,omitempty"`
 	OpenStdin          bool            `json:"open_stdin,omitempty"`
 	AutoRemove         bool            `json:"auto_remove,omitempty"`
+	StopSignal         string          `json:"stop_signal,omitempty"`
+	StopTimeout        *int            `json:"stop_timeout,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 	StartedAt          *time.Time      `json:"started_at,omitempty"`
 	ExitedAt           *time.Time      `json:"exited_at,omitempty"`
+}
+
+func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // ConsolePaths are persistent host-side files for one branch-local console.
@@ -109,6 +120,9 @@ type VolumeInfo struct {
 // Prepare resolves or pulls content, creates or reuses an immutable root, and
 // writes a new container bundle. Existing container names are rejected.
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
+	if opts.StopTimeout != nil && *opts.StopTimeout < -1 {
+		return Prepared{}, fmt.Errorf("stop timeout must be -1 or greater")
+	}
 	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
 	if err != nil {
 		return Prepared{}, err
@@ -177,8 +191,14 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Terminal:           opts.Terminal,
 		OpenStdin:          opts.OpenStdin,
 		AutoRemove:         opts.AutoRemove,
+		StopSignal:         spec.Annotations[StopSignalAnnotation],
+		StopTimeout:        cloneIntPointer(opts.StopTimeout),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
+	}
+	if metadata.StopTimeout == nil {
+		value := DefaultStopTimeoutSeconds
+		metadata.StopTimeout = &value
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)
@@ -281,6 +301,16 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
+	if info.StopSignal == "" {
+		info.StopSignal = DefaultStopSignal
+	}
+	if info.StopTimeout == nil {
+		value := DefaultStopTimeoutSeconds
+		info.StopTimeout = &value
+	}
+	if *info.StopTimeout < -1 {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid stop timeout %d", key, *info.StopTimeout)
+	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}

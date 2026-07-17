@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	mobysignal "github.com/moby/sys/signal"
 	mobyuser "github.com/moby/sys/user"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -33,6 +34,13 @@ const (
 
 	// TmpfsConfigAnnotation records Docker --tmpfs inspect configuration.
 	TmpfsConfigAnnotation = "dev.timetravelos.config.tmpfs"
+	// StopSignalAnnotation records the effective image or CLI stop signal.
+	StopSignalAnnotation = "dev.timetravelos.config.stop-signal"
+
+	// DefaultStopSignal matches Docker's default graceful-termination signal.
+	DefaultStopSignal = "SIGTERM"
+	// DefaultStopTimeoutSeconds matches Docker's Linux default stop timeout.
+	DefaultStopTimeoutSeconds = 10
 )
 
 var defaultCapabilities = []string{
@@ -65,6 +73,7 @@ type SpecOptions struct {
 	Terminal         bool
 	NetworkMode      string
 	ReadonlyRootfs   bool
+	StopSignal       string
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -205,6 +214,18 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	annotations["dev.timetravelos.config.cmd"] = string(commandJSON)
 	annotations["dev.timetravelos.config.user"] = userSpec
 	annotations["dev.timetravelos.config.labels"] = string(labelsJSON)
+	stopSignal := opts.StopSignal
+	if stopSignal == "" {
+		stopSignal = image.Config.StopSignal
+	}
+	if stopSignal == "" {
+		stopSignal = DefaultStopSignal
+	}
+	parsedStopSignal, err := mobysignal.ParseSignal(stopSignal)
+	if err != nil || !mobysignal.ValidSignalForPlatform(parsedStopSignal) {
+		return nil, fmt.Errorf("invalid stop signal %q", stopSignal)
+	}
+	annotations[StopSignalAnnotation] = stopSignal
 	seenDestinations := make(map[string]struct{}, len(mounts)+len(opts.HostMounts)+len(opts.ManagedVolumes)+len(opts.FilesystemMounts))
 	for _, mount := range mounts {
 		seenDestinations[mount.Destination] = struct{}{}

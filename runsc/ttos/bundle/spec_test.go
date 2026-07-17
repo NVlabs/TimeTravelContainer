@@ -56,12 +56,14 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Entrypoint: []string{"/entry"},
 		Cmd:        []string{"default"},
 		WorkingDir: "/work",
+		StopSignal: "SIGQUIT",
 		Labels:     map[string]string{"keep": "yes", "suite": "image"},
 	}}
 	spec, err := BuildSpec(image, SpecOptions{
 		Name:           "demo",
 		RootFS:         root,
 		ReadonlyRootfs: true,
+		StopSignal:     "SIGUSR1",
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
 		Labels:         map[string]string{"empty": "", "extra": "value", "suite": "run"},
@@ -147,6 +149,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		"dev.timetravelos.config.cmd":        `["override","arg"]`,
 		"dev.timetravelos.config.user":       "app",
 		"dev.timetravelos.config.labels":     `{"empty":"","extra":"value","keep":"yes","suite":"run"}`,
+		StopSignalAnnotation:                 "SIGUSR1",
 	}
 	for key, want := range wantConfigAnnotations {
 		if got := spec.Annotations[key]; got != want {
@@ -165,6 +168,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := hostSpec.Annotations["dev.timetravelos.config.network"]; got != "host" {
 		t.Errorf("host network annotation=%q, want host", got)
+	}
+	if got := hostSpec.Annotations[StopSignalAnnotation]; got != "SIGQUIT" {
+		t.Errorf("image stop signal annotation=%q, want SIGQUIT", got)
 	}
 }
 
@@ -231,6 +237,9 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), NetworkMode: "bridge"}); err == nil {
 		t.Error("BuildSpec accepted unsupported network mode")
+	}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), StopSignal: "SIGINVALID"}); err == nil {
+		t.Error("BuildSpec accepted an invalid stop signal")
 	}
 }
 
@@ -324,6 +333,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers[0].NetworkMode != "none" {
 		t.Errorf("legacy network mode=%q, want none", containers[0].NetworkMode)
+	}
+	if containers[0].StopSignal != DefaultStopSignal || containers[0].StopTimeout == nil || *containers[0].StopTimeout != DefaultStopTimeoutSeconds {
+		t.Errorf("legacy stop policy=(%q, %v), want (%q, %d)", containers[0].StopSignal, containers[0].StopTimeout, DefaultStopSignal, DefaultStopTimeoutSeconds)
 	}
 	paths, err := store.BranchConsolePaths("demo", "test-a")
 	if err != nil {

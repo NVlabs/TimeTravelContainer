@@ -40,6 +40,7 @@ import (
 	"text/template"
 	"time"
 
+	mobysignal "github.com/moby/sys/signal"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -1100,6 +1101,8 @@ type runRequest struct {
 	managedVolumes     []ttosbundle.ManagedVolume
 	autoRemove         bool
 	readonlyRootfs     bool
+	stopSignal         string
+	stopTimeout        int
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -1138,8 +1141,18 @@ type exitStatus struct{ code int }
 
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1153,6 +1166,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
 	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
 	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
+	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
+	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1181,6 +1196,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos run [OPTIONS] IMAGE [COMMAND...]")
 	}
+	if *stopTimeout < -1 {
+		return errors.New("stop timeout must be -1 or greater")
+	}
+	if flagWasSet(fs, "stop-signal") {
+		if _, err := parseSignal(*stopSignal); err != nil {
+			return err
+		}
+	}
 	envValues, err := collectEnvironment(envFiles, env)
 	if err != nil {
 		return err
@@ -1225,6 +1248,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
+		stopSignal:         *stopSignal,
+		stopTimeout:        *stopTimeout,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1253,7 +1278,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1265,6 +1290,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
 	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
 	readonlyRootfs := fs.Bool("read-only", false, "mount the container root filesystem as read only")
+	stopSignal := fs.String("stop-signal", "", "signal to stop the container (defaults to image STOPSIGNAL or SIGTERM)")
+	stopTimeout := fs.Int("stop-timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait before killing the container; -1 waits forever")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1292,6 +1319,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
+	}
+	if *stopTimeout < -1 {
+		return errors.New("stop timeout must be -1 or greater")
+	}
+	if flagWasSet(fs, "stop-signal") {
+		if _, err := parseSignal(*stopSignal); err != nil {
+			return err
+		}
 	}
 	envValues, err := collectEnvironment(envFiles, env)
 	if err != nil {
@@ -1337,6 +1372,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
+		stopSignal:         *stopSignal,
+		stopTimeout:        *stopTimeout,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -1805,6 +1842,7 @@ type InspectConfig struct {
 	WorkingDir   string              `json:"WorkingDir"`
 	Entrypoint   []string            `json:"Entrypoint"`
 	Labels       map[string]string   `json:"Labels"`
+	StopSignal   string              `json:"StopSignal"`
 }
 
 // InspectHostConfig is the subset of Docker host configuration implemented by TTOS.
@@ -1813,6 +1851,7 @@ type InspectHostConfig struct {
 	NetworkMode    string            `json:"NetworkMode"`
 	AutoRemove     bool              `json:"AutoRemove"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
+	StopTimeout    *int              `json:"StopTimeout"`
 	Runtime        string            `json:"Runtime"`
 	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
 }
@@ -2773,16 +2812,17 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var timeout int
-	fs.IntVar(&timeout, "time", 10, "seconds to wait for graceful termination; -1 waits forever")
-	fs.IntVar(&timeout, "timeout", 10, "seconds to wait for graceful termination; -1 waits forever")
-	fs.IntVar(&timeout, "t", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "time", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "t", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
 		return errors.New("usage: ttos stop [--time SECONDS] TARGET [TARGET...]")
 	}
-	if timeout < -1 {
+	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
+	if timeoutSet && timeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
 	}
 	for _, arg := range fs.Args() {
@@ -2790,7 +2830,18 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)
 		}
-		if err := stopBranch(target, timeout, backend); err != nil {
+		info, err := backend.inspect(target.container)
+		if err != nil {
+			return fmt.Errorf("inspecting %s before stop: %w", target.container, err)
+		}
+		stopSignal, stopTimeout, err := stopPolicy(info)
+		if err != nil {
+			return err
+		}
+		if timeoutSet {
+			stopTimeout = timeout
+		}
+		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, target)
@@ -2842,9 +2893,9 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var timeout int
-	fs.IntVar(&timeout, "time", 10, "seconds to wait for graceful termination; -1 waits forever")
-	fs.IntVar(&timeout, "timeout", 10, "seconds to wait for graceful termination; -1 waits forever")
-	fs.IntVar(&timeout, "t", 10, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "time", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	fs.IntVar(&timeout, "t", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	force := fs.Bool("force", false, "discard live descendant branches and in-memory managed volumes")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2852,7 +2903,8 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	if fs.NArg() == 0 {
 		return errors.New("usage: ttos restart [--time SECONDS] CONTAINER [CONTAINER...]")
 	}
-	if timeout < -1 {
+	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
+	if timeoutSet && timeout < -1 {
 		return errors.New("restart timeout must be -1 or greater")
 	}
 	for _, name := range fs.Args() {
@@ -2866,17 +2918,24 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if reason := restartDataLossReason(info); reason != "" && !*force {
 			return fmt.Errorf("restarting %q would discard %s; use --force", name, reason)
 		}
+		stopSignal, stopTimeout, err := stopPolicy(info)
+		if err != nil {
+			return err
+		}
+		if timeoutSet {
+			stopTimeout = timeout
+		}
 		target := selector{container: name, branch: defaultBranchID}
 		switch info.State.Status {
 		case "paused":
 			if err := backend.resume(target); err != nil {
 				return fmt.Errorf("resuming %s before restart: %w", target, err)
 			}
-			if err := stopBranch(target, timeout, backend); err != nil {
+			if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 				return err
 			}
 		case "running", "restarting":
-			if err := stopBranch(target, timeout, backend); err != nil {
+			if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 				return err
 			}
 		case "created", "exited", "failed", "dead":
@@ -2930,13 +2989,29 @@ type waitResult struct {
 	err    error
 }
 
-func stopBranch(target selector, timeoutSeconds int, backend backend) error {
-	const (
-		signalKill = 9
-		signalTerm = 15
-	)
-	if err := backend.signal(target, signalTerm, false); err != nil {
-		return fmt.Errorf("stopping %s with SIGTERM: %w", target, err)
+func stopPolicy(info InspectInfo) (int, int, error) {
+	stopSignal := info.Config.StopSignal
+	if stopSignal == "" {
+		stopSignal = ttosbundle.DefaultStopSignal
+	}
+	signal, err := parseSignal(stopSignal)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid configured stop signal %q: %w", stopSignal, err)
+	}
+	timeout := ttosbundle.DefaultStopTimeoutSeconds
+	if info.HostConfig.StopTimeout != nil {
+		timeout = *info.HostConfig.StopTimeout
+	}
+	if timeout < -1 {
+		return 0, 0, fmt.Errorf("invalid configured stop timeout %d", timeout)
+	}
+	return signal, timeout, nil
+}
+
+func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend) error {
+	const signalKill = 9
+	if err := backend.signal(target, stopSignal, false); err != nil {
+		return fmt.Errorf("stopping %s with signal %d: %w", target, stopSignal, err)
 	}
 	waited := make(chan waitResult, 1)
 	go func() {
@@ -2971,22 +3046,11 @@ func stopBranch(target selector, timeoutSeconds int, backend backend) error {
 }
 
 func parseSignal(value string) (int, error) {
-	if number, err := strconv.Atoi(value); err == nil {
-		if number < 1 || number > 64 {
-			return 0, fmt.Errorf("signal number %d is outside 1..64", number)
-		}
-		return number, nil
+	signal, err := mobysignal.ParseSignal(value)
+	if err != nil || !mobysignal.ValidSignalForPlatform(signal) {
+		return 0, fmt.Errorf("unknown signal %q", value)
 	}
-	name := strings.TrimPrefix(strings.ToUpper(value), "SIG")
-	signals := map[string]int{
-		"HUP": 1, "INT": 2, "QUIT": 3, "KILL": 9, "USR1": 10,
-		"USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15, "CONT": 18,
-		"STOP": 19, "TSTP": 20, "TTIN": 21, "TTOU": 22,
-	}
-	if signal, ok := signals[name]; ok {
-		return signal, nil
-	}
-	return 0, fmt.Errorf("unknown signal %q", value)
+	return int(signal), nil
 }
 
 func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -3547,6 +3611,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
 			ReadonlyRootfs:   request.readonlyRootfs,
+			StopSignal:       request.stopSignal,
 			Entrypoint:       request.entrypoint,
 			ManagedVolumes:   request.managedVolumes,
 			HostMounts:       request.hostMounts,
@@ -3559,6 +3624,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
 		AutoRemove:         request.autoRemove,
+		StopTimeout:        &request.stopTimeout,
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -3588,6 +3654,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
 			ReadonlyRootfs:   request.readonlyRootfs,
+			StopSignal:       request.stopSignal,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			ManagedVolumes:   request.managedVolumes,
@@ -3600,6 +3667,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
 		AutoRemove:         request.autoRemove,
+		StopTimeout:        &request.stopTimeout,
 	})
 	if err != nil {
 		return "", err
@@ -4803,6 +4871,15 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		created = inspectTimestamp(nil)
 	}
 	readonlyRootfs := spec != nil && spec.Root != nil && spec.Root.Readonly
+	stopSignal := container.StopSignal
+	if stopSignal == "" {
+		stopSignal = ttosbundle.DefaultStopSignal
+	}
+	stopTimeout := container.StopTimeout
+	if stopTimeout == nil {
+		value := ttosbundle.DefaultStopTimeoutSeconds
+		stopTimeout = &value
+	}
 	return InspectInfo{
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
@@ -4819,10 +4896,10 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		Config: InspectConfig{
 			Hostname: hostname, User: configUser, AttachStdin: container.OpenStdin, AttachStdout: true, AttachStderr: true,
 			Tty: process.Terminal, OpenStdin: container.OpenStdin, Env: append([]string(nil), process.Env...), Cmd: configCmd,
-			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
+			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc", Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
@@ -5479,6 +5556,7 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		if err := json.Unmarshal(output, &result); err != nil {
 			return 0, fmt.Errorf("decoding runsc wait result: %w", err)
 		}
+		b.recordWaitState(target, result.Status)
 		return result.Status, nil
 	}
 
@@ -5487,9 +5565,21 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		return 0, fmt.Errorf("%w; checking persistent wait status: %v", commandErr, err)
 	}
 	if found {
+		b.recordWaitState(target, status)
 		return status, nil
 	}
 	return 0, commandErr
+}
+
+func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
+	if target.branch != defaultBranchID {
+		return
+	}
+	exitStatus := waitStatusExitCode(status)
+	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	if err := store.UpdateState(target.container, "exited", &exitStatus); err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttos: warning: recording exit state for %s: %v\n", target, err)
+	}
 }
 
 func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, error) {

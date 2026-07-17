@@ -16,6 +16,7 @@ go_library(
         "//runsc/ttos/console",
         "//runsc/ttos/images",
         "//runsc/version",
+        "@com_github_moby_sys_signal//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go",
         "@org_golang_x_term//:go_default_library",
     ],

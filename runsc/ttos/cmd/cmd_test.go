@@ -523,14 +523,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -701,6 +701,22 @@ func TestRunAndCreateRejectInvalidPullPolicy(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateRejectInvalidStopPolicy(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--stop-signal", "SIGINVALID", "busybox"},
+		{"create", "--stop-timeout", "-2", "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
+	}
+}
+
 func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--network", "bridge", "busybox"},
@@ -784,10 +800,10 @@ func TestCreateAndStart(t *testing.T) {
 	containerID := strings.Repeat("b", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--stop-signal", "SIGQUIT", "--stop-timeout", "4", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.stopSignal != "SIGQUIT" || b.runRequest.stopTimeout != 4 || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
@@ -1415,9 +1431,10 @@ func TestBuildInspectInfo(t *testing.T) {
 	created := time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC)
 	started := created.Add(time.Second)
 	exit := 23
+	stopTimeout := 4
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1471,6 +1488,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if !info.HostConfig.ReadonlyRootfs {
 		t.Error("inspect omitted read-only rootfs policy")
+	}
+	if info.Config.StopSignal != "SIGUSR1" || info.HostConfig.StopTimeout == nil || *info.HostConfig.StopTimeout != 4 {
+		t.Errorf("inspect stop policy=(%q, %v), want (SIGUSR1, 4)", info.Config.StopSignal, info.HostConfig.StopTimeout)
 	}
 	if !info.HostConfig.AutoRemove {
 		t.Error("inspect omitted auto-remove policy")
@@ -1576,13 +1596,17 @@ func TestKillParsesSignalAndSelectsBranch(t *testing.T) {
 }
 
 func TestStopGraceful(t *testing.T) {
-	b := &fakeBackend{}
+	timeout := 3
+	b := &fakeBackend{inspectInfo: InspectInfo{
+		Config:     InspectConfig{StopSignal: "SIGUSR1"},
+		HostConfig: InspectHostConfig{StopTimeout: &timeout},
+	}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"stop", "--time", "1", "web@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("stop status=%d, stderr=%q", status, stderr.String())
 	}
-	if len(b.signals) != 1 || b.signals[0].signal != 15 {
-		t.Errorf("signal calls=%+v, want SIGTERM only", b.signals)
+	if len(b.signals) != 1 || b.signals[0].signal != 10 {
+		t.Errorf("signal calls=%+v, want configured SIGUSR1 only", b.signals)
 	}
 	if b.waited != (selector{container: "web", branch: "child"}) {
 		t.Errorf("wait target=%+v", b.waited)
@@ -1590,13 +1614,38 @@ func TestStopGraceful(t *testing.T) {
 }
 
 func TestStopEscalatesToKill(t *testing.T) {
-	b := &fakeBackend{waitRelease: make(chan struct{})}
+	timeout := 0
+	b := &fakeBackend{
+		waitRelease: make(chan struct{}),
+		inspectInfo: InspectInfo{
+			Config:     InspectConfig{StopSignal: "SIGUSR2"},
+			HostConfig: InspectHostConfig{StopTimeout: &timeout},
+		},
+	}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"stop", "--time", "0", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"stop", "web"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("stop status=%d, stderr=%q", status, stderr.String())
 	}
+	if len(b.signals) != 2 || b.signals[0].signal != 12 || b.signals[1].signal != 9 {
+		t.Errorf("signal calls=%+v, want configured SIGUSR2 then SIGKILL", b.signals)
+	}
+}
+
+func TestStopTimeoutOverride(t *testing.T) {
+	configuredTimeout := 30
+	b := &fakeBackend{
+		waitRelease: make(chan struct{}),
+		inspectInfo: InspectInfo{
+			Config:     InspectConfig{StopSignal: "SIGTERM"},
+			HostConfig: InspectHostConfig{StopTimeout: &configuredTimeout},
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "--time", "0", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop override status=%d, stderr=%q", status, stderr.String())
+	}
 	if len(b.signals) != 2 || b.signals[0].signal != 15 || b.signals[1].signal != 9 {
-		t.Errorf("signal calls=%+v, want SIGTERM then SIGKILL", b.signals)
+		t.Errorf("signal calls=%+v, want SIGTERM then immediate SIGKILL", b.signals)
 	}
 }
 
@@ -1650,9 +1699,14 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 		{name: "paused", state: "paused", wantSignal: true, wantResume: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			b := &fakeBackend{inspectInfo: InspectInfo{State: InspectState{Status: test.state}}}
+			timeout := 1
+			b := &fakeBackend{inspectInfo: InspectInfo{
+				State:      InspectState{Status: test.state},
+				Config:     InspectConfig{StopSignal: "SIGQUIT"},
+				HostConfig: InspectHostConfig{StopTimeout: &timeout},
+			}}
 			var stdout, stderr bytes.Buffer
-			if status := runCommand([]string{"restart", "--time", "1", "web"}, &stdout, &stderr, b); status != 0 {
+			if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status != 0 {
 				t.Fatalf("restart status=%d, stderr=%q", status, stderr.String())
 			}
 			if got, want := stdout.String(), "web\n"; got != want {
@@ -1665,8 +1719,8 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 				t.Errorf("signals=%+v, wantSignal=%t", b.signals, test.wantSignal)
 			}
 			wantTarget := selector{container: "web", branch: "main"}
-			if test.wantSignal && (len(b.signals) != 1 || b.signals[0].target != wantTarget || b.signals[0].signal != 15) {
-				t.Errorf("restart signals=%+v, want main SIGTERM", b.signals)
+			if test.wantSignal && (len(b.signals) != 1 || b.signals[0].target != wantTarget || b.signals[0].signal != 3) {
+				t.Errorf("restart signals=%+v, want configured main SIGQUIT", b.signals)
 			}
 			if test.wantResume && b.resumed != wantTarget {
 				t.Errorf("resumed=%+v, want %+v", b.resumed, wantTarget)
@@ -2004,6 +2058,13 @@ exit 2
 	status, err = b.wait(selector{container: "web", branch: "main"})
 	if err != nil || status != 9 {
 		t.Errorf("wait fallback returned (%d, %v), want (9, nil)", status, err)
+	}
+	persisted, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatalf("LoadContainer after main wait: %v", err)
+	}
+	if persisted.State != "exited" || persisted.ExitStatus == nil || *persisted.ExitStatus != 137 || persisted.ExitedAt == nil {
+		t.Errorf("main wait did not reconcile persistent state: %+v", persisted)
 	}
 	if err := b.destroy(selector{container: "web", branch: "child"}); err == nil {
 		t.Error("destroy swallowed a live-sandbox control error")

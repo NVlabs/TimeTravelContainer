@@ -30,6 +30,8 @@ covers:
 - Docker `--read-only` rootfs persistence through restart and live fork,
   including write rejection in both branches while custom tmpfs and managed
   volumes remain writable;
+- image `STOPSIGNAL` inheritance plus Docker `--stop-signal` and
+  `--stop-timeout` inspect persistence, graceful-stop delivery, and final exit-code reconciliation;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
 - Alpine dynamic linking and package-tool startup;

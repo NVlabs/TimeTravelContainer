@@ -82,6 +82,7 @@ CONSOLE_STRESS="$PREFIX-console-stress"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
+STOP_POLICY="$PREFIX-stop-policy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
 
@@ -107,7 +108,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -248,12 +249,30 @@ ttos run --name "$PREFIX-python" "$PYTHON_IMAGE" python3 -c \
   'import json, sqlite3, threading; db=sqlite3.connect(":memory:"); db.execute("create table t(v)"); db.execute("insert into t values (7)"); assert db.execute("select v from t").fetchone()[0] == 7; t=threading.Thread(target=lambda: json.dumps({"ok": True})); t.start(); t.join(); print("python-ok")'
 ttos rm "$PREFIX-python"
 
-ttos run --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
+ttos create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
+[ "$(ttos inspect -f '{{.Config.StopSignal}}' "$PREFIX-nginx")" = SIGQUIT ] ||
+  fail "nginx image STOPSIGNAL was not inherited"
+ttos start --attach "$PREFIX-nginx"
 ttos rm "$PREFIX-nginx"
 
 ttos run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
   'test "$(stat -c %u:%g /data)" = 999:1000 && echo redis-owner-ok'
 ttos rm "$PREFIX-redis"
+
+echo "== persisted stop signal and timeout policy =="
+ttos run --name "$STOP_POLICY" --detach --stop-signal SIGUSR1 --stop-timeout 3 \
+  "$ALPINE_IMAGE" sh -c "trap \"exit 42\" USR1; echo stop-policy-ready; while :; do sleep 0.05; done"
+deadline=$(( $(date +%s) + 15 ))
+until ttos logs "$STOP_POLICY" | grep -q stop-policy-ready; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "custom-stop container did not become ready"
+  sleep 1
+done
+[ "$(ttos inspect -f '{{.Config.StopSignal}}|{{.HostConfig.StopTimeout}}' "$STOP_POLICY")" = "SIGUSR1|3" ] ||
+  fail "inspect did not retain custom stop policy"
+ttos stop "$STOP_POLICY"
+[ "$(ttos inspect -f '{{.State.ExitCode}}' "$STOP_POLICY")" = 42 ] ||
+  fail "ttos stop did not deliver the configured SIGUSR1"
+ttos rm "$STOP_POLICY"
 
 echo "== quick-exit console integrity =="
 STRESS_BYTES=262144
