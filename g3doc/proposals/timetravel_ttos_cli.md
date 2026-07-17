@@ -231,9 +231,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
       Docker resource names, infinity, duplicate last-value-wins behavior, OCI
       projection, and persistent inspect metadata. Sentry enforcement applies to
       the init process and exec sessions, and live forks inherit the limits.
-- [ ] Add CPU, memory, and other resource-limit flags. Rootless enforcement must
-      use delegated host cgroup v2 controllers or equivalent Sentry accounting;
-      do not expose parse-only limits.
+- [ ] Add CPU, memory, and other resource-limit flags. Internal Sentry
+      `memory.max` and total-memory reporting are not hard enforcement. The initial
+      implementation must therefore install OCI limits in delegated host cgroup v2,
+      then verify the sandbox process actual `memory.max` and `cpu.max` after
+      `create` but before `start`; fail and clean up when delegation is unavailable.
+      A future equivalent may use hard Sentry accounting.
 - [x] Support foreground, `--detach`, and attached non-TTY `-i` modes.
 - [x] Support `run/create -t` with a detachable Sentry-internal PTY, Docker-style
       combined `-it`/`-dit`, raw interactive attach, resize propagation, and
@@ -401,16 +404,20 @@ a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
 `Loader.k`, default-branch namespaces, and a single process/TTY map.
 
 - [x] Add branch ID to execute and wait-PID paths.
-- [ ] Add branch ID to general process-signal and terminal-control RPCs (the
-      TimeTravel-specific signal RPC is already branch-aware).
-- [ ] Move process bookkeeping from `Loader.processes` into each
-      `sandboxBranch`.
-- [ ] Reconstruct branch process records after fork by resolving cloned virtual
-      TIDs, container IDs, process groups, and execution IDs.
+- [x] Add an optional branch ID to the general process-signal RPC while
+      preserving empty-selector legacy behavior. Process, process-group, all-process,
+      and cloned-internal-TTY foreground-group delivery are branch-aware; internal
+      terminal resize/control RPCs also carry branch IDs.
+- [ ] Move the remaining legacy main-branch OCI process bookkeeping from
+      `Loader.processes`; TTOS-managed exec lifecycle and TTY state are already owned
+      by each `sandboxBranch`.
+- [x] Reconstruct TTOS-managed exec records after fork by resolving cloned
+      virtual TIDs and container/execution IDs in the child Kernel; process groups
+      and controlling terminals are cloned as Kernel state.
 - [x] Select mount and PID namespaces from the target branch's container init.
 - [x] Use the target branch Kernel in `control.Proc` and `control.ExecAsync`.
-- [ ] Share immutable OCI specs and seccomp configuration while keeping mutable
-      process/TTY state branch-local.
+- [x] Share immutable OCI specs and rebuild seccomp programs from them while
+      keeping TTOS-managed exec lifecycle and process/TTY state branch-local.
 - [x] Extend branch Kernel-lifetime leases to exec creation and wait, rejecting
       exec creation unless the selected branch is running.
 - [ ] Add failure injection around FD import, namespace selection, process

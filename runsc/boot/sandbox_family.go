@@ -834,9 +834,8 @@ func (f *SandboxFamily) Processes(id, cid string, out *[]*control.Process) error
 	return control.Processes(b.k, cid, out)
 }
 
-// Signal sends a signal within one branch. Foreground TTY process-group
-// delivery is excluded because branch eligibility currently excludes external
-// TTY resources and Loader's host-side TTY bookkeeping is not cloned.
+// Signal sends a signal within one branch. Foreground process-group delivery
+// resolves the controlling TTY from branch-local cloned Sentry state.
 func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeliveryMode) error {
 	b, done, err := f.beginControl(id)
 	if err != nil {
@@ -878,7 +877,23 @@ func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeli
 		}
 		return fmt.Errorf("process group %d does not belong to container %q", pgid, cid)
 	case DeliverToForegroundProcessGroup:
-		return fmt.Errorf("foreground process-group signaling is not supported for live branches")
+		tg, err := branchThreadGroup(k, cid, kernel.ThreadID(pid))
+		if err != nil {
+			return err
+		}
+		tty := tg.TTY()
+		if tty == nil {
+			return fmt.Errorf("no TTY attached")
+		}
+		ttyTG := tty.ThreadGroup()
+		if ttyTG == nil {
+			return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
+		}
+		pg, _ := ttyTG.ForegroundProcessGroup(tty)
+		if pg == nil {
+			return k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: signo})
+		}
+		return k.SendExternalSignalProcessGroup(pg, &linux.SignalInfo{Signo: signo})
 	default:
 		return fmt.Errorf("unknown signal delivery mode %v", mode)
 	}

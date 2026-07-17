@@ -1211,6 +1211,9 @@ func (s SignalDeliveryMode) String() string {
 
 // SignalArgs are arguments to the Signal method.
 type SignalArgs struct {
+	// BranchID selects a TimeTravel branch. Empty preserves the legacy default branch.
+	BranchID string
+
 	// CID is the container ID.
 	CID string
 
@@ -1232,7 +1235,10 @@ type SignalArgs struct {
 // indicated process, to all processes in the container, or to the foreground
 // process group.
 func (cm *containerManager) Signal(args *SignalArgs, _ *struct{}) error {
-	log.Debugf("containerManager.Signal: cid: %s, PID: %d, signal: %d, mode: %v", args.CID, args.PID, args.Signo, args.Mode)
+	log.Debugf("containerManager.Signal: branch: %s, cid: %s, PID: %d, signal: %d, mode: %v", args.BranchID, args.CID, args.PID, args.Signo, args.Mode)
+	if args.BranchID != "" {
+		return cm.l.family.Signal(args.BranchID, args.CID, args.PID, args.Signo, args.Mode)
+	}
 	return cm.l.signal(args.CID, args.PID, args.Signo, args.Mode)
 }
 

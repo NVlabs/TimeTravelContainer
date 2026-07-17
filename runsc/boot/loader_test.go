@@ -545,8 +545,12 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatalf("child PTY input became readable in parent: readiness=%#x", got)
 	}
 
-	if err := l.family.SignalExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID, Signo: int32(linux.SIGKILL)}); err != nil {
-		t.Fatalf("signaling child exec session: %v", err)
+	manager := &containerManager{l: l}
+	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, Signo: int32(linux.SIGWINCH), Mode: DeliverToForegroundProcessGroup}, &struct{}{}); err != nil {
+		t.Fatalf("signaling child foreground process group: %v", err)
+	}
+	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, PID: int32(execPID), Signo: int32(linux.SIGKILL), Mode: DeliverToProcess}, &struct{}{}); err != nil {
+		t.Fatalf("signaling child exec through general RPC: %v", err)
 	}
 	status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID})
 	if err != nil {
