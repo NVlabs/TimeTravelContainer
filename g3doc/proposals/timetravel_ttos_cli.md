@@ -291,6 +291,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       persistent image, digest, volume, and container-creation metadata into
       live family rows. Recent selection includes non-running states, matching
       Docker's latest/last behavior.
+- [x] Add durable `ttos events [--json] [-f|--follow]` with Docker-style
+      `--since`/`--until`, type/action/subject filters, a versioned JSONL
+      schema, daemon-restart persistence, and nonprinting disconnect heartbeats.
 - [ ] Add writable/virtual size accounting and pass-through process-selection
       options for `top`.
 
@@ -612,8 +615,8 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       readers diagnose premature sidecar exit.
 - [x] Implement a local Unix-domain control service with streamed stdin,
       stdout, and stderr so commands and state ownership survive individual CLI
-      processes. Background pulls run in daemon request workers; event streams
-      remain pending.
+      processes. Background pulls and durable event streams run in daemon
+      request workers.
 - [x] Provide an autostarted rootless per-user socket and private runtime
       directory by default, with peer-UID checks and a `0600` socket.
 - [x] Persist family configuration, image references, managed-volume metadata,
@@ -621,8 +624,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Reconcile persisted metadata with containerd inventory and live runsc
       sandboxes after daemon restart, and restart missing branch/exec console
       drainers. The current direct-runsc backend has no shim process.
-- [ ] Provide events for branch creation, pause, resume, exit, destroy, exec,
-      attach, and eligibility changes.
+- [x] Provide durable manager events for branch/container creation, pause,
+      resume, exit, destroy, exec, attach, image operations, and eligibility
+      check observations. `ttos events` supports text/JSON output, time bounds,
+      filters, and follow streaming across daemon restarts.
 - [ ] Serialize conflicting lifecycle operations and make commands idempotent.
 - [x] Add a versioned framed local API with explicit version rejection so the
       CLI and daemon may be upgraded independently.
@@ -697,7 +702,7 @@ process, fork its branch, and then attach independently to both branches.
 - [x] Initial fork/pause/resume and beautified branch tree.
 - [x] Read-only fork eligibility check.
 - [ ] Richer branch-tree diagnostics.
-- [ ] Rootless daemon lifecycle, recovery, events, documentation, and shell
+- [x] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
 
 Gate: a fresh user can pull a Docker Hub image and exercise the complete

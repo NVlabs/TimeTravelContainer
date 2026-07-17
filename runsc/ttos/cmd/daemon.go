@@ -66,6 +66,9 @@ type daemonServer struct {
 
 	reconcileMu sync.Mutex
 	reconciled  map[string]bool
+
+	eventMu  sync.Mutex
+	eventSeq uint64
 }
 
 type daemonFrameWriter struct {
@@ -75,6 +78,9 @@ type daemonFrameWriter struct {
 }
 
 func (w daemonFrameWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, writeDaemonFrame(w.conn, w.mu, w.typ, nil)
+	}
 	for written := 0; written < len(data); {
 		end := written + daemonMaxFrame
 		if end > len(data) {
@@ -307,8 +313,19 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend := directBackend(opts, stdinReader,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+	if request.Args[0] == "events" {
+		status := 0
+		if err := s.streamEvents(opts.dataRoot, request.Args[1:], backend.stdout); err != nil {
+			fmt.Fprintf(backend.stderr, "ttos: %v\n", err)
+			status = 1
+		}
+		stdinReader.Close()
+		_ = writeDaemonStatus(conn, &writeMu, status)
+		return
+	}
 	s.reconcile(backend)
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
+	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
 }
@@ -507,8 +524,6 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 				}
 			}
 		}()
-	} else if err := writeDaemonFrame(conn, &writeMu, daemonFrameEOF, nil); err != nil {
-		return 1, err
 	}
 
 	reader := bufio.NewReader(conn)

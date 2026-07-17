@@ -101,6 +101,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runDaemonControl(opts, args[1:], stdout, stderr)
 	}
 	if opts.direct {
+		if args[0] == "events" {
+			fmt.Fprintln(stderr, "ttos: events require ttosd; remove --direct")
+			return 1
+		}
 		return runCommand(args, stdout, stderr, directBackend(opts, stdin, stdout, stderr))
 	}
 	status, err := runViaDaemon(opts, args, stdin, stdout, stderr)
@@ -288,6 +292,7 @@ Commands:
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   exec ls|wait|kill ...          Manage detached exec sessions
   inspect [OPTIONS] CONTAINER... Show Docker and TTOS branch/process state
+  events [OPTIONS]               Stream durable manager lifecycle events
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
   restart [OPTIONS] CONTAINER... Restart one or more container families
   rm [--force] CONTAINER...      Remove container metadata and runtime state

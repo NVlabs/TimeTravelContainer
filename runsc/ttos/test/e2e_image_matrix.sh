@@ -693,6 +693,24 @@ ttos exec kill "$LIFECYCLE@main:$EXEC_ID" >/dev/null
 ttos branch rm "$LIFECYCLE@process-grandchild"
 ttos branch rm "$LIFECYCLE@process-child"
 
+echo "== durable daemon events =="
+EVENTS_JSON="$TTOS_E2E_ROOT/events.jsonl"
+ttos events --json >"$EVENTS_JSON"
+for event_type in container branch exec attach eligibility image; do
+  grep -q "\"type\":\"$event_type\"" "$EVENTS_JSON" || fail "durable events omitted type $event_type"
+done
+grep -q '"action":"fork"' "$EVENTS_JSON" || fail "durable events omitted branch fork"
+grep -q '"action":"check"' "$EVENTS_JSON" || fail "durable events omitted eligibility check"
+EVENT_FOLLOW="$TTOS_E2E_ROOT/events-follow.jsonl"
+EVENT_UNTIL=$(( $(date +%s) + 3 ))
+ttos events --follow --json --since 0s --until "$EVENT_UNTIL" --filter action=pause >"$EVENT_FOLLOW" &
+EVENT_FOLLOW_PID=$!
+sleep 1
+ttos pause "$LIFECYCLE"
+ttos resume "$LIFECYCLE"
+wait "$EVENT_FOLLOW_PID" || fail "events follower failed"
+grep -q '"type":"branch".*"action":"pause"' "$EVENT_FOLLOW" || fail "events follower missed a new pause event"
+
 ttos stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
   fail "inspect did not report the stopped family as exited"

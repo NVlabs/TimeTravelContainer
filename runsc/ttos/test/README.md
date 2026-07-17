@@ -7,6 +7,9 @@ covers:
 - default rootless `ttosd` autostart over a versioned per-user Unix API,
   full command streaming through the daemon, status/stop controls, and live
   sandbox plus console-drainer reconciliation after a daemon restart;
+- durable versioned manager events across daemon restart, including text/JSON
+  inventory, type/action filters, time bounds, and live follow of new branch
+  lifecycle activity;
 - Docker-compatible run/create pull policies: explicit refresh with
   `--pull=always`, cached startup with `--pull=never`, missing-image rejection,
   and default local reuse after the initial matrix pull;
