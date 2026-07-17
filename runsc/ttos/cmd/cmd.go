@@ -3843,6 +3843,30 @@ func parseSignal(value string) (int, error) {
 	return int(signal), nil
 }
 
+func parseVolumeQuotaOptions(options []string) (int64, error) {
+	quotaBytes := int64(0)
+	seen := false
+	for _, option := range options {
+		key, value, ok := strings.Cut(option, "=")
+		if !ok || key != "size" || value == "" {
+			return 0, fmt.Errorf("unsupported volume option %q; want size=BYTES", option)
+		}
+		if seen {
+			return 0, errors.New("volume size option may be specified only once")
+		}
+		parsed, err := ttosbundle.ParseShmSize(value)
+		if err != nil {
+			return 0, fmt.Errorf("invalid volume size: %w", err)
+		}
+		if parsed <= 0 {
+			return 0, errors.New("volume size must be greater than zero")
+		}
+		quotaBytes = parsed
+		seen = true
+	}
+	return quotaBytes, nil
+}
+
 func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 	if len(args) == 0 {
 		return errors.New("usage: ttos volume create|ls|inspect|rm [OPTIONS]")
@@ -3853,20 +3877,27 @@ func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 		fs.SetOutput(stderr)
 		driver := fs.String("driver", "local-tmpfs", "volume driver")
 		fs.StringVar(driver, "d", "local-tmpfs", "volume driver")
+		var options stringSlice
+		fs.Var(&options, "opt", "driver option (size=BYTES)")
+		fs.Var(&options, "o", "driver option (size=BYTES)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() > 1 {
-			return errors.New("usage: ttos volume create [--driver local-tmpfs] [NAME]")
+			return errors.New("usage: ttos volume create [--driver local-tmpfs] [--opt size=BYTES] [NAME]")
 		}
 		if *driver != "local-tmpfs" {
 			return fmt.Errorf("unsupported volume driver %q", *driver)
+		}
+		quotaBytes, err := parseVolumeQuotaOptions(options)
+		if err != nil {
+			return err
 		}
 		name := "ttos-volume-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 		if fs.NArg() == 1 {
 			name = fs.Arg(0)
 		}
-		info, err := backend.ensureVolume(name)
+		info, err := backend.ensureVolume(name, quotaBytes)
 		if err != nil {
 			return err
 		}
@@ -4164,7 +4195,7 @@ type backend interface {
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
 	wait(target selector) (uint32, error)
-	ensureVolume(name string) (ttosbundle.VolumeInfo, error)
+	ensureVolume(name string, quotaBytes int64) (ttosbundle.VolumeInfo, error)
 	listVolumes() ([]ttosbundle.VolumeInfo, error)
 	inspectVolume(name string) (ttosbundle.VolumeInfo, error)
 	removeVolume(name string) error
@@ -6422,8 +6453,8 @@ func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bo
 	})
 }
 
-func (b *runtimeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
-	return (ttosbundle.Store{Root: b.dataRoot}).EnsureVolume(name)
+func (b *runtimeBackend) ensureVolume(name string, quotaBytes int64) (ttosbundle.VolumeInfo, error) {
+	return (ttosbundle.Store{Root: b.dataRoot}).EnsureVolumeWithQuota(name, quotaBytes)
 }
 
 func (b *runtimeBackend) listVolumes() ([]ttosbundle.VolumeInfo, error) {

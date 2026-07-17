@@ -63,6 +63,7 @@ else
 fi
 DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
+DAEMON_SOCKET="$TTOS_E2E_ROOT/ttosd.sock"
 HOST_FIXTURE="$TTOS_E2E_ROOT/host-fixture"
 HOST_FIXTURE_TWO="$TTOS_E2E_ROOT/host-fixture-two"
 HOST_COW_FIXTURE="$TTOS_E2E_ROOT/host-cow-fixture"
@@ -94,6 +95,8 @@ ANON_VOLUME="$PREFIX-anon-volume"
 ANON_NOCOPY="$PREFIX-anon-nocopy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
+QUOTA_VOLUME="$PREFIX-quota"
+QUOTA_CONTAINER="$PREFIX-quota-container"
 
 ttos() {
   if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
@@ -102,6 +105,7 @@ ttos() {
       --containerd "$CONTAINERD_ADDRESS" \
       --namespace "$TTOS_NAMESPACE" \
       --data-root "$DATA_ROOT" \
+      --daemon-socket "$DAEMON_SOCKET" \
       --root "$RUNSC_ROOT" \
       --runsc "$RUNSC" \
       "$@"
@@ -111,16 +115,18 @@ ttos() {
     --containerd "$CONTAINERD_ADDRESS" \
     --namespace "$TTOS_NAMESPACE" \
     --data-root "$DATA_ROOT" \
+    --daemon-socket "$DAEMON_SOCKET" \
     --root "$RUNSC_ROOT" \
     --runsc "$RUNSC" \
     "$@"
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
-  ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
+  ttos volume rm "$VOLUME" "$QUOTA_VOLUME" >/dev/null 2>&1 || true
+  ttos daemon stop >/dev/null 2>&1 || true
   if $owned_root; then
     rm -rf "$TTOS_E2E_ROOT"
   fi
@@ -440,6 +446,24 @@ fi
 grep -q "does not support reading" "$TTOS_E2E_ROOT/nolog.err" ||
   fail "none log-driver rejection lacked a compatibility diagnostic"
 ttos rm --force "$NOLOG"
+
+echo "== managed-volume quota enforcement across live fork =="
+ttos volume create --opt size=64k "$QUOTA_VOLUME"
+ttos run --detach --name "$QUOTA_CONTAINER" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota,volume-nocopy" "$BUSYBOX_IMAGE" sh -c "sleep 300" >/dev/null
+ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/base bs=4096 count=15 2>/dev/null"
+ttos fork "$QUOTA_CONTAINER" child
+ttos exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/child bs=4096 count=1 2>/dev/null"
+ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/parent bs=4096 count=1 2>/dev/null"
+if ttos exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/overflow bs=4096 count=1 2>/dev/null"; then
+  fail "child managed-volume quota was not enforced"
+fi
+if ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/overflow bs=4096 count=1 2>/dev/null"; then
+  fail "parent managed-volume quota was not enforced"
+fi
+[ "$(ttos exec "$QUOTA_CONTAINER" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "parent managed-volume quota size is incorrect"
+[ "$(ttos exec "$QUOTA_CONTAINER@child" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "child managed-volume quota size is incorrect"
+ttos rm --force "$QUOTA_CONTAINER"
+ttos volume rm "$QUOTA_VOLUME"
 
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
@@ -770,6 +794,7 @@ ttos stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
 ttos branch rm "$LIFECYCLE@grandchild"
 ttos rm "$LIFECYCLE_ID"
 ttos volume rm "$VOLUME"
+ttos daemon stop >/dev/null
 
 trap - EXIT HUP INT TERM
 if $owned_root; then

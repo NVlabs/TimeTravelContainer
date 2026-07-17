@@ -93,8 +93,8 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 			{Type: "sysfs", Destination: "/alt-sys", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		},
 		ManagedVolumes: []ManagedVolume{
-			{Name: "cache", Destination: "/cache"},
-			{Name: "cache", Destination: "/cache-ro", Readonly: true},
+			{Name: "cache", Destination: "/cache", QuotaBytes: 65536},
+			{Name: "cache", Destination: "/cache-ro", Readonly: true, QuotaBytes: 65536},
 		},
 	})
 	if err != nil {
@@ -136,8 +136,8 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/alt-proc", Type: "proc", Source: "proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		{Destination: "/alt-sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		{Destination: "/mnt/fixture", Type: "bind", Source: host, Options: []string{"rbind", "ro"}},
-		{Destination: "/cache", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
-		{Destination: "/cache-ro", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"ro", "nosuid", "nodev", "mode=0755"}},
+		{Destination: "/cache", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755", "size=65536"}},
+		{Destination: "/cache-ro", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"ro", "nosuid", "nodev", "mode=0755", "size=65536"}},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("mounts=%+v, want %+v", spec.Mounts, wantMounts)
@@ -189,7 +189,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		"dev.gvisor.spec.mount.ttos0.source":  "ttos-volume-cache",
 		"dev.gvisor.spec.mount.ttos0.share":   "container",
 		"dev.gvisor.spec.mount.ttos0.type":    "tmpfs",
-		"dev.gvisor.spec.mount.ttos0.options": "rw,nosuid,nodev,mode=0755",
+		"dev.gvisor.spec.mount.ttos0.options": "rw,nosuid,nodev,mode=0755,size=65536",
 		"dev.gvisor.spec.mount.ttos0.copyup":  "true",
 	}
 	for key, want := range wantVolumeAnnotations {
@@ -834,7 +834,7 @@ func TestContainerIdentityResolution(t *testing.T) {
 func TestVolumeStoreLifecycle(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
-	created, err := store.EnsureVolume("cache")
+	created, err := store.EnsureVolumeWithQuota("cache", 65536)
 	if err != nil {
 		t.Fatalf("EnsureVolume: %v", err)
 	}
@@ -842,8 +842,11 @@ func TestVolumeStoreLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second EnsureVolume: %v", err)
 	}
-	if created != again || created.Driver != "local-tmpfs" {
+	if created != again || created.Driver != "local-tmpfs" || created.QuotaBytes != 65536 {
 		t.Errorf("idempotent volume metadata: first=%+v second=%+v", created, again)
+	}
+	if _, err := store.EnsureVolumeWithQuota("cache", 32768); err == nil {
+		t.Fatal("EnsureVolumeWithQuota accepted a conflicting quota")
 	}
 	volumes, err := store.ListVolumes()
 	if err != nil || len(volumes) != 1 || volumes[0].Name != "cache" {

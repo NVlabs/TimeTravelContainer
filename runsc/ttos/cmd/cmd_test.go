@@ -1933,11 +1933,11 @@ func TestRemove(t *testing.T) {
 func TestVolumeCommands(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"volume", "create", "cache"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"volume", "create", "--opt", "size=64k", "cache"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("volume create status=%d stderr=%q", status, stderr.String())
 	}
-	if b.ensuredVolume != "cache" || stdout.String() != "cache\n" {
-		t.Errorf("create ensured=%q output=%q", b.ensuredVolume, stdout.String())
+	if b.ensuredVolume != "cache" || b.volumeQuota != 65536 || stdout.String() != "cache\n" {
+		t.Errorf("create ensured=%q quota=%d output=%q", b.ensuredVolume, b.volumeQuota, stdout.String())
 	}
 
 	stdout.Reset()
@@ -1956,7 +1956,7 @@ func TestVolumeCommands(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &inspected); err != nil {
 		t.Fatalf("decoding volume inspect: %v", err)
 	}
-	if len(inspected) != 1 || inspected[0].Name != "cache" || inspected[0].Driver != "local-tmpfs" {
+	if len(inspected) != 1 || inspected[0].Name != "cache" || inspected[0].Driver != "local-tmpfs" || inspected[0].QuotaBytes != 65536 {
 		t.Errorf("inspect returned %+v", inspected)
 	}
 
@@ -2911,6 +2911,7 @@ type fakeBackend struct {
 
 	volumes       []ttosbundle.VolumeInfo
 	ensuredVolume string
+	volumeQuota   int64
 	removedVolume string
 }
 
@@ -3086,7 +3087,8 @@ func (b *fakeBackend) wait(target selector) (uint32, error) {
 	return status, err
 }
 
-func (b *fakeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
+func (b *fakeBackend) ensureVolume(name string, quotaBytes int64) (ttosbundle.VolumeInfo, error) {
+	b.volumeQuota = quotaBytes
 	b.ensuredVolume = name
 	if b.err != nil {
 		return ttosbundle.VolumeInfo{}, b.err
@@ -3096,7 +3098,7 @@ func (b *fakeBackend) ensureVolume(name string) (ttosbundle.VolumeInfo, error) {
 			return volume, nil
 		}
 	}
-	volume := ttosbundle.VolumeInfo{Name: name, Driver: "local-tmpfs"}
+	volume := ttosbundle.VolumeInfo{Name: name, Driver: "local-tmpfs", QuotaBytes: quotaBytes}
 	b.volumes = append(b.volumes, volume)
 	return volume, nil
 }

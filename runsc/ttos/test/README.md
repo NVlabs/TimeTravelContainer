@@ -90,7 +90,8 @@ covers:
   eligibility recovery after exit, and detached exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
-  child branch;
+  child branch, including persisted `volume create --opt size=BYTES` quotas and
+  independent quota enforcement after live fork;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

@@ -610,7 +610,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       listing, in-use removal rejection, and removal.
 - [x] Add anonymous volumes, image-path ownership initialization, Docker copy-up
       and `volume-nocopy`, inspect projection, and `rm -v`/`--rm` cleanup.
-- [ ] Add managed-volume quotas and richer usage inspection.
+- [x] Add Docker-style managed-volume quotas with `volume create --opt
+      size=BYTES`; persist the limit, expose it in inspect, enforce it through
+      Sentry tmpfs, and clone independent remaining capacity across live fork.
+- [ ] Add richer branch-local used-byte usage inspection.
 - [x] Initial family-local semantics: attaching a name instantiates one tmpfs
       per sandbox family; the same name in unrelated families does not share
       data.

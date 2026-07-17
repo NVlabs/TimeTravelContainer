@@ -313,9 +313,10 @@ type ConsolePaths struct {
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
 // contents live in Sentry tmpfs and are not checkpointed to this store.
 type VolumeInfo struct {
-	Name      string    `json:"name"`
-	Driver    string    `json:"driver"`
-	CreatedAt time.Time `json:"created_at"`
+	Name       string    `json:"name"`
+	Driver     string    `json:"driver"`
+	QuotaBytes int64     `json:"quota_bytes,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -449,6 +450,13 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	for i := range opts.ManagedVolumes {
+		info, err := s.EnsureVolume(opts.ManagedVolumes[i].Name)
+		if err != nil {
+			return Prepared{}, err
+		}
+		opts.ManagedVolumes[i].QuotaBytes = info.QuotaBytes
+	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
@@ -486,12 +494,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: leaseID, Digest: pulled.Digest}); err != nil {
 		return Prepared{}, err
 	}
-	for _, volume := range opts.ManagedVolumes {
-		if _, err := s.EnsureVolume(volume.Name); err != nil {
-			return Prepared{}, err
-		}
-	}
-
 	bundleDir := filepath.Join(containerDir, "bundle")
 	if err := os.Mkdir(bundleDir, 0700); err != nil {
 		return Prepared{}, fmt.Errorf("creating OCI bundle: %w", err)
@@ -1110,6 +1112,14 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 
 // CreateVolume creates metadata for a family-local managed tmpfs volume.
 func (s Store) CreateVolume(name string) (VolumeInfo, error) {
+	return s.CreateVolumeWithQuota(name, 0)
+}
+
+// CreateVolumeWithQuota creates a managed volume with an optional byte limit.
+func (s Store) CreateVolumeWithQuota(name string, quotaBytes int64) (VolumeInfo, error) {
+	if quotaBytes < 0 {
+		return VolumeInfo{}, fmt.Errorf("volume quota cannot be negative: %d", quotaBytes)
+	}
 	if err := validateVolumeName(name); err != nil {
 		return VolumeInfo{}, err
 	}
@@ -1127,7 +1137,7 @@ func (s Store) CreateVolume(name string) (VolumeInfo, error) {
 			os.RemoveAll(volumeDir)
 		}
 	}()
-	info := VolumeInfo{Name: name, Driver: "local-tmpfs", CreatedAt: time.Now().UTC()}
+	info := VolumeInfo{Name: name, Driver: "local-tmpfs", QuotaBytes: quotaBytes, CreatedAt: time.Now().UTC()}
 	if err := writeJSON(filepath.Join(volumeDir, "volume.json"), &info); err != nil {
 		return VolumeInfo{}, fmt.Errorf("writing volume %q metadata: %w", name, err)
 	}
@@ -1137,19 +1147,30 @@ func (s Store) CreateVolume(name string) (VolumeInfo, error) {
 
 // EnsureVolume returns an existing volume or creates it idempotently.
 func (s Store) EnsureVolume(name string) (VolumeInfo, error) {
+	return s.EnsureVolumeWithQuota(name, 0)
+}
+
+// EnsureVolumeWithQuota creates a volume or validates an explicit quota on an existing one.
+func (s Store) EnsureVolumeWithQuota(name string, quotaBytes int64) (VolumeInfo, error) {
+	if quotaBytes < 0 {
+		return VolumeInfo{}, fmt.Errorf("volume quota cannot be negative: %d", quotaBytes)
+	}
 	info, err := s.LoadVolume(name)
 	if err == nil {
+		if quotaBytes > 0 && info.QuotaBytes != quotaBytes {
+			return VolumeInfo{}, fmt.Errorf("volume %q already exists with quota %d bytes", name, info.QuotaBytes)
+		}
 		return info, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return VolumeInfo{}, err
 	}
-	info, err = s.CreateVolume(name)
+	info, err = s.CreateVolumeWithQuota(name, quotaBytes)
 	if err == nil {
 		return info, nil
 	}
 	if errors.Is(err, os.ErrExist) {
-		return s.LoadVolume(name)
+		return s.EnsureVolumeWithQuota(name, quotaBytes)
 	}
 	return VolumeInfo{}, err
 }
@@ -1169,6 +1190,9 @@ func (s Store) LoadVolume(name string) (VolumeInfo, error) {
 	var info VolumeInfo
 	if err := json.Unmarshal(data, &info); err != nil {
 		return VolumeInfo{}, fmt.Errorf("decoding volume %q: %w", name, err)
+	}
+	if info.QuotaBytes < 0 {
+		return VolumeInfo{}, fmt.Errorf("volume %q has invalid negative quota", name)
 	}
 	if info.Name != name || info.Driver != "local-tmpfs" {
 		return VolumeInfo{}, fmt.Errorf("volume %q has invalid metadata", name)

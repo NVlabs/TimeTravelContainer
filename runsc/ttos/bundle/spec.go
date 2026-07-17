@@ -131,6 +131,7 @@ type HostMount struct {
 type ManagedVolume struct {
 	Name        string `json:"name"`
 	Destination string `json:"destination"`
+	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
 	Readonly    bool   `json:"readonly,omitempty"`
 	// Anonymous records that Name was generated for a source-less Docker
 	// volume request or an image VOLUME declaration.
@@ -771,6 +772,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			options, err := managedVolumeMountOptions(rootfs, destination, rootOwners)
 			if err != nil {
 				return nil, err
+			}
+			if volume.QuotaBytes > 0 {
+				options = append(options, fmt.Sprintf("size=%d", volume.QuotaBytes))
 			}
 			volumeOptions[volume.Name] = options
 			hint := fmt.Sprintf("dev.gvisor.spec.mount.ttos%d.", len(volumeSources)-1)
