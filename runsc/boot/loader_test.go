@@ -513,6 +513,17 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	} else if len(sessions) != 2 {
 		t.Fatalf("parent exec session count: got %d, want 2", len(sessions))
 	}
+	var legacyExecIDs []execID
+	l.mu.Lock()
+	for id := range l.processes {
+		if id.pid != 0 {
+			legacyExecIDs = append(legacyExecIDs, id)
+		}
+	}
+	l.mu.Unlock()
+	if len(legacyExecIDs) != 0 {
+		t.Fatalf("managed main-branch execs leaked into legacy Loader.processes: %+v", legacyExecIDs)
+	}
 	if _, err := l.executeAsync(&control.ExecArgs{
 		BranchID:          DefaultBranchID,
 		Filename:          "/bin/sleep",

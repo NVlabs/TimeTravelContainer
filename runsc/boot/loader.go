@@ -1718,8 +1718,9 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	defer branchDone()
 	targetKernel := branch.k
 
-	// Hold the lock for the entire operation to ensure that exec'd process is
-	// added to 'processes' in case it races with destroyContainer().
+	// Hold the lock for the entire operation so legacy OCI exec publication cannot
+	// race with destroyContainer(). TTOS-managed sessions are instead published
+	// in the selected sandboxBranch while its operation lease is held.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1868,7 +1869,9 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	keepExecSession = true
 	keepProcess = true
 
-	if targetKernel == l.k {
+	if targetKernel == l.k && args.ExecID == "" {
+		// Standard OCI exec/wait uses Loader.processes. Stable TTOS sessions are
+		// branch-owned, including when their selected branch is main.
 		eid := execID{cid: args.ContainerID, pid: tgid}
 		l.processes[eid] = &execProcess{
 			tg:  newTG,

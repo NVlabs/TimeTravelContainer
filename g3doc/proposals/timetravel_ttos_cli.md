@@ -430,18 +430,20 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ## Branch-aware process control
 
-The existing `runsc exec` path reaches `control.ExecAsync`, which can operate on
-a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
-`Loader.k`, default-branch namespaces, and a single process/TTY map.
+The standard OCI `runsc exec` path retains `Loader.processes` only for
+branch-unaware synchronous exec/wait and donated host-TTY compatibility. TTOS
+stable exec sessions select a branch Kernel and keep lifecycle, wait status, and
+internal TTY/console ownership in that `sandboxBranch`, including for `main`.
 
 - [x] Add branch ID to execute and wait-PID paths.
 - [x] Add an optional branch ID to the general process-signal RPC while
       preserving empty-selector legacy behavior. Process, process-group, all-process,
       and cloned-internal-TTY foreground-group delivery are branch-aware; internal
       terminal resize/control RPCs also carry branch IDs.
-- [ ] Move the remaining legacy main-branch OCI process bookkeeping from
-      `Loader.processes`; TTOS-managed exec lifecycle and TTY state are already owned
-      by each `sandboxBranch`.
+- [x] Keep only legacy OCI init and synchronous exec bookkeeping in
+      `Loader.processes`. Stable TTOS exec sessions are owned exclusively by each
+      `sandboxBranch`, including `main`, while Docker/OCI exec and wait remain
+      compatible.
 - [x] Reconstruct TTOS-managed exec records after fork by resolving cloned
       virtual TIDs and container/execution IDs in the child Kernel; process groups
       and controlling terminals are cloned as Kernel state.
