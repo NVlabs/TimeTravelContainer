@@ -42,6 +42,63 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 	}
 }
 
+func TestDaemonCommandNeedsMutationLock(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"fork", "--check", "demo"}, true},
+		{[]string{"pause", "demo"}, true},
+		{[]string{"container", "restart", "demo"}, true},
+		{[]string{"image", "rm", "alpine"}, true},
+		{[]string{"volume", "create", "cache"}, true},
+		{[]string{"branch", "remove", "demo"}, true},
+		{[]string{"run", "-d", "alpine"}, true},
+		{[]string{"run", "--detach=false", "alpine"}, false},
+		{[]string{"run", "alpine"}, false},
+		{[]string{"start", "demo"}, true},
+		{[]string{"start", "-ai", "demo"}, false},
+		{[]string{"start", "--attach=false", "demo"}, true},
+		{[]string{"exec", "-d", "demo", "true"}, false},
+		{[]string{"logs", "-f", "demo"}, false},
+		{[]string{"wait", "demo"}, false},
+	} {
+		if got := daemonCommandNeedsMutationLock(test.args); got != test.want {
+			t.Errorf("daemonCommandNeedsMutationLock(%q)=%t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
+func TestDaemonMutationLocksAreScopedByDataRoot(t *testing.T) {
+	server := &daemonServer{}
+	root := filepath.Join(t.TempDir(), "state")
+	unlockFirst := server.lockMutation(root, []string{"pause", "demo"})
+
+	secondAcquired := make(chan func(), 1)
+	go func() {
+		secondAcquired <- server.lockMutation(root, []string{"stop", "demo"})
+	}()
+	select {
+	case unlock := <-secondAcquired:
+		unlock()
+		t.Fatal("conflicting mutation acquired the same data-root lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlockRead := server.lockMutation(root, []string{"inspect", "demo"})
+	unlockRead()
+	unlockOther := server.lockMutation(root+"-other", []string{"stop", "demo"})
+	unlockOther()
+
+	unlockFirst()
+	select {
+	case unlock := <-secondAcquired:
+		unlock()
+	case <-time.After(5 * time.Second):
+		t.Fatal("conflicting mutation remained blocked after unlock")
+	}
+}
+
 func TestDaemonVersionedCommandTransport(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttosd.sock")
 	done := make(chan error, 1)

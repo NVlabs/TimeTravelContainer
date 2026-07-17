@@ -67,6 +67,9 @@ type daemonServer struct {
 	reconcileMu sync.Mutex
 	reconciled  map[string]bool
 
+	mutationMu    sync.Mutex
+	mutationLocks map[string]*sync.Mutex
+
 	eventMu  sync.Mutex
 	eventSeq uint64
 }
@@ -211,7 +214,11 @@ func serveDaemon(socket string, stdout, stderr io.Writer) error {
 	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN); err != nil {
 		return fmt.Errorf("unlocking daemon startup: %w", err)
 	}
-	server := &daemonServer{listener: listener, reconciled: make(map[string]bool)}
+	server := &daemonServer{
+		listener:      listener,
+		reconciled:    make(map[string]bool),
+		mutationLocks: make(map[string]*sync.Mutex),
+	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "ttosd listening on %s (API v%d)\n", socket, daemonAPIVersion)
 	}
@@ -324,10 +331,85 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	}
 	s.reconcile(backend)
+	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
+	unlock()
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
+}
+
+func daemonCommandNeedsMutationLock(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "container" {
+		args = args[1:]
+		if len(args) == 0 {
+			return false
+		}
+	}
+	switch args[0] {
+	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "kill", "stop", "restart", "fork":
+		return true
+	case "run":
+		return daemonCommandBoolFlag(args[1:], 'd', "--detach")
+	case "start":
+		return !daemonCommandBoolFlag(args[1:], 'a', "--attach")
+	case "image":
+		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
+	case "branch":
+		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
+	case "volume":
+		return len(args) > 1 && (args[1] == "create" || args[1] == "rm" || args[1] == "remove")
+	default:
+		return false
+	}
+}
+
+func daemonCommandBoolFlag(args []string, short byte, long string) bool {
+	value := false
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == long {
+			value = true
+			continue
+		}
+		if strings.HasPrefix(arg, long+"=") {
+			if parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, long+"=")); err == nil {
+				value = parsed
+			}
+			continue
+		}
+		if len(arg) > 1 && arg[0] == '-' && arg[1] != '-' && strings.ContainsRune(arg[1:], rune(short)) {
+			value = true
+		}
+	}
+	return value
+}
+
+func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
+	if !daemonCommandNeedsMutationLock(args) {
+		return func() {}
+	}
+	key := filepath.Clean(dataRoot)
+	if absolute, err := filepath.Abs(key); err == nil {
+		key = absolute
+	}
+	s.mutationMu.Lock()
+	if s.mutationLocks == nil {
+		s.mutationLocks = make(map[string]*sync.Mutex)
+	}
+	lock := s.mutationLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.mutationLocks[key] = lock
+	}
+	s.mutationMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
 }
 
 func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter) {
