@@ -35,6 +35,9 @@ covers:
 - Docker `--pids-limit` OCI and inspect persistence, Sentry-side process and
   thread enforcement without delegated host cgroups, and branch-local limit and
   task-charge inheritance across live fork;
+- repeated Docker `--ulimit NAME=SOFT[:HARD]`, including inspect persistence,
+  enforcement in the image process, and inheritance by exec sessions in both
+  sides of a live fork;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
 - Alpine dynamic linking and package-tool startup;

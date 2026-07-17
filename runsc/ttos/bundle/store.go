@@ -85,6 +85,7 @@ type ContainerInfo struct {
 	StopSignal         string          `json:"stop_signal,omitempty"`
 	StopTimeout        *int            `json:"stop_timeout,omitempty"`
 	PidsLimit          *int64          `json:"pids_limit,omitempty"`
+	Ulimits            []Ulimit        `json:"ulimits,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -206,6 +207,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopSignal:         spec.Annotations[StopSignalAnnotation],
 		StopTimeout:        cloneIntPointer(opts.StopTimeout),
 		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
+		Ulimits:            append([]Ulimit(nil), opts.Ulimits...),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}

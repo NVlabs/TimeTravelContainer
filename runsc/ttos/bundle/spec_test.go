@@ -66,6 +66,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		ReadonlyRootfs: true,
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
+		Ulimits:        []Ulimit{{Name: "core", Soft: 0, Hard: -1}, {Name: "nofile", Soft: 64, Hard: 128}},
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
 		Labels:         map[string]string{"empty": "", "extra": "value", "suite": "run"},
@@ -138,6 +139,13 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil || spec.Linux.Resources.Pids.Limit != pidsLimit {
 		t.Errorf("pids resources=%+v, want limit %d", spec.Linux.Resources, pidsLimit)
 	}
+	wantRlimits := []specs.POSIXRlimit{
+		{Type: "RLIMIT_CORE", Soft: 0, Hard: ^uint64(0)},
+		{Type: "RLIMIT_NOFILE", Soft: 64, Hard: 128},
+	}
+	if !reflect.DeepEqual(spec.Process.Rlimits, wantRlimits) {
+		t.Errorf("rlimits=%+v, want %+v", spec.Process.Rlimits, wantRlimits)
+	}
 	if got := spec.Annotations[PidsLimitAnnotation]; got != "sentry" {
 		t.Errorf("pids enforcement annotation=%q, want sentry", got)
 	}
@@ -192,6 +200,22 @@ func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
 		}
 	}
 	return false
+}
+
+func TestParseUlimits(t *testing.T) {
+	got, err := ParseUlimits([]string{"nofile=32:64", "core=0:-1", "nofile=128"})
+	if err != nil {
+		t.Fatalf("ParseUlimits: %v", err)
+	}
+	want := []Ulimit{{Name: "core", Soft: 0, Hard: -1}, {Name: "nofile", Soft: 128, Hard: 128}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ParseUlimits=%+v, want %+v", got, want)
+	}
+	for _, value := range []string{"unknown=1", "nofile", "nofile=2:1"} {
+		if _, err := ParseUlimits([]string{value}); err == nil {
+			t.Errorf("ParseUlimits(%q) succeeded", value)
+		}
+	}
 }
 
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {

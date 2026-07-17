@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	units "github.com/docker/go-units"
 	mobysignal "github.com/moby/sys/signal"
 	mobyuser "github.com/moby/sys/user"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -81,6 +83,7 @@ type SpecOptions struct {
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
 	FilesystemMounts []FilesystemMount
+	Ulimits          []Ulimit
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind.
@@ -108,6 +111,62 @@ type FilesystemMount struct {
 	Options        []string `json:"options,omitempty"`
 	HostConfig     bool     `json:"host_config,omitempty"`
 	InspectOptions string   `json:"inspect_options,omitempty"`
+}
+
+// Ulimit is the Docker inspect representation of one configured resource limit.
+type Ulimit struct {
+	Name string `json:"Name"`
+	Hard int64  `json:"Hard"`
+	Soft int64  `json:"Soft"`
+}
+
+var ulimitResourceNames = map[string]string{
+	"core": "RLIMIT_CORE", "cpu": "RLIMIT_CPU", "data": "RLIMIT_DATA",
+	"fsize": "RLIMIT_FSIZE", "locks": "RLIMIT_LOCKS", "memlock": "RLIMIT_MEMLOCK",
+	"msgqueue": "RLIMIT_MSGQUEUE", "nice": "RLIMIT_NICE", "nofile": "RLIMIT_NOFILE",
+	"nproc": "RLIMIT_NPROC", "rss": "RLIMIT_RSS", "rtprio": "RLIMIT_RTPRIO",
+	"rttime": "RLIMIT_RTTIME", "sigpending": "RLIMIT_SIGPENDING", "stack": "RLIMIT_STACK",
+}
+
+// ParseUlimits applies Docker parsing and last-value-wins semantics.
+func ParseUlimits(values []string) ([]Ulimit, error) {
+	byName := make(map[string]Ulimit, len(values))
+	for _, value := range values {
+		parsed, err := units.ParseUlimit(value)
+		if err != nil {
+			return nil, err
+		}
+		byName[parsed.Name] = Ulimit{Name: parsed.Name, Hard: parsed.Hard, Soft: parsed.Soft}
+	}
+	result := make([]Ulimit, 0, len(byName))
+	for _, limit := range byName {
+		result = append(result, limit)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+func buildRlimits(configured []Ulimit) ([]specs.POSIXRlimit, error) {
+	byName := map[string]specs.POSIXRlimit{
+		"nofile": {Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024},
+	}
+	for _, limit := range configured {
+		resource, ok := ulimitResourceNames[limit.Name]
+		if !ok {
+			return nil, fmt.Errorf("invalid ulimit type: %s", limit.Name)
+		}
+		byName[limit.Name] = specs.POSIXRlimit{Type: resource, Hard: uint64(limit.Hard), Soft: uint64(limit.Soft)}
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]specs.POSIXRlimit, 0, len(names))
+	for _, name := range names {
+		result = append(result, byName[name])
+	}
+	return result, nil
 }
 
 // BuildSpec combines an OCI image configuration with ttos run overrides.
@@ -225,6 +284,10 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	annotations["dev.timetravelos.config.cmd"] = string(commandJSON)
 	annotations["dev.timetravelos.config.user"] = userSpec
 	annotations["dev.timetravelos.config.labels"] = string(labelsJSON)
+	rlimits, err := buildRlimits(opts.Ulimits)
+	if err != nil {
+		return nil, err
+	}
 	stopSignal := opts.StopSignal
 	if stopSignal == "" {
 		stopSignal = image.Config.StopSignal
@@ -360,11 +423,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 				Effective: append([]string(nil), defaultCapabilities...),
 				Permitted: append([]string(nil), defaultCapabilities...),
 			},
-			Rlimits: []specs.POSIXRlimit{{
-				Type: "RLIMIT_NOFILE",
-				Hard: 1024,
-				Soft: 1024,
-			}},
+			Rlimits: rlimits,
 		},
 		Hostname:    hostname,
 		Mounts:      mounts,

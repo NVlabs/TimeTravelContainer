@@ -15,6 +15,7 @@ go_library(
     deps = [
         "//runsc/ttos/images",
         "//runsc/ttos/ownership",
+        "@com_github_docker_go_units//:go_default_library",
         "@com_github_moby_sys_signal//:go_default_library",
         "@com_github_moby_sys_user//:user",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",

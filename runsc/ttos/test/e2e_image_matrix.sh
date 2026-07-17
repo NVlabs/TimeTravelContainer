@@ -246,8 +246,10 @@ ttos run --name "$PREFIX-alpine" --user 123:456 "$ALPINE_IMAGE" sh -c \
    echo alpine-nonroot-ok'
 ttos rm "$PREFIX-alpine"
 
-ttos run --name "$PREFIX-python" "$PYTHON_IMAGE" python3 -c \
-  'import json, sqlite3, threading; db=sqlite3.connect(":memory:"); db.execute("create table t(v)"); db.execute("insert into t values (7)"); assert db.execute("select v from t").fetchone()[0] == 7; t=threading.Thread(target=lambda: json.dumps({"ok": True})); t.start(); t.join(); print("python-ok")'
+ttos run --name "$PREFIX-python" --ulimit nofile=64:128 --ulimit core=0 "$PYTHON_IMAGE" python3 -c \
+  'import json, resource, sqlite3, threading; assert resource.getrlimit(resource.RLIMIT_NOFILE) == (64, 128); assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0); db=sqlite3.connect(":memory:"); db.execute("create table t(v)"); db.execute("insert into t values (7)"); assert db.execute("select v from t").fetchone()[0] == 7; t=threading.Thread(target=lambda: json.dumps({"ok": True})); t.start(); t.join(); print("python-ok")'
+[ "$(ttos inspect -f '{{len .HostConfig.Ulimits}}|{{(index .HostConfig.Ulimits 0).Name}}|{{(index .HostConfig.Ulimits 0).Soft}}|{{(index .HostConfig.Ulimits 0).Hard}}|{{(index .HostConfig.Ulimits 1).Name}}|{{(index .HostConfig.Ulimits 1).Soft}}|{{(index .HostConfig.Ulimits 1).Hard}}' "$PREFIX-python")" = "2|core|0|0|nofile|64|128" ] ||
+  fail "inspect did not retain sorted Docker ulimits"
 ttos rm "$PREFIX-python"
 
 echo "== rootless Sentry PID limit and branch-local inheritance =="
@@ -365,6 +367,7 @@ ttos rm "$CONSOLE_STRESS"
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
 LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
+  --ulimit nofile=256:256 \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
@@ -421,6 +424,8 @@ if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null
 fi
 ttos fork --check "$LIFECYCLE_PREFIX"
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
+[ "$(ttos exec "$LIFECYCLE" sh -c "ulimit -n")" = 256 ] || fail "parent exec did not inherit RLIMIT_NOFILE"
+[ "$(ttos exec "$LIFECYCLE@child" sh -c "ulimit -n")" = 256 ] || fail "live-forked child exec did not inherit RLIMIT_NOFILE"
 
 RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
 [ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||

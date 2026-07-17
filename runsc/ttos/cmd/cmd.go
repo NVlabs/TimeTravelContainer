@@ -1104,6 +1104,7 @@ type runRequest struct {
 	stopSignal         string
 	stopTimeout        int
 	pidsLimit          *int64
+	ulimits            []ttosbundle.Ulimit
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -1153,7 +1154,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1190,8 +1191,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
-	var logOptions stringSlice
+	var logOptions, ulimitValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
+	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1232,6 +1234,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedUlimits, err := ttosbundle.ParseUlimits(ulimitValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1261,6 +1267,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
+		ulimits:            parsedUlimits,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1289,7 +1296,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1324,8 +1331,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
-	var logOptions stringSlice
+	var logOptions, ulimitValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
+	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1366,6 +1374,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedUlimits, err := ttosbundle.ParseUlimits(ulimitValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1395,6 +1407,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		stopSignal:         *stopSignal,
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
+		ulimits:            parsedUlimits,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -1868,14 +1881,15 @@ type InspectConfig struct {
 
 // InspectHostConfig is the subset of Docker host configuration implemented by TTOS.
 type InspectHostConfig struct {
-	Binds          []string          `json:"Binds"`
-	NetworkMode    string            `json:"NetworkMode"`
-	AutoRemove     bool              `json:"AutoRemove"`
-	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
-	StopTimeout    *int              `json:"StopTimeout"`
-	PidsLimit      *int64            `json:"PidsLimit"`
-	Runtime        string            `json:"Runtime"`
-	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
+	Binds          []string            `json:"Binds"`
+	NetworkMode    string              `json:"NetworkMode"`
+	AutoRemove     bool                `json:"AutoRemove"`
+	ReadonlyRootfs bool                `json:"ReadonlyRootfs"`
+	StopTimeout    *int                `json:"StopTimeout"`
+	PidsLimit      *int64              `json:"PidsLimit"`
+	Ulimits        []ttosbundle.Ulimit `json:"Ulimits"`
+	Runtime        string              `json:"Runtime"`
+	Tmpfs          map[string]string   `json:"Tmpfs,omitempty"`
 }
 
 // InspectMount is a Docker-compatible user mount description.
@@ -3635,6 +3649,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
+			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
 			ManagedVolumes:   request.managedVolumes,
 			HostMounts:       request.hostMounts,
@@ -3679,6 +3694,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
+			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			ManagedVolumes:   request.managedVolumes,
@@ -4923,7 +4939,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{

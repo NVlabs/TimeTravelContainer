@@ -183,6 +183,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       Docker inspect metadata, and enforce it inside the Sentry for both processes
       and threads without requiring delegated host cgroups. Live forks inherit an
       independent limit and current task charge in every branch.
+- [x] Support repeated Docker `run/create --ulimit NAME=SOFT[:HARD]`, including
+      Docker resource names, infinity, duplicate last-value-wins behavior, OCI
+      projection, and persistent inspect metadata. Sentry enforcement applies to
+      the init process and exec sessions, and live forks inherit the limits.
 - [ ] Add CPU, memory, and other resource-limit flags. Rootless enforcement must
       use delegated host cgroup v2 controllers or equivalent Sentry accounting;
       do not expose parse-only limits.
@@ -527,8 +531,8 @@ Reject            unsupported, externally mutable, or host/device-backed
       Docker-like lifecycle commands and inspect across created, running,
       forked, paused, and exited states; live fork; managed-volume CoW;
       read-only host binds; distinct Redis lower-layer ownership; exact quick-exit
-      console integrity; Sentry-enforced PID limits across live fork; and the
-      explicit no-userns fallback.
+      console integrity; Sentry-enforced PID limits and Docker ulimits across
+      live fork; and the explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 
