@@ -4,6 +4,9 @@
 unmodified public Docker images through the complete TTOS path. It currently
 covers:
 
+- Docker-compatible run/create pull policies: explicit refresh with
+  `--pull=always`, cached startup with `--pull=never`, missing-image rejection,
+  and default local reuse after the initial matrix pull;
 - Docker-style image inventory, quiet IDs, JSON output, and materialized-root
   inspection;
 - Docker-compatible 64-hex container IDs from `create` and detached `run`,

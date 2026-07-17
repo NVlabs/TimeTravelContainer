@@ -117,6 +117,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Default rootless pulls to the containerd content store without requesting
       snapshotter unpack; retain explicit `--unpack` for environments where the
       selected snapshotter's mount requirements are available.
+- [x] Make `run` and `create` use Docker-compatible `--pull=missing` by
+      default, reusing local tag or unambiguous image-ID records without
+      registry access. Support explicit `--pull=always` refresh and
+      offline-enforcing `--pull=never`, with requested-platform matching.
 - [ ] Integrate registry authentication and Docker-compatible credential
       helpers without storing plaintext credentials in the state database.
 - [ ] Show pull/unpack progress and content reuse.

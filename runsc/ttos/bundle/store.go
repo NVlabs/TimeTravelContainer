@@ -50,6 +50,7 @@ type PrepareOptions struct {
 	SpecOptions
 	Reference          string
 	Platform           string
+	PullPolicy         string
 	ConsoleLogMaxBytes int64
 	ConsoleLogMaxFiles int
 	OpenStdin          bool
@@ -105,8 +106,8 @@ type VolumeInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Prepare pulls content, creates or reuses an immutable root, and writes a new
-// container bundle. Existing container names are rejected.
+// Prepare resolves or pulls content, creates or reuses an immutable root, and
+// writes a new container bundle. Existing container names are rejected.
 func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, error) {
 	networkMode, err := normalizeNetworkMode(opts.NetworkMode)
 	if err != nil {
@@ -125,13 +126,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
 		}
 	}
-	pulled, err := images.Pull(ctx, images.PullOptions{
-		Address:   s.Address,
-		Namespace: s.Namespace,
-		Reference: opts.Reference,
-		Platform:  opts.Platform,
-		Unpack:    false,
-	})
+	pulled, err := s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -602,6 +597,67 @@ func (s Store) RemoveVolume(name string) error {
 		return fmt.Errorf("removing volume %q: %w", name, err)
 	}
 	return nil
+}
+
+func normalizePullPolicy(policy string) (string, error) {
+	if policy == "" {
+		policy = "missing"
+	}
+	switch policy {
+	case "missing", "always", "never":
+		return policy, nil
+	default:
+		return "", fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", policy)
+	}
+}
+
+func (s Store) resolveImage(ctx context.Context, reference, platform, policy string) (images.Info, error) {
+	policy, err := normalizePullPolicy(policy)
+	if err != nil {
+		return images.Info{}, err
+	}
+	if policy != "always" {
+		stored, err := images.List(ctx, images.ListOptions{Address: s.Address, Namespace: s.Namespace})
+		if err != nil {
+			return images.Info{}, err
+		}
+		match, found, err := selectStoredImage(stored, reference, platform)
+		if err != nil {
+			return images.Info{}, err
+		}
+		if found {
+			return match, nil
+		}
+		if policy == "never" {
+			if platform == "" {
+				return images.Info{}, fmt.Errorf("image %q is not present locally and pull policy is never", reference)
+			}
+			return images.Info{}, fmt.Errorf("image %q for platform %s is not present locally and pull policy is never", reference, platform)
+		}
+	}
+	return images.Pull(ctx, images.PullOptions{
+		Address:   s.Address,
+		Namespace: s.Namespace,
+		Reference: reference,
+		Platform:  platform,
+		Unpack:    false,
+	})
+}
+
+func selectStoredImage(stored []images.Info, reference, platform string) (images.Info, bool, error) {
+	matches, err := images.Resolve(stored, reference)
+	if err != nil {
+		if errors.Is(err, images.ErrNotFound) {
+			return images.Info{}, false, nil
+		}
+		return images.Info{}, false, err
+	}
+	for _, match := range matches {
+		if platform == "" || match.Platform == platform {
+			return match, true, nil
+		}
+	}
+	return images.Info{}, false, nil
 }
 
 func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string) (images.RootFSInfo, string, error) {

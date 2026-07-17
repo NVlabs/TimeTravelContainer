@@ -1084,6 +1084,7 @@ type runRequest struct {
 	name               string
 	reference          string
 	platform           string
+	pullPolicy         string
 	args               []string
 	env                []string
 	labels             map[string]string
@@ -1137,11 +1138,12 @@ type exitStatus struct{ code int }
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
 	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	pullPolicy := fs.String("pull", "missing", "pull policy: missing, always, or never")
 	detach := fs.Bool("detach", false, "run in the background")
 	fs.BoolVar(detach, "d", false, "run in the background")
 	interactive := fs.Bool("interactive", false, "keep stdin open")
@@ -1189,6 +1191,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	if *pullPolicy != "missing" && *pullPolicy != "always" && *pullPolicy != "never" {
+		return fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", *pullPolicy)
+	}
 	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
 		return err
@@ -1205,6 +1210,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		name:               containerName,
 		reference:          fs.Arg(0),
 		platform:           *platform,
+		pullPolicy:         *pullPolicy,
 		args:               append([]string(nil), fs.Args()[1:]...),
 		env:                envValues,
 		labels:             labelValues,
@@ -1244,11 +1250,12 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
 	platform := fs.String("platform", "", "target platform, such as linux/amd64")
+	pullPolicy := fs.String("pull", "missing", "pull policy: missing, always, or never")
 	interactive := fs.Bool("interactive", false, "keep stdin open")
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
 	terminal := fs.Bool("tty", false, "allocate a terminal")
@@ -1294,6 +1301,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	if *pullPolicy != "missing" && *pullPolicy != "always" && *pullPolicy != "never" {
+		return fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", *pullPolicy)
+	}
 	parsedMounts, err := parseMountRequests(volumes, mounts, tmpfsMounts)
 	if err != nil {
 		return err
@@ -1310,6 +1320,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		name:               containerName,
 		reference:          fs.Arg(0),
 		platform:           *platform,
+		pullPolicy:         *pullPolicy,
 		args:               append([]string(nil), fs.Args()[1:]...),
 		env:                envValues,
 		labels:             labelValues,
@@ -3537,6 +3548,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
+		PullPolicy:         request.pullPolicy,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
@@ -3576,6 +3588,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
+		PullPolicy:         request.pullPolicy,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,

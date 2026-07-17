@@ -131,7 +131,7 @@ done
 [ "$(ttos images -q | wc -l)" -ge 5 ] || fail "quiet image inventory omitted an image ID"
 
 echo "== automatic container removal =="
-ttos run --rm --name "$AUTO_FOREGROUND" "$BUSYBOX_IMAGE" true
+ttos run --rm --pull always --name "$AUTO_FOREGROUND" "$BUSYBOX_IMAGE" true
 if ttos inspect "$AUTO_FOREGROUND" >/dev/null 2>&1; then
   fail "foreground --rm retained its container"
 fi
@@ -155,7 +155,11 @@ while ttos inspect "$AUTO_CREATED" >/dev/null 2>&1; do
 done
 
 echo "== one-shot compatibility probes =="
-BUSYBOX_ID=$(ttos create --name "$PREFIX-busybox" \
+if ttos create --pull never --name "$PREFIX-never-missing" "registry.invalid/ttos/missing:latest" true >/dev/null 2>&1; then
+  fail "--pull never unexpectedly created a missing image"
+fi
+
+BUSYBOX_ID=$(ttos create --pull never --name "$PREFIX-busybox" \
   --env-file "$ENV_FILE" --env FROM_FILE=direct \
   --label-file "$LABEL_FILE" --label suite=create \
   "$BUSYBOX_IMAGE" sh -c \

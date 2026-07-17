@@ -17,6 +17,7 @@ package images
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,6 +26,13 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	distref "github.com/distribution/reference"
+)
+
+var (
+	// ErrNotFound indicates that an image selector matched no stored record.
+	ErrNotFound = errors.New("image not found")
+	// ErrAmbiguous indicates that an image ID prefix matched multiple digests.
+	ErrAmbiguous = errors.New("ambiguous image identifier")
 )
 
 // PullOptions controls image resolution, download, and unpacking.
@@ -195,7 +203,7 @@ func Resolve(infos []Info, identifier string) ([]Info, error) {
 	}
 	prefix, digestSelector := digestPrefix(identifier)
 	if !digestSelector {
-		return nil, fmt.Errorf("image %q does not exist", identifier)
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, identifier)
 	}
 	byDigest := make(map[string][]Info)
 	for _, info := range infos {
@@ -204,10 +212,10 @@ func Resolve(infos []Info, identifier string) ([]Info, error) {
 		}
 	}
 	if len(byDigest) == 0 {
-		return nil, fmt.Errorf("image %q does not exist", identifier)
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, identifier)
 	}
 	if len(byDigest) > 1 {
-		return nil, fmt.Errorf("image identifier %q is ambiguous", identifier)
+		return nil, fmt.Errorf("%w: %q", ErrAmbiguous, identifier)
 	}
 	for _, matches := range byDigest {
 		sort.Slice(matches, func(i, j int) bool { return matches[i].Reference < matches[j].Reference })

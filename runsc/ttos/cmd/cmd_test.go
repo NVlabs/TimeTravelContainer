@@ -523,14 +523,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -688,6 +688,19 @@ func TestRunAndCreateRejectInvalidEnvironmentAndLabelFiles(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateRejectInvalidPullPolicy(t *testing.T) {
+	for _, command := range []string{"run", "create"} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand([]string{command, "--pull", "sometimes", "busybox"}, &stdout, &stderr, b); status != 1 {
+			t.Errorf("%s invalid pull policy status=%d, want 1", command, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("%s invalid pull policy invoked backend with %+v", command, b.runRequest)
+		}
+	}
+}
+
 func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--network", "bridge", "busybox"},
@@ -774,7 +787,7 @@ func TestCreateAndStart(t *testing.T) {
 	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {

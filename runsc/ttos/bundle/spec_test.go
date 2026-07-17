@@ -16,6 +16,7 @@ package bundle
 
 import (
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +26,7 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
@@ -225,6 +227,46 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), NetworkMode: "bridge"}); err == nil {
 		t.Error("BuildSpec accepted unsupported network mode")
+	}
+}
+
+func TestPullPolicyAndStoredImageSelection(t *testing.T) {
+	for _, policy := range []string{"", "missing", "always", "never"} {
+		got, err := normalizePullPolicy(policy)
+		if err != nil {
+			t.Errorf("normalizePullPolicy(%q): %v", policy, err)
+		}
+		if policy == "" && got != "missing" || policy != "" && got != policy {
+			t.Errorf("normalizePullPolicy(%q)=%q", policy, got)
+		}
+	}
+	if _, err := normalizePullPolicy("sometimes"); err == nil {
+		t.Fatal("normalizePullPolicy accepted an unsupported policy")
+	}
+
+	digestA := "sha256:" + strings.Repeat("a", 64)
+	digestB := "sha256:aaaa" + strings.Repeat("b", 60)
+	stored := []ttosimages.Info{
+		{Reference: "docker.io/library/alpine:3.20", Digest: digestA, Platform: "linux/amd64"},
+		{Reference: "docker.io/library/alpine:latest", Digest: digestA, Platform: "linux/amd64"},
+		{Reference: "docker.io/library/alternate:latest", Digest: digestB, Platform: "linux/arm64"},
+	}
+	got, found, err := selectStoredImage(stored, "alpine:3.20", "linux/amd64")
+	if err != nil || !found || got.Reference != "docker.io/library/alpine:3.20" {
+		t.Fatalf("selectStoredImage by name=(%+v, %t, %v)", got, found, err)
+	}
+	got, found, err = selectStoredImage(stored, strings.Repeat("a", 12), "linux/amd64")
+	if err != nil || !found || got.Digest != digestA {
+		t.Fatalf("selectStoredImage by digest=(%+v, %t, %v)", got, found, err)
+	}
+	if _, found, err := selectStoredImage(stored, "alpine:3.20", "linux/arm64"); err != nil || found {
+		t.Errorf("platform mismatch=(found=%t, err=%v)", found, err)
+	}
+	if _, found, err := selectStoredImage(stored, "missing:latest", ""); err != nil || found {
+		t.Errorf("missing image=(found=%t, err=%v)", found, err)
+	}
+	if _, _, err := selectStoredImage(stored, "aaaa", ""); !errors.Is(err, ttosimages.ErrAmbiguous) {
+		t.Errorf("ambiguous prefix error=%v", err)
 	}
 }
 
