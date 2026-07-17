@@ -118,6 +118,9 @@ const (
 	// ContMgrBranchRootfsSize gets writable rootfs usage in one branch.
 	ContMgrBranchRootfsSize = "containerManager.BranchRootfsSize"
 
+	// ContMgrBranchFilesystemSize gets writable usage for a mounted filesystem.
+	ContMgrBranchFilesystemSize = "containerManager.BranchFilesystemSize"
+
 	// ContMgrBranchSignal sends a signal within one in-memory branch.
 	ContMgrBranchSignal = "containerManager.BranchSignal"
 
@@ -1016,6 +1019,11 @@ func (cm *containerManager) BranchProcesses(args *BranchProcessesArgs, out *[]*c
 // BranchRootfsSize returns writable rootfs usage from one branch.
 func (cm *containerManager) BranchRootfsSize(args *BranchRootfsSizeArgs, out *control.RootfsSize) error {
 	return cm.l.family.RootfsSize(args.BranchID, args.CID, out)
+}
+
+// BranchFilesystemSize returns writable filesystem usage from one branch.
+func (cm *containerManager) BranchFilesystemSize(args *BranchFilesystemSizeArgs, out *control.FilesystemSize) error {
+	return cm.l.family.FilesystemSize(args.BranchID, args.CID, args.Path, out)
 }
 
 // BranchSignal sends a signal within one branch.

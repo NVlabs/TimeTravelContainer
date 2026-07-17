@@ -310,13 +310,26 @@ type ConsolePaths struct {
 	PID            string
 }
 
+// VolumeUsage is branch-local logical usage for one attachment of a managed
+// volume. Repeated aliases intentionally report the same UsedBytes value.
+type VolumeUsage struct {
+	Container   string `json:"container"`
+	Branch      string `json:"branch"`
+	Destination string `json:"destination"`
+	UsedBytes   uint64 `json:"used_bytes"`
+	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
+	Readonly    bool   `json:"readonly,omitempty"`
+}
+
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
-// contents live in Sentry tmpfs and are not checkpointed to this store.
+// contents live in Sentry tmpfs and are not checkpointed to this store. Usage
+// is populated dynamically by volume inspect --usage and is never persisted.
 type VolumeInfo struct {
-	Name       string    `json:"name"`
-	Driver     string    `json:"driver"`
-	QuotaBytes int64     `json:"quota_bytes,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	Name       string         `json:"name"`
+	Driver     string         `json:"driver"`
+	QuotaBytes int64          `json:"quota_bytes,omitempty"`
+	CreatedAt  time.Time      `json:"created_at"`
+	Usage      *[]VolumeUsage `json:"usage,omitempty"`
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

@@ -35,7 +35,10 @@ branch-local Sentry-memory OverlayFS upper over the user-attested immutable host
 lower; ordinary writable Docker binds remain rejected to avoid silently changing
 their host-write semantics.
 Named managed tmpfs volumes can be attached at one or
-more paths, and their state forks CoW with each live branch. Containers default
+more paths, and their state forks CoW with each live branch. `ttos volume inspect
+--usage CONTAINER[@BRANCH] VOLUME` resolves the selected live branch and
+reports logical used bytes for every destination alias without walking or
+serializing the volume. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
 validation as an external resource. An opt-in internal-console substrate now provides branch-local Sentry pipes for
@@ -613,7 +616,9 @@ closure validation before shared-memory or address-space CoW preparation. Reject
 - [x] Add Docker-style managed-volume quotas with `volume create --opt
       size=BYTES`; persist the limit, expose it in inspect, enforce it through
       Sentry tmpfs, and clone independent remaining capacity across live fork.
-- [ ] Add richer branch-local used-byte usage inspection.
+- [x] Add branch-local logical used-byte inspection with `ttos volume inspect
+      --usage CONTAINER[@BRANCH] VOLUME`, including alias destinations,
+      read-only flags, quota context, and parent/child post-fork divergence.
 - [x] Initial family-local semantics: attaching a name instantiates one tmpfs
       per sandbox family; the same name in unrelated families does not share
       data.

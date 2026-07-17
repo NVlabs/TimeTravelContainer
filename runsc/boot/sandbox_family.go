@@ -103,6 +103,14 @@ type BranchRootfsSizeArgs struct {
 	CID      string
 }
 
+// BranchFilesystemSizeArgs selects a mounted filesystem inside one container
+// and live branch.
+type BranchFilesystemSizeArgs struct {
+	BranchID string
+	CID      string
+	Path     string
+}
+
 // BranchWaitArgs selects a process inside one live branch. PID 0 selects the
 // container init process.
 type BranchWaitArgs struct {
@@ -912,6 +920,17 @@ func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) erro
 	}
 	defer done()
 	return control.RootfsUpperLayerSize(b.k, cid, out)
+}
+
+// FilesystemSize returns branch-local logical writable usage for the
+// filesystem containing path.
+func (f *SandboxFamily) FilesystemSize(id, cid, path string, out *control.FilesystemSize) error {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return control.FilesystemWritableSize(b.k, cid, path, out)
 }
 
 // Signal sends a signal within one branch. Foreground process-group delivery

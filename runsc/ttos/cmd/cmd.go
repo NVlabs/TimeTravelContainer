@@ -3936,14 +3936,35 @@ func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 		return nil
 	case "inspect":
-		if len(args) < 2 {
-			return errors.New("usage: ttos volume inspect VOLUME [VOLUME...]")
+		fs := flag.NewFlagSet("volume inspect", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		usageTarget := fs.String("usage", "", "include branch-local usage for CONTAINER[@BRANCH]")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		volumes := make([]ttosbundle.VolumeInfo, 0, len(args)-1)
-		for _, name := range args[1:] {
+		if fs.NArg() == 0 {
+			return errors.New("usage: ttos volume inspect [--usage CONTAINER[@BRANCH]] VOLUME [VOLUME...]")
+		}
+		var target selector
+		if *usageTarget != "" {
+			var err error
+			target, err = parseSelector(*usageTarget)
+			if err != nil {
+				return fmt.Errorf("invalid usage target: %w", err)
+			}
+		}
+		volumes := make([]ttosbundle.VolumeInfo, 0, fs.NArg())
+		for _, name := range fs.Args() {
 			volume, err := backend.inspectVolume(name)
 			if err != nil {
 				return err
+			}
+			if *usageTarget != "" {
+				usage, err := backend.volumeUsage(target, name)
+				if err != nil {
+					return err
+				}
+				volume.Usage = &usage
 			}
 			volumes = append(volumes, volume)
 		}
@@ -4198,6 +4219,7 @@ type backend interface {
 	ensureVolume(name string, quotaBytes int64) (ttosbundle.VolumeInfo, error)
 	listVolumes() ([]ttosbundle.VolumeInfo, error)
 	inspectVolume(name string) (ttosbundle.VolumeInfo, error)
+	volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error)
 	removeVolume(name string) error
 }
 
@@ -6463,6 +6485,44 @@ func (b *runtimeBackend) listVolumes() ([]ttosbundle.VolumeInfo, error) {
 
 func (b *runtimeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) {
 	return (ttosbundle.Store{Root: b.dataRoot}).LoadVolume(name)
+}
+
+func (b *runtimeBackend) volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error) {
+	resolved, container, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	var usages []ttosbundle.VolumeUsage
+	seen := make(map[string]bool)
+	for _, attachment := range container.Volumes {
+		if attachment.Name != name || seen[attachment.Destination] {
+			continue
+		}
+		seen[attachment.Destination] = true
+		output, err := b.command(
+			"timetravel", "--path", attachment.Destination,
+			resolved.container, "filesystem-size", resolved.branch,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("getting usage for volume %q at %s in %s: %w", name, attachment.Destination, target, err)
+		}
+		var size struct {
+			WritableBytes uint64 `json:"writable_bytes"`
+		}
+		if err := json.Unmarshal(output, &size); err != nil {
+			return nil, fmt.Errorf("decoding usage for volume %q at %s: %w", name, attachment.Destination, err)
+		}
+		usages = append(usages, ttosbundle.VolumeUsage{
+			Container: container.Name, Branch: resolved.branch,
+			Destination: attachment.Destination, UsedBytes: size.WritableBytes,
+			QuotaBytes: attachment.QuotaBytes, Readonly: attachment.Readonly,
+		})
+	}
+	if len(usages) == 0 {
+		return nil, fmt.Errorf("volume %q is not attached to %s", name, target)
+	}
+	sort.Slice(usages, func(i, j int) bool { return usages[i].Destination < usages[j].Destination })
+	return usages, nil
 }
 
 func (b *runtimeBackend) removeVolume(name string) error {

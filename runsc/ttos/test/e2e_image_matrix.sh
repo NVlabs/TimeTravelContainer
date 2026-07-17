@@ -41,6 +41,10 @@ container_id_valid() {
   esac
 }
 
+volume_used_bytes() {
+  ttos volume inspect --usage "$1" "$2" | grep used_bytes | tr -cd "0123456789"
+}
+
 [ -n "$TTOS" ] || fail "set TTOS to the ttos binary"
 [ -x "$TTOS" ] || fail "TTOS is not executable: $TTOS"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
@@ -451,9 +455,16 @@ echo "== managed-volume quota enforcement across live fork =="
 ttos volume create --opt size=64k "$QUOTA_VOLUME"
 ttos run --detach --name "$QUOTA_CONTAINER" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota,volume-nocopy" "$BUSYBOX_IMAGE" sh -c "sleep 300" >/dev/null
 ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/base bs=4096 count=15 2>/dev/null"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "initial managed-volume usage is incorrect"
 ttos fork "$QUOTA_CONTAINER" child
+[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "fork changed parent managed-volume usage"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 61440 ] || fail "fork did not clone child managed-volume usage"
 ttos exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/child bs=4096 count=1 2>/dev/null"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "child write changed parent managed-volume usage"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "child managed-volume usage did not diverge"
 ttos exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/parent bs=4096 count=1 2>/dev/null"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 65536 ] || fail "parent managed-volume usage did not advance independently"
+[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "parent write changed child managed-volume usage"
 if ttos exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/overflow bs=4096 count=1 2>/dev/null"; then
   fail "child managed-volume quota was not enforced"
 fi

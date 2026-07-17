@@ -44,6 +44,7 @@ import (
 type TimeTravel struct {
 	containerLoader
 	source                string
+	path                  string
 	paused                bool
 	pid                   int
 	execID                string
@@ -84,7 +85,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> check <branch-id>\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
-		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
+		"timetravel [flags] <container-id> ps|size|filesystem-size|signal|wait <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
@@ -92,6 +93,7 @@ func (*TimeTravel) Usage() string {
 // SetFlags implements subcommands.Command.SetFlags.
 func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.source, "source", boot.DefaultBranchID, "source branch for fork")
+	f.StringVar(&t.path, "path", "", "container path for filesystem-size")
 	f.BoolVar(&t.paused, "paused", false, "leave a forked branch paused")
 	f.IntVar(&t.pid, "pid", 0, "virtual process ID; 0 selects the container init")
 	f.StringVar(&t.execID, "exec-id", "", "stable branch-local exec session ID")
@@ -206,6 +208,12 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.BranchProcesses(f.Arg(2), cont.ID)
 	case "size":
 		output, err = cont.Sandbox.BranchRootfsSize(f.Arg(2), cont.ID)
+	case "filesystem-size":
+		if t.path == "" {
+			err = fmt.Errorf("filesystem-size requires --path")
+		} else {
+			output, err = cont.Sandbox.BranchFilesystemSize(f.Arg(2), cont.ID, t.path)
+		}
 	case "signal":
 		mode := boot.DeliverToProcess
 		if t.all {

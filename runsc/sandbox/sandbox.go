@@ -2102,6 +2102,16 @@ func (s *Sandbox) BranchRootfsSize(branchID, cid string) (control.RootfsSize, er
 	return size, nil
 }
 
+// BranchFilesystemSize gets logical writable usage for a mounted filesystem.
+func (s *Sandbox) BranchFilesystemSize(branchID, cid, path string) (control.FilesystemSize, error) {
+	args := &boot.BranchFilesystemSizeArgs{BranchID: branchID, CID: cid, Path: path}
+	var size control.FilesystemSize
+	if err := s.call(boot.ContMgrBranchFilesystemSize, args, &size); err != nil {
+		return control.FilesystemSize{}, fmt.Errorf("getting filesystem size at %q in live branch %q: %w", path, branchID, err)
+	}
+	return size, nil
+}
+
 // SignalBranch sends a signal within one in-memory branch.
 func (s *Sandbox) SignalBranch(args *boot.BranchSignalArgs) error {
 	if err := s.call(boot.ContMgrBranchSignal, args, nil); err != nil {

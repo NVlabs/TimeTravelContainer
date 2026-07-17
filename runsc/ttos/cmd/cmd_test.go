@@ -1960,6 +1960,22 @@ func TestVolumeCommands(t *testing.T) {
 		t.Errorf("inspect returned %+v", inspected)
 	}
 
+	b.volumeUsageResult = []ttosbundle.VolumeUsage{{
+		Container: "demo", Branch: "child", Destination: "/cache",
+		UsedBytes: 12288, QuotaBytes: 65536,
+	}}
+	stdout.Reset()
+	if status := runCommand([]string{"volume", "inspect", "--usage", "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("volume inspect usage status=%d stderr=%q", status, stderr.String())
+	}
+	inspected = nil
+	if err := json.Unmarshal(stdout.Bytes(), &inspected); err != nil {
+		t.Fatalf("decoding volume usage inspect: %v", err)
+	}
+	if b.volumeUsageTarget != (selector{container: "demo", branch: "child"}) || b.volumeUsageName != "cache" || len(inspected) != 1 || inspected[0].Usage == nil || len(*inspected[0].Usage) != 1 || (*inspected[0].Usage)[0].UsedBytes != 12288 {
+		t.Errorf("usage target=%+v name=%q inspect=%+v", b.volumeUsageTarget, b.volumeUsageName, inspected)
+	}
+
 	stdout.Reset()
 	if status := runCommand([]string{"volume", "rm", "cache"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("volume rm status=%d stderr=%q", status, stderr.String())
@@ -2399,6 +2415,10 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "size" ] && [ "$6" = 
 	echo '{"writable_bytes":32768}'
 	exit 0
 fi
+if [ "$3" = "timetravel" ] && [ "$4" = "--path" ] && { [ "$5" = "/cache" ] || [ "$5" = "/cache-ro" ]; } && [ "$6" = "web" ] && [ "$7" = "filesystem-size" ] && [ "$8" = "child" ]; then
+	echo '{"writable_bytes":12288}'
+	exit 0
+fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "check" ] && [ "$6" = "child" ]; then
 	echo '{"eligible":true}'
 	exit 0
@@ -2428,7 +2448,7 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(), Volumes: []ttosbundle.ManagedVolume{{Name: "cache", Destination: "/cache", QuotaBytes: 65536}, {Name: "cache", Destination: "/cache-ro", QuotaBytes: 65536, Readonly: true}}})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
 	}
@@ -2461,6 +2481,13 @@ exit 2
 	}
 	if got, err := b.rootfsSize(selector{container: "web", branch: "child"}); err != nil || got != 32768 {
 		t.Fatalf("rootfsSize(child)=(%d, %v), want (32768, nil)", got, err)
+	}
+	usage, err := b.volumeUsage(selector{container: "web", branch: "child"}, "cache")
+	if err != nil {
+		t.Fatalf("volumeUsage(child): %v", err)
+	}
+	if len(usage) != 2 || usage[0].Destination != "/cache" || usage[0].UsedBytes != 12288 || usage[0].QuotaBytes != 65536 || usage[0].Readonly || usage[1].Destination != "/cache-ro" || !usage[1].Readonly || usage[1].UsedBytes != 12288 {
+		t.Errorf("volumeUsage(child)=%+v", usage)
 	}
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"root":{"readonly":true}}`), 0600); err != nil {
 		t.Fatalf("writing read-only config: %v", err)
@@ -2909,10 +2936,13 @@ type fakeBackend struct {
 	execControlID     string
 	execControlSignal int
 
-	volumes       []ttosbundle.VolumeInfo
-	ensuredVolume string
-	volumeQuota   int64
-	removedVolume string
+	volumes           []ttosbundle.VolumeInfo
+	ensuredVolume     string
+	volumeQuota       int64
+	removedVolume     string
+	volumeUsageTarget selector
+	volumeUsageName   string
+	volumeUsageResult []ttosbundle.VolumeUsage
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3114,6 +3144,12 @@ func (b *fakeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) 
 		}
 	}
 	return ttosbundle.VolumeInfo{}, fmt.Errorf("volume %q does not exist", name)
+}
+
+func (b *fakeBackend) volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error) {
+	b.volumeUsageTarget = target
+	b.volumeUsageName = name
+	return append([]ttosbundle.VolumeUsage(nil), b.volumeUsageResult...), b.err
 }
 
 func (b *fakeBackend) removeVolume(name string) error {
