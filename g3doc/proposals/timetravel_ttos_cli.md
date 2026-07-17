@@ -7,7 +7,9 @@ Implementation status: an initial lightweight `ttos` client is available at
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd, generates rootless image-backed OCI bundles, and implements the
 initial run/create/start/wait/restart/inspect/list/remove lifecycle with
-persistent metadata, plus synchronous non-TTY exec into a selected live branch.
+persistent metadata, plus synchronous, detached, and TTY exec into a selected
+live branch, with branch-local managed-session list, wait, signal, log, and
+reattach support.
 Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
 `start` and `wait` accept multiple containers and preserve argument-order
 output. Container inspect uses Docker-shaped JSON and Go templates while adding
@@ -33,8 +35,8 @@ all|N]` replay, tail, or follow rotations independently. This supports optional
 stdin forwarding with Docker-style Ctrl-P, Ctrl-Q detach, foreground
 `run`/`start`, detached output draining, and multiple output readers without
 placing host FDs in the guest resource graph. `ttosd`, daemon-owned stdin
-ownership, detached and TTY exec, persistent managed-volume
-backing, and managed OverlayFS volumes remain TODO.
+ownership, persistent managed-volume backing, and managed OverlayFS volumes
+remain TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -251,8 +253,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Support `--detach`, returning a stable branch-qualified execution ID.
 - [x] Add a Sentry-owned branch-local exec registry with stable IDs, terminal
       metadata, retained exit status, and low-level list, wait, and signal RPCs.
-- [ ] Add `ttos exec ls`, `ttos exec wait`, `ttos exec kill`, and reattach by
-      execution ID.
+- [x] Add `ttos exec ls`, `ttos exec wait`, and `ttos exec kill`, plus
+      branch-qualified reattach and retained logs by execution ID.
 - [x] Preserve virtual PIDs and exec IDs when a running exec session is forked.
 - [x] Require a running branch for exec; do not implicitly resume paused
       branches.
@@ -261,7 +263,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 - [x] Initial non-TTY `ttos attach CONTAINER[@BRANCH]` for the init console,
       with stdout/stderr streaming, optional `-i`, and exit-status forwarding.
-- [ ] `ttos attach CONTAINER[@BRANCH] --exec EXEC_ID` for an exec session.
+- [x] `ttos attach --exec EXEC_ID CONTAINER[@BRANCH]` and
+      `ttos logs --exec EXEC_ID CONTAINER[@BRANCH]` for managed exec sessions.
 - [ ] Support stdin-only, stdout/stderr-only, and combined attachment modes.
 - [x] Support Docker-like detach keys for non-TTY stdin attachment, including
       Ctrl-P, Ctrl-Q by default and `ttos attach --detach-keys` overrides.
@@ -562,7 +565,7 @@ grandchild branches without PID or wait-status crossover.
 - [x] Persistent configurable log size/generation retention.
 - [ ] Daemon-owned stdin leases and daemon-owned transport/reconciliation.
 - [x] Detached exec creation with fork-aware per-session output drains.
-- [ ] Reattach and exec-session detach keys.
+- [x] Reattach, retained logs, and exec-session detach keys.
 - [x] Internal devpts interactive consoles for init and attached exec, including
       host-size propagation and branch-local PTY signal semantics.
 - [x] Non-TTY console state fork and branch-local I/O.

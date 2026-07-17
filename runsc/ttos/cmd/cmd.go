@@ -257,9 +257,10 @@ Commands:
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] CONTAINER      Start a prepared or exited container
-  attach [OPTIONS] TARGET        Attach to a branch's init console
-  logs [-f] [--tail N] TARGET    Print or follow a branch's init-console logs
+  attach [OPTIONS] TARGET        Attach to a branch init or managed exec console
+  logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
+  exec ls|wait|kill ...          Manage detached exec sessions
   inspect [OPTIONS] CONTAINER... Show Docker and TTOS branch/process state
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
   restart [OPTIONS] CONTAINER... Restart one or more container families
@@ -1115,12 +1116,13 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	interactive := fs.Bool("interactive", false, "forward stdin")
 	fs.BoolVar(interactive, "i", false, "forward stdin")
+	execID := fs.String("exec", "", "attach to a managed exec session")
 	detachKeysValue := fs.String("detach-keys", "ctrl-p,ctrl-q", "override the key sequence for detaching")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos attach [-i] [--detach-keys KEYS] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos attach [-i] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -1130,7 +1132,12 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	status, err := backend.attach(target, *interactive, detachKeys)
+	if *execID != "" {
+		if _, err := parseExecSelector(target.String() + ":" + *execID); err != nil {
+			return err
+		}
+	}
+	status, err := backend.attach(target, *execID, *interactive, detachKeys)
 	if err != nil {
 		if errors.Is(err, errDetached) {
 			return nil
@@ -1148,13 +1155,14 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	follow := fs.Bool("follow", false, "follow log output")
 	fs.BoolVar(follow, "f", false, "follow log output")
+	execID := fs.String("exec", "", "show logs for a managed exec session")
 	tailValue := fs.String("tail", "all", "number of lines to show from the end of the logs")
 	fs.StringVar(tailValue, "n", "all", "number of lines to show from the end of the logs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos logs [-f] [--tail all|N] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos logs [-f] [--exec EXEC_ID] [--tail all|N] CONTAINER[@BRANCH]")
 	}
 	tail := -1
 	if parsed, err := strconv.Atoi(*tailValue); err == nil && parsed >= 0 {
@@ -1164,13 +1172,29 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	if err := backend.logs(target, *follow, tail); err != nil {
+	if *execID != "" {
+		if _, err := parseExecSelector(target.String() + ":" + *execID); err != nil {
+			return err
+		}
+	}
+	if err := backend.logs(target, *execID, *follow, tail); err != nil {
 		return fmt.Errorf("reading logs for %s: %w", target, err)
 	}
 	return nil
 }
 
 func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
+	if len(args) != 0 {
+		switch args[0] {
+		case "ls":
+			return runExecList(args[1:], stdout, stderr, backend)
+		case "wait":
+			return runExecWait(args[1:], stdout, stderr, backend)
+		case "kill":
+			return runExecKill(args[1:], stdout, stderr, backend)
+		}
+	}
+
 	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e")
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1226,6 +1250,85 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *detach {
 		fmt.Fprintf(stdout, "%s@%s:%s\n", target.container, target.branch, execID)
 	}
+	return nil
+}
+
+func runExecList(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("exec ls", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos exec ls [--json] CONTAINER[@BRANCH]")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	sessions, err := backend.execSessions(target)
+	if err != nil {
+		return fmt.Errorf("listing exec sessions in %s: %w", target, err)
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(sessions)
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "ID	PID	STATE	TTY	CREATED")
+	for _, session := range sessions {
+		fmt.Fprintf(table, "%s\t%d\t%s\t%t\t%s\n", session.ID, session.PID, session.State, session.Terminal, session.CreatedAt.Local().Format(time.RFC3339))
+	}
+	return table.Flush()
+}
+
+func runExecWait(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("exec wait", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos exec wait CONTAINER[@BRANCH]:EXEC_ID")
+	}
+	target, err := parseExecSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	status, err := backend.waitExecSession(target.target, target.execID)
+	if err != nil {
+		return fmt.Errorf("waiting for %s: %w", target, err)
+	}
+	fmt.Fprintln(stdout, waitStatusExitCode(status))
+	return nil
+}
+
+func runExecKill(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("exec kill", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var signalName string
+	fs.StringVar(&signalName, "signal", "KILL", "signal name or number")
+	fs.StringVar(&signalName, "s", "KILL", "signal name or number")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttos exec kill [--signal SIGNAL] CONTAINER[@BRANCH]:EXEC_ID")
+	}
+	target, err := parseExecSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	signal, err := parseSignal(signalName)
+	if err != nil {
+		return err
+	}
+	if err := backend.signalExecSession(target.target, target.execID, signal); err != nil {
+		return fmt.Errorf("signaling %s: %w", target, err)
+	}
+	fmt.Fprintln(stdout, target)
 	return nil
 }
 
@@ -2560,6 +2663,35 @@ func parseSelector(value string) (selector, error) {
 	return selector{container: parts[0], branch: branch}, nil
 }
 
+type execSelector struct {
+	target selector
+	execID string
+}
+
+func parseExecSelector(value string) (execSelector, error) {
+	separator := strings.LastIndexByte(value, ':')
+	if separator <= 0 || separator == len(value)-1 {
+		return execSelector{}, errors.New("exec selector must be CONTAINER[@BRANCH]:EXEC_ID")
+	}
+	target, err := parseSelector(value[:separator])
+	if err != nil {
+		return execSelector{}, err
+	}
+	execID := value[separator+1:]
+	for index := 0; index < len(execID); index++ {
+		char := execID[index]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || (index > 0 && (char == '.' || char == '_' || char == '-')) {
+			continue
+		}
+		return execSelector{}, fmt.Errorf("invalid exec session ID %q", execID)
+	}
+	return execSelector{target: target, execID: execID}, nil
+}
+
+func (s execSelector) String() string {
+	return s.target.String() + ":" + s.execID
+}
+
 func parseDestination(containerID, value string) (selector, error) {
 	if !strings.Contains(value, "@") {
 		if value == "" {
@@ -2680,9 +2812,12 @@ type backend interface {
 	create(request runRequest) error
 	run(request runRequest) (int, error)
 	start(name string, detach, interactive bool) (int, error)
-	attach(target selector, interactive bool, detachKeys []byte) (uint32, error)
-	logs(target selector, follow bool, tail int) error
+	attach(target selector, execID string, interactive bool, detachKeys []byte) (uint32, error)
+	logs(target selector, execID string, follow bool, tail int) error
 	exec(request execRequest) (int, error)
+	execSessions(target selector) ([]runscExecSession, error)
+	waitExecSession(target selector, execID string) (uint32, error)
+	signalExecSession(target selector, execID string, signal int) error
 	inspect(name string) (InspectInfo, error)
 	remove(name string, force bool) error
 	listFamilies() ([]Family, error)
@@ -3296,21 +3431,39 @@ func readConsoleWaitStatus(path string) (uint32, bool, error) {
 	return uint32(status), true, nil
 }
 
-func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []byte) (status uint32, retErr error) {
-	paths, err := b.ensureConsoleDrain(target, false)
-	if err != nil {
-		return 0, err
-	}
-	store := ttosbundle.Store{Root: b.dataRoot}
-	containerInfo, err := store.LoadContainer(target.container)
-	if err != nil {
-		return 0, err
-	}
-	if containerInfo.Terminal {
-		if err := b.resizeConsoleFromHost(target); err != nil {
+func (b *runtimeBackend) attach(target selector, execID string, interactive bool, detachKeys []byte) (status uint32, retErr error) {
+	var paths ttosbundle.ConsolePaths
+	consoleID := "init"
+	terminal := false
+	var err error
+	if execID == "" {
+		paths, err = b.ensureConsoleDrain(target, false)
+		if err != nil {
 			return 0, err
 		}
-		stopResize := b.watchConsoleResize(target)
+		store := ttosbundle.Store{Root: b.dataRoot}
+		containerInfo, err := store.LoadContainer(target.container)
+		if err != nil {
+			return 0, err
+		}
+		terminal = containerInfo.Terminal
+	} else {
+		session, err := b.execSession(target, execID)
+		if err != nil {
+			return 0, err
+		}
+		consoleID = session.ConsoleID
+		terminal = session.Terminal
+		paths, err = b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if terminal {
+		if err := b.resizeConsoleFromHost(target, consoleID); err != nil {
+			return 0, err
+		}
+		stopResize := b.watchConsoleResize(target, consoleID)
 		defer stopResize()
 	}
 	_, maxFiles, err := b.consoleRetention(target.container)
@@ -3328,7 +3481,7 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 			}
 		}()
 		var restore func() error
-		if containerInfo.Terminal {
+		if terminal {
 			restore, err = makeRawTerminal(b.stdin)
 			if err != nil {
 				return 0, err
@@ -3353,18 +3506,24 @@ func (b *runtimeBackend) attach(target selector, interactive bool, detachKeys []
 	} else if found {
 		waitResult = &attachWaitResult{status: status}
 	}
+	waitForExit := b.wait
+	if execID != "" {
+		waitForExit = func(target selector) (uint32, error) {
+			return b.waitExecSession(target, execID)
+		}
+	}
 	var waitCh chan attachWaitResult
 	if waitResult == nil {
 		ch := make(chan attachWaitResult, 1)
 		waitCh = ch
 		go func() {
-			status, err := b.wait(target)
+			status, err := waitForExit(target)
 			ch <- attachWaitResult{status: status, err: err}
 		}()
 	}
 	inputErrCh := make(chan error, 1)
 	if interactive {
-		go func() { inputErrCh <- b.pumpConsoleInput(target, detachKeys) }()
+		go func() { inputErrCh <- b.pumpConsoleInput(target, consoleID, detachKeys) }()
 	}
 	var waitErr error
 	for {
@@ -3541,8 +3700,18 @@ func (t *consoleLogTail) flush(stdout, stderr io.Writer) error {
 	return nil
 }
 
-func (b *runtimeBackend) logs(target selector, follow bool, tail int) error {
-	paths, err := b.ensureConsoleDrain(target, false)
+func (b *runtimeBackend) logs(target selector, execID string, follow bool, tail int) error {
+	var paths ttosbundle.ConsolePaths
+	var err error
+	if execID == "" {
+		paths, err = b.ensureConsoleDrain(target, false)
+	} else {
+		session, sessionErr := b.execSession(target, execID)
+		if sessionErr != nil {
+			return sessionErr
+		}
+		paths, err = b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false)
+	}
 	if err != nil {
 		return err
 	}
@@ -3769,20 +3938,20 @@ func consoleDrainStoppedError(errorPath string) error {
 	return fmt.Errorf("console drain stopped before output EOF: %s", message)
 }
 
-func (b *runtimeBackend) resizeConsoleFromHost(target selector) error {
+func (b *runtimeBackend) resizeConsoleFromHost(target selector, consoleID string) error {
 	cols, rows, ok, err := hostTerminalSize(b.stdin)
 	if err != nil || !ok {
 		return err
 	}
 	_, err = b.command(
-		"timetravel", "--console", "init",
+		"timetravel", "--console", consoleID,
 		"--rows", strconv.Itoa(rows), "--cols", strconv.Itoa(cols),
 		target.container, "console-resize", target.branch,
 	)
 	return err
 }
 
-func (b *runtimeBackend) watchConsoleResize(target selector) func() {
+func (b *runtimeBackend) watchConsoleResize(target selector, consoleID string) func() {
 	file, ok := b.stdin.(*os.File)
 	if !ok || !term.IsTerminal(int(file.Fd())) {
 		return func() {}
@@ -3794,7 +3963,7 @@ func (b *runtimeBackend) watchConsoleResize(target selector) func() {
 		for {
 			select {
 			case <-resizeSignals:
-				if err := b.resizeConsoleFromHost(target); err != nil && b.stderr != nil {
+				if err := b.resizeConsoleFromHost(target, consoleID); err != nil && b.stderr != nil {
 					fmt.Fprintf(b.stderr, "ttos: warning: resizing console for %s: %v\n", target, err)
 				}
 			case <-done:
@@ -3808,9 +3977,9 @@ func (b *runtimeBackend) watchConsoleResize(target selector) func() {
 	}
 }
 
-func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWriteResult, error) {
+func (b *runtimeBackend) writeConsole(target selector, consoleID string, data []byte) (consoleWriteResult, error) {
 	encoded := base64.StdEncoding.EncodeToString(data)
-	output, err := b.command("timetravel", "--console", "init", "--data-base64", encoded, target.container, "console-write", target.branch)
+	output, err := b.command("timetravel", "--console", consoleID, "--data-base64", encoded, target.container, "console-write", target.branch)
 	if err != nil {
 		return consoleWriteResult{}, err
 	}
@@ -3821,9 +3990,9 @@ func (b *runtimeBackend) writeConsole(target selector, data []byte) (consoleWrit
 	return result, nil
 }
 
-func (b *runtimeBackend) writeConsoleAll(target selector, data []byte) error {
+func (b *runtimeBackend) writeConsoleAll(target selector, consoleID string, data []byte) error {
 	for written := 0; written < len(data); {
-		result, err := b.writeConsole(target, data[written:])
+		result, err := b.writeConsole(target, consoleID, data[written:])
 		if err != nil {
 			return err
 		}
@@ -3835,21 +4004,21 @@ func (b *runtimeBackend) writeConsoleAll(target selector, data []byte) error {
 	return nil
 }
 
-func (b *runtimeBackend) closeConsoleStdin(target selector) error {
-	_, err := b.command("timetravel", "--console", "init", target.container, "console-close-stdin", target.branch)
+func (b *runtimeBackend) closeConsoleStdin(target selector, consoleID string) error {
+	_, err := b.command("timetravel", "--console", consoleID, target.container, "console-close-stdin", target.branch)
 	return err
 }
 
-func (b *runtimeBackend) pumpConsoleInput(target selector, detachKeys []byte) error {
+func (b *runtimeBackend) pumpConsoleInput(target selector, consoleID string, detachKeys []byte) error {
 	if b.stdin == nil {
-		return b.closeConsoleStdin(target)
+		return b.closeConsoleStdin(target, consoleID)
 	}
 	filter := detachKeyFilter{sequence: append([]byte(nil), detachKeys...)}
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := b.stdin.Read(buf)
 		data, detached := filter.push(buf[:n])
-		if err := b.writeConsoleAll(target, data); err != nil {
+		if err := b.writeConsoleAll(target, consoleID, data); err != nil {
 			return err
 		}
 		if detached {
@@ -3857,10 +4026,10 @@ func (b *runtimeBackend) pumpConsoleInput(target selector, detachKeys []byte) er
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				if err := b.writeConsoleAll(target, filter.flush()); err != nil {
+				if err := b.writeConsoleAll(target, consoleID, filter.flush()); err != nil {
 					return err
 				}
-				return b.closeConsoleStdin(target)
+				return b.closeConsoleStdin(target, consoleID)
 			}
 			return fmt.Errorf("reading attached stdin: %w", readErr)
 		}
@@ -4190,7 +4359,7 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 	if detach {
 		return 0, nil
 	}
-	waitStatus, err := b.attach(target, interactive, defaultDetachKeys)
+	waitStatus, err := b.attach(target, "", interactive, defaultDetachKeys)
 	if err != nil {
 		if errors.Is(err, errDetached) {
 			return 0, nil
@@ -4419,6 +4588,20 @@ func (b *runtimeBackend) execSession(target selector, execID string) (runscExecS
 		}
 	}
 	return runscExecSession{}, fmt.Errorf("exec session %q does not exist in %s", execID, target)
+}
+
+func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32, error) {
+	output, err := b.command("timetravel", "--exec-id", execID, target.container, "exec-wait", target.branch)
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		Status uint32 `json:"wait_status"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return 0, fmt.Errorf("decoding exec wait result for %s:%s: %w", target, execID, err)
+	}
+	return result.Status, nil
 }
 
 func (b *runtimeBackend) signalExecSession(target selector, execID string, signal int) error {

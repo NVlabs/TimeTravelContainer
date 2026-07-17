@@ -671,12 +671,12 @@ func TestStartMultipleAndContainerAliases(t *testing.T) {
 func TestAttach(t *testing.T) {
 	b := &fakeBackend{waitStatus: uint32(7 << 8)}
 	var stdout, stderr bytes.Buffer
-	status := runCommand([]string{"attach", "-i", "--detach-keys", "ctrl-a,z", "demo@child"}, &stdout, &stderr, b)
+	status := runCommand([]string{"attach", "-i", "--exec", "exec-one", "--detach-keys", "ctrl-a,z", "demo@child"}, &stdout, &stderr, b)
 	if status != 7 {
 		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.attached != (selector{container: "demo", branch: "child"}) || !b.attachInteractive {
-		t.Errorf("attach target=%+v interactive=%t", b.attached, b.attachInteractive)
+	if b.attached != (selector{container: "demo", branch: "child"}) || b.attachExecID != "exec-one" || !b.attachInteractive {
+		t.Errorf("attach target=%+v exec=%q interactive=%t", b.attached, b.attachExecID, b.attachInteractive)
 	}
 	if got, want := b.attachDetachKeys, []byte{1, 'z'}; !bytes.Equal(got, want) {
 		t.Errorf("attach detach keys=%v, want %v", got, want)
@@ -745,11 +745,11 @@ func TestDetachKeyFilterForwardsNearMatchAndFlushesPrefix(t *testing.T) {
 func TestLogs(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"logs", "--follow", "--tail", "7", "demo@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"logs", "--follow", "--exec", "exec-one", "--tail", "7", "demo@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.logsTarget != (selector{container: "demo", branch: "child"}) || !b.logsFollow || b.logsTail != 7 {
-		t.Errorf("logs target=%+v follow=%t tail=%d", b.logsTarget, b.logsFollow, b.logsTail)
+	if b.logsTarget != (selector{container: "demo", branch: "child"}) || b.logsExecID != "exec-one" || !b.logsFollow || b.logsTail != 7 {
+		t.Errorf("logs target=%+v exec=%q follow=%t tail=%d", b.logsTarget, b.logsExecID, b.logsFollow, b.logsTail)
 	}
 	if status := runCommand([]string{"logs", "--tail", "invalid", "demo"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs with Docker-compatible invalid tail status=%d, stderr=%q", status, stderr.String())
@@ -1052,6 +1052,42 @@ func TestExecDetachReturnsQualifiedSessionID(t *testing.T) {
 	want := "demo@child:" + request.execID + "\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("detached exec output=%q, want %q", got, want)
+	}
+}
+
+func TestExecSessionControls(t *testing.T) {
+	created := time.Date(2026, time.July, 17, 2, 3, 4, 0, time.UTC)
+	b := &fakeBackend{execSessionList: []runscExecSession{{
+		ID: "exec-abc", PID: 7, State: "running", Terminal: true, CreatedAt: created,
+	}}, waitStatus: uint32(7 << 8)}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "ls", "demo@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("exec ls status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "exec-abc") || !strings.Contains(got, "running") {
+		t.Fatalf("exec ls output=%q", got)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"exec", "wait", "demo@child:exec-abc"}, &stdout, &stderr, b); status != 0 || stdout.String() != "7\n" {
+		t.Fatalf("exec wait status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"exec", "kill", "--signal", "TERM", "demo@child:exec-abc"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("exec kill status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.execControlTarget != (selector{container: "demo", branch: "child"}) || b.execControlID != "exec-abc" || b.execControlSignal != 15 {
+		t.Fatalf("exec control target=%+v id=%q signal=%d", b.execControlTarget, b.execControlID, b.execControlSignal)
+	}
+	if stdout.String() != "demo@child:exec-abc\n" {
+		t.Fatalf("exec kill output=%q", stdout.String())
+	}
+}
+
+func TestParseExecSelectorRejectsInvalidValues(t *testing.T) {
+	for _, value := range []string{"", "demo", "demo:", "demo:../bad", "demo@child:-bad"} {
+		if _, err := parseExecSelector(value); err == nil {
+			t.Errorf("parseExecSelector(%q) succeeded", value)
+		}
 	}
 }
 
@@ -1873,9 +1909,11 @@ type fakeBackend struct {
 	startDetach       bool
 	startInteractive  bool
 	attached          selector
+	attachExecID      string
 	attachInteractive bool
 	attachDetachKeys  []byte
 	logsTarget        selector
+	logsExecID        string
 	logsFollow        bool
 	logsTail          int
 	inspectInfo       InspectInfo
@@ -1883,9 +1921,14 @@ type fakeBackend struct {
 	removeForce       bool
 	execRequest       execRequest
 	execStatus        int
-	volumes           []ttosbundle.VolumeInfo
-	ensuredVolume     string
-	removedVolume     string
+	execSessionList   []runscExecSession
+	execControlTarget selector
+	execControlID     string
+	execControlSignal int
+
+	volumes       []ttosbundle.VolumeInfo
+	ensuredVolume string
+	removedVolume string
 }
 
 func (b *fakeBackend) create(request runRequest) error {
@@ -1907,15 +1950,17 @@ func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) 
 	return b.runStatus, b.err
 }
 
-func (b *fakeBackend) attach(target selector, interactive bool, detachKeys []byte) (uint32, error) {
+func (b *fakeBackend) attach(target selector, execID string, interactive bool, detachKeys []byte) (uint32, error) {
 	b.attached = target
+	b.attachExecID = execID
 	b.attachInteractive = interactive
 	b.attachDetachKeys = append([]byte(nil), detachKeys...)
 	return b.waitStatus, b.err
 }
 
-func (b *fakeBackend) logs(target selector, follow bool, tail int) error {
+func (b *fakeBackend) logs(target selector, execID string, follow bool, tail int) error {
 	b.logsTarget = target
+	b.logsExecID = execID
 	b.logsFollow = follow
 	b.logsTail = tail
 	return b.err
@@ -1924,6 +1969,24 @@ func (b *fakeBackend) logs(target selector, follow bool, tail int) error {
 func (b *fakeBackend) exec(request execRequest) (int, error) {
 	b.execRequest = request
 	return b.execStatus, b.err
+}
+
+func (b *fakeBackend) execSessions(target selector) ([]runscExecSession, error) {
+	b.execControlTarget = target
+	return append([]runscExecSession(nil), b.execSessionList...), b.err
+}
+
+func (b *fakeBackend) waitExecSession(target selector, execID string) (uint32, error) {
+	b.execControlTarget = target
+	b.execControlID = execID
+	return b.waitStatus, b.err
+}
+
+func (b *fakeBackend) signalExecSession(target selector, execID string, signal int) error {
+	b.execControlTarget = target
+	b.execControlID = execID
+	b.execControlSignal = signal
+	return b.err
 }
 
 func (b *fakeBackend) inspect(name string) (InspectInfo, error) {
