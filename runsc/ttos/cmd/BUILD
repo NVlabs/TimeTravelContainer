@@ -7,7 +7,7 @@ package(
 
 go_library(
     name = "cmd",
-    srcs = ["cmd.go", "completion.go", "daemon.go", "daemon_terminal.go", "events.go", "idempotency.go"],
+    srcs = ["cmd.go", "completion.go", "daemon.go", "daemon_requests.go", "daemon_terminal.go", "events.go", "idempotency.go"],
     visibility = ["//runsc/ttos:__subpackages__", "//runsc/ttosd:__pkg__"],
     deps = [
         "//pkg/abi/linux",

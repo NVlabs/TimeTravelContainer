@@ -303,6 +303,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		s.stopOnce.Do(func() { s.listener.Close() })
 		return
+	case "mutation-control":
+		status := s.handleMutationControl(request.Options.DataRoot, request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+		_ = writeDaemonStatus(conn, &writeMu, status)
+		return
 	case "command":
 	default:
 		writeError(fmt.Errorf("unknown daemon action %q", request.Action))
@@ -440,6 +444,10 @@ func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
 	if !daemonCommandNeedsMutationLock(args) {
 		return func() {}
 	}
+	return s.lockDataRoot(dataRoot)
+}
+
+func (s *daemonServer) lockDataRoot(dataRoot string) func() {
 	key := filepath.Clean(dataRoot)
 	if absolute, err := filepath.Abs(key); err == nil {
 		key = absolute
@@ -662,6 +670,9 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		}
 		return status, nil
 	}
+	if request.RequestID != "" {
+		return 1, fmt.Errorf("daemon mutation request %s: %w", request.RequestID, lastErr)
+	}
 	return 1, lastErr
 }
 
@@ -802,8 +813,22 @@ func startDaemonProcess(socket string) error {
 }
 
 func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 0 && (args[0] == "requests" || args[0] == "request") {
+		conn, err := connectOrStartDaemon(opts.daemonSocket)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttos: %v\n", err)
+			return 1
+		}
+		defer conn.Close()
+		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, Action: "mutation-control", Options: wireOptions(opts), Args: append([]string(nil), args...)}, strings.NewReader(""), stdout, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttos: %v\n", err)
+			return 1
+		}
+		return status
+	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "ttos: usage: ttos daemon start|status|stop")
+		fmt.Fprintln(stderr, "ttos: usage: ttos daemon start|status|stop|requests|request inspect|request resolve")
 		return 2
 	}
 	action := args[0]

@@ -309,6 +309,8 @@ Commands:
   volume COMMAND                   Manage family-local tmpfs volumes
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start|status|stop          Manage the rootless per-user service
+  daemon requests [OPTIONS]        List durable mutation requests
+  daemon request inspect|resolve   Inspect or resolve an interrupted mutation
 
 Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
 run immediately unless --paused is set; omitting DEST generates a branch ID.

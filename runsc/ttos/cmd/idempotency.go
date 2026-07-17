@@ -36,12 +36,15 @@ type daemonMutationRecord struct {
 	Version     int       `json:"version"`
 	RequestID   string    `json:"request_id"`
 	Fingerprint string    `json:"fingerprint"`
+	Command     []string  `json:"command,omitempty"`
 	State       string    `json:"state"`
 	Status      int       `json:"status,omitempty"`
 	Stdout      []byte    `json:"stdout,omitempty"`
 	Stderr      []byte    `json:"stderr,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
+	Resolution  string    `json:"resolution,omitempty"`
+	Note        string    `json:"note,omitempty"`
 }
 
 func newDaemonRequestID() (string, error) {
@@ -167,7 +170,8 @@ func beginDaemonMutation(dataRoot string, request daemonRequest) (daemonMutation
 	}
 	record = daemonMutationRecord{
 		Version: daemonMutationSchemaVersion, RequestID: request.RequestID,
-		Fingerprint: fingerprint, State: "pending", CreatedAt: time.Now().UTC(),
+		Fingerprint: fingerprint, Command: append([]string(nil), request.Args...),
+		State: "pending", CreatedAt: time.Now().UTC(),
 	}
 	if err := writeDurableJSON(path, &record); err != nil {
 		return daemonMutationRecord{}, false, fmt.Errorf("persisting daemon mutation intent: %w", err)
@@ -187,6 +191,88 @@ func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status
 	record.CompletedAt = time.Now().UTC()
 	if err := writeDurableJSON(path, &record); err != nil {
 		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation result: %w", err)
+	}
+	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
+	return record, nil
+}
+
+func listDaemonMutations(dataRoot, state string) ([]daemonMutationRecord, error) {
+	if state != "" && state != "pending" && state != "completed" {
+		return nil, fmt.Errorf("invalid daemon mutation state %q", state)
+	}
+	dir := filepath.Join(dataRoot, "daemon", "requests")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	records := make([]daemonMutationRecord, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		record, err := loadDaemonMutation(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("loading mutation record %s: %w", entry.Name(), err)
+		}
+		if state == "" || record.State == state {
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].CreatedAt.Equal(records[j].CreatedAt) {
+			return records[i].RequestID < records[j].RequestID
+		}
+		return records[i].CreatedAt.After(records[j].CreatedAt)
+	})
+	return records, nil
+}
+
+func inspectDaemonMutation(dataRoot, requestID string) (daemonMutationRecord, error) {
+	path, err := daemonMutationPath(dataRoot, requestID)
+	if err != nil {
+		return daemonMutationRecord{}, err
+	}
+	record, err := loadDaemonMutation(path)
+	if os.IsNotExist(err) {
+		return daemonMutationRecord{}, fmt.Errorf("daemon mutation request %s does not exist", requestID)
+	}
+	return record, err
+}
+
+func resolveDaemonMutation(dataRoot, requestID, outcome, note string) (daemonMutationRecord, error) {
+	record, err := inspectDaemonMutation(dataRoot, requestID)
+	if err != nil {
+		return daemonMutationRecord{}, err
+	}
+	if record.State != "pending" {
+		return daemonMutationRecord{}, fmt.Errorf("daemon mutation request %s is already %s", requestID, record.State)
+	}
+	switch outcome {
+	case "succeeded":
+		record.Status = 0
+	case "failed":
+		record.Status = 1
+	case "abandoned":
+		record.Status = 125
+	default:
+		return daemonMutationRecord{}, fmt.Errorf("invalid resolution outcome %q (want succeeded, failed, or abandoned)", outcome)
+	}
+	record.State = "completed"
+	record.CompletedAt = time.Now().UTC()
+	record.Resolution = outcome
+	record.Note = note
+	if len(record.Stderr) == 0 {
+		record.Stderr = []byte(fmt.Sprintf("ttosd: interrupted mutation was resolved by an operator as %s; it was not re-executed\n", outcome))
+	}
+	path, err := daemonMutationPath(dataRoot, requestID)
+	if err != nil {
+		return daemonMutationRecord{}, err
+	}
+	if err := writeDurableJSON(path, &record); err != nil {
+		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation resolution: %w", err)
 	}
 	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
 	return record, nil

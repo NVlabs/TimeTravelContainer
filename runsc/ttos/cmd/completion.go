@@ -204,6 +204,14 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		rest = rest[1:]
 	}
 	switch command {
+	case "daemon":
+		if len(rest) == 0 {
+			return []string{"request", "requests", "start", "status", "stop"}, nil
+		}
+		if rest[0] == "request" && len(rest) == 1 {
+			return []string{"inspect", "resolve"}, nil
+		}
+		return nil, nil
 	case "image":
 		if len(rest) == 0 {
 			return []string{"inspect", "ls", "rm"}, nil

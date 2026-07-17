@@ -118,6 +118,75 @@ func TestCompactDaemonMutationsRetainsNewestCompletedAndAllPending(t *testing.T)
 	}
 }
 
+func TestResolveDaemonMutationIsExplicitAndNeverReexecutes(t *testing.T) {
+	root := t.TempDir()
+	id := fmt.Sprintf("%032x", 42)
+	request := daemonRequest{
+		Version: daemonAPIVersion, Action: "command", RequestID: id,
+		Options: daemonWireOptions{DataRoot: root}, Args: []string{"volume", "create", "important"},
+	}
+	record, replay, err := beginDaemonMutation(root, request)
+	if err != nil || replay {
+		t.Fatalf("beginDaemonMutation()=(%+v, %t, %v)", record, replay, err)
+	}
+	if got := strings.Join(record.Command, " "); got != "volume create important" {
+		t.Fatalf("recorded command=%q", got)
+	}
+	record, err = resolveDaemonMutation(root, id, "succeeded", "verified volume metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != "completed" || record.Status != 0 || record.Resolution != "succeeded" || record.Note != "verified volume metadata" {
+		t.Fatalf("resolved record=%+v", record)
+	}
+	if !strings.Contains(string(record.Stderr), "not re-executed") {
+		t.Fatalf("resolution diagnostic=%q", record.Stderr)
+	}
+	if _, err := resolveDaemonMutation(root, id, "failed", ""); err == nil {
+		t.Fatal("completed mutation was resolved twice")
+	}
+}
+
+func TestDaemonMutationControlListInspectAndResolve(t *testing.T) {
+	root := t.TempDir()
+	id := fmt.Sprintf("%032x", 77)
+	request := daemonRequest{
+		Version: daemonAPIVersion, Action: "command", RequestID: id,
+		Options: daemonWireOptions{DataRoot: root}, Args: []string{"pause", "demo"},
+	}
+	if _, _, err := beginDaemonMutation(root, request); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{}
+	var stdout, stderr bytes.Buffer
+	if status := server.handleMutationControl(root, []string{"requests", "--state", "pending"}, &stdout, &stderr); status != 0 {
+		t.Fatalf("list status=%d stderr=%q", status, stderr.String())
+	}
+	if output := stdout.String(); !strings.Contains(output, id) || !strings.Contains(output, "pause demo") {
+		t.Fatalf("list output=%q", output)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := server.handleMutationControl(root, []string{"request", "inspect", "--json", id}, &stdout, &stderr); status != 0 {
+		t.Fatalf("inspect status=%d stderr=%q", status, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "demo") {
+		t.Fatalf("inspect output=%q", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := server.handleMutationControl(root, []string{"request", "resolve", "--outcome", "abandoned", "--note", "state unclear", id}, &stdout, &stderr); status != 0 {
+		t.Fatalf("resolve status=%d stderr=%q", status, stderr.String())
+	}
+	record, err := inspectDaemonMutation(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != 125 || record.Resolution != "abandoned" || record.Note != "state unclear" {
+		t.Fatalf("resolved record=%+v", record)
+	}
+}
+
 func TestDaemonMutationRequestIDValidation(t *testing.T) {
 	for _, id := range []string{"", "not-hex", "00"} {
 		if _, err := daemonMutationPath(t.TempDir(), id); err == nil {
