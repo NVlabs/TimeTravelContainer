@@ -63,6 +63,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 	"gvisor.dev/gvisor/runsc/config"
@@ -616,13 +617,49 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 	}
 
 	manager := &containerManager{l: l}
+	livenessReader, livenessWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating exec wait liveness pipe: %v", err)
+	}
+	defer livenessReader.Close()
+	cancelledWait := make(chan error, 1)
+	go func() {
+		var status uint32
+		cancelledWait <- manager.ExecWait(&ExecWaitArgs{
+			FilePayload:     urpc.FilePayload{Files: []*os.File{livenessReader}},
+			ExecSessionArgs: ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID},
+		}, &status)
+	}()
+	select {
+	case err := <-cancelledWait:
+		t.Fatalf("exec wait returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := livenessWriter.Close(); err != nil {
+		t.Fatalf("closing exec wait liveness pipe: %v", err)
+	}
+	select {
+	case err := <-cancelledWait:
+		if !errors.Is(err, ErrExecWaitCancelled) {
+			t.Fatalf("cancelled exec wait: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("cancelled exec wait retained its control lease")
+	}
+	if err := l.family.Pause(childInfo.ID); err != nil {
+		t.Fatalf("pausing child after exec wait cancellation: %v", err)
+	}
+	if err := l.family.Resume(childInfo.ID); err != nil {
+		t.Fatalf("resuming child after exec wait cancellation: %v", err)
+	}
+
 	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, Signo: int32(linux.SIGWINCH), Mode: DeliverToForegroundProcessGroup}, &struct{}{}); err != nil {
 		t.Fatalf("signaling child foreground process group: %v", err)
 	}
 	if err := manager.Signal(&SignalArgs{BranchID: childInfo.ID, CID: l.sandboxID, PID: int32(execPID), Signo: int32(linux.SIGKILL), Mode: DeliverToProcess}, &struct{}{}); err != nil {
 		t.Fatalf("signaling child exec through general RPC: %v", err)
 	}
-	status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID})
+	status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: childInfo.ID, ExecID: execSessionID}, nil)
 	if err != nil {
 		t.Fatalf("waiting for child exec session: %v", err)
 	}

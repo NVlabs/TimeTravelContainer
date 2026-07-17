@@ -433,7 +433,9 @@ a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
       kills an unpublished process and removes provisional session/console state.
 - [x] Add deterministic post-donated-FD-import failure injection and prove the
       provisional Sentry FD table is released before a successful live fork.
-- [ ] Add exec client-disconnect and wait-cleanup injection.
+- [x] Donate a client-liveness pipe to managed exec waits; client loss cancels
+      the Sentry wait and releases its branch lease without killing the exec
+      process. Deterministic controller-level injection verifies cleanup.
 - [x] Deterministically test the full exec operation lease against same-branch
       pause, resume, fork, and destroy, while proving sibling pause/resume remains
       independent.

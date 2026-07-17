@@ -226,6 +226,16 @@ type ExecSessionArgs struct {
 	Signo    int32
 }
 
+// ExecWaitArgs waits for an exec session. FilePayload contains one liveness
+// reader whose peer remains open for the lifetime of the low-level client.
+type ExecWaitArgs struct {
+	urpc.FilePayload
+	ExecSessionArgs
+}
+
+// ErrExecWaitCancelled reports that the low-level wait client disappeared.
+var ErrExecWaitCancelled = errors.New("exec wait client disconnected")
+
 type execSession struct {
 	info ExecSessionInfo
 	tg   *kernel.ThreadGroup
@@ -1018,7 +1028,7 @@ func (f *SandboxFamily) ExecSessions(args *ExecSessionsArgs) ([]ExecSessionInfo,
 }
 
 // WaitExecSession waits for one exec process and retains its exit status.
-func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs) (uint32, error) {
+func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan struct{}) (uint32, error) {
 	_, session, done, err := f.execSession(args)
 	if err != nil {
 		return 0, err
@@ -1027,7 +1037,16 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs) (uint32, error) {
 	if session.tg == nil {
 		return 0, fmt.Errorf("exec session %q is not published", args.ExecID)
 	}
-	session.tg.WaitExited()
+	exited := make(chan struct{})
+	go func() {
+		session.tg.WaitExited()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+	case <-cancel:
+		return 0, ErrExecWaitCancelled
+	}
 	status := uint32(session.tg.ExitStatus())
 	f.mu.Lock()
 	session.info.State = ExecSessionExited

@@ -1036,8 +1036,17 @@ func (cm *containerManager) ExecSessions(args *ExecSessionsArgs, out *[]ExecSess
 }
 
 // ExecWait waits for a managed exec session.
-func (cm *containerManager) ExecWait(args *ExecSessionArgs, waitStatus *uint32) error {
-	status, err := cm.l.family.WaitExecSession(args)
+func (cm *containerManager) ExecWait(args *ExecWaitArgs, waitStatus *uint32) error {
+	if args == nil || len(args.FilePayload.Files) != 1 {
+		return fmt.Errorf("exec wait requires one client-liveness file")
+	}
+	cancel := make(chan struct{})
+	go func() {
+		var probe [1]byte
+		_, _ = args.FilePayload.Files[0].Read(probe[:])
+		close(cancel)
+	}()
+	status, err := cm.l.family.WaitExecSession(&args.ExecSessionArgs, cancel)
 	if err != nil {
 		return err
 	}

@@ -2120,8 +2120,18 @@ func (s *Sandbox) ExecSessions(args *boot.ExecSessionsArgs) ([]boot.ExecSessionI
 
 // WaitExecSession waits for a managed exec process by stable session ID.
 func (s *Sandbox) WaitExecSession(args *boot.ExecSessionArgs) (uint32, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return 0, fmt.Errorf("creating exec wait liveness pipe: %w", err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	waitArgs := &boot.ExecWaitArgs{
+		FilePayload:     urpc.FilePayload{Files: []*os.File{reader}},
+		ExecSessionArgs: *args,
+	}
 	var waitStatus uint32
-	if err := s.call(boot.ContMgrExecWait, args, &waitStatus); err != nil {
+	if err := s.call(boot.ContMgrExecWait, waitArgs, &waitStatus); err != nil {
 		return 0, fmt.Errorf("waiting for exec session %q in live branch %q: %w", args.ExecID, args.BranchID, err)
 	}
 	return waitStatus, nil
