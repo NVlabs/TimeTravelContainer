@@ -947,6 +947,66 @@ func TestVolumeSnapshotImportIsAtomicAndValidated(t *testing.T) {
 	}
 }
 
+func TestRefreshVolumeSeeds(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	if _, err := store.CreateVolume("cache"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	snapshot, err := store.VolumeSnapshotPath("cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tar.NewWriter(file).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	spec := specs.Spec{
+		Root: &specs.Root{Path: "/rootfs"},
+		Annotations: map[string]string{
+			"dev.gvisor.spec.mount.ttos0.source": "ttos-volume-cache",
+			"dev.gvisor.spec.mount.ttos0.copyup": "true",
+		},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
+		Volumes: []ManagedVolume{{Name: "cache", Destination: "/cache"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RefreshVolumeSeeds("demo"); err != nil {
+		t.Fatalf("RefreshVolumeSeeds: %v", err)
+	}
+	updated, err := store.LoadSpec("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seeds map[string]string
+	if err := json.Unmarshal([]byte(updated.Annotations[specutils.AnnotationMountTar]), &seeds); err != nil {
+		t.Fatalf("decoding mount seeds: %v", err)
+	}
+	if got := seeds["ttos-volume-cache"]; got != snapshot {
+		t.Errorf("seed path=%q, want %q", got, snapshot)
+	}
+	if got := updated.Annotations["dev.gvisor.spec.mount.ttos0.copyup"]; got != "" {
+		t.Errorf("seeded volume retained copyup=%q", got)
+	}
+}
+
 func TestBuildSpecVolumeSeed(t *testing.T) {
 	seed := filepath.Join(t.TempDir(), "snapshot.tar")
 	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{

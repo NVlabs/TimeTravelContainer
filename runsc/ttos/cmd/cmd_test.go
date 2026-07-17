@@ -2047,6 +2047,9 @@ func TestStopGraceful(t *testing.T) {
 	if b.waited != (selector{container: "web", branch: "child"}) {
 		t.Errorf("wait target=%+v", b.waited)
 	}
+	if len(b.preservedVolumes) != 0 {
+		t.Errorf("child stop preserved global volume seed: %+v", b.preservedVolumes)
+	}
 }
 
 func TestStopEscalatesToKill(t *testing.T) {
@@ -2064,6 +2067,10 @@ func TestStopEscalatesToKill(t *testing.T) {
 	}
 	if len(b.signals) != 2 || b.signals[0].signal != 12 || b.signals[1].signal != 9 {
 		t.Errorf("signal calls=%+v, want configured SIGUSR2 then SIGKILL", b.signals)
+	}
+	wantPreserved := []selector{{container: "web", branch: "main"}}
+	if !reflect.DeepEqual(b.preservedVolumes, wantPreserved) {
+		t.Errorf("preserved=%+v, want %+v", b.preservedVolumes, wantPreserved)
 	}
 }
 
@@ -2177,6 +2184,13 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 			if test.wantResume && b.resumed != wantTarget {
 				t.Errorf("resumed=%+v, want %+v", b.resumed, wantTarget)
 			}
+			var wantPreserved []selector
+			if test.state == "running" || test.state == "paused" {
+				wantPreserved = append(wantPreserved, wantTarget)
+			}
+			if !reflect.DeepEqual(b.preservedVolumes, wantPreserved) {
+				t.Errorf("preserved=%+v, want %+v", b.preservedVolumes, wantPreserved)
+			}
 		})
 	}
 
@@ -2194,7 +2208,7 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 		State: InspectState{Status: "running", Running: true},
 		TTOS:  TTOSInspectInfo{Runtime: &Family{Volumes: []string{"cache"}}},
 	}
-	if got, want := restartDataLossReason(volumeInfo), "in-memory managed volume state (cache)"; got != want {
+	if got, want := restartDataLossReason(volumeInfo), ""; got != want {
 		t.Errorf("volume restart reason=%q, want %q", got, want)
 	}
 	b := &fakeBackend{inspectInfo: descendantInfo}
@@ -2984,6 +2998,7 @@ type fakeBackend struct {
 	volumeImportPath   string
 	volumeCommitTarget selector
 	volumeCommitName   string
+	preservedVolumes   []selector
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3210,6 +3225,11 @@ func (b *fakeBackend) commitVolume(target selector, name string) (ttosbundle.Vol
 	b.volumeCommitTarget = target
 	b.volumeCommitName = name
 	return ttosbundle.VolumeInfo{Name: name}, b.err
+}
+
+func (b *fakeBackend) preserveVolumes(target selector) error {
+	b.preservedVolumes = append(b.preservedVolumes, target)
+	return b.err
 }
 
 func (b *fakeBackend) removeVolume(name string) error {

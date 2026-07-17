@@ -568,6 +568,7 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q "tick:"; do
   sleep 1
 done
 
+ttos exec "$LIFECYCLE" touch /state/restart-persist
 ttos container restart --force --time 2 "$LIFECYCLE"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
@@ -577,6 +578,10 @@ done
 
 ttos exec "$LIFECYCLE" grep -qx "$LIFECYCLE" /etc/hostname ||
   fail "restarted container did not retain /etc/hostname"
+ttos exec "$LIFECYCLE" test -f /state/restart-persist ||
+  fail "automatic restart preservation lost managed-volume state"
+ttos volume inspect "$VOLUME" | grep -q '"snapshot_bytes":' ||
+  fail "automatic restart preservation did not publish volume snapshot metadata"
 
 ttos exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttos\.local$\" /etc/hosts; grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" ||
   fail "restarted container did not retain generated network files"

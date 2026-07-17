@@ -95,7 +95,8 @@ covers:
   CONTAINER[@BRANCH]` assertions for branch-local logical-byte divergence, and
   branch-selected `volume export` tar isolation, atomic `volume commit` of a
   selected live branch, teardown and restoration into a new sandbox family,
-  validated `volume import`, and replacement-seed semantics;
+  validated `volume import`, replacement-seed semantics, and automatic
+  pause/commit/resume preservation across Docker-style restart;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

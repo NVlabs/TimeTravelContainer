@@ -33,6 +33,7 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
 	"gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
@@ -814,6 +815,61 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 		return nil, fmt.Errorf("decoding OCI config for container %q: %w", name, err)
 	}
 	return &spec, nil
+}
+
+// RefreshVolumeSeeds atomically updates a persistent OCI bundle to seed every
+// managed volume that has a committed snapshot.
+func (s Store) RefreshVolumeSeeds(name string) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	seeds := make(map[string]string)
+	for _, volume := range info.Volumes {
+		volumeInfo, err := s.LoadVolume(volume.Name)
+		if err != nil {
+			return err
+		}
+		if volumeInfo.SnapshotUpdatedAt == nil {
+			continue
+		}
+		path, err := s.VolumeSnapshotPath(volume.Name)
+		if err != nil {
+			return err
+		}
+		seeds["ttos-volume-"+volume.Name] = path
+	}
+	if len(seeds) == 0 {
+		delete(spec.Annotations, specutils.AnnotationMountTar)
+	} else {
+		encoded, err := json.Marshal(seeds)
+		if err != nil {
+			return fmt.Errorf("encoding managed volume seed paths: %w", err)
+		}
+		spec.Annotations[specutils.AnnotationMountTar] = string(encoded)
+		const mountHintPrefix = "dev.gvisor.spec.mount."
+		for annotation, source := range spec.Annotations {
+			if !strings.HasPrefix(annotation, mountHintPrefix) || !strings.HasSuffix(annotation, ".source") {
+				continue
+			}
+			if _, ok := seeds[source]; !ok {
+				continue
+			}
+			prefix := strings.TrimSuffix(annotation, "source")
+			delete(spec.Annotations, prefix+"copyup")
+		}
+	}
+	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
+		return fmt.Errorf("updating managed volume seeds for container %q: %w", name, err)
+	}
+	return nil
 }
 
 // ListContainers returns all persistent containers ordered by name.

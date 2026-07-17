@@ -62,9 +62,10 @@ container configuration and `logs --details` prefixes them in sorted order;
 private attach transport remains available. A rootless per-user `ttosd` now
 autostarts on a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
-`--direct` remains an explicit recovery path. Explicit managed-volume
-commit/import seeds, lifecycle events, and transactional mutations are
-implemented; automatic volume commit during family teardown remains TODO.
+`--direct` remains an explicit recovery path. Explicit commit/import plus
+quiescent main-branch snapshots before stop, restart, and sole-branch forced
+removal are implemented. A Sentry pre-exit hook for unplanned exits and final
+signal-handler writes remains TODO.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -266,9 +267,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] `ttos restart CONTAINER...` for created, exited, running, or paused base
       containers, including TERM/timeout/KILL behavior. Restart rejects an
       individual branch because destroyed in-memory branches cannot be
-      reconstructed. Live descendants require explicit `--force`; managed
-      volumes can be retained with `volume commit` before restart. Automatic
-      lifecycle commit parity remains TODO.
+      reconstructed. Live descendants require explicit `--force`; restart
+      quiesces and snapshots main before teardown, then seeds the replacement
+      sandbox from that snapshot.
 - [x] `ttos stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
 - [x] `ttos kill CONTAINER[@BRANCH] [SIGNAL]`.
 - [x] Initial `ttos rm CONTAINER`: remove stopped/created family metadata,
@@ -630,9 +631,14 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       disk checkpointing part of live fork.
 - [x] Add `ttos volume import --input TAR VOLUME` and automatically seed a new
       sandbox family's Sentry-owned tmpfs from the validated archive.
-- [ ] Automatically commit the selected main-branch volume state during ordinary
-      stop/remove/restart lifecycle transitions, with an explicit policy for
-      live descendants and forced teardown.
+- [x] Automatically pause, commit, and resume main before explicit stop or
+      restart and before forced removal of a sole-branch live family. Forced
+      restart with descendants selects main; forced removal with descendants
+      preserves the latest explicit commit/import instead of silently selecting
+      a branch.
+- [ ] Add a Sentry pre-exit snapshot hook so unplanned natural exit and writes
+      performed by a shutdown signal handler are captured. Manager-driven stop
+      currently takes its quiescent snapshot before delivering the stop signal.
 
 ## Image and storage backend
 
@@ -803,8 +809,9 @@ bundle.
 
 - [x] Define `start` for an exited main branch as OCI recreation from the immutable
       image and persistent configuration. Managed volumes start from their latest
-      explicitly committed or imported seed; uncommitted in-memory branch changes
-      are not retained after sandbox-family teardown.
+      explicitly committed, imported, or manager-preserved main seed. An explicit
+      stop/restart snapshot precedes signal delivery; unplanned exit after the
+      last seed can still lose newer in-memory changes until the pre-exit hook lands.
 - [x] Output attachment does not reject or migrate with fork: every branch owns
       one drain, while host readers remain attached only to the selected log.
 - [x] Drain to a persistent host log instead of blocking guest output merely

@@ -3620,6 +3620,11 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if timeoutSet {
 			stopTimeout = timeout
 		}
+		if target.branch == defaultBranchID {
+			if err := backend.preserveVolumes(target); err != nil {
+				return fmt.Errorf("preserving managed volumes for %s before stop: %w", target, err)
+			}
+		}
 		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 			return err
 		}
@@ -3675,7 +3680,7 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	fs.IntVar(&timeout, "time", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "timeout", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "t", ttosbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
-	force := fs.Bool("force", false, "discard live descendant branches and in-memory managed volumes")
+	force := fs.Bool("force", false, "discard live descendant branches")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -3705,6 +3710,12 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 			stopTimeout = timeout
 		}
 		target := selector{container: name, branch: defaultBranchID}
+		switch info.State.Status {
+		case "running", "paused", "restarting":
+			if err := backend.preserveVolumes(target); err != nil {
+				return fmt.Errorf("preserving managed volumes for %s before restart: %w", target, err)
+			}
+		}
 		switch info.State.Status {
 		case "paused":
 			if err := backend.resume(target); err != nil {
@@ -3743,22 +3754,6 @@ func restartDataLossReason(info InspectInfo) string {
 		if branch.Metadata.ID != defaultBranchID {
 			return fmt.Sprintf("live descendant branch %q", branch.Metadata.ID)
 		}
-	}
-	volumeNames := []string{}
-	if info.TTOS.Runtime != nil {
-		volumeNames = append(volumeNames, info.TTOS.Runtime.Volumes...)
-	} else {
-		seen := make(map[string]bool)
-		for _, volume := range info.TTOS.Container.Volumes {
-			if !seen[volume.Name] {
-				volumeNames = append(volumeNames, volume.Name)
-				seen[volume.Name] = true
-			}
-		}
-		sort.Strings(volumeNames)
-	}
-	if len(volumeNames) != 0 {
-		return fmt.Sprintf("in-memory managed volume state (%s)", strings.Join(volumeNames, ", "))
 	}
 	return ""
 }
@@ -4280,6 +4275,7 @@ type backend interface {
 	exportVolume(target selector, name, outputPath string) error
 	importVolume(name, inputPath string) (ttosbundle.VolumeInfo, error)
 	commitVolume(target selector, name string) (ttosbundle.VolumeInfo, error)
+	preserveVolumes(target selector) error
 	removeVolume(name string) error
 }
 
@@ -4658,6 +4654,9 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	info, err := b.resolveContainer(name)
 	if err != nil {
 		return 1, err
+	}
+	if err := b.containerStore().RefreshVolumeSeeds(info.ID); err != nil {
+		return 1, fmt.Errorf("refreshing managed volume seeds before starting %q: %w", name, err)
 	}
 	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
@@ -6248,8 +6247,22 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		if family.ID != runtimeID {
 			continue
 		}
-		if !force && family.State != "stopped" && family.State != "exited" {
+		live := family.State != "stopped" && family.State != "exited"
+		if !force && live {
 			return fmt.Errorf("container %q is %s; stop it or use --force", name, family.State)
+		}
+		hasDescendants := false
+		for _, branch := range family.Branches {
+			if branch.ID != defaultBranchID && branch.State != "deleted" {
+				hasDescendants = true
+				break
+			}
+		}
+		if live && !hasDescendants {
+			target := selector{container: runtimeID, branch: defaultBranchID}
+			if err := b.preserveVolumes(target); err != nil {
+				return fmt.Errorf("preserving managed volumes for %s before removal: %w", target, err)
+			}
 		}
 		args := []string{"delete"}
 		if force {
@@ -6645,6 +6658,71 @@ func (b *runtimeBackend) commitVolume(target selector, name string) (ttosbundle.
 		return ttosbundle.VolumeInfo{}, err
 	}
 	return store.LoadVolume(name)
+}
+
+func (b *runtimeBackend) preserveVolumes(target selector) (retErr error) {
+	resolved, container, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	namesByValue := make(map[string]struct{})
+	for _, volume := range container.Volumes {
+		namesByValue[volume.Name] = struct{}{}
+	}
+	if len(namesByValue) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(namesByValue))
+	for name := range namesByValue {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("checking runtime state: %w", err)
+	}
+	state := ""
+	for _, family := range families {
+		if family.ID != target.container {
+			continue
+		}
+		state = family.State
+		for _, branch := range family.Branches {
+			if branch.ID == target.branch {
+				state = branch.State
+				break
+			}
+		}
+		break
+	}
+	switch state {
+	case "", "created", "stopped", "exited", "failed", "dead", "deleted":
+		return nil
+	case "running", "restarting":
+		if err := b.pause(target); err != nil {
+			return fmt.Errorf("pausing %s for volume preservation: %w", target, err)
+		}
+		defer func() {
+			if err := b.resume(target); err != nil {
+				if retErr == nil {
+					retErr = fmt.Errorf("resuming %s after volume preservation: %w", target, err)
+				} else {
+					retErr = fmt.Errorf("%w; resuming %s also failed: %v", retErr, target, err)
+				}
+			}
+		}()
+	case "paused":
+	default:
+		return fmt.Errorf("cannot preserve managed volumes from %s in state %q", target, state)
+	}
+	for _, name := range names {
+		if _, err := b.commitVolume(target, name); err != nil {
+			return fmt.Errorf("committing volume %q: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) removeVolume(name string) error {
