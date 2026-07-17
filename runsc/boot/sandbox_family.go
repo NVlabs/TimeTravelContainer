@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -82,9 +83,10 @@ type ForkBranchArgs struct {
 
 // ForkEligibility is a read-only report for one source branch.
 type ForkEligibility struct {
-	Eligible bool                           `json:"eligible"`
-	Issues   []kernel.LiveForkResourceIssue `json:"issues,omitempty"`
-	Reason   string                         `json:"reason,omitempty"`
+	Eligible      bool                           `json:"eligible"`
+	MountManifest []vfs.LiveForkFilesystemRecord `json:"mount_manifest,omitempty"`
+	Issues        []kernel.LiveForkResourceIssue `json:"issues,omitempty"`
+	Reason        string                         `json:"reason,omitempty"`
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -589,7 +591,9 @@ func (f *SandboxFamily) CheckFork(sourceID string) (*ForkEligibility, error) {
 	if !sourceWasPaused {
 		source.k.Pause()
 	}
-	validationErr := source.k.ValidateLiveFork(source.k.SupervisorContext(), kernel.LiveForkValidationOptions{
+	ctx := source.k.SupervisorContext()
+	mountManifest := source.k.VFS().LiveForkFilesystemEligibilities(ctx)
+	validationErr := source.k.ValidateLiveFork(ctx, kernel.LiveForkValidationOptions{
 		AllowNetworkStack:              f.allowNetworkStack,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 	})
@@ -599,10 +603,11 @@ func (f *SandboxFamily) CheckFork(sourceID string) (*ForkEligibility, error) {
 			return nil, fmt.Errorf("resuming source branch %q after live-fork validation: %w", sourceID, err)
 		}
 	}
+	result := &ForkEligibility{Eligible: validationErr == nil, MountManifest: mountManifest}
 	if validationErr == nil {
-		return &ForkEligibility{Eligible: true}, nil
+		return result, nil
 	}
-	result := &ForkEligibility{Reason: validationErr.Error()}
+	result.Reason = validationErr.Error()
 	var resourceErr *kernel.LiveForkResourceError
 	if errors.As(validationErr, &resourceErr) {
 		result.Issues = append([]kernel.LiveForkResourceIssue(nil), resourceErr.Issues...)

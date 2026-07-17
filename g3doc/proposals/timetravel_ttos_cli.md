@@ -539,7 +539,11 @@ Unclassified filesystems reject by default. Gofer instances must carry a
 stable resource ID, prove that their server connection is read-only, disable
 directfs, and be mounted read-only when visible in the mount table. Restricted
 sysfs also requires a read-only mount. `CheckFork` and `LiveFork` run the same
-closure validation before shared-memory or address-space CoW preparation. Rejections carry the guest mount path (empty for a hidden referenced lower), filesystem type, source class, stable resource description, and reason through the runsc RPC and `ttos fork --check --json`.
+closure validation before shared-memory or address-space CoW preparation.
+`ttos fork --check --json` and inspect fork checks expose the complete sorted
+`mount_manifest`, including visible mount ID/path/flags and hidden referenced
+lowers, with filesystem type, source class, clone/share/reject decision, stable
+identity, and reason. Rejections additionally carry PID/FD resource issues.
 
 - [x] Add a VFS live-fork mount/filesystem eligibility interface returning the
       decision, stable identity, and rejection reason.
@@ -674,8 +678,10 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       permission checks receive the OCI-layer IDs without subordinate ranges.
       Materialized roots default to guest mode 0755 so non-root image users can
       traverse `/` regardless of private host cache-parent modes.
-- [ ] Construct the full mount manifest once allowed mount classes are
-      implemented.
+- [x] Construct the full mount manifest from the Sentry VFS closure and expose it
+      in fork-check JSON and inspect fork-check results. Records include visible
+      mounts and hidden referenced lowers with stable identity and
+      clone/share-external/reject decisions.
 - [x] Place an in-memory OverlayFS upper over the immutable image lower by
       default.
 - [x] Track the image-target content lease for every family and release it only

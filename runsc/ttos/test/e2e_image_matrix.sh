@@ -648,6 +648,13 @@ fi
 ttos fork --check "$LIFECYCLE_PREFIX"
 FORK_CHECK_JSON=$(ttos fork --check --json "$LIFECYCLE_PREFIX")
 echo "$FORK_CHECK_JSON" | grep -q '"warnings"' || fail "fork check omitted shared-view warnings"
+echo "$FORK_CHECK_JSON" | grep -q '"mount_manifest"' || fail "fork check omitted the full mount manifest"
+echo "$FORK_CHECK_JSON" | grep -q '"mounted": false' || fail "fork check omitted a hidden referenced filesystem"
+echo "$FORK_CHECK_JSON" | grep -q '"decision": "clone"' || fail "fork check omitted cloned filesystem decisions"
+echo "$FORK_CHECK_JSON" | grep -q '"decision": "share-external"' || fail "fork check omitted shared external filesystem decisions"
+for filesystem_type in 9p overlay tmpfs proc sysfs; do
+  echo "$FORK_CHECK_JSON" | grep -q "\"filesystem_type\": \"$filesystem_type\"" || fail "fork check manifest omitted $filesystem_type"
+done
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE" || fail "fork check warning omitted first host bind"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warning omitted second host bind"
 echo "$FORK_CHECK_JSON" | grep -q "$HOST_COW_FIXTURE" || fail "fork check warning omitted managed CoW lower"

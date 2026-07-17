@@ -336,7 +336,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckFork: %v", err)
 	}
-	if !eligibility.Eligible || len(eligibility.Issues) != 0 || eligibility.Reason != "" {
+	if !eligibility.Eligible || len(eligibility.MountManifest) == 0 || len(eligibility.Issues) != 0 || eligibility.Reason != "" {
 		t.Fatalf("CheckFork returned %+v", eligibility)
 	}
 	initialBranches := family.List()

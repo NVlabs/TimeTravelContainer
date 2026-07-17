@@ -825,6 +825,20 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 			t.Errorf("missing shared-filesystem eligibility path %q", path)
 		}
 	}
+	manifestSharedPaths := map[string]bool{"": false, "/readonly": false}
+	for _, record := range eligibility.MountManifest {
+		if record.Decision != vfs.LiveForkFilesystemShareExternal {
+			continue
+		}
+		if _, ok := manifestSharedPaths[record.MountPath]; ok {
+			manifestSharedPaths[record.MountPath] = true
+		}
+	}
+	for path, seen := range manifestSharedPaths {
+		if !seen {
+			t.Errorf("mount manifest omitted shared filesystem path %q: %+v", path, eligibility.MountManifest)
+		}
+	}
 	l.family.allowSharedFilesystemResources = true
 
 	mounts := l.k.VFS().GetAllMounts(ctx)

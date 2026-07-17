@@ -387,8 +387,9 @@ func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
 	}
 
 	b.checkResult = ForkEligibility{
-		Reason: "live fork resource validation failed",
-		Issues: []ForkResourceIssue{{PID: 0, FD: -1, MountPath: "/sys", FilesystemType: "sysfs", SourceClass: "sentry-owned", Resource: "mount \"/sys\" filesystem \"sysfs\"", Reason: "read-only mount required"}},
+		MountManifest: []ForkMountRecord{{MountID: 7, MountPath: "/sys", Mounted: true, FilesystemType: "sysfs", SourceClass: "sentry-owned", ReadOnly: false, Decision: "reject", StableIdentity: "mount:7", Reason: "filesystem requires a read-only mount"}, {Mounted: false, FilesystemType: "9p", SourceClass: "external-gofer", ReadOnly: true, Decision: "share-external", StableIdentity: "gofer:root"}},
+		Reason:        "live fork resource validation failed",
+		Issues:        []ForkResourceIssue{{PID: 0, FD: -1, MountPath: "/sys", FilesystemType: "sysfs", SourceClass: "sentry-owned", Resource: "mount \"/sys\" filesystem \"sysfs\"", Reason: "read-only mount required"}},
 	}
 	stdout.Reset()
 	stderr.Reset()

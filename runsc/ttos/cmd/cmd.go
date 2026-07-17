@@ -4177,6 +4177,20 @@ type ForkResourceIssue struct {
 	Reason         string `json:"reason"`
 }
 
+// ForkMountRecord describes one visible mount or hidden referenced filesystem.
+// Mounted is false for a filesystem reachable only through another filesystem.
+type ForkMountRecord struct {
+	MountID        uint64 `json:"mount_id,omitempty"`
+	MountPath      string `json:"mount_path,omitempty"`
+	Mounted        bool   `json:"mounted"`
+	FilesystemType string `json:"filesystem_type"`
+	SourceClass    string `json:"source_class"`
+	ReadOnly       bool   `json:"read_only"`
+	Decision       string `json:"decision"`
+	StableIdentity string `json:"stable_identity"`
+	Reason         string `json:"reason,omitempty"`
+}
+
 // ForkWarning reports a non-blocking observable sharing property.
 type ForkWarning struct {
 	Resource string `json:"resource"`
@@ -4185,10 +4199,11 @@ type ForkWarning struct {
 
 // ForkEligibility is a stable read-only fork validation report.
 type ForkEligibility struct {
-	Eligible bool                `json:"eligible"`
-	Warnings []ForkWarning       `json:"warnings,omitempty"`
-	Issues   []ForkResourceIssue `json:"issues,omitempty"`
-	Reason   string              `json:"reason,omitempty"`
+	Eligible      bool                `json:"eligible"`
+	MountManifest []ForkMountRecord   `json:"mount_manifest,omitempty"`
+	Warnings      []ForkWarning       `json:"warnings,omitempty"`
+	Issues        []ForkResourceIssue `json:"issues,omitempty"`
+	Reason        string              `json:"reason,omitempty"`
 }
 
 // ProcessInfo is stable branch-local process information returned by ttos top.

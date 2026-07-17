@@ -88,15 +88,15 @@ type FilesystemImplLiveForkExtension interface {
 // filesystem is reachable only through another filesystem, such as a gofer
 // lower hidden by OverlayFS.
 type LiveForkFilesystemRecord struct {
-	MountID        uint64
-	MountPath      string
-	Mounted        bool
-	FilesystemType string
-	SourceClass    string
-	ReadOnly       bool
-	Decision       LiveForkFilesystemDecision
-	StableIdentity string
-	Reason         string
+	MountID        uint64                     `json:"mount_id,omitempty"`
+	MountPath      string                     `json:"mount_path,omitempty"`
+	Mounted        bool                       `json:"mounted"`
+	FilesystemType string                     `json:"filesystem_type"`
+	SourceClass    string                     `json:"source_class"`
+	ReadOnly       bool                       `json:"read_only"`
+	Decision       LiveForkFilesystemDecision `json:"decision"`
+	StableIdentity string                     `json:"stable_identity"`
+	Reason         string                     `json:"reason,omitempty"`
 }
 
 // LiveForkFilesystemEligibilities classifies every mounted and otherwise
