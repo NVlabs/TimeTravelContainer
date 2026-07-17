@@ -1091,6 +1091,7 @@ func TestAttachStreamSelection(t *testing.T) {
 	for _, args := range [][]string{
 		{"attach", "--no-stdout", "--no-stderr", "demo"},
 		{"attach", "-i", "--no-stdin", "demo"},
+		{"attach", "-i", "--takeover", "demo"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer

@@ -77,6 +77,9 @@ type daemonServer struct {
 
 	eventMu  sync.Mutex
 	eventSeq uint64
+
+	stdinMu     sync.Mutex
+	stdinLeases map[string]*daemonStdinLease
 }
 
 type daemonFrameWriter struct {
@@ -325,6 +328,25 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
 	opts := optionsFromWire(request.Options)
+	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
+	if err != nil {
+		stdinReader.Close()
+		writeError(err)
+		return
+	}
+	request.Args = cleanArgs
+	if leaseKey != "" {
+		release, err := s.acquireStdinLease(leaseKey, takeover, func() {
+			_ = stdinWriter.CloseWithError(errDetached)
+			_ = conn.Close()
+		})
+		if err != nil {
+			stdinReader.Close()
+			writeError(err)
+			return
+		}
+		defer release()
+	}
 	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
@@ -603,6 +625,12 @@ func writeDaemonStatus(writer io.Writer, mu *sync.Mutex, status int) error {
 func daemonCommandUsesStdin(args []string) bool {
 	if len(args) == 0 {
 		return false
+	}
+	if args[0] == "container" {
+		args = args[1:]
+		if len(args) == 0 {
+			return false
+		}
 	}
 	switch args[0] {
 	case "attach", "run", "start":

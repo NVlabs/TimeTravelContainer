@@ -1827,14 +1827,18 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 	noStderr := fs.Bool("no-stderr", false, "do not attach stderr")
 	execID := fs.String("exec", "", "attach to a managed exec session")
 	detachKeysValue := fs.String("detach-keys", "ctrl-p,ctrl-q", "override the key sequence for detaching")
+	takeover := fs.Bool("takeover", false, "replace the current daemon-owned stdin attachment")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttos attach [-i|--no-stdin] [--no-stdout] [--no-stderr] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttos attach [-i|--no-stdin] [--takeover] [--no-stdout] [--no-stderr] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
 	}
 	if *interactive && *noStdin {
 		return errors.New("--interactive and --no-stdin cannot be used together")
+	}
+	if *takeover {
+		return errors.New("--takeover requires ttosd; remove --direct")
 	}
 	request := attachRequest{
 		execID: *execID,

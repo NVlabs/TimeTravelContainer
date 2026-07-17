@@ -376,7 +376,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Initial single-stdin-owner enforcement with one advisory host lock per
       branch; detach, exit, or client death releases it without adding a host FD
       to forked guest state.
-- [ ] Move stdin leases into `ttosd` and define explicit takeover behavior.
+- [x] Move interactive attach stdin leases into `ttosd`, keyed by resolved
+      container ID, branch, and optional exec session. A second owner is rejected;
+      `attach -i --takeover` disconnects and waits for the prior client before
+      proceeding. Keep the advisory file lock as a direct/recovery backstop.
 - [x] Drain output while no client is attached so guest writers do not stop at
       the Sentry pipe capacity; retain output in a persistent host log.
 - [x] Initial bounded retention: rotate only between complete multiplexed

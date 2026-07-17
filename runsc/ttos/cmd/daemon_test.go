@@ -30,6 +30,7 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 		want bool
 	}{
 		{[]string{"attach", "-i", "demo"}, true},
+		{[]string{"container", "attach", "-i", "demo"}, true},
 		{[]string{"exec", "-dit", "demo", "sh"}, true},
 		{[]string{"run", "--interactive", "alpine"}, true},
 		{[]string{"start", "-ai", "demo"}, true},
@@ -98,6 +99,49 @@ func TestDaemonMutationLocksAreScopedByDataRoot(t *testing.T) {
 		unlock()
 	case <-time.After(5 * time.Second):
 		t.Fatal("conflicting mutation remained blocked after unlock")
+	}
+}
+
+func TestDaemonStdinLeaseRejectsAndTakesOver(t *testing.T) {
+	server := &daemonServer{}
+	cancelOld := make(chan struct{})
+	releaseOld, err := server.acquireStdinLease("root\x00demo", false, func() { close(cancelOld) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.acquireStdinLease("root\x00demo", false, func() {}); err == nil || !strings.Contains(err.Error(), "--takeover") {
+		t.Fatalf("second lease error=%v", err)
+	}
+
+	released := make(chan struct{})
+	go func() {
+		<-cancelOld
+		releaseOld()
+		close(released)
+	}()
+	releaseSecond, err := server.acquireStdinLease("root\x00demo", true, func() {})
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old stdin owner was not detached")
+	}
+	releaseSecond()
+}
+
+func TestDaemonAttachTakeoverParsing(t *testing.T) {
+	clean, key, takeover, err := daemonAttachStdinLease(options{}, []string{"attach", "-i", "--takeover", "--no-stdout"}, true)
+	if err != nil || key != "" || !takeover || strings.Contains(strings.Join(clean, " "), "takeover") {
+		t.Fatalf("takeover parse=(%q, %q, %t, %v)", clean, key, takeover, err)
+	}
+	if _, _, _, err := daemonAttachStdinLease(options{}, []string{"attach", "--takeover", "demo"}, false); err == nil {
+		t.Fatal("takeover without interactive stdin was accepted")
+	}
+	clean, key, takeover, err = daemonAttachStdinLease(options{}, []string{"run", "image", "--takeover"}, false)
+	if err != nil || key != "" || takeover || !strings.Contains(strings.Join(clean, " "), "--takeover") {
+		t.Fatalf("non-attach args were modified: (%q, %q, %t, %v)", clean, key, takeover, err)
 	}
 }
 
