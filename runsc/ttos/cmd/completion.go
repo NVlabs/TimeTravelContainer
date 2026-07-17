@@ -214,7 +214,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return nil, nil
 	case "image":
 		if len(rest) == 0 {
-			return []string{"inspect", "ls", "rm"}, nil
+			return []string{"inspect", "ls", "pull", "rm"}, nil
 		}
 		if rest[0] == "inspect" || rest[0] == "rm" || rest[0] == "remove" {
 			return imageCompletionCandidates(backend)

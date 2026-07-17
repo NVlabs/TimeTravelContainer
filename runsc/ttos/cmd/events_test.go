@@ -118,6 +118,7 @@ func TestCommandEventsExposeExitAndDestroy(t *testing.T) {
 		wantAction string
 	}{
 		{[]string{"rm", "demo"}, "container", "destroy"},
+		{[]string{"image", "pull", "alpine"}, "image", "pull"},
 		{[]string{"branch", "rm", "demo@child"}, "branch", "destroy"},
 		{[]string{"exec", "wait", "demo@child:exec-one"}, "exec", "exit"},
 	} {

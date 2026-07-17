@@ -2516,11 +2516,13 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 
 func runImage(args []string, stdout, stderr io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttos image ls|inspect|rm [OPTIONS]")
+		return errors.New("usage: ttos image ls|pull|inspect|rm [OPTIONS]")
 	}
 	switch args[0] {
 	case "ls", "list":
 		return runImages(args[1:], stdout, stderr, backend)
+	case "pull":
+		return runPull(args[1:], stdout, stderr, backend)
 	case "inspect":
 		return runImageInspect(args[1:], stdout, backend)
 	case "rm", "remove":

@@ -381,6 +381,17 @@ func TestPullNormalizesDockerReference(t *testing.T) {
 	}
 }
 
+func TestImagePullAlias(t *testing.T) {
+	b := &fakeBackend{pullInfo: ttosimages.Info{Digest: "sha256:alias"}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"image", "pull", "-q", "alpine:3.20"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("image pull status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.pullReference != "docker.io/library/alpine:3.20" || stdout.String() != "sha256:alias\n" {
+		t.Fatalf("image pull reference=%q output=%q", b.pullReference, stdout.String())
+	}
+}
+
 func TestPullOptionsAndQuietOutput(t *testing.T) {
 	b := &fakeBackend{pullInfo: ttosimages.Info{Digest: "sha256:5678"}}
 	var stdout, stderr bytes.Buffer

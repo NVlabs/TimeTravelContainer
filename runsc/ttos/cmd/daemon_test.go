@@ -52,6 +52,7 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"pause", "demo"}, true},
 		{[]string{"container", "restart", "demo"}, true},
 		{[]string{"image", "rm", "alpine"}, true},
+		{[]string{"image", "pull", "alpine"}, true},
 		{[]string{"volume", "create", "cache"}, true},
 		{[]string{"branch", "remove", "demo"}, true},
 		{[]string{"run", "-d", "alpine"}, true},

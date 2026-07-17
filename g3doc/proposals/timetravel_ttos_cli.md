@@ -120,8 +120,12 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Define initial `start` semantics: a created or exited base container
       starts from its persistent OCI bundle and immutable image root; destroyed
       in-memory branch state is not reconstructed.
-- [ ] Specify behavior when a family or branch name conflicts with an image,
-      volume, or exec-session name.
+- [x] Use typed namespaces: family names and IDs conflict globally with other
+      families; branch IDs conflict within one family and immutable lineage; exec
+      session IDs conflict within one branch. Image references and managed-volume
+      names are independent namespaces, so they may equal a family, branch, or
+      exec name without ambiguity because commands and selector delimiters carry
+      the object type.
 - [x] Store initial desired configuration and lifecycle metadata separately
       from transient Sentry state so created/stopped containers can be listed,
       inspected, restarted, and removed.
@@ -134,7 +138,8 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 ### Images
 
-- [x] `ttos pull IMAGE` with Docker Hub shorthand such as `ubuntu:24.04`.
+- [x] `ttos pull IMAGE` and Docker-compatible `ttos image pull IMAGE` with
+      Docker Hub shorthand such as `ubuntu:24.04`.
 - [x] Normalize unqualified names to `docker.io/library/...`.
 - [x] Support OCI registries, tags, immutable digests, and multi-architecture
       manifest selection.

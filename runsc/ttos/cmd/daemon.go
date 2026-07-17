@@ -407,7 +407,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	case "start":
 		return !daemonCommandBoolFlag(args[1:], 'a', "--attach")
 	case "image":
-		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
+		return len(args) > 1 && (args[1] == "pull" || args[1] == "rm" || args[1] == "remove")
 	case "branch":
 		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
 	case "volume":

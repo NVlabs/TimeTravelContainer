@@ -101,6 +101,16 @@ func commandEvents(args []string, status int) []DaemonEvent {
 			command = "resume"
 		}
 	}
+	if command == "image" && len(rest) != 0 {
+		switch rest[0] {
+		case "pull":
+			command = "pull"
+			rest = rest[1:]
+		case "rm", "remove":
+			command = "rmi"
+			rest = rest[1:]
+		}
+	}
 	event := DaemonEvent{Status: status}
 	switch command {
 	case "pull", "rmi", "images", "image":
