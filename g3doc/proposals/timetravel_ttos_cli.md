@@ -18,8 +18,10 @@ optional live-fork eligibility reports. Effective Docker entrypoint, command,
 user, and image labels are retained in the generated bundle for later
 inspection. Generated bundles include procfs, restricted read-only sysfs,
 tmpfs-backed `/dev` and `/dev/shm`, and a private devpts instance with
-`/dev/ptmx`. Docker-compatible `--tmpfs` and `--mount type=tmpfs` add arbitrary
-Sentry-owned tmpfs mounts with mode, size, and access options; TTOS extensions
+`/dev/ptmx`. Docker-compatible `--shm-size` configures the fork-safe
+`/dev/shm` tmpfs and is retained across restart and live fork. Docker-compatible
+`--tmpfs` and `--mount type=tmpfs` add arbitrary Sentry-owned tmpfs mounts with
+mode, size, and access options; TTOS extensions
 `--mount type=proc|procfs|sysfs` add alternate Sentry virtual-filesystem
 views. Existing host paths can be attached read-only with Docker-style `-v`
 or `--mount` syntax. Named managed tmpfs volumes can be attached at one or
@@ -171,6 +173,9 @@ the `main` branch and leave `ttos` responsible for branch operations.
       and finish time into persistent inspect metadata.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
+- [x] Support Docker-compatible `--shm-size` byte units with Docker's 64 MiB
+      default, persistent `HostConfig.ShmSize` inspect output, and retention
+      across create/start/restart/live fork.
 - [x] Support Docker-compatible `--tmpfs DEST[:OPTIONS]` and
       `--mount type=tmpfs,target=...` with read/write policy, octal mode, and
       byte-size limits. Support TTOS extension mounts for alternate private
@@ -531,8 +536,8 @@ Reject            unsupported, externally mutable, or host/device-backed
       Docker-like lifecycle commands and inspect across created, running,
       forked, paused, and exited states; live fork; managed-volume CoW;
       read-only host binds; distinct Redis lower-layer ownership; exact quick-exit
-      console integrity; Sentry-enforced PID limits and Docker ulimits across
-      live fork; and the explicit no-userns fallback.
+      console integrity; configurable shared memory, Sentry-enforced PID limits,
+      and Docker ulimits across live fork; and the explicit no-userns fallback.
 - [ ] Add image pull/unpack tests using a local registry and no network-dependent
       test fixtures.
 

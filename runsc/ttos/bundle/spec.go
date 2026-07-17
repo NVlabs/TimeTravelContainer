@@ -45,6 +45,8 @@ const (
 	DefaultStopSignal = "SIGTERM"
 	// DefaultStopTimeoutSeconds matches Docker's Linux default stop timeout.
 	DefaultStopTimeoutSeconds = 10
+	// DefaultShmSizeBytes matches Docker's default /dev/shm size.
+	DefaultShmSizeBytes int64 = 64 * 1024 * 1024
 )
 
 var defaultCapabilities = []string{
@@ -79,6 +81,7 @@ type SpecOptions struct {
 	ReadonlyRootfs   bool
 	StopSignal       string
 	PidsLimit        *int64
+	ShmSize          *int64
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -144,6 +147,28 @@ func ParseUlimits(values []string) ([]Ulimit, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
+}
+
+// ParseShmSize parses the Docker --shm-size byte syntax.
+func ParseShmSize(value string) (int64, error) {
+	bytes, err := units.RAMInBytes(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid shared memory size %q: %w", value, err)
+	}
+	if bytes < 0 {
+		return 0, fmt.Errorf("shared memory size cannot be negative: %d", bytes)
+	}
+	return bytes, nil
+}
+
+func effectiveShmSize(value *int64) (int64, error) {
+	if value == nil {
+		return DefaultShmSizeBytes, nil
+	}
+	if *value < 0 {
+		return 0, fmt.Errorf("shared memory size cannot be negative: %d", *value)
+	}
+	return *value, nil
 }
 
 func buildRlimits(configured []Ulimit) ([]specs.POSIXRlimit, error) {
@@ -227,11 +252,15 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if hostname == "" {
 		hostname = opts.Name
 	}
+	shmSize, err := effectiveShmSize(opts.ShmSize)
+	if err != nil {
+		return nil, err
+	}
 	mounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
-		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", fmt.Sprintf("size=%d", shmSize)}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 	}
 	namespaces := []specs.LinuxNamespace{

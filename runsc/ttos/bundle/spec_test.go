@@ -32,6 +32,7 @@ import (
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	pidsLimit := int64(23)
+	shmSize := int64(32 * 1024 * 1024)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
 		t.Fatal(err)
@@ -66,6 +67,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		ReadonlyRootfs: true,
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
+		ShmSize:        &shmSize,
 		Ulimits:        []Ulimit{{Name: "core", Soft: 0, Hard: -1}, {Name: "nofile", Soft: 64, Hard: 128}},
 		Args:           []string{"override", "arg"},
 		Env:            []string{"A=run", "B", "C=new"},
@@ -103,7 +105,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
-		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=33554432"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/scratch", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "mode=0700", "size=1m"}},
 		{Destination: "/alt-proc", Type: "proc", Source: "proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
@@ -202,6 +204,20 @@ func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
 	return false
 }
 
+func TestParseShmSize(t *testing.T) {
+	for value, want := range map[string]int64{"32m": 32 * 1024 * 1024, "1.5g": 1536 * 1024 * 1024, "0": 0} {
+		got, err := ParseShmSize(value)
+		if err != nil || got != want {
+			t.Errorf("ParseShmSize(%q)=(%d, %v), want %d", value, got, err, want)
+		}
+	}
+	for _, value := range []string{"", "invalid", "-1"} {
+		if _, err := ParseShmSize(value); err == nil {
+			t.Errorf("ParseShmSize(%q) succeeded", value)
+		}
+	}
+}
+
 func TestParseUlimits(t *testing.T) {
 	got, err := ParseUlimits([]string{"nofile=32:64", "core=0:-1", "nofile=128"})
 	if err != nil {
@@ -272,6 +288,10 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), StopSignal: "SIGINVALID"}); err == nil {
 		t.Error("BuildSpec accepted an invalid stop signal")
+	}
+	invalidShmSize := int64(-1)
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ShmSize: &invalidShmSize}); err == nil {
+		t.Error("BuildSpec accepted a negative shared memory size")
 	}
 	invalidPidsLimit := int64(-2)
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), PidsLimit: &invalidPidsLimit}); err == nil {
@@ -380,6 +400,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers[0].StopSignal != DefaultStopSignal || containers[0].StopTimeout == nil || *containers[0].StopTimeout != DefaultStopTimeoutSeconds {
 		t.Errorf("legacy stop policy=(%q, %v), want (%q, %d)", containers[0].StopSignal, containers[0].StopTimeout, DefaultStopSignal, DefaultStopTimeoutSeconds)
+	}
+	if containers[0].ShmSize == nil || *containers[0].ShmSize != DefaultShmSizeBytes {
+		t.Errorf("legacy shared memory size=%v, want %d", containers[0].ShmSize, DefaultShmSizeBytes)
 	}
 	paths, err := store.BranchConsolePaths("demo", "test-a")
 	if err != nil {

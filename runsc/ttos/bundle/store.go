@@ -85,6 +85,7 @@ type ContainerInfo struct {
 	StopSignal         string          `json:"stop_signal,omitempty"`
 	StopTimeout        *int            `json:"stop_timeout,omitempty"`
 	PidsLimit          *int64          `json:"pids_limit,omitempty"`
+	ShmSize            *int64          `json:"shm_size,omitempty"`
 	Ulimits            []Ulimit        `json:"ulimits,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
@@ -189,6 +190,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
 		return Prepared{}, fmt.Errorf("writing OCI config: %w", err)
 	}
+	shmSize, err := effectiveShmSize(opts.ShmSize)
+	if err != nil {
+		return Prepared{}, err
+	}
 	metadata := ContainerInfo{
 		ID:                 id,
 		Name:               opts.Name,
@@ -207,6 +212,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopSignal:         spec.Annotations[StopSignalAnnotation],
 		StopTimeout:        cloneIntPointer(opts.StopTimeout),
 		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
+		ShmSize:            cloneInt64Pointer(&shmSize),
 		Ulimits:            append([]Ulimit(nil), opts.Ulimits...),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
@@ -325,6 +331,13 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	}
 	if *info.StopTimeout < -1 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid stop timeout %d", key, *info.StopTimeout)
+	}
+	if info.ShmSize == nil {
+		value := DefaultShmSizeBytes
+		info.ShmSize = &value
+	}
+	if *info.ShmSize < 0 {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid shared memory size %d", key, *info.ShmSize)
 	}
 	if info.PidsLimit != nil && *info.PidsLimit < -1 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid pids limit %d", key, *info.PidsLimit)

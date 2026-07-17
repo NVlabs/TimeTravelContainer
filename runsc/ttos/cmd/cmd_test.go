@@ -523,7 +523,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "--shm-size", "32m", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -535,6 +535,9 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 23 {
 		t.Errorf("pids limit=%v, want 23", b.runRequest.pidsLimit)
+	}
+	if got, want := b.runRequest.shmSize, int64(32*1024*1024); got != want {
+		t.Errorf("shared memory size=%d, want %d", got, want)
 	}
 	wantUlimits := []ttosbundle.Ulimit{{Name: "core", Soft: 0, Hard: 0}, {Name: "nofile", Soft: 64, Hard: 128}}
 	if !reflect.DeepEqual(b.runRequest.ulimits, wantUlimits) {
@@ -660,6 +663,9 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 			if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 17 {
 				t.Errorf("pids limit=%v, want 17", b.runRequest.pidsLimit)
 			}
+			if got, want := b.runRequest.shmSize, ttosbundle.DefaultShmSizeBytes; got != want {
+				t.Errorf("default shared memory size=%d, want %d", got, want)
+			}
 			if got, want := b.runRequest.ulimits, []ttosbundle.Ulimit{{Name: "stack", Soft: 8388608, Hard: 8388608}}; !reflect.DeepEqual(got, want) {
 				t.Errorf("ulimits=%+v, want %+v", got, want)
 			}
@@ -712,6 +718,21 @@ func TestRunAndCreateRejectInvalidPullPolicy(t *testing.T) {
 		}
 		if b.runRequest.reference != "" {
 			t.Errorf("%s invalid pull policy invoked backend with %+v", command, b.runRequest)
+		}
+	}
+}
+
+func TestRunAndCreateRejectInvalidShmSize(t *testing.T) {
+	for _, command := range []string{"run", "create"} {
+		for _, value := range []string{"invalid", "-1"} {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			if status := runCommand([]string{command, "--shm-size", value, "busybox"}, &stdout, &stderr, b); status != 1 {
+				t.Errorf("%s invalid shm size %q status=%d, want 1", command, value, status)
+			}
+			if b.runRequest.reference != "" {
+				t.Errorf("%s invalid shm size invoked backend", command)
+			}
 		}
 	}
 }
@@ -1462,10 +1483,11 @@ func TestBuildInspectInfo(t *testing.T) {
 	exit := 23
 	stopTimeout := 4
 	pidsLimit := int64(23)
+	shmSize := int64(32 * 1024 * 1024)
 	ulimits := []ttosbundle.Ulimit{{Name: "core", Soft: 0, Hard: 0}, {Name: "nofile", Soft: 64, Hard: 128}}
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, Ulimits: ulimits, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, Ulimits: ulimits, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1525,6 +1547,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if info.HostConfig.PidsLimit == nil || *info.HostConfig.PidsLimit != pidsLimit {
 		t.Errorf("inspect pids limit=%v, want %d", info.HostConfig.PidsLimit, pidsLimit)
+	}
+	if info.HostConfig.ShmSize != shmSize {
+		t.Errorf("inspect shared memory size=%d, want %d", info.HostConfig.ShmSize, shmSize)
 	}
 	if !reflect.DeepEqual(info.HostConfig.Ulimits, ulimits) {
 		t.Errorf("inspect ulimits=%+v, want %+v", info.HostConfig.Ulimits, ulimits)
