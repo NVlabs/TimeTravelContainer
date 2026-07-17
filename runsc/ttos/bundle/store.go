@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	imageRootFormatVersion = "v2"
+	imageRootFormatVersion = "v3"
 	containerIDBytes       = 32
 )
 
@@ -90,6 +90,10 @@ type ContainerInfo struct {
 	CapAdd             []string        `json:"cap_add,omitempty"`
 	CapDrop            []string        `json:"cap_drop,omitempty"`
 	Ulimits            []Ulimit        `json:"ulimits,omitempty"`
+	ExtraHosts         []string        `json:"extra_hosts,omitempty"`
+	DNS                []string        `json:"dns,omitempty"`
+	DNSSearch          []string        `json:"dns_search,omitempty"`
+	DNSOptions         []string        `json:"dns_options,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -111,6 +115,148 @@ func cloneInt64Pointer(value *int64) *int64 {
 	}
 	copy := *value
 	return &copy
+}
+
+func buildHostsFile(extraHosts []string) string {
+	var result strings.Builder
+	result.WriteString("127.0.0.1\tlocalhost\n")
+	result.WriteString("::1\tlocalhost ip6-localhost ip6-loopback\n")
+	result.WriteString("fe00::\tip6-localnet\n")
+	result.WriteString("ff00::\tip6-mcastprefix\n")
+	result.WriteString("ff02::1\tip6-allnodes\n")
+	result.WriteString("ff02::2\tip6-allrouters\n")
+	for _, entry := range extraHosts {
+		host, address, _ := strings.Cut(entry, ":")
+		fmt.Fprintf(&result, "%s\t%s\n", address, host)
+	}
+	return result.String()
+}
+
+func hostResolverConfig(data []byte) (nameservers, search, options []string) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") || strings.HasPrefix(fields[0], ";") {
+			continue
+		}
+		switch fields[0] {
+		case "nameserver":
+			nameservers = append(nameservers, fields[1])
+		case "search":
+			search = append([]string(nil), fields[1:]...)
+		case "domain":
+			if len(search) == 0 {
+				search = []string{fields[1]}
+			}
+		case "options":
+			options = append(options, fields[1:]...)
+		}
+	}
+	return nameservers, search, options
+}
+
+func buildResolvConf(hostData []byte, dns, search, options []string) string {
+	hostDNS, hostSearch, hostOptions := hostResolverConfig(hostData)
+	if len(dns) == 0 {
+		dns = hostDNS
+	}
+	if len(dns) == 0 {
+		dns = []string{"127.0.0.1"}
+	}
+	if len(search) == 0 {
+		search = hostSearch
+	}
+	if len(options) == 0 {
+		options = hostOptions
+	}
+	var result strings.Builder
+	for _, address := range dns {
+		fmt.Fprintf(&result, "nameserver %s\n", address)
+	}
+	if len(search) != 0 {
+		fmt.Fprintf(&result, "search %s\n", strings.Join(search, " "))
+	}
+	if len(options) != 0 {
+		fmt.Fprintf(&result, "options %s\n", strings.Join(options, " "))
+	}
+	return result.String()
+}
+
+func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount, error) {
+	networkDir := filepath.Join(containerDir, "network")
+	if err := os.Mkdir(networkDir, 0700); err != nil {
+		return nil, fmt.Errorf("creating container network configuration: %w", err)
+	}
+	hostname := opts.Hostname
+	if hostname == "" {
+		hostname = opts.Name
+	}
+	hostResolv, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading host resolver configuration: %w", err)
+	}
+	files := []struct {
+		name        string
+		destination string
+		contents    string
+	}{
+		{name: "hostname", destination: "/etc/hostname", contents: hostname + "\n"},
+		{name: "hosts", destination: "/etc/hosts", contents: buildHostsFile(opts.ExtraHosts)},
+		{name: "resolv.conf", destination: "/etc/resolv.conf", contents: buildResolvConf(hostResolv, opts.DNS, opts.DNSSearch, opts.DNSOptions)},
+	}
+	mounts := make([]HostMount, 0, len(files))
+	for _, file := range files {
+		name := filepath.Join(networkDir, file.name)
+		if err := os.WriteFile(name, []byte(file.contents), 0444); err != nil {
+			return nil, fmt.Errorf("writing container network file %q: %w", file.destination, err)
+		}
+		mounts = append(mounts, HostMount{Source: name, Destination: file.destination, Readonly: true, Internal: true})
+	}
+	return mounts, nil
+}
+
+func ensureNetworkMountpoints(rootfs string) error {
+	manifestName := ownership.ManifestPath(rootfs)
+	manifest, err := ownership.Read(manifestName)
+	if err != nil {
+		return fmt.Errorf("loading rootfs ownership for network mountpoints: %w", err)
+	}
+	etc := filepath.Join(rootfs, "etc")
+	if info, err := os.Lstat(etc); os.IsNotExist(err) {
+		if err := os.Mkdir(etc, 0755); err != nil {
+			return fmt.Errorf("creating rootfs /etc mountpoint directory: %w", err)
+		}
+		manifest.Entries["etc"] = ownership.Owner{}
+	} else if err != nil {
+		return fmt.Errorf("checking rootfs /etc mountpoint directory: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("rootfs /etc is not a directory")
+	}
+	for _, base := range []string{"hostname", "hosts", "resolv.conf"} {
+		name := filepath.Join(etc, base)
+		info, err := os.Lstat(name)
+		switch {
+		case os.IsNotExist(err):
+		case err != nil:
+			return fmt.Errorf("checking rootfs /etc/%s mountpoint: %w", base, err)
+		case info.Mode().IsRegular():
+			manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+			continue
+		case info.Mode()&os.ModeSymlink != 0:
+			if err := os.Remove(name); err != nil {
+				return fmt.Errorf("replacing rootfs /etc/%s symlink: %w", base, err)
+			}
+		default:
+			return fmt.Errorf("rootfs /etc/%s is not a regular file or symlink", base)
+		}
+		if err := os.WriteFile(name, nil, 0644); err != nil {
+			return fmt.Errorf("creating rootfs /etc/%s mountpoint: %w", base, err)
+		}
+		manifest.Entries[filepath.ToSlash(filepath.Join("etc", base))] = ownership.Owner{}
+	}
+	if err := ownership.Write(manifestName, manifest); err != nil {
+		return fmt.Errorf("updating rootfs ownership for network mountpoints: %w", err)
+	}
+	return nil
 }
 
 // ConsolePaths are persistent host-side files for one branch-local console.
@@ -145,6 +291,22 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	opts.NetworkMode = networkMode
+	opts.ExtraHosts, err = ParseExtraHosts(opts.ExtraHosts)
+	if err != nil {
+		return Prepared{}, err
+	}
+	opts.DNS, err = ParseDNS(opts.DNS)
+	if err != nil {
+		return Prepared{}, err
+	}
+	opts.DNSSearch, err = ParseDNSSearch(opts.DNSSearch)
+	if err != nil {
+		return Prepared{}, err
+	}
+	opts.DNSOptions, err = ParseDNSOptions(opts.DNSOptions)
+	if err != nil {
+		return Prepared{}, err
+	}
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
@@ -165,6 +327,21 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	id, containerDir, err := s.createContainerDir(containers)
+	if err != nil {
+		return Prepared{}, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(containerDir)
+		}
+	}()
+	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
+	if err != nil {
+		return Prepared{}, err
+	}
+	opts.HostMounts = append(opts.HostMounts, internalMounts...)
 	opts.SpecOptions.RootFS = rootfs
 	spec, err := BuildSpec(imageInfo.Image, opts.SpecOptions)
 	if err != nil {
@@ -176,16 +353,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		}
 	}
 
-	id, containerDir, err := s.createContainerDir(containers)
-	if err != nil {
-		return Prepared{}, err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			os.RemoveAll(containerDir)
-		}
-	}()
 	bundleDir := filepath.Join(containerDir, "bundle")
 	if err := os.Mkdir(bundleDir, 0700); err != nil {
 		return Prepared{}, fmt.Errorf("creating OCI bundle: %w", err)
@@ -220,6 +387,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		CapAdd:             append([]string(nil), opts.CapAdd...),
 		CapDrop:            append([]string(nil), opts.CapDrop...),
 		Ulimits:            append([]Ulimit(nil), opts.Ulimits...),
+		ExtraHosts:         append([]string(nil), opts.ExtraHosts...),
+		DNS:                append([]string(nil), opts.DNS...),
+		DNSSearch:          append([]string(nil), opts.DNSSearch...),
+		DNSOptions:         append([]string(nil), opts.DNSOptions...),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -472,6 +643,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 	}
 	prefixes := []string{
 		safeComponent(digest + "-"),
+		safeComponent("v2-" + digest + "-"),
 		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
 	}
 	removed := 0
@@ -757,6 +929,9 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	if err != nil {
 		return images.RootFSInfo{}, "", err
 	}
+	if err := ensureNetworkMountpoints(rootfs); err != nil {
+		return images.RootFSInfo{}, "", err
+	}
 	if err := writeJSON(filepath.Join(tempDir, "image.json"), &info); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("writing image-root metadata: %w", err)
 	}
@@ -798,7 +973,24 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0600)
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
 }
 
 func validateName(name string) error {

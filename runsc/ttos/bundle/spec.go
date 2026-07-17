@@ -18,6 +18,7 @@ package bundle
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -41,6 +42,8 @@ const (
 	StopSignalAnnotation = "dev.timetravelos.config.stop-signal"
 	// PidsLimitAnnotation enables TTOS Sentry-side enforcement of linux.resources.pids.
 	PidsLimitAnnotation = "dev.timetravelos.resource.pids-limit"
+	// InternalMountsAnnotation identifies TTOS-generated implementation mounts.
+	InternalMountsAnnotation = "dev.timetravelos.config.internal-mounts"
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -86,6 +89,10 @@ type SpecOptions struct {
 	GroupAdd         []string
 	CapAdd           []string
 	CapDrop          []string
+	ExtraHosts       []string
+	DNS              []string
+	DNSSearch        []string
+	DNSOptions       []string
 	Entrypoint       []string
 	HostMounts       []HostMount
 	ManagedVolumes   []ManagedVolume
@@ -100,6 +107,7 @@ type HostMount struct {
 	Source      string
 	Destination string
 	Readonly    bool
+	Internal    bool
 }
 
 // ManagedVolume describes a family-local Sentry tmpfs. Repeated attachments of
@@ -151,6 +159,86 @@ func ParseUlimits(values []string) ([]Ulimit, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
+}
+
+// ParseExtraHosts validates and canonicalizes Docker --add-host entries.
+func ParseExtraHosts(values []string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		host, address, ok := strings.Cut(value, "=")
+		if !ok {
+			host, address, ok = strings.Cut(value, ":")
+		}
+		if !ok || host == "" || strings.ContainsAny(host, " \t\r\n:") {
+			return nil, fmt.Errorf("invalid add-host value %q; expected HOST:IP", value)
+		}
+		address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
+		if address == "host-gateway" {
+			return nil, fmt.Errorf("add-host value %q uses host-gateway, which requires an unsupported bridge gateway", value)
+		}
+		ip, err := netip.ParseAddr(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP address in add-host value %q: %w", value, err)
+		}
+		result = append(result, host+":"+ip.String())
+	}
+	return result, nil
+}
+
+// ParseDNS validates and canonicalizes Docker --dns addresses.
+func ParseDNS(values []string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		ip, err := netip.ParseAddr(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid DNS address %q: %w", value, err)
+		}
+		result = append(result, ip.String())
+	}
+	return result, nil
+}
+
+func validDNSDomain(value string) bool {
+	if value == "." {
+		return true
+	}
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && (character < '0' || character > '9') && character != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ParseDNSSearch validates Docker --dns-search domains.
+func ParseDNSSearch(values []string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if !validDNSDomain(value) {
+			return nil, fmt.Errorf("invalid DNS search domain %q", value)
+		}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+// ParseDNSOptions rejects resolver options that would inject extra lines.
+func ParseDNSOptions(values []string) ([]string, error) {
+	for _, value := range values {
+		if value == "" || strings.ContainsAny(value, " \t\r\n") {
+			return nil, fmt.Errorf("invalid DNS option %q", value)
+		}
+	}
+	return append([]string(nil), values...), nil
 }
 
 // NormalizeCapabilities applies Docker capability spelling and validation.
@@ -501,6 +589,19 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Source:      filepath.Clean(mount.Source),
 			Options:     []string{"rbind", "ro"},
 		})
+	}
+	internalMounts := make([]string, 0)
+	for _, mount := range opts.HostMounts {
+		if mount.Internal {
+			internalMounts = append(internalMounts, filepath.Clean(mount.Destination))
+		}
+	}
+	if len(internalMounts) != 0 {
+		encoded, err := json.Marshal(internalMounts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding internal mount destinations: %w", err)
+		}
+		annotations[InternalMountsAnnotation] = string(encoded)
 	}
 	volumeSources := make(map[string]string)
 	for _, volume := range opts.ManagedVolumes {

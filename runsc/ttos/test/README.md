@@ -26,6 +26,13 @@ covers:
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
+- Docker `--add-host`, `--dns`, `--dns-search`, and `--dns-option`/`--dns-opt`
+  persistence through immutable `/etc/hosts`, `/etc/resolv.conf`, and
+  `/etc/hostname` files, including Docker inspect projection, read-only-rootfs
+  startup, restart retention, live-fork inheritance, and hiding of internal
+  implementation binds from user mount inspection; literal IPv4 and IPv6
+  addresses are supported, while `host-gateway` is rejected until TTOS gains a
+  bridge gateway;
 - BusyBox process/procfs/sysfs startup;
 - Docker `--group-add` plus `--cap-add`/`--cap-drop` normalization, inspect
   persistence, init and exec enforcement, restart retention, and live-fork

@@ -16,7 +16,9 @@ package bundle
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -263,6 +265,150 @@ func TestParseUlimits(t *testing.T) {
 	}
 }
 
+func TestDockerNetworkConfiguration(t *testing.T) {
+	extraHosts, err := ParseExtraHosts([]string{"db:192.0.2.10", "v6=[2001:0db8::10]"})
+	if err != nil {
+		t.Fatalf("ParseExtraHosts: %v", err)
+	}
+	if want := []string{"db:192.0.2.10", "v6:2001:db8::10"}; !reflect.DeepEqual(extraHosts, want) {
+		t.Errorf("extra hosts=%q, want %q", extraHosts, want)
+	}
+	dns, err := ParseDNS([]string{"192.0.2.53", "2001:0db8::53"})
+	if err != nil {
+		t.Fatalf("ParseDNS: %v", err)
+	}
+	if want := []string{"192.0.2.53", "2001:db8::53"}; !reflect.DeepEqual(dns, want) {
+		t.Errorf("DNS=%q, want %q", dns, want)
+	}
+	search, err := ParseDNSSearch([]string{"example.test", "."})
+	if err != nil || !reflect.DeepEqual(search, []string{"example.test", "."}) {
+		t.Errorf("DNS search=(%q, %v)", search, err)
+	}
+	options, err := ParseDNSOptions([]string{"ndots:2", "rotate"})
+	if err != nil || !reflect.DeepEqual(options, []string{"ndots:2", "rotate"}) {
+		t.Errorf("DNS options=(%q, %v)", options, err)
+	}
+	for _, value := range []string{"missing-address", ":192.0.2.1", "bad host:192.0.2.1", "host:not-an-ip", "host:host-gateway"} {
+		if _, err := ParseExtraHosts([]string{value}); err == nil {
+			t.Errorf("ParseExtraHosts(%q) succeeded", value)
+		}
+	}
+	if _, err := ParseDNS([]string{"not-an-ip"}); err == nil {
+		t.Error("ParseDNS accepted an invalid address")
+	}
+	for _, value := range []string{"-bad.example", "bad..example", "bad domain"} {
+		if _, err := ParseDNSSearch([]string{value}); err == nil {
+			t.Errorf("ParseDNSSearch(%q) succeeded", value)
+		}
+	}
+	for _, value := range []string{"", "ndots:2 rotate", "rotate\noptions timeout:1"} {
+		if _, err := ParseDNSOptions([]string{value}); err == nil {
+			t.Errorf("ParseDNSOptions(%q) succeeded", value)
+		}
+	}
+}
+
+func TestNetworkFileMaterialization(t *testing.T) {
+	containerDir := t.TempDir()
+	opts := SpecOptions{
+		Name: "demo", Hostname: "custom-host",
+		ExtraHosts: []string{"db:192.0.2.10", "v6:2001:db8::10"},
+		DNS:        []string{"203.0.113.53"}, DNSSearch: []string{"example.test"}, DNSOptions: []string{"ndots:2", "rotate"},
+	}
+	mounts, err := materializeNetworkFiles(containerDir, opts)
+	if err != nil {
+		t.Fatalf("materializeNetworkFiles: %v", err)
+	}
+	if len(mounts) != 3 {
+		t.Fatalf("mounts=%+v, want three", mounts)
+	}
+	wantFiles := map[string]string{
+		"/etc/hostname":    "custom-host\n",
+		"/etc/hosts":       "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\nfe00::\tip6-localnet\nff00::\tip6-mcastprefix\nff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n192.0.2.10\tdb\n2001:db8::10\tv6\n",
+		"/etc/resolv.conf": "nameserver 203.0.113.53\nsearch example.test\noptions ndots:2 rotate\n",
+	}
+	for _, mount := range mounts {
+		if !mount.Readonly || !mount.Internal {
+			t.Errorf("network mount is not immutable/internal: %+v", mount)
+		}
+		data, err := os.ReadFile(mount.Source)
+		if err != nil {
+			t.Errorf("reading %s: %v", mount.Source, err)
+			continue
+		}
+		if got, want := string(data), wantFiles[mount.Destination]; got != want {
+			t.Errorf("%s contents=%q, want %q", mount.Destination, got, want)
+		}
+		if info, err := os.Stat(mount.Source); err != nil || info.Mode().Perm() != 0444 {
+			t.Errorf("%s mode: info=%v err=%v", mount.Source, info, err)
+		}
+	}
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{RootFS: t.TempDir(), HostMounts: mounts})
+	if err != nil {
+		t.Fatalf("BuildSpec with network files: %v", err)
+	}
+	if got, want := spec.Annotations[InternalMountsAnnotation], `["/etc/hostname","/etc/hosts","/etc/resolv.conf"]`; got != want {
+		t.Errorf("internal mounts annotation=%q, want %q", got, want)
+	}
+}
+
+func TestEnsureNetworkMountpoints(t *testing.T) {
+	rootfs := t.TempDir()
+	etc := filepath.Join(rootfs, "etc")
+	if err := os.Mkdir(etc, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(etc, "hostname"), []byte("image-value"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../run/hosts", filepath.Join(etc, "hosts")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureNetworkMountpoints(rootfs); err != nil {
+		t.Fatalf("ensureNetworkMountpoints: %v", err)
+	}
+	if err := ensureNetworkMountpoints(rootfs); err != nil {
+		t.Fatalf("idempotent ensureNetworkMountpoints: %v", err)
+	}
+	for _, base := range []string{"hostname", "hosts", "resolv.conf"} {
+		name := filepath.Join(etc, base)
+		info, err := os.Lstat(name)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
+			t.Errorf("mountpoint %s: info=%v err=%v", base, info, err)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(etc, "hostname")); err != nil || string(data) != "image-value" {
+		t.Errorf("existing hostname contents=%q, err=%v", data, err)
+	}
+	updated, err := ownership.Read(ownership.ManifestPath(rootfs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"etc/hostname", "etc/hosts", "etc/resolv.conf"} {
+		if owner, ok := updated.Entries[name]; !ok || owner != (ownership.Owner{}) {
+			t.Errorf("mountpoint owner %s=(%+v, %t), want root", name, owner, ok)
+		}
+	}
+}
+
+func TestBuildResolvConf(t *testing.T) {
+	host := []byte("# generated\nnameserver 192.0.2.1\ndomain host.test\noptions timeout:1 rotate\n")
+	if got, want := buildResolvConf(host, nil, nil, nil), "nameserver 192.0.2.1\nsearch host.test\noptions timeout:1 rotate\n"; got != want {
+		t.Errorf("inherited resolver=%q, want %q", got, want)
+	}
+	if got, want := buildResolvConf(host, []string{"203.0.113.53"}, []string{"custom.test"}, []string{"ndots:3"}), "nameserver 203.0.113.53\nsearch custom.test\noptions ndots:3\n"; got != want {
+		t.Errorf("overridden resolver=%q, want %q", got, want)
+	}
+	if got, want := buildResolvConf(nil, nil, nil, nil), "nameserver 127.0.0.1\n"; got != want {
+		t.Errorf("fallback resolver=%q, want %q", got, want)
+	}
+}
+
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), Env: []string{"=INVALID"}}); err == nil {
@@ -392,6 +538,39 @@ func TestValidateName(t *testing.T) {
 		if err := validateName(name); err == nil {
 			t.Errorf("validateName(%q) succeeded", name)
 		}
+	}
+}
+
+func TestWriteJSONAtomicallyReplacesMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "container.json")
+	if err := writeJSON(path, map[string]int{"generation": 1}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	if err := writeJSON(path, map[string]int{"generation": 2}); err != nil {
+		t.Fatal(err)
+	}
+	oldData, err := io.ReadAll(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldValue, newValue map[string]int
+	if err := json.Unmarshal(oldData, &oldValue); err != nil {
+		t.Fatalf("old metadata is incomplete: %v", err)
+	}
+	if err := json.Unmarshal(newData, &newValue); err != nil {
+		t.Fatalf("new metadata is incomplete: %v", err)
+	}
+	if oldValue["generation"] != 1 || newValue["generation"] != 2 {
+		t.Errorf("metadata generations old=%v new=%v", oldValue, newValue)
 	}
 }
 
@@ -639,6 +818,18 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	amd64 := makeRoot(digest, "linux/amd64")
 	arm64 := makeRoot(digest, "linux/arm64/v8")
 	other := makeRoot(otherDigest, "linux/amd64")
+	legacy := filepath.Join(root, "images", safeComponent("v2-"+digest+"-linux/386"))
+	if err := os.MkdirAll(filepath.Join(legacy, "rootfs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "image.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacyManifest := ownership.NewManifest()
+	legacyManifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(filepath.Join(legacy, "rootfs")), legacyManifest); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, platform := range []string{"linux/amd64", "linux/arm64/v8"} {
 		found, err := store.HasImageRoot(digest, platform)
@@ -653,10 +844,10 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveImageRoots: %v", err)
 	}
-	if removed != 2 {
-		t.Errorf("RemoveImageRoots removed %d roots, want 2", removed)
+	if removed != 3 {
+		t.Errorf("RemoveImageRoots removed %d roots, want 3", removed)
 	}
-	for _, dir := range []string{amd64, arm64} {
+	for _, dir := range []string{amd64, arm64, legacy} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Errorf("removed image root %q still exists: %v", dir, err)
 		}

@@ -370,6 +370,8 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --ulimit nofile=256:256 \
   --shm-size 32m \
   --group-add 4242 --cap-add sys_ptrace --cap-drop net_raw \
+  --add-host ttos.local:192.0.2.10 --add-host v6.local=2001:db8::10 \
+  --dns 203.0.113.53 --dns-search example.test --dns-option ndots:2 \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
@@ -379,7 +381,7 @@ LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach --read-only \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=sysfs,target=/alt-sys,readonly \
   "$ALPINE_IMAGE" sh -c \
-  'echo parent >/state/value; echo scratch-parent >/scratch/value; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /alt-proc/self/status; test -r /alt-sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+  'grep -Eq "^192\.0\.2\.10[[:space:]]+ttos\.local$" /etc/hosts; grep -Eq "^2001:db8::10[[:space:]]+v6\.local$" /etc/hosts; grep -qx "nameserver 203.0.113.53" /etc/resolv.conf; grep -qx "search example.test" /etc/resolv.conf; grep -qx "options ndots:2" /etc/resolv.conf; echo parent >/state/value; echo scratch-parent >/scratch/value; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /alt-proc/self/status; test -r /alt-sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
 container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
 LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
 LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
@@ -399,6 +401,12 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   sleep 1
 done
 
+ttos exec "$LIFECYCLE" grep -qx "$LIFECYCLE" /etc/hostname ||
+  fail "restarted container did not retain /etc/hostname"
+
+ttos exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttos\.local$\" /etc/hosts; grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" ||
+  fail "restarted container did not retain generated network files"
+
 EXEC_GROUPS=$(ttos exec --user 123:456 --additional-gids 4242 --additional-gids 4243 "$LIFECYCLE" /bin/busybox id)
 echo "$EXEC_GROUPS" | grep -q "4242,4243" || fail "exec supplementary groups missing: $EXEC_GROUPS"
 ttos exec --cap CAP_SYS_ADMIN "$LIFECYCLE" sh -c \
@@ -417,6 +425,9 @@ echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environ
 [ "$(ttos exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] ||
   fail "restarted container did not retain /dev/shm size"
 [ "$(ttos inspect -f "{{.HostConfig.ReadonlyRootfs}}" "$LIFECYCLE")" = true ] || fail "inspect omitted read-only rootfs policy"
+[ "$(ttos inspect -f "{{index .HostConfig.ExtraHosts 0}}|{{index .HostConfig.ExtraHosts 1}}|{{index .HostConfig.Dns 0}}|{{index .HostConfig.DnsSearch 0}}|{{index .HostConfig.DnsOptions 0}}" "$LIFECYCLE")" = "ttos.local:192.0.2.10|v6.local:2001:db8::10|203.0.113.53|example.test|ndots:2" ] ||
+  fail "inspect omitted Docker network configuration"
+
 if ttos exec "$LIFECYCLE" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&1; then
   fail "read-only root filesystem accepted a parent write"
 fi
@@ -438,6 +449,9 @@ ttos exec "$LIFECYCLE" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /pro
 [ "$(ttos exec "$LIFECYCLE@child" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "live-forked child lost /dev/shm size"
 ttos exec "$LIFECYCLE@child" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "child exec lost configured groups or capabilities"
 
+ttos exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttos\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf" || fail "parent branch lost generated network files"
+ttos exec "$LIFECYCLE@child" sh -c "grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" || fail "live-forked child lost generated network files"
+
 RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
 [ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||
   fail "running forked inspect returned $RUNNING_INSPECT"
@@ -454,6 +468,8 @@ grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch pr
 grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
 grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
+[ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "4|1" ] || fail "internal network files leaked into Docker mount inspection"
+
 FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
 echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"
 echo "$FORK_INSPECT" | grep -q 'child=true' || fail "inspect fork check omitted eligible child branch: $FORK_INSPECT"

@@ -646,6 +646,13 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 				"--group-add", "4242",
 				"--cap-add", "chown",
 				"--cap-drop", "all",
+				"--add-host", "db:192.0.2.10",
+				"--add-host", "v6=[2001:0db8::10]",
+				"--dns", "203.0.113.53",
+				"--dns", "2001:0db8::53",
+				"--dns-search", "example.test",
+				"--dns-option", "ndots:2",
+				"--dns-opt", "rotate",
 				"busybox:1.36",
 			}
 			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
@@ -683,6 +690,18 @@ func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
 			}
 			if got, want := b.runRequest.capDrop, []string{"ALL"}; !reflect.DeepEqual(got, want) {
 				t.Errorf("cap drop=%q, want %q", got, want)
+			}
+			if got, want := b.runRequest.extraHosts, []string{"db:192.0.2.10", "v6:2001:db8::10"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("extra hosts=%q, want %q", got, want)
+			}
+			if got, want := b.runRequest.dns, []string{"203.0.113.53", "2001:db8::53"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("DNS=%q, want %q", got, want)
+			}
+			if got, want := b.runRequest.dnsSearch, []string{"example.test"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("DNS search=%q, want %q", got, want)
+			}
+			if got, want := b.runRequest.dnsOptions, []string{"ndots:2", "rotate"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("DNS options=%q, want %q", got, want)
 			}
 			if got, want := b.runRequest.shmSize, ttosbundle.DefaultShmSizeBytes; got != want {
 				t.Errorf("default shared memory size=%d, want %d", got, want)
@@ -799,6 +818,30 @@ func TestRunAndCreateRejectInvalidStopPolicy(t *testing.T) {
 		}
 		if b.runRequest.reference != "" {
 			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
+	}
+}
+
+func TestRunAndCreateRejectInvalidNetworkConfiguration(t *testing.T) {
+	invalid := [][]string{
+		{"--add-host", "missing-address"},
+		{"--add-host", "host:host-gateway"},
+		{"--dns", "not-an-ip"},
+		{"--dns-search", "bad..domain"},
+		{"--dns-option", "ndots:2 rotate"},
+	}
+	for _, command := range []string{"run", "create"} {
+		for _, option := range invalid {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			args := append([]string{command}, option...)
+			args = append(args, "busybox")
+			if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+				t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+			}
+			if b.runRequest.reference != "" {
+				t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+			}
 		}
 	}
 }
@@ -1524,9 +1567,13 @@ func TestBuildInspectInfo(t *testing.T) {
 	capAdd := []string{"SYS_ADMIN"}
 	capDrop := []string{"NET_RAW"}
 	ulimits := []ttosbundle.Ulimit{{Name: "core", Soft: 0, Hard: 0}, {Name: "nofile", Soft: 64, Hard: 128}}
+	extraHosts := []string{"db:192.0.2.10", "v6:2001:db8::10"}
+	dns := []string{"203.0.113.53"}
+	dnsSearch := []string{"example.test"}
+	dnsOptions := []string{"ndots:2", "rotate"}
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, StopSignal: "SIGUSR1", StopTimeout: &stopTimeout, PidsLimit: &pidsLimit, ShmSize: &shmSize, GroupAdd: groupAdd, CapAdd: capAdd, CapDrop: capDrop, Ulimits: ulimits, ExtraHosts: extraHosts, DNS: dns, DNSSearch: dnsSearch, DNSOptions: dnsOptions, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: true},
@@ -1537,6 +1584,7 @@ func TestBuildInspectInfo(t *testing.T) {
 		Mounts: []specs.Mount{
 			{Type: "proc", Source: "proc", Destination: "/proc"},
 			{Type: "bind", Source: "/host/data", Destination: "/data", Options: []string{"rbind", "ro"}},
+			{Type: "bind", Source: "/state/network/hosts", Destination: "/etc/hosts", Options: []string{"rbind", "ro"}},
 			{Type: "tmpfs", Source: "ttos-volume-cache", Destination: "/cache", Options: []string{"rw"}},
 			{Type: "tmpfs", Source: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}},
 			{Type: "tmpfs", Source: "tmpfs", Destination: "/worktmp", Options: []string{"rw", "size=2097152", "mode=0750"}},
@@ -1550,6 +1598,7 @@ func TestBuildInspectInfo(t *testing.T) {
 			"dev.timetravelos.config.user":       "app",
 			"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
 			"dev.timetravelos.config.tmpfs":      `{"/scratch":"mode=0700,size=1m"}`,
+			ttosbundle.InternalMountsAnnotation:  `["/etc/hosts"]`,
 		},
 	}
 	family := &Family{ID: containerID, Name: "demo", State: "running", SandboxPID: 4321, Branches: []Branch{
@@ -1601,6 +1650,16 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if info.HostConfig.NetworkMode != "host" {
 		t.Errorf("network mode=%q, want host", info.HostConfig.NetworkMode)
+	}
+	if !reflect.DeepEqual(info.HostConfig.ExtraHosts, extraHosts) || !reflect.DeepEqual(info.HostConfig.DNS, dns) || !reflect.DeepEqual(info.HostConfig.DNSSearch, dnsSearch) || !reflect.DeepEqual(info.HostConfig.DNSOptions, dnsOptions) {
+		t.Errorf("inspect network configuration=(%q, %q, %q, %q)", info.HostConfig.ExtraHosts, info.HostConfig.DNS, info.HostConfig.DNSSearch, info.HostConfig.DNSOptions)
+	}
+	var networkTemplate bytes.Buffer
+	if err := writeInspectFormat(&networkTemplate, []InspectInfo{info}, `{{index .HostConfig.Dns 0}}|{{index .HostConfig.DnsSearch 0}}|{{index .HostConfig.DnsOptions 0}}|{{.HostConfig.ShmSize}}`); err != nil {
+		t.Fatalf("Docker DNS inspect template: %v", err)
+	}
+	if got, want := networkTemplate.String(), "203.0.113.53|example.test|ndots:2|33554432\n"; got != want {
+		t.Errorf("Docker DNS inspect template=%q, want %q", got, want)
 	}
 	if _, ok := info.Config.Volumes["/cache"]; !ok {
 		t.Errorf("volumes=%v", info.Config.Volumes)

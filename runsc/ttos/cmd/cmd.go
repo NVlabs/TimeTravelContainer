@@ -1093,6 +1093,10 @@ type runRequest struct {
 	user               string
 	hostname           string
 	networkMode        string
+	extraHosts         []string
+	dns                []string
+	dnsSearch          []string
+	dnsOptions         []string
 	entrypoint         []string
 	hostMounts         []ttosbundle.HostMount
 	filesystemMounts   []ttosbundle.FilesystemMount
@@ -1158,7 +1162,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1197,11 +1201,17 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
+	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
 	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
 	fs.Var(&capDropValues, "cap-drop", "drop a Linux capability")
+	fs.Var(&extraHostValues, "add-host", "add a custom host-to-IP mapping")
+	fs.Var(&dnsValues, "dns", "set a custom DNS server")
+	fs.Var(&dnsSearchValues, "dns-search", "set a custom DNS search domain")
+	fs.Var(&dnsOptionValues, "dns-option", "set a DNS resolver option")
+	fs.Var(&dnsOptionValues, "dns-opt", "set a DNS resolver option")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1258,6 +1268,22 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedExtraHosts, err := ttosbundle.ParseExtraHosts(extraHostValues)
+	if err != nil {
+		return err
+	}
+	parsedDNS, err := ttosbundle.ParseDNS(dnsValues)
+	if err != nil {
+		return err
+	}
+	parsedDNSSearch, err := ttosbundle.ParseDNSSearch(dnsSearchValues)
+	if err != nil {
+		return err
+	}
+	parsedDNSOptions, err := ttosbundle.ParseDNSOptions(dnsOptionValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1279,6 +1305,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		extraHosts:         parsedExtraHosts,
+		dns:                parsedDNS,
+		dnsSearch:          parsedDNSSearch,
+		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
@@ -1320,7 +1350,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1357,11 +1387,17 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
+	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
 	fs.Var(&logOptions, "log-opt", "set logging option max-size=SIZE or max-file=COUNT")
 	fs.Var(&ulimitValues, "ulimit", "set resource limit NAME=SOFT[:HARD]")
 	fs.Var(&groupAddValues, "group-add", "add an additional group by name or GID")
 	fs.Var(&capAddValues, "cap-add", "add a Linux capability")
 	fs.Var(&capDropValues, "cap-drop", "drop a Linux capability")
+	fs.Var(&extraHostValues, "add-host", "add a custom host-to-IP mapping")
+	fs.Var(&dnsValues, "dns", "set a custom DNS server")
+	fs.Var(&dnsSearchValues, "dns-search", "set a custom DNS search domain")
+	fs.Var(&dnsOptionValues, "dns-option", "set a DNS resolver option")
+	fs.Var(&dnsOptionValues, "dns-opt", "set a DNS resolver option")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1418,6 +1454,22 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedExtraHosts, err := ttosbundle.ParseExtraHosts(extraHostValues)
+	if err != nil {
+		return err
+	}
+	parsedDNS, err := ttosbundle.ParseDNS(dnsValues)
+	if err != nil {
+		return err
+	}
+	parsedDNSSearch, err := ttosbundle.ParseDNSSearch(dnsSearchValues)
+	if err != nil {
+		return err
+	}
+	parsedDNSOptions, err := ttosbundle.ParseDNSOptions(dnsOptionValues)
+	if err != nil {
+		return err
+	}
 	containerName := *name
 	if containerName == "" {
 		containerName = "ttos-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -1439,6 +1491,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		extraHosts:         parsedExtraHosts,
+		dns:                parsedDNS,
+		dnsSearch:          parsedDNSSearch,
+		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
 		managedVolumes:     parsedMounts.managed,
@@ -1927,6 +1983,10 @@ type InspectConfig struct {
 type InspectHostConfig struct {
 	Binds          []string            `json:"Binds"`
 	NetworkMode    string              `json:"NetworkMode"`
+	ExtraHosts     []string            `json:"ExtraHosts"`
+	DNS            []string            `json:"Dns"`
+	DNSSearch      []string            `json:"DnsSearch"`
+	DNSOptions     []string            `json:"DnsOptions"`
 	AutoRemove     bool                `json:"AutoRemove"`
 	ReadonlyRootfs bool                `json:"ReadonlyRootfs"`
 	StopTimeout    *int                `json:"StopTimeout"`
@@ -2085,6 +2145,31 @@ func writeInspectFormat(w io.Writer, results []InspectInfo, format string) error
 
 type inspectTemplateValues map[string]any
 
+func inspectHostConfigTemplateValues(config InspectHostConfig) map[string]any {
+	// Docker templates address serialized API keys, including Dns rather than
+	// the Go initialism DNS. Keep values in their original Go types so integer
+	// limits and structured slices retain Docker-compatible template rendering.
+	return map[string]any{
+		"Binds":          config.Binds,
+		"NetworkMode":    config.NetworkMode,
+		"ExtraHosts":     config.ExtraHosts,
+		"Dns":            config.DNS,
+		"DnsSearch":      config.DNSSearch,
+		"DnsOptions":     config.DNSOptions,
+		"AutoRemove":     config.AutoRemove,
+		"ReadonlyRootfs": config.ReadonlyRootfs,
+		"StopTimeout":    config.StopTimeout,
+		"PidsLimit":      config.PidsLimit,
+		"ShmSize":        config.ShmSize,
+		"GroupAdd":       config.GroupAdd,
+		"CapAdd":         config.CapAdd,
+		"CapDrop":        config.CapDrop,
+		"Ulimits":        config.Ulimits,
+		"Runtime":        config.Runtime,
+		"Tmpfs":          config.Tmpfs,
+	}
+}
+
 func inspectTemplateValuesFor(result InspectInfo) inspectTemplateValues {
 	return inspectTemplateValues{
 		"Id":           result.ID,
@@ -2100,7 +2185,7 @@ func inspectTemplateValuesFor(result InspectInfo) inspectTemplateValues {
 		"Platform":     result.Platform,
 		"GraphDriver":  result.GraphDriver,
 		"Config":       result.Config,
-		"HostConfig":   result.HostConfig,
+		"HostConfig":   inspectHostConfigTemplateValues(result.HostConfig),
 		"Mounts":       result.Mounts,
 		"TTOS":         result.TTOS,
 	}
@@ -3694,6 +3779,10 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
+			ExtraHosts:       request.extraHosts,
+			DNS:              request.dns,
+			DNSSearch:        request.dnsSearch,
+			DNSOptions:       request.dnsOptions,
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
@@ -3743,6 +3832,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
 			NetworkMode:      request.networkMode,
+			ExtraHosts:       request.extraHosts,
+			DNS:              request.dns,
+			DNSSearch:        request.dnsSearch,
+			DNSOptions:       request.dnsOptions,
 			ReadonlyRootfs:   request.readonlyRootfs,
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
@@ -4846,7 +4939,19 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 	if encoded := spec.Annotations[ttosbundle.TmpfsConfigAnnotation]; encoded != "" {
 		_ = json.Unmarshal([]byte(encoded), &dockerTmpfs)
 	}
+	internalMounts := make(map[string]struct{})
+	if encoded := spec.Annotations[ttosbundle.InternalMountsAnnotation]; encoded != "" {
+		var destinations []string
+		if json.Unmarshal([]byte(encoded), &destinations) == nil {
+			for _, destination := range destinations {
+				internalMounts[filepath.Clean(destination)] = struct{}{}
+			}
+		}
+	}
 	for _, mount := range spec.Mounts {
+		if _, internal := internalMounts[filepath.Clean(mount.Destination)]; internal {
+			continue
+		}
 		readonly := false
 		for _, option := range mount.Options {
 			if option == "ro" {
@@ -4999,7 +5104,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
