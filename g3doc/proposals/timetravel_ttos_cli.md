@@ -62,10 +62,13 @@ container configuration and `logs --details` prefixes them in sorted order;
 private attach transport remains available. A rootless per-user `ttosd` now
 autostarts on a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
-`--direct` remains an explicit recovery path. Explicit commit/import plus
-quiescent main-branch snapshots before stop, restart, and sole-branch forced
-removal are implemented. A Sentry pre-exit hook for unplanned exits and final
-signal-handler writes remains TODO.
+`--direct` remains an explicit recovery path.
+Explicit commit/import, quiescent main-branch snapshots before stop, restart,
+and sole-branch forced removal, plus a Sentry post-init-exit snapshot hook are
+implemented. The Sentry retains the mount namespace through init teardown,
+writes container-specific pending archives, and publishes readiness markers
+only after successful serialization and sync; TTOS validates and atomically
+promotes completed archives.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelOS gVisor prototype into a
@@ -636,9 +639,13 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       restart with descendants selects main; forced removal with descendants
       preserves the latest explicit commit/import instead of silently selecting
       a branch.
-- [ ] Add a Sentry pre-exit snapshot hook so unplanned natural exit and writes
-      performed by a shutdown signal handler are captured. Manager-driven stop
-      currently takes its quiescent snapshot before delivering the stop signal.
+- [x] Add a Sentry post-init-exit snapshot hook so unplanned natural exit and
+      writes performed by a shutdown signal handler are captured. The Sentry
+      retains the root mount namespace until pending managed-volume archives are
+      synced, then writes completion markers; TTOS validates and atomically
+      promotes them. Manager-driven stop still takes an earlier quiescent
+      snapshot before delivering the stop signal, which the final snapshot
+      supersedes after exit.
 
 ## Image and storage backend
 
@@ -809,9 +816,9 @@ bundle.
 
 - [x] Define `start` for an exited main branch as OCI recreation from the immutable
       image and persistent configuration. Managed volumes start from their latest
-      explicitly committed, imported, or manager-preserved main seed. An explicit
-      stop/restart snapshot precedes signal delivery; unplanned exit after the
-      last seed can still lose newer in-memory changes until the pre-exit hook lands.
+      explicitly committed, imported, manager-preserved, or natural-exit main
+      seed. An explicit stop/restart snapshot precedes signal delivery, and the
+      Sentry final snapshot captures later shutdown-handler writes before teardown.
 - [x] Output attachment does not reject or migrate with fork: every branch owns
       one drain, while host readers remain attached only to the selected log.
 - [x] Drain to a persistent host log instead of blocking guest output merely

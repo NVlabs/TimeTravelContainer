@@ -842,6 +842,25 @@ func TestTPUProxyEnabled(t *testing.T) {
 	}
 }
 
+func TestMountTarOnExitPathsPrefersWritableDestination(t *testing.T) {
+	spec := specs.Spec{
+		Mounts: []specs.Mount{
+			{Source: "/volume/cache", Destination: "/cache-view", Options: []string{"ro"}},
+			{Source: "/volume/cache", Destination: "/cache", Options: []string{"rw"}},
+		},
+		Annotations: map[string]string{
+			AnnotationMountTarOnExit: `{"/volume/cache":{"path":"/snapshots/cache.tar","ready_path":"/snapshots/cache.ready"}}`,
+		},
+	}
+	paths, err := MountTarOnExitPaths(&spec)
+	if err != nil {
+		t.Fatalf("MountTarOnExitPaths: %v", err)
+	}
+	if len(paths) != 1 || paths[0].Destination != "/cache" {
+		t.Fatalf("final mount paths=%+v, want writable /cache", paths)
+	}
+}
+
 func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	const bundleDir = "/bundle"
 	spec := specs.Spec{
@@ -855,6 +874,7 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 			"dev.gvisor.spec.mount.host.source":  "/host/data",
 			"dev.gvisor.spec.mount.cache.type":   "tmpfs",
 			AnnotationMountTar:                   `{"volumes/cache":"/snapshots/cache.tar"}`,
+			AnnotationMountTarOnExit:             `{"volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"}}`,
 			"example.source":                     "relative-but-not-a-mount-hint",
 		},
 	}
@@ -872,6 +892,9 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	}
 	if got, want := spec.Annotations[AnnotationMountTar], `{"/bundle/volumes/cache":"/snapshots/cache.tar"}`; got != want {
 		t.Errorf("mount tar annotation=%q, want %q", got, want)
+	}
+	if got, want := spec.Annotations[AnnotationMountTarOnExit], `{"/bundle/volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"}}`; got != want {
+		t.Errorf("final mount tar annotation=%q, want %q", got, want)
 	}
 	if got, want := spec.Annotations["example.source"], "relative-but-not-a-mount-hint"; got != want {
 		t.Errorf("unrelated annotation=%q, want %q", got, want)

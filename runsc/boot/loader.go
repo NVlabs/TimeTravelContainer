@@ -254,6 +254,9 @@ type Loader struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	finalMountExports   []finalMountExport
+	finalMountNamespace *vfs.MountNamespace
+
 	// cpuQuota and cpuPeriod are the raw host CFS settings that should be
 	// exposed through sandbox cgroupfs.
 	cpuQuota  int64
@@ -335,6 +338,12 @@ type Loader struct {
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
+type finalMountExport struct {
+	destination string
+	archive     *os.File
+	ready       *os.File
+}
+
 type execID struct {
 	cid string
 	pid kernel.ThreadID
@@ -458,6 +467,9 @@ type Args struct {
 	RootfsUpperTarFD int
 	// MountTarFDs are ordered according to specutils.MountTarPaths(Args.Spec).
 	MountTarFDs []int
+	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
+	MountTarOnExitFDs      []int
+	MountTarOnExitReadyFDs []int
 }
 
 // HostTHP holds host transparent hugepage settings.
@@ -666,6 +678,20 @@ func New(args Args) (*Loader, error) {
 	l.root.mountTarFDs = make(map[string]*fd.FD, len(mountTarPaths))
 	for i, seed := range mountTarPaths {
 		l.root.mountTarFDs[seed.Source] = fd.New(args.MountTarFDs[i])
+	}
+	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if len(finalMountPaths) != len(args.MountTarOnExitFDs) || len(finalMountPaths) != len(args.MountTarOnExitReadyFDs) {
+		return nil, fmt.Errorf("got %d final mount tar FDs and %d markers, want %d of each", len(args.MountTarOnExitFDs), len(args.MountTarOnExitReadyFDs), len(finalMountPaths))
+	}
+	for i, target := range finalMountPaths {
+		l.finalMountExports = append(l.finalMountExports, finalMountExport{
+			destination: target.Destination,
+			archive:     os.NewFile(uintptr(args.MountTarOnExitFDs[i]), "mount-tar-on-exit-"+target.Source),
+			ready:       os.NewFile(uintptr(args.MountTarOnExitReadyFDs[i]), "mount-tar-on-exit-ready-"+target.Source),
+		})
 	}
 
 	// Create kernel and platform.
@@ -991,6 +1017,10 @@ func (l *Loader) Destroy() {
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
+	if l.finalMountNamespace != nil {
+		l.finalMountNamespace.DecRef(ctx)
+		l.finalMountNamespace = nil
+	}
 	l.family.DestroyChildren()
 	l.k.Release()
 
@@ -1017,6 +1047,10 @@ func (l *Loader) Destroy() {
 	}
 	for _, f := range l.root.mountTarFDs {
 		_ = f.Close()
+	}
+	for i := range l.finalMountExports {
+		_ = l.finalMountExports[i].archive.Close()
+		_ = l.finalMountExports[i].ready.Close()
 	}
 
 	l.stopProfiling()
@@ -1239,6 +1273,13 @@ func (l *Loader) run() error {
 	}
 
 	ep.tg = l.k.GlobalInit()
+	if len(l.finalMountExports) != 0 {
+		mntns := ep.tg.Leader().MountNamespace()
+		if mntns == nil || !mntns.TryIncRef() {
+			return fmt.Errorf("retaining root mount namespace for final mount exports")
+		}
+		l.finalMountNamespace = mntns
+	}
 	if ns, ok := specutils.GetNS(specs.PIDNamespace, l.root.spec); ok {
 		ep.pidnsPath = ns.Path
 	}
@@ -1963,6 +2004,46 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	l.k.WaitExited()
 
 	return l.k.GlobalInit().ExitStatus()
+}
+
+// ExportFinalMounts serializes configured writable mounts after init exits and
+// marks each pending archive ready only after it has been synced successfully.
+func (l *Loader) ExportFinalMounts() error {
+	if len(l.finalMountExports) == 0 {
+		return nil
+	}
+	ctx := l.k.SupervisorContext()
+	if l.finalMountNamespace == nil {
+		return fmt.Errorf("final mount namespace is unavailable")
+	}
+	defer func() {
+		l.finalMountNamespace.DecRef(ctx)
+		l.finalMountNamespace = nil
+	}()
+	var exportErrs []error
+	for i := range l.finalMountExports {
+		target := &l.finalMountExports[i]
+		if _, err := target.archive.Seek(0, 0); err != nil {
+			exportErrs = append(exportErrs, fmt.Errorf("seeking final archive for %q: %w", target.destination, err))
+			continue
+		}
+		if err := control.TarFilesystemMountNamespace(l.k, l.finalMountNamespace, target.destination, target.archive); err != nil {
+			exportErrs = append(exportErrs, fmt.Errorf("exporting final archive for %q: %w", target.destination, err))
+			continue
+		}
+		if err := target.archive.Sync(); err != nil {
+			exportErrs = append(exportErrs, fmt.Errorf("syncing final archive for %q: %w", target.destination, err))
+			continue
+		}
+		if _, err := target.ready.WriteString("complete\n"); err != nil {
+			exportErrs = append(exportErrs, fmt.Errorf("marking final archive for %q ready: %w", target.destination, err))
+			continue
+		}
+		if err := target.ready.Sync(); err != nil {
+			exportErrs = append(exportErrs, fmt.Errorf("syncing final archive marker for %q: %w", target.destination, err))
+		}
+	}
+	return errors.Join(exportErrs...)
 }
 
 // QuiesceBranchControls waits for registered branch operations to finish and

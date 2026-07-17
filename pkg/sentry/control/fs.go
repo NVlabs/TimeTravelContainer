@@ -126,7 +126,12 @@ func TarFilesystem(k *kernel.Kernel, containerID, path string, outFD *os.File) e
 		return err
 	}
 	defer mntns.DecRef(ctx)
+	return TarFilesystemMountNamespace(k, mntns, path, outFD)
+}
 
+// TarFilesystemMountNamespace exports a writable filesystem through a retained mount namespace.
+func TarFilesystemMountNamespace(k *kernel.Kernel, mntns *vfs.MountNamespace, path string, outFD *os.File) error {
+	ctx := k.SupervisorContext()
 	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
 	vd, err := k.VFS().GetDentryAt(ctx, auth.NewRootCredentials(k.RootUserNamespace()), &vfs.PathOperation{

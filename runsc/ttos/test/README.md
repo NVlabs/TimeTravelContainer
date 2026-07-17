@@ -96,7 +96,9 @@ covers:
   branch-selected `volume export` tar isolation, atomic `volume commit` of a
   selected live branch, teardown and restoration into a new sandbox family,
   validated `volume import`, replacement-seed semantics, and automatic
-  pause/commit/resume preservation across Docker-style restart;
+  pause/commit/resume preservation across Docker-style restart, and validated
+  atomic preservation of normal-exit plus shutdown-handler writes into a fresh
+  sandbox family;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

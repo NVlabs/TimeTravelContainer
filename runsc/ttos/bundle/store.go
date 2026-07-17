@@ -513,6 +513,24 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
+	for _, volume := range opts.ManagedVolumes {
+		if volume.Readonly {
+			continue
+		}
+		pending, ready, err := s.VolumeExitSnapshotPaths(id, volume.Name)
+		if err != nil {
+			return Prepared{}, err
+		}
+		exitTargets["ttos-volume-"+volume.Name] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
+	}
+	if len(exitTargets) != 0 {
+		encoded, err := json.Marshal(exitTargets)
+		if err != nil {
+			return Prepared{}, fmt.Errorf("encoding final managed volume snapshot paths: %w", err)
+		}
+		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
+	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
 		return Prepared{}, err
@@ -820,6 +838,9 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 // RefreshVolumeSeeds atomically updates a persistent OCI bundle to seed every
 // managed volume that has a committed snapshot.
 func (s Store) RefreshVolumeSeeds(name string) error {
+	if err := s.FinalizeVolumeExitSnapshots(name); err != nil {
+		return fmt.Errorf("finalizing previous managed volume exit snapshots: %w", err)
+	}
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
@@ -832,10 +853,18 @@ func (s Store) RefreshVolumeSeeds(name string) error {
 		spec.Annotations = make(map[string]string)
 	}
 	seeds := make(map[string]string)
+	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
 	for _, volume := range info.Volumes {
 		volumeInfo, err := s.LoadVolume(volume.Name)
 		if err != nil {
 			return err
+		}
+		if !volume.Readonly {
+			pending, ready, err := s.VolumeExitSnapshotPaths(info.ID, volume.Name)
+			if err != nil {
+				return err
+			}
+			exitTargets["ttos-volume-"+volume.Name] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
 		}
 		if volumeInfo.SnapshotUpdatedAt == nil {
 			continue
@@ -865,6 +894,15 @@ func (s Store) RefreshVolumeSeeds(name string) error {
 			prefix := strings.TrimSuffix(annotation, "source")
 			delete(spec.Annotations, prefix+"copyup")
 		}
+	}
+	if len(exitTargets) == 0 {
+		delete(spec.Annotations, specutils.AnnotationMountTarOnExit)
+	} else {
+		encoded, err := json.Marshal(exitTargets)
+		if err != nil {
+			return fmt.Errorf("encoding final managed volume snapshot paths: %w", err)
+		}
+		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
 	}
 	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
 		return fmt.Errorf("updating managed volume seeds for container %q: %w", name, err)
@@ -1263,6 +1301,77 @@ func (s Store) VolumeSnapshotPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(s.Root, "volumes", name, volumeSnapshotFile), nil
+}
+
+// VolumeExitSnapshotPaths returns the per-container pending archive and marker paths.
+func (s Store) VolumeExitSnapshotPaths(containerID, name string) (string, string, error) {
+	if err := validateName(containerID); err != nil {
+		return "", "", err
+	}
+	if err := validateVolumeName(name); err != nil {
+		return "", "", err
+	}
+	base := filepath.Join(s.Root, "volumes", name, ".exit-"+containerID)
+	return base + ".tar", base + ".ready", nil
+}
+
+// FinalizeVolumeExitSnapshots validates and atomically publishes completed exit archives.
+func (s Store) FinalizeVolumeExitSnapshots(container string) error {
+	info, err := s.LoadContainer(container)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{})
+	for _, volume := range info.Volumes {
+		if volume.Readonly {
+			continue
+		}
+		if _, ok := seen[volume.Name]; ok {
+			continue
+		}
+		seen[volume.Name] = struct{}{}
+		pending, ready, err := s.VolumeExitSnapshotPaths(info.ID, volume.Name)
+		if err != nil {
+			return err
+		}
+		marker, err := os.ReadFile(ready)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("reading exit snapshot marker for volume %q: %w", volume.Name, err)
+		}
+		if len(marker) == 0 {
+			continue
+		}
+		if strings.TrimSpace(string(marker)) != "complete" {
+			return fmt.Errorf("invalid exit snapshot marker for volume %q", volume.Name)
+		}
+		if err := s.ImportVolumeSnapshot(volume.Name, pending); err != nil {
+			return fmt.Errorf("publishing exit snapshot for volume %q: %w", volume.Name, err)
+		}
+		if err := os.Remove(ready); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing exit snapshot marker for volume %q: %w", volume.Name, err)
+		}
+		if err := os.Remove(pending); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing pending exit snapshot for volume %q: %w", volume.Name, err)
+		}
+	}
+	return nil
+}
+
+// FinalizeAllVolumeExitSnapshots publishes completed archives from all containers.
+func (s Store) FinalizeAllVolumeExitSnapshots() error {
+	containers, err := s.ListContainers()
+	if err != nil {
+		return err
+	}
+	for _, container := range containers {
+		if err := s.FinalizeVolumeExitSnapshots(container.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateVolumeSnapshot(file *os.File) error {

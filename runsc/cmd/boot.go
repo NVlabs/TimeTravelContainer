@@ -108,6 +108,10 @@ type Boot struct {
 	// mountTarFDs are ordered tar seeds for shared mounts.
 	mountTarFDs sandboxsetup.IntFlags
 
+	// mountTarOnExitFDs and markers are ordered final snapshot outputs.
+	mountTarOnExitFDs      sandboxsetup.IntFlags
+	mountTarOnExitReadyFDs sandboxsetup.IntFlags
+
 	// goferMountConfs contains information about how the gofer mounts have been
 	// configured. The first entry is for rootfs and the following entries are
 	// for bind mounts in Spec.Mounts (in the same order).
@@ -274,6 +278,8 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
 	f.Var(&b.mountTarFDs, "mount-tar-fds", "ordered tar seed FDs for shared mounts")
+	f.Var(&b.mountTarOnExitFDs, "mount-tar-on-exit-fds", "ordered final tar output FDs for shared mounts")
+	f.Var(&b.mountTarOnExitReadyFDs, "mount-tar-on-exit-ready-fds", "ordered completion marker FDs for final shared mount tar outputs")
 	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
 	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
@@ -624,6 +630,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		FSRestoreCheckpointGofer: b.fsRestoreCheckpointGofer,
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
 		MountTarFDs:              b.mountTarFDs.GetArray(),
+		MountTarOnExitFDs:        b.mountTarOnExitFDs.GetArray(),
+		MountTarOnExitReadyFDs:   b.mountTarOnExitReadyFDs.GetArray(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
@@ -686,6 +694,9 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	ws := l.WaitExit()
 	log.Infof("application exiting with %+v", ws)
+	if err := l.ExportFinalMounts(); err != nil {
+		log.Warningf("final managed-volume export failed: %v", err)
+	}
 	waitStatus := args[1].(*unix.WaitStatus)
 	*waitStatus = unix.WaitStatus(ws)
 	l.QuiesceBranchControls()

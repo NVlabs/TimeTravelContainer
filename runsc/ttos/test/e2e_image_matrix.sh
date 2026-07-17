@@ -103,6 +103,9 @@ QUOTA_VOLUME="$PREFIX-quota"
 QUOTA_CONTAINER="$PREFIX-quota-container"
 QUOTA_RESTORED="$PREFIX-quota-restored"
 QUOTA_IMPORTED="$PREFIX-quota-imported"
+NATURAL_VOLUME="$PREFIX-natural-exit"
+NATURAL_WRITER="$PREFIX-natural-writer"
+NATURAL_READER="$PREFIX-natural-reader"
 
 ttos() {
   if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
@@ -128,10 +131,10 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
-  ttos volume rm "$VOLUME" "$QUOTA_VOLUME" >/dev/null 2>&1 || true
+  ttos volume rm "$VOLUME" "$QUOTA_VOLUME" "$NATURAL_VOLUME" >/dev/null 2>&1 || true
   ttos daemon stop >/dev/null 2>&1 || true
   if $owned_root; then
     rm -rf "$TTOS_E2E_ROOT"
@@ -452,6 +455,14 @@ fi
 grep -q "does not support reading" "$TTOS_E2E_ROOT/nolog.err" ||
   fail "none log-driver rejection lacked a compatibility diagnostic"
 ttos rm --force "$NOLOG"
+
+echo "== natural-exit managed-volume preservation =="
+ttos volume create "$NATURAL_VOLUME"
+ttos run --name "$NATURAL_WRITER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'trap "echo shutdown-handler >/natural/final" EXIT; echo before-exit >/natural/before'
+ttos volume inspect "$NATURAL_VOLUME" | grep -q '"snapshot_bytes":' || fail "natural exit did not publish managed-volume snapshot metadata"
+ttos run --name "$NATURAL_READER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'test "$(cat /natural/before)" = before-exit; test "$(cat /natural/final)" = shutdown-handler'
+ttos rm "$NATURAL_WRITER" "$NATURAL_READER"
+ttos volume rm "$NATURAL_VOLUME"
 
 echo "== managed-volume quota enforcement across live fork =="
 ttos volume create --opt size=64k "$QUOTA_VOLUME"

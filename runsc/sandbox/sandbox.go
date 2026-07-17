@@ -1004,6 +1004,22 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 		donations.DonateAndClose("mount-tar-fds", file)
 	}
+	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
+	if err != nil {
+		return err
+	}
+	for _, target := range finalMountPaths {
+		archive, err := os.OpenFile(target.Path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return fmt.Errorf("opening final tar output for mount %q: %w", target.Source, err)
+		}
+		donations.DonateAndClose("mount-tar-on-exit-fds", archive)
+		ready, err := os.OpenFile(target.ReadyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return fmt.Errorf("opening final tar marker for mount %q: %w", target.Source, err)
+		}
+		donations.DonateAndClose("mount-tar-on-exit-ready-fds", ready)
+	}
 
 	// Pass gofer mount configs.
 	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())

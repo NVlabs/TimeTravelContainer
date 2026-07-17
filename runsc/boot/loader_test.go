@@ -2279,7 +2279,8 @@ func liveForkTestTCPPair(t *testing.T, task *kernel.Task, serverPort uint16) (*v
 	}
 
 	acceptedFD := int32(-1)
-	for attempts := 0; attempts < 1000; attempts++ {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
 		fd, _, _, err := listenerSocket.Accept(task, false, linux.SOCK_NONBLOCK, false)
 		if err == nil {
 			acceptedFD = fd
@@ -2290,7 +2291,7 @@ func liveForkTestTCPPair(t *testing.T, task *kernel.Task, serverPort uint16) (*v
 			client.DecRef(task)
 			t.Fatalf("accepting loopback TCP connection: %v", err)
 		}
-		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 	listener.DecRef(task)
 	if acceptedFD < 0 {

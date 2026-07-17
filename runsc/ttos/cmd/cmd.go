@@ -5884,6 +5884,11 @@ func waitStatusExitCode(status uint32) int {
 
 func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	if !detach || status != 0 {
+		if err := store.FinalizeVolumeExitSnapshots(name); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttos: warning: finalizing managed volumes for %s: %v\n", name, err)
+		}
+	}
 	state := "exited"
 	var exitStatus *int
 	if detach && status == 0 {
@@ -6234,6 +6239,9 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	store := b.containerStore()
+	if err := store.FinalizeVolumeExitSnapshots(name); err != nil {
+		return fmt.Errorf("finalizing managed volumes before removing %q: %w", name, err)
+	}
 	info, err := store.LoadContainer(name)
 	if err != nil {
 		return err
@@ -6553,11 +6561,19 @@ func (b *runtimeBackend) ensureVolume(name string, quotaBytes int64) (ttosbundle
 }
 
 func (b *runtimeBackend) listVolumes() ([]ttosbundle.VolumeInfo, error) {
-	return (ttosbundle.Store{Root: b.dataRoot}).ListVolumes()
+	store := ttosbundle.Store{Root: b.dataRoot}
+	if err := store.FinalizeAllVolumeExitSnapshots(); err != nil {
+		return nil, err
+	}
+	return store.ListVolumes()
 }
 
 func (b *runtimeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) {
-	return (ttosbundle.Store{Root: b.dataRoot}).LoadVolume(name)
+	store := ttosbundle.Store{Root: b.dataRoot}
+	if err := store.FinalizeAllVolumeExitSnapshots(); err != nil {
+		return ttosbundle.VolumeInfo{}, err
+	}
+	return store.LoadVolume(name)
 }
 
 func (b *runtimeBackend) volumeUsage(target selector, name string) ([]ttosbundle.VolumeUsage, error) {
@@ -7346,6 +7362,9 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 		return
 	}
 	exitStatus := waitStatusExitCode(status)
+	if err := store.FinalizeVolumeExitSnapshots(target.container); err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttos: warning: finalizing managed volumes for %s: %v\n", target, err)
+	}
 	if err := store.UpdateState(target.container, "exited", &exitStatus); err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttos: warning: recording exit state for %s: %v\n", target, err)
 	}

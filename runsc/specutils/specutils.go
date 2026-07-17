@@ -76,6 +76,9 @@ const (
 	// AnnotationMountTar maps shared mount sources to tar seed paths.
 	AnnotationMountTar = "dev.gvisor.tar.mounts"
 
+	// AnnotationMountTarOnExit maps shared mount sources to pending tar outputs.
+	AnnotationMountTarOnExit = "dev.timetravelos.tar.mounts.on-exit"
+
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
 	// Usage:
@@ -302,6 +305,25 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 			return fmt.Errorf("normalizing %s: %w", AnnotationMountTar, err)
 		}
 		spec.Annotations[AnnotationMountTar] = string(encoded)
+	}
+	if encoded := spec.Annotations[AnnotationMountTarOnExit]; encoded != "" {
+		var targets map[string]MountTarOnExitTarget
+		if err := json.Unmarshal([]byte(encoded), &targets); err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationMountTarOnExit, err)
+		}
+		normalized := make(map[string]MountTarOnExitTarget, len(targets))
+		for source, target := range targets {
+			source = absPath(bundleDir, source)
+			if _, ok := normalized[source]; ok {
+				return fmt.Errorf("%s contains duplicate normalized source %q", AnnotationMountTarOnExit, source)
+			}
+			normalized[source] = target
+		}
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationMountTarOnExit, err)
+		}
+		spec.Annotations[AnnotationMountTarOnExit] = string(encoded)
 	}
 
 	if containerName := containerNameNoRemap(spec); len(containerName) > 0 {
@@ -963,6 +985,69 @@ func MountTarPaths(spec *specs.Spec) ([]MountTarPath, error) {
 	result := make([]MountTarPath, 0, len(sources))
 	for _, source := range sources {
 		result = append(result, MountTarPath{Source: source, Path: paths[source]})
+	}
+	return result, nil
+}
+
+// MountTarOnExitTarget names a pending archive and its completion marker.
+type MountTarOnExitTarget struct {
+	Path      string `json:"path"`
+	ReadyPath string `json:"ready_path"`
+}
+
+// MountTarOnExitPath associates one shared mount with a guest destination and host outputs.
+type MountTarOnExitPath struct {
+	Source      string
+	Destination string
+	Path        string
+	ReadyPath   string
+}
+
+// MountTarOnExitPaths returns final shared-mount exports in deterministic source order.
+func MountTarOnExitPaths(spec *specs.Spec) ([]MountTarOnExitPath, error) {
+	if spec == nil || spec.Annotations == nil || spec.Annotations[AnnotationMountTarOnExit] == "" {
+		return nil, nil
+	}
+	var targets map[string]MountTarOnExitTarget
+	if err := json.Unmarshal([]byte(spec.Annotations[AnnotationMountTarOnExit]), &targets); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", AnnotationMountTarOnExit, err)
+	}
+	type mountDestination struct {
+		path     string
+		readonly bool
+	}
+	destinations := make(map[string]mountDestination)
+	for _, mount := range spec.Mounts {
+		readonly := false
+		for _, option := range mount.Options {
+			if option == "ro" {
+				readonly = true
+				break
+			}
+		}
+		current, exists := destinations[mount.Source]
+		if !exists || current.readonly && !readonly {
+			destinations[mount.Source] = mountDestination{path: mount.Destination, readonly: readonly}
+		}
+	}
+	sources := make([]string, 0, len(targets))
+	for source, target := range targets {
+		if source == "" || target.Path == "" || target.ReadyPath == "" {
+			return nil, fmt.Errorf("%s contains an empty source or path", AnnotationMountTarOnExit)
+		}
+		if !filepath.IsAbs(target.Path) || !filepath.IsAbs(target.ReadyPath) {
+			return nil, fmt.Errorf("%s output paths for source %q must be absolute", AnnotationMountTarOnExit, source)
+		}
+		if destinations[source].path == "" {
+			return nil, fmt.Errorf("%s source %q is not mounted", AnnotationMountTarOnExit, source)
+		}
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+	result := make([]MountTarOnExitPath, 0, len(sources))
+	for _, source := range sources {
+		target := targets[source]
+		result = append(result, MountTarOnExitPath{Source: source, Destination: destinations[source].path, Path: target.Path, ReadyPath: target.ReadyPath})
 	}
 	return result, nil
 }
