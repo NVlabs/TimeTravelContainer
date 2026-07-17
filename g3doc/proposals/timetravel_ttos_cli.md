@@ -488,11 +488,14 @@ closure validation before shared-memory or address-space CoW preparation. Reject
       truncate, fallocate, and mount flags across branches. Standard OCI mount
       flags now use last-option-wins parsing; `nodev` is enforced and retained
       through recursive live forks.
-- [ ] Admit procfs only after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,
-      namespaces, mounts, clocks, and `/proc/net` resolve through the child
-      Kernel rather than the source Kernel.
-- [x] Initial procfs fork and parent/child `/proc/1/status` access coverage;
-      exhaustive dynamic-file validation remains above.
+- [x] Admit procfs after proving `/proc/self`, `/proc/PID`, `/proc/*/fd`,
+      PID namespace inodes, mount topology, uptime, and `/proc/net` resolve
+      through the selected branch Kernel. Network proof covers loopback device
+      counters, SNMP counters, routes, and complete TCP, UDP, and Unix socket
+      rows; live-fork loopback reconstruction preserves NIC counter values and
+      TCP restore no longer double-counts established connections.
+- [x] Verify parent/child `/proc/1/status` and `/proc/self/status` identity plus
+      branch-divergent reads through an already-open `/proc/self/fd` handle.
 - [x] Admit a read-only restricted Sentry-owned sysfs profile.
 - [x] Keep host binds and TPU/NVIDIA device proxies rejected by the initial
       allowlist; other mirrored host sysfs paths remain rejected until

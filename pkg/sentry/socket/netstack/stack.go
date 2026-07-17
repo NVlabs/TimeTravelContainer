@@ -1218,14 +1218,23 @@ func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
 		dstStack.Stack.ResetConfig()
 		return nil
 	}
-	dstStack.Stack.ResetConfig()
 	const nicID = tcpip.NICID(linux.LOOPBACK_IFINDEX)
+	sourceNIC, ok := s.Stack.SingleNICInfo(nicID)
+	if !ok {
+		return fmt.Errorf("source loopback NIC %d disappeared", nicID)
+	}
+	dstStack.Stack.ResetConfig()
 	if err := dstStack.Stack.CreateNICWithOptions(nicID, ethernet.New(loopback.New()), stack.NICOptions{
 		Name:               "lo",
 		DeliverLinkPackets: true,
 	}); err != nil {
 		return fmt.Errorf("creating cloned loopback NIC: %v", err)
 	}
+	destinationNIC, ok := dstStack.Stack.SingleNICInfo(nicID)
+	if !ok {
+		return fmt.Errorf("cloned loopback NIC %d disappeared", nicID)
+	}
+	sourceNIC.Stats.Clone(&destinationNIC.Stats)
 	for _, addr := range s.InterfaceAddrs()[linux.LOOPBACK_IFINDEX] {
 		if err := dstStack.AddInterfaceAddr(linux.LOOPBACK_IFINDEX, addr); err != nil {
 			return fmt.Errorf("adding cloned loopback address: %v", err)

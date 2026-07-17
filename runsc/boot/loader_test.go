@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1147,10 +1148,6 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childTimerFile := liveForkTestFD(t, child.k, timerFD)
 	childTimer := childTimerFile.Impl().(*timerfd.TimerFileDescription)
 	childTask := child.k.GlobalInit().Leader()
-	childUDPClient := liveForkTestFD(t, child.k, udpFDs[0])
-	childUDPServer := liveForkTestFD(t, child.k, udpFDs[1])
-	childTCPClient := liveForkTestFD(t, child.k, tcpFDs[0])
-	childTCPServer := liveForkTestFD(t, child.k, tcpFDs[1])
 	liveForkTestMMRead(t, childTask, shmAddr1, "seed")
 	liveForkTestMMRead(t, childTask, shmAddr2, "seed")
 	liveForkTestMMWrite(t, childTask, shmAddr1, "chld")
@@ -1163,8 +1160,6 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childRoot := childTask.MountNamespace().Root(childCtx)
 	childInotifyFile := liveForkTestFD(t, child.k, inotifyFD)
 	childInotify := childInotifyFile.Impl().(*vfs.Inotify)
-	childUnix1 := liveForkTestFD(t, child.k, unixFDs[0])
-	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
 	childMemfd := liveForkTestFD(t, child.k, memfdFD)
 	childOverlayFile := liveForkTestFD(t, child.k, overlayFD)
 	childTruncateFile := liveForkTestFD(t, child.k, truncateFD)
@@ -1186,14 +1181,115 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		task *kernel.Task
 		path string
 	}{
-		{parentTask, "proc/1/status"},
-		{childTask, "proc/1/status"},
 		{parentTask, "sys"},
 		{childTask, "sys"},
 	} {
 		file := liveForkTestOpenPath(t, check.task, check.path, linux.O_RDONLY)
 		file.DecRef(check.task)
 	}
+
+	// Every dynamic procfs view must resolve through the selected branch Kernel.
+	// Use the task itself as context so /proc/self is not accidentally resolved
+	// against the supervisor.
+	procStatuses := map[string]string{
+		"parent-self": liveForkTestReadAllPathContext(t, parentTask, parentTask, "proc/self/status"),
+		"parent-pid1": liveForkTestReadAllPathContext(t, parentTask, parentTask, "proc/1/status"),
+		"child-self":  liveForkTestReadAllPathContext(t, childTask, childTask, "proc/self/status"),
+		"child-pid1":  liveForkTestReadAllPathContext(t, childTask, childTask, "proc/1/status"),
+	}
+	for name, status := range procStatuses {
+		for _, field := range []string{"Pid:\t1\n", "PPid:\t0\n"} {
+			if !strings.Contains(status, field) {
+				t.Errorf("%s status omitted %q: %q", name, field, status)
+			}
+		}
+	}
+	parentMountInfo := liveForkTestReadAllPathContext(t, parentTask, parentTask, "proc/self/mountinfo")
+	childMountInfo := liveForkTestReadAllPathContext(t, childTask, childTask, "proc/self/mountinfo")
+	if diff := cmp.Diff(parentMountInfo, childMountInfo); diff != "" {
+		t.Errorf("live fork changed /proc/self/mountinfo (-parent +child):\n%s", diff)
+	}
+	for _, mountPath := range []string{"/proc", "/dev/shm", "/sys", "/readonly", "/managed", "/managed-alias"} {
+		if !strings.Contains(parentMountInfo, " "+mountPath+" ") {
+			t.Errorf("/proc/self/mountinfo omitted %q: %q", mountPath, parentMountInfo)
+		}
+	}
+	var parentNetDev string
+	normalizeProcNet := func(name, contents string) string {
+		switch name {
+		case "tcp", "tcp6", "udp", "udp6", "unix":
+			lines := strings.Split(strings.TrimSuffix(contents, "\n"), "\n")
+			sort.Strings(lines)
+			return strings.Join(lines, "\n") + "\n"
+		default:
+			return contents
+		}
+	}
+	for _, name := range []string{"dev", "snmp", "route", "tcp", "tcp6", "udp", "udp6", "unix"} {
+		path := "proc/net/" + name
+		parentContents := liveForkTestReadAllPathContext(t, parentTask, parentTask, path)
+		childContents := liveForkTestReadAllPathContext(t, childTask, childTask, path)
+		if diff := cmp.Diff(normalizeProcNet(name, parentContents), normalizeProcNet(name, childContents)); diff != "" {
+			t.Errorf("live fork changed /%s (-parent +child):\n%s", path, diff)
+		}
+		if name == "dev" {
+			parentNetDev = parentContents
+		}
+	}
+	if !strings.Contains(parentNetDev, "lo:") {
+		t.Errorf("/proc/net/dev omitted contained loopback: %q", parentNetDev)
+	}
+	var parentUptime, childUptime float64
+	if _, err := fmt.Sscanf(liveForkTestReadAllPathContext(t, parentTask, parentTask, "proc/uptime"), "%f", &parentUptime); err != nil {
+		t.Fatalf("parsing parent /proc/uptime: %v", err)
+	}
+	if _, err := fmt.Sscanf(liveForkTestReadAllPathContext(t, childTask, childTask, "proc/uptime"), "%f", &childUptime); err != nil {
+		t.Fatalf("parsing child /proc/uptime: %v", err)
+	}
+	if delta := parentUptime - childUptime; delta < -1 || delta > 1 {
+		t.Errorf("live fork changed procfs uptime discontinuously: parent=%f child=%f", parentUptime, childUptime)
+	}
+	parentSelfPIDNS := liveForkTestOpenPathContext(t, parentTask, parentTask, "proc/self/ns/pid", linux.O_RDONLY)
+	parentPID1NS := liveForkTestOpenPathContext(t, parentTask, parentTask, "proc/1/ns/pid", linux.O_RDONLY)
+	childSelfPIDNS := liveForkTestOpenPathContext(t, childTask, childTask, "proc/self/ns/pid", linux.O_RDONLY)
+	childPID1NS := liveForkTestOpenPathContext(t, childTask, childTask, "proc/1/ns/pid", linux.O_RDONLY)
+	namespaceInode := func(name string, task *kernel.Task, file *vfs.FileDescription) uint64 {
+		stat, err := file.Stat(task, vfs.StatOptions{Mask: linux.STATX_INO})
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		return stat.Ino
+	}
+	parentSelfPIDNSIno := namespaceInode("parent /proc/self/ns/pid", parentTask, parentSelfPIDNS)
+	parentPID1NSIno := namespaceInode("parent /proc/1/ns/pid", parentTask, parentPID1NS)
+	childSelfPIDNSIno := namespaceInode("child /proc/self/ns/pid", childTask, childSelfPIDNS)
+	childPID1NSIno := namespaceInode("child /proc/1/ns/pid", childTask, childPID1NS)
+	if parentSelfPIDNSIno != parentPID1NSIno {
+		t.Errorf("parent /proc/self/ns/pid inode %d differs from PID 1 namespace inode %d", parentSelfPIDNSIno, parentPID1NSIno)
+	}
+	if childSelfPIDNSIno != childPID1NSIno {
+		t.Errorf("child /proc/self/ns/pid inode %d differs from PID 1 namespace inode %d", childSelfPIDNSIno, childPID1NSIno)
+	}
+	if parentSelfPIDNSIno != childSelfPIDNSIno {
+		t.Errorf("live fork changed observable PID namespace inode: parent=%d child=%d", parentSelfPIDNSIno, childSelfPIDNSIno)
+	}
+	if parentSelfPIDNS.VirtualDentry().Dentry() == childSelfPIDNS.VirtualDentry().Dentry() {
+		t.Error("parent and child procfs namespace handles share a source-Kernel dentry")
+	}
+	parentSelfPIDNS.DecRef(parentTask)
+	parentPID1NS.DecRef(parentTask)
+	childSelfPIDNS.DecRef(childTask)
+	childPID1NS.DecRef(childTask)
+
+	// Acquire matching branch-local test references only after procfs has been
+	// observed, so the proc socket refcounts are compared symmetrically.
+	childUnix1 := liveForkTestFD(t, child.k, unixFDs[0])
+	childUnix2 := liveForkTestFD(t, child.k, unixFDs[1])
+	childUDPClient := liveForkTestFD(t, child.k, udpFDs[0])
+	childUDPServer := liveForkTestFD(t, child.k, udpFDs[1])
+	childTCPClient := liveForkTestFD(t, child.k, tcpFDs[0])
+	childTCPServer := liveForkTestFD(t, child.k, tcpFDs[1])
+
 	liveForkTestPathRead(t, parentTask, "readonly/fixture", "host-data")
 	liveForkTestPathRead(t, childTask, "readonly/fixture", "host-data")
 	liveForkTestPathWriteDenied(t, parentTask, "readonly/fixture")
@@ -1416,6 +1512,12 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMappedWrite(t, childTask, childMemfd, "chld")
 	liveForkTestPRead(t, childTask, childMemfd, 0, "chld")
 	liveForkTestPRead(t, parentTask, parentMemfd, 0, "prnt")
+	parentProcMemfd := liveForkTestOpenPathContext(t, parentTask, parentTask, "proc/self/fd/19", linux.O_RDONLY)
+	childProcMemfd := liveForkTestOpenPathContext(t, childTask, childTask, "proc/self/fd/19", linux.O_RDONLY)
+	liveForkTestPRead(t, parentTask, parentProcMemfd, 0, "prnt")
+	liveForkTestPRead(t, childTask, childProcMemfd, 0, "chld")
+	parentProcMemfd.DecRef(parentTask)
+	childProcMemfd.DecRef(childTask)
 
 	// An explicit tmpfs submount uses the Kernel MemoryFile and therefore
 	// detaches syscall and mapped writes without eager copying. Its inode graph,
@@ -2263,7 +2365,11 @@ func liveForkTestPathRead(t *testing.T, task *kernel.Task, path, want string) {
 
 func liveForkTestOpenPath(t *testing.T, task *kernel.Task, path string, flags uint32) *vfs.FileDescription {
 	t.Helper()
-	ctx := task.Kernel().SupervisorContext()
+	return liveForkTestOpenPathContext(t, task.Kernel().SupervisorContext(), task, path, flags)
+}
+
+func liveForkTestOpenPathContext(t *testing.T, ctx context.Context, task *kernel.Task, path string, flags uint32) *vfs.FileDescription {
+	t.Helper()
 	root := task.MountNamespace().Root(ctx)
 	defer root.DecRef(ctx)
 	file, err := task.Kernel().VFS().OpenAt(ctx, task.Credentials(), &vfs.PathOperation{
@@ -2276,6 +2382,31 @@ func liveForkTestOpenPath(t *testing.T, task *kernel.Task, path string, flags ui
 		t.Fatalf("opening %q: %v", path, err)
 	}
 	return file
+}
+
+func liveForkTestReadAllPathContext(t *testing.T, ctx context.Context, task *kernel.Task, path string) string {
+	t.Helper()
+	file := liveForkTestOpenPathContext(t, ctx, task, path, linux.O_RDONLY)
+	readCtx := task.Kernel().SupervisorContext()
+	defer file.DecRef(readCtx)
+	var out bytes.Buffer
+	buf := make([]byte, 4096)
+	for {
+		n, err := file.Read(readCtx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+		if n > 0 {
+			out.Write(buf[:n])
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("reading %q: %v", path, err)
+			}
+			break
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return out.String()
 }
 
 func liveForkTestPathWriteDenied(t *testing.T, task *kernel.Task, path string) {

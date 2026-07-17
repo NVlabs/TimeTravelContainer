@@ -24,6 +24,67 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
+func TestNICStatsClone(t *testing.T) {
+	src := NICStats{}.FillIn()
+	dst := NICStats{}.FillIn()
+	counters := []struct {
+		name  string
+		src   *StatCounter
+		dst   *StatCounter
+		value uint64
+	}{
+		{"malformed L4", src.MalformedL4RcvdPackets, dst.MalformedL4RcvdPackets, 1},
+		{"tx packets", src.Tx.Packets, dst.Tx.Packets, 2},
+		{"tx bytes", src.Tx.Bytes, dst.Tx.Bytes, 3},
+		{"tx no buffer", src.TxPacketsDroppedNoBufferSpace, dst.TxPacketsDroppedNoBufferSpace, 4},
+		{"rx packets", src.Rx.Packets, dst.Rx.Packets, 5},
+		{"rx bytes", src.Rx.Bytes, dst.Rx.Bytes, 6},
+		{"disabled rx packets", src.DisabledRx.Packets, dst.DisabledRx.Packets, 7},
+		{"disabled rx bytes", src.DisabledRx.Bytes, dst.DisabledRx.Bytes, 8},
+		{"neighbor unreachable", src.Neighbor.UnreachableEntryLookups, dst.Neighbor.UnreachableEntryLookups, 9},
+		{"neighbor unsolicited", src.Neighbor.DroppedConfirmationForNoninitiatedNeighbor, dst.Neighbor.DroppedConfirmationForNoninitiatedNeighbor, 10},
+		{"neighbor invalid address", src.Neighbor.DroppedInvalidLinkAddressConfirmations, dst.Neighbor.DroppedInvalidLinkAddressConfirmations, 11},
+	}
+	for _, counter := range counters {
+		counter.src.IncrementBy(counter.value)
+	}
+	src.UnknownL3ProtocolRcvdPacketCounts.IncrementBy(0x800, 12)
+	src.UnknownL4ProtocolRcvdPacketCounts.IncrementBy(253, 13)
+
+	src.Clone(&dst)
+	for _, counter := range counters {
+		if got := counter.dst.Value(); got != counter.value {
+			t.Errorf("cloned %s = %d, want %d", counter.name, got, counter.value)
+		}
+		counter.src.Increment()
+		if got := counter.dst.Value(); got != counter.value {
+			t.Errorf("cloned %s changed with source: got %d, want %d", counter.name, got, counter.value)
+		}
+	}
+	for _, mapped := range []struct {
+		name  string
+		m     *IntegralStatCounterMap
+		key   uint64
+		value uint64
+	}{
+		{"unknown L3", dst.UnknownL3ProtocolRcvdPacketCounts, 0x800, 12},
+		{"unknown L4", dst.UnknownL4ProtocolRcvdPacketCounts, 253, 13},
+	} {
+		counter, ok := mapped.m.Get(mapped.key)
+		var got uint64
+		if ok {
+			got = counter.Value()
+		}
+		if !ok || got != mapped.value {
+			t.Errorf("cloned %s[%d] = (%d, %t), want (%d, true)", mapped.name, mapped.key, got, ok, mapped.value)
+		}
+	}
+	src.UnknownL3ProtocolRcvdPacketCounts.Increment(0x800)
+	if counter, _ := dst.UnknownL3ProtocolRcvdPacketCounts.Get(0x800); counter.Value() != 12 {
+		t.Errorf("cloned unknown L3 changed with source: got %d, want 12", counter.Value())
+	}
+}
+
 func TestLimitedWriter_Write(t *testing.T) {
 	var b bytes.Buffer
 	l := LimitedWriter{

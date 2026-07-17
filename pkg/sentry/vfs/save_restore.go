@@ -299,7 +299,7 @@ func (vfs *VirtualFilesystem) saveMounts() []*Mount {
 		// vfs.Init() was never called.
 		return nil
 	}
-	var mounts []*Mount
+	mounts := make([]*Mount, 0)
 	vfs.mounts.Range(func(mount *Mount) bool {
 		mounts = append(mounts, mount)
 		return true

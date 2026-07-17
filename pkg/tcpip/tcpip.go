@@ -2399,6 +2399,11 @@ func (m *IntegralStatCounterMap) Init() {
 
 // Increment increments the counter associated with the provided key.
 func (m *IntegralStatCounterMap) Increment(key uint64) {
+	m.IncrementBy(key, 1)
+}
+
+// IncrementBy increments the counter associated with the provided key by v.
+func (m *IntegralStatCounterMap) IncrementBy(key, v uint64) {
 	m.mu.RLock()
 	counter, ok := m.counterMap[key]
 	m.mu.RUnlock()
@@ -2412,7 +2417,7 @@ func (m *IntegralStatCounterMap) Increment(key uint64) {
 		}
 		m.mu.Unlock()
 	}
-	counter.Increment()
+	counter.IncrementBy(v)
 }
 
 // A MultiIntegralStatCounterMap keeps track of two integral counter maps at
@@ -2482,6 +2487,31 @@ type NICStats struct {
 func (s NICStats) FillIn() NICStats {
 	InitStatCounters(reflect.ValueOf(&s).Elem())
 	return s
+}
+
+// Clone copies the current counter values into the zero-valued counters in dst.
+// The destination must have been initialized with FillIn or InitStatCounters.
+func (src *NICStats) Clone(dst *NICStats) {
+	cloneNICStats(reflect.ValueOf(dst).Elem(), reflect.ValueOf(src).Elem())
+}
+
+func cloneNICStats(dst, src reflect.Value) {
+	for i := 0; i < src.NumField(); i++ {
+		srcField := src.Field(i)
+		dstField := dst.Field(i)
+		switch counter := srcField.Interface().(type) {
+		case *StatCounter:
+			dstField.Interface().(*StatCounter).IncrementBy(counter.Value())
+		case *IntegralStatCounterMap:
+			dstMap := dstField.Interface().(*IntegralStatCounterMap)
+			for _, key := range counter.Keys() {
+				value, _ := counter.Get(key)
+				dstMap.IncrementBy(key, value.Value())
+			}
+		default:
+			cloneNICStats(dstField, srcField)
+		}
+	}
 }
 
 // Stats holds statistics about the networking stack.

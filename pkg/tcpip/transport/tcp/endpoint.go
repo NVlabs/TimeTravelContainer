@@ -2505,7 +2505,9 @@ func (e *Endpoint) connect(addr tcpip.FullAddress, handshake bool) tcpip.Error {
 		}
 		e.segmentQueue.mu.Unlock()
 		e.snd.updateMaxPayloadSize(int(e.route.MTU()), 0)
-		e.setEndpointState(StateEstablished)
+		// The stack statistics were restored with the endpoint state. Avoid the
+		// normal transition accounting, which would count this connection twice.
+		e.state.Store(uint32(StateEstablished))
 		// Set the new auto tuned send buffer size after entering
 		// established state.
 		e.ops.SetSendBufferSize(e.computeTCPSendBufferSize(), false /* notify */)
