@@ -16,6 +16,8 @@ package bundle
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +33,10 @@ import (
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
 )
 
-const imageRootFormatVersion = "v2"
+const (
+	imageRootFormatVersion = "v2"
+	containerIDBytes       = 32
+)
 
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
@@ -55,10 +60,12 @@ type Prepared struct {
 	BundleDir string
 	RootFS    string
 	Image     images.RootFSInfo
+	Container ContainerInfo
 }
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
+	ID                 string          `json:"id"`
 	Name               string          `json:"name"`
 	Reference          string          `json:"reference"`
 	Digest             string          `json:"digest"`
@@ -107,6 +114,15 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
+	containers, err := s.ListContainers()
+	if err != nil {
+		return Prepared{}, err
+	}
+	for _, existing := range containers {
+		if existing.Name == opts.Name || existing.ID == opts.Name {
+			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
+		}
+	}
 	pulled, err := images.Pull(ctx, images.PullOptions{
 		Address:   s.Address,
 		Namespace: s.Namespace,
@@ -132,16 +148,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		}
 	}
 
-	containersDir := filepath.Join(s.Root, "containers")
-	if err := os.MkdirAll(containersDir, 0700); err != nil {
-		return Prepared{}, fmt.Errorf("creating container state root: %w", err)
-	}
-	containerDir := filepath.Join(containersDir, opts.Name)
-	if err := os.Mkdir(containerDir, 0700); err != nil {
-		if os.IsExist(err) {
-			return Prepared{}, fmt.Errorf("container %q already exists", opts.Name)
-		}
-		return Prepared{}, fmt.Errorf("creating state for container %q: %w", opts.Name, err)
+	id, containerDir, err := s.createContainerDir(containers)
+	if err != nil {
+		return Prepared{}, err
 	}
 	keep := false
 	defer func() {
@@ -157,6 +166,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, fmt.Errorf("writing OCI config: %w", err)
 	}
 	metadata := ContainerInfo{
+		ID:                 id,
 		Name:               opts.Name,
 		Reference:          imageInfo.Reference,
 		Digest:             pulled.Digest,
@@ -176,38 +186,105 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)
 	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo}, nil
+	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
-// LoadContainer returns persistent configuration for name.
-func (s Store) LoadContainer(name string) (ContainerInfo, error) {
-	if err := validateName(name); err != nil {
+func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {
+	unavailable := make(map[string]bool, len(existing))
+	for _, info := range existing {
+		unavailable[info.Name] = true
+	}
+	containersDir := filepath.Join(s.Root, "containers")
+	if err := os.MkdirAll(containersDir, 0700); err != nil {
+		return "", "", fmt.Errorf("creating container state root: %w", err)
+	}
+	for attempt := 0; attempt < 100; attempt++ {
+		data := make([]byte, containerIDBytes)
+		if _, err := rand.Read(data); err != nil {
+			return "", "", fmt.Errorf("generating container ID: %w", err)
+		}
+		id := hex.EncodeToString(data)
+		if unavailable[id] {
+			continue
+		}
+		dir := filepath.Join(containersDir, id)
+		if err := os.Mkdir(dir, 0700); err == nil {
+			return id, dir, nil
+		} else if !os.IsExist(err) {
+			return "", "", fmt.Errorf("creating state for container %s: %w", id, err)
+		}
+	}
+	return "", "", errors.New("could not allocate a unique container ID")
+}
+
+// LoadContainer resolves an exact name, full ID, or unambiguous ID prefix.
+// Legacy name-keyed records are returned with ID set to their directory key.
+func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
+	if err := validateName(identifier); err != nil {
 		return ContainerInfo{}, err
 	}
-	data, err := os.ReadFile(filepath.Join(s.Root, "containers", name, "container.json"))
+	if info, err := s.loadContainerKey(identifier); err == nil {
+		return info, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ContainerInfo{}, err
+	}
+	containers, err := s.ListContainers()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ContainerInfo{}, fmt.Errorf("container %q does not exist", name)
+		return ContainerInfo{}, err
+	}
+	var names []ContainerInfo
+	var ids []ContainerInfo
+	for _, info := range containers {
+		if info.Name == identifier {
+			names = append(names, info)
 		}
-		return ContainerInfo{}, fmt.Errorf("reading container %q: %w", name, err)
+		if strings.HasPrefix(info.ID, identifier) {
+			ids = append(ids, info)
+		}
+	}
+	if len(names) == 1 {
+		return names[0], nil
+	}
+	if len(names) > 1 {
+		return ContainerInfo{}, fmt.Errorf("container name %q is ambiguous", identifier)
+	}
+	if len(ids) == 1 {
+		return ids[0], nil
+	}
+	if len(ids) > 1 {
+		return ContainerInfo{}, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
+	}
+	return ContainerInfo{}, fmt.Errorf("container %q does not exist", identifier)
+}
+
+func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
+	data, err := os.ReadFile(filepath.Join(s.Root, "containers", key, "container.json"))
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("reading container %q: %w", key, err)
 	}
 	var info ContainerInfo
 	if err := json.Unmarshal(data, &info); err != nil {
-		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", name, err)
+		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", key, err)
 	}
-	if info.Name != name || info.BundleDir == "" {
-		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", name)
+	if info.ID == "" {
+		info.ID = key
+	}
+	if info.ID != key || info.Name == "" || info.BundleDir == "" {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", key)
+	}
+	if err := validateName(info.Name); err != nil {
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	if info.State == "" {
 		info.State = "created"
 	}
 	networkMode, err := normalizeNetworkMode(info.NetworkMode)
 	if err != nil {
-		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", name, err)
+		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
-		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", name, err)
+		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}
 	return info, nil
 }
@@ -244,13 +321,18 @@ func (s Store) ListContainers() ([]ContainerInfo, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		info, err := s.LoadContainer(entry.Name())
+		info, err := s.loadContainerKey(entry.Name())
 		if err != nil {
 			return nil, err
 		}
 		containers = append(containers, info)
 	}
-	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+	sort.Slice(containers, func(i, j int) bool {
+		if containers[i].Name != containers[j].Name {
+			return containers[i].Name < containers[j].Name
+		}
+		return containers[i].ID < containers[j].ID
+	})
 	return containers, nil
 }
 
@@ -270,7 +352,7 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 	case "exited":
 		info.ExitedAt = &now
 	}
-	path := filepath.Join(s.Root, "containers", name, "container.json")
+	path := filepath.Join(s.Root, "containers", info.ID, "container.json")
 	if err := writeJSON(path, &info); err != nil {
 		return fmt.Errorf("updating container %q: %w", name, err)
 	}
@@ -281,10 +363,11 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 // roots remain until image garbage collection proves that no container uses
 // them.
 func (s Store) RemoveContainer(name string) error {
-	if _, err := s.LoadContainer(name); err != nil {
+	info, err := s.LoadContainer(name)
+	if err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "containers", name)); err != nil {
+	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
 		return fmt.Errorf("removing container %q: %w", name, err)
 	}
 	return nil
@@ -356,10 +439,11 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	if err := validateObjectName("branch", branch); err != nil {
 		return ConsolePaths{}, err
 	}
-	if _, err := s.LoadContainer(container); err != nil {
+	info, err := s.LoadContainer(container)
+	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.Root, "containers", container, "console")
+	dir := filepath.Join(s.Root, "containers", info.ID, "console")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", container, err)
 	}
@@ -385,10 +469,11 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	if err := validateObjectName("exec session", execID); err != nil {
 		return ConsolePaths{}, err
 	}
-	if _, err := s.LoadContainer(container); err != nil {
+	info, err := s.LoadContainer(container)
+	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.Root, "containers", container, "console", "exec", branch)
+	dir := filepath.Join(s.Root, "containers", info.ID, "console", "exec", branch)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", container, err)
 	}

@@ -34,6 +34,13 @@ fail() {
   exit 1
 }
 
+container_id_valid() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+}
+
 [ -n "$TTOS" ] || fail "set TTOS to the ttos binary"
 [ -x "$TTOS" ] || fail "TTOS is not executable: $TTOS"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
@@ -121,11 +128,17 @@ done
 [ "$(ttos images -q | wc -l)" -ge 5 ] || fail "quiet image inventory omitted an image ID"
 
 echo "== one-shot compatibility probes =="
-ttos create --name "$PREFIX-busybox" \
+BUSYBOX_ID=$(ttos create --name "$PREFIX-busybox" \
   --env-file "$ENV_FILE" --env FROM_FILE=direct \
   --label-file "$LABEL_FILE" --label suite=create \
   "$BUSYBOX_IMAGE" sh -c \
-  'test "$FROM_FILE" = direct && test "$TTOS_E2E_HOST_IMPORT" = host-import && test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok && echo busybox-err >&2'
+  'test "$FROM_FILE" = direct && test "$TTOS_E2E_HOST_IMPORT" = host-import && test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok && echo busybox-err >&2')
+container_id_valid "$BUSYBOX_ID" || fail "create returned invalid container ID: $BUSYBOX_ID"
+BUSYBOX_PREFIX=$(printf %.16s "$BUSYBOX_ID")
+[ "$(ttos inspect -f "{{.Id}}|{{.Name}}" "$PREFIX-busybox")" = "$BUSYBOX_ID|/$PREFIX-busybox" ] ||
+  fail "inspect by name did not expose the stable ID and name"
+[ "$(ttos inspect -f "{{.Id}}|{{.Name}}" "$BUSYBOX_PREFIX")" = "$BUSYBOX_ID|/$PREFIX-busybox" ] ||
+  fail "inspect did not resolve an unambiguous ID prefix"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{.Path}}|{{len .TTOS.Branches}}' "$PREFIX-busybox")" = \
   "created|docker.io/library/busybox:1.36|sh|1" ] ||
   fail "created-container inspect did not expose Docker config and TTOS branch state"
@@ -134,7 +147,7 @@ ttos create --name "$PREFIX-busybox" \
 BUSYBOX_ENV=$(ttos inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$PREFIX-busybox")
 echo "$BUSYBOX_ENV" | grep -qx 'FROM_FILE=direct' || fail "created-container inspect omitted direct environment override"
 echo "$BUSYBOX_ENV" | grep -qx 'TTOS_E2E_HOST_IMPORT=host-import' || fail "created-container inspect omitted imported host environment"
-ttos start --attach "$PREFIX-busybox"
+ttos start --attach "$BUSYBOX_PREFIX"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
   "exited|0|false" ] ||
   fail "exited-container inspect did not expose exit state"
@@ -157,7 +170,7 @@ ttos rm "$ATTACH_INPUT"
 ttos container restart --time 1 "$PREFIX-busybox"
 [ "$(ttos container wait "$PREFIX-busybox")" = "0" ] ||
   fail "restart/wait did not preserve the BusyBox command exit status"
-ttos rm "$PREFIX-busybox"
+ttos rm "$BUSYBOX_ID"
 ttos image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
   fail "image inspection did not report the materialized BusyBox root"
@@ -242,14 +255,19 @@ ttos rm "$CONSOLE_STRESS"
 
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
-ttos run --name "$LIFECYCLE" --detach \
+LIFECYCLE_ID=$(ttos run --name "$LIFECYCLE" --detach \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   "$ALPINE_IMAGE" sh -c \
-  'echo parent >/state/value; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done'
+  'echo parent >/state/value; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
+LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
+LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
+[ "$(ttos inspect -f "{{.Id}}|{{.Name}}" "$LIFECYCLE_PREFIX")" = "$LIFECYCLE_ID|/$LIFECYCLE" ] ||
+  fail "detached container was not addressable by ID prefix"
 
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
@@ -281,8 +299,8 @@ echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environ
 if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
   fail "read-only host bind accepted a write"
 fi
-ttos fork --check "$LIFECYCLE"
-ttos fork "$LIFECYCLE" child
+ttos fork --check "$LIFECYCLE_PREFIX"
+ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 
 RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
 [ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||
@@ -302,8 +320,8 @@ echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted e
 echo "$FORK_INSPECT" | grep -q 'child=true' || fail "inspect fork check omitted eligible child branch: $FORK_INSPECT"
 
 PS_CHILD=$(ttos ps --filter branch=child --filter status=running --filter ancestor="$ALPINE_IMAGE" --format '{{.ID}}')
-[ "$PS_CHILD" = "$LIFECYCLE@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
-[ "$(ttos ps --latest --quiet)" = "$LIFECYCLE@child" ] || fail "ps --latest did not select the forked child"
+[ "$PS_CHILD" = "$LIFECYCLE_SHORT@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
+[ "$(ttos ps --latest --quiet)" = "$LIFECYCLE_SHORT@child" ] || fail "ps --latest did not select the forked child"
 ttos ps --filter branch=child --format json |
   grep -q '"created_at":"' ||
   fail "ps JSON omitted the child creation timestamp"
@@ -312,7 +330,7 @@ ttos exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 [ "$(ttos exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
 [ "$(ttos exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
 
-ttos pause "$LIFECYCLE" "$LIFECYCLE@child"
+ttos pause "$LIFECYCLE_PREFIX" "$LIFECYCLE_ID@child"
 PAUSED_INSPECT=$(ttos inspect -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$LIFECYCLE")
 echo "$PAUSED_INSPECT" | grep -q 'main=paused' || fail "inspect did not report paused main branch: $PAUSED_INSPECT"
 echo "$PAUSED_INSPECT" | grep -q 'child=paused' || fail "inspect did not report paused child branch: $PAUSED_INSPECT"
@@ -327,7 +345,7 @@ ttos stop --time 2 "$LIFECYCLE@child" "$LIFECYCLE"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
   fail "inspect did not report the stopped family as exited"
 ttos branch rm "$LIFECYCLE@child"
-ttos rm "$LIFECYCLE"
+ttos rm "$LIFECYCLE_ID"
 ttos volume rm "$VOLUME"
 
 trap - EXIT HUP INT TERM

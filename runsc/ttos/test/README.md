@@ -6,6 +6,9 @@ covers:
 
 - Docker-style image inventory, quiet IDs, JSON output, and materialized-root
   inspection;
+- Docker-compatible 64-hex container IDs from `create` and detached `run`,
+  distinct persisted names, 12-character `ps` IDs, and lifecycle lookup by
+  exact name, full ID, and unambiguous ID prefix;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
   configuration, env-file/host-import environment overrides, merged labels,

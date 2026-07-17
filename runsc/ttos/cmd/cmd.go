@@ -893,6 +893,11 @@ type execRequest struct {
 	terminal       bool
 }
 
+type containerRunResult struct {
+	ID     string
+	Status int
+}
+
 type exitStatus struct{ code int }
 
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
@@ -987,15 +992,15 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 			}
 		}
 	})
-	status, err := backend.run(request)
+	result, err := backend.run(request)
 	if err != nil {
 		return err
 	}
-	if status != 0 {
-		return exitStatus{code: status}
+	if result.Status != 0 {
+		return exitStatus{code: result.Status}
 	}
 	if request.detach {
-		fmt.Fprintln(stdout, request.name)
+		fmt.Fprintln(stdout, result.ID)
 	}
 	return nil
 }
@@ -1087,10 +1092,11 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 			}
 		}
 	})
-	if err := backend.create(request); err != nil {
+	id, err := backend.create(request)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, request.name)
+	fmt.Fprintln(stdout, id)
 	return nil
 }
 
@@ -2111,6 +2117,20 @@ type psRow struct {
 	digest  string
 }
 
+func familyDisplayName(family Family) string {
+	if family.Name != "" {
+		return family.Name
+	}
+	return family.ID
+}
+
+func displayContainerID(id string, noTrunc bool) string {
+	if !noTrunc && len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
 func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 	var rows []psRow
 	for _, family := range families {
@@ -2118,6 +2138,7 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 		if image == "" {
 			image = "<unknown>"
 		}
+		displayName := familyDisplayName(family)
 		for _, branch := range family.Branches {
 			created := branch.CreatedAt
 			if created.IsZero() {
@@ -2127,7 +2148,8 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 			if parent == "" {
 				parent = "-"
 			}
-			id := family.ID + "@" + branch.ID
+			id := displayContainerID(family.ID, noTrunc) + "@" + branch.ID
+			name := displayName + "@" + branch.ID
 			runningFor := formatImageAge(now, created)
 			status := branch.State
 			switch branch.State {
@@ -2146,8 +2168,8 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 			}
 			rows = append(rows, psRow{
 				ID:         id,
-				Names:      id,
-				Container:  family.ID,
+				Names:      name,
+				Container:  displayName,
 				Branch:     branch.ID,
 				Image:      image,
 				ImageID:    displayImageID(family.Digest, noTrunc),
@@ -2896,6 +2918,7 @@ type Branch struct {
 // Family is stable family metadata returned by ttos ls --json.
 type Family struct {
 	ID         string    `json:"id"`
+	Name       string    `json:"name,omitempty"`
 	Image      string    `json:"image,omitempty"`
 	Digest     string    `json:"digest,omitempty"`
 	State      string    `json:"state"`
@@ -2978,8 +3001,8 @@ type backend interface {
 	listImages() ([]ImageInfo, error)
 	inspectImage(identifier string) (ImageInspectInfo, error)
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
-	create(request runRequest) error
-	run(request runRequest) (int, error)
+	create(request runRequest) (string, error)
+	run(request runRequest) (containerRunResult, error)
 	start(name string, detach, interactive bool) (int, error)
 	attach(request attachRequest) (uint32, error)
 	logs(target selector, execID string, follow bool, tail int) error
@@ -3014,6 +3037,26 @@ type runtimeBackend struct {
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
+}
+
+func (b *runtimeBackend) containerStore() ttosbundle.Store {
+	return ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+}
+
+func (b *runtimeBackend) resolveContainer(identifier string) (ttosbundle.ContainerInfo, error) {
+	if b.dataRoot == "" {
+		return ttosbundle.ContainerInfo{ID: identifier, Name: identifier}, nil
+	}
+	return b.containerStore().LoadContainer(identifier)
+}
+
+func (b *runtimeBackend) resolveSelector(target selector) (selector, ttosbundle.ContainerInfo, error) {
+	info, err := b.resolveContainer(target.container)
+	if err != nil {
+		return selector{}, ttosbundle.ContainerInfo{}, err
+	}
+	target.container = info.ID
+	return target, info, nil
 }
 
 func (b *runtimeBackend) imageRecords() ([]ttosimages.Info, error) {
@@ -3217,7 +3260,7 @@ func validateImageRemoval(digest string, users []string, force bool) error {
 	return nil
 }
 
-func (b *runtimeBackend) run(request runRequest) (int, error) {
+func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
@@ -3241,18 +3284,19 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 		OpenStdin:          request.interactive,
 	})
 	if err != nil {
-		return 1, err
+		return containerRunResult{}, err
 	}
-	status, err := b.launch(request.name, prepared.BundleDir, request.networkMode, request.detach, request.interactive, request.terminal)
+	id := prepared.Container.ID
+	status, err := b.launch(id, prepared.BundleDir, request.networkMode, request.detach, request.interactive, request.terminal)
 	if err == nil {
-		b.recordLaunchState(request.name, request.detach, status)
+		b.recordLaunchState(id, request.detach, status)
 	}
-	return status, err
+	return containerRunResult{ID: id, Status: status}, err
 }
 
-func (b *runtimeBackend) create(request runRequest) error {
+func (b *runtimeBackend) create(request runRequest) (string, error) {
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
-	_, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
+	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
 			Name:           request.name,
 			Args:           request.args,
@@ -3273,21 +3317,23 @@ func (b *runtimeBackend) create(request runRequest) error {
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
 	})
-	return err
+	if err != nil {
+		return "", err
+	}
+	return prepared.Container.ID, nil
 }
 
 func (b *runtimeBackend) start(name string, detach, interactive bool) (int, error) {
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
-	info, err := store.LoadContainer(name)
+	info, err := b.resolveContainer(name)
 	if err != nil {
 		return 1, err
 	}
-	if err := b.removeStoppedRuntime(name); err != nil {
+	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
 	}
-	status, err := b.launch(name, info.BundleDir, info.NetworkMode, detach, interactive, info.Terminal)
+	status, err := b.launch(info.ID, info.BundleDir, info.NetworkMode, detach, interactive, info.Terminal)
 	if err == nil {
-		b.recordLaunchState(name, detach, status)
+		b.recordLaunchState(info.ID, detach, status)
 	}
 	return status, err
 }
@@ -3313,6 +3359,11 @@ func (b *runtimeBackend) removeStoppedRuntime(name string) error {
 }
 
 func (b *runtimeBackend) exec(request execRequest) (int, error) {
+	resolved, _, err := b.resolveSelector(request.target)
+	if err != nil {
+		return 1, err
+	}
+	request.target = resolved
 	args := []string{"--root", b.root, "exec", "--branch", request.target.branch}
 	consoleID := ""
 	if request.detach {
@@ -3614,12 +3665,14 @@ func readConsoleWaitStatus(path string) (uint32, bool, error) {
 }
 
 func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr error) {
-	target := request.target
+	target, _, err := b.resolveSelector(request.target)
+	if err != nil {
+		return 0, err
+	}
 	execID := request.execID
 	var paths ttosbundle.ConsolePaths
 	consoleID := "init"
 	terminal := false
-	var err error
 	if execID == "" {
 		paths, err = b.ensureConsoleDrain(target, false)
 		if err != nil {
@@ -3892,8 +3945,12 @@ func (t *consoleLogTail) flush(stdout, stderr io.Writer) error {
 }
 
 func (b *runtimeBackend) logs(target selector, execID string, follow bool, tail int) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
 	var paths ttosbundle.ConsolePaths
-	var err error
 	if execID == "" {
 		paths, err = b.ensureConsoleDrain(target, false)
 	} else {
@@ -4374,7 +4431,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 	}
 	readonlyRootfs := spec != nil && spec.Root != nil && spec.Root.Readonly
 	return InspectInfo{
-		ID: container.Name, Created: created, Path: path, Args: args,
+		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
 			Status: state, Running: state == "running" || state == "paused", Paused: state == "paused",
 			Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
@@ -4407,7 +4464,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	spec, err := store.LoadSpec(name)
+	spec, err := store.LoadSpec(containerInfo.ID)
 	if err != nil {
 		return InspectInfo{}, err
 	}
@@ -4417,7 +4474,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	var runtimeFamily *Family
 	for i := range families {
-		if families[i].ID == name {
+		if families[i].ID == containerInfo.ID {
 			runtimeFamily = &families[i]
 			break
 		}
@@ -4428,7 +4485,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		if branch.Metadata.State != "running" && branch.Metadata.State != "paused" {
 			continue
 		}
-		processes, err := b.processes(selector{container: name, branch: branch.Metadata.ID})
+		processes, err := b.processes(selector{container: containerInfo.ID, branch: branch.Metadata.ID})
 		if err != nil {
 			branch.ProcessError = err.Error()
 			continue
@@ -4439,16 +4496,18 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 }
 
 func (b *runtimeBackend) remove(name string, force bool) error {
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
-	if _, err := store.LoadContainer(name); err != nil {
+	store := b.containerStore()
+	info, err := store.LoadContainer(name)
+	if err != nil {
 		return err
 	}
+	runtimeID := info.ID
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
 		return fmt.Errorf("checking runtime state before removing %q: %w", name, err)
 	}
 	for _, family := range families {
-		if family.ID != name {
+		if family.ID != runtimeID {
 			continue
 		}
 		if !force && family.State != "stopped" && family.State != "exited" {
@@ -4458,13 +4517,13 @@ func (b *runtimeBackend) remove(name string, force bool) error {
 		if force {
 			args = append(args, "--force")
 		}
-		args = append(args, name)
+		args = append(args, runtimeID)
 		if _, err := b.command(args...); err != nil {
 			return fmt.Errorf("deleting runtime container %q: %w", name, err)
 		}
 		break
 	}
-	return store.RemoveContainer(name)
+	return store.RemoveContainer(runtimeID)
 }
 
 func (b *runtimeBackend) configuredRunscArgs() []string {
@@ -4493,15 +4552,40 @@ func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
 
 func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args ...string) (int, error) {
 	args = append(b.configuredRunscArgsForNetwork(networkMode), args...)
+	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return 1, fmt.Errorf("opening runsc launch stdout: %w", err)
+	}
+	defer stdout.Close()
+	stderr, err := os.CreateTemp("", "ttos-runsc-launch-*.log")
+	if err != nil {
+		return 1, fmt.Errorf("creating runsc launch stderr: %w", err)
+	}
+	stderrName := stderr.Name()
+	defer os.Remove(stderrName)
+	defer stderr.Close()
+
 	command := exec.Command(b.runsc, args...)
-	command.Stdout = b.stdout
-	command.Stderr = b.stderr
-	if err := command.Run(); err != nil {
+	// Use real files rather than the caller streams. The sandbox may inherit
+	// these descriptors after runsc exits; an os/exec copy pipe would keep
+	// `ttos run --detach` command substitutions and redirected callers open.
+	command.Stdout = stdout
+	command.Stderr = stderr
+	runErr := command.Run()
+	if _, err := stderr.Seek(0, io.SeekStart); err != nil {
+		return 1, fmt.Errorf("rewinding runsc launch stderr: %w", err)
+	}
+	if b.stderr != nil {
+		if _, err := io.Copy(b.stderr, stderr); err != nil {
+			return 1, fmt.Errorf("replaying runsc launch stderr: %w", err)
+		}
+	}
+	if runErr != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(runErr, &exitErr) {
 			return exitErr.ExitCode(), nil
 		}
-		return 1, fmt.Errorf("starting runsc: %w", err)
+		return 1, fmt.Errorf("starting runsc: %w", runErr)
 	}
 	return 0, nil
 }
@@ -4632,8 +4716,9 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			}
 		}
 		sort.Strings(volumes)
-		byID[container.Name] = Family{
-			ID:        container.Name,
+		byID[container.ID] = Family{
+			ID:        container.ID,
+			Name:      container.Name,
 			Image:     container.Reference,
 			Digest:    container.Digest,
 			State:     state,
@@ -4647,6 +4732,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		for _, family := range runtimeFamilies {
 			runtimeIDs[family.ID] = struct{}{}
 			if persistent, ok := byID[family.ID]; ok {
+				family.Name = persistent.Name
 				family.Image = persistent.Image
 				family.Digest = persistent.Digest
 				family.CreatedAt = persistent.CreatedAt
@@ -4671,16 +4757,16 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		}
 		for _, container := range containers {
 			if container.State == "running" {
-				if _, ok := runtimeIDs[container.Name]; ok {
+				if _, ok := runtimeIDs[container.ID]; ok {
 					continue
 				}
-				_ = store.UpdateState(container.Name, "exited", nil)
-				family := byID[container.Name]
+				_ = store.UpdateState(container.ID, "exited", nil)
+				family := byID[container.ID]
 				family.State = "exited"
 				family.Branches = []Branch{{
 					ID: defaultBranchID, State: "exited", CreatedAt: container.CreatedAt,
 				}}
-				byID[container.Name] = family
+				byID[container.ID] = family
 			}
 		}
 	} else {
@@ -4696,7 +4782,13 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	for _, family := range byID {
 		families = append(families, family)
 	}
-	sort.Slice(families, func(i, j int) bool { return families[i].ID < families[j].ID })
+	sort.Slice(families, func(i, j int) bool {
+		left, right := familyDisplayName(families[i]), familyDisplayName(families[j])
+		if left != right {
+			return left < right
+		}
+		return families[i].ID < families[j].ID
+	})
 	return families, nil
 }
 
@@ -4757,6 +4849,11 @@ type runscExecSession struct {
 }
 
 func (b *runtimeBackend) execSessions(target selector) ([]runscExecSession, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	target = resolved
 	output, err := b.command("timetravel", target.container, "exec-list", target.branch)
 	if err != nil {
 		return nil, err
@@ -4782,6 +4879,11 @@ func (b *runtimeBackend) execSession(target selector, execID string) (runscExecS
 }
 
 func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return 0, err
+	}
+	target = resolved
 	output, err := b.command("timetravel", "--exec-id", execID, target.container, "exec-wait", target.branch)
 	if err != nil {
 		return 0, err
@@ -4796,7 +4898,12 @@ func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32
 }
 
 func (b *runtimeBackend) signalExecSession(target selector, execID string, signal int) error {
-	_, err := b.command("timetravel", "--exec-id", execID, "--signal", strconv.Itoa(signal), target.container, "exec-signal", target.branch)
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	_, err = b.command("timetravel", "--exec-id", execID, "--signal", strconv.Itoa(signal), target.container, "exec-signal", target.branch)
 	return err
 }
 
@@ -4827,6 +4934,11 @@ func branchView(info runscBranchInfo) Branch {
 }
 
 func (b *runtimeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
+	resolved, _, err := b.resolveSelector(source)
+	if err != nil {
+		return Branch{}, err
+	}
+	source = resolved
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
@@ -4873,16 +4985,31 @@ func (b *runtimeBackend) fork(source selector, destination string, paused bool) 
 }
 
 func (b *runtimeBackend) pause(target selector) error {
-	_, err := b.command("timetravel", target.container, "pause", target.branch)
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	_, err = b.command("timetravel", target.container, "pause", target.branch)
 	return err
 }
 
 func (b *runtimeBackend) resume(target selector) error {
-	_, err := b.command("timetravel", target.container, "resume", target.branch)
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	_, err = b.command("timetravel", target.container, "resume", target.branch)
 	return err
 }
 
 func (b *runtimeBackend) destroy(target selector) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
 	if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
 		return nil
 	} else {
@@ -4917,6 +5044,11 @@ func (b *runtimeBackend) destroy(target selector) error {
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	target = resolved
 	output, err := b.command("timetravel", target.container, "ps", target.branch)
 	if err != nil {
 		return nil, err
@@ -4929,6 +5061,11 @@ func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
 }
 
 func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return ForkEligibility{}, err
+	}
+	target = resolved
 	output, err := b.command("timetravel", target.container, "check", target.branch)
 	if err != nil {
 		return ForkEligibility{}, err
@@ -4941,16 +5078,26 @@ func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
 }
 
 func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
 	args := []string{"timetravel", "--signal", strconv.Itoa(signal)}
 	if all {
 		args = append(args, "--all")
 	}
 	args = append(args, target.container, "signal", target.branch)
-	_, err := b.command(args...)
+	_, err = b.command(args...)
 	return err
 }
 
 func (b *runtimeBackend) wait(target selector) (uint32, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return 0, err
+	}
+	target = resolved
 	output, commandErr := b.command("timetravel", target.container, "wait", target.branch)
 	if commandErr == nil {
 		var result struct {
@@ -4997,7 +5144,7 @@ func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, er
 
 func writeTree(w io.Writer, families []Family) {
 	for _, family := range families {
-		fmt.Fprintf(w, "%s (%s)\n", family.ID, family.State)
+		fmt.Fprintf(w, "%s (%s)\n", familyDisplayName(family), family.State)
 		if family.Error != "" {
 			fmt.Fprintf(w, "    ! %s\n", family.Error)
 		}

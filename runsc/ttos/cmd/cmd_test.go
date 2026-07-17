@@ -174,10 +174,11 @@ func TestPsDockerFiltersLatestAndFormatting(t *testing.T) {
 }
 
 func TestPsJSONAndNoTruncImageID(t *testing.T) {
+	containerID := strings.Repeat("d", 64)
 	created := time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC)
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	b := &fakeBackend{families: []Family{{
-		ID: "demo", Image: "docker.io/example/demo:v1", Digest: digest, CreatedAt: created,
+		ID: containerID, Name: "demo", Image: "docker.io/example/demo:v1", Digest: digest, CreatedAt: created,
 		Branches: []Branch{{ID: "main", State: "running", CreatedAt: created}},
 	}}}
 	var stdout, stderr bytes.Buffer
@@ -188,7 +189,7 @@ func TestPsJSONAndNoTruncImageID(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &row); err != nil {
 		t.Fatalf("decoding ps JSON %q: %v", stdout.String(), err)
 	}
-	if row["id"] != "demo@main" || row["image"] != "example/demo:v1" || row["image_id"] != digest {
+	if row["id"] != containerID+"@main" || row["names"] != "demo@main" || row["container"] != "demo" || row["image"] != "example/demo:v1" || row["image_id"] != digest {
 		t.Errorf("ps JSON row=%+v", row)
 	}
 	if row["created_at"] != created.Format(time.RFC3339Nano) {
@@ -519,14 +520,15 @@ func TestValidateImageRemovalRequiresForceWhenInUse(t *testing.T) {
 }
 
 func TestRunParsesDockerStyleOptions(t *testing.T) {
-	b := &fakeBackend{}
+	containerID := strings.Repeat("a", 64)
+	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
 	args := []string{"run", "--name", "demo", "-dit", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
-	if got := stdout.String(); got != "demo\n" {
-		t.Errorf("run output=%q, want demo", got)
+	if got, want := stdout.String(), containerID+"\n"; got != want {
+		t.Errorf("run output=%q, want %q", got, want)
 	}
 	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
 		t.Errorf("run request=%+v", b.runRequest)
@@ -708,13 +710,17 @@ func TestRunForwardsContainerExitStatus(t *testing.T) {
 }
 
 func TestCreateAndStart(t *testing.T) {
-	b := &fakeBackend{}
+	containerID := strings.Repeat("b", 64)
+	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"create", "--name", "demo", "-it", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
 	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
+	}
+	if got, want := stdout.String(), containerID+"\n"; got != want {
+		t.Errorf("create output=%q, want %q", got, want)
 	}
 	stdout.Reset()
 	if status := runCommand([]string{"start", "demo"}, &stdout, &stderr, b); status != 0 {
@@ -1334,11 +1340,12 @@ func TestInspect(t *testing.T) {
 }
 
 func TestBuildInspectInfo(t *testing.T) {
+	containerID := strings.Repeat("c", 64)
 	created := time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC)
 	started := created.Add(time.Second)
 	exit := 23
 	container := ttosbundle.ContainerInfo{
-		Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
+		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
 		RootFS: "/roots/alpine", NetworkMode: "host", State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
@@ -1360,12 +1367,12 @@ func TestBuildInspectInfo(t *testing.T) {
 			"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
 		},
 	}
-	family := &Family{ID: "demo", State: "running", SandboxPID: 4321, Branches: []Branch{
+	family := &Family{ID: containerID, Name: "demo", State: "running", SandboxPID: 4321, Branches: []Branch{
 		{ID: "child", ParentID: "main", State: "running"},
 		{ID: "main", State: "paused"},
 	}}
 	info := buildInspectInfo(container, spec, family, "")
-	if info.ID != "demo" || info.Name != "/demo" || info.Path != "/bin/sh" || !reflect.DeepEqual(info.Args, []string{"-c", "sleep 10"}) {
+	if info.ID != containerID || info.Name != "/demo" || info.Path != "/bin/sh" || !reflect.DeepEqual(info.Args, []string{"-c", "sleep 10"}) {
 		t.Errorf("identity/process view=%+v", info)
 	}
 	if info.State.Status != "paused" || !info.State.Running || !info.State.Paused || info.State.Pid != 4321 || info.State.ExitCode != 23 {
@@ -1701,6 +1708,36 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+echo discarded-output
+echo launch-diagnostic >&2
+sleep 3 &
+exit 0
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
+	started := time.Now()
+	status, err := b.runConfiguredCommand("start", "demo")
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("launch waited %v for a descendant holding stdio", elapsed)
+	}
+	if err != nil || status != 0 {
+		t.Fatalf("launch returned status=%d err=%v", status, err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("runsc launch stdout leaked to container output: %q", stdout.String())
+	}
+	if got, want := stderr.String(), "launch-diagnostic\n"; got != want {
+		t.Errorf("runsc launch diagnostic=%q, want %q", got, want)
+	}
+}
+
 func TestRuntimeBackendUsesRunscCLI(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -1878,6 +1915,97 @@ exit 2
 	}
 	if err := b.destroy(selector{container: "missing", branch: "child"}); err == nil {
 		t.Error("destroy accepted a nonexistent persistent container")
+	}
+}
+
+func TestRuntimeBackendResolvesStableContainerID(t *testing.T) {
+	dir := t.TempDir()
+	id := "1234567890ab" + strings.Repeat("c", 52)
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+id="` + id + `"
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+shift 2
+case "$1 $2 $3 $4" in
+"list --format=json --sandbox ")
+	printf "[{\"id\":\"%s\",\"pid\":2468,\"status\":\"running\"}]\n" "$id"
+	;;
+"timetravel $id branches ")
+	echo "[{\"ID\":\"main\",\"ParentID\":\"\",\"State\":\"running\",\"ForkMetrics\":{\"SourceDowntime\":0,\"Kernel\":{\"Total\":0},\"Total\":0}}]"
+	;;
+"timetravel $id ps main")
+	echo "[{\"uid\":0,\"pid\":1,\"ppid\":0,\"pgid\":1,\"threads\":[1],\"c\":0,\"tty\":\"?\",\"stime\":\"12:00\",\"time\":\"1ms\",\"cmd\":\"init\"}]"
+	;;
+"timetravel $id check main")
+	echo "{\"eligible\":true}"
+	;;
+"timetravel $id pause main"|"timetravel $id resume main")
+	;;
+"delete --force $id ")
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", id)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	metadata, err := json.Marshal(ttosbundle.ContainerInfo{
+		ID: id, Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("encoding metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if len(families) != 1 || families[0].ID != id || families[0].Name != "web" || families[0].SandboxPID != 2468 {
+		t.Fatalf("stable family=%+v", families)
+	}
+	for _, identifier := range []string{"web", id[:16]} {
+		info, err := b.inspect(identifier)
+		if err != nil {
+			t.Fatalf("inspect(%q): %v", identifier, err)
+		}
+		if info.ID != id || info.Name != "/web" || len(info.TTOS.Branches) != 1 || len(info.TTOS.Branches[0].Processes) != 1 {
+			t.Errorf("inspect(%q)=%+v", identifier, info)
+		}
+	}
+	target := selector{container: "web", branch: "main"}
+	if err := b.pause(target); err != nil {
+		t.Fatalf("pause by name: %v", err)
+	}
+	if err := b.resume(selector{container: id[:16], branch: "main"}); err != nil {
+		t.Fatalf("resume by ID prefix: %v", err)
+	}
+	if eligibility, err := b.checkFork(target); err != nil || !eligibility.Eligible {
+		t.Fatalf("checkFork by name=(%+v, %v)", eligibility, err)
+	}
+	if err := b.remove("web", true); err != nil {
+		t.Fatalf("remove by name: %v", err)
+	}
+	if _, err := os.Stat(containerDir); !os.IsNotExist(err) {
+		t.Errorf("removed ID-keyed state still exists: %v", err)
 	}
 }
 
@@ -2117,6 +2245,7 @@ type fakeBackend struct {
 	imageRemoveForce  bool
 	imageRemoveResult ImageRemoveResult
 	runRequest        runRequest
+	containerID       string
 	runStatus         int
 	created           bool
 	started           string
@@ -2143,15 +2272,22 @@ type fakeBackend struct {
 	removedVolume string
 }
 
-func (b *fakeBackend) create(request runRequest) error {
-	b.runRequest = request
-	b.created = true
-	return b.err
+func (b *fakeBackend) resultID(request runRequest) string {
+	if b.containerID != "" {
+		return b.containerID
+	}
+	return request.name
 }
 
-func (b *fakeBackend) run(request runRequest) (int, error) {
+func (b *fakeBackend) create(request runRequest) (string, error) {
 	b.runRequest = request
-	return b.runStatus, b.err
+	b.created = true
+	return b.resultID(request), b.err
+}
+
+func (b *fakeBackend) run(request runRequest) (containerRunResult, error) {
+	b.runRequest = request
+	return containerRunResult{ID: b.resultID(request), Status: b.runStatus}, b.err
 }
 
 func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) {

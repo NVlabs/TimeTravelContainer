@@ -15,9 +15,11 @@
 package bundle
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,6 +286,93 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
 		t.Fatalf("containers after remove=%+v, err=%v", containers, err)
+	}
+}
+
+func TestContainerIdentityResolution(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	generatedID, generatedDir, err := store.createContainerDir(nil)
+	if err != nil {
+		t.Fatalf("createContainerDir: %v", err)
+	}
+	if len(generatedID) != 2*containerIDBytes {
+		t.Fatalf("generated ID length=%d, want %d", len(generatedID), 2*containerIDBytes)
+	}
+	if _, err := hex.DecodeString(generatedID); err != nil {
+		t.Fatalf("generated ID %q is not hexadecimal: %v", generatedID, err)
+	}
+	if filepath.Base(generatedDir) != generatedID {
+		t.Fatalf("generated directory=%q, want ID basename", generatedDir)
+	}
+	if err := os.RemoveAll(generatedDir); err != nil {
+		t.Fatal(err)
+	}
+
+	writeRecord := func(key, id, name string) string {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", key)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+			ID: id, Name: name, BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return containerDir
+	}
+	idAlpha := "abc1" + strings.Repeat("a", 60)
+	idBeta := "abc2" + strings.Repeat("b", 60)
+	idNamedPrefix := strings.Repeat("c", 64)
+	alphaDir := writeRecord(idAlpha, idAlpha, "alpha")
+	betaDir := writeRecord(idBeta, idBeta, "beta")
+	writeRecord(idNamedPrefix, idNamedPrefix, "abc")
+	legacyDir := writeRecord("legacy", "", "legacy")
+
+	for identifier, wantID := range map[string]string{
+		"alpha": idAlpha, idAlpha: idAlpha, idAlpha[:4]: idAlpha,
+		"abc": idNamedPrefix, "legacy": "legacy", idNamedPrefix: idNamedPrefix, idNamedPrefix[:8]: idNamedPrefix,
+	} {
+		info, err := store.LoadContainer(identifier)
+		if err != nil {
+			t.Errorf("LoadContainer(%q): %v", identifier, err)
+		} else if info.ID != wantID {
+			t.Errorf("LoadContainer(%q).ID=%q, want %q", identifier, info.ID, wantID)
+		}
+	}
+	if _, err := store.LoadContainer("ab"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous ID prefix error=%v", err)
+	}
+	paths, err := store.BranchConsolePaths("alpha", "main")
+	if err != nil {
+		t.Fatalf("BranchConsolePaths by name: %v", err)
+	}
+	if !strings.HasPrefix(paths.Log, filepath.Join(alphaDir, "console")+string(filepath.Separator)) {
+		t.Errorf("console path=%q, want under ID directory %q", paths.Log, alphaDir)
+	}
+	status := 9
+	if err := store.UpdateState(idAlpha[:4], "exited", &status); err != nil {
+		t.Fatalf("UpdateState by prefix: %v", err)
+	}
+	if info, err := store.LoadContainer("alpha"); err != nil || info.ExitStatus == nil || *info.ExitStatus != status {
+		t.Fatalf("updated container=%+v, err=%v", info, err)
+	}
+	if err := store.RemoveContainer("beta"); err != nil {
+		t.Fatalf("RemoveContainer by name: %v", err)
+	}
+	if _, err := os.Stat(betaDir); !os.IsNotExist(err) {
+		t.Errorf("removed ID directory still exists: %v", err)
+	}
+	if info, err := store.LoadContainer("legacy"); err != nil || info.ID != "legacy" {
+		t.Fatalf("legacy record=%+v, err=%v", info, err)
+	}
+	if _, err := os.Stat(legacyDir); err != nil {
+		t.Errorf("legacy directory changed: %v", err)
 	}
 }
 
