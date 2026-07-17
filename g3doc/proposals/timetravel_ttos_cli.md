@@ -489,7 +489,8 @@ state still forks entirely in memory.
       persisted-state and console-drainer reconciliation.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published
       PID while the guest remains live and output draining resumes.
-- [ ] Test client crash during stdin and control-socket failure.
+- [x] Test that client loss delivers already-acknowledged stdin before EOF,
+      releases the receiver, and that a control-socket failure returns promptly.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 

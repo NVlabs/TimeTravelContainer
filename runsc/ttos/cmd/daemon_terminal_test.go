@@ -84,6 +84,84 @@ func TestDaemonStdinAcknowledgementCodec(t *testing.T) {
 	}
 }
 
+func TestDaemonClientCrashDeliversAcknowledgedStdinThenEOF(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	stdinReader, stdinWriter := io.Pipe()
+	var serverWriteMu sync.Mutex
+	terminal := newDaemonTerminalInput(stdinReader, serverConn, &serverWriteMu)
+	receiverDone := make(chan struct{})
+	go func() {
+		receiveDaemonInput(bufio.NewReader(serverConn), stdinWriter, true, terminal)
+		close(receiverDone)
+	}()
+	readDone := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		data, err := io.ReadAll(stdinReader)
+		readDone <- struct {
+			data []byte
+			err  error
+		}{data, err}
+	}()
+	var clientWriteMu sync.Mutex
+	if err := writeDaemonFrame(clientConn, &clientWriteMu, daemonFrameStdin, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, err := readDaemonFrame(clientConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := decodeDaemonStdinAcknowledgement(payload)
+	if err != nil || typ != daemonFrameStdinAck || ack != len("accepted") {
+		t.Fatalf("ack type=%q bytes=%d err=%v", typ, ack, err)
+	}
+	_ = clientConn.Close()
+	select {
+	case result := <-readDone:
+		if result.err != nil || string(result.data) != "accepted" {
+			t.Fatalf("stdin after client crash=(%q, %v)", result.data, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued stdin did not close after client crash")
+	}
+	select {
+	case <-receiverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon input receiver survived client crash")
+	}
+	_ = serverConn.Close()
+	_ = stdinReader.Close()
+}
+
+func TestExchangeDaemonReturnsOnControlSocketFailure(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	serverDone := make(chan struct{})
+	go func() {
+		reader := bufio.NewReader(serverConn)
+		_, _ = reader.ReadBytes('\n')
+		_, _, _ = readDaemonFrame(reader)
+		_ = serverConn.Close()
+		close(serverDone)
+	}()
+	result := make(chan error, 1)
+	go func() {
+		_, err := exchangeDaemon(clientConn, daemonRequest{Version: daemonAPIVersion, Action: "command", Stdin: true}, strings.NewReader("payload"), io.Discard, io.Discard)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("exchange succeeded after control socket failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("exchange did not return after control socket failure")
+	}
+	<-serverDone
+	_ = clientConn.Close()
+}
+
 func TestDaemonTerminalSizeRoundTrip(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
