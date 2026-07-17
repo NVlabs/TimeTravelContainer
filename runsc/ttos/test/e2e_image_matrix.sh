@@ -84,6 +84,8 @@ MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
 STOP_POLICY="$PREFIX-stop-policy"
 PIDS_LIMIT="$PREFIX-pids-limit"
+ANON_VOLUME="$PREFIX-anon-volume"
+ANON_NOCOPY="$PREFIX-anon-nocopy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 VOLUME="$PREFIX-state"
 
@@ -109,7 +111,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -137,8 +139,10 @@ ttos run --rm --pull always --name "$AUTO_FOREGROUND" "$BUSYBOX_IMAGE" true
 if ttos inspect "$AUTO_FOREGROUND" >/dev/null 2>&1; then
   fail "foreground --rm retained its container"
 fi
-AUTO_DETACHED_ID=$(ttos run --rm --detach --name "$AUTO_DETACHED" "$BUSYBOX_IMAGE" sh -c "sleep 2")
+AUTO_DETACHED_ID=$(ttos run --rm --detach --name "$AUTO_DETACHED" --volume /auto "$BUSYBOX_IMAGE" sh -c "sleep 2")
 container_id_valid "$AUTO_DETACHED_ID" || fail "detached --rm returned invalid ID: $AUTO_DETACHED_ID"
+AUTO_DETACHED_VOLUME=$(ttos inspect -f "{{(index .Mounts 0).Name}}" "$AUTO_DETACHED_ID")
+container_id_valid "$AUTO_DETACHED_VOLUME" || fail "detached --rm generated invalid anonymous volume name: $AUTO_DETACHED_VOLUME"
 [ "$(ttos inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED_ID")" = true ] ||
   fail "inspect omitted detached auto-remove policy"
 deadline=$(( $(date +%s) + 15 ))
@@ -146,6 +150,9 @@ while ttos inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached --rm did not remove its container"
   sleep 1
 done
+if ttos volume inspect "$AUTO_DETACHED_VOLUME" >/dev/null 2>&1; then
+  fail "detached --rm retained its anonymous volume"
+fi
 AUTO_CREATED_ID=$(ttos create --rm --name "$AUTO_CREATED" "$BUSYBOX_IMAGE" sh -c "sleep 1")
 [ "$(ttos inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED_ID")" = true ] ||
   fail "create --rm did not persist its policy"
@@ -207,6 +214,29 @@ ttos rm "$BUSYBOX_ID"
 ttos image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
   fail "image inspection did not report the materialized BusyBox root"
+
+echo "== anonymous Docker volumes and live-fork isolation =="
+ttos run --name "$ANON_VOLUME" --detach --volume /etc "$BUSYBOX_IMAGE" sh -c 'test -s /etc/passwd; echo parent >/etc/branch; sleep 300' >/dev/null
+ANON_NAME=$(ttos inspect -f "{{(index .Mounts 0).Name}}" "$ANON_VOLUME")
+container_id_valid "$ANON_NAME" || fail "anonymous volume name is not a 64-character ID: $ANON_NAME"
+[ "$(ttos inspect -f '{{(index .Mounts 0).Type}}|{{(index .Mounts 0).Destination}}' "$ANON_VOLUME")" = "volume|/etc" ] ||
+  fail "anonymous short volume was not exposed through Docker inspect"
+ttos exec "$ANON_VOLUME" sh -c 'test -s /etc/passwd; test "$(cat /etc/branch)" = parent' || fail "anonymous volume did not copy image contents"
+ttos fork "$ANON_VOLUME" "$ANON_VOLUME@child" >/dev/null
+ttos exec "$ANON_VOLUME@child" sh -c 'test -s /etc/passwd; echo child >/etc/branch'
+[ "$(ttos exec "$ANON_VOLUME" cat /etc/branch)" = parent ] || fail "anonymous-volume child write leaked into parent"
+[ "$(ttos exec "$ANON_VOLUME@child" cat /etc/branch)" = child ] || fail "anonymous-volume child write was not retained"
+ttos stop --time 1 "$ANON_VOLUME@child" "$ANON_VOLUME"
+ttos branch rm "$ANON_VOLUME@child"
+ttos rm --volumes "$ANON_VOLUME"
+if ttos volume inspect "$ANON_NAME" >/dev/null 2>&1; then
+  fail "rm --volumes retained an anonymous volume"
+fi
+
+ttos run --name "$ANON_NOCOPY" --volume /etc:volume-nocopy "$BUSYBOX_IMAGE" sh -c 'test ! -e /etc/passwd'
+NOCOPY_NAME=$(ttos inspect -f "{{(index .Mounts 0).Name}}" "$ANON_NOCOPY")
+container_id_valid "$NOCOPY_NAME" || fail "volume-nocopy generated invalid anonymous volume name"
+ttos rm -v "$ANON_NOCOPY"
 
 ttos container create --name "$MULTI_A" "$BUSYBOX_IMAGE" sh -c 'exit 3'
 ttos container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
@@ -318,7 +348,12 @@ ttos rm "$PREFIX-nginx"
 
 ttos run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
   'test "$(stat -c %u:%g /data)" = 999:1000 && echo redis-owner-ok'
-ttos rm "$PREFIX-redis"
+REDIS_VOLUME=$(ttos inspect -f '{{(index .Mounts 0).Name}}|{{(index .Mounts 0).Destination}}' "$PREFIX-redis")
+case "$REDIS_VOLUME" in
+  *"|/data") ;;
+  *) fail "Redis image VOLUME was not materialized: $REDIS_VOLUME" ;;
+esac
+ttos rm --volumes "$PREFIX-redis"
 
 echo "== persisted stop signal and timeout policy =="
 ttos run --name "$STOP_POLICY" --detach --stop-signal SIGUSR1 --stop-timeout 3 \

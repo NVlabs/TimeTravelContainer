@@ -165,6 +165,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		"dev.gvisor.spec.mount.ttos0.share":   "container",
 		"dev.gvisor.spec.mount.ttos0.type":    "tmpfs",
 		"dev.gvisor.spec.mount.ttos0.options": "rw,nosuid,nodev,mode=0755",
+		"dev.gvisor.spec.mount.ttos0.copyup":  "true",
 	}
 	for key, want := range wantVolumeAnnotations {
 		if got := spec.Annotations[key]; got != want {
@@ -857,5 +858,66 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	}
 	if _, err := store.RemoveImageRoots(""); err == nil {
 		t.Fatal("RemoveImageRoots accepted an empty digest")
+	}
+}
+
+func TestResolveManagedVolumesIncludesImageDeclarations(t *testing.T) {
+	store := Store{Root: t.TempDir()}
+	image := ocispec.Image{Config: ocispec.ImageConfig{Volumes: map[string]struct{}{
+		"/image-data": {}, "/override": {}, "/dev": {},
+	}}}
+	resolved, err := store.resolveManagedVolumes(image, SpecOptions{
+		ManagedVolumes: []ManagedVolume{{Name: "named", Destination: "/override", NoCopy: true}},
+	})
+	if err != nil {
+		t.Fatalf("resolveManagedVolumes: %v", err)
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("resolved volumes=%+v, want explicit plus image volume", resolved)
+	}
+	if got := resolved[0]; got.Name != "named" || got.Destination != "/override" || got.Anonymous || !got.NoCopy {
+		t.Errorf("explicit volume=%+v", got)
+	}
+	got := resolved[1]
+	if got.Destination != "/image-data" || !got.Anonymous || got.NoCopy {
+		t.Errorf("image volume=%+v", got)
+	}
+	if len(got.Name) != 2*volumeIDBytes {
+		t.Fatalf("anonymous name length=%d, want %d", len(got.Name), 2*volumeIDBytes)
+	}
+	if _, err := hex.DecodeString(got.Name); err != nil {
+		t.Errorf("anonymous name %q is not hexadecimal: %v", got.Name, err)
+	}
+}
+
+func TestBuildSpecVolumeNoCopy(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "data"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manifest.Entries["data"] = ownership.Owner{UID: 999, GID: 1000}
+	if err := ownership.Write(ownership.ManifestPath(root), manifest); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{
+		RootFS: root, ManagedVolumes: []ManagedVolume{{Name: "empty", Destination: "/data", NoCopy: true}},
+	})
+	if err != nil {
+		t.Fatalf("BuildSpec: %v", err)
+	}
+	if got := spec.Annotations["dev.gvisor.spec.mount.ttos0.copyup"]; got != "" {
+		t.Errorf("volume-nocopy emitted copyup annotation %q", got)
+	}
+	wantOptions := "rw,nosuid,nodev,mode=0750,uid=999,gid=1000"
+	if got := spec.Annotations["dev.gvisor.spec.mount.ttos0.options"]; got != wantOptions {
+		t.Errorf("volume master options=%q, want %q", got, wantOptions)
+	}
+	if got := strings.Join(spec.Mounts[len(spec.Mounts)-1].Options, ","); got != wantOptions {
+		t.Errorf("volume mount options=%q, want %q", got, wantOptions)
 	}
 }

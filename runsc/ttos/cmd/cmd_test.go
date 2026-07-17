@@ -1677,8 +1677,8 @@ func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
 	if b.waited != (selector{container: "demo", branch: "main"}) {
 		t.Errorf("waited=%+v", b.waited)
 	}
-	if b.removed != "demo" || !b.removeForce {
-		t.Errorf("remove=(%q, force=%t)", b.removed, b.removeForce)
+	if b.removed != "demo" || !b.removeForce || !b.removeVolumes {
+		t.Errorf("remove=(%q, force=%t, volumes=%t)", b.removed, b.removeForce, b.removeVolumes)
 	}
 	if err := runAutoRemove([]string{"demo@child"}, b); err == nil {
 		t.Fatal("internal auto-remove accepted a branch selector")
@@ -1688,11 +1688,11 @@ func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
 func TestRemove(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"rm", "--force", "demo"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"rm", "--force", "--volumes", "demo"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("rm status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.removed != "demo" || !b.removeForce || stdout.String() != "demo\n" {
-		t.Errorf("removed=%q force=%t output=%q", b.removed, b.removeForce, stdout.String())
+	if b.removed != "demo" || !b.removeForce || !b.removeVolumes || stdout.String() != "demo\n" {
+		t.Errorf("removed=%q force=%t volumes=%t output=%q", b.removed, b.removeForce, b.removeVolumes, stdout.String())
 	}
 }
 
@@ -2326,7 +2326,7 @@ esac
 	if eligibility, err := b.checkFork(target); err != nil || !eligibility.Eligible {
 		t.Fatalf("checkFork by name=(%+v, %v)", eligibility, err)
 	}
-	if err := b.remove("web", true); err != nil {
+	if err := b.remove("web", true, false); err != nil {
 		t.Fatalf("remove by name: %v", err)
 	}
 	if _, err := os.Stat(containerDir); !os.IsNotExist(err) {
@@ -2585,6 +2585,7 @@ type fakeBackend struct {
 	inspectInfo       InspectInfo
 	removed           string
 	removeForce       bool
+	removeVolumes     bool
 	execRequest       execRequest
 	execStatus        int
 	execSessionList   []runscExecSession
@@ -2664,9 +2665,10 @@ func (b *fakeBackend) inspect(name string) (InspectInfo, error) {
 	return b.inspectInfo, b.err
 }
 
-func (b *fakeBackend) remove(name string, force bool) error {
+func (b *fakeBackend) remove(name string, force, volumes bool) error {
 	b.removed = name
 	b.removeForce = force
+	b.removeVolumes = volumes
 	return b.err
 }
 
@@ -2788,4 +2790,27 @@ func (b *fakeBackend) inspectVolume(name string) (ttosbundle.VolumeInfo, error) 
 func (b *fakeBackend) removeVolume(name string) error {
 	b.removedVolume = name
 	return b.err
+}
+
+func TestParseAnonymousManagedVolumes(t *testing.T) {
+	request, err := parseMountRequests(
+		[]string{"/cache", "/readonly:ro", "/empty:volume-nocopy", "named:/named:ro,volume-nocopy"},
+		[]string{"type=volume,target=/long", "type=volume,dst=/long-nocopy,volume-nocopy"}, nil)
+	if err != nil {
+		t.Fatalf("parseMountRequests: %v", err)
+	}
+	want := []ttosbundle.ManagedVolume{
+		{Destination: "/cache", Anonymous: true},
+		{Destination: "/readonly", Readonly: true, Anonymous: true},
+		{Destination: "/empty", Anonymous: true, NoCopy: true},
+		{Name: "named", Destination: "/named", Readonly: true, NoCopy: true},
+		{Destination: "/long", Anonymous: true},
+		{Destination: "/long-nocopy", Anonymous: true, NoCopy: true},
+	}
+	if !reflect.DeepEqual(request.managed, want) {
+		t.Errorf("managed volumes=%+v, want %+v", request.managed, want)
+	}
+	if _, err := parseMountRequests([]string{"relative"}, nil, nil); err == nil {
+		t.Fatal("relative anonymous volume destination was accepted")
+	}
 }

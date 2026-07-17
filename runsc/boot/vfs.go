@@ -16,6 +16,7 @@ package boot
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -798,9 +799,14 @@ func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec,
 		)
 
 		if submount.hint != nil && submount.hint.ShouldShareMount() {
-			sharedMount, err := c.getSharedMount(ctx, spec, conf, submount, creds)
+			sharedMount, created, err := c.getSharedMount(ctx, spec, conf, submount, creds)
 			if err != nil {
 				return fmt.Errorf("getting shared mount %q: %w", submount.hint.Name, err)
+			}
+			if created && submount.hint.CopyUp {
+				if err := c.copyManagedVolume(ctx, mns, creds, submount.mount.Destination, sharedMount); err != nil {
+					return fmt.Errorf("populating shared mount %q from %q: %w", submount.hint.Name, submount.mount.Destination, err)
+				}
 			}
 			mnt, err = c.mountSharedSubmount(ctx, conf, mns, creds, submount, sharedMount)
 			if err != nil {
@@ -1240,7 +1246,173 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 	}
 }
 
-func (c *containerMounter) getSharedMount(ctx context.Context, spec *specs.Spec, conf *config.Config, mount *mountInfo, creds *auth.Credentials) (*vfs.Mount, error) {
+type copiedVolumeInode struct {
+	devMajor uint32
+	devMinor uint32
+	ino      uint64
+}
+
+type volumeTreeCopier struct {
+	vfsObj    *vfs.VirtualFilesystem
+	creds     *auth.Credentials
+	srcRoot   vfs.VirtualDentry
+	dstRoot   vfs.VirtualDentry
+	hardlinks map[copiedVolumeInode]string
+}
+
+func volumePath(root vfs.VirtualDentry, name string, follow bool) vfs.PathOperation {
+	return vfs.PathOperation{Root: root, Start: root, Path: fspath.Parse(name), FollowFinalSymlink: follow}
+}
+
+func (c *containerMounter) copyManagedVolume(ctx context.Context, mns *vfs.MountNamespace, creds *auth.Credentials, source string, destination *vfs.Mount) error {
+	srcRoot := mns.Root(ctx)
+	defer srcRoot.DecRef(ctx)
+	dstRoot := vfs.MakeVirtualDentry(destination, destination.Root())
+	src := volumePath(srcRoot, source, true)
+	stat, err := c.l.k.VFS().StatAt(ctx, creds, &src, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if linuxerr.Equals(linuxerr.ENOENT, err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if linux.FileMode(stat.Mode).FileType() != linux.S_IFDIR {
+		return linuxerr.ENOTDIR
+	}
+	copier := volumeTreeCopier{
+		vfsObj: c.l.k.VFS(), creds: creds, srcRoot: srcRoot, dstRoot: dstRoot,
+		hardlinks: make(map[copiedVolumeInode]string),
+	}
+	if err := copier.copyDirectory(ctx, source, ""); err != nil {
+		return err
+	}
+	if err := copier.copyMetadata(ctx, source, "", stat); err != nil {
+		return err
+	}
+	dst := volumePath(dstRoot, "", false)
+	copied, err := c.l.k.VFS().StatAt(ctx, creds, &dst, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if err != nil {
+		return fmt.Errorf("stating populated volume root: %w", err)
+	}
+	log.Infof("Populated managed volume %q: source root owner=%d:%d mode=%#o, volume root owner=%d:%d mode=%#o", source, stat.UID, stat.GID, stat.Mode, copied.UID, copied.GID, copied.Mode)
+	if copied.UID != stat.UID || copied.GID != stat.GID || copied.Mode != stat.Mode {
+		return fmt.Errorf("populated volume root metadata mismatch: got owner=%d:%d mode=%#o, want owner=%d:%d mode=%#o", copied.UID, copied.GID, copied.Mode, stat.UID, stat.GID, stat.Mode)
+	}
+	return nil
+}
+
+func (c *volumeTreeCopier) copyDirectory(ctx context.Context, srcName, dstName string) error {
+	src := volumePath(c.srcRoot, srcName, true)
+	fd, err := c.vfsObj.OpenAt(ctx, c.creds, &src, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
+	if err != nil {
+		return err
+	}
+	defer fd.DecRef(ctx)
+	var names []string
+	if err := fd.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
+		if dirent.Name != "." && dirent.Name != ".." {
+			names = append(names, dirent.Name)
+		}
+		return nil
+	})); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if err := c.copyEntry(ctx, path.Join(srcName, name), path.Join(dstName, name)); err != nil {
+			return fmt.Errorf("copying %q: %w", path.Join(srcName, name), err)
+		}
+	}
+	return nil
+}
+
+func (c *volumeTreeCopier) copyEntry(ctx context.Context, srcName, dstName string) error {
+	src := volumePath(c.srcRoot, srcName, false)
+	stat, err := c.vfsObj.StatAt(ctx, c.creds, &src, &vfs.StatOptions{Mask: linux.STATX_BASIC_STATS})
+	if err != nil {
+		return err
+	}
+	dst := volumePath(c.dstRoot, dstName, false)
+	fileType := linux.FileMode(stat.Mode).FileType()
+	if fileType != linux.S_IFDIR && stat.Nlink > 1 {
+		key := copiedVolumeInode{devMajor: stat.DevMajor, devMinor: stat.DevMinor, ino: stat.Ino}
+		if previous, ok := c.hardlinks[key]; ok {
+			old := volumePath(c.dstRoot, previous, false)
+			return c.vfsObj.LinkAt(ctx, c.creds, &old, &dst)
+		}
+		c.hardlinks[key] = dstName
+	}
+
+	switch fileType {
+	case linux.S_IFDIR:
+		if err := c.vfsObj.MkdirAt(ctx, c.creds, &dst, &vfs.MkdirOptions{Mode: 0700}); err != nil {
+			return err
+		}
+		if err := c.copyDirectory(ctx, srcName, dstName); err != nil {
+			return err
+		}
+	case linux.S_IFREG:
+		if err := c.vfsObj.MknodAt(ctx, c.creds, &dst, &vfs.MknodOptions{Mode: linux.S_IFREG | 0600}); err != nil {
+			return err
+		}
+		srcFD, err := c.vfsObj.OpenAt(ctx, c.creds, &src, &vfs.OpenOptions{Flags: linux.O_RDONLY})
+		if err != nil {
+			return err
+		}
+		defer srcFD.DecRef(ctx)
+		dstFD, err := c.vfsObj.OpenAt(ctx, c.creds, &dst, &vfs.OpenOptions{Flags: linux.O_WRONLY})
+		if err != nil {
+			return err
+		}
+		defer dstFD.DecRef(ctx)
+		if _, err := vfs.CopyRegularFileData(ctx, dstFD, srcFD); err != nil {
+			return err
+		}
+	case linux.S_IFLNK:
+		target, err := c.vfsObj.ReadlinkAt(ctx, c.creds, &src)
+		if err != nil {
+			return err
+		}
+		if err := c.vfsObj.SymlinkAt(ctx, c.creds, &dst, target); err != nil {
+			return err
+		}
+	case linux.S_IFBLK, linux.S_IFCHR, linux.S_IFIFO:
+		if err := c.vfsObj.MknodAt(ctx, c.creds, &dst, &vfs.MknodOptions{
+			Mode: linux.FileMode(stat.Mode), DevMajor: stat.RdevMajor, DevMinor: stat.RdevMinor,
+		}); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported file type %#o", fileType)
+	}
+	return c.copyMetadata(ctx, srcName, dstName, stat)
+}
+
+func (c *volumeTreeCopier) copyMetadata(ctx context.Context, srcName, dstName string, stat linux.Statx) error {
+	dst := volumePath(c.dstRoot, dstName, false)
+	metadata := stat
+	metadata.Mask &= linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE | linux.STATX_ATIME | linux.STATX_MTIME
+	metadata.Mode &= uint16(linux.PermissionsMask | linux.S_ISUID | linux.S_ISGID | linux.S_ISVTX)
+	if err := c.vfsObj.SetStatAt(ctx, c.creds, &dst, &vfs.SetStatOptions{Stat: metadata}); err != nil {
+		return err
+	}
+	src := volumePath(c.srcRoot, srcName, srcName == "")
+	names, err := c.vfsObj.ListXattrAt(ctx, c.creds, &src, 0)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		value, err := c.vfsObj.GetXattrAt(ctx, c.creds, &src, &vfs.GetXattrOptions{Name: name, Size: math.MaxUint64})
+		if err != nil {
+			return err
+		}
+		if err := c.vfsObj.SetXattrAt(ctx, c.creds, &dst, &vfs.SetXattrOptions{Name: name, Value: value}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *containerMounter) getSharedMount(ctx context.Context, spec *specs.Spec, conf *config.Config, mount *mountInfo, creds *auth.Credentials) (*vfs.Mount, bool, error) {
 	sharedMount, ok := c.sharedMounts[mount.hint.Mount.Source]
 	if ok {
 		log.Infof("Using existing shared mount %q from %q type %q", mount.hint.Name, mount.hint.Mount.Source, mount.hint.Mount.Type)
@@ -1250,15 +1422,15 @@ func (c *containerMounter) getSharedMount(ctx context.Context, spec *specs.Spec,
 		if mount.filestoreFD != nil {
 			mount.filestoreFD.Close()
 		}
-		return sharedMount, nil
+		return sharedMount, false, nil
 	}
 	log.Infof("Mounting master of shared mount %q from %q type %q", mount.hint.Name, mount.hint.Mount.Source, mount.hint.Mount.Type)
 	sharedMount, err := c.mountSharedMaster(ctx, spec, conf, mount, creds)
 	if err != nil {
-		return nil, fmt.Errorf("mounting shared master %q: %v", mount.hint.Name, err)
+		return nil, false, fmt.Errorf("mounting shared master %q: %v", mount.hint.Name, err)
 	}
 	c.sharedMounts[mount.hint.Mount.Source] = sharedMount
-	return sharedMount, nil
+	return sharedMount, true, nil
 }
 
 // mountCgroupMounts mounts the cgroups which are shared across all containers.

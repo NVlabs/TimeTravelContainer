@@ -30,6 +30,7 @@ func TestPodMountHintsHappy(t *testing.T) {
 			MountPrefix + "mount1.source": "foo",
 			MountPrefix + "mount1.type":   "tmpfs",
 			MountPrefix + "mount1.share":  "pod",
+			MountPrefix + "mount1.copyup": "true",
 
 			MountPrefix + "mount2.source":  "bar",
 			MountPrefix + "mount2.type":    "bind",
@@ -61,6 +62,9 @@ func TestPodMountHintsHappy(t *testing.T) {
 	}
 	if mount1.SuppressDirectFS {
 		t.Errorf("mount1 SuppressDirectFS, want: false, got: true")
+	}
+	if !mount1.CopyUp {
+		t.Errorf("mount1 CopyUp, want: true, got: false")
 	}
 
 	mount2 := podHints.Mounts["mount2"]

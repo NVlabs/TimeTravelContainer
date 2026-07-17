@@ -28,6 +28,7 @@ import (
 	"time"
 	"unicode"
 
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/ttos/images"
 	"gvisor.dev/gvisor/runsc/ttos/ownership"
@@ -36,6 +37,7 @@ import (
 const (
 	imageRootFormatVersion = "v3"
 	containerIDBytes       = 32
+	volumeIDBytes          = 32
 )
 
 // Store owns persistent image roots and generated container bundles.
@@ -327,6 +329,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	opts.ManagedVolumes, err = s.resolveManagedVolumes(imageInfo.Image, opts.SpecOptions)
+	if err != nil {
+		return Prepared{}, err
+	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
@@ -405,6 +411,76 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
+func randomObjectID(kind string, size int) (string, error) {
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		return "", fmt.Errorf("generating %s ID: %w", kind, err)
+	}
+	return hex.EncodeToString(data), nil
+}
+
+func (s Store) resolveManagedVolumes(image ocispec.Image, opts SpecOptions) ([]ManagedVolume, error) {
+	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
+	occupied := map[string]bool{
+		"/proc": true, "/dev": true, "/dev/pts": true, "/dev/shm": true, "/sys": true,
+	}
+	for _, mount := range opts.HostMounts {
+		occupied[filepath.Clean(mount.Destination)] = true
+	}
+	for _, mount := range opts.ManagedVolumes {
+		occupied[filepath.Clean(mount.Destination)] = true
+	}
+	for _, mount := range opts.FilesystemMounts {
+		occupied[filepath.Clean(mount.Destination)] = true
+	}
+	imageDestinations := make([]string, 0, len(image.Config.Volumes))
+	for destination := range image.Config.Volumes {
+		imageDestinations = append(imageDestinations, destination)
+	}
+	sort.Strings(imageDestinations)
+	for _, destination := range imageDestinations {
+		clean := filepath.Clean(destination)
+		if !filepath.IsAbs(clean) || clean == "/" {
+			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
+		}
+		if occupied[clean] {
+			continue
+		}
+		occupied[clean] = true
+		volumes = append(volumes, ManagedVolume{Destination: clean, Anonymous: true})
+	}
+
+	known := make(map[string]bool)
+	if existing, err := s.ListVolumes(); err != nil {
+		return nil, err
+	} else {
+		for _, volume := range existing {
+			known[volume.Name] = true
+		}
+	}
+	for i := range volumes {
+		if volumes[i].Name != "" {
+			continue
+		}
+		volumes[i].Anonymous = true
+		for attempt := 0; attempt < 100; attempt++ {
+			name, err := randomObjectID("volume", volumeIDBytes)
+			if err != nil {
+				return nil, err
+			}
+			if !known[name] {
+				volumes[i].Name = name
+				known[name] = true
+				break
+			}
+		}
+		if volumes[i].Name == "" {
+			return nil, errors.New("could not allocate a unique volume ID")
+		}
+	}
+	return volumes, nil
+}
+
 func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {
 	unavailable := make(map[string]bool, len(existing))
 	for _, info := range existing {
@@ -415,11 +491,10 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		return "", "", fmt.Errorf("creating container state root: %w", err)
 	}
 	for attempt := 0; attempt < 100; attempt++ {
-		data := make([]byte, containerIDBytes)
-		if _, err := rand.Read(data); err != nil {
-			return "", "", fmt.Errorf("generating container ID: %w", err)
+		id, err := randomObjectID("container", containerIDBytes)
+		if err != nil {
+			return "", "", err
 		}
-		id := hex.EncodeToString(data)
 		if unavailable[id] {
 			continue
 		}

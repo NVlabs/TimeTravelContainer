@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	units "github.com/docker/go-units"
 	mobysignal "github.com/moby/sys/signal"
@@ -116,6 +117,12 @@ type ManagedVolume struct {
 	Name        string `json:"name"`
 	Destination string `json:"destination"`
 	Readonly    bool   `json:"readonly,omitempty"`
+	// Anonymous records that Name was generated for a source-less Docker
+	// volume request or an image VOLUME declaration.
+	Anonymous bool `json:"anonymous,omitempty"`
+	// NoCopy implements Docker's volume-nocopy option. By default, the Sentry
+	// populates a newly created managed tmpfs from the image mountpoint.
+	NoCopy bool `json:"no_copy,omitempty"`
 }
 
 // FilesystemMount describes a Sentry-implemented tmpfs, procfs, or sysfs mount.
@@ -474,7 +481,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		annotations[PidsLimitAnnotation] = "sentry"
 	}
 	ownerManifest := ownership.ManifestPath(rootfs)
-	if _, err := ownership.Read(ownerManifest); err == nil {
+	var rootOwners *ownership.Manifest
+	if manifest, err := ownership.Read(ownerManifest); err == nil {
+		rootOwners = manifest
 		annotations[ownership.Annotation] = ownerManifest
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("loading rootfs ownership: %w", err)
@@ -604,6 +613,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		annotations[InternalMountsAnnotation] = string(encoded)
 	}
 	volumeSources := make(map[string]string)
+	volumeOptions := make(map[string][]string)
 	for _, volume := range opts.ManagedVolumes {
 		if err := validateVolumeName(volume.Name); err != nil {
 			return nil, err
@@ -620,13 +630,21 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		if !ok {
 			source = "ttos-volume-" + volume.Name
 			volumeSources[volume.Name] = source
+			options, err := managedVolumeMountOptions(rootfs, destination, rootOwners)
+			if err != nil {
+				return nil, err
+			}
+			volumeOptions[volume.Name] = options
 			hint := fmt.Sprintf("dev.gvisor.spec.mount.ttos%d.", len(volumeSources)-1)
 			annotations[hint+"source"] = source
 			annotations[hint+"share"] = "container"
 			annotations[hint+"type"] = "tmpfs"
-			annotations[hint+"options"] = "rw,nosuid,nodev,mode=0755"
+			annotations[hint+"options"] = strings.Join(volumeOptions[volume.Name], ",")
+			if !volume.NoCopy {
+				annotations[hint+"copyup"] = "true"
+			}
 		}
-		mountOptions := []string{"rw", "nosuid", "nodev", "mode=0755"}
+		mountOptions := append([]string(nil), volumeOptions[volume.Name]...)
 		if volume.Readonly {
 			mountOptions[0] = "ro"
 		}
@@ -661,6 +679,34 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		Linux:       &specs.Linux{Namespaces: namespaces, Resources: resources},
 		Annotations: annotations,
 	}, nil
+}
+
+func managedVolumeMountOptions(rootfs, destination string, owners *ownership.Manifest) ([]string, error) {
+	options := []string{"rw", "nosuid", "nodev", "mode=0755"}
+	name := filepath.Join(rootfs, strings.TrimPrefix(destination, "/"))
+	info, err := os.Stat(name)
+	if os.IsNotExist(err) {
+		return options, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stating managed volume destination %q: %w", destination, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("managed volume destination %q has unsupported stat data", destination)
+	}
+	options[3] = fmt.Sprintf("mode=%04o", stat.Mode&07777)
+	uid, gid := stat.Uid, stat.Gid
+	if owner, ok := owners.Lookup(strings.TrimPrefix(destination, "/")); ok {
+		uid, gid = owner.UID, owner.GID
+	}
+	if uid != 0 {
+		options = append(options, fmt.Sprintf("uid=%d", uid))
+	}
+	if gid != 0 {
+		options = append(options, fmt.Sprintf("gid=%d", gid))
+	}
+	return options, nil
 }
 
 func filesystemMountOptions(mount FilesystemMount) ([]string, error) {

@@ -548,14 +548,27 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 	}
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
-		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
-			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want SOURCE:CONTAINER[:ro]", value)
+		if len(parts) == 1 || (len(parts) == 2 && filepath.IsAbs(parts[0]) && !filepath.IsAbs(parts[1])) {
+			readonly, noCopy, err := parseVolumeOptions(value, parts[1:])
+			if err != nil {
+				return mountRequests{}, err
+			}
+			volume, err := normalizeManagedVolume("", parts[0], readonly)
+			if err != nil {
+				return mountRequests{}, err
+			}
+			volume.NoCopy = noCopy
+			request.managed = append(request.managed, volume)
+			continue
+		}
+		if len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want [SOURCE:]CONTAINER[:OPTIONS]", value)
 		}
 		if isHostMountSource(parts[0]) {
 			hostVolumes = append(hostVolumes, value)
 			continue
 		}
-		readonly, err := parseVolumeOptions(value, parts[2:])
+		readonly, noCopy, err := parseVolumeOptions(value, parts[2:])
 		if err != nil {
 			return mountRequests{}, err
 		}
@@ -563,6 +576,7 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 		if err != nil {
 			return mountRequests{}, err
 		}
+		volume.NoCopy = noCopy
 		request.managed = append(request.managed, volume)
 	}
 	for _, value := range mountSpecs {
@@ -818,10 +832,9 @@ func isHostMountSource(source string) bool {
 	return filepath.IsAbs(source) || source == "." || strings.HasPrefix(source, "."+string(filepath.Separator))
 }
 
-func parseVolumeOptions(spec string, optionParts []string) (bool, error) {
-	readonly := false
+func parseVolumeOptions(spec string, optionParts []string) (readonly, noCopy bool, err error) {
 	if len(optionParts) == 0 {
-		return readonly, nil
+		return false, false, nil
 	}
 	for _, option := range strings.Split(optionParts[0], ",") {
 		switch option {
@@ -829,23 +842,30 @@ func parseVolumeOptions(spec string, optionParts []string) (bool, error) {
 			readonly = true
 		case "rw", "":
 			readonly = false
+		case "volume-nocopy", "nocopy":
+			noCopy = true
 		default:
-			return false, fmt.Errorf("unsupported volume option %q in %q", option, spec)
+			return false, false, fmt.Errorf("unsupported volume option %q in %q", option, spec)
 		}
 	}
-	return readonly, nil
+	return readonly, noCopy, nil
 }
 
 func parseManagedLongMount(value string) (ttosbundle.ManagedVolume, error) {
 	name := ""
 	destination := ""
 	readonly := false
+	noCopy := false
 	for _, field := range strings.Split(value, ",") {
 		key, raw, found := strings.Cut(field, "=")
 		key = strings.TrimSpace(key)
 		if !found {
 			if key == "ro" || key == "readonly" {
 				readonly = true
+				continue
+			}
+			if key == "volume-nocopy" || key == "nocopy" {
+				noCopy = true
 				continue
 			}
 			return ttosbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", field, value)
@@ -866,24 +886,32 @@ func parseManagedLongMount(value string) (ttosbundle.ManagedVolume, error) {
 				return ttosbundle.ManagedVolume{}, fmt.Errorf("invalid readonly value %q in %q", raw, value)
 			}
 			readonly = parsed
+		case "volume-nocopy", "nocopy":
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return ttosbundle.ManagedVolume{}, fmt.Errorf("invalid volume-nocopy value %q in %q", raw, value)
+			}
+			noCopy = parsed
 		default:
 			return ttosbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", key, value)
 		}
 	}
-	return normalizeManagedVolume(name, destination, readonly)
+	volume, err := normalizeManagedVolume(name, destination, readonly)
+	if err != nil {
+		return ttosbundle.ManagedVolume{}, err
+	}
+	volume.NoCopy = noCopy
+	return volume, nil
 }
 
 func normalizeManagedVolume(name, destination string, readonly bool) (ttosbundle.ManagedVolume, error) {
-	if name == "" {
-		return ttosbundle.ManagedVolume{}, errors.New("managed volume name must not be empty")
-	}
-	if isHostMountSource(name) {
+	if name != "" && isHostMountSource(name) {
 		return ttosbundle.ManagedVolume{}, fmt.Errorf("managed volume name %q looks like a host path", name)
 	}
 	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
 		return ttosbundle.ManagedVolume{}, fmt.Errorf("managed volume destination %q must be an absolute non-root path", destination)
 	}
-	return ttosbundle.ManagedVolume{Name: name, Destination: filepath.Clean(destination), Readonly: readonly}, nil
+	return ttosbundle.ManagedVolume{Name: name, Destination: filepath.Clean(destination), Readonly: readonly, Anonymous: name == ""}, nil
 }
 
 func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttosbundle.HostMount, error) {
@@ -1196,8 +1224,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "volume", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -1382,8 +1410,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "volume", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
+	fs.Var(&volumes, "v", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
 	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -2210,17 +2238,19 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	force := fs.Bool("force", false, "force removal of a running container family")
 	fs.BoolVar(force, "f", false, "force removal of a running container family")
+	volumes := fs.Bool("volumes", false, "remove anonymous volumes attached to the container")
+	fs.BoolVar(volumes, "v", false, "remove anonymous volumes attached to the container")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttos rm [--force] CONTAINER [CONTAINER...]")
+		return errors.New("usage: ttos rm [--force] [--volumes] CONTAINER [CONTAINER...]")
 	}
 	for _, name := range fs.Args() {
 		if strings.Contains(name, "@") {
 			return fmt.Errorf("rm removes a whole container family; use 'branch rm' for %q", name)
 		}
-		if err := backend.remove(name, *force); err != nil {
+		if err := backend.remove(name, *force, *volumes); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, name)
@@ -2236,7 +2266,7 @@ func runAutoRemove(args []string, backend backend) error {
 	if _, err := backend.wait(target); err != nil {
 		return fmt.Errorf("waiting to auto-remove %s: %w", args[0], err)
 	}
-	if err := backend.remove(args[0], true); err != nil {
+	if err := backend.remove(args[0], true, true); err != nil {
 		return fmt.Errorf("auto-removing %s: %w", args[0], err)
 	}
 	return nil
@@ -3517,7 +3547,7 @@ type backend interface {
 	waitExecSession(target selector, execID string) (uint32, error)
 	signalExecSession(target selector, execID string, signal int) error
 	inspect(name string) (InspectInfo, error)
-	remove(name string, force bool) error
+	remove(name string, force, volumes bool) error
 	listFamilies() ([]Family, error)
 	processes(target selector) ([]ProcessInfo, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
@@ -3887,14 +3917,14 @@ func (b *runtimeBackend) applyAutoRemove(id string, detach bool, status int, lau
 		if err := b.scheduleAutoRemove(id); err == nil {
 			return status, nil
 		} else {
-			cleanupErr := b.remove(id, true)
+			cleanupErr := b.remove(id, true, true)
 			if cleanupErr != nil {
 				return 1, fmt.Errorf("scheduling auto-remove: %w (cleanup also failed: %v)", err, cleanupErr)
 			}
 			return 1, fmt.Errorf("scheduling auto-remove: %w; container was removed", err)
 		}
 	}
-	cleanupErr := b.remove(id, true)
+	cleanupErr := b.remove(id, true, true)
 	if cleanupErr != nil {
 		if launchErr != nil {
 			return status, fmt.Errorf("%w (auto-remove also failed: %v)", launchErr, cleanupErr)
@@ -5150,7 +5180,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	return result, nil
 }
 
-func (b *runtimeBackend) remove(name string, force bool) error {
+func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	store := b.containerStore()
 	info, err := store.LoadContainer(name)
 	if err != nil {
@@ -5178,7 +5208,20 @@ func (b *runtimeBackend) remove(name string, force bool) error {
 		}
 		break
 	}
-	return store.RemoveContainer(runtimeID)
+	if err := store.RemoveContainer(runtimeID); err != nil {
+		return err
+	}
+	if volumes {
+		for _, volume := range info.Volumes {
+			if !volume.Anonymous {
+				continue
+			}
+			if err := store.RemoveVolume(volume.Name); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("removing anonymous volume %q: %w", volume.Name, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) configuredRunscArgs() []string {

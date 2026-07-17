@@ -12,7 +12,7 @@ covers:
 - Docker-compatible 64-hex container IDs from `create` and detached `run`,
   distinct persisted names, 12-character `ps` IDs, and lifecycle lookup by
   exact name, full ID, and unambiguous ID prefix;
-- Docker-compatible foreground and detached `run --rm`, plus persisted
+- Docker-compatible foreground and detached `run --rm`, including anonymous-volume cleanup, plus persisted
   `create --rm` cleanup after a later detached start;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
@@ -52,11 +52,15 @@ covers:
   sides of a live fork;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
+- anonymous `-v CONTAINER[:OPTIONS]` and source-less `--mount type=volume`,
+  Docker-style 64-hex volume identities, image `VOLUME` materialization, initial
+  image-tree copy-up with `volume-nocopy` opt-out, `rm -v` cleanup, and
+  branch-local CoW behavior after a live fork;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
-- Redis image ownership fidelity for a `999:1000` lower-layer directory while
-  physical rootfs files remain caller-owned;
+- Redis image ownership fidelity for its `999:1000` image-declared `/data`
+  volume while physical rootfs files remain caller-owned;
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
