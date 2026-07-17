@@ -75,6 +75,9 @@ printf "%s\n" "# label file" "suite=file" "file-only=value" "empty" >"$LABEL_FIL
 PREFIX="e2e-$$"
 LIFECYCLE="$PREFIX-lifecycle"
 ATTACH_INPUT="$PREFIX-attach-input"
+AUTO_FOREGROUND="$PREFIX-auto-foreground"
+AUTO_DETACHED="$PREFIX-auto-detached"
+AUTO_CREATED="$PREFIX-auto-created"
 CONSOLE_STRESS="$PREFIX-console-stress"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
@@ -104,7 +107,7 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE" "$ATTACH_INPUT"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" >/dev/null 2>&1 || true
@@ -126,6 +129,30 @@ for reference in docker.io/library/busybox:1.36 docker.io/library/alpine:3.20 do
   grep -q "\"reference\": \"$reference\"" "$IMAGE_LIST" || fail "image inventory omitted $reference"
 done
 [ "$(ttos images -q | wc -l)" -ge 5 ] || fail "quiet image inventory omitted an image ID"
+
+echo "== automatic container removal =="
+ttos run --rm --name "$AUTO_FOREGROUND" "$BUSYBOX_IMAGE" true
+if ttos inspect "$AUTO_FOREGROUND" >/dev/null 2>&1; then
+  fail "foreground --rm retained its container"
+fi
+AUTO_DETACHED_ID=$(ttos run --rm --detach --name "$AUTO_DETACHED" "$BUSYBOX_IMAGE" sh -c "sleep 2")
+container_id_valid "$AUTO_DETACHED_ID" || fail "detached --rm returned invalid ID: $AUTO_DETACHED_ID"
+[ "$(ttos inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED_ID")" = true ] ||
+  fail "inspect omitted detached auto-remove policy"
+deadline=$(( $(date +%s) + 15 ))
+while ttos inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "detached --rm did not remove its container"
+  sleep 1
+done
+AUTO_CREATED_ID=$(ttos create --rm --name "$AUTO_CREATED" "$BUSYBOX_IMAGE" sh -c "sleep 1")
+[ "$(ttos inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED_ID")" = true ] ||
+  fail "create --rm did not persist its policy"
+ttos start "$AUTO_CREATED_ID" >/dev/null
+deadline=$(( $(date +%s) + 15 ))
+while ttos inspect "$AUTO_CREATED" >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "started create --rm container was retained"
+  sleep 1
+done
 
 echo "== one-shot compatibility probes =="
 BUSYBOX_ID=$(ttos create --name "$PREFIX-busybox" \

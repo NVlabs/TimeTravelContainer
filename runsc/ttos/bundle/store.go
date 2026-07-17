@@ -53,6 +53,7 @@ type PrepareOptions struct {
 	ConsoleLogMaxBytes int64
 	ConsoleLogMaxFiles int
 	OpenStdin          bool
+	AutoRemove         bool
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -78,6 +79,7 @@ type ContainerInfo struct {
 	ConsoleLogMaxFiles int             `json:"console_log_max_files,omitempty"`
 	Terminal           bool            `json:"terminal,omitempty"`
 	OpenStdin          bool            `json:"open_stdin,omitempty"`
+	AutoRemove         bool            `json:"auto_remove,omitempty"`
 	State              string          `json:"state"`
 	ExitStatus         *int            `json:"exit_status,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -179,6 +181,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
 		Terminal:           opts.Terminal,
 		OpenStdin:          opts.OpenStdin,
+		AutoRemove:         opts.AutoRemove,
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}

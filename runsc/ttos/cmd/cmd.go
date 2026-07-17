@@ -312,6 +312,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
 		err = runRemove(args[1:], stdout, stderr, backend)
+	case "_auto-remove":
+		err = runAutoRemove(args[1:], backend)
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -864,6 +866,7 @@ type runRequest struct {
 	consoleLogMaxBytes int64
 	consoleLogMaxFiles int
 	managedVolumes     []ttosbundle.ManagedVolume
+	autoRemove         bool
 	detach             bool
 	interactive        bool
 	terminal           bool
@@ -914,6 +917,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
 	terminal := fs.Bool("tty", false, "allocate a terminal")
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
+	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -978,6 +982,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
 		managedVolumes:     parsedMounts.managed,
+		autoRemove:         *autoRemove,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		detach:             *detach,
@@ -1015,6 +1020,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
 	terminal := fs.Bool("tty", false, "allocate a terminal")
 	fs.BoolVar(terminal, "t", false, "allocate a terminal")
+	autoRemove := fs.Bool("rm", false, "automatically remove the container when it exits")
 	cwd := fs.String("workdir", "", "working directory inside the container")
 	fs.StringVar(cwd, "w", "", "working directory inside the container")
 	user := fs.String("user", "", "username or UID[:GID]")
@@ -1079,6 +1085,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		networkMode:        networkMode,
 		hostMounts:         parsedMounts.host,
 		managedVolumes:     parsedMounts.managed,
+		autoRemove:         *autoRemove,
 		consoleLogMaxBytes: logMaxBytes,
 		consoleLogMaxFiles: logMaxFiles,
 		interactive:        *interactive,
@@ -1553,6 +1560,7 @@ type InspectConfig struct {
 type InspectHostConfig struct {
 	Binds          []string          `json:"Binds"`
 	NetworkMode    string            `json:"NetworkMode"`
+	AutoRemove     bool              `json:"AutoRemove"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	Runtime        string            `json:"Runtime"`
 	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
@@ -1757,6 +1765,20 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 		fmt.Fprintln(stdout, name)
+	}
+	return nil
+}
+
+func runAutoRemove(args []string, backend backend) error {
+	if len(args) != 1 || strings.Contains(args[0], "@") {
+		return errors.New("internal auto-remove requires one container ID")
+	}
+	target := selector{container: args[0], branch: defaultBranchID}
+	if _, err := backend.wait(target); err != nil {
+		return fmt.Errorf("waiting to auto-remove %s: %w", args[0], err)
+	}
+	if err := backend.remove(args[0], true); err != nil {
+		return fmt.Errorf("auto-removing %s: %w", args[0], err)
 	}
 	return nil
 }
@@ -3282,6 +3304,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
+		AutoRemove:         request.autoRemove,
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -3290,6 +3313,9 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	status, err := b.launch(id, prepared.BundleDir, request.networkMode, request.detach, request.interactive, request.terminal)
 	if err == nil {
 		b.recordLaunchState(id, request.detach, status)
+	}
+	if request.autoRemove {
+		status, err = b.applyAutoRemove(id, request.detach, status, err)
 	}
 	return containerRunResult{ID: id, Status: status}, err
 }
@@ -3316,6 +3342,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
 		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
 		OpenStdin:          request.interactive,
+		AutoRemove:         request.autoRemove,
 	})
 	if err != nil {
 		return "", err
@@ -3335,7 +3362,73 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err == nil {
 		b.recordLaunchState(info.ID, detach, status)
 	}
+	if info.AutoRemove {
+		return b.applyAutoRemove(info.ID, detach, status, err)
+	}
 	return status, err
+}
+
+func (b *runtimeBackend) applyAutoRemove(id string, detach bool, status int, launchErr error) (int, error) {
+	if detach && launchErr == nil && status == 0 {
+		if err := b.scheduleAutoRemove(id); err == nil {
+			return status, nil
+		} else {
+			cleanupErr := b.remove(id, true)
+			if cleanupErr != nil {
+				return 1, fmt.Errorf("scheduling auto-remove: %w (cleanup also failed: %v)", err, cleanupErr)
+			}
+			return 1, fmt.Errorf("scheduling auto-remove: %w; container was removed", err)
+		}
+	}
+	cleanupErr := b.remove(id, true)
+	if cleanupErr != nil {
+		if launchErr != nil {
+			return status, fmt.Errorf("%w (auto-remove also failed: %v)", launchErr, cleanupErr)
+		}
+		return 1, fmt.Errorf("auto-removing container after exit: %w", cleanupErr)
+	}
+	return status, launchErr
+}
+
+func (b *runtimeBackend) scheduleAutoRemove(id string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locating ttos executable: %w", err)
+	}
+	args := []string{
+		"--root", b.root,
+		"--runsc", b.runsc,
+		"--containerd", b.containerd,
+		"--namespace", b.namespace,
+		"--data-root", b.dataRoot,
+	}
+	if b.unsafeNoHostIsolation {
+		args = append(args, "--unsafe-no-host-isolation")
+	}
+	args = append(args, "_auto-remove", id)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening auto-remove stdio: %w", err)
+	}
+	defer devNull.Close()
+	errorPath := filepath.Join(b.dataRoot, "containers", id, "auto-remove.error.log")
+	errorLog, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("opening auto-remove error log: %w", err)
+	}
+	defer errorLog.Close()
+	command := exec.Command(executable, args...)
+	command.Stdin = devNull
+	command.Stdout = devNull
+	command.Stderr = errorLog
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("starting auto-remove helper: %w", err)
+	}
+	if err := command.Process.Release(); err != nil {
+		return fmt.Errorf("releasing auto-remove helper: %w", err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) removeStoppedRuntime(name string) error {
@@ -4449,7 +4542,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, ReadonlyRootfs: readonlyRootfs, Runtime: "runsc",
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{

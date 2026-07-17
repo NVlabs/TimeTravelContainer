@@ -523,14 +523,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--network", "host", "-e", "A=1", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if got, want := strings.Join(b.runRequest.args, " "), "echo ok"; got != want {
@@ -713,10 +713,10 @@ func TestCreateAndStart(t *testing.T) {
 	containerID := strings.Repeat("b", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "-it", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
@@ -1346,7 +1346,7 @@ func TestBuildInspectInfo(t *testing.T) {
 	exit := 23
 	container := ttosbundle.ContainerInfo{
 		ID: containerID, Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc", Platform: "linux/amd64",
-		RootFS: "/roots/alpine", NetworkMode: "host", State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
+		RootFS: "/roots/alpine", NetworkMode: "host", AutoRemove: true, State: "running", ExitStatus: &exit, CreatedAt: created, StartedAt: &started,
 	}
 	spec := &specs.Spec{
 		Root: &specs.Root{Readonly: false},
@@ -1390,6 +1390,9 @@ func TestBuildInspectInfo(t *testing.T) {
 	if got := info.HostConfig.Binds; !reflect.DeepEqual(got, []string{"/host/data:/data:ro"}) {
 		t.Errorf("binds=%q", got)
 	}
+	if !info.HostConfig.AutoRemove {
+		t.Error("inspect omitted auto-remove policy")
+	}
 	if info.HostConfig.NetworkMode != "host" {
 		t.Errorf("network mode=%q, want host", info.HostConfig.NetworkMode)
 	}
@@ -1398,6 +1401,22 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 	if len(info.TTOS.Branches) != 2 || info.TTOS.Branches[0].Metadata.ID != "child" {
 		t.Errorf("TTOS branches=%+v", info.TTOS.Branches)
+	}
+}
+
+func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
+	b := &fakeBackend{waitStatus: uint32(7 << 8)}
+	if err := runAutoRemove([]string{"demo"}, b); err != nil {
+		t.Fatalf("runAutoRemove: %v", err)
+	}
+	if b.waited != (selector{container: "demo", branch: "main"}) {
+		t.Errorf("waited=%+v", b.waited)
+	}
+	if b.removed != "demo" || !b.removeForce {
+		t.Errorf("remove=(%q, force=%t)", b.removed, b.removeForce)
+	}
+	if err := runAutoRemove([]string{"demo@child"}, b); err == nil {
+		t.Fatal("internal auto-remove accepted a branch selector")
 	}
 }
 
