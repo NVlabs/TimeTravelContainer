@@ -420,8 +420,11 @@ a selected `kernel.Kernel`. The current loader wrapper nevertheless hardcodes
       keeping TTOS-managed exec lifecycle and process/TTY state branch-local.
 - [x] Extend branch Kernel-lifetime leases to exec creation and wait, rejecting
       exec creation unless the selected branch is running.
-- [ ] Add failure injection around FD import, namespace selection, process
-      creation, publication, client disconnect, and wait cleanup.
+- [x] Add staged failure injection after namespace selection, session reservation,
+      internal-console creation, process creation, and session publication; rollback
+      kills an unpublished process and removes provisional session/console state.
+- [ ] Add lower-level donated-FD import failures plus client-disconnect and wait-cleanup
+      injection.
 - [ ] Test exec concurrently with pause, resume, fork, destroy, and sibling
       activity.
 

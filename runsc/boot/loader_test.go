@@ -346,6 +346,42 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		t.Fatalf("start result: %v", err)
 	}
 
+	for index, stage := range []SandboxExecStage{
+		SandboxExecStageNamespaceSelected,
+		SandboxExecStageSessionReserved,
+		SandboxExecStageConsoleCreated,
+		SandboxExecStageProcessCreated,
+		SandboxExecStageSessionPublished,
+	} {
+		execID := fmt.Sprintf("failed-exec-%d", index)
+		consoleID := fmt.Sprintf("failed-console-%d", index)
+		injected := errors.New("injected exec transaction failure")
+		l.family.testOnlyExecFailureInjector = func(completed SandboxExecStage) error {
+			if completed == stage {
+				return injected
+			}
+			return nil
+		}
+		_, err := l.executeAsync(&control.ExecArgs{
+			BranchID: DefaultBranchID, Filename: "/bin/sleep", Argv: []string{"/bin/sleep", "30"},
+			Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
+			KUID: auth.RootKUID, KGID: auth.RootKGID, ExecID: execID,
+			InternalConsoleID: consoleID, ContainerID: l.sandboxID,
+		})
+		l.family.testOnlyExecFailureInjector = nil
+		if !errors.Is(err, injected) {
+			t.Fatalf("exec failure at %s: got %v", stage, err)
+		}
+		if sessions, err := l.family.ExecSessions(&ExecSessionsArgs{BranchID: DefaultBranchID, CID: l.sandboxID}); err != nil {
+			t.Fatalf("listing sessions after %s: %v", stage, err)
+		} else if len(sessions) != 0 {
+			t.Fatalf("sessions leaked after %s: %+v", stage, sessions)
+		}
+		if _, _, _, err := l.k.ReadInternalConsole(l.k.SupervisorContext(), consoleID, kernel.InternalConsoleStdout, 1); err == nil {
+			t.Fatalf("internal console %q leaked after %s", consoleID, stage)
+		}
+	}
+
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
 	if parentTask.ThreadGroup().TTY() == nil {

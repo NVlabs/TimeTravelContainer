@@ -1688,6 +1688,9 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	defer root.DecRef(sctx)
 	ctx := vfs.WithRoot(sctx, root)
 	defer args.MountNamespace.DecRef(ctx)
+	if err := l.family.injectExecFailure(SandboxExecStageNamespaceSelected); err != nil {
+		return 0, err
+	}
 
 	if err := l.family.reserveExecSession(branch, args); err != nil {
 		return 0, err
@@ -1699,6 +1702,9 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 			l.family.abortExecSession(branch, args.ExecID)
 		}
 	}()
+	if err := l.family.injectExecFailure(SandboxExecStageSessionReserved); err != nil {
+		return 0, err
+	}
 
 	internalConsoleCreated := false
 	if args.InternalConsoleID != "" {
@@ -1743,6 +1749,9 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 			_ = targetKernel.RemoveInternalConsole(ctx, args.InternalConsoleID)
 		}
 	}()
+	if err := l.family.injectExecFailure(SandboxExecStageConsoleCreated); err != nil {
+		return 0, err
+	}
 
 	args.Envv, err = specutils.ResolveEnvs(args.Envv)
 	if err != nil {
@@ -1777,9 +1786,23 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if err != nil {
 		return 0, err
 	}
-	keepInternalConsole = true
+	keepProcess := false
+	defer func() {
+		if !keepProcess {
+			_ = targetKernel.SendExternalSignalThreadGroup(newTG, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+			newTG.WaitExited()
+		}
+	}()
+	if err := l.family.injectExecFailure(SandboxExecStageProcessCreated); err != nil {
+		return 0, err
+	}
 	l.family.publishExecSession(branch, args.ExecID, tgid, newTG)
+	if err := l.family.injectExecFailure(SandboxExecStageSessionPublished); err != nil {
+		return 0, err
+	}
+	keepInternalConsole = true
 	keepExecSession = true
+	keepProcess = true
 
 	if targetKernel == l.k {
 		eid := execID{cid: args.ContainerID, pid: tgid}

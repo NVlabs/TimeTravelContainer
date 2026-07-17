@@ -254,6 +254,7 @@ type SandboxFamily struct {
 	allowSharedFilesystemResources bool
 	watchdogOpts                   *watchdog.Opts
 	testOnlyForkFailureInjector    func(SandboxForkStage) error
+	testOnlyExecFailureInjector    func(SandboxExecStage) error
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -264,7 +265,21 @@ type SandboxFamilyOptions struct {
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
+	// TestOnlyExecFailureInjector verifies branch exec transaction cleanup.
+	// Production callers should leave it nil.
+	TestOnlyExecFailureInjector func(SandboxExecStage) error
 }
+
+// SandboxExecStage identifies a completed branch exec transaction stage.
+type SandboxExecStage string
+
+const (
+	SandboxExecStageNamespaceSelected SandboxExecStage = "namespace-selected"
+	SandboxExecStageSessionReserved   SandboxExecStage = "session-reserved"
+	SandboxExecStageConsoleCreated    SandboxExecStage = "console-created"
+	SandboxExecStageProcessCreated    SandboxExecStage = "process-created"
+	SandboxExecStageSessionPublished  SandboxExecStage = "session-published"
+)
 
 // SandboxForkStage identifies a completed family-level fork stage.
 type SandboxForkStage string
@@ -285,6 +300,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
 		testOnlyForkFailureInjector:    opts.TestOnlyForkFailureInjector,
+		testOnlyExecFailureInjector:    opts.TestOnlyExecFailureInjector,
 		defaultStarted:                 make(chan struct{}),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
@@ -304,6 +320,16 @@ func (f *SandboxFamily) injectForkFailure(stage SandboxForkStage) error {
 	}
 	if err := f.testOnlyForkFailureInjector(stage); err != nil {
 		return fmt.Errorf("sandbox fork aborted after %s: %w", stage, err)
+	}
+	return nil
+}
+
+func (f *SandboxFamily) injectExecFailure(stage SandboxExecStage) error {
+	if f.testOnlyExecFailureInjector == nil {
+		return nil
+	}
+	if err := f.testOnlyExecFailureInjector(stage); err != nil {
+		return fmt.Errorf("sandbox exec aborted after %s: %w", stage, err)
 	}
 	return nil
 }
