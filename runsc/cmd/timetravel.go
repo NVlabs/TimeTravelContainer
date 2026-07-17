@@ -61,6 +61,7 @@ type TimeTravel struct {
 	consoleReadyFD        int
 	consoleWaitStatus     string
 	consoleRetentionStats string
+	consolePIDFile        string
 	consoleLogMax         int64
 	consoleLogFiles       int
 }
@@ -104,8 +105,44 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled after console-follow connects")
 	f.StringVar(&t.consoleWaitStatus, "console-wait-status", "", "host path where console-follow atomically records init wait status")
 	f.StringVar(&t.consoleRetentionStats, "console-retention-stats", "", "host path for cumulative console retention accounting")
+	f.StringVar(&t.consolePIDFile, "console-pid-file", "", "host path for the console-follow process identity")
 	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
+}
+
+func publishConsoleFollowerPID(path string) (func(), error) {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".console-pid-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating console follower PID file: %w", err)
+	}
+	tempName := temp.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tempName)
+		}
+	}()
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return nil, fmt.Errorf("setting console follower PID permissions: %w", err)
+	}
+	if _, err := fmt.Fprintf(temp, "%d\n", os.Getpid()); err != nil {
+		temp.Close()
+		return nil, fmt.Errorf("writing console follower PID: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return nil, fmt.Errorf("syncing console follower PID: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return nil, fmt.Errorf("closing console follower PID: %w", err)
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return nil, fmt.Errorf("publishing console follower PID: %w", err)
+	}
+	cleanupTemp = false
+	return func() { _ = os.Remove(path) }, nil
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -257,6 +294,14 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			YPixels:   uint16(t.consoleYPixels),
 		})
 	case "console-follow":
+		if t.consolePIDFile != "" {
+			cleanupPID, pidErr := publishConsoleFollowerPID(t.consolePIDFile)
+			if pidErr != nil {
+				err = pidErr
+				break
+			}
+			defer cleanupPID()
+		}
 		type branchWaitResult struct {
 			err error
 		}

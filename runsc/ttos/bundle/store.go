@@ -292,6 +292,7 @@ type ConsolePaths struct {
 	Error          string
 	WaitStatus     string
 	RetentionStats string
+	PID            string
 }
 
 // VolumeInfo is persistent metadata for a family-local managed volume. Volume
@@ -987,6 +988,7 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 		Error:          base + ".error.log",
 		WaitStatus:     base + ".wait-status",
 		RetentionStats: ttosconsole.RetentionStatsPath(base + ".log"),
+		PID:            base + ".pid",
 	}, nil
 }
 
@@ -1018,6 +1020,7 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 		Error:          base + ".error.log",
 		WaitStatus:     base + ".wait-status",
 		RetentionStats: ttosconsole.RetentionStatsPath(base + ".log"),
+		PID:            base + ".pid",
 	}, nil
 }
 

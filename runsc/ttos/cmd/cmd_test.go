@@ -2225,7 +2225,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-retention-stats" ] && [ "${16}" = "--console-ready-fd" ] && [ "${17}" = "4" ] && [ "${18}" = "web" ] && [ "${19}" = "console-follow" ] && [ "${20}" = "child" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-retention-stats" ] && [ "${16}" = "--console-pid-file" ] && [ "${18}" = "--console-ready-fd" ] && [ "${19}" = "4" ] && [ "${20}" = "web" ] && [ "${21}" = "console-follow" ] && [ "${22}" = "child" ]; then
 	touch "$0.retention"
 	printf 1 >&4
 	exit 0

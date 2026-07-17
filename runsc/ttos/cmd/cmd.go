@@ -5131,6 +5131,9 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		}
 		return ttosbundle.ConsolePaths{}, fmt.Errorf("locking console drain: %w", err)
 	}
+	if err := os.Remove(paths.PID); err != nil && !os.IsNotExist(err) {
+		return ttosbundle.ConsolePaths{}, fmt.Errorf("removing stale console follower PID: %w", err)
+	}
 	if !reset {
 		if _, err := os.Stat(paths.WaitStatus); err == nil {
 			return paths, nil
@@ -5193,6 +5196,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		"--console-log-max-files", strconv.Itoa(maxFiles),
 		"--console-wait-status", paths.WaitStatus,
 		"--console-retention-stats", paths.RetentionStats,
+		"--console-pid-file", paths.PID,
 		"--console-ready-fd", "4",
 	}
 	if execID != "" {

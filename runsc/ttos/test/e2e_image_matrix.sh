@@ -485,6 +485,30 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
   sleep 1
 done
+echo "== console sidecar crash recovery =="
+SIDECAR_PID_FILE="$DATA_ROOT/containers/$LIFECYCLE_ID/console/main.pid"
+deadline=$(( $(date +%s) + 15 ))
+while [ ! -s "$SIDECAR_PID_FILE" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "active console sidecar did not publish its PID"
+  sleep 1
+done
+OLD_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE")
+kill -KILL "$OLD_SIDECAR_PID"
+deadline=$(( $(date +%s) + 15 ))
+while :; do
+  ttos logs --tail 10 "$LIFECYCLE" >/dev/null 2>&1 || true
+  NEW_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE" 2>/dev/null || true)
+  if [ -n "$NEW_SIDECAR_PID" ] && [ "$NEW_SIDECAR_PID" != "$OLD_SIDECAR_PID" ] && kill -0 "$NEW_SIDECAR_PID" 2>/dev/null; then
+    break
+  fi
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console sidecar was not replaced after SIGKILL"
+  sleep 1
+done
+deadline=$(( $(date +%s) + 15 ))
+while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q "tick:"; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after sidecar replacement"
+  sleep 1
+done
 
 ttos container restart --force --time 2 "$LIFECYCLE"
 deadline=$(( $(date +%s) + 15 ))
