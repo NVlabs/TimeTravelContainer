@@ -48,17 +48,18 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	image := ocispec.Image{Config: ocispec.ImageConfig{
 		User:       "app",
-		Env:        []string{"A=image", "B=keep"},
+		Env:        []string{"A=image", "B=first", "B=keep"},
 		Entrypoint: []string{"/entry"},
 		Cmd:        []string{"default"},
 		WorkingDir: "/work",
-		Labels:     map[string]string{"suite": "ttos"},
+		Labels:     map[string]string{"keep": "yes", "suite": "image"},
 	}}
 	spec, err := BuildSpec(image, SpecOptions{
 		Name:       "demo",
 		RootFS:     root,
 		Args:       []string{"override", "arg"},
-		Env:        []string{"A=run", "C=new"},
+		Env:        []string{"A=run", "B", "C=new"},
+		Labels:     map[string]string{"empty": "", "extra": "value", "suite": "run"},
 		HostMounts: []HostMount{{Source: host, Destination: "/mnt/fixture", Readonly: true}},
 		ManagedVolumes: []ManagedVolume{
 			{Name: "cache", Destination: "/cache"},
@@ -71,7 +72,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got, want := spec.Process.Args, []string{"/entry", "override", "arg"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("args=%q, want %q", got, want)
 	}
-	if got, want := spec.Process.Env, []string{"A=run", "B=keep", "C=new"}; !reflect.DeepEqual(got, want) {
+	if got, want := spec.Process.Env, []string{"A=run", "C=new"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("env=%q, want %q", got, want)
 	}
 	if spec.Process.Cwd != "/work" || spec.Hostname != "demo" {
@@ -126,7 +127,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		"dev.timetravelos.config.entrypoint": `["/entry"]`,
 		"dev.timetravelos.config.cmd":        `["override","arg"]`,
 		"dev.timetravelos.config.user":       "app",
-		"dev.timetravelos.config.labels":     `{"suite":"ttos"}`,
+		"dev.timetravelos.config.labels":     `{"empty":"","extra":"value","keep":"yes","suite":"run"}`,
 	}
 	for key, want := range wantConfigAnnotations {
 		if got := spec.Annotations[key]; got != want {
@@ -162,7 +163,7 @@ func hasNamespace(spec *specs.Spec, namespace specs.LinuxNamespaceType) bool {
 
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
-	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), Env: []string{"INVALID"}}); err == nil {
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), Env: []string{"=INVALID"}}); err == nil {
 		t.Error("BuildSpec accepted invalid environment override")
 	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), Cwd: "relative"}); err == nil {

@@ -135,8 +135,13 @@ the `main` branch and leave `ttos` responsible for branch operations.
 
 - [x] `ttos run [OPTIONS] IMAGE [COMMAND...]` (initial foreground/detached,
       non-TTY slice with procfs, `/dev` tmpfs, and restricted sysfs mounts).
-- [x] Support `--name`, environment variables, working directory, named or
-      numeric user, entrypoint override, hostname, and rootless execution.
+- [x] Support `--name`, Docker-style `--env`/`-e` values and host imports,
+      `--env-file` (including removal of inherited image variables),
+      `--label`/`-l`, and `--label-file`, with direct flags overriding file and
+      image values. Persist the effective environment and labels through
+      create/start/restart/fork and expose them through inspect. Also support
+      working directory, named or numeric user, entrypoint override, hostname,
+      and rootless execution.
 - [x] Keep single-ID user-namespace rootless execution as the default without
       requiring `newuidmap`, `newgidmap`, or subordinate-ID ranges. Provide an
       explicit `--unsafe-no-host-isolation` fallback for trusted workloads on

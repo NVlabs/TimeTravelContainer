@@ -556,6 +556,104 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateLoadEnvironmentAndLabels(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "container.env")
+	const absent = "TTOS_TEST_ABSENT_ENV_7281"
+	if _, ok := os.LookupEnv(absent); ok {
+		t.Fatalf("test environment unexpectedly contains %s", absent)
+	}
+	if err := os.WriteFile(envFile, []byte("# from a file\nFROM_FILE=file\nHOST_IMPORT\n"+absent+"\n\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	labelFile := filepath.Join(dir, "container.labels")
+	if err := os.WriteFile(labelFile, []byte("# metadata\nsuite=file\nfile-only=value\nempty\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_IMPORT", "host-value")
+	t.Setenv("DIRECT_IMPORT", "direct-host")
+
+	for _, command := range []string{"run", "create"} {
+		t.Run(command, func(t *testing.T) {
+			b := &fakeBackend{}
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				command,
+				"--env-file", envFile,
+				"--env", "FROM_FILE=direct",
+				"-e", "DIRECT=value",
+				"-e", "DIRECT_IMPORT",
+				"-e", absent,
+				"--label-file", labelFile,
+				"--label", "suite=direct",
+				"-l", "direct-only=value",
+				"--name", "demo",
+				"busybox:1.36",
+			}
+			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("%s status=%d, stderr=%q", command, status, stderr.String())
+			}
+			wantEnv := []string{
+				"FROM_FILE=file",
+				"HOST_IMPORT=host-value",
+				absent,
+				"FROM_FILE=direct",
+				"DIRECT=value",
+				"DIRECT_IMPORT=direct-host",
+				absent,
+			}
+			if !reflect.DeepEqual(b.runRequest.env, wantEnv) {
+				t.Errorf("environment=%q, want %q", b.runRequest.env, wantEnv)
+			}
+			wantLabels := map[string]string{
+				"suite":       "direct",
+				"file-only":   "value",
+				"empty":       "",
+				"direct-only": "value",
+			}
+			if !reflect.DeepEqual(b.runRequest.labels, wantLabels) {
+				t.Errorf("labels=%q, want %q", b.runRequest.labels, wantLabels)
+			}
+			wantOutput := ""
+			if command == "create" {
+				wantOutput = "demo\n"
+			}
+			if got := stdout.String(); got != wantOutput {
+				t.Errorf("output=%q, want %q", got, wantOutput)
+			}
+			if got := b.created; got != (command == "create") {
+				t.Errorf("created=%t for %s", got, command)
+			}
+		})
+	}
+}
+
+func TestRunAndCreateRejectInvalidEnvironmentAndLabelFiles(t *testing.T) {
+	dir := t.TempDir()
+	invalidEnv := filepath.Join(dir, "invalid.env")
+	if err := os.WriteFile(invalidEnv, []byte(" =value\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	invalidLabels := filepath.Join(dir, "invalid.labels")
+	if err := os.WriteFile(invalidLabels, []byte("=value\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"run", "--env-file", filepath.Join(dir, "missing"), "busybox"},
+		{"run", "--env-file", invalidEnv, "busybox"},
+		{"create", "--label-file", invalidLabels, "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) reached backend with %+v", args, b.runRequest)
+		}
+	}
+}
+
 func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--network", "bridge", "busybox"},

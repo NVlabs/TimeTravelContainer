@@ -59,6 +59,12 @@ RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
 HOST_FIXTURE="$TTOS_E2E_ROOT/host-fixture"
 mkdir -p "$HOST_FIXTURE"
 echo host-readonly >"$HOST_FIXTURE/value"
+ENV_FILE="$TTOS_E2E_ROOT/container.env"
+LABEL_FILE="$TTOS_E2E_ROOT/container.labels"
+TTOS_E2E_HOST_IMPORT=host-import
+export TTOS_E2E_HOST_IMPORT
+printf "%s\n" "# environment file" "FROM_FILE=file" "TTOS_E2E_HOST_IMPORT" >"$ENV_FILE"
+printf "%s\n" "# label file" "suite=file" "file-only=value" "empty" >"$LABEL_FILE"
 PREFIX="e2e-$$"
 LIFECYCLE="$PREFIX-lifecycle"
 CONSOLE_STRESS="$PREFIX-console-stress"
@@ -114,11 +120,19 @@ done
 [ "$(ttos images -q | wc -l)" -ge 5 ] || fail "quiet image inventory omitted an image ID"
 
 echo "== one-shot compatibility probes =="
-ttos create --name "$PREFIX-busybox" "$BUSYBOX_IMAGE" sh -c \
-  'test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok'
+ttos create --name "$PREFIX-busybox" \
+  --env-file "$ENV_FILE" --env FROM_FILE=direct \
+  --label-file "$LABEL_FILE" --label suite=create \
+  "$BUSYBOX_IMAGE" sh -c \
+  'test "$FROM_FILE" = direct && test "$TTOS_E2E_HOST_IMPORT" = host-import && test -r /proc/self/status && test -r /sys/kernel && echo busybox-ok'
 [ "$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{.Path}}|{{len .TTOS.Branches}}' "$PREFIX-busybox")" = \
   "created|docker.io/library/busybox:1.36|sh|1" ] ||
   fail "created-container inspect did not expose Docker config and TTOS branch state"
+[ "$(ttos inspect -f '{{index .Config.Labels "suite"}}|{{index .Config.Labels "file-only"}}|{{index .Config.Labels "empty"}}' "$PREFIX-busybox")" = \
+  "create|value|" ] || fail "created-container inspect did not retain merged labels"
+BUSYBOX_ENV=$(ttos inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$PREFIX-busybox")
+echo "$BUSYBOX_ENV" | grep -qx 'FROM_FILE=direct' || fail "created-container inspect omitted direct environment override"
+echo "$BUSYBOX_ENV" | grep -qx 'TTOS_E2E_HOST_IMPORT=host-import' || fail "created-container inspect omitted imported host environment"
 ttos start --attach "$PREFIX-busybox"
 [ "$(ttos inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
   "exited|0|false" ] ||
@@ -212,6 +226,8 @@ ttos rm "$CONSOLE_STRESS"
 echo "== detached lifecycle, managed-volume CoW, and live fork =="
 ttos volume create "$VOLUME"
 ttos run --name "$LIFECYCLE" --detach \
+  --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
+  --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-opt max-size=64k --log-opt max-file=3 \
   --volume "$VOLUME:/state" \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
@@ -254,6 +270,11 @@ ttos fork "$LIFECYCLE" child
 RUNNING_INSPECT=$(ttos inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTOS.Branches}}' "$LIFECYCLE")
 [ "$RUNNING_INSPECT" = "running|docker.io/library/alpine:3.20|2" ] ||
   fail "running forked inspect returned $RUNNING_INSPECT"
+[ "$(ttos inspect -f '{{index .Config.Labels "suite"}}|{{index .Config.Labels "file-only"}}|{{index .Config.Labels "empty"}}' "$LIFECYCLE")" = \
+  "lifecycle|value|" ] || fail "forked-container inspect did not retain merged labels"
+LIFECYCLE_ENV=$(ttos inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$LIFECYCLE")
+echo "$LIFECYCLE_ENV" | grep -qx 'FROM_FILE=lifecycle' || fail "forked-container inspect omitted direct environment override"
+echo "$LIFECYCLE_ENV" | grep -qx 'TTOS_E2E_HOST_IMPORT=host-import' || fail "forked-container inspect omitted imported host environment"
 INSPECT_JSON="$TTOS_E2E_ROOT/lifecycle-inspect.json"
 ttos inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
 grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"

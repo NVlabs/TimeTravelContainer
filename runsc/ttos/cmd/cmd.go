@@ -16,6 +16,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -405,6 +406,80 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
+func readKeyValueFiles(paths []string, kind string) ([]string, error) {
+	var values []string
+	for _, name := range paths {
+		file, err := os.Open(name)
+		if err != nil {
+			return nil, fmt.Errorf("opening %s file %q: %w", kind, name, err)
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		lineNumber := 0
+		for scanner.Scan() {
+			lineNumber++
+			line := strings.TrimSuffix(scanner.Text(), "\r")
+			if lineNumber == 1 {
+				line = strings.TrimPrefix(line, "\ufeff")
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			values = append(values, line)
+		}
+		scanErr := scanner.Err()
+		closeErr := file.Close()
+		if scanErr != nil {
+			return nil, fmt.Errorf("reading %s file %q: %w", kind, name, scanErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("closing %s file %q: %w", kind, name, closeErr)
+		}
+	}
+	return values, nil
+}
+
+func collectEnvironment(fileNames, direct []string) ([]string, error) {
+	values, err := readKeyValueFiles(fileNames, "environment")
+	if err != nil {
+		return nil, err
+	}
+	values = append(values, direct...)
+	for i, value := range values {
+		name, _, hasValue := strings.Cut(value, "=")
+		if name == "" || strings.TrimSpace(name) != name {
+			return nil, fmt.Errorf("invalid environment variable %q", value)
+		}
+		if !hasValue {
+			if hostValue, ok := os.LookupEnv(name); ok {
+				values[i] = name + "=" + hostValue
+			}
+		}
+	}
+	return values, nil
+}
+
+func collectLabels(fileNames, direct []string) (map[string]string, error) {
+	values, err := readKeyValueFiles(fileNames, "label")
+	if err != nil {
+		return nil, err
+	}
+	values = append(values, direct...)
+	labels := make(map[string]string, len(values))
+	for _, value := range values {
+		name, labelValue, hasValue := strings.Cut(value, "=")
+		if name == "" || strings.TrimSpace(name) != name {
+			return nil, fmt.Errorf("invalid label %q", value)
+		}
+		if !hasValue {
+			labelValue = ""
+		}
+		labels[name] = labelValue
+	}
+	return labels, nil
+}
+
 // expandCombinedShortBools implements Docker-style boolean clusters such as
 // -it and -dit while preserving everything after the image/container operand.
 func expandCombinedShortBools(args []string, boolNames string, valueNames ...string) []string {
@@ -779,6 +854,7 @@ type runRequest struct {
 	platform           string
 	args               []string
 	env                []string
+	labels             map[string]string
 	cwd                string
 	user               string
 	hostname           string
@@ -813,7 +889,7 @@ type exitStatus struct{ code int }
 func (e exitStatus) Error() string { return fmt.Sprintf("container exited with status %d", e.code) }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--volume", "-v", "--mount", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -832,9 +908,13 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
-	var env stringSlice
-	fs.Var(&env, "env", "set environment variable NAME=VALUE")
-	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	var env, envFiles, labels, labelFiles stringSlice
+	fs.Var(&env, "env", "set or import environment variable NAME[=VALUE]")
+	fs.Var(&env, "e", "set or import environment variable NAME[=VALUE]")
+	fs.Var(&envFiles, "env-file", "read environment variables from a file")
+	fs.Var(&labels, "label", "set container metadata KEY[=VALUE]")
+	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
+	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts stringSlice
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
@@ -846,6 +926,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos run [OPTIONS] IMAGE [COMMAND...]")
+	}
+	envValues, err := collectEnvironment(envFiles, env)
+	if err != nil {
+		return err
+	}
+	labelValues, err := collectLabels(labelFiles, labels)
+	if err != nil {
+		return err
 	}
 	networkMode, err := parseNetworkMode(*networkModeValue)
 	if err != nil {
@@ -868,7 +956,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		reference:          fs.Arg(0),
 		platform:           *platform,
 		args:               append([]string(nil), fs.Args()[1:]...),
-		env:                append([]string(nil), env...),
+		env:                envValues,
+		labels:             labelValues,
 		cwd:                *cwd,
 		user:               *user,
 		hostname:           *hostname,
@@ -903,7 +992,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--volume", "-v", "--mount", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--entrypoint", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -920,9 +1009,13 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
-	var env stringSlice
-	fs.Var(&env, "env", "set environment variable NAME=VALUE")
-	fs.Var(&env, "e", "set environment variable NAME=VALUE")
+	var env, envFiles, labels, labelFiles stringSlice
+	fs.Var(&env, "env", "set or import environment variable NAME[=VALUE]")
+	fs.Var(&env, "e", "set or import environment variable NAME[=VALUE]")
+	fs.Var(&envFiles, "env-file", "read environment variables from a file")
+	fs.Var(&labels, "label", "set container metadata KEY[=VALUE]")
+	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
+	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts stringSlice
 	fs.Var(&volumes, "volume", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
 	fs.Var(&volumes, "v", "attach NAME:CONTAINER[:ro] or HOST:CONTAINER:ro")
@@ -934,6 +1027,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	if fs.NArg() < 1 {
 		return errors.New("usage: ttos create [OPTIONS] IMAGE [COMMAND...]")
+	}
+	envValues, err := collectEnvironment(envFiles, env)
+	if err != nil {
+		return err
+	}
+	labelValues, err := collectLabels(labelFiles, labels)
+	if err != nil {
+		return err
 	}
 	networkMode, err := parseNetworkMode(*networkModeValue)
 	if err != nil {
@@ -956,7 +1057,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		reference:          fs.Arg(0),
 		platform:           *platform,
 		args:               append([]string(nil), fs.Args()[1:]...),
-		env:                append([]string(nil), env...),
+		env:                envValues,
+		labels:             labelValues,
 		cwd:                *cwd,
 		user:               *user,
 		hostname:           *hostname,
@@ -3097,6 +3199,7 @@ func (b *runtimeBackend) run(request runRequest) (int, error) {
 			Name:           request.name,
 			Args:           request.args,
 			Env:            request.env,
+			Labels:         request.labels,
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,
@@ -3129,6 +3232,7 @@ func (b *runtimeBackend) create(request runRequest) error {
 			Name:           request.name,
 			Args:           request.args,
 			Env:            request.env,
+			Labels:         request.labels,
 			Cwd:            request.cwd,
 			User:           request.user,
 			Hostname:       request.hostname,

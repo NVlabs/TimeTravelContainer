@@ -53,6 +53,7 @@ type SpecOptions struct {
 	RootFS         string
 	Args           []string
 	Env            []string
+	Labels         map[string]string
 	Cwd            string
 	User           string
 	Hostname       string
@@ -172,7 +173,14 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encoding effective command: %w", err)
 	}
-	labelsJSON, err := json.Marshal(image.Config.Labels)
+	labels := make(map[string]string, len(image.Config.Labels)+len(opts.Labels))
+	for key, value := range image.Config.Labels {
+		labels[key] = value
+	}
+	for key, value := range opts.Labels {
+		labels[key] = value
+	}
+	labelsJSON, err := json.Marshal(labels)
 	if err != nil {
 		return nil, fmt.Errorf("encoding image labels: %w", err)
 	}
@@ -297,9 +305,23 @@ func mergeEnv(imageEnv, overrides []string) ([]string, error) {
 		}
 	}
 	for _, value := range overrides {
-		name, _, ok := strings.Cut(value, "=")
-		if !ok || name == "" {
-			return nil, fmt.Errorf("environment override %q must be NAME=VALUE", value)
+		name, _, hasValue := strings.Cut(value, "=")
+		if name == "" {
+			return nil, fmt.Errorf("environment override %q has an empty name", value)
+		}
+		if !hasValue {
+			clear(positions)
+			kept := result[:0]
+			for _, entry := range result {
+				entryName, _, _ := strings.Cut(entry, "=")
+				if entryName == name {
+					continue
+				}
+				positions[entryName] = len(kept)
+				kept = append(kept, entry)
+			}
+			result = kept
+			continue
 		}
 		if i, ok := positions[name]; ok {
 			result[i] = value

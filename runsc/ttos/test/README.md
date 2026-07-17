@@ -8,8 +8,9 @@ covers:
   inspection;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
-  configuration, user mounts, sandbox PID, per-branch processes and timings,
-  and explicit fork-eligibility reports;
+  configuration, env-file/host-import environment overrides, merged labels,
+  user mounts, sandbox PID, per-branch processes and timings, and explicit
+  fork-eligibility reports;
 - Docker-style `container` aliases, multi-container detached `start`, concurrent
   `wait` with argument-ordered exit codes, restart of an exited container, and
   an explicitly forced running-family restart where in-memory managed-volume
