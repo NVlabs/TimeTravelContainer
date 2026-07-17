@@ -1396,6 +1396,13 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	return nil
 }
 
+func initialInternalPTYWinsize(rows, cols uint64) linux.Winsize {
+	if rows == 0 || rows > 1<<16-1 || cols == 0 || cols > 1<<16-1 {
+		return linux.Winsize{Row: 24, Col: 80}
+	}
+	return linux.Winsize{Row: uint16(rows), Col: uint16(cols)}
+}
+
 func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable, error) {
 	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
 	if consoleID == "" {
@@ -1416,9 +1423,14 @@ func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable
 		if err != nil {
 			return nil, err
 		}
-		if err := l.k.ResizeInternalConsole(ctx, consoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
+		rows, cols := uint64(0), uint64(0)
+		if size := info.spec.Process.ConsoleSize; size != nil {
+			rows, cols = uint64(size.Height), uint64(size.Width)
+		}
+		winsize := initialInternalPTYWinsize(rows, cols)
+		if err := l.k.ResizeInternalConsole(ctx, consoleID, winsize); err != nil {
 			fdTable.DecRef(ctx)
-			return nil, fmt.Errorf("setting default internal PTY size: %w", err)
+			return nil, fmt.Errorf("setting initial internal PTY size: %w", err)
 		}
 		info.procArgs.TTY = tty
 		return fdTable, nil
@@ -1707,9 +1719,10 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 			if err != nil {
 				return 0, err
 			}
-			if err := targetKernel.ResizeInternalConsole(consoleCtx, args.InternalConsoleID, linux.Winsize{Row: 24, Col: 80}); err != nil {
+			winsize := initialInternalPTYWinsize(uint64(args.ConsoleRows), uint64(args.ConsoleCols))
+			if err := targetKernel.ResizeInternalConsole(consoleCtx, args.InternalConsoleID, winsize); err != nil {
 				_ = targetKernel.RemoveInternalConsole(consoleCtx, args.InternalConsoleID)
-				return 0, fmt.Errorf("setting default internal exec PTY size: %w", err)
+				return 0, fmt.Errorf("setting initial internal exec PTY size: %w", err)
 			}
 			args.TTY = tty
 		} else {

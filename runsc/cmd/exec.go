@@ -71,6 +71,8 @@ type Exec struct {
 	internalConsole         string
 	internalConsoleTerminal bool
 	internalConsoleStdin    bool
+	internalConsoleRows     int
+	internalConsoleCols     int
 
 	// passFDs are user-supplied FDs from the host to be exposed to the
 	// sandboxed app.
@@ -126,6 +128,8 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&ex.internalConsole, "internal-console", "", "Sentry-owned branch-local pipe or PTY console ID")
 	f.BoolVar(&ex.internalConsoleTerminal, "internal-console-terminal", false, "make --internal-console a PTY")
 	f.BoolVar(&ex.internalConsoleStdin, "internal-console-stdin", false, "forward stdin to --internal-console")
+	f.IntVar(&ex.internalConsoleRows, "internal-console-rows", 0, "initial internal PTY rows")
+	f.IntVar(&ex.internalConsoleCols, "internal-console-cols", 0, "initial internal PTY columns")
 	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 }
@@ -165,6 +169,14 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 		e.InternalConsoleID = ex.internalConsole
 		e.StdioIsPty = ex.internalConsoleTerminal
+		if ex.internalConsoleRows < 0 || ex.internalConsoleRows > 1<<16-1 || ex.internalConsoleCols < 0 || ex.internalConsoleCols > 1<<16-1 {
+			util.Fatalf("--internal-console-rows and --internal-console-cols must fit in uint16")
+		}
+		if (ex.internalConsoleRows == 0) != (ex.internalConsoleCols == 0) {
+			util.Fatalf("--internal-console-rows and --internal-console-cols must be specified together")
+		}
+		e.ConsoleRows = uint16(ex.internalConsoleRows)
+		e.ConsoleCols = uint16(ex.internalConsoleCols)
 	}
 	if ex.execID != "" && e.InternalConsoleID == "" {
 		util.Fatalf("--exec-id requires --internal-console")
@@ -317,7 +329,7 @@ func (ex *Exec) startInternalConsole(c *container.Container, e *control.ExecArgs
 	if branchID == "" {
 		branchID = boot.DefaultBranchID
 	}
-	target := &boot.ConsoleResizeArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID}
+	target := &boot.ConsoleResizeArgs{BranchID: branchID, ConsoleID: e.InternalConsoleID, Rows: e.ConsoleRows, Cols: e.ConsoleCols}
 	stdinFD := int(os.Stdin.Fd())
 	stdinIsTerminal := e.StdioIsPty && term.IsTerminal(stdinFD)
 	if stdinIsTerminal {

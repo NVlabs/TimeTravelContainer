@@ -34,13 +34,15 @@ import (
 )
 
 const (
-	daemonAPIVersion  = 1
-	daemonFrameStdin  = byte('I')
-	daemonFrameEOF    = byte('C')
-	daemonFrameStdout = byte('O')
-	daemonFrameStderr = byte('E')
-	daemonFrameStatus = byte('X')
-	daemonMaxFrame    = 1 << 20
+	daemonAPIVersion    = 2
+	daemonFrameStdin    = byte('I')
+	daemonFrameEOF      = byte('C')
+	daemonFrameResize   = byte('W')
+	daemonFrameStdout   = byte('O')
+	daemonFrameStderr   = byte('E')
+	daemonFrameStatus   = byte('X')
+	daemonFrameTerminal = byte('T')
+	daemonMaxFrame      = 1 << 20
 )
 
 type daemonWireOptions struct {
@@ -314,12 +316,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if !request.Stdin {
 		stdinWriter.Close()
 	}
-	if request.Stdin {
-		go receiveDaemonInput(reader, stdinWriter)
-	}
+	terminalInput := newDaemonTerminalInput(stdinReader, conn, &writeMu)
+	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
 	opts := optionsFromWire(request.Options)
-	backend := directBackend(opts, stdinReader,
+	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 	if request.Args[0] == "events" {
@@ -456,23 +457,43 @@ func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
 	return lock.Unlock
 }
 
-func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter) {
-	defer writer.Close()
+func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin bool, terminal *daemonTerminalInput) {
+	var stdinQueue *daemonStdinQueue
+	if allowStdin {
+		stdinQueue = newDaemonStdinQueue(writer)
+	}
+	stdinOpen := allowStdin
+	fail := func(err error) {
+		if stdinQueue != nil {
+			stdinQueue.closeWithError(err)
+		}
+	}
 	for {
 		typ, payload, err := readDaemonFrame(reader)
 		if err != nil {
-			writer.CloseWithError(err)
+			fail(err)
 			return
 		}
 		switch typ {
 		case daemonFrameStdin:
-			if _, err := writer.Write(payload); err != nil {
+			if !stdinOpen || !stdinQueue.enqueue(payload) {
+				fail(errors.New("unexpected stdin frame"))
 				return
 			}
 		case daemonFrameEOF:
-			return
+			if stdinOpen {
+				stdinOpen = false
+				stdinQueue.closeWithError(nil)
+			}
+		case daemonFrameResize:
+			rows, cols, err := decodeDaemonTerminalSize(payload)
+			if err != nil {
+				fail(err)
+				return
+			}
+			terminal.updateSize(rows, cols)
 		default:
-			writer.CloseWithError(fmt.Errorf("unexpected client frame %q", typ))
+			fail(fmt.Errorf("unexpected client frame %q", typ))
 			return
 		}
 	}
@@ -693,6 +714,11 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 		}()
 	}
 
+	terminal := newDaemonClientTerminal(stdin, func(typ byte, payload []byte) error {
+		return writeDaemonFrame(conn, &writeMu, typ, payload)
+	})
+	defer terminal.Close()
+
 	reader := bufio.NewReader(conn)
 	for {
 		typ, payload, err := readDaemonFrame(reader)
@@ -706,6 +732,10 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 			}
 		case daemonFrameStderr:
 			if _, err := stderr.Write(payload); err != nil {
+				return 1, err
+			}
+		case daemonFrameTerminal:
+			if err := terminal.configure(payload); err != nil {
 				return 1, err
 			}
 		case daemonFrameStatus:

@@ -1769,7 +1769,20 @@ func (f *detachKeyFilter) flush() []byte {
 	return output
 }
 
+type remoteTerminalInput interface {
+	io.Reader
+	setRawTerminal(bool) error
+	terminalSize() (cols, rows int, ok bool, err error)
+	terminalResizeEvents() <-chan struct{}
+}
+
 func makeRawTerminal(input io.Reader) (func() error, error) {
+	if remote, ok := input.(remoteTerminalInput); ok {
+		if err := remote.setRawTerminal(true); err != nil {
+			return nil, err
+		}
+		return func() error { return remote.setRawTerminal(false) }, nil
+	}
 	file, ok := input.(*os.File)
 	if !ok {
 		return nil, nil
@@ -1788,6 +1801,9 @@ func makeRawTerminal(input io.Reader) (func() error, error) {
 }
 
 func hostTerminalSize(input io.Reader) (cols, rows int, ok bool, err error) {
+	if remote, ok := input.(remoteTerminalInput); ok {
+		return remote.terminalSize()
+	}
 	file, ok := input.(*os.File)
 	if !ok || !term.IsTerminal(int(file.Fd())) {
 		return 0, 0, false, nil
@@ -4023,7 +4039,22 @@ func validateImageRemoval(digest string, users []string, force bool) error {
 	return nil
 }
 
+func (b *runtimeBackend) initialConsoleSize(enabled bool) (*specs.Box, error) {
+	if !enabled {
+		return nil, nil
+	}
+	cols, rows, ok, err := hostTerminalSize(b.stdin)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &specs.Box{Height: uint(rows), Width: uint(cols)}, nil
+}
+
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
+	consoleSize, err := b.initialConsoleSize(request.terminal)
+	if err != nil {
+		return containerRunResult{}, err
+	}
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
@@ -4035,6 +4066,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			User:             request.user,
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
+			ConsoleSize:      consoleSize,
 			NetworkMode:      request.networkMode,
 			ExtraHosts:       request.extraHosts,
 			DNS:              request.dns,
@@ -4079,6 +4111,10 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 }
 
 func (b *runtimeBackend) create(request runRequest) (string, error) {
+	consoleSize, err := b.initialConsoleSize(request.terminal)
+	if err != nil {
+		return "", err
+	}
 	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
@@ -4090,6 +4126,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			User:             request.user,
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
+			ConsoleSize:      consoleSize,
 			NetworkMode:      request.networkMode,
 			ExtraHosts:       request.extraHosts,
 			DNS:              request.dns,
@@ -4226,12 +4263,19 @@ func (b *runtimeBackend) removeStoppedRuntime(name string) error {
 	return nil
 }
 
-func (b *runtimeBackend) exec(request execRequest) (int, error) {
+func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error) {
 	resolved, _, err := b.resolveSelector(request.target)
 	if err != nil {
 		return 1, err
 	}
 	request.target = resolved
+	cols, rows, hasConsoleSize := 0, 0, false
+	if request.terminal {
+		cols, rows, hasConsoleSize, err = hostTerminalSize(b.stdin)
+		if err != nil {
+			return 1, err
+		}
+	}
 	args := []string{"--root", b.root, "exec", "--branch", request.target.branch}
 	consoleID := ""
 	if request.detach {
@@ -4266,6 +4310,9 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 			args = append(args, "--internal-console", consoleID)
 		}
 		args = append(args, "--internal-console-terminal")
+		if hasConsoleSize {
+			args = append(args, "--internal-console-rows", strconv.Itoa(rows), "--internal-console-cols", strconv.Itoa(cols))
+		}
 		if request.interactive && !request.detach {
 			args = append(args, "--internal-console-stdin")
 		}
@@ -4280,7 +4327,27 @@ func (b *runtimeBackend) exec(request execRequest) (int, error) {
 	}
 	command.Stdout = b.stdout
 	command.Stderr = b.stderr
-	if err := command.Run(); err != nil {
+	if request.terminal && request.interactive && !request.detach {
+		restore, err := makeRawTerminal(b.stdin)
+		if err != nil {
+			return 1, err
+		}
+		if restore != nil {
+			defer func() {
+				if err := restore(); retErr == nil && err != nil {
+					retErr = fmt.Errorf("restoring exec stdin terminal: %w", err)
+				}
+			}()
+		}
+	}
+	if err := command.Start(); err != nil {
+		return 1, fmt.Errorf("starting runsc exec: %w", err)
+	}
+	if request.terminal && !request.detach {
+		stopResize := b.watchConsoleResize(request.target, consoleID)
+		defer stopResize()
+	}
+	if err := command.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode(), nil
@@ -5196,16 +5263,26 @@ func (b *runtimeBackend) resizeConsoleFromHost(target selector, consoleID string
 }
 
 func (b *runtimeBackend) watchConsoleResize(target selector, consoleID string) func() {
-	file, ok := b.stdin.(*os.File)
-	if !ok || !term.IsTerminal(int(file.Fd())) {
-		return func() {}
+	var resizeEvents <-chan struct{}
+	var resizeSignals chan os.Signal
+	if remote, ok := b.stdin.(remoteTerminalInput); ok {
+		resizeEvents = remote.terminalResizeEvents()
+	} else {
+		file, ok := b.stdin.(*os.File)
+		if !ok || !term.IsTerminal(int(file.Fd())) {
+			return func() {}
+		}
+		resizeSignals = make(chan os.Signal, 1)
+		signal.Notify(resizeSignals, syscall.SIGWINCH)
 	}
-	resizeSignals := make(chan os.Signal, 1)
 	done := make(chan struct{})
-	signal.Notify(resizeSignals, syscall.SIGWINCH)
 	go func() {
 		for {
 			select {
+			case <-resizeEvents:
+				if err := b.resizeConsoleFromHost(target, consoleID); err != nil && b.stderr != nil {
+					fmt.Fprintf(b.stderr, "ttos: warning: resizing console for %s: %v\n", target, err)
+				}
 			case <-resizeSignals:
 				if err := b.resizeConsoleFromHost(target, consoleID); err != nil && b.stderr != nil {
 					fmt.Fprintf(b.stderr, "ttos: warning: resizing console for %s: %v\n", target, err)
@@ -5216,7 +5293,9 @@ func (b *runtimeBackend) watchConsoleResize(target selector, consoleID string) f
 		}
 	}()
 	return func() {
-		signal.Stop(resizeSignals)
+		if resizeSignals != nil {
+			signal.Stop(resizeSignals)
+		}
 		close(done)
 	}
 }

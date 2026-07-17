@@ -67,6 +67,8 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		Name:           "demo",
 		RootFS:         root,
 		ReadonlyRootfs: true,
+		Terminal:       true,
+		ConsoleSize:    &specs.Box{Height: 37, Width: 91},
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
 		ShmSize:        &shmSize,
@@ -97,6 +99,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 
 	if !spec.Root.Readonly {
 		t.Error("root filesystem is writable")
+	}
+	if !spec.Process.Terminal || spec.Process.ConsoleSize == nil || spec.Process.ConsoleSize.Height != 37 || spec.Process.ConsoleSize.Width != 91 {
+		t.Errorf("terminal configuration=%+v size=%+v", spec.Process.Terminal, spec.Process.ConsoleSize)
 	}
 	if got, want := spec.Process.Args, []string{"/entry", "override", "arg"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("args=%q, want %q", got, want)

@@ -145,6 +145,11 @@ type ExecArgs struct {
 	// imported host descriptors. Loader populates FDTable and, for a PTY, TTY.
 	InternalConsoleID string `json:"internal_console_id,omitempty"`
 
+	// ConsoleRows and ConsoleCols set the internal PTY size before the exec
+	// process becomes runnable. Zero values select the 24x80 default.
+	ConsoleRows uint16 `json:"console_rows,omitempty"`
+	ConsoleCols uint16 `json:"console_cols,omitempty"`
+
 	// TTY is the controlling terminal associated with an internal console.
 	// It is populated inside the Sentry and is nil on the RPC wire.
 	TTY *kernel.TTY

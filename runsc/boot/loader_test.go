@@ -294,6 +294,22 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestInitialInternalPTYWinsize(t *testing.T) {
+	for _, test := range []struct {
+		rows, cols uint64
+		want       linux.Winsize
+	}{
+		{37, 91, linux.Winsize{Row: 37, Col: 91}},
+		{0, 0, linux.Winsize{Row: 24, Col: 80}},
+		{37, 0, linux.Winsize{Row: 24, Col: 80}},
+		{1 << 16, 80, linux.Winsize{Row: 24, Col: 80}},
+	} {
+		if got := initialInternalPTYWinsize(test.rows, test.cols); got != test.want {
+			t.Errorf("initialInternalPTYWinsize(%d, %d)=%+v, want %+v", test.rows, test.cols, got, test.want)
+		}
+	}
+}
+
 // TestRunInternalTTYLiveFork verifies that a terminal container uses a fully
 // Sentry-owned PTY and that live fork duplicates both endpoints and queued data.
 func TestRunInternalTTYLiveFork(t *testing.T) {

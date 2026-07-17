@@ -358,7 +358,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
 - [x] Support Docker-like detach keys for non-TTY stdin attachment, including
       Ctrl-P, Ctrl-Q by default and `ttos attach --detach-keys` overrides.
 - [x] Support TTY detach keys, terminal resize/SIGWINCH propagation, and
-      line-discipline signal delivery from an attached raw terminal.
+      line-discipline signal delivery from an attached raw terminal. Daemon API
+      v2 negotiates raw mode and window sizes with the client, queues early
+      stdin without blocking control frames, and sets init/exec PTY dimensions
+      before the guest process becomes runnable.
 - [x] Initial noninteractive streaming suitable for pipelines.
 - [x] Allow multiple independent stdout/stderr readers without consuming each
       other's output; one locked sidecar is the sole Sentry-pipe reader.
@@ -373,8 +376,10 @@ the `main` branch and leave `ttos` responsible for branch operations.
       readers follow inode replacement without duplicating frames.
 - [x] Make retention size and generation count configurable, persist the
       settings per container, and report when a reader falls behind retention.
-- [ ] Define explicit backpressure policy and surface cumulative truncation
-      counters through inspect/events.
+- [ ] Define explicit output backpressure policy and surface cumulative
+      truncation counters through inspect/events.
+- [ ] Bound daemon-side queued stdin and add framed flow control so a client
+      cannot grow manager memory without limit while the guest is not reading.
 - [x] Allow fork while output readers are attached: read RPCs serialize against
       fork, readers follow a host log, and a new child sidecar starts afterward.
 - [x] Keep branches fork-eligible before, during, and after output attachment;
@@ -691,7 +696,9 @@ grandchild branches without PID or wait-status crossover.
       across fork, and independent retained exit status per branch.
 - [x] Frame-safe bounded log rotation and rotation-aware replay/follow.
 - [x] Persistent configurable log size/generation retention.
-- [ ] Daemon-owned stdin leases and daemon-owned transport/reconciliation.
+- [x] Daemon-owned framed stdin/stdout/stderr and terminal-control transport,
+      including restart reconciliation.
+- [ ] Define daemon-owned stdin lease takeover and stale-client behavior.
 - [x] Detached exec creation with fork-aware per-session output drains.
 - [x] Reattach, retained logs, and exec-session detach keys.
 - [x] Internal devpts interactive consoles for init and attached exec, including

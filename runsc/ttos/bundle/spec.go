@@ -86,6 +86,7 @@ type SpecOptions struct {
 	User             string
 	Hostname         string
 	Terminal         bool
+	ConsoleSize      *specs.Box
 	NetworkMode      string
 	ReadonlyRootfs   bool
 	StopSignal       string
@@ -693,7 +694,8 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Readonly: opts.ReadonlyRootfs,
 		},
 		Process: &specs.Process{
-			Terminal: opts.Terminal,
+			Terminal:    opts.Terminal,
+			ConsoleSize: opts.ConsoleSize,
 			User: specs.User{
 				UID:            uint32(resolvedUser.Uid),
 				GID:            uint32(resolvedUser.Gid),
