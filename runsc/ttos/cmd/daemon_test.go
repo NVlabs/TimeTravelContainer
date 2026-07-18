@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -57,6 +58,51 @@ func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 	status = Run([]string{"--unsafe-no-host-isolation", "daemon", "status"}, strings.NewReader(""), &stdout, &stderr)
 	if status != 2 || !strings.Contains(stderr.String(), "valid with 'daemon start' only") {
 		t.Fatalf("daemon status mode: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
+func TestRootlessDaemonStartupPreflight(t *testing.T) {
+	original := createDaemonRootlessProbe
+	originalEUID := daemonEffectiveUID
+	defer func() {
+		createDaemonRootlessProbe = original
+		daemonEffectiveUID = originalEUID
+	}()
+	daemonEffectiveUID = func() int { return 1000 }
+	calls := 0
+	createDaemonRootlessProbe = func() error {
+		calls++
+		return errors.New("permission denied")
+	}
+
+	if err := preflightDaemonIsolation(true); err != nil {
+		t.Fatalf("unsafe preflight: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("unsafe mode ran %d rootless probes, want zero", calls)
+	}
+
+	socket := filepath.Join(t.TempDir(), "runtime", "ttosd.sock")
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--daemon-socket", socket, "daemon", "start"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 {
+		t.Fatalf("rootless start: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rootless mode is unavailable") || !strings.Contains(stderr.String(), "--unsafe-no-host-isolation") {
+		t.Fatalf("rootless start diagnostic=%q", stderr.String())
+	}
+	if calls != 1 {
+		t.Fatalf("rootless start ran %d probes, want one", calls)
+	}
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("failed preflight created daemon socket: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	status = RunDaemon([]string{"--socket", socket}, &stdout, &stderr)
+	if status != 1 || !strings.Contains(stderr.String(), "rootless mode is unavailable") {
+		t.Fatalf("direct ttosd preflight: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 }
 

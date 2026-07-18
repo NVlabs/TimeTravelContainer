@@ -77,6 +77,9 @@ type options struct {
 
 // Run executes ttos with args and returns a process exit status.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
+		return 0
+	}
 	if len(args) != 0 && args[0] == "_daemon-serve" {
 		return RunDaemon(args[1:], stdout, stderr)
 	}

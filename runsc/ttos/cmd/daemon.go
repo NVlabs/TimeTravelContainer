@@ -34,16 +34,22 @@ import (
 )
 
 const (
-	daemonAPIVersion    = 4
-	daemonFrameStdin    = byte('I')
-	daemonFrameStdinAck = byte('A')
-	daemonFrameEOF      = byte('C')
-	daemonFrameResize   = byte('W')
-	daemonFrameStdout   = byte('O')
-	daemonFrameStderr   = byte('E')
-	daemonFrameStatus   = byte('X')
-	daemonFrameTerminal = byte('T')
-	daemonMaxFrame      = 1 << 20
+	daemonAPIVersion       = 4
+	daemonFrameStdin       = byte('I')
+	daemonFrameStdinAck    = byte('A')
+	daemonFrameEOF         = byte('C')
+	daemonFrameResize      = byte('W')
+	daemonFrameStdout      = byte('O')
+	daemonFrameStderr      = byte('E')
+	daemonFrameStatus      = byte('X')
+	daemonFrameTerminal    = byte('T')
+	daemonMaxFrame         = 1 << 20
+	daemonRootlessProbeArg = "_rootless-userns-probe"
+)
+
+var (
+	createDaemonRootlessProbe = createRootlessProbe
+	daemonEffectiveUID        = os.Geteuid
 )
 
 type daemonWireOptions struct {
@@ -191,6 +197,9 @@ func optionsFromWire(w daemonWireOptions) options {
 // RunDaemon serves the versioned TTOS local API. It is used by the standalone
 // ttosd binary and by ttos's private daemon entry point.
 func RunDaemon(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
+		return 0
+	}
 	socket := defaultDaemonSocket()
 	unsafeNoHostIsolation := false
 	for len(args) != 0 {
@@ -215,12 +224,49 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttosd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+	} else if err := preflightDaemonIsolation(false); err != nil {
+		fmt.Fprintf(stderr, "ttosd: %v\n", err)
+		return 1
 	}
 	if err := serveDaemon(socket, unsafeNoHostIsolation, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttosd: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
+	if unsafeNoHostIsolation || daemonEffectiveUID() == 0 {
+		return nil
+	}
+	if err := createDaemonRootlessProbe(); err != nil {
+		hint := "permit unprivileged user namespaces in the host kernel and LSM policy"
+		if data, readErr := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); readErr == nil && strings.TrimSpace(string(data)) == "1" {
+			hint = "the host AppArmor policy restricts unprivileged user namespaces; grant userns permission to TTOS/runsc"
+		}
+		return fmt.Errorf("rootless mode is unavailable: creating a disposable user/mount namespace: %w; %s, or restart with --unsafe-no-host-isolation for trusted workloads", err, hint)
+	}
+	return nil
+}
+
+func createRootlessProbe() error {
+	command := exec.Command("/proc/self/exe", daemonRootlessProbeArg)
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		},
+		Credential:                 &syscall.Credential{Uid: 0, Gid: 0},
+		GidMappingsEnableSetgroups: false,
+		Pdeathsig:                  syscall.SIGKILL,
+	}
+	if err := command.Run(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func secureDaemonDirectory(dir string) error {
@@ -939,6 +985,9 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		}
 		if opts.unsafeNoHostIsolation {
 			fmt.Fprintln(stderr, "ttos: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+		} else if err := preflightDaemonIsolation(false); err != nil {
+			fmt.Fprintf(stderr, "ttos: %v\n", err)
+			return 1
 		}
 		if err := startDaemonProcess(opts.daemonSocket, opts.unsafeNoHostIsolation); err != nil {
 			fmt.Fprintf(stderr, "ttos: %v\n", err)

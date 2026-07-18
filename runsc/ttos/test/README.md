@@ -128,6 +128,8 @@ If this probe fails, fix the host's unprivileged-user-namespace or LSM policy
 first. A single-ID mapping does not require `newuidmap`, `newgidmap`, or
 subordinate-ID ranges. Some Linux distributions apply AppArmor restrictions
 independently of `kernel.unprivileged_userns_clone`.
+Rootless `ttos daemon start` and direct `ttosd` startup run the equivalent
+probe and fail immediately with an isolation-mode diagnostic when it is denied.
 
 For trusted test workloads on hosts that prohibit user namespaces, set
 `TTOS_UNSAFE_NO_HOST_ISOLATION=1`. The harness then starts its `ttosd` once

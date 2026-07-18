@@ -46,7 +46,7 @@ sudo apt-get install \
 aarch64 VDSO build means the ARM64 cross-C++ package is incomplete.
 
 The normal rootless mode requires unprivileged user namespaces. Check the host
-before starting:
+before starting if desired:
 
 ```shell
 unshare -Ur /bin/true
@@ -55,6 +55,10 @@ unshare -Ur /bin/true
 A one-entry UID/GID map is sufficient. `newuidmap`, `newgidmap`, and subordinate
 UID/GID ranges are not required. If the command fails, enable unprivileged user
 namespaces and check the host's AppArmor or other LSM policy.
+`ttos daemon start` performs an equivalent disposable user/mount-namespace
+probe automatically and refuses to start in rootless mode when the probe fails,
+so an apparently healthy daemon cannot defer this error until container launch.
+Directly launching `ttosd` performs the same preflight.
 
 For trusted local testing only, start the daemon with
 `--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
