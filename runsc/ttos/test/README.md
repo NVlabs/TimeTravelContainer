@@ -108,11 +108,11 @@ covers:
   operation after deletion of the source branch;
 - graceful stop, branch removal, container removal, and volume removal.
 
-The test requires network access for image pulls and an accessible containerd
-socket. TTOS only uses containerd's content service; it extracts image layers
-into its own rootless data directory instead of requesting a mounted snapshot.
-By default, the runtime user must be able to create a user namespace with a
-one-entry UID/GID map:
+The test requires network access for image pulls. TTOS resolves OCI registries
+directly and stores verified manifests, configs, and layers in its native
+rootless content store under `--data-root`; no Docker or containerd daemon is
+required. By default, the runtime user must be able to create a user namespace
+with a one-entry UID/GID map:
 
 ```shell
 unshare -Ur /bin/true
@@ -139,7 +139,6 @@ bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \
 
 TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
 RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
-CONTAINERD_ADDRESS=/path/to/containerd.sock \
   "$PWD/runsc/ttos/test/e2e_image_matrix.sh"
 ```
 
@@ -149,19 +148,28 @@ No-userns example:
 TTOS_UNSAFE_NO_HOST_ISOLATION=1 \
 TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
 RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
-CONTAINERD_ADDRESS=/path/to/containerd.sock \
   "$PWD/runsc/ttos/test/e2e_image_matrix.sh"
 ```
 Use `TTOS_E2E_ROOT` to retain the generated TTOS state for inspection. Image
-references and the containerd namespace can be overridden with
-`BUSYBOX_IMAGE`, `ALPINE_IMAGE`, `PYTHON_IMAGE`, `NGINX_IMAGE`,
-`REDIS_IMAGE`, and `TTOS_NAMESPACE`. By default, temporary TTOS state is
-removed on success or failure; pulled content remains managed by the selected containerd namespace.
+references can be overridden with `BUSYBOX_IMAGE`, `ALPINE_IMAGE`,
+`PYTHON_IMAGE`, `NGINX_IMAGE`, and `REDIS_IMAGE`. By default, temporary TTOS
+state, including the native image content, is removed on success or failure.
 
 A passing result is stronger than the unit suite: it proves image pulling,
 layer extraction, OCI generation, rootless runsc startup, versioned daemon
 transport and restart recovery, nontrivial userspace, console sidecars, and
 TimeTravel branch operations on the executing host.
+
+### Upgrading from the containerd-backed image store
+
+Existing TTOS container-family metadata and already-materialized root filesystems
+remain usable after upgrading. Image names and blobs that were owned by a
+containerd daemon are not copied into TTOS's native store automatically; pull
+those image names again before creating a new family from them. The native
+content is downloaded once per `--data-root` and is reused by later pulls and
+families. Restart any manually managed `ttosd` process after upgrading because
+the daemon protocol version changed; the normal CLI autostart path does this
+automatically.
 
 ## Terminal and live-fork integration
 
@@ -178,7 +186,6 @@ bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \
 TTOS_UNSAFE_NO_HOST_ISOLATION=1 \
 TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
 RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
-CONTAINERD_ADDRESS=/path/to/containerd.sock \
   "$PWD/runsc/ttos/test/e2e_terminal.sh"
 ```
 
@@ -229,7 +236,6 @@ TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
 RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttos/test/registry_fixture/registry_fixture_/registry_fixture" \
 FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttos/test/registry_fixture/guest/guest_/guest" \
-CONTAINERD_ADDRESS=/path/to/containerd.sock \
   "$PWD/runsc/ttos/test/e2e_local_registry.sh"
 ```
 

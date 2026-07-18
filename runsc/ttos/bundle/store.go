@@ -50,9 +50,7 @@ const (
 
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
-	Root      string
-	Address   string
-	Namespace string
+	Root string
 }
 
 // PrepareOptions describes an image-backed OCI bundle.
@@ -494,7 +492,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		if !keep {
 			if leaseID != "" {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: leaseID})
+				_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 				cancel()
 			}
 			os.RemoveAll(containerDir)
@@ -536,7 +534,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	leaseID = images.ContainerLeaseID(id)
-	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: leaseID, Digest: pulled.Digest}); err != nil {
+	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID, Digest: pulled.Digest}); err != nil {
 		return Prepared{}, err
 	}
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -1057,7 +1055,7 @@ func (s Store) RemoveContainer(name string) error {
 		return err
 	}
 	if info.LeaseID != "" {
-		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Address: s.Address, Namespace: s.Namespace, LeaseID: info.LeaseID}); err != nil {
+		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
 			return fmt.Errorf("releasing image content for container %q: %w", name, err)
 		}
 	}
@@ -1542,7 +1540,7 @@ func (s Store) resolveImage(ctx context.Context, reference, platform, policy str
 		return images.Info{}, err
 	}
 	if policy != "always" {
-		stored, err := images.List(ctx, images.ListOptions{Address: s.Address, Namespace: s.Namespace})
+		stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 		if err != nil {
 			return images.Info{}, err
 		}
@@ -1561,11 +1559,9 @@ func (s Store) resolveImage(ctx context.Context, reference, platform, policy str
 		}
 	}
 	return images.Pull(ctx, images.PullOptions{
-		Address:   s.Address,
-		Namespace: s.Namespace,
+		Root:      s.Root,
 		Reference: reference,
 		Platform:  platform,
-		Unpack:    false,
 	})
 }
 
@@ -1606,8 +1602,7 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	defer os.RemoveAll(tempDir)
 	rootfs := filepath.Join(tempDir, "rootfs")
 	info, err := images.MaterializeRootFS(ctx, images.RootFSOptions{
-		Address:   s.Address,
-		Namespace: s.Namespace,
+		StoreRoot: s.Root,
 		Reference: pulled.Reference,
 		Platform:  platform,
 		Root:      rootfs,

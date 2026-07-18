@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package images implements TTOS image operations backed by containerd.
+// Package images implements TTOS's native OCI image operations.
 package images
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
-	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
-	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	distref "github.com/distribution/reference"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 var (
@@ -39,52 +40,43 @@ var (
 	ErrAmbiguous = errors.New("ambiguous image identifier")
 )
 
-// PullOptions controls image resolution, download, and unpacking.
+// PullOptions controls image resolution and download into the native store.
 type PullOptions struct {
-	Address     string
-	Namespace   string
-	Reference   string
-	Platform    string
-	Snapshotter string
-	Unpack      bool
+	Root      string
+	Reference string
+	Platform  string
 }
 
 // ContentLeaseOptions identifies a durable TTOS family lease over one image target.
 type ContentLeaseOptions struct {
-	Address   string
-	Namespace string
-	LeaseID   string
-	Digest    string
+	Root    string
+	LeaseID string
+	Digest  string
 }
 
-// ListOptions identifies the containerd image store to query.
+// ListOptions identifies the native image store to query.
 type ListOptions struct {
-	Address     string
-	Namespace   string
-	Snapshotter string
+	Root string
 }
 
-// DeleteOptions identifies one exact containerd image record to remove. Digest
+// DeleteOptions identifies one exact native image record to remove. Digest
 // protects against deleting a tag that was concurrently retargeted.
 type DeleteOptions struct {
-	Address   string
-	Namespace string
+	Root      string
 	Reference string
 	Digest    string
 }
 
 // Info describes a pulled platform-specific image.
 type Info struct {
-	Reference   string     `json:"reference"`
-	Digest      string     `json:"digest"`
-	MediaType   string     `json:"media_type"`
-	Size        int64      `json:"size"`
-	Platform    string     `json:"platform"`
-	Snapshotter string     `json:"snapshotter,omitempty"`
-	Unpacked    bool       `json:"unpacked"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	PullStats   *PullStats `json:"pull_stats,omitempty"`
+	Reference string     `json:"reference"`
+	Digest    string     `json:"digest"`
+	MediaType string     `json:"media_type"`
+	Size      int64      `json:"size"`
+	Platform  string     `json:"platform"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	PullStats *PullStats `json:"pull_stats,omitempty"`
 }
 
 // PullStats summarizes committed content reuse observed during one pull.
@@ -133,117 +125,126 @@ func NormalizeReference(input string) (string, error) {
 	return distref.TagNameOnly(named).String(), nil
 }
 
-// Pull resolves and stores one image in containerd.
+func platformMatcher(value string) (platforms.MatchComparer, error) {
+	if value == "" {
+		return platforms.DefaultStrict(), nil
+	}
+	parsed, err := platforms.Parse(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid platform %q: %w", value, err)
+	}
+	return platforms.OnlyStrict(parsed), nil
+}
+
+// Pull resolves and stores one image in TTOS's native content store.
 func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	reference, err := NormalizeReference(opts.Reference)
 	if err != nil {
 		return Info{}, err
 	}
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	matcher, err := platformMatcher(opts.Platform)
 	if err != nil {
-		return Info{}, fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return Info{}, err
 	}
-	defer client.Close()
-
-	contentBefore, snapshotErr := snapshotContent(ctx, client.ContentStore())
-
-	var remoteOpts []containerd.RemoteOpt
+	store, err := openNativeStore(opts.Root)
+	if err != nil {
+		return Info{}, err
+	}
+	defer store.close()
+	complete := false
+	defer func() {
+		if !complete {
+			_ = store.garbageCollect(context.Background())
+		}
+	}()
+	contentBefore, snapshotErr := snapshotContent(ctx, store.content)
 	credentials, configured, err := dockerCredentialCallback()
 	if err != nil {
 		return Info{}, err
 	}
+	resolverOptions := docker.ResolverOptions{}
 	if configured {
-		resolver := docker.NewResolver(docker.ResolverOptions{Credentials: credentials})
-		remoteOpts = append(remoteOpts, containerd.WithResolver(resolver))
+		resolverOptions.Credentials = credentials
 	}
-	if opts.Platform != "" {
-		remoteOpts = append(remoteOpts, containerd.WithPlatform(opts.Platform))
-	}
-	if opts.Unpack {
-		remoteOpts = append(remoteOpts, containerd.WithPullUnpack)
-		if opts.Snapshotter != "" {
-			remoteOpts = append(remoteOpts, containerd.WithPullSnapshotter(opts.Snapshotter))
-		}
-	}
-	image, err := client.Pull(ctx, reference, remoteOpts...)
+	resolver := docker.NewResolver(resolverOptions)
+	name, target, err := resolver.Resolve(ctx, reference)
 	if err != nil {
+		return Info{}, fmt.Errorf("resolving %q: %w", reference, err)
+	}
+	if target.MediaType == containerdimages.MediaTypeDockerSchema1Manifest {
+		return Info{}, fmt.Errorf("pulling %q: legacy Docker schema 1 images are unsupported", reference)
+	}
+	fetcher, err := resolver.Fetcher(ctx, name)
+	if err != nil {
+		return Info{}, fmt.Errorf("creating fetcher for %q: %w", reference, err)
+	}
+	children := containerdimages.FilterPlatforms(containerdimages.ChildrenHandler(store.content), matcher)
+	children = containerdimages.LimitManifests(children, matcher, 1)
+	handler := containerdimages.Handlers(remotes.FetchHandler(store.content, fetcher), children)
+	if err := containerdimages.Dispatch(ctx, handler, nil, target); err != nil {
 		return Info{}, fmt.Errorf("pulling %q: %w", reference, err)
 	}
-	size, err := image.Size(ctx)
+	manifest, err := containerdimages.Manifest(ctx, store.content, target, matcher)
 	if err != nil {
-		return Info{}, fmt.Errorf("measuring %q: %w", reference, err)
+		return Info{}, fmt.Errorf("selecting manifest for %q: %w", reference, err)
 	}
-	spec, err := image.Spec(ctx)
+	configData, err := content.ReadBlob(ctx, store.content, manifest.Config)
 	if err != nil {
 		return Info{}, fmt.Errorf("reading config for %q: %w", reference, err)
 	}
-	platform := strings.TrimSuffix(spec.OS+"/"+spec.Architecture+"/"+spec.Variant, "/")
-	var pullStats *PullStats
+	var config ocispec.Image
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return Info{}, fmt.Errorf("decoding config for %q: %w", reference, err)
+	}
+	if config.OS != "linux" {
+		return Info{}, fmt.Errorf("image %q has unsupported OS %q", reference, config.OS)
+	}
+	image := containerdimages.Image{Name: reference, Target: target}
+	size, err := image.Size(ctx, store.content, matcher)
+	if err != nil {
+		return Info{}, fmt.Errorf("measuring %q: %w", reference, err)
+	}
+	now := time.Now().UTC()
+	info := Info{
+		Reference: reference,
+		Digest:    target.Digest.String(),
+		MediaType: target.MediaType,
+		Size:      size,
+		Platform:  imagePlatform(config.OS, config.Architecture, config.Variant),
+		CreatedAt: imageCreatedAt(now, config.Created),
+		UpdatedAt: now,
+	}
 	if snapshotErr == nil {
-		if contentAfter, err := snapshotContent(ctx, client.ContentStore()); err == nil {
+		if contentAfter, err := snapshotContent(ctx, store.content); err == nil {
 			stats := contentReuse(contentBefore, contentAfter, size)
-			pullStats = &stats
+			info.PullStats = &stats
 		}
 	}
-	target := image.Target()
-	metadata := image.Metadata()
-	return Info{
-		Reference:   image.Name(),
-		Digest:      target.Digest.String(),
-		MediaType:   target.MediaType,
-		Size:        size,
-		Platform:    platform,
-		Snapshotter: opts.Snapshotter,
-		Unpacked:    opts.Unpack,
-		CreatedAt:   imageCreatedAt(metadata.CreatedAt, spec.Created),
-		UpdatedAt:   metadata.UpdatedAt,
-		PullStats:   pullStats,
-	}, nil
+	store.catalog.Images[reference] = imageRecord{Info: info, Target: target}
+	if err := store.saveCatalog(); err != nil {
+		return Info{}, fmt.Errorf("saving native image record: %w", err)
+	}
+	if err := store.garbageCollect(ctx); err != nil {
+		return Info{}, fmt.Errorf("collecting superseded image content: %w", err)
+	}
+	complete = true
+	return info, nil
 }
 
 // List returns all named image records ordered by reference. Multiple
 // references may intentionally point at the same digest.
 func List(ctx context.Context, opts ListOptions) ([]Info, error) {
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	store, err := openNativeStore(opts.Root)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return nil, err
 	}
-	defer client.Close()
-
-	stored, err := client.ListImages(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing containerd images: %w", err)
-	}
-	infos := make([]Info, 0, len(stored))
-	for _, image := range stored {
-		size, err := image.Size(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("measuring %q: %w", image.Name(), err)
+	defer store.close()
+	infos := make([]Info, 0, len(store.catalog.Images))
+	for _, record := range store.catalog.Images {
+		if _, err := store.content.Info(ctx, record.Target.Digest); err != nil {
+			return nil, fmt.Errorf("checking image %q content: %w", record.Info.Reference, err)
 		}
-		spec, err := image.Spec(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("reading config for %q: %w", image.Name(), err)
-		}
-		unpacked := false
-		if opts.Snapshotter != "" {
-			// TTOS materializes roots itself and does not require a containerd
-			// snapshot. Failure to query an optional snapshotter must not hide
-			// otherwise usable image records.
-			unpacked, _ = image.IsUnpacked(ctx, opts.Snapshotter)
-		}
-		target := image.Target()
-		metadata := image.Metadata()
-		infos = append(infos, Info{
-			Reference:   image.Name(),
-			Digest:      target.Digest.String(),
-			MediaType:   target.MediaType,
-			Size:        size,
-			Platform:    imagePlatform(spec.OS, spec.Architecture, spec.Variant),
-			Snapshotter: opts.Snapshotter,
-			Unpacked:    unpacked,
-			CreatedAt:   imageCreatedAt(metadata.CreatedAt, spec.Created),
-			UpdatedAt:   metadata.UpdatedAt,
-		})
+		infos = append(infos, record.Info)
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Reference < infos[j].Reference })
 	return infos, nil
@@ -292,7 +293,7 @@ func Resolve(infos []Info, identifier string) ([]Info, error) {
 	panic("unreachable")
 }
 
-// ContainerLeaseID returns the deterministic containerd lease identity for a TTOS family.
+// ContainerLeaseID returns the deterministic native content pin for a TTOS family.
 func ContainerLeaseID(containerID string) string {
 	return "ttos-" + containerID
 }
@@ -302,62 +303,70 @@ func CreateContentLease(ctx context.Context, opts ContentLeaseOptions) error {
 	if opts.LeaseID == "" || opts.Digest == "" {
 		return errors.New("content lease requires an ID and image digest")
 	}
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	store, err := openNativeStore(opts.Root)
 	if err != nil {
-		return fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return err
 	}
-	defer client.Close()
-	manager := client.LeasesService()
-	lease, err := manager.Create(ctx, leases.WithID(opts.LeaseID), leases.WithLabels(map[string]string{
-		"dev.timetravelos.kind":  "sandbox-family",
-		"dev.timetravelos.image": opts.Digest,
-	}))
-	if err != nil {
-		return fmt.Errorf("creating content lease %q: %w", opts.LeaseID, err)
+	defer store.close()
+	if _, exists := store.catalog.Leases[opts.LeaseID]; exists {
+		return fmt.Errorf("content lease %q already exists", opts.LeaseID)
 	}
-	if err := manager.AddResource(ctx, lease, leases.Resource{Type: "content", ID: opts.Digest}); err != nil {
-		_ = manager.Delete(ctx, lease, leases.SynchronousDelete)
-		return fmt.Errorf("pinning image target %s in lease %q: %w", opts.Digest, opts.LeaseID, err)
+	var target ocispec.Descriptor
+	for _, image := range store.catalog.Images {
+		if image.Info.Digest == opts.Digest {
+			target = image.Target
+			break
+		}
+	}
+	if target.Digest == "" {
+		return fmt.Errorf("cannot pin unknown image target %s", opts.Digest)
+	}
+	store.catalog.Leases[opts.LeaseID] = leaseRecord{Digest: opts.Digest, Target: target}
+	if err := store.saveCatalog(); err != nil {
+		return fmt.Errorf("saving content lease %q: %w", opts.LeaseID, err)
 	}
 	return nil
 }
 
-// DeleteContentLease releases one family lease and synchronously collects newly unreachable content.
+// DeleteContentLease releases one family pin and collects unreachable content.
 func DeleteContentLease(ctx context.Context, opts ContentLeaseOptions) error {
 	if opts.LeaseID == "" {
 		return nil
 	}
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	store, err := openNativeStore(opts.Root)
 	if err != nil {
-		return fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return err
 	}
-	defer client.Close()
-	if err := client.LeasesService().Delete(ctx, leases.Lease{ID: opts.LeaseID}, leases.SynchronousDelete); err != nil && !errdefs.IsNotFound(err) {
+	defer store.close()
+	if _, exists := store.catalog.Leases[opts.LeaseID]; !exists {
+		return nil
+	}
+	delete(store.catalog.Leases, opts.LeaseID)
+	if err := store.saveCatalog(); err != nil {
 		return fmt.Errorf("deleting content lease %q: %w", opts.LeaseID, err)
 	}
-	return nil
+	return store.garbageCollect(ctx)
 }
 
-// Delete removes one exact named image record and synchronously asks
-// containerd to garbage-collect newly unreachable content.
+// Delete removes one exact named image record and collects unreachable content.
 func Delete(ctx context.Context, opts DeleteOptions) error {
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	store, err := openNativeStore(opts.Root)
 	if err != nil {
-		return fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return err
 	}
-	defer client.Close()
-	image, err := client.GetImage(ctx, opts.Reference)
-	if err != nil {
-		return fmt.Errorf("finding image %q: %w", opts.Reference, err)
+	defer store.close()
+	record, exists := store.catalog.Images[opts.Reference]
+	if !exists {
+		return fmt.Errorf("finding image %q: %w", opts.Reference, ErrNotFound)
 	}
-	target := image.Target()
-	if opts.Digest != "" && target.Digest.String() != opts.Digest {
-		return fmt.Errorf("image %q changed from %s to %s", opts.Reference, opts.Digest, target.Digest)
+	if opts.Digest != "" && record.Info.Digest != opts.Digest {
+		return fmt.Errorf("image %q changed from %s to %s", opts.Reference, opts.Digest, record.Info.Digest)
 	}
-	if err := client.ImageService().Delete(ctx, opts.Reference, containerdimages.SynchronousDelete(), containerdimages.DeleteTarget(&target)); err != nil {
+	delete(store.catalog.Images, opts.Reference)
+	if err := store.saveCatalog(); err != nil {
 		return fmt.Errorf("deleting image %q: %w", opts.Reference, err)
 	}
-	return nil
+	return store.garbageCollect(ctx)
 }
 
 func imagePlatform(os, architecture, variant string) string {

@@ -25,6 +25,18 @@ import (
 	"time"
 )
 
+func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
+	wire := wireOptions(options{clientExecutable: "/opt/ttos/bin/ttos"})
+	if got := wire.ClientExecutable; got != "/opt/ttos/bin/ttos" {
+		t.Fatalf("wire client executable=%q, want /opt/ttos/bin/ttos", got)
+	}
+	opts := optionsFromWire(wire)
+	backend := directBackend(opts, strings.NewReader(""), io.Discard, io.Discard)
+	if got := backend.clientExecutable; got != "/opt/ttos/bin/ttos" {
+		t.Fatalf("backend client executable=%q, want /opt/ttos/bin/ttos", got)
+	}
+}
+
 func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	command := exec.Command("sleep", "30")
 	if err := command.Start(); err != nil {

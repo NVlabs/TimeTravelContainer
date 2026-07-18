@@ -19,8 +19,6 @@ set -eu
 
 TTOS=${TTOS:-}
 RUNSC=${RUNSC:-}
-CONTAINERD_ADDRESS=${CONTAINERD_ADDRESS:-}
-TTOS_NAMESPACE=${TTOS_NAMESPACE:-ttos-terminal-e2e}
 TTOS_E2E_ROOT=${TTOS_E2E_ROOT:-}
 TTOS_UNSAFE_NO_HOST_ISOLATION=${TTOS_UNSAFE_NO_HOST_ISOLATION:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
@@ -34,8 +32,6 @@ fail() {
 [ -x "$TTOS" ] || fail "TTOS is not executable: $TTOS"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
-[ -n "$CONTAINERD_ADDRESS" ] || fail "set CONTAINERD_ADDRESS"
-[ -S "$CONTAINERD_ADDRESS" ] || fail "containerd socket does not exist: $CONTAINERD_ADDRESS"
 command -v script >/dev/null 2>&1 || fail "util-linux script is required"
 command -v timeout >/dev/null 2>&1 || fail "timeout is required"
 if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
@@ -59,18 +55,16 @@ if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   UNSAFE=--unsafe-no-host-isolation
 fi
 
-for value in "$TTOS" "$RUNSC" "$CONTAINERD_ADDRESS" "$TTOS_E2E_ROOT"; do
+for value in "$TTOS" "$RUNSC" "$TTOS_E2E_ROOT"; do
   case "$value" in
     *[[:space:]]*) fail "PTY test paths must not contain whitespace: $value" ;;
   esac
 done
 
-TTOS_COMMAND="$TTOS $UNSAFE --containerd $CONTAINERD_ADDRESS --namespace $TTOS_NAMESPACE --data-root $DATA_ROOT --daemon-socket $DAEMON_SOCKET --root $RUNSC_ROOT --runsc $RUNSC"
+TTOS_COMMAND="$TTOS $UNSAFE --data-root $DATA_ROOT --daemon-socket $DAEMON_SOCKET --root $RUNSC_ROOT --runsc $RUNSC"
 
 ttos() {
   "$TTOS" $UNSAFE \
-    --containerd "$CONTAINERD_ADDRESS" \
-    --namespace "$TTOS_NAMESPACE" \
     --data-root "$DATA_ROOT" \
     --daemon-socket "$DAEMON_SOCKET" \
     --root "$RUNSC_ROOT" \

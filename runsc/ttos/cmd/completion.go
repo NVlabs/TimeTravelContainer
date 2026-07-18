@@ -41,7 +41,7 @@ _ttos_completion() {
   done
   for ((i=0; i<${#before[@]}; i++)); do
     case "${before[i]}" in
-      --root|--runsc|--containerd|--namespace|--data-root|--daemon-socket)
+      --root|--runsc|--data-root|--daemon-socket)
         globals+=("${before[i]}")
         if ((i+1 < ${#before[@]})); then
           globals+=("${before[i+1]}")
@@ -50,7 +50,7 @@ _ttos_completion() {
           break
         fi
         ;;
-      --root=*|--runsc=*|--containerd=*|--namespace=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
+      --root=*|--runsc=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
         globals+=("${before[i]}")
         ;;
       *) break ;;
@@ -72,7 +72,7 @@ _ttos_completion() {
   done
   for ((i=1; i<=${#before[@]}; i++)); do
     case "${before[i]}" in
-      --root|--runsc|--containerd|--namespace|--data-root|--daemon-socket)
+      --root|--runsc|--data-root|--daemon-socket)
         globals+=("${before[i]}")
         if ((i < ${#before[@]})); then
           ((i++))
@@ -81,7 +81,7 @@ _ttos_completion() {
           break
         fi
         ;;
-      --root=*|--runsc=*|--containerd=*|--namespace=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
+      --root=*|--runsc=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
         globals+=("${before[i]}")
         ;;
       *) break ;;
@@ -102,13 +102,13 @@ const fishCompletion = `function __ttos_completion
     set -l scan $before
     while test (count $scan) -gt 0
         switch $scan[1]
-            case --root --runsc --containerd --namespace --data-root --daemon-socket
+            case --root --runsc --data-root --daemon-socket
                 if test (count $scan) -lt 2
                     break
                 end
                 set -a globals $scan[1] $scan[2]
                 set -e scan[1..2]
-            case "--root=*" "--runsc=*" "--containerd=*" "--namespace=*" "--data-root=*" "--daemon-socket=*" --direct --unsafe-no-host-isolation
+            case "--root=*" "--runsc=*" "--data-root=*" "--daemon-socket=*" --direct --unsafe-no-host-isolation
                 set -a globals $scan[1]
                 set -e scan[1]
             case "*"
@@ -171,13 +171,12 @@ func stripGlobalCompletionOptions(words []string) []string {
 		switch {
 		case word == "--unsafe-no-host-isolation" || word == "--direct":
 			words = words[1:]
-		case word == "--root" || word == "--runsc" || word == "--containerd" || word == "--namespace" || word == "--data-root" || word == "--daemon-socket":
+		case word == "--root" || word == "--runsc" || word == "--data-root" || word == "--daemon-socket":
 			if len(words) == 1 {
 				return nil
 			}
 			words = words[2:]
 		case strings.HasPrefix(word, "--root=") || strings.HasPrefix(word, "--runsc=") ||
-			strings.HasPrefix(word, "--containerd=") || strings.HasPrefix(word, "--namespace=") ||
 			strings.HasPrefix(word, "--data-root=") || strings.HasPrefix(word, "--daemon-socket="):
 			words = words[1:]
 		default:

@@ -53,12 +53,10 @@ import (
 )
 
 const (
-	defaultRuntimeRoot      = "/var/run/runsc"
-	defaultContainerdSocket = "/run/containerd/containerd.sock"
-	defaultImageNamespace   = "ttos"
-	defaultBranchID         = "main"
-	defaultConsoleLogMax    = int64(16 << 20)
-	defaultConsoleLogFiles  = 2
+	defaultRuntimeRoot     = "/var/run/runsc"
+	defaultBranchID        = "main"
+	defaultConsoleLogMax   = int64(16 << 20)
+	defaultConsoleLogFiles = 2
 )
 
 var (
@@ -69,12 +67,11 @@ var (
 type options struct {
 	root                  string
 	runsc                 string
-	containerd            string
-	namespace             string
 	dataRoot              string
 	unsafeNoHostIsolation bool
 	daemonSocket          string
 	direct                bool
+	clientExecutable      string
 }
 
 // Run executes ttos with args and returns a process exit status.
@@ -126,12 +123,11 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
 	opts := options{
-		root:         runtimeRoot(),
-		runsc:        runscPath(),
-		containerd:   containerdAddress(),
-		namespace:    defaultImageNamespace,
-		dataRoot:     dataRoot(),
-		daemonSocket: defaultDaemonSocket(),
+		root:             runtimeRoot(),
+		runsc:            runscPath(),
+		dataRoot:         dataRoot(),
+		daemonSocket:     defaultDaemonSocket(),
+		clientExecutable: currentExecutable(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -164,30 +160,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 			opts.runsc = strings.TrimPrefix(arg, "--runsc=")
 			if opts.runsc == "" {
 				return opts, nil, false, errors.New("--runsc requires a path")
-			}
-			args = args[1:]
-		case arg == "--containerd":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--containerd requires a socket path")
-			}
-			opts.containerd = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--containerd="):
-			opts.containerd = strings.TrimPrefix(arg, "--containerd=")
-			if opts.containerd == "" {
-				return opts, nil, false, errors.New("--containerd requires a socket path")
-			}
-			args = args[1:]
-		case arg == "--namespace":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--namespace requires a name")
-			}
-			opts.namespace = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--namespace="):
-			opts.namespace = strings.TrimPrefix(arg, "--namespace=")
-			if opts.namespace == "" {
-				return opts, nil, false, errors.New("--namespace requires a name")
 			}
 			args = args[1:]
 		case arg == "--data-root":
@@ -249,14 +221,9 @@ func runscPath() string {
 	return "runsc"
 }
 
-func containerdAddress() string {
-	if address := os.Getenv("CONTAINERD_ADDRESS"); address != "" {
-		return address
-	}
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "containerd", "containerd.sock")
-	}
-	return defaultContainerdSocket
+func currentExecutable() string {
+	executable, _ := os.Executable()
+	return executable
 }
 
 func dataRoot() string {
@@ -280,9 +247,7 @@ Manage TimeTravelOS container families and live branches.
 Global options:
   --root PATH                    runsc state root
   --runsc PATH                   TimeTravel-enabled runsc executable
-  --containerd PATH              containerd socket
-  --namespace NAME               containerd namespace (default: ttos)
-  --data-root PATH               image, bundle, and metadata directory
+  --data-root PATH               native images, bundles, and metadata
   --daemon-socket PATH           per-user ttosd Unix socket
   --direct                       bypass ttosd for recovery/debugging
   --unsafe-no-host-isolation     run without host namespaces/chroots (unsafe)
@@ -2677,8 +2642,6 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("pull", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	platform := fs.String("platform", "", "target platform, such as linux/amd64")
-	unpack := fs.Bool("unpack", false, "also unpack through a containerd snapshotter (may require mount privileges)")
-	snapshotter := fs.String("snapshotter", defaultSnapshotter(), "containerd snapshotter used for unpacking")
 	quiet := fs.Bool("quiet", false, "only print the pulled digest")
 	fs.BoolVar(quiet, "q", false, "only print the pulled digest")
 	if err := fs.Parse(args); err != nil {
@@ -2691,7 +2654,7 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	info, err := backend.pull(reference, *platform, *snapshotter, *unpack)
+	info, err := backend.pull(reference, *platform)
 	if err != nil {
 		return err
 	}
@@ -2702,11 +2665,6 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	fmt.Fprintf(stdout, "Pulled %s\nDigest: %s\nPlatform: %s\n", info.Reference, info.Digest, info.Platform)
 	if info.PullStats != nil {
 		fmt.Fprintf(stdout, "Content: %d bytes downloaded, %d bytes reused\n", info.PullStats.DownloadedBytes, info.PullStats.ReusedBytes)
-	}
-	if info.Unpacked {
-		fmt.Fprintln(stdout, "Unpack: complete")
-	} else {
-		fmt.Fprintln(stdout, "Unpack: skipped")
 	}
 	return nil
 }
@@ -2763,7 +2721,7 @@ func runImages(args []string, stdout, stderr io.Writer, backend backend) error {
 		return nil
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "REPOSITORY\tTAG\tIMAGE ID\tPLATFORM\tROOTFS\tUNPACKED\tSIZE\tCREATED")
+	fmt.Fprintln(table, "REPOSITORY\tTAG\tIMAGE ID\tPLATFORM\tROOTFS\tSIZE\tCREATED")
 	now := time.Now()
 	for _, info := range infos {
 		repository, tag := splitImageReference(info.Reference)
@@ -2772,13 +2730,9 @@ func runImages(args []string, stdout, stderr io.Writer, backend backend) error {
 		if info.Materialized {
 			materialized = "yes"
 		}
-		unpacked := "no"
-		if info.Unpacked {
-			unpacked = "yes"
-		}
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			repository, tag, displayImageID(info.Digest, *noTrunc), info.Platform,
-			materialized, unpacked, formatImageSize(info.Size), formatImageAge(now, info.CreatedAt))
+			materialized, formatImageSize(info.Size), formatImageAge(now, info.CreatedAt))
 	}
 	return table.Flush()
 }
@@ -2899,13 +2853,6 @@ func formatImageAge(now, created time.Time) string {
 		}
 	}
 	return "less than a minute ago"
-}
-
-func defaultSnapshotter() string {
-	if snapshotter := os.Getenv("CONTAINERD_SNAPSHOTTER"); snapshotter != "" {
-		return snapshotter
-	}
-	return "native"
 }
 
 func runList(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -4288,8 +4235,6 @@ type ImageInfo struct {
 	MediaType    string    `json:"media_type"`
 	Size         int64     `json:"size"`
 	Platform     string    `json:"platform"`
-	Snapshotter  string    `json:"snapshotter,omitempty"`
-	Unpacked     bool      `json:"unpacked"`
 	Materialized bool      `json:"materialized"`
 	Containers   []string  `json:"containers,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -4308,7 +4253,6 @@ type ImageInspectInfo struct {
 	OS           string    `json:"Os"`
 	Variant      string    `json:"Variant,omitempty"`
 	MediaType    string    `json:"MediaType"`
-	Unpacked     bool      `json:"Unpacked"`
 	Materialized bool      `json:"Materialized"`
 	Containers   []string  `json:"Containers,omitempty"`
 }
@@ -4320,7 +4264,7 @@ type ImageRemoveResult struct {
 }
 
 type backend interface {
-	pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error)
+	pull(reference, platform string) (ttosimages.Info, error)
 	listImages() ([]ImageInfo, error)
 	inspectImage(identifier string) (ImageInspectInfo, error)
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
@@ -4363,10 +4307,9 @@ type consoleSidecarOwner interface {
 type runtimeBackend struct {
 	root                  string
 	runsc                 string
-	containerd            string
-	namespace             string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	clientExecutable      string
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
@@ -4374,7 +4317,7 @@ type runtimeBackend struct {
 }
 
 func (b *runtimeBackend) containerStore() ttosbundle.Store {
-	return ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	return ttosbundle.Store{Root: b.dataRoot}
 }
 
 func (b *runtimeBackend) resolveContainer(identifier string) (ttosbundle.ContainerInfo, error) {
@@ -4395,9 +4338,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttosbundle.
 
 func (b *runtimeBackend) imageRecords() ([]ttosimages.Info, error) {
 	return ttosimages.List(context.Background(), ttosimages.ListOptions{
-		Address:     b.containerd,
-		Namespace:   b.namespace,
-		Snapshotter: defaultSnapshotter(),
+		Root: b.dataRoot,
 	})
 }
 
@@ -4406,7 +4347,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	containers, err := store.ListContainers()
 	if err != nil {
 		return nil, err
@@ -4429,8 +4370,6 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 			MediaType:    record.MediaType,
 			Size:         record.Size,
 			Platform:     record.Platform,
-			Snapshotter:  record.Snapshotter,
-			Unpacked:     record.Unpacked,
 			Materialized: materialized,
 			Containers:   containerNames,
 			CreatedAt:    record.CreatedAt,
@@ -4466,7 +4405,6 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 	seenRepoDigest := make(map[string]bool)
 	seenContainer := make(map[string]bool)
 	materialized := false
-	unpacked := false
 	for i := range infos {
 		info := &infos[i]
 		if info.Digest != digest {
@@ -4491,7 +4429,6 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 			}
 		}
 		materialized = materialized || info.Materialized
-		unpacked = unpacked || info.Unpacked
 		for _, container := range info.Containers {
 			if !seenContainer[container] {
 				containers = append(containers, container)
@@ -4526,7 +4463,6 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 		OS:           osName,
 		Variant:      variant,
 		MediaType:    selected.MediaType,
-		Unpacked:     unpacked,
 		Materialized: materialized,
 		Containers:   containers,
 	}, nil
@@ -4542,7 +4478,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 		return ImageRemoveResult{}, err
 	}
 	digest := matches[0].Digest
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	containers, err := store.ListContainers()
 	if err != nil {
 		return ImageRemoveResult{}, err
@@ -4560,8 +4496,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 	result := ImageRemoveResult{Untagged: make([]string, 0, len(matches))}
 	for _, match := range matches {
 		if err := ttosimages.Delete(context.Background(), ttosimages.DeleteOptions{
-			Address:   b.containerd,
-			Namespace: b.namespace,
+			Root:      b.dataRoot,
 			Reference: match.Reference,
 			Digest:    match.Digest,
 		}); err != nil {
@@ -4610,7 +4545,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, err
 	}
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
 			Name:             request.name,
@@ -4675,7 +4610,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	prepared, err := store.Prepare(context.Background(), ttosbundle.PrepareOptions{
 		SpecOptions: ttosbundle.SpecOptions{
 			Name:             request.name,
@@ -4771,15 +4706,17 @@ func (b *runtimeBackend) applyAutoRemove(id string, detach bool, status int, lau
 }
 
 func (b *runtimeBackend) scheduleAutoRemove(id string) error {
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locating ttos executable: %w", err)
+	executable := b.clientExecutable
+	if executable == "" {
+		executable = currentExecutable()
+	}
+	if executable == "" {
+		return errors.New("locating ttos executable")
 	}
 	args := []string{
+		"--direct",
 		"--root", b.root,
 		"--runsc", b.runsc,
-		"--containerd", b.containerd,
-		"--namespace", b.namespace,
 		"--data-root", b.dataRoot,
 	}
 	if b.unsafeNoHostIsolation {
@@ -5960,7 +5897,7 @@ func waitStatusExitCode(status uint32) int {
 }
 
 func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	if !detach || status != 0 {
 		if err := store.FinalizeVolumeExitSnapshots(name); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttos: warning: finalizing managed volumes for %s: %v\n", name, err)
@@ -6260,7 +6197,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 }
 
 func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	containerInfo, err := store.LoadContainer(name)
 	if err != nil {
 		return InspectInfo{}, err
@@ -6611,14 +6548,11 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 	return waitStatusExitCode(waitStatus), nil
 }
 
-func (b *runtimeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
+func (b *runtimeBackend) pull(reference, platform string) (ttosimages.Info, error) {
 	return ttosimages.Pull(context.Background(), ttosimages.PullOptions{
-		Address:     b.containerd,
-		Namespace:   b.namespace,
-		Reference:   reference,
-		Platform:    platform,
-		Snapshotter: snapshotter,
-		Unpack:      unpack,
+		Root:      b.dataRoot,
+		Reference: reference,
+		Platform:  platform,
 	})
 }
 
@@ -6836,7 +6770,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	if b.dataRoot == "" {
 		return runtimeFamilies, runtimeErr
 	}
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	containers, storeErr := store.ListContainers()
 	if storeErr != nil {
 		return nil, storeErr
@@ -7420,7 +7354,7 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 }
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
-	store := ttosbundle.Store{Root: b.dataRoot, Address: b.containerd, Namespace: b.namespace}
+	store := ttosbundle.Store{Root: b.dataRoot}
 	if target.branch != defaultBranchID {
 		if err := store.UpdateBranchState(target.container, target.branch, "exited"); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttos: warning: recording branch exit state for %s: %v\n", target, err)

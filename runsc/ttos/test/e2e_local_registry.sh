@@ -19,10 +19,8 @@ set -eu
 
 TTOS=${TTOS:-}
 RUNSC=${RUNSC:-}
-CONTAINERD_ADDRESS=${CONTAINERD_ADDRESS:-}
 REGISTRY_FIXTURE=${REGISTRY_FIXTURE:-}
 FIXTURE_BINARY=${FIXTURE_BINARY:-}
-TTOS_NAMESPACE=${TTOS_NAMESPACE:-ttos-local-registry-$$}
 TTOS_E2E_ROOT=${TTOS_E2E_ROOT:-}
 TTOS_UNSAFE_NO_HOST_ISOLATION=${TTOS_UNSAFE_NO_HOST_ISOLATION:-0}
 
@@ -33,14 +31,12 @@ fail() {
 
 [ -n "$TTOS" ] || fail "set TTOS"
 [ -n "$RUNSC" ] || fail "set RUNSC"
-[ -n "$CONTAINERD_ADDRESS" ] || fail "set CONTAINERD_ADDRESS"
 [ -n "$REGISTRY_FIXTURE" ] || fail "set REGISTRY_FIXTURE"
 [ -n "$FIXTURE_BINARY" ] || fail "set FIXTURE_BINARY"
 [ -x "$TTOS" ] || fail "TTOS is not executable: $TTOS"
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
 [ -x "$REGISTRY_FIXTURE" ] || fail "REGISTRY_FIXTURE is not executable: $REGISTRY_FIXTURE"
 [ -x "$FIXTURE_BINARY" ] || fail "FIXTURE_BINARY is not executable: $FIXTURE_BINARY"
-[ -S "$CONTAINERD_ADDRESS" ] || fail "containerd socket does not exist: $CONTAINERD_ADDRESS"
 
 if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" != 1 ] && ! unshare -Ur /bin/true >/dev/null 2>&1; then
   fail "rootless UID/GID mapping is unavailable; set TTOS_UNSAFE_NO_HOST_ISOLATION=1 only for trusted test workloads"
@@ -62,8 +58,6 @@ ttos() {
     unsafe=--unsafe-no-host-isolation
   fi
   "$TTOS" $unsafe \
-    --containerd "$CONTAINERD_ADDRESS" \
-    --namespace "$TTOS_NAMESPACE" \
     --data-root "$TTOS_E2E_ROOT/data" \
     --daemon-socket "$TTOS_E2E_ROOT/ttosd.sock" \
     --root "$TTOS_E2E_ROOT/runsc" \

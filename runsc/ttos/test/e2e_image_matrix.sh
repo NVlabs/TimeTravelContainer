@@ -14,13 +14,11 @@
 # limitations under the License.
 
 # This is a manual, networked end-to-end matrix. It intentionally uses public,
-# unmodified Docker images and a real containerd content service.
+# unmodified Docker images and TTOS's native OCI content store.
 set -eu
 
 TTOS=${TTOS:-}
 RUNSC=${RUNSC:-}
-CONTAINERD_ADDRESS=${CONTAINERD_ADDRESS:-}
-TTOS_NAMESPACE=${TTOS_NAMESPACE:-ttos-e2e}
 TTOS_E2E_ROOT=${TTOS_E2E_ROOT:-}
 TTOS_UNSAFE_NO_HOST_ISOLATION=${TTOS_UNSAFE_NO_HOST_ISOLATION:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
@@ -49,8 +47,6 @@ volume_used_bytes() {
 [ -x "$TTOS" ] || fail "TTOS is not executable: $TTOS"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
-[ -n "$CONTAINERD_ADDRESS" ] || fail "set CONTAINERD_ADDRESS to an accessible containerd socket"
-[ -S "$CONTAINERD_ADDRESS" ] || fail "containerd socket does not exist: $CONTAINERD_ADDRESS"
 if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
   if ! unshare -Ur /bin/true >/dev/null 2>&1; then
@@ -111,8 +107,6 @@ ttos() {
   if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
     "$TTOS" \
       --unsafe-no-host-isolation \
-      --containerd "$CONTAINERD_ADDRESS" \
-      --namespace "$TTOS_NAMESPACE" \
       --data-root "$DATA_ROOT" \
       --daemon-socket "$DAEMON_SOCKET" \
       --root "$RUNSC_ROOT" \
@@ -121,8 +115,6 @@ ttos() {
     return
   fi
   "$TTOS" \
-    --containerd "$CONTAINERD_ADDRESS" \
-    --namespace "$TTOS_NAMESPACE" \
     --data-root "$DATA_ROOT" \
     --daemon-socket "$DAEMON_SOCKET" \
     --root "$RUNSC_ROOT" \
@@ -541,14 +533,14 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
 done
 
 echo "== daemon restart reconciliation =="
-ttos daemon status | grep -q '"version":2' || fail "ttosd did not report API version 2"
+ttos daemon status | grep -q '"version":3' || fail "ttosd did not report API version 3"
 ttos daemon stop
 if ttos daemon status >/dev/null 2>&1; then
   fail "ttosd remained reachable after stop"
 fi
 [ "$(ttos inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
   fail "autostarted ttosd did not reconcile the running container"
-ttos daemon status | grep -q '"version":2' || fail "ttosd did not autostart after restart"
+ttos daemon status | grep -q '"version":3' || fail "ttosd did not autostart after restart"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"

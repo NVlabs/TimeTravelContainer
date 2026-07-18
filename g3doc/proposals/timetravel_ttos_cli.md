@@ -4,8 +4,8 @@ Status: implemented for the documented rootless systrap scope.
 
 Implementation status: the roadmap is implemented. The `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
-sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
-containerd with Docker config and credential-helper authentication, generates
+sandboxes through runsc's JSON command surface, pulls OCI/Docker images directly
+into a native content store with Docker config and credential-helper authentication, generates
 rootless image-backed OCI bundles, and implements the
 run/create/start/wait/restart/inspect/list/remove lifecycle with
 persistent metadata and immutable branch lineage/tombstones, plus synchronous, detached, and TTY exec into a selected
@@ -94,10 +94,10 @@ ttos CLI
    |
    +-- ttosd local control service
          |
-         +-- containerd client
+         +-- native OCI image store
          |     +-- registry/auth and Docker Hub pulls
-         |     +-- OCI content store and image metadata
-         |     +-- snapshotter/unpacked immutable image roots
+         |     +-- verified content-addressed blobs and image metadata
+         |     +-- transactional family pins and synchronous garbage collection
          |
          +-- TimeTravel-enabled runsc/shim
                +-- SandboxFamily and branch lifecycle RPCs
@@ -155,9 +155,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] Normalize unqualified names to `docker.io/library/...`.
 - [x] Support OCI registries, tags, immutable digests, and multi-architecture
       manifest selection.
-- [x] Default rootless pulls to the containerd content store without requesting
-      snapshotter unpack; retain explicit `--unpack` for environments where the
-      selected snapshotter's mount requirements are available.
+- [x] Pull directly into TTOS's rootless native content store without Docker,
+      containerd, a host snapshotter, or mount privileges.
 - [x] Make `run` and `create` use Docker-compatible `--pull=missing` by
       default, reusing local tag or unambiguous image-ID records without
       registry access. Support explicit `--pull=always` refresh and
@@ -166,10 +165,10 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       helpers without storing plaintext credentials in the state database.
       Pulls discover `DOCKER_CONFIG` or `~/.docker/config.json`, support inline
       auth/token entries plus per-registry and global credential helpers, and
-      resolve secrets only in the containerd registry callback.
-- [x] Show pull completion, unpack completion/skipping, and measured content-store
+      resolve secrets only in the in-process registry callback.
+- [x] Show pull completion and measured content-store
       downloaded-versus-reused byte totals. Quiet mode remains digest-only.
-- [x] `ttos images` with reference, digest, platform, unpacked state, size, and
+- [x] `ttos images` with reference, digest, platform, materialized-root state, size, and
       creation time.
 - [x] `ttos image inspect`, `ttos image rm`, and content garbage collection.
       `ttos image ls`, top-level `ttos images`, and `ttos rmi` aliases
@@ -178,9 +177,9 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       exposing the target platform and whether TTOS has materialized its own
       immutable root.
 - [x] Protect image removal with persistent-container usage checks. A forced
-      removal may untag containerd records while retaining TTOS roots required
-      by existing containers. Removing the last alias of an unused digest
-      synchronously requests containerd content collection and removes all
+      removal may untag native records while retaining TTOS roots required by
+      existing containers. Removing the last alias of an unused digest
+      synchronously collects unreachable native content and removes all
       platform-specific TTOS roots for that digest.
 
 ### Container lifecycle
@@ -660,15 +659,21 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
 
 ## Image and storage backend
 
-- [x] Use containerd's client APIs for registry pulls, OCI content, manifest
-      resolution, and unpacking rather than implementing a Docker registry
-      client from scratch.
-- [x] Use target-guarded synchronous containerd image deletion APIs for image
-      removal and newly unreachable content collection.
-- [x] Add deterministic containerd content leases for every prepared family. The
-      image target is pinned transactionally after materialization, the lease ID is
+- [x] Remove the containerd daemon and client dependency. Use the OCI registry,
+      manifest, archive, and local content-store libraries in process while TTOS
+      owns its catalog, locking, lifecycle, and storage paths.
+      Existing materialized families remain usable across this upgrade, while
+      image names previously owned by containerd must be pulled once into the
+      native store before they can seed new families.
+- [x] Store digest-verified blobs in a private rootless CAS under `--data-root`,
+      with atomic, versioned image metadata and target-guarded tag deletion.
+- [x] Add deterministic native content pins for every prepared family. The
+      image target is pinned transactionally after materialization, the pin ID is
       persisted for recovery and inspection, failed prepares roll it back, and family
       removal releases it synchronously only after runtime teardown.
+- [x] Mark descriptors reachable from image records and family pins, and
+      synchronously collect unreachable blobs after retag, image deletion, and
+      family-pin release.
 - [x] Use no host snapshotter for execution: TTOS materializes a content-addressed,
       caller-owned immutable directory lower that is exposed through a read-only gofer.
       This avoids requiring a rootful or FUSE snapshotter in the live-fork path.
@@ -686,12 +691,12 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       clone/share-external/reject decisions.
 - [x] Place an in-memory OverlayFS upper over the immutable image lower by
       default.
-- [x] Track the image-target content lease for every family and release it only
-      during family removal, after all live branches have been destroyed. TTOS does not
-      create containerd snapshot resources in the current directory-lower design.
+- [x] Track an image-target content pin for every family and release it only
+      during family removal, after all live branches have been destroyed. TTOS
+      creates no host snapshot resources in the current directory-lower design.
 - [x] Keep root and managed-volume mutable state in Sentry tmpfs/OverlayFS
-      memory so it participates in live fork; containerd and host snapshotters own no
-      branch-local writable layer.
+      memory so it participates in live fork; no host service or snapshotter owns
+      a branch-local writable layer.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
       Python, nginx, and Redis images, covering rootless prerequisites, OCI startup,
       Docker-like lifecycle commands and inspect across created, running,
@@ -720,7 +725,7 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
 - [x] Persist family configuration, image references, managed-volume metadata and
       optional committed tar seeds, lineage, and tombstones; live branch memory
       remains exclusively in the Sentry.
-- [x] Reconcile persisted metadata with containerd inventory and live runsc
+- [x] Reconcile persisted metadata with the native image catalog and live runsc
       sandboxes after daemon restart, and restart missing branch/exec console
       drainers. The current direct-runsc backend has no shim process.
 - [x] Provide durable manager events for branch/container creation, pause,
@@ -740,8 +745,7 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
 - [x] Add a versioned framed local API with explicit version rejection so the
       CLI and daemon may be upgraded independently.
 - [x] Keep direct runsc invocation behind the daemon API and an explicit
-      `--direct` recovery path; later extend `containerd-shim-runsc-v1` while
-      preserving the branch-control API boundary.
+      `--direct` recovery path while preserving the branch-control API boundary.
 
 ## Docker and containerd compatibility
 
@@ -757,9 +761,9 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       `gvisor.timetravel.v1.Branches` is registered on the existing shim socket
       and exposes `List`, `Check`, `Fork`, `Pause`, `Resume`, and `Destroy`; its
       public Go client delegates to `runsc timetravel` while task-v2 is unchanged.
-- [x] Keep the image target and its referenced content leased while any branch
-      in the family may reference the materialized immutable lower. No containerd
-      snapshot is used by the current execution backend.
+- [x] Keep the image target and its referenced content natively pinned while any
+      branch in the family may reference the materialized immutable lower. No
+      host snapshotter is used by the current execution backend.
 - [x] Consider a future nerdctl/Docker-compatible flag layer only after the
       branch-native `ttos` model is stable. Decision: keep `ttos` as the
       Docker-compatible command surface rather than wrapping nerdctl; containerd
@@ -818,7 +822,8 @@ process, fork its branch, and then attach independently to both branches.
 
 ### Milestone D: Docker-like `ttos`
 
-- [x] Initial containerd-backed image pull/unpack and managed image-root storage.
+- [x] Native daemon-free OCI image pull, verified CAS, family pins, GC, and
+      managed image-root storage.
 - [x] Full run/create/start/stop/rm/inspect/logs/exec/attach command
       surface, exercised through Docker-style aliases and the five-image matrix.
 - [x] Initial fork/pause/resume and beautified branch tree.

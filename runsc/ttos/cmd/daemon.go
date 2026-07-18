@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	daemonAPIVersion    = 2
+	daemonAPIVersion    = 3
 	daemonFrameStdin    = byte('I')
 	daemonFrameStdinAck = byte('A')
 	daemonFrameEOF      = byte('C')
@@ -49,10 +49,9 @@ const (
 type daemonWireOptions struct {
 	Root                  string `json:"root"`
 	Runsc                 string `json:"runsc"`
-	Containerd            string `json:"containerd"`
-	Namespace             string `json:"namespace"`
 	DataRoot              string `json:"data_root"`
 	UnsafeNoHostIsolation bool   `json:"unsafe_no_host_isolation"`
+	ClientExecutable      string `json:"client_executable"`
 }
 
 type daemonRequest struct {
@@ -150,10 +149,9 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 	return &runtimeBackend{
 		root:                  opts.root,
 		runsc:                 opts.runsc,
-		containerd:            opts.containerd,
-		namespace:             opts.namespace,
 		dataRoot:              opts.dataRoot,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
+		clientExecutable:      opts.clientExecutable,
 		stdin:                 stdin,
 		stdout:                stdout,
 		stderr:                stderr,
@@ -162,17 +160,17 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 
 func wireOptions(opts options) daemonWireOptions {
 	return daemonWireOptions{
-		Root: opts.root, Runsc: opts.runsc, Containerd: opts.containerd,
-		Namespace: opts.namespace, DataRoot: opts.dataRoot,
+		Root: opts.root, Runsc: opts.runsc, DataRoot: opts.dataRoot,
 		UnsafeNoHostIsolation: opts.unsafeNoHostIsolation,
+		ClientExecutable:      opts.clientExecutable,
 	}
 }
 
 func optionsFromWire(w daemonWireOptions) options {
 	return options{
-		root: w.Root, runsc: w.Runsc, containerd: w.Containerd,
-		namespace: w.Namespace, dataRoot: w.DataRoot,
+		root: w.Root, runsc: w.Runsc, dataRoot: w.DataRoot,
 		unsafeNoHostIsolation: w.UnsafeNoHostIsolation,
+		clientExecutable:      w.ClientExecutable,
 	}
 }
 

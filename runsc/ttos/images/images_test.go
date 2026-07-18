@@ -15,6 +15,8 @@
 package images
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -23,6 +25,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/containerd/containerd/v2/core/content"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func TestContentReuse(t *testing.T) {
@@ -36,6 +41,83 @@ func TestContentReuse(t *testing.T) {
 	}
 	if got := contentReuse(nil, map[string]int64{"extra": 120}, 100); got.DownloadedBytes != 100 || got.ReusedBytes != 0 {
 		t.Fatalf("capped download=%+v", got)
+	}
+}
+
+func TestNativeCatalogPinsContentUntilFamilyRemoval(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageConfig,
+		Digest:    "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+		Size:      5,
+	}
+	store, err := openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := content.WriteBlob(ctx, store.content, "test-config", bytes.NewReader([]byte("hello")), target); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	reference := "docker.io/library/test:latest"
+	store.catalog.Images[reference] = imageRecord{
+		Info:   Info{Reference: reference, Digest: target.Digest.String(), Platform: "linux/amd64"},
+		Target: target,
+	}
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+
+	leaseID := ContainerLeaseID("family")
+	if err := CreateContentLease(ctx, ContentLeaseOptions{Root: root, LeaseID: leaseID, Digest: target.Digest.String()}); err != nil {
+		t.Fatalf("CreateContentLease: %v", err)
+	}
+	if err := Delete(ctx, DeleteOptions{Root: root, Reference: reference, Digest: target.Digest.String()}); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	store, err = openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.content.Info(ctx, target.Digest); err != nil {
+		store.close()
+		t.Fatalf("leased content was collected: %v", err)
+	}
+	store.close()
+	if err := DeleteContentLease(ctx, ContentLeaseOptions{Root: root, LeaseID: leaseID}); err != nil {
+		t.Fatalf("DeleteContentLease: %v", err)
+	}
+	store, err = openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	if _, err := store.content.Info(ctx, target.Digest); err == nil {
+		t.Fatal("unreferenced content remains after family pin removal")
+	}
+}
+
+func TestNativeDeleteGuardsAgainstRetargetedTag(t *testing.T) {
+	root := t.TempDir()
+	store, err := openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := "docker.io/library/test:latest"
+	store.catalog.Images[reference] = imageRecord{
+		Info: Info{Reference: reference, Digest: "sha256:" + strings.Repeat("a", 64)},
+	}
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+	err = Delete(context.Background(), DeleteOptions{Root: root, Reference: reference, Digest: "sha256:" + strings.Repeat("b", 64)})
+	if err == nil || !strings.Contains(err.Error(), "changed from") {
+		t.Fatalf("Delete retarget guard error=%v", err)
 	}
 }
 

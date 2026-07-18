@@ -3,8 +3,8 @@ package(
     licenses = ["notice"],
 )
 
-# Manual because it pulls public images and requires a real containerd socket
-# plus host support for rootless UID/GID mappings.
+# Manual because it pulls public images and requires host support for rootless
+# UID/GID mappings.
 sh_binary(
     name = "e2e_image_matrix",
     srcs = ["e2e_image_matrix.sh"],
@@ -23,7 +23,7 @@ sh_binary(
     ],
 )
 
-# Manual because it requires a real PTY, a containerd socket, and a public image.
+# Manual because it requires a real PTY and a public image.
 sh_binary(
     name = "e2e_terminal",
     srcs = ["e2e_terminal.sh"],

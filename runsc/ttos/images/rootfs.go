@@ -27,7 +27,6 @@ import (
 	"strings"
 	"syscall"
 
-	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/archive"
@@ -39,8 +38,7 @@ import (
 
 // RootFSOptions identifies an image and an empty destination directory.
 type RootFSOptions struct {
-	Address   string
-	Namespace string
+	StoreRoot string
 	Reference string
 	Platform  string
 	Root      string
@@ -56,8 +54,8 @@ type RootFSInfo struct {
 }
 
 // MaterializeRootFS applies the selected image's layers directly to an empty
-// directory. It does not mount a containerd snapshot, so it can run without
-// host mount privileges. Physical files remain owned by the invoking user;
+// directory without a host mount or snapshotter. Physical files remain owned
+// by the invoking user;
 // their image UIDs and GIDs are persisted in a sidecar manifest for the gofer
 // to expose to the Sentry.
 func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, error) {
@@ -72,15 +70,14 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 		return RootFSInfo{}, err
 	}
 
-	client, err := containerd.New(opts.Address, containerd.WithDefaultNamespace(opts.Namespace))
+	store, err := openNativeStore(opts.StoreRoot)
 	if err != nil {
-		return RootFSInfo{}, fmt.Errorf("connecting to containerd at %q: %w", opts.Address, err)
+		return RootFSInfo{}, err
 	}
-	defer client.Close()
-
-	image, err := client.GetImage(ctx, reference)
-	if err != nil {
-		return RootFSInfo{}, fmt.Errorf("finding image %q: %w", reference, err)
+	defer store.close()
+	record, ok := store.catalog.Images[reference]
+	if !ok {
+		return RootFSInfo{}, fmt.Errorf("finding image %q: %w", reference, ErrNotFound)
 	}
 	matcher := platforms.DefaultStrict()
 	if opts.Platform != "" {
@@ -90,12 +87,11 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 		}
 		matcher = platforms.OnlyStrict(platform)
 	}
-	store := client.ContentStore()
-	manifest, err := containerdimages.Manifest(ctx, store, image.Target(), matcher)
+	manifest, err := containerdimages.Manifest(ctx, store.content, record.Target, matcher)
 	if err != nil {
 		return RootFSInfo{}, fmt.Errorf("resolving manifest for %q: %w", reference, err)
 	}
-	configData, err := content.ReadBlob(ctx, store, manifest.Config)
+	configData, err := content.ReadBlob(ctx, store.content, manifest.Config)
 	if err != nil {
 		return RootFSInfo{}, fmt.Errorf("reading image config for %q: %w", reference, err)
 	}
@@ -109,7 +105,7 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 
 	owners := newOwnershipState()
 	for _, layer := range manifest.Layers {
-		if err := applyContentLayer(ctx, store, opts.Root, layer, owners); err != nil {
+		if err := applyContentLayer(ctx, store.content, opts.Root, layer, owners); err != nil {
 			return RootFSInfo{}, fmt.Errorf("applying layer %s: %w", layer.Digest, err)
 		}
 	}
@@ -122,7 +118,7 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 	}
 	platform := strings.TrimSuffix(imageConfig.OS+"/"+imageConfig.Architecture+"/"+imageConfig.Variant, "/")
 	return RootFSInfo{
-		Reference:    image.Name(),
+		Reference:    record.Info.Reference,
 		ConfigDigest: manifest.Config.Digest.String(),
 		Platform:     platform,
 		LayerCount:   len(manifest.Layers),
@@ -252,7 +248,7 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 			group = s.nextGroup
 			s.groups[target] = group
 		}
-		// containerd applies the link header owner with lchown(2), which changes
+		// The archive extractor applies the link header owner with lchown(2), which changes
 		// the shared inode and therefore every existing alias.
 		for name, candidate := range s.groups {
 			if candidate == group {

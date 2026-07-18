@@ -499,10 +499,10 @@ func TestPullNormalizesDockerReference(t *testing.T) {
 	if status := runCommand([]string{"pull", "ubuntu"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("pull status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.pullReference != "docker.io/library/ubuntu:latest" || b.pullSnapshotter != "native" || b.pullUnpack {
-		t.Errorf("pull call: reference=%q snapshotter=%q unpack=%t", b.pullReference, b.pullSnapshotter, b.pullUnpack)
+	if b.pullReference != "docker.io/library/ubuntu:latest" {
+		t.Errorf("pull reference=%q", b.pullReference)
 	}
-	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\nContent: 1024 bytes downloaded, 2048 bytes reused\nUnpack: skipped\n"
+	want := "Pulled docker.io/library/ubuntu:latest\nDigest: sha256:1234\nPlatform: linux/amd64\nContent: 1024 bytes downloaded, 2048 bytes reused\n"
 	if got := stdout.String(); got != want {
 		t.Errorf("pull output=%q, want %q", got, want)
 	}
@@ -522,12 +522,12 @@ func TestImagePullAlias(t *testing.T) {
 func TestPullOptionsAndQuietOutput(t *testing.T) {
 	b := &fakeBackend{pullInfo: ttosimages.Info{Digest: "sha256:5678"}}
 	var stdout, stderr bytes.Buffer
-	args := []string{"pull", "--platform", "linux/arm64", "--snapshotter", "overlayfs", "--unpack=false", "-q", "example/app:v1"}
+	args := []string{"pull", "--platform", "linux/arm64", "-q", "example/app:v1"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("pull status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.pullReference != "docker.io/example/app:v1" || b.pullPlatform != "linux/arm64" || b.pullSnapshotter != "overlayfs" || b.pullUnpack {
-		t.Errorf("pull call: reference=%q platform=%q snapshotter=%q unpack=%t", b.pullReference, b.pullPlatform, b.pullSnapshotter, b.pullUnpack)
+	if b.pullReference != "docker.io/example/app:v1" || b.pullPlatform != "linux/arm64" {
+		t.Errorf("pull call: reference=%q platform=%q", b.pullReference, b.pullPlatform)
 	}
 	if got := stdout.String(); got != "sha256:5678\n" {
 		t.Errorf("quiet pull output=%q", got)
@@ -557,7 +557,7 @@ func TestImagesDockerStyleTableAndQuietAliases(t *testing.T) {
 	if status := runCommand([]string{"images"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("images status=%d, stderr=%q", status, stderr.String())
 	}
-	for _, want := range []string{"REPOSITORY", "TAG", "IMAGE ID", "PLATFORM", "ROOTFS", "UNPACKED", "busybox", "latest", "stable", "0123456789ab", "linux/amd64", "2.15MB", "2 hours ago"} {
+	for _, want := range []string{"REPOSITORY", "TAG", "IMAGE ID", "PLATFORM", "ROOTFS", "busybox", "latest", "stable", "0123456789ab", "linux/amd64", "2.15MB", "2 hours ago"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("images output %q does not contain %q", stdout.String(), want)
 		}
@@ -597,14 +597,13 @@ func TestImageInspectAggregatesAliasesAndTTOSState(t *testing.T) {
 			Digest:       digest,
 			Platform:     "linux/arm64/v8",
 			Materialized: true,
-			Unpacked:     true,
 		},
 	}
 	got, err := inspectImageFromInventory(infos, "busybox")
 	if err != nil {
 		t.Fatalf("inspectImageFromInventory: %v", err)
 	}
-	if got.ID != digest || got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" || !got.Materialized || !got.Unpacked {
+	if got.ID != digest || got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" || !got.Materialized {
 		t.Errorf("inspect info=%+v", got)
 	}
 	if want := []string{"busybox:latest", "busybox:stable"}; !reflect.DeepEqual(got.RepoTags, want) {
@@ -3010,8 +3009,6 @@ type fakeBackend struct {
 	waitRelease       chan struct{}
 	pullReference     string
 	pullPlatform      string
-	pullSnapshotter   string
-	pullUnpack        bool
 	pullInfo          ttosimages.Info
 	imageList         []ImageInfo
 	imageInspectID    string
@@ -3130,11 +3127,9 @@ func (b *fakeBackend) remove(name string, force, volumes bool) error {
 	return b.err
 }
 
-func (b *fakeBackend) pull(reference, platform, snapshotter string, unpack bool) (ttosimages.Info, error) {
+func (b *fakeBackend) pull(reference, platform string) (ttosimages.Info, error) {
 	b.pullReference = reference
 	b.pullPlatform = platform
-	b.pullSnapshotter = snapshotter
-	b.pullUnpack = unpack
 	return b.pullInfo, b.err
 }
 
