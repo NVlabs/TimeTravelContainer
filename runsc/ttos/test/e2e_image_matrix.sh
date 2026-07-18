@@ -90,6 +90,7 @@ MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
 VNET="$PREFIX-vnet"
+DAEMON_STOP="$PREFIX-daemon-stop"
 STOP_POLICY="$PREFIX-stop-policy"
 PIDS_LIMIT="$PREFIX-pids-limit"
 ANON_VOLUME="$PREFIX-anon-volume"
@@ -124,8 +125,20 @@ ttos_daemon_start() {
   ttos daemon start
 }
 
+ttos_daemon_crash() {
+  daemon_status=$(ttos daemon status)
+  daemon_pid=$(printf '%s\n' "$daemon_status" | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p')
+  [ -n "$daemon_pid" ] || fail "could not parse ttosd PID from status: $daemon_status"
+  kill -KILL "$daemon_pid"
+  deadline=$(( $(date +%s) + 5 ))
+  while ttos daemon status >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "killed ttosd remained reachable"
+    sleep 1
+  done
+}
+
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" "$QUOTA_VOLUME" "$NATURAL_VOLUME" >/dev/null 2>&1 || true
@@ -342,7 +355,7 @@ ttos exec "$VNET@child" sh -c 'echo child >/www/index.html'
   fail "forked TTOS branch did not retain its branch-local network service state"
 ttos fork "$VNET" "$VNET@second" >/dev/null
 ttos fork "$VNET@child" "$VNET@grandchild" >/dev/null
-ttos daemon stop
+ttos_daemon_crash
 ttos_daemon_start
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published TTOS port did not survive daemon restart reconciliation"
@@ -593,9 +606,9 @@ done
 
 echo "== daemon restart reconciliation =="
 ttos daemon status | grep -q '"version":4' || fail "ttosd did not report API version 4"
-ttos daemon stop
+ttos_daemon_crash
 if ttos daemon status >/dev/null 2>&1; then
-  fail "ttosd remained reachable after stop"
+  fail "ttosd remained reachable after crash"
 fi
 ttos_daemon_start
 [ "$(ttos inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
@@ -896,6 +909,21 @@ ttos stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
 ttos branch rm "$LIFECYCLE@grandchild"
 ttos rm "$LIFECYCLE_ID"
 ttos volume rm "$VOLUME"
+
+echo "== intentional daemon stop terminates managed containers =="
+ttos run --detach --name "$DAEMON_STOP" "$BUSYBOX_IMAGE" sleep 300 >/dev/null
+ttos fork "$DAEMON_STOP" "$DAEMON_STOP@child" >/dev/null
+ttos pause "$DAEMON_STOP@child" >/dev/null
+ttos daemon stop
+if ttos daemon status >/dev/null 2>&1; then
+  fail "ttosd remained reachable after intentional stop"
+fi
+ttos_daemon_start
+DAEMON_STOP_STATES=$(ttos inspect -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$DAEMON_STOP")
+case "$DAEMON_STOP_STATES" in
+  *running*|*paused*) fail "intentional daemon stop left a live branch: $DAEMON_STOP_STATES" ;;
+esac
+ttos rm --force "$DAEMON_STOP"
 ttos daemon stop >/dev/null
 
 trap - EXIT HUP INT TERM

@@ -50,6 +50,7 @@ DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTOS_E2E_ROOT/ttosd.sock"
 NAME="terminal-e2e-$$"
+CLIENT_TERM=${TERM:-xterm}
 for value in "$TTOS" "$RUNSC" "$TTOS_E2E_ROOT"; do
   case "$value" in
     *[[:space:]]*) fail "PTY test paths must not contain whitespace: $value" ;;
@@ -114,7 +115,7 @@ ttos fork "$NAME" "$NAME@child" >/dev/null
 ttos pause "$NAME@child" >/dev/null
 ttos resume "$NAME@child" >/dev/null
 run_pty "$TTOS_E2E_ROOT/exec.typescript" \
-  "exec -it $NAME@child sh -c \"test -t 0 && test -t 1 && echo tty-exec-ok\"" \
+  "exec -it $NAME@child sh -c 'test -t 0 && test -t 1 && test -t 2 && stty -a >/dev/null && echo term:\$TERM && echo tty-exec-ok'" \
   >"$TTOS_E2E_ROOT/exec.out"
 
 ttos logs "$NAME" >"$TTOS_E2E_ROOT/parent.logs"
@@ -124,6 +125,7 @@ ttos ls --tree >"$TTOS_E2E_ROOT/tree.out"
 grep -a -q "parent-terminal-marker" "$TTOS_E2E_ROOT/parent.logs" || fail "parent attach output was not persisted"
 grep -a -q "child-terminal-marker" "$TTOS_E2E_ROOT/child.logs" || fail "child attach output was not persisted"
 grep -a -q "tty-exec-ok" "$TTOS_E2E_ROOT/exec.out" || fail "terminal exec failed"
+grep -a -q "term:$CLIENT_TERM" "$TTOS_E2E_ROOT/exec.out" || fail "terminal exec did not inherit client TERM=$CLIENT_TERM"
 grep -q "child running" "$TTOS_E2E_ROOT/tree.out" || fail "branch tree does not show the running child"
 
 echo "TTOS terminal and live-fork integration passed"

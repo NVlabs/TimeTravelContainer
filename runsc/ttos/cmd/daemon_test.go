@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,43 @@ func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	status := Run([]string{"--daemon-socket", socket, "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "start it explicitly with 'ttos daemon start'") {
 		t.Fatalf("missing daemon: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
+func TestStopDaemonContainersStopsDescendantsBeforeMain(t *testing.T) {
+	b := &fakeBackend{
+		families: []Family{{
+			ID: "web",
+			Branches: []Branch{
+				{ID: defaultBranchID, State: "running"},
+				{ID: "child", ParentID: defaultBranchID, State: "paused"},
+				{ID: "grandchild", ParentID: "child", State: "running"},
+				{ID: "old", ParentID: defaultBranchID, State: "exited"},
+			},
+		}},
+		inspectInfo: InspectInfo{},
+	}
+	if err := stopDaemonContainers(b); err != nil {
+		t.Fatalf("stopDaemonContainers: %v", err)
+	}
+	if got, want := b.resumed, (selector{container: "web", branch: "child"}); got != want {
+		t.Errorf("resumed=%+v, want %+v", got, want)
+	}
+	wantOrder := []selector{
+		{container: "web", branch: "grandchild"},
+		{container: "web", branch: "child"},
+		{container: "web", branch: defaultBranchID},
+	}
+	if len(b.signals) != len(wantOrder) {
+		t.Fatalf("signals=%+v, want targets %+v", b.signals, wantOrder)
+	}
+	for i, want := range wantOrder {
+		if b.signals[i].target != want {
+			t.Errorf("signal[%d] target=%+v, want %+v", i, b.signals[i].target, want)
+		}
+	}
+	if got, want := b.preservedRootfs, []selector{{container: "web", branch: defaultBranchID}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("preserved rootfs=%+v, want %+v", got, want)
 	}
 }
 

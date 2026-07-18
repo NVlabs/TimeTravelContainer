@@ -2896,6 +2896,38 @@ exit 2
 	}
 }
 
+func TestRuntimeBackendTerminalExecUsesClientTERM(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+case " $* " in
+  *" --env TERM=tmux-256color "*) ;;
+  *) echo "client TERM missing: $*" >&2; exit 2 ;;
+esac
+case " $* " in
+  *" --internal-console-terminal "*) ;;
+  *) echo "terminal exec flags missing: $*" >&2; exit 2 ;;
+esac
+case " $* " in
+  *" web true ") exit 0 ;;
+  *) echo "terminal exec command missing: $*" >&2; exit 2 ;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	var stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, clientTERM: "tmux-256color", stderr: &stderr}
+	status, err := b.exec(execRequest{
+		target:   selector{container: "web", branch: "main"},
+		args:     []string{"true"},
+		terminal: true,
+	})
+	if err != nil || status != 0 {
+		t.Fatalf("terminal exec returned status=%d err=%v stderr=%q", status, err, stderr.String())
+	}
+}
+
 func TestRemoveStoppedRuntimeBeforeStart(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

@@ -287,6 +287,12 @@ ttos exec -d web@test-b long-running-command
 ttos exec ls web@test-b
 ```
 
+For `-t`, TTOS propagates the invoking client's `TERM` value into a new
+container or exec process when the image/container and command do not already
+define `TERM`; an unset client value falls back to `xterm`. This lets terminal
+applications such as `tmux` select the correct terminfo entry while preserving
+an explicitly configured container terminal type.
+
 Attach to the branch's init console:
 
 ```shell
@@ -465,6 +471,14 @@ change modes. `daemon status` returns the active mode in JSON.
 direct mutations with daemon-mediated commands against the same data root.
 Durable mutation records can be inspected with `ttos daemon requests` after an
 interrupted operation.
+
+`ttos daemon stop` is an orderly manager shutdown: it resumes paused branches,
+stops descendants before their source branches using each container's normal
+stop policy, persists managed volumes and writable rootfs state, and then exits
+the daemon. If a stop fails, the daemon remains available and reports the
+failure. In contrast, an unexpected `ttosd` crash does not terminate Sentry
+sandboxes; after restarting the daemon, TTOS reconciles those live containers
+and their console/port sidecars.
 
 ## Shell completion
 

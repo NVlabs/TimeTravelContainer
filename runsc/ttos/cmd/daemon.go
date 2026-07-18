@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,12 +61,13 @@ type daemonWireOptions struct {
 }
 
 type daemonRequest struct {
-	Version   int               `json:"version"`
-	Action    string            `json:"action"`
-	RequestID string            `json:"request_id,omitempty"`
-	Options   daemonWireOptions `json:"options,omitempty"`
-	Args      []string          `json:"args,omitempty"`
-	Stdin     bool              `json:"stdin,omitempty"`
+	Version    int               `json:"version"`
+	Action     string            `json:"action"`
+	RequestID  string            `json:"request_id,omitempty"`
+	ClientTERM string            `json:"client_term,omitempty"`
+	Options    daemonWireOptions `json:"options,omitempty"`
+	Args       []string          `json:"args,omitempty"`
+	Stdin      bool              `json:"stdin,omitempty"`
 }
 
 type daemonServer struct {
@@ -174,10 +176,74 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		dataRoot:              opts.dataRoot,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		clientExecutable:      opts.clientExecutable,
+		clientTERM:            os.Getenv("TERM"),
 		stdin:                 stdin,
 		stdout:                stdout,
 		stderr:                stderr,
 	}
+}
+
+type daemonStopTarget struct {
+	selector selector
+	state    string
+	depth    int
+}
+
+func stopDaemonContainers(backend backend) error {
+	families, err := backend.listFamilies()
+	if err != nil {
+		return err
+	}
+	var targets []daemonStopTarget
+	for _, family := range families {
+		parents := make(map[string]string, len(family.Branches))
+		for _, branch := range family.Branches {
+			parents[branch.ID] = branch.ParentID
+		}
+		for _, branch := range family.Branches {
+			switch branch.State {
+			case "running", "paused", "restarting":
+			default:
+				continue
+			}
+			depth := 0
+			seen := map[string]bool{branch.ID: true}
+			for parent := branch.ParentID; parent != "" && !seen[parent]; parent = parents[parent] {
+				seen[parent] = true
+				depth++
+			}
+			targets = append(targets, daemonStopTarget{
+				selector: selector{container: family.ID, branch: branch.ID},
+				state:    branch.State,
+				depth:    depth,
+			})
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].selector.container != targets[j].selector.container {
+			return targets[i].selector.container < targets[j].selector.container
+		}
+		if targets[i].selector.branch == defaultBranchID || targets[j].selector.branch == defaultBranchID {
+			return targets[j].selector.branch == defaultBranchID
+		}
+		if targets[i].depth != targets[j].depth {
+			return targets[i].depth > targets[j].depth
+		}
+		return targets[i].selector.branch < targets[j].selector.branch
+	})
+	var stopErrors []error
+	for _, target := range targets {
+		if target.state == "paused" {
+			if err := backend.resume(target.selector); err != nil {
+				stopErrors = append(stopErrors, fmt.Errorf("resuming %s before stop: %w", target.selector, err))
+				continue
+			}
+		}
+		if err := runStop([]string{target.selector.String()}, io.Discard, io.Discard, backend); err != nil {
+			stopErrors = append(stopErrors, fmt.Errorf("stopping %s: %w", target.selector, err))
+		}
+	}
+	return errors.Join(stopErrors...)
 }
 
 func wireOptions(opts options) daemonWireOptions {
@@ -408,6 +474,20 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		return
 	case "stop":
+		if request.Options != (daemonWireOptions{}) {
+			opts := optionsFromWire(request.Options)
+			opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+			backend := directBackend(opts, strings.NewReader(""), io.Discard,
+				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+			backend.consoleSidecars = s
+			unlock := s.lockDataRoot(opts.dataRoot)
+			err := stopDaemonContainers(backend)
+			unlock()
+			if err != nil {
+				writeError(fmt.Errorf("stopping managed containers: %w", err))
+				return
+			}
+		}
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		s.stopOnce.Do(func() { s.listener.Close() })
 		return
@@ -456,6 +536,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+	backend.clientTERM = request.ClientTERM
 	backend.consoleSidecars = s
 	if request.Args[0] == "events" {
 		status := 0
@@ -770,7 +851,7 @@ func daemonCommandUsesStdin(args []string) bool {
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
-		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args),
+		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
 	}
 	if daemonCommandNeedsMutationLock(args) && opts.dataRoot != "" {
 		requestID, err := newDaemonRequestID()
@@ -1011,7 +1092,11 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 1
 		}
 		defer conn.Close()
-		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, Action: map[string]string{"status": "ping", "stop": "stop"}[action]}, strings.NewReader(""), stdout, stderr)
+		request := daemonRequest{Version: daemonAPIVersion, Action: map[string]string{"status": "ping", "stop": "stop"}[action]}
+		if action == "stop" {
+			request.Options = wireOptions(opts)
+		}
+		status, err := exchangeDaemon(conn, request, strings.NewReader(""), stdout, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttos: %v\n", err)
 			return 1

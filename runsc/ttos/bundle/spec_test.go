@@ -74,6 +74,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		RootFS:         root,
 		ReadonlyRootfs: true,
 		Terminal:       true,
+		TerminalType:   "screen-256color",
 		ConsoleSize:    &specs.Box{Height: 37, Width: 91},
 		StopSignal:     "SIGUSR1",
 		PidsLimit:      &pidsLimit,
@@ -116,7 +117,7 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got, want := spec.Process.Args, []string{"/entry", "override", "arg"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("args=%q, want %q", got, want)
 	}
-	if got, want := spec.Process.Env, []string{"A=run", "C=new"}; !reflect.DeepEqual(got, want) {
+	if got, want := spec.Process.Env, []string{"A=run", "C=new", "TERM=screen-256color"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("env=%q, want %q", got, want)
 	}
 	if spec.Process.Cwd != "/work" || spec.Hostname != "demo" {
@@ -227,6 +228,19 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := hostSpec.Annotations[StopSignalAnnotation]; got != "SIGQUIT" {
 		t.Errorf("image stop signal annotation=%q, want SIGQUIT", got)
+	}
+}
+
+func TestBuildSpecPreservesConfiguredTerminalType(t *testing.T) {
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{
+		Cmd: []string{"sh"},
+		Env: []string{"TERM=vt100"},
+	}}, SpecOptions{RootFS: t.TempDir(), Terminal: true, TerminalType: "xterm-256color"})
+	if err != nil {
+		t.Fatalf("BuildSpec: %v", err)
+	}
+	if got, want := spec.Process.Env, []string{"TERM=vt100"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("env=%q, want configured image terminal type %q", got, want)
 	}
 }
 

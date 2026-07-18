@@ -184,8 +184,9 @@ normal commands.
 
 `e2e_terminal.sh` is the authoritative real-PTY test for `run -it`, detached
 terminal containers, the `ttosd` terminal transport, attach/detach keys,
-branch-local terminal state after live fork, pause/resume, persistent logs, and
-`exec -it`. It repeats quick-exit terminal runs to cover the pre-start console
+branch-local terminal state after live fork, pause/resume, persistent logs,
+client `TERM` propagation, terminal ioctls, and `exec -it`. It repeats
+quick-exit terminal runs to cover the pre-start console
 follower handshake and verifies that their output is never lost.
 
 ```shell

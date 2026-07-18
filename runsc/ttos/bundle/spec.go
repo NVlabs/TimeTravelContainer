@@ -89,6 +89,7 @@ type SpecOptions struct {
 	User             string
 	Hostname         string
 	Terminal         bool
+	TerminalType     string
 	ConsoleSize      *specs.Box
 	NetworkMode      string
 	ReadonlyRootfs   bool
@@ -476,6 +477,13 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	}
 	if len(env) == 0 {
 		env = []string{"PATH=" + defaultPath}
+	}
+	if opts.Terminal && !envHasKey(env, "TERM") {
+		terminalType := opts.TerminalType
+		if terminalType == "" {
+			terminalType = "xterm"
+		}
+		env = append(env, "TERM="+terminalType)
 	}
 	cwd := image.Config.WorkingDir
 	if opts.Cwd != "" {
@@ -945,4 +953,14 @@ func mergeEnv(imageEnv, overrides []string) ([]string, error) {
 		}
 	}
 	return result, nil
+}
+
+func envHasKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, assignment := range env {
+		if strings.HasPrefix(assignment, prefix) {
+			return true
+		}
+	}
+	return false
 }

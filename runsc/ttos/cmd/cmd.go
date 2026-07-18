@@ -4417,10 +4417,28 @@ type runtimeBackend struct {
 	dataRoot              string
 	unsafeNoHostIsolation bool
 	clientExecutable      string
+	clientTERM            string
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
 	consoleSidecars       consoleSidecarOwner
+}
+
+func terminalType(value string) string {
+	if value == "" {
+		return "xterm"
+	}
+	return value
+}
+
+func environmentHasKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, assignment := range env {
+		if strings.HasPrefix(assignment, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *runtimeBackend) containerStore() ttosbundle.Store {
@@ -4663,6 +4681,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			User:             request.user,
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
+			TerminalType:     terminalType(b.clientTERM),
 			ConsoleSize:      consoleSize,
 			NetworkMode:      request.networkMode,
 			ExtraHosts:       request.extraHosts,
@@ -4730,6 +4749,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			User:             request.user,
 			Hostname:         request.hostname,
 			Terminal:         request.terminal,
+			TerminalType:     terminalType(b.clientTERM),
 			ConsoleSize:      consoleSize,
 			NetworkMode:      request.networkMode,
 			ExtraHosts:       request.extraHosts,
@@ -4890,6 +4910,19 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		return 1, err
 	}
 	request.target = resolved
+	if request.terminal && request.processPath == "" && !environmentHasKey(request.env, "TERM") {
+		hasContainerTERM := false
+		if b.dataRoot != "" {
+			spec, loadErr := b.containerStore().LoadSpec(request.target.container)
+			if loadErr != nil {
+				return 1, fmt.Errorf("loading container environment for terminal exec: %w", loadErr)
+			}
+			hasContainerTERM = spec.Process != nil && environmentHasKey(spec.Process.Env, "TERM")
+		}
+		if !hasContainerTERM {
+			request.env = append(request.env, "TERM="+terminalType(b.clientTERM))
+		}
+	}
 	cols, rows, hasConsoleSize := 0, 0, false
 	if request.terminal {
 		cols, rows, hasConsoleSize, err = hostTerminalSize(b.stdin)

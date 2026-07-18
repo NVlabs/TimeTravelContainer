@@ -529,8 +529,11 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [x] Test explicit daemon stop/restart while a container remains live, including
-      persisted-state and console-drainer reconciliation.
+- [x] Make explicit daemon stop gracefully terminate every live branch in the
+      selected data root, descendants before parents, while preserving daemon
+      crash/restart reconciliation for still-live sandboxes and console drains.
+- [x] Propagate the invoking client's `TERM` for terminal runs and execs when no
+      image/container or command value exists, with an `xterm` fallback.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published
       PID while the guest remains live and output draining resumes.
 - [x] Test that client loss delivers already-acknowledged stdin before EOF,
