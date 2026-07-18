@@ -128,6 +128,51 @@ func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 	}
 }
 
+func TestLiveForkPrivateAnonymousMemoryApplicationWriteFault(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length:   2 * hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	if _, err := parent.CopyOut(ctx, addr, []byte{1}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("faulting first parent page: %v", err)
+	}
+	second := addr + hostarch.PageSize
+	if _, err := parent.CopyOut(ctx, second, []byte{2}, usermem.IOOpts{}); err != nil {
+		t.Fatalf("faulting second parent page: %v", err)
+	}
+
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("clone child: %v", err)
+	}
+	defer child.DecUsers(ctx)
+
+	if err := parent.HandleUserFault(ctx, second, hostarch.Write, 0); err != nil {
+		t.Errorf("parent HandleUserFault(Write): %v", err)
+	}
+	if err := child.HandleUserFault(ctx, second, hostarch.Write, 0); err != nil {
+		t.Errorf("child HandleUserFault(Write): %v", err)
+	}
+	for name, memMgr := range map[string]*MemoryManager{"parent": parent, "child": child} {
+		got := make([]byte, 1)
+		if _, err := memMgr.CopyIn(ctx, addr, got, usermem.IOOpts{}); err != nil {
+			t.Fatalf("%s CopyIn(first page): %v", name, err)
+		}
+		if got[0] != 1 {
+			t.Errorf("%s first page after second-page write fault: got %d, want 1", name, got[0])
+		}
+	}
+}
+
 func TestLiveForkPrivateAnonymousMemoryRepeatedRelease(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)

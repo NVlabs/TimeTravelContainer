@@ -150,6 +150,7 @@ func (k *Kernel) ValidateLiveFork(ctx context.Context, opts LiveForkValidationOp
 	if !k.IsPaused() {
 		return fmt.Errorf("live fork validation requires a paused kernel")
 	}
+	k.tasks.waitForExternalStop()
 	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil && !opts.AllowNetworkStack {
 		return fmt.Errorf("live fork does not yet support a network stack")
 	}
@@ -198,6 +199,8 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	if !k.IsPaused() {
 		return nil, fmt.Errorf("live fork requires a paused kernel")
 	}
+	k.tasks.waitForExternalStop()
+	k.ReceiveTaskStates()
 	if opts.Clocks == nil {
 		return nil, fmt.Errorf("live fork requires a clock source")
 	}
@@ -432,6 +435,12 @@ func (k *Kernel) validateLiveForkNetwork(stack inet.Stack) error {
 	k.tasks.mu.RLock()
 	defer k.tasks.mu.RUnlock()
 	for task, tid := range k.tasks.Root.tids {
+		// Exit teardown releases the task's network namespace before the task
+		// is reaped from its PID namespace. Such zombies have no remaining
+		// network state to validate or clone.
+		if task.netns == nil {
+			continue
+		}
 		if task.netns != k.rootNetworkNamespace {
 			return fmt.Errorf("live fork does not yet support non-root network namespace observed by pid %d", tid)
 		}

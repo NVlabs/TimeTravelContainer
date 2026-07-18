@@ -221,6 +221,50 @@ func (ts *TaskSet) PullFullState() {
 	}
 }
 
+// waitForExternalStop waits until every extant task goroutine has reached
+// Task.doStop or exited. TaskSet.BeginExternalStop interrupts tasks, but
+// Kernel.Pause's aggregate running-goroutine barrier may observe an
+// interruptible sleeper as quiescent before it has unwound its syscall and
+// entered Task.doStop. State serialization must not capture that transient
+// combination of syscall-entry registers and a pre-syscall run state.
+//
+// Preconditions: ts is externally stopped.
+func (ts *TaskSet) waitForExternalStop() {
+	for {
+		ts.mu.RLock()
+		if ts.Root == nil {
+			ts.mu.RUnlock()
+			return
+		}
+		tasks := make([]*Task, 0, len(ts.Root.tids))
+		for t := range ts.Root.tids {
+			tasks = append(tasks, t)
+		}
+		ts.mu.RUnlock()
+
+		for _, t := range tasks {
+			t.waitGoroutineStoppedOrExited()
+		}
+
+		// A task may have created another task while unwinding toward its
+		// external stop. Future tasks inherit the TaskSet stop, so repeat only
+		// until every task now in the PID namespace is stopped or gone.
+		ts.mu.RLock()
+		allStopped := true
+		for t := range ts.Root.tids {
+			switch t.TaskGoroutineState() {
+			case TaskGoroutineStopped, TaskGoroutineNonexistent:
+			default:
+				allStopped = false
+			}
+		}
+		ts.mu.RUnlock()
+		if allStopped {
+			return
+		}
+	}
+}
+
 // EndExternalStop indicates the end of an external stop started by a previous
 // call to TaskSet.BeginExternalStop. EndExternalStop does not wait for task
 // goroutines to resume.

@@ -25,9 +25,46 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+type recordingMappingSpace struct {
+	invalidated bool
+	opts        memmap.InvalidateOpts
+}
+
+func (ms *recordingMappingSpace) Invalidate(_ hostarch.AddrRange, opts memmap.InvalidateOpts) {
+	ms.invalidated = true
+	ms.opts = opts
+}
+
+func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := rf.AddMapping(ctx, ms, ar, 0, true); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
+
+	rf.prepareLiveFork()
+	if !ms.invalidated {
+		t.Fatal("prepareLiveFork did not invalidate file-backed translations")
+	}
+	if ms.opts.InvalidatePrivate {
+		t.Fatal("prepareLiveFork invalidated private PMAs containing application modifications")
+	}
+}
 
 // Test that we can write some data to a file and read it back.`
 func TestSimpleWriteRead(t *testing.T) {

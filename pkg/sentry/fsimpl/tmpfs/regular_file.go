@@ -148,11 +148,13 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	}
 }
 
-// prepareLiveFork invalidates all cached translations and marks every present
-// page as shared with the impending child branch.
+// prepareLiveFork invalidates file-backed translations and marks every present
+// page as shared with the impending child branch. Private PMAs must be
+// preserved: they contain application-owned modifications, such as dynamic
+// linker relocations, that are no longer represented by the tmpfs file.
 func (rf *regularFile) prepareLiveFork() {
 	rf.mapsMu.Lock()
-	rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	rf.dataMu.Lock()
 	rf.cow.RemoveAll()
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
