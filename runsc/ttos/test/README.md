@@ -29,7 +29,9 @@ covers:
 - Docker-style `container` aliases, multi-container detached `start`, concurrent
   `wait` with argument-ordered exit codes, restart of an exited container, and
   an explicitly forced running-family restart where in-memory managed-volume
-  contents are expected to be recreated;
+  contents are expected to be recreated; writable-rootfs upper-layer state,
+  including shutdown-handler writes, is exported on main exit and restored by
+  a later start;
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;

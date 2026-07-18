@@ -856,7 +856,8 @@ bundle.
 ## Open semantic decisions
 
 - [x] Define `start` for an exited main branch as OCI recreation from the immutable
-      image and persistent configuration. Managed volumes start from their latest
+      image, persistent configuration, and the main branch's last exit-exported
+      writable-rootfs upper layer. Managed volumes start from their latest
       explicitly committed, imported, manager-preserved, or natural-exit main
       seed. An explicit stop/restart snapshot precedes signal delivery, and the
       Sentry final snapshot captures later shutdown-handler writes before teardown.

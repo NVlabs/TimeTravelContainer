@@ -79,6 +79,10 @@ const (
 	// AnnotationMountTarOnExit maps shared mount sources to pending tar outputs.
 	AnnotationMountTarOnExit = "dev.timetravelos.tar.mounts.on-exit"
 
+	// RootfsMountTarSource is the reserved source key used to export the root
+	// filesystem through AnnotationMountTarOnExit.
+	RootfsMountTarSource = "dev.timetravelos.rootfs"
+
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
 	// Usage:
@@ -313,7 +317,9 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 		normalized := make(map[string]MountTarOnExitTarget, len(targets))
 		for source, target := range targets {
-			source = absPath(bundleDir, source)
+			if source != RootfsMountTarSource {
+				source = absPath(bundleDir, source)
+			}
 			if _, ok := normalized[source]; ok {
 				return fmt.Errorf("%s contains duplicate normalized source %q", AnnotationMountTarOnExit, source)
 			}
@@ -1017,6 +1023,9 @@ func MountTarOnExitPaths(spec *specs.Spec) ([]MountTarOnExitPath, error) {
 		readonly bool
 	}
 	destinations := make(map[string]mountDestination)
+	if spec.Root != nil && !spec.Root.Readonly {
+		destinations[RootfsMountTarSource] = mountDestination{path: "/"}
+	}
 	for _, mount := range spec.Mounts {
 		readonly := false
 		for _, option := range mount.Options {

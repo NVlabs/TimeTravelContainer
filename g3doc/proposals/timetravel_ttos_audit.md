@@ -281,10 +281,13 @@ rootless `ttos` virtual-NIC mode, optional user-mode NAT, and persistent TCP
 port publication, but this is not the Docker network API. Host mode cannot be
 live-forked.
 
-Restart recreates an exited main branch from persistent configuration and the
-immutable image. A stopped branch does not retain its in-memory Kernel or
-uncommitted branch-local filesystem state. Managed-volume state must be
-committed/imported or captured by the documented stop/exit preservation path.
+Restart recreates an exited main branch from persistent configuration, the
+immutable image, and the last atomically exported writable-rootfs upper layer.
+The main branch exports that upper layer after init exits, including shutdown
+handler writes. A stopped branch does not retain its in-memory Kernel; child
+branch filesystem changes are not promoted automatically. Managed-volume state
+must be committed/imported or captured by the documented stop/exit preservation
+path.
 
 ### C2: current gVisor networking and the TTOS subset
 

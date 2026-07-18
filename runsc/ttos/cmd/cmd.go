@@ -3734,6 +3734,11 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 			return err
 		}
+		if target.branch == defaultBranchID {
+			if err := backend.preserveRootfs(target); err != nil {
+				return fmt.Errorf("preserving writable rootfs for %s after stop: %w", target, err)
+			}
+		}
 		fmt.Fprintln(stdout, target)
 	}
 	return nil
@@ -4394,6 +4399,7 @@ type backend interface {
 	importVolume(name, inputPath string) (ttosbundle.VolumeInfo, error)
 	commitVolume(target selector, name string) (ttosbundle.VolumeInfo, error)
 	preserveVolumes(target selector) error
+	preserveRootfs(target selector) error
 	removeVolume(name string) error
 }
 
@@ -4769,11 +4775,11 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err != nil {
 		return 1, err
 	}
-	if err := b.containerStore().RefreshVolumeSeeds(info.ID); err != nil {
-		return 1, fmt.Errorf("refreshing managed volume seeds before starting %q: %w", name, err)
-	}
 	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
+	}
+	if err := b.containerStore().RefreshVolumeSeeds(info.ID); err != nil {
+		return 1, fmt.Errorf("refreshing persistent filesystem seeds before starting %q: %w", name, err)
 	}
 	status, err := b.launch(info, detach, interactive)
 	if err == nil {
@@ -4862,6 +4868,11 @@ func (b *runtimeBackend) removeStoppedRuntime(name string) error {
 		if family.State != "stopped" && family.State != "exited" {
 			return fmt.Errorf("container %q is already %s", name, family.State)
 		}
+		if b.dataRoot != "" {
+			if err := b.containerStore().FinalizeRootfsExitSnapshot(name); err != nil {
+				return fmt.Errorf("preserving writable rootfs from stopped container %q: %w", name, err)
+			}
+		}
 		if _, err := b.command("delete", "--force", name); err != nil {
 			return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
 		}
@@ -4929,8 +4940,13 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		args = append(args, request.args...)
 	}
 	command := exec.Command(b.runsc, args...)
+	var closeCommandStdin func()
 	if !request.detach && (request.interactive || request.terminal) {
-		command.Stdin = b.stdin
+		closeCommandStdin, err = setCommandStdin(command, b.stdin)
+		if err != nil {
+			return 1, err
+		}
+		defer closeCommandStdin()
 	}
 	command.Stdout = b.stdout
 	command.Stderr = b.stderr
@@ -4975,6 +4991,33 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		}
 	}
 	return 0, nil
+}
+
+// setCommandStdin passes real files directly and bridges other readers through
+// an OS pipe. os/exec otherwise creates an internal copy goroutine and Wait
+// waits for it; a daemon-side interactive reader can remain blocked after the
+// child exits, causing a completed exec to hang forever.
+func setCommandStdin(command *exec.Cmd, input io.Reader) (func(), error) {
+	if input == nil {
+		return func() {}, nil
+	}
+	if file, ok := input.(*os.File); ok {
+		command.Stdin = file
+		return func() {}, nil
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("creating command stdin pipe: %w", err)
+	}
+	command.Stdin = reader
+	go func() {
+		_, _ = io.Copy(writer, input)
+		_ = writer.Close()
+	}()
+	return func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	}, nil
 }
 
 type consoleWriteResult struct {
@@ -6441,6 +6484,7 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, ne
 	args = append(args,
 		"--network="+networkMode,
 		"--directfs=false",
+		"--allow-rootfs-tar-annotation=true",
 		"--overlay2=all:memory")
 	if networkMode == "ttos" {
 		args = append(args, "--ttos-network-nat="+strconv.FormatBool(networkNAT))
@@ -6952,6 +6996,17 @@ func (b *runtimeBackend) preserveVolumes(target selector) (retErr error) {
 		}
 	}
 	return nil
+}
+
+func (b *runtimeBackend) preserveRootfs(target selector) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	if resolved.branch != defaultBranchID {
+		return fmt.Errorf("writable rootfs persistence is only supported for the main branch")
+	}
+	return b.containerStore().FinalizeRootfsExitSnapshot(resolved.container)
 }
 
 func (b *runtimeBackend) removeVolume(name string) error {

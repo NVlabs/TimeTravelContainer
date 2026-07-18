@@ -302,6 +302,17 @@ ttos logs --follow --tail 100 web@test-b
 
 ## Filesystems and volumes
 
+The ordinary container root is writable by default. While the container is
+running it is a Sentry-owned memory overlay, so live forks share it copy-on-write.
+When the main container exits, TTOS exports only that overlay's upper layer and
+uses it as the seed for the next `ttos start`; normal rootfs changes and shutdown
+handler writes therefore survive stop/start. A read-only root (`--read-only`)
+has no writable upper, and child-branch changes are not promoted to the main
+container's restart seed.
+
+Plain tmpfs mounts remain ephemeral across stop/start. Use a managed volume for
+tmpfs-backed data that must be forkable and restart-persistent.
+
 Arbitrary Sentry-owned tmpfs, alternate procfs, and restricted read-only sysfs
 mounts are supported:
 

@@ -874,7 +874,7 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 			"dev.gvisor.spec.mount.host.source":  "/host/data",
 			"dev.gvisor.spec.mount.cache.type":   "tmpfs",
 			AnnotationMountTar:                   `{"volumes/cache":"/snapshots/cache.tar"}`,
-			AnnotationMountTarOnExit:             `{"volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"}}`,
+			AnnotationMountTarOnExit:             `{"volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`,
 			"example.source":                     "relative-but-not-a-mount-hint",
 		},
 	}
@@ -893,7 +893,7 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	if got, want := spec.Annotations[AnnotationMountTar], `{"/bundle/volumes/cache":"/snapshots/cache.tar"}`; got != want {
 		t.Errorf("mount tar annotation=%q, want %q", got, want)
 	}
-	if got, want := spec.Annotations[AnnotationMountTarOnExit], `{"/bundle/volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"}}`; got != want {
+	if got, want := spec.Annotations[AnnotationMountTarOnExit], `{"/bundle/volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`; got != want {
 		t.Errorf("final mount tar annotation=%q, want %q", got, want)
 	}
 	if got, want := spec.Annotations["example.source"], "relative-but-not-a-mount-hint"; got != want {

@@ -508,8 +508,9 @@ ttos rm --force "$NOLOG"
 
 echo "== natural-exit managed-volume preservation =="
 ttos volume create "$NATURAL_VOLUME"
-ttos run --name "$NATURAL_WRITER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'trap "echo shutdown-handler >/natural/final" EXIT; echo before-exit >/natural/before'
+ttos run --name "$NATURAL_WRITER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'if [ -e /rootfs-before ]; then test "$(cat /rootfs-before)" = before-exit; test "$(cat /rootfs-final)" = shutdown-handler; exit; fi; trap "echo shutdown-handler >/natural/final; echo shutdown-handler >/rootfs-final" EXIT; echo before-exit >/natural/before; echo before-exit >/rootfs-before'
 ttos volume inspect "$NATURAL_VOLUME" | grep -q '"snapshot_bytes":' || fail "natural exit did not publish managed-volume snapshot metadata"
+ttos start "$NATURAL_WRITER" || fail "natural-exit restart did not restore writable rootfs state"
 ttos run --name "$NATURAL_READER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'test "$(cat /natural/before)" = before-exit; test "$(cat /natural/final)" = shutdown-handler'
 ttos rm "$NATURAL_WRITER" "$NATURAL_READER"
 ttos volume rm "$NATURAL_VOLUME"

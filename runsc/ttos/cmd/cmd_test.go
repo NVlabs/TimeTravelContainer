@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -2458,21 +2459,21 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--overlay2=all:memory"}
+	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--overlay2=all:memory"}
+	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTOSNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttos", "--directfs=false", "--overlay2=all:memory", "--ttos-network-nat=true"}
+	wantTTOSNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttos", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory", "--ttos-network-nat=true"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttos", true); !reflect.DeepEqual(got, wantTTOSNAT) {
 		t.Errorf("TTOS NAT runsc args=%q, want %q", got, wantTTOSNAT)
 	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
-		"--network=none", "--directfs=false", "--overlay2=all:memory",
+		"--network=none", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory",
 	}
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
@@ -2945,6 +2946,34 @@ exit 2
 	}
 }
 
+func TestSetCommandStdinDoesNotHoldWaitOpen(t *testing.T) {
+	input, inputWriter := io.Pipe()
+	command := exec.Command("/bin/sh", "-c", "exit 0")
+	cleanup, err := setCommandStdin(command, input)
+	if err != nil {
+		t.Fatalf("setCommandStdin: %v", err)
+	}
+	defer cleanup()
+	defer inputWriter.Close()
+	defer input.Close()
+	if _, ok := command.Stdin.(*os.File); !ok {
+		t.Fatalf("command stdin type=%T, want *os.File", command.Stdin)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatalf("starting command: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- command.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("waiting for command: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("command Wait blocked on still-open daemon stdin")
+	}
+}
+
 func TestListFamiliesMergesPersistentStateAndReconcilesStaleRunning(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -3100,6 +3129,7 @@ type fakeBackend struct {
 	volumeCommitTarget selector
 	volumeCommitName   string
 	preservedVolumes   []selector
+	preservedRootfs    []selector
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3328,6 +3358,11 @@ func (b *fakeBackend) commitVolume(target selector, name string) (ttosbundle.Vol
 
 func (b *fakeBackend) preserveVolumes(target selector) error {
 	b.preservedVolumes = append(b.preservedVolumes, target)
+	return b.err
+}
+
+func (b *fakeBackend) preserveRootfs(target selector) error {
+	b.preservedRootfs = append(b.preservedRootfs, target)
 	return b.err
 }
 

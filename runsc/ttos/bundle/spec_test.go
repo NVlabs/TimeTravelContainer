@@ -1016,6 +1016,67 @@ func TestFinalizeVolumeExitSnapshots(t *testing.T) {
 	}
 }
 
+func TestFinalizeRootfsExitSnapshot(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Root: &specs.Root{Path: "/rootfs"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, ready, err := store.RootfsExitSnapshotPaths("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := tar.NewWriter(file)
+	contents := "preserved"
+	if err := writer.WriteHeader(&tar.Header{Name: "./shutdown-state", Mode: 0644, Size: int64(len(contents))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte(contents)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ready, []byte("complete\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinalizeRootfsExitSnapshot("demo"); err != nil {
+		t.Fatalf("FinalizeRootfsExitSnapshot: %v", err)
+	}
+	snapshot, err := store.RootfsSnapshotPath("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(snapshot); err != nil {
+		t.Fatal(err)
+	} else if info.Size() == 0 || info.Mode().Perm() != 0600 {
+		t.Fatalf("rootfs snapshot info=%+v", info)
+	}
+	if _, err := os.Stat(pending); !os.IsNotExist(err) {
+		t.Errorf("pending rootfs archive remains: %v", err)
+	}
+	if _, err := os.Stat(ready); !os.IsNotExist(err) {
+		t.Errorf("rootfs ready marker remains: %v", err)
+	}
+}
+
 func TestRefreshVolumeSeeds(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
@@ -1058,6 +1119,20 @@ func TestRefreshVolumeSeeds(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	rootfsSnapshot, err := store.RootfsSnapshotPath("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfsFile, err := os.Create(rootfsSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tar.NewWriter(rootfsFile).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootfsFile.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.RefreshVolumeSeeds("demo"); err != nil {
 		t.Fatalf("RefreshVolumeSeeds: %v", err)
 	}
@@ -1072,6 +1147,9 @@ func TestRefreshVolumeSeeds(t *testing.T) {
 	if got := seeds["ttos-volume-cache"]; got != snapshot {
 		t.Errorf("seed path=%q, want %q", got, snapshot)
 	}
+	if got := updated.Annotations[specutils.AnnotationRootfsUpperTar]; got != rootfsSnapshot {
+		t.Errorf("rootfs seed path=%q, want %q", got, rootfsSnapshot)
+	}
 	if got := updated.Annotations["dev.gvisor.spec.mount.ttos0.copyup"]; got != "" {
 		t.Errorf("seeded volume retained copyup=%q", got)
 	}
@@ -1085,6 +1163,13 @@ func TestRefreshVolumeSeeds(t *testing.T) {
 	}
 	if got, want := exitTargets["ttos-volume-cache"], (specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}); got != want {
 		t.Errorf("final mount target=%+v, want %+v", got, want)
+	}
+	rootPending, rootReady, err := store.RootfsExitSnapshotPaths("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := exitTargets[specutils.RootfsMountTarSource], (specutils.MountTarOnExitTarget{Path: rootPending, ReadyPath: rootReady}); got != want {
+		t.Errorf("final rootfs target=%+v, want %+v", got, want)
 	}
 }
 

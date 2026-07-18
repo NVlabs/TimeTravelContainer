@@ -45,6 +45,7 @@ const (
 	containerIDBytes       = 32
 	volumeIDBytes          = 32
 	volumeSnapshotFile     = "snapshot.tar"
+	rootfsSnapshotFile     = "rootfs-upper.tar"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
 )
@@ -553,6 +554,13 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
+	if spec.Root == nil || !spec.Root.Readonly {
+		pending, ready, err := s.RootfsExitSnapshotPaths(id)
+		if err != nil {
+			return Prepared{}, err
+		}
+		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
+	}
 	for _, volume := range opts.ManagedVolumes {
 		if volume.Readonly {
 			continue
@@ -879,6 +887,9 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 // RefreshVolumeSeeds atomically updates a persistent OCI bundle to seed every
 // managed volume that has a committed snapshot.
 func (s Store) RefreshVolumeSeeds(name string) error {
+	if err := s.FinalizeRootfsExitSnapshot(name); err != nil {
+		return fmt.Errorf("finalizing previous rootfs exit snapshot: %w", err)
+	}
 	if err := s.FinalizeVolumeExitSnapshots(name); err != nil {
 		return fmt.Errorf("finalizing previous managed volume exit snapshots: %w", err)
 	}
@@ -893,8 +904,31 @@ func (s Store) RefreshVolumeSeeds(name string) error {
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
+	rootfsSnapshot, err := s.RootfsSnapshotPath(info.ID)
+	if err != nil {
+		return err
+	}
+	if spec.Root != nil && spec.Root.Readonly {
+		delete(spec.Annotations, specutils.AnnotationRootfsUpperTar)
+	} else if snapshotInfo, statErr := os.Stat(rootfsSnapshot); statErr == nil {
+		if !snapshotInfo.Mode().IsRegular() {
+			return fmt.Errorf("container rootfs snapshot %q is not a regular file", rootfsSnapshot)
+		}
+		spec.Annotations[specutils.AnnotationRootfsUpperTar] = rootfsSnapshot
+	} else if os.IsNotExist(statErr) {
+		delete(spec.Annotations, specutils.AnnotationRootfsUpperTar)
+	} else {
+		return fmt.Errorf("stating container rootfs snapshot: %w", statErr)
+	}
 	seeds := make(map[string]string)
 	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
+	if spec.Root == nil || !spec.Root.Readonly {
+		pending, ready, err := s.RootfsExitSnapshotPaths(info.ID)
+		if err != nil {
+			return err
+		}
+		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
+	}
 	for _, volume := range info.Volumes {
 		volumeInfo, err := s.LoadVolume(volume.Name)
 		if err != nil {
@@ -1342,6 +1376,103 @@ func (s Store) VolumeSnapshotPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(s.Root, "volumes", name, volumeSnapshotFile), nil
+}
+
+// RootfsSnapshotPath returns the private persistent upper-layer seed path for
+// a container. The image root remains immutable; this archive contains only
+// the container's writable overlay changes.
+func (s Store) RootfsSnapshotPath(container string) (string, error) {
+	if err := validateName(container); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.Root, "containers", container, rootfsSnapshotFile), nil
+}
+
+// RootfsExitSnapshotPaths returns the pending rootfs upper-layer archive and
+// its completion marker for one container run.
+func (s Store) RootfsExitSnapshotPaths(container string) (string, string, error) {
+	if err := validateName(container); err != nil {
+		return "", "", err
+	}
+	base := filepath.Join(s.Root, "containers", container, ".rootfs-upper.exit")
+	return base + ".tar", base + ".ready", nil
+}
+
+// FinalizeRootfsExitSnapshot atomically publishes a completed rootfs export.
+func (s Store) FinalizeRootfsExitSnapshot(container string) error {
+	info, err := s.LoadContainer(container)
+	if err != nil {
+		return err
+	}
+	pending, ready, err := s.RootfsExitSnapshotPaths(info.ID)
+	if err != nil {
+		return err
+	}
+	marker, err := os.ReadFile(ready)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading rootfs exit snapshot marker: %w", err)
+	}
+	if len(marker) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(string(marker)) != "complete" {
+		return errors.New("invalid rootfs exit snapshot marker")
+	}
+	source, err := os.Open(pending)
+	if err != nil {
+		return fmt.Errorf("opening rootfs exit snapshot: %w", err)
+	}
+	defer source.Close()
+	if stat, err := source.Stat(); err != nil {
+		return fmt.Errorf("stating rootfs exit snapshot: %w", err)
+	} else if !stat.Mode().IsRegular() {
+		return fmt.Errorf("rootfs exit snapshot %q is not a regular file", pending)
+	}
+	if err := validateVolumeSnapshot(source); err != nil {
+		return fmt.Errorf("validating rootfs exit snapshot: %w", err)
+	}
+	destination, err := s.RootfsSnapshotPath(info.ID)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(destination), ".rootfs-upper-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary rootfs snapshot: %w", err)
+	}
+	tempPath := temp.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			temp.Close()
+			os.Remove(tempPath)
+		}
+	}()
+	if _, err := io.Copy(temp, source); err != nil {
+		return fmt.Errorf("copying rootfs snapshot: %w", err)
+	}
+	if err := temp.Chmod(0600); err != nil {
+		return fmt.Errorf("securing rootfs snapshot: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("syncing rootfs snapshot: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("closing rootfs snapshot: %w", err)
+	}
+	if err := os.Rename(tempPath, destination); err != nil {
+		return fmt.Errorf("publishing rootfs snapshot: %w", err)
+	}
+	keep = true
+	if err := os.Remove(ready); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing rootfs exit marker: %w", err)
+	}
+	if err := os.Remove(pending); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing pending rootfs exit snapshot: %w", err)
+	}
+	return nil
 }
 
 // VolumeExitSnapshotPaths returns the per-container pending archive and marker paths.
