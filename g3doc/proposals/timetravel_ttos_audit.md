@@ -1,9 +1,9 @@
 # TimeTravelOS performance and compatibility audit
 
-This audit covers the TTOS implementation through commit `8368172` and was run
-on 2026-07-18. It evaluates the native OCI image store, rootless execution, the
-Docker-like CLI, and in-memory live fork. It is a development-readiness audit,
-not a security certification.
+This audit was refreshed on 2026-07-18 through the rootless virtual-NIC,
+user-mode NAT, and published-port milestone. It evaluates the native OCI image
+store, rootless execution, Docker-like CLI, and in-memory live fork. It is a
+development-readiness audit, not a security certification.
 
 ## Executive assessment
 
@@ -21,10 +21,10 @@ The recommended readiness levels are:
 
 | Use case | Assessment |
 | --- | --- |
-| Trusted integration tests with `--network none` | Ready for broader testing |
+| Trusted integration tests with `--network none` or `ttos` | Ready for broader testing |
 | Forking Python, shell, nginx configuration, or Redis-like local workloads | Demonstrated |
 | General Docker CLI replacement | Partial |
-| External networking at the fork boundary | Unsupported |
+| Parent external TCP continuity with child reset | Demonstrated; reconnect required in child |
 | Replay of external nondeterministic inputs | Not a TTOS guarantee |
 | Untrusted production multi-tenancy | Not audited or recommended |
 
@@ -39,6 +39,8 @@ native-store implementation verification:
   3.12-alpine, nginx 1.27-alpine, and Redis 7-alpine;
 * exec, logs, attach, daemon restart, pause/resume, recursive fork, internal
   pipes and sockets, tmpfs, managed-volume CoW, and writable overlay CoW;
+* a rootless in-process `ttos0` NIC, NAT-disabled isolation, TCP/UDP user-mode
+  NAT, persistent parent-bound TCP publication, and child external-flow reset;
 * the systrap `BenchmarkSandboxFamilyFork` benchmark; and
 * real Python containers with 1 MiB, 128 MiB, and 256 MiB touched application
   allocations and multiple guest threads.
@@ -208,12 +210,15 @@ Currently demonstrated as branch-local or safely cloned:
 * anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, and inotify;
 * entirely internal Unix socket graphs without queued `SCM_RIGHTS`; and
 * an empty or canonical loopback-only netstack, including internal UDP/TCP
-  queues and connections.
+  queues and connections; and
+* the TTOS virtual NIC and an unmodified network configuration. Internal flows
+  clone, while external child TCP flows reset and the source stays connected.
 
 Rejected or externally shared:
 
-* host-network mode, external TCP/UDP links, hostinet/plugin stacks, secondary
-  network namespaces, modified iptables/conntrack, and nftables;
+* host-network mode, hostinet/plugin stacks, secondary network namespaces,
+  modified iptables/conntrack, and nftables. TTOS user-mode NAT and published
+  TCP flows are handled by reset-on-child policy instead of rejection;
 * imported host FDs, external pipes, host eventfd, host-bound Unix sockets,
   host-backed peers, and queued `SCM_RIGHTS`;
 * directfs and writable gofer filesystems;
@@ -266,9 +271,11 @@ TTOS fails closed when a requested hard limit cannot be enforced.
 ### C2: Docker compatibility is a CLI subset, not a Docker API
 
 Implemented commands intentionally resemble Docker, but there is no Docker
-Engine API, Compose API, swarm, bridge/NAT manager, port publishing, plugin
-system, or general device pass-through. Supported TTOS networking is `none` or
-`host`, and host mode cannot be live-forked.
+Engine API, Compose API, swarm, named networks, a host bridge/CNI manager,
+plugin system, or general device pass-through. TTOS does provide its own
+rootless `ttos` virtual-NIC mode, optional user-mode NAT, and persistent TCP
+port publication, but this is not the Docker network API. Host mode cannot be
+live-forked.
 
 Restart recreates an exited main branch from persistent configuration and the
 immutable image. A stopped branch does not retain its in-memory Kernel or
@@ -277,29 +284,36 @@ committed/imported or captured by the documented stop/exit preservation path.
 
 ### C2: current gVisor networking and the TTOS subset
 
-Upstream runsc has four internal network selections:
+Upstream runsc has four internal network selections; this TTOS fork adds a
+fifth, `ttos`:
 
 * `none` creates netstack with canonical loopback only;
 * `sandbox` imports interfaces and routes from a network namespace prepared by
   Docker, CNI, or another external network manager;
 * `host` uses hostinet and redirects network operations to the host stack; and
-* `plugin` delegates to a third-party stack.
+* `plugin` delegates to a third-party stack; while
+* `ttos` creates a branch-local in-process link between guest netstack and a
+  user-mode gateway/proxy.
 
 In `sandbox` mode, gVisor implements IP, TCP, UDP, ICMP, socket queues, and
 firewall behavior in userspace. Docker or CNI remains responsible for creating
 the veth/bridge topology, assigning addresses, NAT, and publishing ports. TTOS
-is rootless and currently exposes only `none` and `host`, so it has no bridge,
-NAT, or port-publication control plane.
+does not use that topology for `--network ttos`: it creates `ttos0` at
+`10.0.2.15/24`, an in-process `10.0.2.2` gateway, optional IPv4 TCP/UDP host
+proxying, and rootless host TCP listeners for `-p`.
 
-Live fork currently accepts only a contained empty or canonical loopback
-netstack with unmodified iptables and no nftables. It reconstructs a new child
-loopback NIC and clones internal UDP/TCP endpoint state. Host mode, external
-links, and plugin stacks reject. Adding rootless external networking is
-practical through a user-mode helper such as a netstack link proxy or slirp-like
-NAT, but fork semantics require a branch-private proxy/NAT instance. Existing
-external TCP connections still cannot be duplicated without a much stronger
-connection-proxy protocol; the safe first implementation should require no
-external sockets at fork and provision a fresh branch network afterward.
+Live fork accepts canonical loopback and an unmodified TTOS virtual-NIC stack.
+The child gets a new link and proxy realm. Internal TCP/UDP endpoints and queues
+clone; established or connecting child TCP endpoints that terminate in NAT or
+a published-port proxy are reset. The parent retains its proxy realm, existing
+connections, and published listener. A child is not published automatically.
+
+This gives useful fail-soft semantics without pretending that one host TCP flow
+can be duplicated. It does not replay bytes arriving from outside during the
+pause window, preserve a child's external TCP session, or provide a stable
+public endpoint for each branch. NAT is presently IPv4 TCP/UDP; publication is
+IPv4 TCP only. Modified iptables/conntrack, nftables, host mode, secondary
+network namespaces, external sandbox links, and plugin stacks still reject.
 
 ### C2: one image reference stores one selected platform
 

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,8 @@ type PrepareOptions struct {
 	OpenStdin          bool
 	AutoRemove         bool
 	StopTimeout        *int
+	NetworkNAT         bool
+	PublishedPorts     []PortBinding
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -88,6 +91,15 @@ type BranchInfo struct {
 	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
 }
 
+// PortBinding describes a TCP listener managed by TTOS for the main branch.
+// Forked children intentionally start with no published host listeners.
+type PortBinding struct {
+	HostIP        string `json:"host_ip"`
+	HostPort      uint16 `json:"host_port"`
+	ContainerPort uint16 `json:"container_port"`
+	Protocol      string `json:"protocol"`
+}
+
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
 	ID                 string            `json:"id"`
@@ -102,6 +114,8 @@ type ContainerInfo struct {
 	Volumes            []ManagedVolume   `json:"volumes,omitempty"`
 	Branches           []BranchInfo      `json:"branches,omitempty"`
 	NetworkMode        string            `json:"network_mode,omitempty"`
+	NetworkNAT         bool              `json:"network_nat,omitempty"`
+	PublishedPorts     []PortBinding     `json:"published_ports,omitempty"`
 	LogDriver          string            `json:"log_driver,omitempty"`
 	LogOptions         map[string]string `json:"log_options,omitempty"`
 	LogAttributes      map[string]string `json:"log_attributes,omitempty"`
@@ -196,12 +210,33 @@ func hostResolverConfig(data []byte) (nameservers, search, options []string) {
 }
 
 func buildResolvConf(hostData []byte, dns, search, options []string) string {
+	return buildResolvConfForNetwork(hostData, dns, search, options, "none")
+}
+
+func buildResolvConfForNetwork(hostData []byte, dns, search, options []string, networkMode string) string {
 	hostDNS, hostSearch, hostOptions := hostResolverConfig(hostData)
 	if len(dns) == 0 {
 		dns = hostDNS
 	}
 	if len(dns) == 0 {
 		dns = []string{"127.0.0.1"}
+	}
+	if networkMode == "ttos" {
+		dns = append([]string(nil), dns...)
+		for i, value := range dns {
+			address, err := netip.ParseAddr(value)
+			if err != nil || !address.IsLoopback() {
+				continue
+			}
+			last := byte(2)
+			if address.Is4() {
+				last = address.As4()[3]
+				if last == 1 || last == 15 || last == 255 {
+					last = 2
+				}
+			}
+			dns[i] = netip.AddrFrom4([4]byte{10, 0, 2, last}).String()
+		}
 	}
 	if len(search) == 0 {
 		search = hostSearch
@@ -242,7 +277,7 @@ func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount
 	}{
 		{name: "hostname", destination: "/etc/hostname", contents: hostname + "\n"},
 		{name: "hosts", destination: "/etc/hosts", contents: buildHostsFile(opts.ExtraHosts)},
-		{name: "resolv.conf", destination: "/etc/resolv.conf", contents: buildResolvConf(hostResolv, opts.DNS, opts.DNSSearch, opts.DNSOptions)},
+		{name: "resolv.conf", destination: "/etc/resolv.conf", contents: buildResolvConfForNetwork(hostResolv, opts.DNS, opts.DNSSearch, opts.DNSOptions, opts.NetworkMode)},
 	}
 	mounts := make([]HostMount, 0, len(files))
 	for _, file := range files {
@@ -427,6 +462,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	opts.NetworkMode = networkMode
+	if opts.NetworkNAT && networkMode != "ttos" {
+		return Prepared{}, fmt.Errorf("NAT requires network mode ttos")
+	}
+	if len(opts.PublishedPorts) != 0 && networkMode != "ttos" {
+		return Prepared{}, fmt.Errorf("published ports require network mode ttos")
+	}
 	opts.ExtraHosts, err = ParseExtraHosts(opts.ExtraHosts)
 	if err != nil {
 		return Prepared{}, err
@@ -560,6 +601,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		RootFS:             rootfs,
 		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		NetworkMode:        networkMode,
+		NetworkNAT:         opts.NetworkNAT,
+		PublishedPorts:     append([]PortBinding(nil), opts.PublishedPorts...),
 		LogDriver:          logDriver,
 		LogOptions:         cloneStringMap(opts.LogOptions),
 		LogAttributes:      logAttributes,

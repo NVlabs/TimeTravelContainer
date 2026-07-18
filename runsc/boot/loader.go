@@ -822,7 +822,7 @@ func New(args Args) (*Loader, error) {
 	}
 	l.watchdog = watchdog.New(l.k, dogOpts)
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
-		AllowNetworkStack:              args.Conf.Network == config.NetworkNone,
+		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
 	})
@@ -943,6 +943,11 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 	}
 	if err := n.CreateLinksAndRoutes(networkArgs, nil); err != nil {
 		return err
+	}
+	if networkArgs.TimeTravel != nil {
+		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1148,7 +1153,7 @@ func (l *Loader) installSeccompFilters() error {
 	if l.root.conf.DisableSeccomp {
 		log.Warningf("*** SECCOMP WARNING: syscall filter is DISABLED. Running in less secure mode.")
 	} else {
-		hostnet := l.root.conf.Network == config.NetworkHost
+		hostnet := l.root.conf.Network == config.NetworkHost || (l.root.conf.Network == config.NetworkTimeTravel && l.root.conf.TimeTravelNetworkNAT)
 		var nvproxyCaps nvconf.DriverCaps
 		nvproxyEnabled := specutils.NVProxyEnabled(l.root.spec, l.root.conf)
 		if nvproxyEnabled {
@@ -1167,6 +1172,7 @@ func (l *Loader) installSeccompFilters() error {
 			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
+			TimeTravelNetworkNAT:  l.root.conf.Network == config.NetworkTimeTravel && l.root.conf.TimeTravelNetworkNAT,
 			HostFilesystem:        l.root.conf.DirectFS,
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
@@ -2071,7 +2077,7 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 		// No network namespacing support for hostinet yet, hence creator is nil.
 		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
 
-	case config.NetworkNone, config.NetworkSandbox:
+	case config.NetworkNone, config.NetworkSandbox, config.NetworkTimeTravel:
 		creator := &sandboxNetstackCreator{
 			clock:                    clock,
 			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
@@ -2420,21 +2426,32 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 		return fmt.Errorf("stream FD is required for port forward")
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	cid := opts.ContainerID
+	l.mu.Lock()
 	tg, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
+	l.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to get threadgroup from %q: %w", cid, err)
 	}
 	if tg == nil {
 		return fmt.Errorf("container %q not started", cid)
 	}
+	branchID := opts.BranchID
+	if branchID == "" {
+		branchID = DefaultBranchID
+	}
+	branch, done, err := l.family.beginControl(branchID)
+	if err != nil {
+		return fmt.Errorf("selecting branch %q: %w", branchID, err)
+	}
+	defer done()
+	if branch.k.GlobalInit() == nil {
+		return fmt.Errorf("container %q is not started in branch %q", cid, branchID)
+	}
 
 	// Import the fd for the UDS.
-	ctx := l.k.SupervisorContext()
-	fd, err := l.importFD(ctx, opts.Files[0])
+	ctx := branch.k.SupervisorContext()
+	fd, err := importFD(ctx, branch.k, opts.Files[0])
 	if err != nil {
 		return fmt.Errorf("importing stream fd: %w", err)
 	}
@@ -2447,8 +2464,8 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 	pair := pf.ProxyPair{To: fdConn}
 
 	switch l.root.conf.Network {
-	case config.NetworkSandbox:
-		stack := l.k.RootNetworkNamespace().Stack().(*netstack.Stack).Stack
+	case config.NetworkSandbox, config.NetworkTimeTravel:
+		stack := branch.k.RootNetworkNamespace().Stack().(*netstack.Stack).Stack
 		nsConn, err := pf.NewNetstackConn(stack, opts.Port)
 		if err != nil {
 			return fmt.Errorf("creating netstack port forward connection: %w", err)
@@ -2468,7 +2485,9 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 
 	// Add to the list of port forward connections and remove when the
 	// connection closes.
+	l.mu.Lock()
 	l.portForwardProxies = append(l.portForwardProxies, proxy)
+	l.mu.Unlock()
 	proxy.AddCleanup(func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
@@ -2487,13 +2506,13 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 
 // importFD generically imports a host file descriptor without adding it to any
 // fd table.
-func (l *Loader) importFD(ctx context.Context, f *os.File) (*vfs.FileDescription, error) {
+func importFD(ctx context.Context, k *kernel.Kernel, f *os.File) (*vfs.FileDescription, error) {
 	hostFD, err := fd.NewFromFile(f)
 	if err != nil {
 		return nil, err
 	}
 	defer hostFD.Close()
-	fd, err := host.NewFD(ctx, l.k.HostMount(), hostFD.FD(), &host.NewFDOptions{
+	fd, err := host.NewFD(ctx, k.HostMount(), hostFD.FD(), &host.NewFDOptions{
 		Savable:      false, // We disconnect and close on save.
 		IsTTY:        false,
 		VirtualOwner: false, // FD not visible to the sandboxed app so user can't be changed.

@@ -334,32 +334,81 @@ ttos run -d --name edit \
 
 ## Networking and resource limits
 
-The `ttos` frontend currently exposes two network modes:
+TTOS exposes three network modes:
 
 ```shell
---network none       # forkable contained stack; default
---network host       # host-facing and therefore not live-forkable
+--network none       # loopback-only netstack; forkable and the default
+--network ttos       # loopback plus rootless in-process virtual NIC; forkable
+--network host       # hostinet; host-facing and not live-forkable
 ```
 
-With `none`, gVisor creates its userspace TCP/IP stack (netstack) with only the
-canonical `lo` interface, `127.0.0.1/8`, `::1/128`, and local routes. Processes
-inside the same branch can use TCP and UDP over loopback. At fork, TTOS creates
-a new netstack object with a new loopback endpoint, clones socket and protocol
-state, and preserves unread loopback TCP/UDP data independently in each branch.
+`none` creates a userspace netstack with only canonical loopback. Processes in
+one branch can use TCP and UDP over `127.0.0.1` and `::1`. At fork, TTOS creates
+a new netstack and loopback endpoint, clones protocol/socket state, and
+preserves internal connections and unread data independently in both branches.
 
-Upstream runsc also has `sandbox` networking. An external manager such as
-Docker or a CNI plugin first creates a network namespace, veth, bridge, routes,
-NAT, and published-port rules; runsc then imports that namespace's interfaces
-and routes into netstack. gVisor supplies the userspace IP/TCP/UDP stack, but it
-does not itself act as Docker's bridge/NAT/port-allocation manager. Rootless
-runsc cannot currently set up `sandbox` networking unaided, and `ttos` does not
-yet integrate an external helper, so it intentionally exposes only `none` and
-`host`.
+`ttos` adds a rootless, Sentry-managed IPv4 interface without TAP, veth, a host
+network namespace, CNI, or elevated network capabilities:
 
-`host` uses gVisor hostinet to redirect network syscalls to the host stack. It
-is useful for ordinary execution but cannot be forked because connections and
-host stack state are external. Bridge networking, NAT, published ports, CNI,
-and Docker's network API are not implemented by `ttos`.
+```text
+ttos0       10.0.2.15/24
+gateway     10.0.2.2
+```
+
+The interface is useful by itself for a stable container-visible NIC. Add
+`--nat` to permit outbound IPv4 TCP and UDP through the Sentry's user-mode
+proxy:
+
+```shell
+ttos run --rm --network ttos --nat alpine:3.20 \
+  wget -qO- https://example.com/
+```
+
+Without `--nat`, non-container destinations are unreachable. TTOS rewrites a
+host loopback DNS resolver such as `127.0.0.53` to its corresponding
+`10.0.2.53` host alias, so common systemd-resolved configurations work through
+the proxy. NAT is currently IPv4-only and implements TCP plus short-lived UDP
+mappings; ICMP forwarding is not provided.
+
+Publish a container TCP port with Docker-style `-p`/`--publish`:
+
+```shell
+ttos run -d --name web --network ttos \
+  -p 127.0.0.1:8080:80 nginx:1.27-alpine
+curl http://127.0.0.1:8080/
+```
+
+Accepted forms are `HOST_PORT:CONTAINER_PORT` and
+`HOST_IP:HOST_PORT:CONTAINER_PORT[/tcp]`. Host addresses and published ports are
+currently IPv4/TCP only. The binding is persistent configuration: `ttosd`
+reconciles its rootless user-mode listener after restart. It is also shown in
+Docker-compatible `.HostConfig.PortBindings` inspect output.
+
+Live-fork policy deliberately distinguishes internal from external flows:
+
+* the source branch's established and connecting NAT TCP flows continue;
+* the source branch retains its published-port listener and accepted flows;
+* the child receives a fresh virtual link and proxy realm;
+* every inherited child TCP flow to the host, internet, or a published-port
+  proxy is reset, while internal loopback and `ttos0` connections remain; and
+* no host port is automatically published for a child branch.
+
+Thus a fork is not rejected merely because an external TCP flow is open. Child
+applications observe ordinary connection-reset behavior and may reconnect
+outbound. Publishing a child branch separately is not implemented yet. UDP NAT
+mappings are runtime-only and are re-created on later child datagrams.
+
+Modified iptables/conntrack state, nftables, secondary network namespaces,
+hostinet, and plugin stacks still fail `ttos fork --check`. `host` mode remains
+useful for conventional execution but is not live-forkable because its socket
+state belongs to the host kernel.
+
+Upstream runsc's `sandbox` mode imports a network namespace prepared by Docker,
+CNI, or another manager. That manager owns the veth/bridge topology, address
+assignment, NAT, and port rules. TTOS's `ttos` mode is a separate in-process
+design and does not require that host networking control plane. TTOS still does
+not implement the Docker Engine network API, named networks, or inter-family
+virtual switching.
 
 PID and Sentry-enforced limits work without host cgroups where possible.
 Hard CPU and memory limits require a writable delegated cgroup-v2 subtree; TTOS

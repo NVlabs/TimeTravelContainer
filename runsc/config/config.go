@@ -119,6 +119,10 @@ type Config struct {
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
 
+	// TimeTravelNetworkNAT enables outbound host socket proxying for the TTOS
+	// in-process virtual NIC.
+	TimeTravelNetworkNAT bool `flag:"ttos-network-nat"`
+
 	// EnableRaw indicates whether raw sockets should be enabled. Raw
 	// sockets are disabled by stripping CAP_NET_RAW from the list of
 	// capabilities.
@@ -490,6 +494,9 @@ func (c *Config) Validate() error {
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
+	if c.TimeTravelNetworkNAT && c.Network != NetworkTimeTravel {
+		return fmt.Errorf("ttos-network-nat is only supported with ttos networking")
+	}
 	if c.TBFBurst > maxQDiscTBFBurst {
 		return fmt.Errorf("qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.TBFBurst)
 	}
@@ -726,6 +733,10 @@ const (
 
 	// NetworkPlugin uses third-party network stack.
 	NetworkPlugin
+
+	// NetworkTimeTravel uses a rootless, in-process virtual NIC. An optional
+	// user-mode NAT proxy provides outbound access without a host netns or TAP.
+	NetworkTimeTravel
 )
 
 func networkTypePtr(v NetworkType) *NetworkType {
@@ -741,6 +752,8 @@ func (n *NetworkType) Set(v string) error {
 		*n = NetworkHost
 	case "none":
 		*n = NetworkNone
+	case "ttos":
+		*n = NetworkTimeTravel
 	case "plugin":
 		*n = NetworkPlugin
 	default:
@@ -763,6 +776,8 @@ func (n NetworkType) String() string {
 		return "host"
 	case NetworkNone:
 		return "none"
+	case NetworkTimeTravel:
+		return "ttos"
 	case NetworkPlugin:
 		return "plugin"
 	}

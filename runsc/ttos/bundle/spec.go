@@ -902,10 +902,10 @@ func normalizeNetworkMode(mode string) (string, error) {
 		mode = "none"
 	}
 	switch mode {
-	case "none", "host":
+	case "none", "host", "ttos":
 		return mode, nil
 	default:
-		return "", fmt.Errorf("unsupported network mode %q; supported modes are none and host", mode)
+		return "", fmt.Errorf("unsupported network mode %q; supported modes are none, host, and ttos", mode)
 	}
 }
 

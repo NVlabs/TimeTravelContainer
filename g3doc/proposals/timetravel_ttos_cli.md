@@ -41,7 +41,12 @@ reports logical used bytes for every destination alias without walking or
 serializing the volume. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
-validation as an external resource. An opt-in internal-console substrate now provides branch-local Sentry pipes for
+validation as an external resource. Rootless `--network ttos` adds a
+Sentry-managed `ttos0` virtual NIC, optional IPv4 TCP/UDP user-mode NAT with
+`--nat`, and persistent IPv4 TCP publication with `-p`/`--publish`. Live fork
+keeps the source proxy and connections, gives the child a fresh proxy realm,
+and resets inherited external child TCP flows instead of rejecting the fork.
+An opt-in internal-console substrate now provides branch-local Sentry pipes for
 non-TTY containers and Sentry devpts PTYs for terminal containers, with
 nonblocking control RPCs, explicit stdin close, terminal resize, and saved
 console state.
@@ -204,11 +209,16 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       hosts that prohibit user namespaces; this runs Sentry/gofer as the
       caller without host namespaces or chroots while retaining Sentry guest
       namespaces and credentials.
-- [x] Support Docker-style `--network/--net none|host` on run/create, persist
-      the selected mode across start/restart, and report it through inspect.
-      `none` remains the fork-safe default. Host networking deliberately has no
-      port-publishing layer and is ineligible for live fork because it exposes
-      the external host network stack.
+- [x] Support Docker-style `--network/--net none|host|ttos` on run/create,
+      persist the selected mode across start/restart, and report it through
+      inspect. `none` remains the fork-safe default. Host networking is
+      ineligible for live fork because it exposes the external host stack.
+- [x] Implement a rootless in-process TTOS virtual NIC (`10.0.2.15/24`) and
+      branch-private gateway/proxy, optional outbound IPv4 TCP/UDP `--nat`, and
+      Docker-style IPv4 TCP `-p`/`--publish`. Persist bindings, reconcile
+      listeners after daemon restart, retain the source listener across fork,
+      reset inherited child external TCP flows, and leave child branches
+      unpublished until an explicit branch-publication surface is designed.
 - [x] Support Docker `run/create --read-only`, persist it in the OCI root and
       Docker inspect view, and retain it across start/restart/live fork while
       writable tmpfs and managed-volume submounts remain usable and fork CoW.

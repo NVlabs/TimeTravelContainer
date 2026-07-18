@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1117,11 +1118,61 @@ func normalizeHostMount(source, destination string, readonly, immutableSource, m
 
 func parseNetworkMode(value string) (string, error) {
 	switch value {
-	case "none", "host":
+	case "none", "host", "ttos":
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported network mode %q; supported modes are none and host", value)
+		return "", fmt.Errorf("unsupported network mode %q; supported modes are none, host, and ttos", value)
 	}
+}
+
+func parsePublishedPorts(values []string) ([]ttosbundle.PortBinding, error) {
+	bindings := make([]ttosbundle.PortBinding, 0, len(values))
+	seen := make(map[string]bool)
+	for _, value := range values {
+		original := value
+		protocol := "tcp"
+		if before, after, ok := strings.Cut(value, "/"); ok {
+			value, protocol = before, strings.ToLower(after)
+		}
+		if protocol != "tcp" {
+			return nil, fmt.Errorf("published port %q uses unsupported protocol %q; only tcp is currently supported", original, protocol)
+		}
+		parts := strings.Split(value, ":")
+		hostIP := "0.0.0.0"
+		if len(parts) == 3 {
+			hostIP = parts[0]
+			parts = parts[1:]
+		}
+		if len(parts) != 2 || hostIP == "" {
+			return nil, fmt.Errorf("invalid published port %q; use [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]", original)
+		}
+		address, err := netip.ParseAddr(hostIP)
+		if err != nil || !address.Is4() {
+			return nil, fmt.Errorf("published port %q has invalid IPv4 host address %q", original, hostIP)
+		}
+		parsePort := func(text, role string) (uint16, error) {
+			port, err := strconv.ParseUint(text, 10, 16)
+			if err != nil || port == 0 {
+				return 0, fmt.Errorf("published port %q has invalid %s port %q", original, role, text)
+			}
+			return uint16(port), nil
+		}
+		hostPort, err := parsePort(parts[0], "host")
+		if err != nil {
+			return nil, err
+		}
+		containerPort, err := parsePort(parts[1], "container")
+		if err != nil {
+			return nil, err
+		}
+		key := netip.AddrPortFrom(address, hostPort).String() + "/" + protocol
+		if seen[key] {
+			return nil, fmt.Errorf("published host endpoint %s is specified more than once", key)
+		}
+		seen[key] = true
+		bindings = append(bindings, ttosbundle.PortBinding{HostIP: address.String(), HostPort: hostPort, ContainerPort: containerPort, Protocol: protocol})
+	}
+	return bindings, nil
 }
 
 func parseLogDriver(value string, options []string) (string, error) {
@@ -1251,6 +1302,8 @@ type runRequest struct {
 	user               string
 	hostname           string
 	networkMode        string
+	networkNAT         bool
+	publishedPorts     []ttosbundle.PortBinding
 	logDriver          string
 	extraHosts         []string
 	dns                []string
@@ -1327,7 +1380,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1357,11 +1410,14 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
 	fs.StringVar(hostname, "h", "", "container hostname")
-	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttos")
+	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttos virtual NIC")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
-	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
+	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttos")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
-	var env, envFiles, labels, labelFiles stringSlice
+	var env, envFiles, labels, labelFiles, publishedPortValues stringSlice
+	fs.Var(&publishedPortValues, "publish", "publish [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
+	fs.Var(&publishedPortValues, "p", "publish [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
 	fs.Var(&env, "env", "set or import environment variable NAME[=VALUE]")
 	fs.Var(&env, "e", "set or import environment variable NAME[=VALUE]")
 	fs.Var(&envFiles, "env-file", "read environment variables from a file")
@@ -1426,6 +1482,16 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	if *networkNAT && networkMode != "ttos" {
+		return errors.New("--nat requires --network=ttos")
+	}
+	publishedPorts, err := parsePublishedPorts(publishedPortValues)
+	if err != nil {
+		return err
+	}
+	if len(publishedPorts) != 0 && networkMode != "ttos" {
+		return errors.New("--publish requires --network=ttos")
+	}
 	if *pullPolicy != "missing" && *pullPolicy != "always" && *pullPolicy != "never" {
 		return fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", *pullPolicy)
 	}
@@ -1519,6 +1585,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		networkNAT:         *networkNAT,
+		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
 		dns:                parsedDNS,
@@ -1571,7 +1639,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1599,11 +1667,14 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
 	fs.StringVar(hostname, "h", "", "container hostname")
-	networkModeValue := fs.String("network", "none", "network mode: none or host")
+	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttos")
+	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttos virtual NIC")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
-	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
+	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttos")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
-	var env, envFiles, labels, labelFiles stringSlice
+	var env, envFiles, labels, labelFiles, publishedPortValues stringSlice
+	fs.Var(&publishedPortValues, "publish", "publish [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
+	fs.Var(&publishedPortValues, "p", "publish [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
 	fs.Var(&env, "env", "set or import environment variable NAME[=VALUE]")
 	fs.Var(&env, "e", "set or import environment variable NAME[=VALUE]")
 	fs.Var(&envFiles, "env-file", "read environment variables from a file")
@@ -1668,6 +1739,16 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	if *networkNAT && networkMode != "ttos" {
+		return errors.New("--nat requires --network=ttos")
+	}
+	publishedPorts, err := parsePublishedPorts(publishedPortValues)
+	if err != nil {
+		return err
+	}
+	if len(publishedPorts) != 0 && networkMode != "ttos" {
+		return errors.New("--publish requires --network=ttos")
+	}
 	if *pullPolicy != "missing" && *pullPolicy != "always" && *pullPolicy != "never" {
 		return fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", *pullPolicy)
 	}
@@ -1761,6 +1842,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		networkNAT:         *networkNAT,
+		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
 		dns:                parsedDNS,
@@ -2346,31 +2429,38 @@ type InspectLogConfig struct {
 	Config map[string]string `json:"Config"`
 }
 
+// InspectPortBinding is Docker's HostConfig.PortBindings value shape.
+type InspectPortBinding struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}
+
 // InspectHostConfig is the subset of Docker host configuration implemented by TTOS.
 type InspectHostConfig struct {
-	Binds          []string            `json:"Binds"`
-	NetworkMode    string              `json:"NetworkMode"`
-	LogConfig      InspectLogConfig    `json:"LogConfig"`
-	ExtraHosts     []string            `json:"ExtraHosts"`
-	DNS            []string            `json:"Dns"`
-	DNSSearch      []string            `json:"DnsSearch"`
-	DNSOptions     []string            `json:"DnsOptions"`
-	AutoRemove     bool                `json:"AutoRemove"`
-	ReadonlyRootfs bool                `json:"ReadonlyRootfs"`
-	StopTimeout    *int                `json:"StopTimeout"`
-	PidsLimit      *int64              `json:"PidsLimit"`
-	Memory         int64               `json:"Memory"`
-	NanoCPUs       int64               `json:"NanoCpus"`
-	CPUShares      uint64              `json:"CpuShares"`
-	CPUPeriod      uint64              `json:"CpuPeriod"`
-	CPUQuota       int64               `json:"CpuQuota"`
-	ShmSize        int64               `json:"ShmSize"`
-	GroupAdd       []string            `json:"GroupAdd"`
-	CapAdd         []string            `json:"CapAdd"`
-	CapDrop        []string            `json:"CapDrop"`
-	Ulimits        []ttosbundle.Ulimit `json:"Ulimits"`
-	Runtime        string              `json:"Runtime"`
-	Tmpfs          map[string]string   `json:"Tmpfs,omitempty"`
+	Binds          []string                        `json:"Binds"`
+	NetworkMode    string                          `json:"NetworkMode"`
+	PortBindings   map[string][]InspectPortBinding `json:"PortBindings"`
+	LogConfig      InspectLogConfig                `json:"LogConfig"`
+	ExtraHosts     []string                        `json:"ExtraHosts"`
+	DNS            []string                        `json:"Dns"`
+	DNSSearch      []string                        `json:"DnsSearch"`
+	DNSOptions     []string                        `json:"DnsOptions"`
+	AutoRemove     bool                            `json:"AutoRemove"`
+	ReadonlyRootfs bool                            `json:"ReadonlyRootfs"`
+	StopTimeout    *int                            `json:"StopTimeout"`
+	PidsLimit      *int64                          `json:"PidsLimit"`
+	Memory         int64                           `json:"Memory"`
+	NanoCPUs       int64                           `json:"NanoCpus"`
+	CPUShares      uint64                          `json:"CpuShares"`
+	CPUPeriod      uint64                          `json:"CpuPeriod"`
+	CPUQuota       int64                           `json:"CpuQuota"`
+	ShmSize        int64                           `json:"ShmSize"`
+	GroupAdd       []string                        `json:"GroupAdd"`
+	CapAdd         []string                        `json:"CapAdd"`
+	CapDrop        []string                        `json:"CapDrop"`
+	Ulimits        []ttosbundle.Ulimit             `json:"Ulimits"`
+	Runtime        string                          `json:"Runtime"`
+	Tmpfs          map[string]string               `json:"Tmpfs,omitempty"`
 }
 
 // InspectMount is a Docker-compatible user mount description.
@@ -2540,6 +2630,7 @@ func inspectHostConfigTemplateValues(config InspectHostConfig) map[string]any {
 	return map[string]any{
 		"Binds":          config.Binds,
 		"NetworkMode":    config.NetworkMode,
+		"PortBindings":   config.PortBindings,
 		"LogConfig":      config.LogConfig,
 		"ExtraHosts":     config.ExtraHosts,
 		"Dns":            config.DNS,
@@ -4302,6 +4393,7 @@ type backend interface {
 
 type consoleSidecarOwner interface {
 	OwnConsoleSidecar(key string, command *exec.Cmd) error
+	OwnPortSidecar(key string, command *exec.Cmd) error
 }
 
 type runtimeBackend struct {
@@ -4590,12 +4682,14 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		OpenStdin:          request.interactive,
 		AutoRemove:         request.autoRemove,
 		StopTimeout:        &request.stopTimeout,
+		NetworkNAT:         request.networkNAT,
+		PublishedPorts:     request.publishedPorts,
 	})
 	if err != nil {
 		return containerRunResult{}, err
 	}
 	id := prepared.Container.ID
-	status, err := b.launch(id, prepared.BundleDir, request.networkMode, request.detach, request.interactive, request.terminal)
+	status, err := b.launch(prepared.Container, request.detach, request.interactive)
 	if err == nil {
 		b.recordLaunchState(id, request.detach, status)
 	}
@@ -4655,6 +4749,8 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		OpenStdin:          request.interactive,
 		AutoRemove:         request.autoRemove,
 		StopTimeout:        &request.stopTimeout,
+		NetworkNAT:         request.networkNAT,
+		PublishedPorts:     request.publishedPorts,
 	})
 	if err != nil {
 		return "", err
@@ -4673,7 +4769,7 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
 	}
-	status, err := b.launch(info.ID, info.BundleDir, info.NetworkMode, detach, interactive, info.Terminal)
+	status, err := b.launch(info, detach, interactive)
 	if err == nil {
 		b.recordLaunchState(info.ID, detach, status)
 	}
@@ -6168,6 +6264,13 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 		logConfig.Config["max-size"] = strconv.FormatInt(maxBytes, 10)
 		logConfig.Config["max-file"] = strconv.Itoa(maxFiles)
 	}
+	portBindings := make(map[string][]InspectPortBinding)
+	for _, binding := range container.PublishedPorts {
+		key := fmt.Sprintf("%d/%s", binding.ContainerPort, binding.Protocol)
+		portBindings[key] = append(portBindings[key], InspectPortBinding{
+			HostIP: binding.HostIP, HostPort: strconv.Itoa(int(binding.HostPort)),
+		})
+	}
 	return InspectInfo{
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
@@ -6187,7 +6290,7 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, PortBindings: portBindings, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTOS: TTOSInspectInfo{
@@ -6317,6 +6420,10 @@ func (b *runtimeBackend) configuredRunscArgs() []string {
 }
 
 func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []string {
+	return b.configuredRunscArgsForNetworkNAT(networkMode, false)
+}
+
+func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, networkNAT bool) []string {
 	args := []string{
 		"--root", b.root,
 	}
@@ -6329,6 +6436,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []str
 		"--network="+networkMode,
 		"--directfs=false",
 		"--overlay2=all:memory")
+	if networkMode == "ttos" {
+		args = append(args, "--ttos-network-nat="+strconv.FormatBool(networkNAT))
+	}
 	return args
 }
 
@@ -6337,7 +6447,11 @@ func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
 }
 
 func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args ...string) (int, error) {
-	args = append(b.configuredRunscArgsForNetwork(networkMode), args...)
+	return b.runConfiguredCommandForNetworkNAT(networkMode, false, args...)
+}
+
+func (b *runtimeBackend) runConfiguredCommandForNetworkNAT(networkMode string, networkNAT bool, args ...string) (int, error) {
+	args = append(b.configuredRunscArgsForNetworkNAT(networkMode, networkNAT), args...)
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return 1, fmt.Errorf("opening runsc launch stdout: %w", err)
@@ -6498,8 +6612,9 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 	return nil
 }
 
-func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, interactive, terminal bool) (int, error) {
-	status, err := b.runConfiguredCommandForNetwork(networkMode, "create", "--bundle", bundleDir, name)
+func (b *runtimeBackend) launch(info ttosbundle.ContainerInfo, detach, interactive bool) (int, error) {
+	name, bundleDir := info.ID, info.BundleDir
+	status, err := b.runConfiguredCommandForNetworkNAT(info.NetworkMode, info.NetworkNAT, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
 	}
@@ -6524,7 +6639,7 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 		}
 		return 1, err
 	}
-	status, err = b.runConfiguredCommandForNetwork(networkMode, "start", name)
+	status, err = b.runConfiguredCommandForNetworkNAT(info.NetworkMode, info.NetworkNAT, "start", name)
 	if err != nil || status != 0 {
 		if err == nil {
 			err = fmt.Errorf("runsc start exited with status %d", status)
@@ -6534,6 +6649,13 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
 		return status, err
+	}
+	if err := b.ensurePublishedPorts(info); err != nil {
+		_, cleanupErr := b.command("delete", "--force", name)
+		if cleanupErr != nil {
+			return 1, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+		}
+		return 1, fmt.Errorf("publishing ports: %w", err)
 	}
 	if detach {
 		return 0, nil
@@ -6546,6 +6668,91 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 		return 1, err
 	}
 	return waitStatusExitCode(waitStatus), nil
+}
+
+func portSidecarPaths(dataRoot, container string, binding ttosbundle.PortBinding) (lockPath, errorPath string) {
+	name := strings.NewReplacer(".", "_", ":", "_", "/", "_").Replace(binding.HostIP)
+	base := filepath.Join(dataRoot, "containers", container, "ports", fmt.Sprintf("%s-%d-%d-%s", name, binding.HostPort, binding.ContainerPort, binding.Protocol))
+	return base + ".lock", base + ".log"
+}
+
+func (b *runtimeBackend) ensurePublishedPorts(info ttosbundle.ContainerInfo) error {
+	for _, binding := range info.PublishedPorts {
+		if err := b.ensurePublishedPort(info, binding); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) ensurePublishedPort(info ttosbundle.ContainerInfo, binding ttosbundle.PortBinding) error {
+	if info.NetworkMode != "ttos" {
+		return fmt.Errorf("container %s publishes ports with network mode %q", info.ID, info.NetworkMode)
+	}
+	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
+		return fmt.Errorf("creating published-port state: %w", err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening published-port lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil
+		}
+		return fmt.Errorf("locking published port: %w", err)
+	}
+	errorFile, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("opening published-port log: %w", err)
+	}
+	defer errorFile.Close()
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("creating published-port readiness pipe: %w", err)
+	}
+	defer readyReader.Close()
+	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
+	args := b.configuredRunscArgsForNetworkNAT(info.NetworkMode, info.NetworkNAT)
+	args = append(args, "port-forward", "--branch="+defaultBranchID, "--ready-fd=4", info.ID, endpoint)
+	command := exec.Command(b.runsc, args...)
+	command.Stdout = errorFile
+	command.Stderr = errorFile
+	command.ExtraFiles = []*os.File{lockFile, readyWriter}
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		readyWriter.Close()
+		return fmt.Errorf("starting published port %s: %w", endpoint, err)
+	}
+	if err := readyWriter.Close(); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		return fmt.Errorf("closing published-port readiness writer: %w", err)
+	}
+	if err := readyReader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		return fmt.Errorf("setting published-port readiness deadline: %w", err)
+	}
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
+		command.Process.Kill()
+		command.Wait()
+		diagnostic, _ := os.ReadFile(errorPath)
+		return fmt.Errorf("waiting for published port %s: %w: %s", endpoint, err, strings.TrimSpace(string(diagnostic)))
+	}
+	if b.consoleSidecars != nil {
+		if err := b.consoleSidecars.OwnPortSidecar(lockPath, command); err != nil {
+			command.Process.Kill()
+			command.Wait()
+			return fmt.Errorf("transferring published-port ownership: %w", err)
+		}
+	} else if err := command.Process.Release(); err != nil {
+		return fmt.Errorf("releasing published-port process: %w", err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) pull(reference, platform string) (ttosimages.Info, error) {

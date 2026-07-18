@@ -94,10 +94,19 @@ type daemonFrameWriter struct {
 // intentionally not killed when the daemon shuts down: they retain the advisory
 // lock and continue draining until a restarted daemon reconciles the family.
 func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd) error {
+	return s.ownSidecar("console", key, command)
+}
+
+// OwnPortSidecar tracks and reaps a published-port listener.
+func (s *daemonServer) OwnPortSidecar(key string, command *exec.Cmd) error {
+	return s.ownSidecar("port", key, command)
+}
+
+func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd) error {
 	s.sidecarMu.Lock()
 	if _, ok := s.sidecars[key]; ok {
 		s.sidecarMu.Unlock()
-		return fmt.Errorf("console sidecar %q is already daemon-owned", key)
+		return fmt.Errorf("%s sidecar %q is already daemon-owned", kind, key)
 	}
 	if s.sidecars == nil {
 		s.sidecars = make(map[string]*exec.Cmd)
@@ -586,12 +595,16 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 		return
 	}
 	for _, family := range families {
+		container, containerErr := backend.containerStore().LoadContainer(family.ID)
 		for _, branch := range family.Branches {
 			if branch.State != "running" && branch.State != "paused" {
 				continue
 			}
 			target := selector{container: family.ID, branch: branch.ID}
 			_, _ = backend.ensureConsoleDrain(target, false)
+			if branch.ID == defaultBranchID && containerErr == nil {
+				_ = backend.ensurePublishedPorts(container)
+			}
 			sessions, err := backend.execSessions(target)
 			if err != nil {
 				continue

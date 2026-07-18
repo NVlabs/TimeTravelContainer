@@ -55,6 +55,30 @@ type Stack struct {
 	// id is a unique identifier for this stack, it is currently only
 	// used for a deterministic lock ordering.
 	id uint64
+
+	// liveForkNetwork is runtime-only configuration for a contained link whose
+	// external side must never enter serialized kernel state. Clone recreates a
+	// new link/proxy realm in the child; reset then drops only inherited flows
+	// that crossed that link.
+	liveForkNetwork *LiveForkNetworkHooks `state:"nosave"`
+}
+
+// LiveForkNetworkHooks integrates a contained runtime link with live fork.
+// All functions must be safe to call while the owning Kernel is paused.
+type LiveForkNetworkHooks struct {
+	Validate   func(*Stack) error
+	Clone      func(dst *Stack) error
+	ResetChild func(*Stack) error
+	Close      func()
+}
+
+// SetLiveForkNetworkHooks installs runtime-only contained-network hooks. Any
+// previous runtime realm is closed before replacement.
+func (s *Stack) SetLiveForkNetworkHooks(hooks *LiveForkNetworkHooks) {
+	if s.liveForkNetwork != nil && s.liveForkNetwork.Close != nil {
+		s.liveForkNetwork.Close()
+	}
+	s.liveForkNetwork = hooks
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.
@@ -102,6 +126,10 @@ func (s *Stack) sendDeleteEvent(ctx context.Context, id tcpip.NICID, nicInfo *st
 
 // Destroy implements inet.Stack.Destroy.
 func (s *Stack) Destroy() {
+	if s.liveForkNetwork != nil && s.liveForkNetwork.Close != nil {
+		s.liveForkNetwork.Close()
+		s.liveForkNetwork = nil
+	}
 	if s.Stack != nil {
 		s.Stack.Close()
 		refs.CleanupSync.Add(1)
@@ -1136,6 +1164,12 @@ func (s *Stack) RegisteredEndpoints() []stack.TransportEndpoint {
 	return s.Stack.RegisteredEndpoints()
 }
 
+// OwnsLiveForkDanglingEndpoint implements inet.LiveForkDanglingEndpointOwner.
+func (s *Stack) OwnsLiveForkDanglingEndpoint(endpoint tcpip.Endpoint) bool {
+	tcpEndpoint, ok := endpoint.(*tcp.Endpoint)
+	return ok && tcpEndpoint.OwnedByStack(s.Stack)
+}
+
 // CleanupEndpoints implements inet.Stack.CleanupEndpoints.
 func (s *Stack) CleanupEndpoints() []stack.TransportEndpoint {
 	return s.Stack.CleanupEndpoints()
@@ -1173,6 +1207,12 @@ func (s *Stack) SetRemoveConf(removeConf bool) {
 // fork networking policy accepts an empty stack or the canonical loopback NIC
 // and rejects every host-facing or cross-namespace link.
 func (s *Stack) ValidateLiveFork() error {
+	if s.liveForkNetwork != nil {
+		if s.liveForkNetwork.Validate == nil {
+			return fmt.Errorf("contained live-fork network has no validator")
+		}
+		return s.liveForkNetwork.Validate(s)
+	}
 	if tables := s.Stack.IPTables(); tables == nil {
 		return fmt.Errorf("network stack has no iptables configuration")
 	} else if tables.Modified() {
@@ -1208,6 +1248,12 @@ func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
 	if !ok {
 		return fmt.Errorf("cannot clone netstack config into %T", dst)
 	}
+	if s.liveForkNetwork != nil {
+		if s.liveForkNetwork.Clone == nil {
+			return fmt.Errorf("contained live-fork network has no config cloner")
+		}
+		return s.liveForkNetwork.Clone(dstStack)
+	}
 	interfaces := s.Interfaces()
 	tables, ok := s.Stack.IPTables().CloneUnmodifiedForLiveFork(dstStack.Stack.Clock())
 	if !ok {
@@ -1242,6 +1288,14 @@ func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
 	}
 	dstStack.Stack.SetRouteTable(s.Stack.GetRouteTable())
 	return nil
+}
+
+// ResetLiveForkChild implements inet.LiveForkStackChildResetter.
+func (s *Stack) ResetLiveForkChild() error {
+	if s.liveForkNetwork == nil || s.liveForkNetwork.ResetChild == nil {
+		return nil
+	}
+	return s.liveForkNetwork.ResetChild(s)
 }
 
 // GetRemoveConf implements inet.Stack.GetRemoveConf.

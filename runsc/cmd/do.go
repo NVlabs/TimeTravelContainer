@@ -249,7 +249,7 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 		return util.Errorf("FetchSpec failed: %v", err)
 	}
 
-	if conf.Network == config.NetworkNone {
+	if conf.Network == config.NetworkNone || conf.Network == config.NetworkTimeTravel {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	} else if conf.Rootless {
 		if conf.Network == config.NetworkSandbox {

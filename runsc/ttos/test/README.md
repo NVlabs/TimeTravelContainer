@@ -33,6 +33,10 @@ covers:
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
+- rootless `--network ttos` startup with the `ttos0` virtual NIC, NAT-disabled
+  isolation, optional IPv4 TCP/UDP user-mode NAT, Docker-style persistent TCP
+  publication, parent listener continuity across live fork, and child external
+  TCP reset/fresh-proxy semantics;
 - Docker `--add-host`, `--dns`, `--dns-search`, and `--dns-option`/`--dns-opt`
   persistence through immutable `/etc/hosts`, `/etc/resolv.conf`, and
   `/etc/hostname` files, including Docker inspect projection, read-only-rootfs

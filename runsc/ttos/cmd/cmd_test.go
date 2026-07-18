@@ -742,6 +742,49 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
+	wantPorts := []ttosbundle.PortBinding{
+		{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+		{HostIP: "127.0.0.1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+	}
+	for _, command := range []string{"run", "create"} {
+		t.Run(command, func(t *testing.T) {
+			backend := &fakeBackend{containerID: "demo"}
+			var stdout, stderr bytes.Buffer
+			args := []string{command, "--network=ttos", "--nat", "-p", "8080:80", "--publish", "127.0.0.1:8443:443/tcp", "busybox"}
+			if status := runCommand(args, &stdout, &stderr, backend); status != 0 {
+				t.Fatalf("status=%d, stderr=%q", status, stderr.String())
+			}
+			if backend.runRequest.networkMode != "ttos" || !backend.runRequest.networkNAT {
+				t.Errorf("network request=%+v", backend.runRequest)
+			}
+			if !reflect.DeepEqual(backend.runRequest.publishedPorts, wantPorts) {
+				t.Errorf("published ports=%+v, want %+v", backend.runRequest.publishedPorts, wantPorts)
+			}
+		})
+	}
+}
+
+func TestTimeTravelNetworkingRejectsInvalidCombinations(t *testing.T) {
+	tests := [][]string{
+		{"run", "--nat", "busybox"},
+		{"run", "-p", "8080:80", "busybox"},
+		{"create", "--network=ttos", "-p", "8080:80/udp", "busybox"},
+		{"create", "--network=ttos", "-p", "not-a-port", "busybox"},
+		{"create", "--network=ttos", "-p", "127.0.0.1:8080:80", "-p", "127.0.0.1:8080:81", "busybox"},
+	}
+	for _, args := range tests {
+		backend := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, backend); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if backend.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) reached backend", args)
+		}
+	}
+}
+
 func TestParseTmpfsMountDockerOptions(t *testing.T) {
 	const value = "/data:ro,suid,dev,noexec,sync,dirsync,noatime,nodiratime,size=64m,mode=1770,uid=123,gid=456,nr_inodes=400k,nr_blocks=1024"
 	got, err := parseTmpfsMount(value)
@@ -2422,6 +2465,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
+	}
+	wantTTOSNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttos", "--directfs=false", "--overlay2=all:memory", "--ttos-network-nat=true"}
+	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttos", true); !reflect.DeepEqual(got, wantTTOSNAT) {
+		t.Errorf("TTOS NAT runsc args=%q, want %q", got, wantTTOSNAT)
 	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",

@@ -89,11 +89,15 @@ NOLOG="$PREFIX-nolog"
 MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
+VNET="$PREFIX-vnet"
 STOP_POLICY="$PREFIX-stop-policy"
 PIDS_LIMIT="$PREFIX-pids-limit"
 ANON_VOLUME="$PREFIX-anon-volume"
 ANON_NOCOPY="$PREFIX-anon-nocopy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
+NAT_FIXTURE_PORT=$((20000 + (($$ + 1000) % 30000)))
+PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
+NAT_FIXTURE_PID=
 VOLUME="$PREFIX-state"
 QUOTA_VOLUME="$PREFIX-quota"
 QUOTA_CONTAINER="$PREFIX-quota-container"
@@ -123,11 +127,15 @@ ttos() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED"; do
     ttos rm --force "$container" >/dev/null 2>&1 || true
   done
   ttos volume rm "$VOLUME" "$QUOTA_VOLUME" "$NATURAL_VOLUME" >/dev/null 2>&1 || true
   ttos daemon stop >/dev/null 2>&1 || true
+  if [ -n "$NAT_FIXTURE_PID" ]; then
+    kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+    wait "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+  fi
   if $owned_root; then
     rm -rf "$TTOS_E2E_ROOT"
   fi
@@ -289,6 +297,56 @@ if ttos fork --check "$HOSTNET" >/dev/null 2>&1; then
 fi
 ttos stop --time 1 "$HOSTNET"
 ttos rm "$HOSTNET"
+
+echo "== rootless virtual NIC, NAT, publication, and live fork =="
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for the TTOS NAT fixture"
+mkdir -p "$TTOS_E2E_ROOT/nat-fixture"
+echo nat-ok >"$TTOS_E2E_ROOT/nat-fixture/index.html"
+python3 -m http.server "$NAT_FIXTURE_PORT" --bind 127.0.0.1 \
+  --directory "$TTOS_E2E_ROOT/nat-fixture" \
+  >"$TTOS_E2E_ROOT/nat-fixture.log" 2>&1 &
+NAT_FIXTURE_PID=$!
+deadline=$(( $(date +%s) + 15 ))
+until curl -fsS --max-time 1 "http://127.0.0.1:$NAT_FIXTURE_PORT/" >/dev/null 2>&1; do
+  kill -0 "$NAT_FIXTURE_PID" >/dev/null 2>&1 || fail "TTOS NAT fixture exited during startup"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "TTOS NAT fixture did not become ready"
+  sleep 1
+done
+
+if ttos run --rm --network ttos "$BUSYBOX_IMAGE" \
+    wget -T 2 -qO- "http://10.0.2.2:$NAT_FIXTURE_PORT/" >/dev/null 2>&1; then
+  fail "NAT-disabled TTOS virtual NIC reached a host service"
+fi
+[ "$(ttos run --rm --network ttos --nat "$BUSYBOX_IMAGE" \
+    wget -T 5 -qO- "http://10.0.2.2:$NAT_FIXTURE_PORT/")" = nat-ok ] ||
+  fail "TTOS user-mode NAT did not reach the host fixture"
+
+ttos run --name "$VNET" --detach --network ttos \
+  --publish "127.0.0.1:$PUBLISHED_PORT:8080" \
+  "$BUSYBOX_IMAGE" sh -c \
+  'mkdir -p /www; echo parent >/www/index.html; exec httpd -f -p 8080 -h /www' >/dev/null
+deadline=$(( $(date +%s) + 15 ))
+VNET_RESPONSE=
+while [ "$VNET_RESPONSE" != parent ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "published TTOS TCP port did not become reachable"
+  VNET_RESPONSE=$(curl -fsS --max-time 1 "http://127.0.0.1:$PUBLISHED_PORT/" 2>/dev/null || true)
+  [ "$VNET_RESPONSE" = parent ] || sleep 1
+done
+[ "$(ttos inspect -f '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIP}}:{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostPort}}' "$VNET")" = "127.0.0.1:$PUBLISHED_PORT" ] ||
+  fail "inspect omitted the persisted TTOS port binding"
+ttos fork "$VNET" "$VNET@child" >/dev/null
+ttos exec "$VNET@child" sh -c 'echo child >/www/index.html'
+[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
+  fail "published host port switched away from the source branch after fork"
+[ "$(ttos exec "$VNET@child" cat /www/index.html)" = child ] ||
+  fail "forked TTOS branch did not retain its branch-local network service state"
+ttos fork "$VNET" "$VNET@second" >/dev/null
+ttos fork "$VNET@child" "$VNET@grandchild" >/dev/null
+ttos daemon stop
+ttos daemon start
+[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
+  fail "published TTOS port did not survive daemon restart reconciliation"
+ttos rm --force "$VNET"
 
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'

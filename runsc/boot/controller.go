@@ -604,13 +604,15 @@ type PortForwardOpts struct {
 
 	// ContainerID is the container for the process being executed.
 	ContainerID string
+	// BranchID selects the TimeTravel branch. Empty means the default branch.
+	BranchID string
 	// Port is the port to to forward.
 	Port uint16
 }
 
 // PortForward initiates a port forward to the container.
 func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) error {
-	log.Debugf("containerManager.PortForward, cid: %s, port: %d", opts.ContainerID, opts.Port)
+	log.Debugf("containerManager.PortForward, cid: %s, branch: %s, port: %d", opts.ContainerID, opts.BranchID, opts.Port)
 	if err := cm.l.portForward(opts); err != nil {
 		log.Debugf("containerManager.PortForward failed, opts: %+v, err: %v", opts, err)
 		return err

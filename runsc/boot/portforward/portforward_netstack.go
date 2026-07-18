@@ -69,6 +69,9 @@ func NewNetstackConn(stack *stack.Stack, port uint16) (proxyConn, error) {
 	if tcpErr != nil {
 		return nil, fmt.Errorf("connecting endpoint: %v", tcpErr)
 	}
+	if tcpEP, ok := n.ep.(*tcp.Endpoint); ok {
+		tcpEP.MarkLiveForkExternal()
+	}
 	return n, nil
 }
 

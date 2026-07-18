@@ -61,6 +61,16 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config, disableIPv6 b
 		if err := createDefaultLoopbackInterface(conf, conn, isRestore); err != nil {
 			return fmt.Errorf("creating default loopback interface: %v", err)
 		}
+	case config.NetworkTimeTravel:
+		link := boot.DefaultLoopbackLink
+		link.GVisorGRO = conf.GVisorGRO
+		if err := conn.Call(boot.ContMgrSetNetworkArgs, &boot.CreateLinksAndRoutesArgs{
+			LoopbackLinks: []boot.LoopbackLink{link},
+			TimeTravel:    &boot.TimeTravelNetworkConfig{NAT: conf.TimeTravelNetworkNAT},
+			IsRestore:     isRestore,
+		}, nil); err != nil {
+			return fmt.Errorf("creating TTOS virtual network: %v", err)
+		}
 	case config.NetworkSandbox:
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.

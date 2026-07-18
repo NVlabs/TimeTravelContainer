@@ -347,6 +347,11 @@ func (sq *sndQueueInfo) CloneState(other *TCPSndBufState) {
 // +stateify savable
 type Endpoint struct {
 	TCPEndpointStateInner
+
+	// liveForkExternal marks a Sentry-created proxy connection whose peer is
+	// outside the guest object graph. The mark is serialized so both directions
+	// of the corresponding child connection can be reset after restore.
+	liveForkExternal bool
 	stack.TransportEndpointInfo
 	tcpip.DefaultSocketOptionsHandler
 
@@ -620,6 +625,28 @@ type Endpoint struct {
 	//
 	// +checklocks:mu
 	terminateAtRestore bool
+}
+
+// MarkLiveForkExternal marks e as terminating in an external proxy.
+func (e *Endpoint) MarkLiveForkExternal() {
+	e.LockUser()
+	e.liveForkExternal = true
+	e.UnlockUser()
+}
+
+// LiveForkExternal reports whether e terminates in an external proxy.
+func (e *Endpoint) LiveForkExternal() bool {
+	e.LockUser()
+	external := e.liveForkExternal
+	e.UnlockUser()
+	return external
+}
+
+// OwnedByStack reports whether e belongs to s. Endpoint stack ownership is
+// immutable outside state restoration, which completes before live-fork
+// filtering begins.
+func (e *Endpoint) OwnedByStack(s *stack.Stack) bool {
+	return e.stack == s
 }
 
 // calculateAdvertisedMSS calculates the MSS to advertise.
@@ -1052,6 +1079,25 @@ func (e *Endpoint) Abort() {
 		return
 	}
 	e.closeLocked()
+}
+
+// ResetForLiveForkChild resets a connected or connecting endpoint inherited by
+// a live-fork child. Unlike Abort, it reports connection reset, matching the
+// observable result of losing the child's external path while leaving the
+// parent's endpoint untouched.
+func (e *Endpoint) ResetForLiveForkChild() {
+	defer e.drainClosingSegmentQueue()
+	e.LockUser()
+	defer e.UnlockUser()
+	defer e.purgeReadQueue()
+	state := e.EndpointState()
+	if state.connected() {
+		e.resetConnectionLocked(&tcpip.ErrConnectionReset{})
+		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+	} else if state.connecting() {
+		e.handshakeFailed(&tcpip.ErrConnectionReset{})
+		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+	}
 }
 
 // Close puts the endpoint in a closed state and frees all resources associated

@@ -117,7 +117,7 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 
 	if conf.Rootless {
 		if conf.Network == config.NetworkSandbox {
-			return util.Errorf("sandbox network isn't supported with --rootless, use --network=none or --network=host")
+			return util.Errorf("sandbox network isn't supported with --rootless, use --network=ttos, --network=none, or --network=host")
 		}
 		if err := specutils.MaybeRunAsRoot(); err != nil {
 			return util.Errorf("Error executing inside namespace: %v", err)

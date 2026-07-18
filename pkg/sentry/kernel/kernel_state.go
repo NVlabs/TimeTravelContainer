@@ -17,6 +17,7 @@ package kernel
 import (
 	"context"
 
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
@@ -27,7 +28,26 @@ func (ts *TaskSet) afterLoad(_ context.Context) {
 
 // saveDanglingEndpoints is invoked by stateify.
 func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
-	return tcpip.GetDanglingEndpoints()
+	endpoints := tcpip.GetDanglingEndpoints()
+	if !k.filteringLiveForkDanglingEndpoints {
+		return endpoints
+	}
+	if k.rootNetworkNamespace == nil || k.rootNetworkNamespace.Stack() == nil {
+		return nil
+	}
+	owner, ok := k.rootNetworkNamespace.Stack().(inet.LiveForkDanglingEndpointOwner)
+	if !ok {
+		// Network live-fork validation must reject stacks that cannot identify
+		// branch ownership before serialization reaches this point.
+		return nil
+	}
+	owned := make([]tcpip.Endpoint, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if owner.OwnsLiveForkDanglingEndpoint(endpoint) {
+			owned = append(owned, endpoint)
+		}
+	}
+	return owned
 }
 
 // loadDanglingEndpoints is invoked by stateify.

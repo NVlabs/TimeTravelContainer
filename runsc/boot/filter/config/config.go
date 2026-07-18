@@ -37,6 +37,7 @@ type Options struct {
 	Platform              platform.SeccompInfo
 	HostNetwork           bool
 	HostNetworkRawSockets bool
+	TimeTravelNetworkNAT  bool
 	HostFilesystem        bool
 	ProfileEnable         bool
 	NVProxy               bool
@@ -65,6 +66,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "Platform=%q ", opt.Platform.ConfigKey())
 	fmt.Fprintf(&sb, "HostNetwork=%t ", opt.HostNetwork)
 	fmt.Fprintf(&sb, "HostNetworkRawSockets=%t ", opt.HostNetworkRawSockets)
+	fmt.Fprintf(&sb, "TimeTravelNetworkNAT=%t ", opt.TimeTravelNetworkNAT)
 	fmt.Fprintf(&sb, "HostFilesystem=%t ", opt.HostFilesystem)
 	fmt.Fprintf(&sb, "ProfileEnable=%t ", opt.ProfileEnable)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
@@ -142,6 +144,9 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 
 	if opt.HostNetwork {
 		s.Merge(hostInetFilters(opt.HostNetworkRawSockets))
+	}
+	if opt.TimeTravelNetworkNAT {
+		s.Merge(timeTravelNATFilters())
 	}
 	if opt.ProfileEnable {
 		s.Merge(profileFilters())

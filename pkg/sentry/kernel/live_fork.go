@@ -305,6 +305,10 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 		})
 		metadataStarted := time.Now()
+		k.filteringLiveForkDanglingEndpoints = true
+		defer func() {
+			k.filteringLiveForkDanglingEndpoints = false
+		}()
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
 		}
@@ -334,6 +338,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				return fmt.Errorf("cloning live-fork network configuration: %w", err)
 			}
 			rootNS.Stack().Restore()
+			if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
+				if err := resetter.ResetLiveForkChild(); err != nil {
+					return fmt.Errorf("resetting child external network state: %w", err)
+				}
+			}
 		}
 		if err := injectLiveForkFailure(opts, LiveForkStageNetworkRestored); err != nil {
 			return err
@@ -413,6 +422,9 @@ func (k *Kernel) validateLiveForkNetwork(stack inet.Stack) error {
 	validator, ok := stack.(inet.LiveForkStackValidator)
 	if !ok {
 		return fmt.Errorf("live fork network stack %T has not opted into containment validation", stack)
+	}
+	if _, ok := stack.(inet.LiveForkDanglingEndpointOwner); !ok {
+		return fmt.Errorf("live fork network stack %T cannot identify branch-owned dangling endpoints", stack)
 	}
 	if err := validator.ValidateLiveFork(); err != nil {
 		return fmt.Errorf("live fork network containment validation failed: %w", err)

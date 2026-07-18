@@ -158,6 +158,20 @@ type LiveForkStackConfigCloner interface {
 	CloneLiveForkConfig(dst Stack) error
 }
 
+// LiveForkStackChildResetter removes branch-external transport state from a
+// freshly cloned stack after its endpoints have been restored.
+type LiveForkStackChildResetter interface {
+	ResetLiveForkChild() error
+}
+
+// LiveForkDanglingEndpointOwner identifies globally tracked transport
+// endpoints that belong to one stack. The ordinary checkpoint path assumes one
+// Kernel per Sentry, but live fork keeps multiple Kernels in one process and
+// must not serialize a sibling branch's dangling endpoints.
+type LiveForkDanglingEndpointOwner interface {
+	OwnsLiveForkDanglingEndpoint(tcpip.Endpoint) bool
+}
+
 // Interface contains information about a network interface.
 type Interface struct {
 	// DeviceType is the device type, a Linux ARPHRD_* constant.

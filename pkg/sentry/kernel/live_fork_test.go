@@ -140,3 +140,50 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	parent.Release()
 	child.Release()
 }
+
+// TestLiveForkRunningKernelRepeatedly verifies that restarting the parent after
+// one fork leaves all save-time services quiesceable for a later fork.
+func TestLiveForkRunningKernelRepeatedly(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+
+	first, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		t.Fatalf("first LiveFork: %v", err)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("parent.StartPaused: %v", err)
+	}
+	if err := first.StartPaused(); err != nil {
+		t.Fatalf("first.StartPaused: %v", err)
+	}
+	parent.Unpause()
+	first.Unpause()
+
+	parent.Pause()
+	second, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		t.Fatalf("second LiveFork: %v", err)
+	}
+	if err := second.StartPaused(); err != nil {
+		t.Fatalf("second.StartPaused: %v", err)
+	}
+	parent.Unpause()
+	second.Unpause()
+
+	parent.Pause()
+	first.Pause()
+	second.Pause()
+	second.Release()
+	first.Release()
+	parent.Release()
+}

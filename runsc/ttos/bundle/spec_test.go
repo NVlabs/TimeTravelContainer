@@ -436,6 +436,12 @@ func TestBuildResolvConf(t *testing.T) {
 	if got, want := buildResolvConf(nil, nil, nil, nil), "nameserver 127.0.0.1\n"; got != want {
 		t.Errorf("fallback resolver=%q, want %q", got, want)
 	}
+	if got, want := buildResolvConfForNetwork([]byte("nameserver 127.0.0.53\n"), nil, nil, nil, "ttos"), "nameserver 10.0.2.53\n"; got != want {
+		t.Errorf("TTOS host stub resolver=%q, want %q", got, want)
+	}
+	if got, want := buildResolvConfForNetwork(nil, []string{"127.0.0.1", "203.0.113.53"}, nil, nil, "ttos"), "nameserver 10.0.2.2\nnameserver 203.0.113.53\n"; got != want {
+		t.Errorf("TTOS mixed resolver=%q, want %q", got, want)
+	}
 }
 
 func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {

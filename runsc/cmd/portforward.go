@@ -43,6 +43,8 @@ type PortForward struct {
 	containerLoader
 	portNum int
 	stream  string
+	branch  string
+	readyFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -82,6 +84,8 @@ OPTIONS:
 // SetFlags implements subcommands.Command.SetFlags.
 func (p *PortForward) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.stream, "stream", "", "Stream mode - a Unix domain socket")
+	f.StringVar(&p.branch, "branch", boot.DefaultBranchID, "TimeTravel branch to receive forwarded connections")
+	f.IntVar(&p.readyFD, "ready-fd", -1, "write one byte after the local listener is ready")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -118,8 +122,13 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 
 	// Allow forwarding to a local port.
 	ports := strings.Split(portStr, ":")
-	if len(ports) != 2 {
+	if len(ports) != 2 && len(ports) != 3 {
 		util.Fatalf("invalid port string %q", portStr)
+	}
+	localAddress := ""
+	if len(ports) == 3 {
+		localAddress = ports[0]
+		ports = ports[1:]
 	}
 
 	localPort, err := strconv.Atoi(ports[0])
@@ -143,7 +152,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 		defer wg.Done()
 		// Print message to local user.
 		fmt.Printf("Forwarding local port %d to %d...\n", localPort, portNum)
-		if err := localForward(ctx, c, localPort, uint16(portNum)); err != nil {
+		if err := localForward(ctx, c, p.branch, localAddress, localPort, uint16(portNum), p.readyFD); err != nil {
 			log.Warningf("port forwarding: %v", err)
 		}
 	}(localPort, portNum)
@@ -171,12 +180,26 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 }
 
 // localForward starts port forwarding from the given local port.
-func localForward(ctx context.Context, c *container.Container, localPort int, containerPort uint16) error {
-	l, err := net.Listen("tcp", ":"+strconv.Itoa(localPort))
+func localForward(ctx context.Context, c *container.Container, branch, localAddress string, localPort int, containerPort uint16, readyFD int) error {
+	address := net.JoinHostPort(localAddress, strconv.Itoa(localPort))
+	l, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
 	defer l.Close()
+	if readyFD >= 0 {
+		ready := os.NewFile(uintptr(readyFD), "port-forward-ready")
+		if ready == nil {
+			return fmt.Errorf("invalid ready fd %d", readyFD)
+		}
+		if _, err := ready.Write([]byte{1}); err != nil {
+			ready.Close()
+			return fmt.Errorf("notifying port-forward readiness: %w", err)
+		}
+		if err := ready.Close(); err != nil {
+			return fmt.Errorf("closing port-forward readiness fd: %w", err)
+		}
+	}
 
 	localConnChan := make(chan net.Conn, 1)
 	errChan := make(chan error, 1)
@@ -208,7 +231,7 @@ func localForward(ctx context.Context, c *container.Container, localPort int, co
 			go func() {
 				defer localConn.Close()
 				fmt.Println("Forwarding new connection...")
-				err := portCopy(ctx, c, localConn, containerPort)
+				err := portCopy(ctx, c, branch, localConn, containerPort)
 				if err != nil {
 					log.Warningf("port forwarding: %v", err)
 				}
@@ -239,6 +262,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 	if err := c.PortForward(&boot.PortForwardOpts{
 		Port:        uint16(p.portNum),
 		ContainerID: c.ID,
+		BranchID:    p.branch,
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 	}); err != nil {
 		return fmt.Errorf("PortForward: %v", err)
@@ -249,7 +273,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 
 // portCopy creates a UDS and begins copying data to and from the local
 // connection.
-func portCopy(ctx context.Context, c *container.Container, localConn net.Conn, port uint16) error {
+func portCopy(ctx context.Context, c *container.Container, branch string, localConn net.Conn, port uint16) error {
 	// Create a new path address for the UDS.
 	addr, err := tmpUDSAddr()
 	if err != nil {
@@ -275,6 +299,7 @@ func portCopy(ctx context.Context, c *container.Container, localConn net.Conn, p
 	// handled via the UDS from then on.
 	if err := c.PortForward(&boot.PortForwardOpts{
 		Port:        port,
+		BranchID:    branch,
 		FilePayload: urpc.FilePayload{Files: []*os.File{streamFile}},
 	}); err != nil {
 		return fmt.Errorf("PortForward: %v", err)

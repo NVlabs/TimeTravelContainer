@@ -106,6 +106,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		},
 		"HostNetwork":           func(opt *Options) { opt.HostNetwork = !opt.HostNetwork },
 		"HostNetworkRawSockets": func(opt *Options) { opt.HostNetworkRawSockets = !opt.HostNetworkRawSockets },
+		"TimeTravelNetworkNAT":  func(opt *Options) { opt.TimeTravelNetworkNAT = !opt.TimeTravelNetworkNAT },
 		"HostFilesystem":        func(opt *Options) { opt.HostFilesystem = !opt.HostFilesystem },
 		"ProfileEnable":         func(opt *Options) { opt.ProfileEnable = !opt.ProfileEnable },
 		"NVProxy":               func(opt *Options) { opt.NVProxy = !opt.NVProxy },

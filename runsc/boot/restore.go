@@ -359,7 +359,7 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
-	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone {
+	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkTimeTravel {
 		// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
 		return errors.New("checkpoint not supported when using hostinet")
 	}
