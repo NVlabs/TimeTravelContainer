@@ -332,21 +332,24 @@ endif
 # we make a non-phony version of bazel-server that can be included.
 bazel-server-inc: bazel-server
 
-# build_paths extracts the built binary from the bazel stderr output.
+# build_paths builds its first argument and extracts output paths with cquery.
+# The optional third argument is a single cquery expression. This is required
+# for callers that build multiple positional targets, since build accepts a
+# list while cquery accepts exactly one expression.
 #
 # The last line is used to prevent terminal shenanigans.
 build_paths = \
   (set -euo pipefail; \
   $(call wrapper,$(BAZEL) build $(BASE_OPTIONS) $(BAZEL_OPTIONS) $(1)) && \
-  $(call wrapper,$(BAZEL) cquery $(BASE_OPTIONS) $(BAZEL_OPTIONS) --output=starlark --starlark:file=tools/show_paths.bzl $(1)) \
+  $(call wrapper,$(BAZEL) cquery $(BASE_OPTIONS) $(BAZEL_OPTIONS) --output=starlark --starlark:file=tools/show_paths.bzl $(if $(3),'$(3)',$(1))) \
   | $(call wrapper,xargs -r -I {} bash -c 'test -e "{}" || exit 0; $(REALPATH_M) "{}"') \
   | sed 's~^$(HOME)/\.cache/bazel/~$(patsubst %/,%,$(BAZEL_CACHE))/~' \
   | xargs -r -I {} bash -c 'test -e "{}" || exit 0; $(REALPATH_M) "{}"' \
   | xargs -r -I {} bash -c 'set -euo pipefail; $(2)')
 
 clean = $(call header,CLEAN) && $(call wrapper,$(BAZEL) clean)
-build = $(call header,BUILD $(1)) && $(call build_paths,$(1),echo {})
-copy  = $(call header,COPY $(1) $(2)) && $(call build_paths,$(1),cp -fa {} $(2))
+build = $(call header,BUILD $(1)) && $(call build_paths,$(1),echo {},$(2))
+copy  = $(call header,COPY $(1) $(2)) && $(call build_paths,$(1),cp -fa {} $(2),set($(1)))
 run   = $(call header,RUN $(1) $(2)) && $(call build_paths,$(1),{} $(2))
 sudo  = $(call header,SUDO $(1) $(2)) && $(call build_paths,$(1),sudo -E {} $(2))
 test  = $(call header,TEST $(1)) && $(call wrapper,$(BAZEL) test --strip=never $(BAZEL_OPTIONS) $(TEST_OPTIONS) $(1))
