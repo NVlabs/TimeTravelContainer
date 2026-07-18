@@ -219,6 +219,9 @@ go_test(
     library = ":boot",
     deps = [
         "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/kernel",
+        "//pkg/sentry/vfs",
+        "//pkg/usermem",
         "//pkg/sentry/platform/systrap",
     ],
 )

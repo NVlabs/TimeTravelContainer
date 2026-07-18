@@ -1090,14 +1090,23 @@ func (cm *containerManager) ExecSignal(args *ExecSessionArgs, _ *struct{}) error
 
 // ConsoleFollow coordinates client-side console draining with init lifetime.
 func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *uint32) error {
-	if len(args.FilePayload.Files) < 3 || len(args.FilePayload.Files) > 4 {
-		return fmt.Errorf("console follow received %d files, want final output, wait status, release, and optional readiness", len(args.FilePayload.Files))
+	if len(args.FilePayload.Files) < 3 || len(args.FilePayload.Files) > 5 {
+		return fmt.Errorf("console follow received %d files, want final output, wait status, release, and optional registration and attachment readiness", len(args.FilePayload.Files))
 	}
 	var ready func() error
-	if len(args.FilePayload.Files) == 4 {
+	var attached func() error
+	if len(args.FilePayload.Files) >= 4 {
 		ready = func() error {
 			if _, err := args.FilePayload.Files[3].Write([]byte{1}); err != nil {
 				return fmt.Errorf("writing console follow readiness: %w", err)
+			}
+			return nil
+		}
+	}
+	if len(args.FilePayload.Files) == 5 {
+		attached = func() error {
+			if _, err := args.FilePayload.Files[4].Write([]byte{1}); err != nil {
+				return fmt.Errorf("writing console attachment readiness: %w", err)
 			}
 			return nil
 		}
@@ -1119,7 +1128,7 @@ func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *u
 		}
 		return nil
 	}
-	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, args.FilePayload.Files[0], ready, exited, released)
+	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, args.FilePayload.Files[0], ready, attached, exited, released)
 	if err != nil {
 		return err
 	}

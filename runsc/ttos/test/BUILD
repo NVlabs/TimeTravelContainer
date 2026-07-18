@@ -23,6 +23,15 @@ sh_binary(
     ],
 )
 
+# Manual because it requires a real PTY, a containerd socket, and a public image.
+sh_binary(
+    name = "e2e_terminal",
+    srcs = ["e2e_terminal.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",

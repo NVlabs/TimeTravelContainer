@@ -395,10 +395,33 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				err = fmt.Errorf("creating console drain-release pipe: %w", pipeErr)
 				break
 			}
-			files := []*os.File{finalWriter, statusWriter, releaseReader}
-			if readyFile != nil {
-				files = append(files, readyFile)
+			registrationWriter := readyFile
+			if registrationWriter == nil {
+				registrationWriter, pipeErr = os.OpenFile("/dev/null", os.O_WRONLY, 0)
+				if pipeErr != nil {
+					_ = finalReader.Close()
+					_ = finalWriter.Close()
+					_ = statusReader.Close()
+					_ = statusWriter.Close()
+					_ = releaseReader.Close()
+					_ = releaseWriter.Close()
+					err = fmt.Errorf("opening registration readiness sink: %w", pipeErr)
+					break
+				}
+				defer registrationWriter.Close()
 			}
+			attachedReader, attachedWriter, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				_ = finalReader.Close()
+				_ = finalWriter.Close()
+				_ = statusReader.Close()
+				_ = statusWriter.Close()
+				_ = releaseReader.Close()
+				_ = releaseWriter.Close()
+				err = fmt.Errorf("creating console attachment pipe: %w", pipeErr)
+				break
+			}
+			files := []*os.File{finalWriter, statusWriter, releaseReader, registrationWriter, attachedWriter}
 			waitCh := make(chan branchWaitResult, 1)
 			go func() {
 				_, waitErr := cont.Sandbox.FollowConsole(&boot.ConsoleFollowArgs{
@@ -411,14 +434,28 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				_ = finalWriter.Close()
 				_ = statusWriter.Close()
 				_ = releaseReader.Close()
+				_ = attachedWriter.Close()
 				waitCh <- branchWaitResult{err: waitErr}
 			}()
-			drain := drainConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, nil)
+			var attached [1]byte
+			if _, attachErr := io.ReadFull(attachedReader, attached[:]); attachErr != nil {
+				err = fmt.Errorf("waiting for console attachment readiness: %w", attachErr)
+			}
+			_ = attachedReader.Close()
+			drain := consoleDrainResult{}
+			if err == nil {
+				drain = drainConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, nil)
+				if drain.err != nil {
+					err = drain.err
+				}
+			}
 			if _, releaseErr := releaseWriter.Write([]byte{1}); err == nil && releaseErr != nil {
 				err = fmt.Errorf("handing console reads to coordinator: %w", releaseErr)
 			}
 			_ = releaseWriter.Close()
-			err = ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
+			if copyErr := ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF); err == nil && copyErr != nil {
+				err = copyErr
+			}
 			_ = finalReader.Close()
 			var encodedStatus [4]byte
 			_, statusErr := io.ReadFull(statusReader, encodedStatus[:])

@@ -37,6 +37,44 @@ import (
 	ttosimages "gvisor.dev/gvisor/runsc/ttos/images"
 )
 
+func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "ttosd.sock")
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"flag command", []string{"run", "--help"}, "Usage of run:"},
+		{"container namespace", []string{"container", "--help"}, "Usage: ttos container COMMAND"},
+		{"container subcommand", []string{"container", "run", "--help"}, "Usage of run:"},
+		{"pause", []string{"pause", "--help"}, "Usage: ttos pause"},
+		{"unpause", []string{"unpause", "--help"}, "Usage: ttos unpause"},
+		{"top", []string{"top", "--help"}, "Usage: ttos top"},
+		{"events", []string{"events", "--help"}, "Usage: ttos events"},
+		{"image inspect", []string{"image", "inspect", "--help"}, "Usage: ttos image inspect"},
+		{"volume remove", []string{"volume", "rm", "--help"}, "Usage: ttos volume rm"},
+		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttos exec wait"},
+		{"daemon", []string{"daemon", "--help"}, "Usage: ttos daemon"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"--daemon-socket", socket}, test.args...)
+			if status := Run(args, strings.NewReader(""), &stdout, &stderr); status != 0 {
+				t.Fatalf("status=%d, stdout=%q, stderr=%q", status, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stdout.String(), test.want) {
+				t.Fatalf("stdout=%q, want %q", stdout.String(), test.want)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr=%q", stderr.String())
+			}
+			if _, err := os.Stat(socket); !os.IsNotExist(err) {
+				t.Fatalf("help created daemon socket: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseSelector(t *testing.T) {
 	tests := []struct {
 		input string
@@ -627,14 +665,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "-h", "demo-host", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.hostname != "demo-host" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 23 {
@@ -1098,10 +1136,10 @@ func TestCreateAndStart(t *testing.T) {
 	containerID := strings.Repeat("b", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--stop-signal", "SIGQUIT", "--stop-timeout", "4", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--stop-signal", "SIGQUIT", "--stop-timeout", "4", "-h", "create-host", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.stopSignal != "SIGQUIT" || b.runRequest.stopTimeout != 4 || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.hostname != "create-host" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.stopSignal != "SIGQUIT" || b.runRequest.stopTimeout != 4 || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
@@ -2038,6 +2076,15 @@ func TestKillParsesSignalAndSelectsBranch(t *testing.T) {
 	}
 	if len(b.signals) != 1 || b.signals[0].target != (selector{container: "web", branch: "child"}) || b.signals[0].signal != 15 || b.signals[0].all {
 		t.Errorf("signal calls=%+v", b.signals)
+	}
+	b = &fakeBackend{}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"kill", "web@child", "SIGUSR1"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("positional kill status=%d, stderr=%q", status, stderr.String())
+	}
+	if len(b.signals) != 1 || b.signals[0].target != (selector{container: "web", branch: "child"}) || b.signals[0].signal != 10 {
+		t.Errorf("positional signal calls=%+v", b.signals)
 	}
 }
 

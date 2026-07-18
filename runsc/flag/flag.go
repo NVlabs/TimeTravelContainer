@@ -33,6 +33,7 @@ var (
 	Bool        = flag.Bool
 	BoolVar     = flag.BoolVar
 	CommandLine = flag.CommandLine
+	ErrHelp     = flag.ErrHelp
 	Duration    = flag.Duration
 	Float64     = flag.Float64
 	Int         = flag.Int

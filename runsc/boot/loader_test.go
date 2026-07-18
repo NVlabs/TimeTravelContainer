@@ -311,6 +311,85 @@ func TestInitialInternalPTYWinsize(t *testing.T) {
 	}
 }
 
+// TestPreStartInternalTTYFollowerCapturesQuickExit verifies the two-phase
+// follower handshake used by OCI create/start. Registration must complete before
+// start, attachment must wait until the internal PTY exists, and a quick init
+// exit must not lose its buffered terminal output.
+func TestPreStartInternalTTYFollowerCapturesQuickExit(t *testing.T) {
+	spec := testSpec()
+	spec.Process.Args = []string{"/bin/sh", "-c", "printf quick-terminal-output"}
+	spec.Process.Terminal = true
+	spec.Mounts = []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+	}
+	const consoleID = "init"
+	spec.Annotations = map[string]string{InternalConsoleAnnotation: consoleID}
+	conf := testConfig()
+	conf.DirectFS = false
+	l, cleanup, err := createLoaderWithGoferMountConf(conf, spec, specutils.GoferMountConf{Lower: specutils.Lisafs, Upper: specutils.NoOverlay})
+	if err != nil {
+		t.Fatalf("creating terminal loader: %v", err)
+	}
+	defer cleanup()
+	defer l.Destroy()
+
+	registered := make(chan struct{})
+	attached := make(chan struct{})
+	var final bytes.Buffer
+	type followResult struct {
+		status uint32
+		err    error
+	}
+	followDone := make(chan followResult, 1)
+	go func() {
+		status, err := l.family.FollowConsole(DefaultBranchID, l.root.cid, "", consoleID, &final,
+			func() error { close(registered); return nil },
+			func() error { close(attached); return nil },
+			func(uint32) error { return nil },
+			func() error { return nil })
+		followDone <- followResult{status: status, err: err}
+	}()
+	select {
+	case <-registered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("console follower did not register before start")
+	}
+	select {
+	case <-attached:
+		t.Fatal("console follower attached before the internal PTY existed")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	startResult := make(chan error, 1)
+	go func() { startResult <- <-l.ctrl.manager.startResultChan }()
+	if err := l.Run(); err != nil {
+		t.Fatalf("running quick terminal container: %v", err)
+	}
+	if err := <-startResult; err != nil {
+		t.Fatalf("start result: %v", err)
+	}
+	select {
+	case <-attached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("console follower did not attach after start")
+	}
+	select {
+	case result := <-followDone:
+		if result.err != nil || result.status != 0 {
+			t.Fatalf("console follower: status=%#x err=%v", result.status, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("console follower did not finish after quick exit")
+	}
+	if !bytes.Contains(final.Bytes(), []byte("quick-terminal-output")) {
+		t.Fatalf("final console frames %q do not contain quick-exit output", final.Bytes())
+	}
+}
+
 // TestRunInternalTTYLiveFork verifies that a terminal container uses a fully
 // Sentry-owned PTY and that live fork duplicates both endpoints and queued data.
 func TestRunInternalTTYLiveFork(t *testing.T) {

@@ -163,6 +163,29 @@ layer extraction, OCI generation, rootless runsc startup, versioned daemon
 transport and restart recovery, nontrivial userspace, console sidecars, and
 TimeTravel branch operations on the executing host.
 
+## Terminal and live-fork integration
+
+`e2e_terminal.sh` is the authoritative real-PTY test for `run -it`, detached
+terminal containers, the `ttosd` terminal transport, attach/detach keys,
+branch-local terminal state after live fork, pause/resume, persistent logs, and
+`exec -it`. It repeats quick-exit terminal runs to cover the pre-start console
+follower handshake and verifies that their output is never lost.
+
+```shell
+bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \
+  //runsc/ttos/test:e2e_terminal
+
+TTOS_UNSAFE_NO_HOST_ISOLATION=1 \
+TTOS="$PWD/bazel-bin/runsc/ttos/ttos_/ttos" \
+RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+CONTAINERD_ADDRESS=/path/to/containerd.sock \
+  "$PWD/runsc/ttos/test/e2e_terminal.sh"
+```
+
+Omit `TTOS_UNSAFE_NO_HOST_ISOLATION=1` on a host where `unshare -Ur /bin/true`
+succeeds. The test also requires util-linux `script` and `timeout`. Set
+`TTOS_E2E_ROOT` to retain terminal transcripts, console logs, and runtime state.
+
 ## Docker main-container compatibility
 
 `e2e_docker_main.sh` verifies that the TimeTravel-enabled `runsc` retains its

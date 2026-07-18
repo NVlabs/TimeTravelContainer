@@ -133,7 +133,7 @@ type BranchWaitArgs struct {
 
 // ConsoleFollowArgs streams one branch's init output and waits for init to
 // exit. FilePayload contains the final-output writer, wait-status writer,
-// release reader, and an optional readiness writer.
+// release reader, and optional registration and attachment readiness writers.
 type ConsoleFollowArgs struct {
 	urpc.FilePayload
 	BranchID  string
@@ -1135,9 +1135,11 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 }
 
 // FollowConsole coordinates a client-side console drainer with process lifetime.
-// It holds a branch control lease until output has been drained, preventing
-// Sentry shutdown from racing the client's final ConsoleRead calls.
-func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, exited func(uint32) error, released func() error) (uint32, error) {
+// ready acknowledges that the lifetime lease exists, before OCI start may run
+// guest code. attached acknowledges that the process and its console exist, so
+// the client may begin ConsoleRead calls. The lease remains held until output is
+// drained, preventing Sentry shutdown from racing the client's final reads.
+func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, attached func() error, exited func(uint32) error, released func() error) (uint32, error) {
 	b, done, err := f.beginControl(id)
 	if err != nil {
 		return 0, err
@@ -1173,6 +1175,11 @@ func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWr
 		f.mu.Unlock()
 		if tg == nil {
 			return 0, fmt.Errorf("exec session %q does not exist in branch %q", execID, id)
+		}
+	}
+	if attached != nil {
+		if err := attached(); err != nil {
+			return 0, fmt.Errorf("acknowledging console attachment: %w", err)
 		}
 	}
 	tg.WaitExited()
@@ -1245,6 +1252,7 @@ func writeConsoleFrame(writer io.Writer, stream byte, data []byte) error {
 	encoded := make([]byte, 8+len(data))
 	encoded[0] = stream
 	binary.BigEndian.PutUint32(encoded[4:8], uint32(len(data)))
+	copy(encoded[8:], data)
 	for len(encoded) != 0 {
 		n, err := writer.Write(encoded)
 		if err != nil {

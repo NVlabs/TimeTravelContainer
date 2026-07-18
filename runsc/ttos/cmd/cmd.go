@@ -94,6 +94,15 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+	if printCustomCommandHelp(args, stdout) {
+		return 0
+	}
+	if len(args) == 2 && args[1] == "--help" {
+		return runCommand(args, stdout, stdout, nil)
+	}
+	if len(args) == 3 && args[2] == "--help" && (args[0] == "container" || args[0] == "image" || args[0] == "volume" || args[0] == "exec") {
+		return runCommand(args, stdout, stdout, nil)
+	}
 	if opts.unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttos: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
 	}
@@ -318,6 +327,46 @@ run immediately unless --paused is set; omitting DEST generates a branch ID.
 `)
 }
 
+func printCustomCommandHelp(args []string, stdout io.Writer) bool {
+	if len(args) == 2 && args[1] == "--help" {
+		usage := map[string]string{
+			"container":  "Usage: ttos container COMMAND",
+			"image":      "Usage: ttos image COMMAND",
+			"volume":     "Usage: ttos volume COMMAND",
+			"branch":     "Usage: ttos branch rm TARGET [TARGET...]",
+			"completion": "Usage: ttos completion bash|zsh|fish",
+			"daemon":     "Usage: ttos daemon start|status|stop|requests|request",
+			"events":     "Usage: ttos events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
+			"pause":      "Usage: ttos pause TARGET [TARGET...]",
+			"resume":     "Usage: ttos resume TARGET [TARGET...]",
+			"unpause":    "Usage: ttos unpause TARGET [TARGET...]",
+			"top":        "Usage: ttos top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+		}
+		if text, ok := usage[args[0]]; ok {
+			fmt.Fprintln(stdout, text)
+			return true
+		}
+	}
+	if len(args) == 3 && args[2] == "--help" {
+		usage := map[string]string{
+			"container pause":   "Usage: ttos container pause CONTAINER [CONTAINER...]",
+			"container unpause": "Usage: ttos container unpause CONTAINER [CONTAINER...]",
+			"container top":     "Usage: ttos container top CONTAINER [PS OPTIONS]",
+			"image inspect":     "Usage: ttos image inspect IMAGE [IMAGE...]",
+			"volume commit":     "Usage: ttos volume commit CONTAINER@BRANCH VOLUME",
+			"volume rm":         "Usage: ttos volume rm VOLUME [VOLUME...]",
+			"volume remove":     "Usage: ttos volume remove VOLUME [VOLUME...]",
+			"branch rm":         "Usage: ttos branch rm TARGET [TARGET...]",
+			"exec wait":         "Usage: ttos exec wait CONTAINER@BRANCH:EXEC_ID",
+		}
+		if text, ok := usage[args[0]+" "+args[1]]; ok {
+			fmt.Fprintln(stdout, text)
+			return true
+		}
+	}
+	return false
+}
+
 func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	var err error
 	switch args[0] {
@@ -386,6 +435,9 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		return 2
 	}
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		var status exitStatus
 		if errors.As(err, &status) {
 			return status.code
@@ -1310,7 +1362,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1339,6 +1391,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	user := fs.String("user", "", "username or UID[:GID]")
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
+	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
@@ -1553,7 +1606,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1580,6 +1633,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	user := fs.String("user", "", "username or UID[:GID]")
 	fs.StringVar(user, "u", "", "username or UID[:GID]")
 	hostname := fs.String("hostname", "", "container hostname")
+	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none or host")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none or host")
@@ -3568,14 +3622,21 @@ func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() == 0 {
-		return errors.New("usage: ttos kill [--signal SIGNAL] TARGET [TARGET...]")
+	targets := fs.Args()
+	if !flagWasSet(fs, "signal") && !flagWasSet(fs, "s") && len(targets) > 1 {
+		if _, err := parseSignal(targets[len(targets)-1]); err == nil {
+			signalName = targets[len(targets)-1]
+			targets = targets[:len(targets)-1]
+		}
+	}
+	if len(targets) == 0 {
+		return errors.New("usage: ttos kill [--signal SIGNAL] TARGET [TARGET...] | ttos kill TARGET SIGNAL")
 	}
 	signal, err := parseSignal(signalName)
 	if err != nil {
 		return err
 	}
-	for _, arg := range fs.Args() {
+	for _, arg := range targets {
 		target, err := parseSelector(arg)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)
@@ -6519,14 +6580,12 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 		}
 		return nil
 	}
-	if !terminal {
-		if err := startDrain("before"); err != nil {
-			_, cleanupErr := b.command("delete", "--force", name)
-			if cleanupErr != nil {
-				return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
-			}
-			return 1, err
+	if err := startDrain("before"); err != nil {
+		_, cleanupErr := b.command("delete", "--force", name)
+		if cleanupErr != nil {
+			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
+		return 1, err
 	}
 	status, err = b.runConfiguredCommandForNetwork(networkMode, "start", name)
 	if err != nil || status != 0 {
@@ -6538,15 +6597,6 @@ func (b *runtimeBackend) launch(name, bundleDir, networkMode string, detach, int
 			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
 		return status, err
-	}
-	if terminal {
-		if err := startDrain("after"); err != nil {
-			_, cleanupErr := b.command("delete", "--force", name)
-			if cleanupErr != nil {
-				return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
-			}
-			return 1, err
-		}
 	}
 	if detach {
 		return 0, nil
