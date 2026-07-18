@@ -216,6 +216,10 @@ func TestSandboxFamilyConsoleWaitReadinessAndLifecycleIndependence(t *testing.T)
 	}
 	fdTable.DecRef(parent.SupervisorContext())
 	fdTableReleased = true
+	data, eof, wouldBlock, err = parent.ReadInternalConsole(parent.SupervisorContext(), consoleID, kernel.InternalConsoleStdout, 1)
+	if err != nil || !eof || wouldBlock || len(data) != 0 {
+		t.Fatalf("reading closed internal console: data=%q eof=%t wouldBlock=%t err=%v", data, eof, wouldBlock, err)
+	}
 }
 
 func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {

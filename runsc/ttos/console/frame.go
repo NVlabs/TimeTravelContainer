@@ -140,7 +140,7 @@ func DecodeFrame(data []byte) (frame Frame, consumed int, complete bool, err err
 // the client-side drain already wrote. If reader ends cleanly first, this
 // synthesizes missing EOF markers; partial frames remain errors.
 func CopyFinalFrames(writer io.Writer, reader io.Reader, stdoutEOF, stderrEOF bool) error {
-	for !stdoutEOF || !stderrEOF {
+	for {
 		header := make([]byte, HeaderSize)
 		if _, err := io.ReadFull(reader, header); err != nil {
 			if err == io.EOF {

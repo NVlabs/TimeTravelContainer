@@ -445,32 +445,37 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			drain := consoleDrainResult{}
 			if err == nil {
 				drain = drainConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, nil)
-				if drain.err != nil {
-					err = drain.err
-				}
 			}
+			// A per-read uRPC connection may lose the shutdown race after init
+			// exits. The coordinator still owns the Kernel lease and performs the
+			// authoritative final drain below. Report the client error only when
+			// that handoff also fails.
 			if _, releaseErr := releaseWriter.Write([]byte{1}); err == nil && releaseErr != nil {
 				err = fmt.Errorf("handing console reads to coordinator: %w", releaseErr)
 			}
 			_ = releaseWriter.Close()
-			if copyErr := ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF); err == nil && copyErr != nil {
-				err = copyErr
-			}
+			copyErr := ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
 			_ = finalReader.Close()
 			var encodedStatus [4]byte
 			_, statusErr := io.ReadFull(statusReader, encodedStatus[:])
 			_ = statusReader.Close()
 			result := <-waitCh
 			if err == nil {
-				if statusErr != nil {
-					if result.err != nil {
-						err = result.err
-					} else {
-						err = fmt.Errorf("reading console wait status: %w", statusErr)
-					}
-				} else {
+				switch {
+				case copyErr != nil:
+					err = copyErr
+				case statusErr != nil && result.err != nil:
+					err = fmt.Errorf("console coordinator failed: %v; reading wait status: %w", result.err, statusErr)
+				case statusErr != nil:
+					err = fmt.Errorf("reading console wait status: %w", statusErr)
+				case result.err != nil:
+					err = result.err
+				default:
 					err = writeConsoleWaitStatus(t.consoleWaitStatus, binary.BigEndian.Uint32(encodedStatus[:]))
 				}
+			}
+			if err != nil && drain.err != nil {
+				err = fmt.Errorf("%w (client console drain also failed: %v)", err, drain.err)
 			}
 		} else {
 			err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, ready)

@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -237,6 +238,9 @@ func (k *Kernel) ReadInternalConsole(ctx context.Context, id string, stream Inte
 		return nil, false, true, nil
 	}
 	if err != nil {
+		if err == io.EOF {
+			return nil, true, false, nil
+		}
 		if console.terminal && linuxerr.Equals(linuxerr.EIO, err) && file.Readiness(waiter.EventHUp)&waiter.EventHUp != 0 {
 			return nil, true, false, nil
 		}

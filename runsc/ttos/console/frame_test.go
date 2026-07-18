@@ -188,6 +188,26 @@ func TestCopyFinalFramesSkipsCoordinatorDuplicateEOF(t *testing.T) {
 	}
 }
 
+func TestCopyFinalFramesDrainsCoordinatorAfterBothClientEOFs(t *testing.T) {
+	var input bytes.Buffer
+	if err := WriteFrame(&input, StreamStdout, nil); err != nil {
+		t.Fatalf("WriteFrame stdout: %v", err)
+	}
+	if err := WriteFrame(&input, StreamStderr, nil); err != nil {
+		t.Fatalf("WriteFrame stderr: %v", err)
+	}
+	var got bytes.Buffer
+	if err := CopyFinalFrames(&got, &input, true, true); err != nil {
+		t.Fatalf("CopyFinalFrames: %v", err)
+	}
+	if input.Len() != 0 {
+		t.Fatalf("CopyFinalFrames left %d coordinator bytes unread", input.Len())
+	}
+	if got.Len() != 0 {
+		t.Fatalf("CopyFinalFrames duplicated client EOFs: %x", got.Bytes())
+	}
+}
+
 func TestCopyFinalFramesRejectsTruncatedFrame(t *testing.T) {
 	for _, input := range [][]byte{
 		{StreamStdout},
