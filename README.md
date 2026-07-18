@@ -55,6 +55,10 @@ made available to a container.
 User documentation and technical architecture, including quick start guides, can
 be found at [gvisor.dev][gvisor-dev].
 
+This branch's experimental TimeTravelOS interface is documented in the
+[TTOS user guide](g3doc/user_guide/timetravelos.md), with a separate
+[performance and compatibility audit](g3doc/proposals/timetravel_ttos_audit.md).
+
 ## Installing from source
 
 gVisor builds on x86_64 and ARM64. Other architectures may become available in
