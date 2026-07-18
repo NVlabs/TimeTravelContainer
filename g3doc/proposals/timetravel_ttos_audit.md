@@ -13,11 +13,9 @@ application-memory fork cost is effectively independent of resident byte count
 in the measured range. It does not copy application RAM to disk or duplicate
 all resident pages at fork time.
 
-TTOS is not yet a deterministic time-travel system, a drop-in Docker daemon, or
-a universally compatible Linux container runtime. The biggest performance cost
-is full kernel-metadata serialization while the source is paused. The biggest
-semantic gap against identical-observable branching is randomness: `getrandom`
-and `/dev/urandom` still read a process-global host entropy source after fork.
+TTOS is not a drop-in Docker daemon or a universally compatible Linux container
+runtime. The biggest performance cost is full kernel-metadata serialization
+while the source is paused.
 
 The recommended readiness levels are:
 
@@ -27,7 +25,7 @@ The recommended readiness levels are:
 | Forking Python, shell, nginx configuration, or Redis-like local workloads | Demonstrated |
 | General Docker CLI replacement | Partial |
 | External networking at the fork boundary | Unsupported |
-| Bit-for-bit deterministic replay after fork | Unsupported |
+| Replay of external nondeterministic inputs | Not a TTOS guarantee |
 | Untrusted production multi-tenancy | Not audited or recommended |
 
 ## Evidence
@@ -182,18 +180,19 @@ explicit multi-fork API that amortizes command setup and journal syncs.
 
 ## Compatibility findings
 
-### C1: randomness is not branch-reproducible
+### Entropy behavior is intentionally nondeterministic
 
-Guest `getrandom`, `/dev/random`, and `/dev/urandom` read `pkg/rand.Reader`, a
-process-global host-backed source. The source and child do not receive cloned
-branch-local PRNG state, so their next random reads are neither equal nor
-deterministically related.
+Guest `getrandom`, `/dev/random`, and `/dev/urandom` read the host-backed
+`pkg/rand.Reader`. Their future outputs need not match across branches, just as
+two post-fork Linux processes are not entitled to receive identical results
+from later kernel entropy requests. This is not a live-fork compatibility
+defect.
 
-This conflicts with a strict promise that every container-observable random seed
-and stream is identical at the fork boundary. Before advertising deterministic
-time travel, introduce a per-Kernel DRBG, serialize its state into the child,
-and define whether the branches intentionally produce identical streams or
-derive domain-separated streams after the first read.
+PRNG state that exists in application memory is cloned with that memory, so a
+user-space generator that does not reseed may initially produce the same stream
+in both branches. Applications that require independent streams remain
+responsible for reseeding, as with ordinary process fork. TTOS does not promise
+replay of external nondeterministic inputs.
 
 ### C1: fork compatibility is deliberately narrower than run compatibility
 
@@ -223,9 +222,35 @@ Rejected or externally shared:
 * TPU/GPU/device proxy state and private filesystem MemoryFiles; and
 * any anonymous object or filesystem that has not explicitly opted in.
 
+"Host FD" in this list means a file description whose behavior is owned by the
+host kernel and has been imported into the guest graph: for example host stdio,
+a host eventfd, socket, pipe endpoint, device, or a directfs file description.
+It does **not** include an ordinary read-only host bind in the same category.
+Read-only binds use a LISAFS gofer client with a stable resource identity;
+`directfs=false` lets the child borrow that read-only client explicitly.
+
 Read-only host binds are shared external views. `immutable-source` is only an
 attestation; it does not stop an independent host writer. Managed bind CoW also
 assumes its external lower remains immutable for stable snapshot semantics.
+
+Directfs bypasses gofer RPCs by exposing host file descriptions more directly
+to the Sentry. Duplicating such an FD normally shares the host open-file
+description, offset, locks, and external mutations rather than creating a
+branch-local clone, so TTOS disables directfs in its normal runsc arguments.
+
+Queued `SCM_RIGHTS` means an internal Unix socket has an unread ancillary
+message carrying one or more FDs. Ordinary queued bytes clone correctly, but
+the rights message adds graph edges to arbitrary file descriptions. Supporting
+it requires cloning those edges with correct aliasing, cycles, reference counts,
+and eligibility checks; this is feasible for fully Sentry-owned targets but is
+not implemented yet.
+
+AIO and io_uring expose memory-mapped submission/completion rings and may retain
+pending operations, registered buffers, files, and worker state. Their mapped
+control pages do not yet receive branch-local backing. A safe implementation is
+possible, but it must first quiesce submissions and then clone or reject each
+pending operation according to whether all of its resources are Sentry-owned.
+External in-flight I/O cannot be duplicated transparently.
 
 ### C1: rootless operation depends on host user-namespace policy
 
@@ -249,6 +274,32 @@ Restart recreates an exited main branch from persistent configuration and the
 immutable image. A stopped branch does not retain its in-memory Kernel or
 uncommitted branch-local filesystem state. Managed-volume state must be
 committed/imported or captured by the documented stop/exit preservation path.
+
+### C2: current gVisor networking and the TTOS subset
+
+Upstream runsc has four internal network selections:
+
+* `none` creates netstack with canonical loopback only;
+* `sandbox` imports interfaces and routes from a network namespace prepared by
+  Docker, CNI, or another external network manager;
+* `host` uses hostinet and redirects network operations to the host stack; and
+* `plugin` delegates to a third-party stack.
+
+In `sandbox` mode, gVisor implements IP, TCP, UDP, ICMP, socket queues, and
+firewall behavior in userspace. Docker or CNI remains responsible for creating
+the veth/bridge topology, assigning addresses, NAT, and publishing ports. TTOS
+is rootless and currently exposes only `none` and `host`, so it has no bridge,
+NAT, or port-publication control plane.
+
+Live fork currently accepts only a contained empty or canonical loopback
+netstack with unmodified iptables and no nftables. It reconstructs a new child
+loopback NIC and clones internal UDP/TCP endpoint state. Host mode, external
+links, and plugin stacks reject. Adding rootless external networking is
+practical through a user-mode helper such as a netstack link proxy or slirp-like
+NAT, but fork semantics require a branch-private proxy/NAT instance. Existing
+external TCP connections still cannot be duplicated without a much stronger
+connection-proxy protocol; the safe first implementation should require no
+external sockets at fork and provision a fresh branch network afterward.
 
 ### C2: one image reference stores one selected platform
 
@@ -283,16 +334,15 @@ automation should treat it as an open defect.
 
 Before calling TTOS a broadly compatible beta:
 
-1. Implement and test branch-local randomness semantics.
-2. Fix terminal exec EOF/teardown and make the real-PTY suite pass without a
+1. Fix terminal exec EOF/teardown and make the real-PTY suite pass without a
    watchdog intervention.
-3. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
-4. Shorten source downtime by separating metadata capture from child restore.
-5. Shard image-store locking and replace foreground full-store GC.
-6. Add multi-platform catalog keys and concurrent pull/materialization tests.
-7. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
+2. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
+3. Shorten source downtime by separating metadata capture from child restore.
+4. Shard image-store locking and replace foreground full-store GC.
+5. Add multi-platform catalog keys and concurrent pull/materialization tests.
+6. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
    zstd layers, foreign-layer policy, and private registry authentication.
-8. Expand the live-fork resource matrix only through explicit fail-closed
+7. Expand the live-fork resource matrix only through explicit fail-closed
    validators and branch-isolation tests.
 
 Until those gates pass, end users should run `ttos fork --check` immediately

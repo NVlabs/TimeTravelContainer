@@ -774,10 +774,10 @@ not an absolute microsecond target.
 5. **Metadata cost:** `pkg/state` copies mutable queues and filesystem metadata.
    This is acceptable initially, but large object graphs will not fork in
    constant time.
-6. **Randomness semantics:** guest-visible PRNG and entropy sources require an
-   explicit policy. If TimeTravelOS promises identical post-fork random streams,
-   host-backed entropy calls must be virtualized per branch rather than simply
-   forwarded after resume.
+6. **Randomness semantics:** resolved policy: application-resident PRNG state is
+   cloned as ordinary memory, while later `getrandom` and `/dev/{u,}random`
+   reads remain fresh host-backed entropy requests and are not replayed. TTOS
+   does not promise identical future entropy streams across branches.
 
 If the multiple-Kernel Phase 0 gate fails because of pervasive process-global
 state, the fallback is a warm child Sentry process with sealed shared base

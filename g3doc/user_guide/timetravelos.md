@@ -275,9 +275,12 @@ Attach to the branch's init console:
 ttos attach -i web@test-b
 ```
 
-The default detach sequence is Ctrl-P followed by Ctrl-Q. Detaching releases
-the host stdin attachment; this is important because an active host attachment
-can make a fork ineligible. Output continues into persistent logs:
+The default detach sequence is Ctrl-P followed by Ctrl-Q. Init-console and
+managed-console attachments use TTOS's internal pipes or PTYs and do not place
+host FDs in the guest resource graph, so merely attaching does not make the
+branch ineligible. A synchronous exec created with directly imported host stdio
+is different: that exec must exit before the branch can fork. Output continues
+into persistent logs:
 
 ```shell
 ttos logs --follow --tail 100 web@test-b
@@ -331,16 +334,32 @@ ttos run -d --name edit \
 
 ## Networking and resource limits
 
-The supported network modes are:
+The `ttos` frontend currently exposes two network modes:
 
 ```shell
 --network none       # forkable contained stack; default
 --network host       # host-facing and therefore not live-forkable
 ```
 
-Bridge networking, NAT, published ports, CNI, and Docker's network API are not
-implemented by `ttos`. A contained empty or loopback-only netstack can be
-forked; external links and connections are rejected by `fork --check`.
+With `none`, gVisor creates its userspace TCP/IP stack (netstack) with only the
+canonical `lo` interface, `127.0.0.1/8`, `::1/128`, and local routes. Processes
+inside the same branch can use TCP and UDP over loopback. At fork, TTOS creates
+a new netstack object with a new loopback endpoint, clones socket and protocol
+state, and preserves unread loopback TCP/UDP data independently in each branch.
+
+Upstream runsc also has `sandbox` networking. An external manager such as
+Docker or a CNI plugin first creates a network namespace, veth, bridge, routes,
+NAT, and published-port rules; runsc then imports that namespace's interfaces
+and routes into netstack. gVisor supplies the userspace IP/TCP/UDP stack, but it
+does not itself act as Docker's bridge/NAT/port-allocation manager. Rootless
+runsc cannot currently set up `sandbox` networking unaided, and `ttos` does not
+yet integrate an external helper, so it intentionally exposes only `none` and
+`host`.
+
+`host` uses gVisor hostinet to redirect network syscalls to the host stack. It
+is useful for ordinary execution but cannot be forked because connections and
+host stack state are external. Bridge networking, NAT, published ports, CNI,
+and Docker's network API are not implemented by `ttos`.
 
 PID and Sentry-enforced limits work without host cgroups where possible.
 Hard CPU and memory limits require a writable delegated cgroup-v2 subtree; TTOS
