@@ -56,15 +56,29 @@ A one-entry UID/GID map is sufficient. `newuidmap`, `newgidmap`, and subordinate
 UID/GID ranges are not required. If the command fails, enable unprivileged user
 namespaces and check the host's AppArmor or other LSM policy.
 
-For trusted local testing only, `--unsafe-no-host-isolation` bypasses the host
-user-namespace and chroot setup:
+For trusted local testing only, start the daemon with
+`--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
+setup:
 
 ```shell
-ttos --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
+ttos daemon start --unsafe-no-host-isolation
+ttos run --rm busybox:1.36 echo hello
 ```
 
-This mode retains Sentry-level guest isolation and branch semantics, but removes
-host-side defense in depth. Do not use it for untrusted images.
+Isolation mode is fixed for the lifetime of that daemon. All ordinary commands
+inherit it, so do not repeat the flag on `run`, `exec`, or other operations.
+`ttos daemon status` reports `isolation_mode` and
+`unsafe_no_host_isolation`. Stop and explicitly restart the daemon to change
+modes. Ordinary commands do not autostart the service; if it is absent, they
+tell you to run `ttos daemon start`.
+
+Unsafe mode retains Sentry-level guest isolation and branch semantics, but
+removes host-side defense in depth. Do not use it for untrusted images. For a
+one-off recovery command that bypasses the daemon, the equivalent opt-in is:
+
+```shell
+ttos --direct --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
+```
 
 ## Compile
 
@@ -416,14 +430,21 @@ fails before start when the requested enforcement is unavailable.
 
 ## Daemon operation and recovery
 
-Normal commands use the versioned per-user `ttosd` API. Service management is
-rarely necessary:
+Normal commands use the versioned per-user `ttosd` API. Start it once before
+issuing ordinary commands:
 
 ```shell
+ttos daemon start
 ttos daemon status
 ttos daemon stop
-ttos daemon start
 ```
+
+One daemon uses one isolation mode across every data root it serves. Start it
+without an option for normal rootless host isolation, or use
+`ttos daemon start --unsafe-no-host-isolation` for trusted workloads on a host
+that cannot create an unprivileged user namespace. An explicit start request
+does not reconfigure an already-running daemon; stop it first if you want to
+change modes. `daemon status` returns the active mode in JSON.
 
 `--direct` bypasses `ttosd` for recovery and debugging. Do not routinely mix
 direct mutations with daemon-mediated commands against the same data root.
@@ -447,8 +468,8 @@ Create the target directory first if it does not exist.
 Existing family metadata and materialized root filesystems remain usable.
 Image records and blobs formerly owned by containerd are not imported; pull
 each required image once into the native TTOS data root. Restart a manually
-managed `ttosd` after upgrading. CLI-managed daemon autostart handles the
-protocol change automatically.
+managed `ttosd` after upgrading, then start it explicitly before issuing normal
+commands.
 
 ## Further verification
 

@@ -65,9 +65,10 @@ alias, not a promise of host JSON files). Docker-style `labels`, `labels-regex`,
 container configuration and `logs --details` prefixes them in sorted order;
 `none` disables `ttos logs` while the
 private attach transport remains available. A rootless per-user `ttosd` now
-autostarts on a versioned Unix-socket API, proxies command streams, and
+serves a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
-`--direct` remains an explicit recovery path.
+startup is explicit so its fixed isolation mode is never inferred from a
+client request, and `--direct` remains an explicit recovery path.
 Explicit commit/import, quiescent main-branch snapshots before stop, restart,
 and sole-branch forced removal, plus a Sentry post-init-exit snapshot hook are
 implemented. The Sentry retains the mount namespace through init teardown,
@@ -208,7 +209,10 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       explicit `--unsafe-no-host-isolation` fallback for trusted workloads on
       hosts that prohibit user namespaces; this runs Sentry/gofer as the
       caller without host namespaces or chroots while retaining Sentry guest
-      namespaces and credentials.
+      namespaces and credentials. Configure this once on `ttos daemon start`;
+      the daemon owns one fixed isolation mode and all ordinary commands
+      inherit it without sending or negotiating a mode. Keep the per-command
+      flag only for explicit `--direct` recovery.
 - [x] Support Docker-style `--network/--net none|host|ttos` on run/create,
       persist the selected mode across start/restart, and report it through
       inspect. `none` remains the fork-safe default. Host networking is
@@ -525,7 +529,7 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [x] Test daemon stop/autostart while a container remains live, including
+- [x] Test explicit daemon stop/restart while a container remains live, including
       persisted-state and console-drainer reconciliation.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published
       PID while the guest remains live and output draining resumes.
@@ -730,8 +734,9 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       stdout, and stderr so commands and state ownership survive individual CLI
       processes. Background pulls and durable event streams run in daemon
       request workers.
-- [x] Provide an autostarted rootless per-user socket and private runtime
-      directory by default, with peer-UID checks and a `0600` socket.
+- [x] Provide an explicitly started rootless per-user socket and private runtime
+      directory, with peer-UID checks and a `0600` socket. Keep isolation mode
+      exclusively in daemon startup configuration; clients never send it.
 - [x] Persist family configuration, image references, managed-volume metadata and
       optional committed tar seeds, lineage, and tombstones; live branch memory
       remains exclusively in the Sentry.

@@ -50,21 +50,16 @@ DATA_ROOT="$TTOS_E2E_ROOT/data"
 RUNSC_ROOT="$TTOS_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTOS_E2E_ROOT/ttosd.sock"
 NAME="terminal-e2e-$$"
-UNSAFE=
-if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-  UNSAFE=--unsafe-no-host-isolation
-fi
-
 for value in "$TTOS" "$RUNSC" "$TTOS_E2E_ROOT"; do
   case "$value" in
     *[[:space:]]*) fail "PTY test paths must not contain whitespace: $value" ;;
   esac
 done
 
-TTOS_COMMAND="$TTOS $UNSAFE --data-root $DATA_ROOT --daemon-socket $DAEMON_SOCKET --root $RUNSC_ROOT --runsc $RUNSC"
+TTOS_COMMAND="$TTOS --data-root $DATA_ROOT --daemon-socket $DAEMON_SOCKET --root $RUNSC_ROOT --runsc $RUNSC"
 
 ttos() {
-  "$TTOS" $UNSAFE \
+  "$TTOS" \
     --data-root "$DATA_ROOT" \
     --daemon-socket "$DAEMON_SOCKET" \
     --root "$RUNSC_ROOT" \
@@ -86,6 +81,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT HUP INT TERM
+
+if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
+  ttos daemon start --unsafe-no-host-isolation
+else
+  ttos daemon start
+fi
 
 # Repetition makes the original post-start follower race deterministic on an
 # unfixed runtime. Every run also checks that stdin and stdout are real TTYs.

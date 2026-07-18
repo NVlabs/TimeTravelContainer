@@ -263,7 +263,11 @@ TTOS does not need subordinate ID maps, but normal isolation still needs the
 host to allow a one-entry user namespace. Distribution LSM policy can deny this
 even when the kernel sysctl appears enabled. The fallback
 `--unsafe-no-host-isolation` is useful for trusted CI but must not silently
-become a production default.
+become a production default. It is therefore a daemon-start setting rather
+than a normal per-command setting: one daemon serves all requests in one fixed
+mode and reports that mode through `daemon status`. Clients do not send or
+negotiate isolation mode, and normal commands require the user to start the
+daemon explicitly.
 
 CPU and memory limit compatibility additionally depends on delegated cgroup v2.
 TTOS fails closed when a requested hard limit cannot be enforced.

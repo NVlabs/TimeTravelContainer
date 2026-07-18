@@ -101,13 +101,17 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 3 && args[2] == "--help" && (args[0] == "container" || args[0] == "image" || args[0] == "volume" || args[0] == "exec") {
 		return runCommand(args, stdout, stdout, nil)
 	}
-	if opts.unsafeNoHostIsolation {
-		fmt.Fprintln(stderr, "ttos: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
-	}
 	if args[0] == "daemon" {
 		return runDaemonControl(opts, args[1:], stdout, stderr)
 	}
+	if opts.unsafeNoHostIsolation && !opts.direct {
+		fmt.Fprintln(stderr, "ttos: --unsafe-no-host-isolation configures 'daemon start' or '--direct' only; ordinary commands inherit the running daemon's mode")
+		return 2
+	}
 	if opts.direct {
+		if opts.unsafeNoHostIsolation {
+			fmt.Fprintln(stderr, "ttos: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
+		}
 		if args[0] == "events" {
 			fmt.Fprintln(stderr, "ttos: events require ttosd; remove --direct")
 			return 1
@@ -251,7 +255,7 @@ Global options:
   --data-root PATH               native images, bundles, and metadata
   --daemon-socket PATH           per-user ttosd Unix socket
   --direct                       bypass ttosd for recovery/debugging
-  --unsafe-no-host-isolation     run without host namespaces/chroots (unsafe)
+  --unsafe-no-host-isolation     disable host isolation for daemon start/--direct
 
 Commands:
   images [OPTIONS]               List local images
@@ -284,7 +288,9 @@ Commands:
   branch rm TARGET...             Destroy one or more non-main branches
   volume COMMAND                   Manage family-local tmpfs volumes
   completion SHELL                 Generate Bash, Zsh, or Fish completion
-  daemon start|status|stop          Manage the rootless per-user service
+  daemon start [--unsafe-no-host-isolation]
+                                  Start the per-user service in one fixed mode
+  daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
   daemon request inspect|resolve   Inspect or resolve an interrupted mutation
 
@@ -301,7 +307,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"volume":     "Usage: ttos volume COMMAND",
 			"branch":     "Usage: ttos branch rm TARGET [TARGET...]",
 			"completion": "Usage: ttos completion bash|zsh|fish",
-			"daemon":     "Usage: ttos daemon start|status|stop|requests|request",
+			"daemon":     "Usage: ttos daemon start [--unsafe-no-host-isolation]|status|stop|requests|request",
 			"events":     "Usage: ttos events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttos pause TARGET [TARGET...]",
 			"resume":     "Usage: ttos resume TARGET [TARGET...]",

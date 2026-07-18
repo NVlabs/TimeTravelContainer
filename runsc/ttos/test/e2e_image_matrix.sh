@@ -108,22 +108,20 @@ NATURAL_WRITER="$PREFIX-natural-writer"
 NATURAL_READER="$PREFIX-natural-reader"
 
 ttos() {
-  if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-    "$TTOS" \
-      --unsafe-no-host-isolation \
-      --data-root "$DATA_ROOT" \
-      --daemon-socket "$DAEMON_SOCKET" \
-      --root "$RUNSC_ROOT" \
-      --runsc "$RUNSC" \
-      "$@"
-    return
-  fi
   "$TTOS" \
     --data-root "$DATA_ROOT" \
     --daemon-socket "$DAEMON_SOCKET" \
     --root "$RUNSC_ROOT" \
     --runsc "$RUNSC" \
     "$@"
+}
+
+ttos_daemon_start() {
+  if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
+    ttos daemon start --unsafe-no-host-isolation
+    return
+  fi
+  ttos daemon start
 }
 
 cleanup() {
@@ -141,6 +139,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT HUP INT TERM
+
+ttos_daemon_start
 
 echo "== pulling public image matrix =="
 for image in "$BUSYBOX_IMAGE" "$ALPINE_IMAGE" "$PYTHON_IMAGE" "$NGINX_IMAGE" "$REDIS_IMAGE"; do
@@ -343,7 +343,7 @@ ttos exec "$VNET@child" sh -c 'echo child >/www/index.html'
 ttos fork "$VNET" "$VNET@second" >/dev/null
 ttos fork "$VNET@child" "$VNET@grandchild" >/dev/null
 ttos daemon stop
-ttos daemon start
+ttos_daemon_start
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published TTOS port did not survive daemon restart reconciliation"
 ttos rm --force "$VNET"
@@ -591,14 +591,15 @@ while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
 done
 
 echo "== daemon restart reconciliation =="
-ttos daemon status | grep -q '"version":3' || fail "ttosd did not report API version 3"
+ttos daemon status | grep -q '"version":4' || fail "ttosd did not report API version 4"
 ttos daemon stop
 if ttos daemon status >/dev/null 2>&1; then
   fail "ttosd remained reachable after stop"
 fi
+ttos_daemon_start
 [ "$(ttos inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
-  fail "autostarted ttosd did not reconcile the running container"
-ttos daemon status | grep -q '"version":3' || fail "ttosd did not autostart after restart"
+  fail "restarted ttosd did not reconcile the running container"
+ttos daemon status | grep -q '"version":4' || fail "ttosd did not restart"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttos logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"

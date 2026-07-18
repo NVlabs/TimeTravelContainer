@@ -53,11 +53,7 @@ ADDRESS_FILE="$TTOS_E2E_ROOT/registry-address"
 REGISTRY_PID=
 
 ttos() {
-  unsafe=
-  if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-    unsafe=--unsafe-no-host-isolation
-  fi
-  "$TTOS" $unsafe \
+  "$TTOS" \
     --data-root "$TTOS_E2E_ROOT/data" \
     --daemon-socket "$TTOS_E2E_ROOT/ttosd.sock" \
     --root "$TTOS_E2E_ROOT/runsc" \
@@ -76,6 +72,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT HUP INT TERM
+
+if [ "$TTOS_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
+  ttos daemon start --unsafe-no-host-isolation
+else
+  ttos daemon start
+fi
 
 "$REGISTRY_FIXTURE" --binary "$FIXTURE_BINARY" --address-file "$ADDRESS_FILE" &
 REGISTRY_PID=$!

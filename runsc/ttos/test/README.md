@@ -4,7 +4,7 @@
 unmodified public Docker images through the complete TTOS path. It currently
 covers:
 
-- default rootless `ttosd` autostart over a versioned per-user Unix API,
+- explicit rootless `ttosd` startup over a versioned per-user Unix API,
   full command streaming through the daemon, status/stop controls, and live
   sandbox plus console-drainer reconciliation after a daemon restart;
 - durable versioned manager events across daemon restart, including text/JSON
@@ -128,9 +128,10 @@ subordinate-ID ranges. Some Linux distributions apply AppArmor restrictions
 independently of `kernel.unprivileged_userns_clone`.
 
 For trusted test workloads on hosts that prohibit user namespaces, set
-`TTOS_UNSAFE_NO_HOST_ISOLATION=1`. The matrix then passes
-`--unsafe-no-host-isolation` to TTOS, running the Sentry and gofer as the
-invoking user without host namespaces or chroots. Guest namespaces,
+`TTOS_UNSAFE_NO_HOST_ISOLATION=1`. The harness then starts its `ttosd` once
+with `--unsafe-no-host-isolation`; all subsequent commands inherit that fixed
+daemon mode. This runs the Sentry and gofer as the invoking user without host
+namespaces or chroots. Guest namespaces,
 credentials, procfs, mounts, and filesystem CoW remain implemented by the
 Sentry, but this mode removes host-side defense in depth and must not be used
 for untrusted containers.
@@ -172,8 +173,8 @@ containerd daemon are not copied into TTOS's native store automatically; pull
 those image names again before creating a new family from them. The native
 content is downloaded once per `--data-root` and is reused by later pulls and
 families. Restart any manually managed `ttosd` process after upgrading because
-the daemon protocol version changed; the normal CLI autostart path does this
-automatically.
+the daemon protocol version changed, then explicitly start it before issuing
+normal commands.
 
 ## Terminal and live-fork integration
 

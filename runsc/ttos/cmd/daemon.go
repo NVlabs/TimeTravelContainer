@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	daemonAPIVersion    = 3
+	daemonAPIVersion    = 4
 	daemonFrameStdin    = byte('I')
 	daemonFrameStdinAck = byte('A')
 	daemonFrameEOF      = byte('C')
@@ -47,11 +47,10 @@ const (
 )
 
 type daemonWireOptions struct {
-	Root                  string `json:"root"`
-	Runsc                 string `json:"runsc"`
-	DataRoot              string `json:"data_root"`
-	UnsafeNoHostIsolation bool   `json:"unsafe_no_host_isolation"`
-	ClientExecutable      string `json:"client_executable"`
+	Root             string `json:"root"`
+	Runsc            string `json:"runsc"`
+	DataRoot         string `json:"data_root"`
+	ClientExecutable string `json:"client_executable"`
 }
 
 type daemonRequest struct {
@@ -64,7 +63,8 @@ type daemonRequest struct {
 }
 
 type daemonServer struct {
-	listener net.Listener
+	listener              net.Listener
+	unsafeNoHostIsolation bool
 
 	stopOnce sync.Once
 
@@ -154,6 +154,13 @@ func defaultDaemonSocket() string {
 	return filepath.Join(os.TempDir(), "ttos-"+strconv.Itoa(os.Geteuid()), "ttosd.sock")
 }
 
+func daemonIsolationMode(unsafeNoHostIsolation bool) string {
+	if unsafeNoHostIsolation {
+		return "unsafe-no-host-isolation"
+	}
+	return "rootless"
+}
+
 func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *runtimeBackend {
 	return &runtimeBackend{
 		root:                  opts.root,
@@ -170,23 +177,22 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 func wireOptions(opts options) daemonWireOptions {
 	return daemonWireOptions{
 		Root: opts.root, Runsc: opts.runsc, DataRoot: opts.dataRoot,
-		UnsafeNoHostIsolation: opts.unsafeNoHostIsolation,
-		ClientExecutable:      opts.clientExecutable,
+		ClientExecutable: opts.clientExecutable,
 	}
 }
 
 func optionsFromWire(w daemonWireOptions) options {
 	return options{
 		root: w.Root, runsc: w.Runsc, dataRoot: w.DataRoot,
-		unsafeNoHostIsolation: w.UnsafeNoHostIsolation,
-		clientExecutable:      w.ClientExecutable,
+		clientExecutable: w.ClientExecutable,
 	}
 }
 
 // RunDaemon serves the versioned TTOS local API. It is used by the standalone
-// ttosd binary and by ttos's private autostart entry point.
+// ttosd binary and by ttos's private daemon entry point.
 func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	socket := defaultDaemonSocket()
+	unsafeNoHostIsolation := false
 	for len(args) != 0 {
 		switch {
 		case args[0] == "--socket" && len(args) >= 2:
@@ -194,6 +200,9 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			args = args[2:]
 		case strings.HasPrefix(args[0], "--socket="):
 			socket = strings.TrimPrefix(args[0], "--socket=")
+			args = args[1:]
+		case args[0] == "--unsafe-no-host-isolation":
+			unsafeNoHostIsolation = true
 			args = args[1:]
 		default:
 			fmt.Fprintf(stderr, "ttosd: unknown option %q\n", args[0])
@@ -204,7 +213,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttosd: socket path must not be empty")
 		return 2
 	}
-	if err := serveDaemon(socket, stdout, stderr); err != nil {
+	if unsafeNoHostIsolation {
+		fmt.Fprintln(stderr, "ttosd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+	}
+	if err := serveDaemon(socket, unsafeNoHostIsolation, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttosd: %v\n", err)
 		return 1
 	}
@@ -231,7 +243,7 @@ func secureDaemonDirectory(dir string) error {
 	return nil
 }
 
-func serveDaemon(socket string, stdout, stderr io.Writer) error {
+func serveDaemon(socket string, unsafeNoHostIsolation bool, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -264,12 +276,13 @@ func serveDaemon(socket string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("unlocking daemon startup: %w", err)
 	}
 	server := &daemonServer{
-		listener:      listener,
-		reconciled:    make(map[string]bool),
-		mutationLocks: make(map[string]*sync.Mutex),
+		listener:              listener,
+		unsafeNoHostIsolation: unsafeNoHostIsolation,
+		reconciled:            make(map[string]bool),
+		mutationLocks:         make(map[string]*sync.Mutex),
 	}
 	if stdout != nil {
-		fmt.Fprintf(stdout, "ttosd listening on %s (API v%d)\n", socket, daemonAPIVersion)
+		fmt.Fprintf(stdout, "ttosd listening on %s (API v%d, isolation=%s)\n", socket, daemonAPIVersion, daemonIsolationMode(unsafeNoHostIsolation))
 	}
 	for {
 		conn, err := listener.Accept()
@@ -339,7 +352,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	switch request.Action {
 	case "ping":
-		payload, _ := json.Marshal(map[string]any{"version": daemonAPIVersion, "pid": os.Getpid()})
+		payload, _ := json.Marshal(map[string]any{
+			"version":                  daemonAPIVersion,
+			"pid":                      os.Getpid(),
+			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
+			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
+		})
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		return
@@ -369,6 +387,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
 	opts := optionsFromWire(request.Options)
+	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
 	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
 	if err != nil {
 		stdinReader.Close()
@@ -720,7 +739,7 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 	}
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		conn, err := connectOrStartDaemon(opts.daemonSocket)
+		conn, err := connectRunningDaemon(opts.daemonSocket)
 		if err != nil {
 			return 1, err
 		}
@@ -751,25 +770,12 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 	return 1, lastErr
 }
 
-func connectOrStartDaemon(socket string) (net.Conn, error) {
+func connectRunningDaemon(socket string) (net.Conn, error) {
 	conn, err := connectDaemon(socket)
-	if err == nil {
-		return conn, nil
+	if err != nil {
+		return nil, fmt.Errorf("ttosd is not running; start it explicitly with 'ttos daemon start': %w", err)
 	}
-	if err := startDaemonProcess(socket); err != nil {
-		return nil, err
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err = connectDaemon(socket)
-		if err == nil {
-			return conn, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("connecting to autostarted daemon: %w", err)
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
+	return conn, nil
 }
 
 func connectDaemon(socket string) (net.Conn, error) {
@@ -855,7 +861,7 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	}
 }
 
-func startDaemonProcess(socket string) error {
+func startDaemonProcess(socket string, unsafeNoHostIsolation bool) error {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -870,6 +876,9 @@ func startDaemonProcess(socket string) error {
 			commandName = sibling
 			commandArgs = []string{"--socket", socket}
 		}
+	}
+	if unsafeNoHostIsolation {
+		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -888,8 +897,22 @@ func startDaemonProcess(socket string) error {
 }
 
 func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int {
+	if opts.unsafeNoHostIsolation && (len(args) == 0 || args[0] != "start") {
+		fmt.Fprintln(stderr, "ttos: --unsafe-no-host-isolation is valid with 'daemon start' only")
+		return 2
+	}
+	if len(args) != 0 && args[0] == "start" {
+		for _, arg := range args[1:] {
+			if arg != "--unsafe-no-host-isolation" {
+				fmt.Fprintf(stderr, "ttos: unknown daemon start option %q\n", arg)
+				return 2
+			}
+			opts.unsafeNoHostIsolation = true
+		}
+		args = args[:1]
+	}
 	if len(args) != 0 && (args[0] == "requests" || args[0] == "request") {
-		conn, err := connectOrStartDaemon(opts.daemonSocket)
+		conn, err := connectRunningDaemon(opts.daemonSocket)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttos: %v\n", err)
 			return 1
@@ -911,10 +934,13 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 	case "start":
 		if conn, err := connectDaemon(opts.daemonSocket); err == nil {
 			conn.Close()
-			fmt.Fprintln(stdout, "ttosd already running")
+			fmt.Fprintln(stdout, "ttosd already running; use 'ttos daemon status' to inspect its mode")
 			return 0
 		}
-		if err := startDaemonProcess(opts.daemonSocket); err != nil {
+		if opts.unsafeNoHostIsolation {
+			fmt.Fprintln(stderr, "ttos: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+		}
+		if err := startDaemonProcess(opts.daemonSocket, opts.unsafeNoHostIsolation); err != nil {
 			fmt.Fprintf(stderr, "ttos: %v\n", err)
 			return 1
 		}

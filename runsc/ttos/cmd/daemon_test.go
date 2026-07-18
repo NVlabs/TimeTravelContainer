@@ -37,6 +37,29 @@ func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
 	}
 }
 
+func TestClientRequiresExplicitDaemonStart(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "runtime", "ttosd.sock")
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--daemon-socket", socket, "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "start it explicitly with 'ttos daemon start'") {
+		t.Fatalf("missing daemon: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
+func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--unsafe-no-host-isolation", "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "ordinary commands inherit the running daemon's mode") {
+		t.Fatalf("per-command mode: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	status = Run([]string{"--unsafe-no-host-isolation", "daemon", "status"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 2 || !strings.Contains(stderr.String(), "valid with 'daemon start' only") {
+		t.Fatalf("daemon status mode: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
 func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	command := exec.Command("sleep", "30")
 	if err := command.Start(); err != nil {
@@ -197,7 +220,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttosd.sock")
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, io.Discard, io.Discard)
+		done <- serveDaemon(socket, true, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -237,6 +260,10 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		t.Fatalf("completion response: status=%d stdout=%q stderr=%q", status, stdout, stderr)
 	}
 
+	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
+	if status != 0 || !strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) || !strings.Contains(stdout, `"unsafe_no_host_isolation":true`) || stderr != "" {
+		t.Fatalf("daemon mode status: status=%d stdout=%q stderr=%q", status, stdout, stderr)
+	}
 	dataRoot := t.TempDir()
 	requestID, err := newDaemonRequestID()
 	if err != nil {
