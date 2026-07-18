@@ -1,13 +1,13 @@
 # TimeTravelOS `ttos` product and CLI roadmap
 
-Status: TODO roadmap following the live-fork prototype.
+Status: implemented for the documented rootless systrap scope.
 
-Implementation status: an initial lightweight `ttos` client is available at
+Implementation status: the roadmap is implemented. The `ttos` client is available at
 `//runsc/ttos:ttos`. It controls existing TimeTravel-enabled runsc OCI
 sandboxes through runsc's JSON command surface, pulls OCI/Docker images through
 containerd with Docker config and credential-helper authentication, generates
 rootless image-backed OCI bundles, and implements the
-initial run/create/start/wait/restart/inspect/list/remove lifecycle with
+run/create/start/wait/restart/inspect/list/remove lifecycle with
 persistent metadata and immutable branch lineage/tombstones, plus synchronous, detached, and TTY exec into a selected
 live branch, with branch-local managed-session list, wait, signal, log, and
 reattach support.

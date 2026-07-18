@@ -1,6 +1,7 @@
 # TimeTravelOS live container fork
 
-Status: design draft for the first implementation.
+Status: implemented for the documented systrap scope; unsupported external
+resources are rejected by design.
 
 Follow-on product, mount, volume, exec, attach/detach, image-management, and
 Docker-like CLI work is tracked in
@@ -14,7 +15,7 @@ metadata, preserves virtual Linux observables, shares existing physical pages,
 and performs page-level copy-on-write (CoW) after either branch writes. It does
 not create a checkpoint image or copy resident application memory.
 
-The first implementation will host all branches of a sandbox in one Sentry
+The implemented design hosts all branches of a sandbox in one Sentry
 process. Each branch has a distinct `kernel.Kernel` and virtual object graph,
 but the family shares the systrap `platform.Platform` and one or more
 `pgalloc.MemoryFile`s. This avoids forking the Go runtime, permits reuse of
