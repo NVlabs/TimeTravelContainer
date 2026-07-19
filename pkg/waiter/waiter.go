@@ -183,8 +183,6 @@ func (e *Entry) NotifyEvent(mask EventMask) {
 // ChannelNotifier is a simple channel-based notification.
 type ChannelNotifier chan struct{}
 
-func (ChannelNotifier) transientWaiterListener() {}
-
 // NotifyEvent implements waiter.EventListener.NotifyEvent.
 func (c ChannelNotifier) NotifyEvent(EventMask) {
 	select {
@@ -202,9 +200,31 @@ func NewChannelEntry(mask EventMask) (e Entry, ch chan struct{}) {
 	return e, ch
 }
 
-type functionNotifier func(EventMask)
+// transientChannelNotifier is a host-runtime notification channel that must
+// not enter serialized Sentry state. Callers must arrange to keep the source
+// registration alive and to recreate any corresponding restored runtime
+// resource.
+type transientChannelNotifier chan struct{}
 
-func (functionNotifier) transientWaiterListener() {}
+func (transientChannelNotifier) transientWaiterListener() {}
+
+func (c transientChannelNotifier) NotifyEvent(EventMask) {
+	select {
+	case c <- struct{}{}:
+	default:
+	}
+}
+
+// NewTransientChannelEntry initializes an Entry for host-runtime glue that is
+// intentionally omitted from state snapshots. Guest and Sentry waiters must
+// use NewChannelEntry so an unexpected live registration remains fail-closed.
+func NewTransientChannelEntry(mask EventMask) (e Entry, ch chan struct{}) {
+	ch = make(chan struct{}, 1)
+	e.Init(transientChannelNotifier(ch), mask)
+	return e, ch
+}
+
+type functionNotifier func(EventMask)
 
 // NotifyEvent implements waiter.EventListener.NotifyEvent.
 func (f functionNotifier) NotifyEvent(mask EventMask) {
@@ -219,8 +239,6 @@ func NewFunctionEntry(mask EventMask, fn func(EventMask)) (e Entry) {
 
 // NoopListener is an EventListener that does nothing.
 type NoopListener struct{}
-
-func (NoopListener) transientWaiterListener() {}
 
 // NotifyEvent implements EventListener.NotifyEvent.
 func (NoopListener) NotifyEvent(mask EventMask) {}
@@ -245,10 +263,10 @@ type transientWaiterListener interface {
 	transientWaiterListener()
 }
 
-// StateSave snapshots only persistent Sentry object-graph listeners. Channel,
-// function, and no-op listeners belong to runtime goroutines; cloning them
-// would either serialize a Go channel/function or leave an inert registration
-// in the restored Queue.
+// StateSave snapshots persistent Sentry object-graph listeners and omits only
+// listeners explicitly marked as host-runtime state. It is unsafe to infer
+// transience from the listener's implementation: Sentry also uses channels for
+// blocking guest operations.
 func (q *Queue) StateSave(s state.Sink) {
 	q.mu.RLock()
 	entries := make([]*Entry, 0)

@@ -77,7 +77,7 @@ func NewHostInetConn(port uint16) (proxyConn, error) {
 
 		// Connect is in progress. Wait for the socket to be writable.
 		mask := waiter.WritableEvents
-		waitEntry, notifyCh := waiter.NewChannelEntry(mask)
+		waitEntry, notifyCh := waiter.NewTransientChannelEntry(mask)
 		s.eventRegister(&waitEntry)
 		defer s.eventUnregister(&waitEntry)
 
@@ -111,7 +111,7 @@ func (s *hostInetConn) Read(ctx context.Context, buf []byte, cancel <-chan struc
 	n, err := s.fd.Read(buf)
 	for ctx.Err() == nil && linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		if ch == nil {
-			e, ch = waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr)
+			e, ch = waiter.NewTransientChannelEntry(waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
 			s.eventRegister(&e)
 			defer s.eventUnregister(&e)
@@ -135,7 +135,7 @@ func (s *hostInetConn) Write(ctx context.Context, buf []byte, cancel <-chan stru
 	n, err := s.fd.Write(buf)
 	for ctx.Err() == nil && linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		if ch == nil {
-			e, ch = waiter.NewChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
+			e, ch = waiter.NewTransientChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
 			s.eventRegister(&e)
 			defer s.eventUnregister(&e)

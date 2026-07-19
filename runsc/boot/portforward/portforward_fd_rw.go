@@ -52,7 +52,7 @@ func (r *fileDescriptionConn) Read(ctx context.Context, buf []byte, cancel <-cha
 	n, err := r.file.Read(ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 	for linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		if notifyCh == nil {
-			waitEntry, notifyCh = waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
+			waitEntry, notifyCh = waiter.NewTransientChannelEntry(waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is readable or disconnected.
 			r.file.EventRegister(&waitEntry)
 			defer r.file.EventUnregister(&waitEntry)
@@ -80,7 +80,7 @@ func (r *fileDescriptionConn) Write(ctx context.Context, buf []byte, cancel <-ch
 	n, err := r.file.Write(ctx, usermem.BytesIOSequence(buf), vfs.WriteOptions{})
 	for linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		if notifyCh == nil {
-			waitEntry, notifyCh = waiter.NewChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
+			waitEntry, notifyCh = waiter.NewTransientChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
 			r.file.EventRegister(&waitEntry)
 			defer r.file.EventUnregister(&waitEntry)

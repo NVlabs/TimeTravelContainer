@@ -1235,7 +1235,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentTCPClient := liveForkTestFD(t, l.k, tcpFDs[0])
 	parentTCPServer := liveForkTestFD(t, l.k, tcpFDs[1])
 	liveForkTestWrite(t, parentTask, parentTCPClient, "seed")
-	transientNetworkWaiter, _ := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventErr | waiter.EventHUp)
+	transientNetworkWaiter, _ := waiter.NewTransientChannelEntry(waiter.ReadableEvents | waiter.EventErr | waiter.EventHUp)
 	if err := parentTCPClient.EventRegister(&transientNetworkWaiter); err != nil {
 		t.Fatalf("registering transient network waiter: %v", err)
 	}

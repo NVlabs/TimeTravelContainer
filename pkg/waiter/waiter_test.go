@@ -25,7 +25,7 @@ import (
 
 func TestQueueStateOmitsTransientChannelWaiter(t *testing.T) {
 	var source Queue
-	entry, _ := NewChannelEntry(ReadableEvents | EventErr | EventHUp)
+	entry, _ := NewTransientChannelEntry(ReadableEvents | EventErr | EventHUp)
 	source.EventRegister(&entry)
 
 	var image bytes.Buffer
@@ -41,6 +41,20 @@ func TestQueueStateOmitsTransientChannelWaiter(t *testing.T) {
 	}
 	if !restored.IsEmpty() {
 		t.Fatalf("restored Queue retained transient events %#x", restored.Events())
+	}
+}
+
+func TestQueueStateRejectsUnmarkedChannelWaiter(t *testing.T) {
+	var source Queue
+	entry, _ := NewChannelEntry(ReadableEvents)
+	source.EventRegister(&entry)
+
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, &source); err == nil {
+		t.Fatal("saving Queue with unmarked channel waiter unexpectedly succeeded")
+	}
+	if got, want := source.Events(), ReadableEvents; got != want {
+		t.Fatalf("source events after rejected save=%#x, want %#x", got, want)
 	}
 }
 

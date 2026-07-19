@@ -54,7 +54,7 @@ func NewNetstackConn(stack *stack.Stack, port uint16) (proxyConn, error) {
 		port: port,
 		wq:   &wq,
 	}
-	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	waitEntry, notifyCh := waiter.NewTransientChannelEntry(waiter.WritableEvents)
 	n.wq.EventRegister(&waitEntry)
 	defer n.wq.EventUnregister(&waitEntry)
 
@@ -106,7 +106,7 @@ func (n *netstackConn) Read(ctx context.Context, buf []byte, cancel <-chan struc
 	res, tcpErr := n.ep.Read(b, tcpip.ReadOptions{})
 	for _, ok := tcpErr.(*tcpip.ErrWouldBlock); ok && ctx.Err() == nil; _, ok = tcpErr.(*tcpip.ErrWouldBlock) {
 		if ch == nil {
-			e, ch = waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventIn | waiter.EventHUp | waiter.EventErr)
+			e, ch = waiter.NewTransientChannelEntry(waiter.ReadableEvents | waiter.EventIn | waiter.EventHUp | waiter.EventErr)
 			n.wq.EventRegister(&e)
 			defer n.wq.EventUnregister(&e)
 		}
@@ -134,7 +134,7 @@ func (n *netstackConn) Write(ctx context.Context, buf []byte, cancel <-chan stru
 	res, tcpErr := n.ep.Write(&b, tcpip.WriteOptions{Atomic: true})
 	for _, ok := tcpErr.(*tcpip.ErrWouldBlock); ok && ctx.Err() == nil; _, ok = tcpErr.(*tcpip.ErrWouldBlock) {
 		if ch == nil {
-			e, ch = waiter.NewChannelEntry(waiter.WritableEvents | waiter.EventIn | waiter.EventHUp | waiter.EventErr)
+			e, ch = waiter.NewTransientChannelEntry(waiter.WritableEvents | waiter.EventIn | waiter.EventHUp | waiter.EventErr)
 			n.wq.EventRegister(&e)
 			defer n.wq.EventUnregister(&e)
 		}
