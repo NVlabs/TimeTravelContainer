@@ -26,6 +26,7 @@ go_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/state",
         "//pkg/sync",
     ],
 )
@@ -37,5 +38,8 @@ go_test(
         "waiter_test.go",
     ],
     library = ":waiter",
-    deps = ["//pkg/atomicbitops"],
+    deps = [
+        "//pkg/atomicbitops",
+        "//pkg/state",
+    ],
 )

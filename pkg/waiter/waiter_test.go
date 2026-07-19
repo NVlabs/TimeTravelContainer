@@ -15,10 +15,34 @@
 package waiter
 
 import (
+	"bytes"
+	"context"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/state"
 )
+
+func TestQueueStateOmitsTransientChannelWaiter(t *testing.T) {
+	var source Queue
+	entry, _ := NewChannelEntry(ReadableEvents | EventErr | EventHUp)
+	source.EventRegister(&entry)
+
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, &source); err != nil {
+		t.Fatalf("saving Queue with channel waiter: %v", err)
+	}
+	if got, want := source.Events(), ReadableEvents|EventErr|EventHUp; got != want {
+		t.Fatalf("source events after save=%#x, want %#x", got, want)
+	}
+	var restored Queue
+	if _, err := state.Load(context.Background(), &image, &restored); err != nil {
+		t.Fatalf("loading Queue with channel waiter: %v", err)
+	}
+	if !restored.IsEmpty() {
+		t.Fatalf("restored Queue retained transient events %#x", restored.Events())
+	}
+}
 
 func TestEmptyQueue(t *testing.T) {
 	var q Queue

@@ -339,6 +339,14 @@ connections, and published listener. A child is not published automatically;
 `ttos port publish CONTAINER@BRANCH ...` can assign an independent persistent
 listener to any live child after the fork.
 
+Host relay goroutines register channel- and function-backed waiters while NAT
+or published-port traffic is active. These registrations are runtime glue, not
+guest kernel state: the live-fork snapshot filters them out without unregistering
+them from the source queue. Persistent Sentry waiters (for example epoll
+interests) are cloned normally, while the child's fresh proxy realm installs its
+own relay waiters. This permits a loaded Chromium branch to fork without trying
+to serialize Go channels and keeps the source relay uninterrupted.
+
 This gives useful fail-soft semantics without pretending that one host TCP flow
 can be duplicated. It does not replay bytes arriving from outside during the
 pause window or preserve a child's external TCP session. Explicit branch port

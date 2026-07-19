@@ -1235,6 +1235,10 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentTCPClient := liveForkTestFD(t, l.k, tcpFDs[0])
 	parentTCPServer := liveForkTestFD(t, l.k, tcpFDs[1])
 	liveForkTestWrite(t, parentTask, parentTCPClient, "seed")
+	transientNetworkWaiter, _ := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventErr | waiter.EventHUp)
+	if err := parentTCPClient.EventRegister(&transientNetworkWaiter); err != nil {
+		t.Fatalf("registering transient network waiter: %v", err)
+	}
 	netlinkFile, netlinkErr := socket.New(parentTask, linux.AF_NETLINK, linux.SOCK_RAW, linux.NETLINK_ROUTE)
 	if netlinkErr != nil {
 		t.Fatalf("creating netlink route socket: %v", netlinkErr)
@@ -1385,6 +1389,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	liveForkTestMMReadContext(t, ctx, parentTask, readonlyMapAddr, "host-data")
 
 	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
+	parentTCPClient.EventUnregister(&transientNetworkWaiter)
 	if err != nil {
 		t.Fatalf("forking live loader: %v", err)
 	}

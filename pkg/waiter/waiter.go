@@ -58,6 +58,9 @@
 package waiter
 
 import (
+	"context"
+
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -137,7 +140,7 @@ type EventListener interface {
 //
 // +stateify savable
 type Entry struct {
-	waiterEntry
+	waiterEntry `state:"nosave"`
 
 	// eventListener receives the notification.
 	eventListener EventListener
@@ -180,6 +183,8 @@ func (e *Entry) NotifyEvent(mask EventMask) {
 // ChannelNotifier is a simple channel-based notification.
 type ChannelNotifier chan struct{}
 
+func (ChannelNotifier) transientWaiterListener() {}
+
 // NotifyEvent implements waiter.EventListener.NotifyEvent.
 func (c ChannelNotifier) NotifyEvent(EventMask) {
 	select {
@@ -199,6 +204,8 @@ func NewChannelEntry(mask EventMask) (e Entry, ch chan struct{}) {
 
 type functionNotifier func(EventMask)
 
+func (functionNotifier) transientWaiterListener() {}
+
 // NotifyEvent implements waiter.EventListener.NotifyEvent.
 func (f functionNotifier) NotifyEvent(mask EventMask) {
 	f(mask)
@@ -213,6 +220,8 @@ func NewFunctionEntry(mask EventMask, fn func(EventMask)) (e Entry) {
 // NoopListener is an EventListener that does nothing.
 type NoopListener struct{}
 
+func (NoopListener) transientWaiterListener() {}
+
 // NotifyEvent implements EventListener.NotifyEvent.
 func (NoopListener) NotifyEvent(mask EventMask) {}
 
@@ -221,10 +230,49 @@ func (NoopListener) NotifyEvent(mask EventMask) {}
 //
 // The zero value for waiter.Queue is an empty queue ready for use.
 //
-// +stateify savable
+// +stateify type
 type Queue struct {
-	list waiterList
+	list waiterList   `state:"nosave"`
 	mu   sync.RWMutex `state:"nosave"`
+
+	// stateEntries reserves the state field used by StateSave and StateLoad.
+	// It is never populated on a live Queue: StateSave snapshots under mu so
+	// runtime registrations may continue without becoming part of the clone.
+	stateEntries []*Entry
+}
+
+type transientWaiterListener interface {
+	transientWaiterListener()
+}
+
+// StateSave snapshots only persistent Sentry object-graph listeners. Channel,
+// function, and no-op listeners belong to runtime goroutines; cloning them
+// would either serialize a Go channel/function or leave an inert registration
+// in the restored Queue.
+func (q *Queue) StateSave(s state.Sink) {
+	q.mu.RLock()
+	entries := make([]*Entry, 0)
+	for e := q.list.Front(); e != nil; e = e.Next() {
+		if _, transient := e.eventListener.(transientWaiterListener); !transient {
+			entries = append(entries, e)
+		}
+	}
+	q.mu.RUnlock()
+	s.Save(0, &entries)
+}
+
+// StateLoad restores the persistent queue topology from StateSave's snapshot.
+func (q *Queue) StateLoad(_ context.Context, s state.Source) {
+	var entries []*Entry
+	s.LoadWait(0, &entries)
+	s.AfterLoad(func() {
+		q.list = waiterList{}
+		for _, e := range entries {
+			e.waiterEntry = waiterEntry{}
+			q.list.PushBack(e)
+		}
+		q.stateEntries = nil
+	})
 }
 
 // EventRegister adds a waiter to the wait queue.

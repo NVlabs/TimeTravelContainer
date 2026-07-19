@@ -362,6 +362,13 @@ starts unpublished. Hostinet, plugin stacks, arbitrary external links,
 secondary network namespaces, and modified firewall/conntrack state remain
 rejection cases.
 
+The source proxy's channel- and function-backed waiter registrations are
+host-runtime state rather than part of the Sentry object graph. Queue snapshots
+therefore omit those transient listeners while retaining serializable Sentry
+listeners such as epoll interests. Snapshotting does not unregister or mutate
+the source queue; the child creates new relay waiters when its fresh proxy realm
+starts.
+
 ### `runsc/boot` and control plane
 
 Add a `SandboxFamily`/branch manager above the current single `Loader.k` model.
