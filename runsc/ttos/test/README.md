@@ -107,6 +107,9 @@ covers:
   pause/commit/resume preservation across Docker-style restart, and validated
   atomic preservation of normal-exit plus shutdown-handler writes into a fresh
   sandbox family;
+- tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
+  the source-read-lock versus CoW-invalidation-write-lock ordering that loaded
+  Chromium exercises;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;
@@ -198,10 +201,11 @@ follower handshake, verifies that their output is never lost, and requires
 `exec -it` to close promptly after the guest process exits. The 60-second
 `timeout` is a test-wide deadlock guard, not an accepted teardown delay.
 
-The `runsc/boot:boot_test` live-fork coverage also installs the same transient
-channel waiter used by an active TTOS network relay. It verifies that the source
-registration survives snapshotting, the child omits the host-runtime waiter,
-and live fork does not attempt to serialize a Go channel.
+The `runsc/boot:boot_test` live-fork coverage also installs the same explicitly
+transient channel waiter used by active TTOS port forwarding. It verifies that
+the source registration survives snapshotting, the child omits that host-runtime
+waiter, and ordinary Sentry listeners are not classified by implementation
+type.
 
 ```shell
 bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \

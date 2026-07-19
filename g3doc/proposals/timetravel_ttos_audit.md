@@ -54,6 +54,16 @@ real-PTY regression now requires `exec -it` to exit promptly. Focused tests also
 cover preservation of application-modified private pages during live-fork
 write-protection and custom virtual-NIC address/MAC propagation.
 
+A loaded Chromium/VNC reproduction exposed a post-fork tmpfs lock inversion:
+`pwrite()` from a mapping in one memory manager entered the file writer with
+that manager read-locked, then branch CoW invalidation requested its write lock.
+The affected task deadlocked, later tasks accumulated behind the same lock, and
+a subsequent fork blocked in `Kernel.Pause()`. Shared-range syscall writes now
+use a bounded bounce buffer so source-memory locks are released before mapping
+invalidation. The focused regression checks the lock ordering and the real
+validation forks Chromium after loading Google, Wikipedia, and Chromium.org,
+with an authenticated VNC published-port connection active.
+
 ## Performance measurements
 
 The measurements below are retained from the July 18 run and were not repeated
@@ -339,13 +349,15 @@ connections, and published listener. A child is not published automatically;
 `ttos port publish CONTAINER@BRANCH ...` can assign an independent persistent
 listener to any live child after the fork.
 
-Host relay goroutines register channel- and function-backed waiters while NAT
-or published-port traffic is active. These registrations are runtime glue, not
-guest kernel state: the live-fork snapshot filters them out without unregistering
-them from the source queue. Persistent Sentry waiters (for example epoll
-interests) are cloned normally, while the child's fresh proxy realm installs its
-own relay waiters. This permits a loaded Chromium branch to fork without trying
-to serialize Go channels and keeps the source relay uninterrupted.
+Host relay goroutines register channel-backed waiters while port-forwarded
+traffic is active. The port-forwarding code marks these registrations explicitly
+as runtime glue, so the live-fork snapshot filters them out without
+unregistering them from the source queue. No listener type is globally assumed
+to be transient: guest blocking operations also use channel waiters. Persistent
+Sentry waiters (for example epoll interests) are cloned normally, while the
+child's fresh proxy realm installs its own relay waiters. This permits a loaded
+Chromium branch to fork without trying to serialize host Go channels and keeps
+the source relay uninterrupted.
 
 This gives useful fail-soft semantics without pretending that one host TCP flow
 can be duplicated. It does not replay bytes arriving from outside during the

@@ -302,6 +302,15 @@ This covers tmpfs regular files, memfd, POSIX shared memory, and anonymous
 `MAP_SHARED`, all of which use tmpfs machinery. Add tests for each access path,
 not only mmap faults.
 
+Syscall writes need special lock ordering after a fork. `IOSequence.CopyInTo`
+may invoke the tmpfs writer while holding the source `MemoryManager.activeMu`
+for reading, but breaking file CoW invalidates mappings and may need that same
+lock for writing. When a write overlaps a live-fork-shared tmpfs range, TTOS
+therefore stages source data through a bounded buffer before invalidation. The
+ordinary non-CoW path remains direct. Regression coverage maps the destination
+file in the source memory manager and verifies that `pwrite()` neither reenters
+the lock nor loses data.
+
 ### `pkg/sentry/fsimpl/overlay` and gofer
 
 The supported root layout is:
@@ -362,12 +371,13 @@ starts unpublished. Hostinet, plugin stacks, arbitrary external links,
 secondary network namespaces, and modified firewall/conntrack state remain
 rejection cases.
 
-The source proxy's channel- and function-backed waiter registrations are
+The source proxy's explicitly marked port-forwarding waiter registrations are
 host-runtime state rather than part of the Sentry object graph. Queue snapshots
-therefore omit those transient listeners while retaining serializable Sentry
-listeners such as epoll interests. Snapshotting does not unregister or mutate
-the source queue; the child creates new relay waiters when its fresh proxy realm
-starts.
+omit only those registrations while retaining serializable Sentry listeners
+such as epoll interests. Listener implementation alone is not sufficient: both
+host relays and guest blocking operations can use channels. Snapshotting does
+not unregister or mutate the source queue; the child creates new relay waiters
+when its fresh proxy realm starts.
 
 ### `runsc/boot` and control plane
 
