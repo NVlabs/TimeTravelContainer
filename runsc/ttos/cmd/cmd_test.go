@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -2437,6 +2438,18 @@ func TestVerifyCgroupV2Resources(t *testing.T) {
 	write("cgroup.procs", "7\n")
 	if err := verifyCgroupV2Resources(pid, membership, root, "ttos/demo", resources); err == nil || !strings.Contains(err.Error(), "is not a member") {
 		t.Fatalf("missing PID error=%v", err)
+	}
+}
+
+func TestRuntimeRootIsWritableByDefault(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/test")
+	if got, want := runtimeRoot(), "/run/user/test/runsc"; got != want {
+		t.Fatalf("runtimeRoot with XDG_RUNTIME_DIR=%q, want %q", got, want)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	want := filepath.Join(os.TempDir(), "ttos-"+strconv.Itoa(os.Geteuid()), "runsc")
+	if got := runtimeRoot(); got != want {
+		t.Fatalf("runtimeRoot without XDG_RUNTIME_DIR=%q, want %q", got, want)
 	}
 }
 

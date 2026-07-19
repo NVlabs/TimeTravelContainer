@@ -167,9 +167,9 @@ The first defined location wins. The native OCI content store is the
 `image-store` subdirectory of that data root.
 
 The default `runsc` root is `$XDG_RUNTIME_DIR/runsc`. Without
-`XDG_RUNTIME_DIR`, the inherited gVisor default is `/var/run/runsc`, which is
-usually not writable by an unprivileged user. In a non-systemd or minimal shell,
-pass explicit per-user paths before the subcommand:
+`XDG_RUNTIME_DIR`, TTOS uses `/tmp/ttos-$UID/runsc`, alongside its per-user
+daemon socket. Both locations are writable only by the invoking user. Explicit
+paths remain available for independent installations or test runs:
 
 ```shell
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/ttos-$UID}"

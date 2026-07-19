@@ -19,6 +19,7 @@ package ownership
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -87,9 +88,20 @@ func (m *Manifest) Lookup(name string) (Owner, bool) {
 
 // Read loads and validates a manifest.
 func Read(name string) (*Manifest, error) {
-	data, err := os.ReadFile(name)
+	file, err := os.Open(name)
 	if err != nil {
 		return nil, err
+	}
+	defer file.Close()
+	return ReadFrom(name, file)
+}
+
+// ReadFrom loads and validates a manifest from r. name identifies the source
+// in validation errors.
+func ReadFrom(name string, r io.Reader) (*Manifest, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading ownership manifest %q: %w", name, err)
 	}
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {

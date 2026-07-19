@@ -1114,7 +1114,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if ns, ok := specutils.GetNS(specs.NetworkNamespace, args.Spec); ok && conf.Network != config.NetworkNone && conf.Network != config.NetworkTimeTravel {
 		log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
 		nss = append(nss, ns)
-	} else if conf.Network == config.NetworkHost {
+	} else if sandboxUsesHostNetworkNamespace(conf) {
 		log.Infof("Sandbox will be started in the host network namespace")
 	} else {
 		log.Infof("Sandbox will be started in new network namespace")
@@ -1421,6 +1421,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	log.Infof("Sandbox started, PID: %d", cmd.Process.Pid)
 
 	return nil
+}
+
+// sandboxUsesHostNetworkNamespace reports whether host sockets created by the
+// Sentry must use the caller's network namespace. TTOS NAT terminates guest
+// connections in the Sentry and creates corresponding host sockets, so putting
+// the Sentry in an otherwise empty network namespace makes every outbound flow
+// unreachable. Guest processes still see only the in-process TTOS netstack.
+func sandboxUsesHostNetworkNamespace(conf *config.Config) bool {
+	return conf.Network == config.NetworkHost ||
+		(conf.Network == config.NetworkTimeTravel && conf.TimeTravelNetworkNAT)
 }
 
 func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {

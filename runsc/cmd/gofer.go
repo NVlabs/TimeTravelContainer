@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -110,12 +111,13 @@ type Gofer struct {
 	uid int
 	gid int
 
-	specFD           int
-	mountsFD         int
-	goferToHostRPCFD int
-	profileFDs       profile.FDArgs
-	syncFDs          goferSyncFDs
-	stopProfiling    func()
+	specFD            int
+	rootfsOwnershipFD int
+	mountsFD          int
+	goferToHostRPCFD  int
+	profileFDs        profile.FDArgs
+	syncFDs           goferSyncFDs
+	stopProfiling     func()
 }
 
 // Name implements subcommands.Command.
@@ -144,6 +146,7 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.Var(&g.mountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured. They must follow this order: root first, then mounts as defined in the spec.")
 	f.IntVar(&g.devIoFD, "dev-io-fd", -1, "optional FD to connect /dev gofer server")
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
+	f.IntVar(&g.rootfsOwnershipFD, "rootfs-ownership-fd", -1, "optional open TTOS rootfs ownership manifest preserved across gofer re-exec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
 
@@ -191,9 +194,12 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if err != nil {
 		util.Fatalf("parsing rootfs hint: %v", err)
 	}
-	virtualOwners, err := loadRootfsOwnership(spec)
+	virtualOwners, rootfsOwnershipFile, err := loadRootfsOwnership(spec, g.rootfsOwnershipFD)
 	if err != nil {
 		util.Fatalf("loading rootfs ownership: %v", err)
+	}
+	if rootfsOwnershipFile != nil {
+		defer rootfsOwnershipFile.Close()
 	}
 	lisafsNeeded := lisafsNeededForDirectFSSuppression(spec, mountHints, rootfsHint, g.mountConfs)
 
@@ -229,6 +235,12 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
+		if rootfsOwnershipFile != nil {
+			if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, rootfsOwnershipFile.Fd(), unix.F_SETFD, 0); errno != 0 {
+				util.Fatalf("clearing CLOEXEC on rootfs ownership manifest: %v", errno)
+			}
+			overrides["rootfs-ownership-fd"] = strconv.Itoa(int(rootfsOwnershipFile.Fd()))
+		}
 		for key, value := range extensionPrepare.FlagOverrides {
 			overrides[key] = value
 		}
@@ -343,21 +355,44 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	return g.serve(spec, conf, root, ruid, euid, rgid, egid, virtualOwners)
 }
 
-func loadRootfsOwnership(spec *specs.Spec) (*ownership.Manifest, error) {
+func loadRootfsOwnership(spec *specs.Spec, inheritedFD int) (_ *ownership.Manifest, manifestFile *os.File, retErr error) {
 	name := spec.Annotations[ownership.Annotation]
 	if name == "" {
-		return nil, nil
+		if inheritedFD >= 0 {
+			return nil, nil, fmt.Errorf("rootfs ownership fd %d supplied without %q annotation", inheritedFD, ownership.Annotation)
+		}
+		return nil, nil, nil
 	}
 	want := ownership.ManifestPath(spec.Root.Path)
 	if !filepath.IsAbs(name) || filepath.Clean(name) != filepath.Clean(want) {
-		return nil, fmt.Errorf("ownership manifest path %q does not match rootfs %q", name, spec.Root.Path)
+		return nil, nil, fmt.Errorf("ownership manifest path %q does not match rootfs %q", name, spec.Root.Path)
 	}
-	manifest, err := ownership.Read(name)
+	if inheritedFD >= 0 {
+		manifestFile = os.NewFile(uintptr(inheritedFD), "rootfs ownership manifest")
+		if manifestFile == nil {
+			return nil, nil, fmt.Errorf("invalid rootfs ownership fd %d", inheritedFD)
+		}
+	} else {
+		var err error
+		manifestFile, err = os.Open(name)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	defer func() {
+		if retErr != nil {
+			manifestFile.Close()
+		}
+	}()
+	if _, err := manifestFile.Seek(0, 0); err != nil {
+		return nil, nil, fmt.Errorf("rewinding ownership manifest %q: %w", name, err)
+	}
+	manifest, err := ownership.ReadFrom(name, manifestFile)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	log.Infof("Loaded virtual ownership for %d rootfs paths from %q", len(manifest.Entries), name)
-	return manifest, nil
+	return manifest, manifestFile, nil
 }
 
 func goferMountPath(conf *config.Config, source, destination string) string {

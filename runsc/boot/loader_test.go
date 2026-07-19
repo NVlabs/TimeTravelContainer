@@ -807,6 +807,16 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sleep", "30"}
+	// The Bazel sandbox may expose the host root through an unprivileged user
+	// namespace, in which case lisafs reports it as owned by nobody. Model a
+	// normal root container explicitly so the writable memory overlay is tested
+	// independently of the host test sandbox's UID mapping.
+	rootCaps := []string{"CAP_DAC_OVERRIDE"}
+	spec.Process.Capabilities = &specs.LinuxCapabilities{
+		Bounding:  rootCaps,
+		Effective: rootCaps,
+		Permitted: rootCaps,
+	}
 	spec.Root.Readonly = false
 	spec.Mounts = []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},

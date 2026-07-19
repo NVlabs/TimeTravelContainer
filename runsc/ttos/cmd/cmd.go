@@ -56,7 +56,6 @@ import (
 )
 
 const (
-	defaultRuntimeRoot     = "/var/run/runsc"
 	defaultBranchID        = "main"
 	defaultConsoleLogMax   = int64(16 << 20)
 	defaultConsoleLogFiles = 2
@@ -215,7 +214,7 @@ func runtimeRoot() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "runsc")
 	}
-	return defaultRuntimeRoot
+	return filepath.Join(os.TempDir(), "ttos-"+strconv.Itoa(os.Geteuid()), "runsc")
 }
 
 func runscPath() string {

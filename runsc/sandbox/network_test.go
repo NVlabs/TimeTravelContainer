@@ -27,6 +27,27 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 )
 
+func TestSandboxUsesHostNetworkNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		conf config.Config
+		want bool
+	}{
+		{name: "host", conf: config.Config{Network: config.NetworkHost}, want: true},
+		{name: "ttos NAT", conf: config.Config{Network: config.NetworkTimeTravel, TimeTravelNetworkNAT: true}, want: true},
+		{name: "ttos isolated", conf: config.Config{Network: config.NetworkTimeTravel}, want: false},
+		{name: "none", conf: config.Config{Network: config.NetworkNone}, want: false},
+		{name: "sandbox", conf: config.Config{Network: config.NetworkSandbox}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sandboxUsesHostNetworkNamespace(&test.conf); got != test.want {
+				t.Errorf("sandboxUsesHostNetworkNamespace(%+v) = %t, want %t", test.conf, got, test.want)
+			}
+		})
+	}
+}
+
 func fdbasedLinkEqual(a, b boot.FDBasedLink) bool {
 	if a.Name != b.Name {
 		return false

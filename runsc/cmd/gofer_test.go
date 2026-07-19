@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/config"
@@ -46,20 +47,37 @@ func TestLoadRootfsOwnership(t *testing.T) {
 		Root:        &specs.Root{Path: root},
 		Annotations: map[string]string{ownership.Annotation: manifestPath},
 	}
-	got, err := loadRootfsOwnership(spec)
+	got, manifestFile, err := loadRootfsOwnership(spec, -1)
 	if err != nil {
 		t.Fatalf("loadRootfsOwnership: %v", err)
 	}
+	defer manifestFile.Close()
 	if owner, ok := got.Lookup("owned"); !ok || owner != (ownership.Owner{UID: 123, GID: 456}) {
 		t.Fatalf("owned=%+v, ok=%t", owner, ok)
 	}
+	inheritedFD, err := unix.Dup(int(manifestFile.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(manifestPath); err != nil {
+		unix.Close(inheritedFD)
+		t.Fatal(err)
+	}
+	inherited, inheritedFile, err := loadRootfsOwnership(spec, inheritedFD)
+	if err != nil {
+		t.Fatalf("loadRootfsOwnership from inherited fd after path removal: %v", err)
+	}
+	defer inheritedFile.Close()
+	if owner, ok := inherited.Lookup("owned"); !ok || owner != (ownership.Owner{UID: 123, GID: 456}) {
+		t.Fatalf("inherited owned=%+v, ok=%t", owner, ok)
+	}
 	spec.Annotations[ownership.Annotation] = filepath.Join(dir, "other.json")
-	if _, err := loadRootfsOwnership(spec); err == nil {
+	if _, _, err := loadRootfsOwnership(spec, -1); err == nil {
 		t.Fatal("loadRootfsOwnership accepted a manifest not paired with the rootfs")
 	}
 	delete(spec.Annotations, ownership.Annotation)
-	if got, err := loadRootfsOwnership(spec); err != nil || got != nil {
-		t.Fatalf("unannotated load=(%v, %v), want nil, nil", got, err)
+	if got, file, err := loadRootfsOwnership(spec, -1); err != nil || got != nil || file != nil {
+		t.Fatalf("unannotated load=(%v, %v, %v), want nil, nil, nil", got, file, err)
 	}
 }
 

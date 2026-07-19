@@ -208,7 +208,6 @@ func CopyFinalFrames(writer io.Writer, reader io.Reader, stdoutEOF, stderrEOF bo
 			}
 		}
 	}
-	return nil
 }
 
 func validateStream(stream byte) error {
