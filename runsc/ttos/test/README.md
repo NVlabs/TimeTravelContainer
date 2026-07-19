@@ -114,6 +114,11 @@ covers:
   operation after deletion of the source branch;
 - graceful stop, branch removal, container removal, and volume removal.
 
+Focused Go tests additionally cover custom TTOS NIC IPv4/MAC validation and
+runtime propagation, line-oriented image pull/extraction progress, default
+guest SUID enablement in TTOS's runsc arguments, daemon namespace preflight,
+and private-anonymous-memory write-fault regression cases.
+
 The test requires network access for image pulls. TTOS resolves OCI registries
 directly and stores verified manifests, configs, and layers in its native
 rootless content store under `--data-root`; no Docker or containerd daemon is
@@ -187,7 +192,9 @@ terminal containers, the `ttosd` terminal transport, attach/detach keys,
 branch-local terminal state after live fork, pause/resume, persistent logs,
 client `TERM` propagation, terminal ioctls, and `exec -it`. It repeats
 quick-exit terminal runs to cover the pre-start console
-follower handshake and verifies that their output is never lost.
+follower handshake, verifies that their output is never lost, and requires
+`exec -it` to close promptly after the guest process exits. The 60-second
+`timeout` is a test-wide deadlock guard, not an accepted teardown delay.
 
 ```shell
 bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd \

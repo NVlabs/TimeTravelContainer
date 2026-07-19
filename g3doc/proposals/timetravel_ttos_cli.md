@@ -42,7 +42,8 @@ serializing the volume. Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
 validation as an external resource. Rootless `--network ttos` adds a
-Sentry-managed `ttos0` virtual NIC, optional IPv4 TCP/UDP user-mode NAT with
+Sentry-managed `ttos0` virtual NIC, optional persistent `--ip` and
+`--mac-address`, optional IPv4 TCP/UDP user-mode NAT with
 `--nat`, and persistent IPv4 TCP publication with `-p`/`--publish`. Live fork
 keeps the source proxy and connections, gives the child a fresh proxy realm,
 and resets inherited external child TCP flows instead of rejecting the fork.
@@ -172,8 +173,10 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       Pulls discover `DOCKER_CONFIG` or `~/.docker/config.json`, support inline
       auth/token entries plus per-registry and global credential helpers, and
       resolve secrets only in the in-process registry callback.
-- [x] Show pull completion and measured content-store
-      downloaded-versus-reused byte totals. Quiet mode remains digest-only.
+- [x] Show line-oriented resolve, per-layer download/cache-reuse, extraction,
+      completion, and measured content-store downloaded-versus-reused byte
+      totals through both direct and daemon transports. Quiet mode remains
+      digest-only.
 - [x] `ttos images` with reference, digest, platform, materialized-root state, size, and
       creation time.
 - [x] `ttos image inspect`, `ttos image rm`, and content garbage collection.
@@ -223,6 +226,14 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       listeners after daemon restart, retain the source listener across fork,
       reset inherited child external TCP flows, and leave child branches
       unpublished until an explicit branch-publication surface is designed.
+- [x] Add persistent Docker-style `--ip` and `--mac-address` configuration for
+      the TTOS virtual NIC. Derive the branch-local `.2` gateway from the
+      selected `/24`, validate unicast IPv4 and 48-bit MAC values, and retain
+      the guest-visible identity across start, restart, and live fork.
+- [x] Enable Sentry guest SUID/SGID exec semantics for TTOS by default so common
+      unmodified images using `sudo` or `su` work without changing the host
+      identity of the Sentry/gofer. Retain OCI `noNewPrivileges` as the guest
+      elevation override.
 - [x] Support Docker `run/create --read-only`, persist it in the OCI root and
       Docker inspect view, and retain it across start/restart/live fork while
       writable tmpfs and managed-volume submounts remain usable and fork CoW.
@@ -529,9 +540,11 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [x] Make explicit daemon stop gracefully terminate every live branch in the
-      selected data root, descendants before parents, while preserving daemon
-      crash/restart reconciliation for still-live sandboxes and console drains.
+- [x] Make an orderly `ttos daemon stop` resume paused branches, stop descendants
+      before ancestors with normal stop policy, persist writable rootfs and
+      managed-volume state, and leave the daemon running if container shutdown
+      fails. Preserve live sandboxes after an unexpected daemon crash for
+      restart reconciliation, including console drains and port sidecars.
 - [x] Propagate the invoking client's `TERM` for terminal runs and execs when no
       image/container or command value exists, with an `xterm` fallback.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published

@@ -91,6 +91,17 @@ To build specific libraries or binaries, you can specify the target:
 make build TARGETS="//pkg/tcpip:tcpip"
 ```
 
+To build this branch's complete TimeTravelOS command set with the build
+container and copy it into a local directory:
+
+```sh
+mkdir -p bin
+make copy TARGETS="runsc runsc/ttos runsc/ttosd" DESTINATION="$PWD/bin"
+```
+
+See the [TTOS user guide](g3doc/user_guide/timetravelos.md) for direct Bazel
+builds, optional per-user installation, and daemon startup.
+
 ### Building directly with Bazel (without Docker)
 
 Using Bazel directly isn't recommended due to the extra overhead, but in order

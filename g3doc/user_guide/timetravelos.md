@@ -18,9 +18,10 @@ TTOS consists of three binaries:
 * `ttos`, the user-facing command-line client; and
 * `ttosd`, the per-user manager service.
 
-`ttos` starts the service automatically when needed. Docker, containerd, CRIU,
-KVM, and a containerd snapshotter are not required. TTOS talks directly to OCI
-registries and stores image content under its own data root.
+Start `ttosd` explicitly with `ttos daemon start` before ordinary commands.
+Docker, containerd, CRIU, KVM, and a containerd snapshotter are not required.
+TTOS talks directly to OCI registries and stores image content under its own
+data root.
 
 ## Host requirements
 
@@ -86,7 +87,17 @@ ttos --direct --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
 
 ## Compile
 
-From the gVisor repository root:
+The repository's Docker-based build wrapper can copy all three binaries in one
+command:
+
+```shell
+mkdir -p bin
+make copy TARGETS="runsc runsc/ttos runsc/ttosd" DESTINATION="$PWD/bin"
+```
+
+This build path requires Docker only while compiling; Docker is not needed to
+run TTOS. To build directly on the host with Bazel, from the gVisor repository
+root run:
 
 ```shell
 bazel build //runsc:runsc //runsc/ttos:ttos //runsc/ttosd:ttosd
@@ -204,6 +215,9 @@ ttos run --pull never IMAGE         # require a local image record
 ```
 
 `ttos pull` contacts the registry even when all blobs are already cached.
+Normal pulls and implicit image preparation print line-oriented resolve,
+download, cache-reuse, and extraction progress that survives daemon stream
+forwarding. `ttos pull -q` suppresses progress and prints only the digest.
 `--pull missing` is the fastest offline path after the first pull.
 
 ## Run and inspect containers
@@ -292,6 +306,12 @@ container or exec process when the image/container and command do not already
 define `TERM`; an unset client value falls back to `xterm`. This lets terminal
 applications such as `tmux` select the correct terminfo entry while preserving
 an explicitly configured container terminal type.
+
+TTOS enables guest SUID/SGID exec semantics by default for compatibility with
+images that use helpers such as `sudo` or `su`. UID/GID elevation changes only
+the Sentry's emulated guest credentials; it never changes the host UID of the
+Sentry or gofer. An OCI process with `noNewPrivileges` still suppresses this
+elevation.
 
 Attach to the branch's init console:
 
@@ -386,9 +406,25 @@ preserves internal connections and unread data independently in both branches.
 network namespace, CNI, or elevated network capabilities:
 
 ```text
-ttos0       10.0.2.15/24
+ttos0       10.0.2.15/24           MAC 02:42:0a:00:02:0f
 gateway     10.0.2.2
 ```
+
+Set a stable guest-visible address and MAC at create/run time when a test needs
+a particular network identity:
+
+```shell
+ttos run -d --name appliance --network ttos --nat \
+  --ip 192.0.2.44 --mac-address 02:aa:bb:cc:dd:ee \
+  alpine:3.20 sleep 600
+```
+
+Both values are persistent container configuration and survive start, restart,
+and live fork. The address must be unicast IPv4; TTOS uses a `/24` and reserves
+the `.2` address in that subnet for its gateway, in addition to the network and
+broadcast addresses. The MAC must be a unicast 48-bit address. `--ip` and
+`--mac-address` are valid only with `--network ttos`. If no custom value is
+given, the defaults above apply.
 
 The interface is useful by itself for a stable container-visible NIC. Add
 `--nat` to permit outbound IPv4 TCP and UDP through the Sentry's user-mode

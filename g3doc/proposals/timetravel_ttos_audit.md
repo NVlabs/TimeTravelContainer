@@ -1,9 +1,11 @@
 # TimeTravelOS performance and compatibility audit
 
-This audit was refreshed on 2026-07-18 through the rootless virtual-NIC,
-user-mode NAT, and published-port milestone. It evaluates the native OCI image
-store, rootless execution, Docker-like CLI, and in-memory live fork. It is a
-development-readiness audit, not a security certification.
+This audit was refreshed on 2026-07-19 through configurable virtual-NIC
+identity, line-oriented image progress, default guest SUID semantics, rootless
+namespace preflight, orderly daemon shutdown, persistent writable-root restart,
+and the private-memory and interactive-exec fixes. It evaluates the native OCI
+image store, rootless execution, Docker-like CLI, and in-memory live fork. It is
+a development-readiness audit, not a security certification.
 
 ## Executive assessment
 
@@ -45,17 +47,20 @@ native-store implementation verification:
 * real Python containers with 1 MiB, 128 MiB, and 256 MiB touched application
   allocations and multiple guest threads.
 
-The real-PTY suite completed its five quick TTY runs, parent and child attach,
-and printed the expected `tty-exec-ok` result. The terminal exec connection then
-remained open until the suite's 60-second watchdog, which is recorded below as
-a compatibility defect.
+The original July 18 real-PTY run exposed a daemon transport EOF defect after
+`exec -it` had already produced its expected output and exit status. The July 19
+fix made daemon stdin pumping cancellable when the output side completes; the
+real-PTY regression now requires `exec -it` to exit promptly. Focused tests also
+cover preservation of application-modified private pages during live-fork
+write-protection and custom virtual-NIC address/MAC propagation.
 
 ## Performance measurements
 
-The host was an x86-64 Intel Xeon Platinum 8488C system. The host policy blocked
-unprivileged user namespaces, so real-container measurements used
-`--unsafe-no-host-isolation`. These are developer-build, single-host baseline
-numbers, not release guarantees.
+The measurements below are retained from the July 18 run and were not repeated
+for this documentation refresh. The host was an x86-64 Intel Xeon Platinum
+8488C system. The host policy blocked unprivileged user namespaces, so
+real-container measurements used `--unsafe-no-host-isolation`. These are
+developer-build, single-host baseline numbers, not release guarantees.
 
 ### Live-fork latency
 
@@ -272,6 +277,19 @@ daemon explicitly.
 CPU and memory limit compatibility additionally depends on delegated cgroup v2.
 TTOS fails closed when a requested hard limit cannot be enforced.
 
+### C1: guest identity is virtual, but image metadata coverage is finite
+
+Image layers are extracted as the invoking host user while TTOS records their
+OCI UID/GID values in a sidecar manifest. The LISAFS gofer substitutes those
+values in guest-visible metadata, and writable overlay ownership remains Sentry
+state. This is why arbitrary image users do not require subordinate host IDs.
+
+TTOS also enables Sentry SUID/SGID exec semantics by default for compatibility
+with helpers such as `sudo`; OCI `noNewPrivileges` still prevents elevation.
+This changes only emulated guest credentials. It does not grant host privilege
+to the Sentry or gofer, and it does not fill the uncommon xattr, file-capability,
+or device-node coverage gaps described below.
+
 ### C2: Docker compatibility is a CLI subset, not a Docker API
 
 Implemented commands intentionally resemble Docker, but there is no Docker
@@ -307,7 +325,10 @@ firewall behavior in userspace. Docker or CNI remains responsible for creating
 the veth/bridge topology, assigning addresses, NAT, and publishing ports. TTOS
 does not use that topology for `--network ttos`: it creates `ttos0` at
 `10.0.2.15/24`, an in-process `10.0.2.2` gateway, optional IPv4 TCP/UDP host
-proxying, and rootless host TCP listeners for `-p`.
+proxying, and rootless host TCP listeners for `-p`. `--ip` may replace the
+guest address and derives the gateway at `.2` in the selected `/24`;
+`--mac-address` may replace the default guest MAC. Both identities persist
+through restart and live fork.
 
 Live fork accepts canonical loopback and an unmodified TTOS virtual-NIC stack.
 The child gets a new link and proxy realm. Internal TCP/UDP endpoints and queues
@@ -344,26 +365,24 @@ privileged security xattrs, or executable file capabilities that the invoking
 host user cannot materialize. Add purpose-built OCI fixtures for these cases and
 define whether unsupported metadata is rejected or represented virtually.
 
-### C2: terminal exec teardown can linger
+### Resolved regression: terminal exec teardown
 
-The real-PTY audit observed correct output and exit status from `exec -it`, but
-the transport did not close until the 60-second test watchdog. This does not
-affect noninteractive exec or the completed public-image matrix, but interactive
-automation should treat it as an open defect.
+The July 18 audit observed a lingering `exec -it` transport after the guest had
+exited. The July 19 daemon transport fix cancels the stdin pump when the output
+side completes. The real-PTY suite retains a 60-second whole-command timeout as
+a deadlock guard; reaching it is now a test failure, not accepted behavior.
 
 ## Recommended acceptance gates
 
 Before calling TTOS a broadly compatible beta:
 
-1. Fix terminal exec EOF/teardown and make the real-PTY suite pass without a
-   watchdog intervention.
-2. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
-3. Shorten source downtime by separating metadata capture from child restore.
-4. Shard image-store locking and replace foreground full-store GC.
-5. Add multi-platform catalog keys and concurrent pull/materialization tests.
-6. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
+1. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
+2. Shorten source downtime by separating metadata capture from child restore.
+3. Shard image-store locking and replace foreground full-store GC.
+4. Add multi-platform catalog keys and concurrent pull/materialization tests.
+5. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
    zstd layers, foreign-layer policy, and private registry authentication.
-7. Expand the live-fork resource matrix only through explicit fail-closed
+6. Expand the live-fork resource matrix only through explicit fail-closed
    validators and branch-isolation tests.
 
 Until those gates pass, end users should run `ttos fork --check` immediately

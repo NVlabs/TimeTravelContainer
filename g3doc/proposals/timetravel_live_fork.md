@@ -45,8 +45,10 @@ latency rather than branch failure isolation.
 * Running different branches in different Sentry processes or hosts.
 * Supporting KVM, ptrace, or other gVisor platforms before systrap.
 * Migrating or persisting branches.
-* Cloning host networking, writable gofer mounts, host FDs, devices, GPU state,
-  packet mmap rings, KCOV, AIO, or io_uring.
+* Cloning host-network/hostinet or arbitrary external links, writable gofer
+  mounts, host FDs, devices, GPU state, packet mmap rings, KCOV, AIO, or
+  io_uring. TTOS's own virtual NIC is supported by an explicit parent-retain,
+  child-reset policy for external proxy flows.
 * Security isolation between branches in the same Sentry process.
 * Constant-time cloning of arbitrary kernel metadata. Pause time may scale with
   tasks, VMAs, FDs, pipes/socket queues, filesystem metadata, and allocated
@@ -199,10 +201,12 @@ different lifetime and rollback semantics.
 The child must therefore receive an external stop before `StartPaused()` starts
 its task goroutines.
 
-Checkpoint-only package-global state requires audit. Registered loopback UDP
-and established TCP endpoints now pass recursive-fork tests, but all remaining
-package-global registries remain Phase 7 audit targets and should be rejected if
-they cannot be proven Kernel-local.
+Checkpoint-only package-global state requires audit. Registered loopback UDP,
+established internal TCP endpoints, and the TTOS virtual-NIC hooks pass
+recursive-fork tests. The TTOS gateway/proxy is runtime-only rather than
+serialized: each child reconstructs a fresh realm and resets inherited external
+TCP endpoints. All remaining package-global registries must still reject unless
+they can be proven Kernel-local.
 
 ### `pkg/state`
 
@@ -343,16 +347,20 @@ queue and peer-topology tests pass.
 
 ### Networking
 
-Phase one rejects all network sockets. Later phases may allow:
+The implemented validator accepts:
 
-* loopback-only netstack TCP/UDP where all endpoints and queued packets are
+* canonical loopback netstack TCP/UDP where endpoints and queued packets are
   contained in the cloned Kernel;
-* purely internal Unix sockets.
+* purely internal Unix sockets without queued `SCM_RIGHTS`; and
+* the TTOS in-process virtual NIC with its unmodified routes and firewall state.
 
-Hostinet, plugin stacks, link endpoints connected to the host, port forwarding,
-and externally routed connections remain rejection cases until an explicit
-policy and implementation exist. Network namespaces and netstack package-global
-registries need an ownership audit before enabling this phase.
+The TTOS NIC has an explicit external-flow policy. The source keeps its
+gateway/proxy, published listener, and host-facing connections. The child
+reconstructs a fresh link and proxy realm, retains internal loopback/`ttos0`
+queues, resets inherited TCP endpoints that terminate outside the branch, and
+starts unpublished. Hostinet, plugin stacks, arbitrary external links,
+secondary network namespaces, and modified firewall/conntrack state remain
+rejection cases.
 
 ### `runsc/boot` and control plane
 
@@ -399,7 +407,8 @@ Initial policy:
 | SysV SHM | Clone through a branch-local page map with first-fault CoW |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
 | Loopback netstack socket | Clone on canonical loopback with unmodified default iptables |
-| Host TCP/UDP/Unix socket | Reject |
+| TTOS virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
+| Host TCP/UDP/Unix socket outside the TTOS proxy policy | Reject |
 | Writable or mutable gofer mount | Reject |
 | Host FD/device/FUSE/GPU | Reject |
 | AIO/io_uring/KCOV/packet mmap | Reject |
@@ -446,40 +455,28 @@ Failure handling:
 
 ## Implementation status
 
-As of 2026-07-16, Phase 0 passes on the systrap platform. The prototype streams
-Kernel metadata directly through an in-memory pipe, shares one platform and main
-MemoryFile, preserves the visible init PID, starts both kernels from an external
-stop, gives each branch a private VVAR page, and releases both kernels
-independently. The focused `pgalloc` owner-lifetime and systrap two-Kernel tests
-pass.
+As of 2026-07-19, the implementation spans the documented Phase 0-7 slices on
+systrap. Kernel metadata streams through an in-memory pipe; branches share the
+platform and eligible MemoryFile pages; visible PIDs and register state are
+preserved; and private anonymous memory, tmpfs, SysV SHM, managed volumes, and
+the in-memory OverlayFS upper detach copy-on-write. Focused tests cover
+bidirectional writes, application write faults, recursive branch trees, and
+arbitrary release order, while real multithreaded Python measurements confirm
+that resident application bytes are not eagerly copied.
 
-Phase 1 scaffolding is also implemented: private PMAs are write-protected using
-the existing MM fork COW transition, clone-mode state load acquires child PMA
-range references, and a focused anonymous-memory test verifies bidirectional
-write divergence. A one-iteration benchmark measured about 0.72 ms at 1 MiB and 0.55 ms at
-1 GiB of resident anonymous memory, confirming that clone time did not scale with
-resident bytes in this setup. A 100-cycle clone/release test also verifies that
-the parent PMA regains a unique page reference after every child release. A real
-multithreaded sandbox workload remains before the complete Phase 1 gate.
+`runsc` owns a transactional `SandboxFamily` with branch-local process,
+signal, wait, exec, event, console, pause/resume, and destroy control. The
+current gate accepts an immutable read-only gofer lower with directfs disabled,
+a writable in-memory OverlayFS upper, supported Sentry virtual filesystems and
+managed mounts, canonical loopback, and the TTOS virtual NIC. It validates
+reachable FD/VMA/mount/network resources before page-ownership mutation and
+continues to fail closed for host FDs, writable gofer state, unsupported special
+mappings, host networking, devices, and unrecognized implementations.
 
-The restricted Phase 2 gate is implemented. `runsc` now owns a `SandboxFamily`
-with explicit creating, paused, running, destroying, and failed states; exposes
-fork/list/pause/resume/destroy plus branch-local process, signal, and wait RPCs;
-and provides matching `runsc timetravel` commands. Fork publication is
-transactional, source run state is restored on failure, branch trees can fork
-recursively, each child has its own watchdog, and loader teardown destroys
-leaves before ancestors. A real loader test forks a running systrap sandbox,
-observes virtual PID 1 in both kernels, kills and waits for only the child, and
-verifies that the parent remains alive.
-
-That gate currently applies only to `NetworkNone`, a read-only gofer root with
-no additional OCI mounts, directfs disabled, and no host-facing process FDs at
-the fork boundary. The contained netstack is cloned and restored as an
-independent object. The child gofer filesystem borrows the immutable root
-connection and root FDID while owning descendant FDIDs; children are therefore
-destroyed before the default branch. Branch-local exec, events, foreground TTY
-signaling, writable roots, additional mounts, and general network resource
-closure remain later work.
+The early Phase 0-2 measurements and phase-by-phase paragraphs below are
+retained as implementation history. The current performance baseline and
+compatibility boundary are summarized in
+[timetravel_ttos_audit.md](timetravel_ttos_audit.md).
 
 The Phase 3 object-graph slice is validated for anonymous pipes, pure Sentry
 eventfds, epoll registration graphs, timerfds, signalfds, inotify watches, and
@@ -652,11 +649,14 @@ from the corresponding mappings in other branches.
 
 ### Phase 6: contained networking
 
-Refactor global netstack save state as needed, then enable internal Unix sockets
-and loopback-only netstack connections. External links remain rejected.
+Enable internal Unix sockets, loopback netstack connections, and the TTOS
+in-process virtual NIC through explicit validation and clone hooks. Host
+networking and arbitrary external links remain rejected; TTOS proxy flows use
+the documented source-retain/child-reset policy.
 
 Gate: connection state, packet queues, polling, and peer relationships clone
-without packets or wakeups crossing branches.
+without packets or wakeups crossing branches, while child external flows reset
+without interrupting the source.
 
 ### Phase 7: recursive fork and optimization
 
@@ -785,14 +785,16 @@ state, the fallback is a warm child Sentry process with sealed shared base
 generation-aware `memmap.File` handling and is expected to have higher latency;
 it should not be selected before the simpler architecture is tested.
 
-## First implementation slice
+## Historical first implementation slice
 
-The first code change after this design should implement only Phase 0 plus the
-minimum owner-lifetime scaffolding needed to avoid double destruction. It
-should not yet add tmpfs CoW, networking, or an OCI-visible command. The result
-will answer the central architectural question with executable evidence:
+The first code change implemented only Phase 0 plus the minimum owner-lifetime
+scaffolding needed to avoid double destruction. It intentionally omitted tmpfs
+CoW, networking, and an OCI-visible command, answering the central
+architectural question with executable evidence:
 
 > Can two independently started gVisor Kernels, cloned through the state graph,
 > safely share one systrap platform and one page allocator inside a Sentry?
 
-Only after that test passes should Phase 1 modify private-memory CoW paths.
+That gate passed. The later phases described above subsequently added
+private-memory and filesystem CoW, resource validation, networking, recursive
+families, and the user-facing TTOS lifecycle.
