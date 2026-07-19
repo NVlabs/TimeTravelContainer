@@ -18,11 +18,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	stdsync "sync"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -33,6 +36,38 @@ import (
 type recordingMappingSpace struct {
 	invalidated bool
 	opts        memmap.InvalidateOpts
+}
+
+type lockDetectingIO struct {
+	*usermem.BytesIO
+	mu stdsync.RWMutex
+}
+
+func (i *lockDetectingIO) CopyIn(ctx context.Context, addr hostarch.Addr, dst []byte, opts usermem.IOOpts) (int, error) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.BytesIO.CopyIn(ctx, addr, dst, opts)
+}
+
+func (i *lockDetectingIO) CopyInTo(ctx context.Context, ars hostarch.AddrRangeSeq, dst safemem.Writer, opts usermem.IOOpts) (int64, error) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.BytesIO.CopyInTo(ctx, ars, dst, opts)
+}
+
+type lockDetectingMappingSpace struct {
+	io          *lockDetectingIO
+	invalidated bool
+	reentrant   bool
+}
+
+func (ms *lockDetectingMappingSpace) Invalidate(_ hostarch.AddrRange, _ memmap.InvalidateOpts) {
+	ms.invalidated = true
+	if !ms.io.mu.TryLock() {
+		ms.reentrant = true
+		return
+	}
+	ms.io.mu.Unlock()
 }
 
 func (ms *recordingMappingSpace) Invalidate(_ hostarch.AddrRange, opts memmap.InvalidateOpts) {
@@ -63,6 +98,52 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 	if ms.opts.InvalidatePrivate {
 		t.Fatal("prepareLiveFork invalidated private PMAs containing application modifications")
+	}
+}
+
+func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+
+	data := bytes.Repeat([]byte{'a'}, hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
+	}
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	guarded := &lockDetectingIO{BytesIO: &usermem.BytesIO{Bytes: bytes.Repeat([]byte{'b'}, hostarch.PageSize)}}
+	ms := &lockDetectingMappingSpace{io: guarded}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := rf.AddMapping(ctx, ms, ar, 0, true); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	defer rf.RemoveMapping(ctx, ms, ar, 0, true)
+	rf.prepareLiveFork()
+	ms.invalidated = false
+
+	src := usermem.IOSequence{
+		IO:    guarded,
+		Addrs: hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: 0, End: hostarch.PageSize}),
+	}
+	if n, err := fd.PWrite(ctx, src, 0, vfs.WriteOptions{}); err != nil || n != int64(hostarch.PageSize) {
+		t.Fatalf("CoW PWrite: n=%d err=%v", n, err)
+	}
+	if !ms.invalidated {
+		t.Fatal("CoW PWrite did not invalidate the file mapping")
+	}
+	if ms.reentrant {
+		t.Fatal("CoW PWrite invalidated the source MemoryManager while its read lock was held")
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := fd.PRead(ctx, usermem.BytesIOSequence(got), 0, vfs.ReadOptions{}); err != nil || n != int64(len(got)) {
+		t.Fatalf("PRead after CoW write: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, guarded.Bytes) {
+		t.Fatal("CoW PWrite data mismatch")
 	}
 }
 

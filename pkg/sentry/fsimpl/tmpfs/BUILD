@@ -173,6 +173,7 @@ go_test(
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",

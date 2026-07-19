@@ -730,7 +730,23 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 
 	// Perform the write.
 	rw := getRegularFileReadWriter(f, offset, pgalloc.MemoryCgroupIDFromContext(ctx))
-	n, err := src.CopyInTo(ctx, rw)
+	pageEnd, _ := hostarch.Addr(end).RoundUp()
+	writeRange := memmap.MappableRange{Start: uint64(hostarch.Addr(offset).RoundDown()), End: uint64(pageEnd)}
+	f.dataMu.RLock()
+	shared := !f.cow.IsEmptyRange(writeRange)
+	f.dataMu.RUnlock()
+	var n int64
+	if shared {
+		// WriteFromBlocks must invalidate this file's mappings before it
+		// detaches live-fork-shared pages. CopyInTo may call WriteFromBlocks
+		// while holding the source MemoryManager's activeMu for reading. If
+		// this file is mapped in that same MemoryManager, invalidation needs
+		// activeMu for writing and deadlocks recursively. Bounce only CoW
+		// writes so all source-MM locks are released before invalidation.
+		n, err = copyInToWithBounce(ctx, src, rw)
+	} else {
+		n, err = src.CopyInTo(ctx, rw)
+	}
 
 	f.inode.touchCMtimeLocked()
 	for {
@@ -743,6 +759,38 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	f.inode.xattrs.KillPriv()
 	putRegularFileReadWriter(rw)
 	return n, n + offset, err
+}
+
+// copyInToWithBounce copies src to dst without calling dst while src's
+// user-memory implementation may hold MemoryManager locks.
+func copyInToWithBounce(ctx context.Context, src usermem.IOSequence, dst safemem.Writer) (int64, error) {
+	const maxBounce = 64 << 10
+	buf := make([]byte, min(src.NumBytes(), maxBounce))
+	var done int64
+	for src.NumBytes() != 0 {
+		want := min(src.NumBytes(), int64(len(buf)))
+		n, readErr := src.TakeFirst64(want).CopyIn(ctx, buf[:want])
+		if n != 0 {
+			written, writeErr := dst.WriteFromBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:n])))
+			done += int64(written)
+			if writeErr != nil {
+				return done, writeErr
+			}
+			if written != uint64(n) {
+				// safemem.Writer permits a partial write without an error, and
+				// regularFileReadWriter uses that for partial ENOSPC writes.
+				return done, nil
+			}
+			src = src.DropFirst(n)
+		}
+		if readErr != nil {
+			return done, readErr
+		}
+		if n == 0 {
+			return done, io.ErrNoProgress
+		}
+	}
+	return done, nil
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
