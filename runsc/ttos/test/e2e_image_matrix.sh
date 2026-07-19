@@ -98,6 +98,7 @@ ANON_NOCOPY="$PREFIX-anon-nocopy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 NAT_FIXTURE_PORT=$((20000 + (($$ + 1000) % 30000)))
 PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
+CHILD_PUBLISHED_PORT=$((20000 + (($$ + 3000) % 30000)))
 NAT_FIXTURE_PID=
 VOLUME="$PREFIX-state"
 QUOTA_VOLUME="$PREFIX-quota"
@@ -354,12 +355,31 @@ ttos exec "$VNET@child" sh -c 'echo child >/www/index.html'
   fail "published host port switched away from the source branch after fork"
 [ "$(ttos exec "$VNET@child" cat /www/index.html)" = child ] ||
   fail "forked TTOS branch did not retain its branch-local network service state"
+ttos port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
+[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
+  fail "dynamically published child port did not reach the forked branch"
+ttos port ls "$VNET@child" | grep -q "127.0.0.1:$CHILD_PUBLISHED_PORT" ||
+  fail "branch port listing omitted the dynamically published child port"
 ttos fork "$VNET" "$VNET@second" >/dev/null
 ttos fork "$VNET@child" "$VNET@grandchild" >/dev/null
 ttos_daemon_crash
 ttos_daemon_start
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published TTOS port did not survive daemon restart reconciliation"
+[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
+  fail "dynamically published child port did not survive daemon restart reconciliation"
+ttos port unpublish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
+if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
+  fail "unpublished child port remained reachable"
+fi
+ttos port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
+ttos branch rm "$VNET@child"
+if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
+  fail "deleted child branch left its published port reachable"
+fi
+if ttos port ls --json "$VNET" | grep -q '"branch_id": "child"'; then
+  fail "deleted child branch retained published-port metadata"
+fi
 ttos rm --force "$VNET"
 
 ttos run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \

@@ -334,13 +334,16 @@ Live fork accepts canonical loopback and an unmodified TTOS virtual-NIC stack.
 The child gets a new link and proxy realm. Internal TCP/UDP endpoints and queues
 clone; established or connecting child TCP endpoints that terminate in NAT or
 a published-port proxy are reset. The parent retains its proxy realm, existing
-connections, and published listener. A child is not published automatically.
+connections, and published listener. A child is not published automatically;
+`ttos port publish CONTAINER@BRANCH ...` can assign an independent persistent
+listener to any live child after the fork.
 
 This gives useful fail-soft semantics without pretending that one host TCP flow
 can be duplicated. It does not replay bytes arriving from outside during the
-pause window, preserve a child's external TCP session, or provide a stable
-public endpoint for each branch. NAT is presently IPv4 TCP/UDP; publication is
-IPv4 TCP only. Modified iptables/conntrack, nftables, host mode, secondary
+pause window or preserve a child's external TCP session. Explicit branch port
+bindings provide stable public endpoints and are reconciled after daemon
+restart. NAT is presently IPv4 TCP/UDP; publication is IPv4 TCP only. Modified
+iptables/conntrack, nftables, host mode, secondary
 network namespaces, external sandbox links, and plugin stacks still reject.
 
 ### C2: one image reference stores one selected platform

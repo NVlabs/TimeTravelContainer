@@ -110,6 +110,45 @@ func (s *daemonServer) OwnPortSidecar(key string, command *exec.Cmd) error {
 	return s.ownSidecar("port", key, command)
 }
 
+// StopPortSidecar terminates a listener owned by this daemon. The boolean is
+// false when the listener survived an older daemon and must be found through
+// its advisory lock instead.
+func (s *daemonServer) StopPortSidecar(key string) (bool, error) {
+	s.sidecarMu.Lock()
+	command := s.sidecars[key]
+	s.sidecarMu.Unlock()
+	if command == nil || command.Process == nil {
+		return false, nil
+	}
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return true, err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.sidecarMu.Lock()
+		owned := s.sidecars[key] == command
+		s.sidecarMu.Unlock()
+		if !owned {
+			return true, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return true, err
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s.sidecarMu.Lock()
+		owned := s.sidecars[key] == command
+		s.sidecarMu.Unlock()
+		if !owned {
+			return true, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true, fmt.Errorf("port sidecar %q did not exit", key)
+}
+
 func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd) error {
 	s.sidecarMu.Lock()
 	if _, ok := s.sidecars[key]; ok {
@@ -621,6 +660,8 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		return len(args) > 1 && (args[1] == "pull" || args[1] == "rm" || args[1] == "remove")
 	case "branch":
 		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
+	case "port":
+		return len(args) > 1 && (args[1] == "publish" || args[1] == "unpublish")
 	case "volume":
 		return len(args) > 1 && (args[1] == "create" || args[1] == "export" || args[1] == "import" || args[1] == "commit" || args[1] == "rm" || args[1] == "remove")
 	default:
@@ -748,8 +789,8 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			}
 			target := selector{container: family.ID, branch: branch.ID}
 			_, _ = backend.ensureConsoleDrain(target, false)
-			if branch.ID == defaultBranchID && containerErr == nil {
-				_ = backend.ensurePublishedPorts(container)
+			if containerErr == nil {
+				_ = backend.ensurePublishedPortsForBranch(container, branch.ID)
 			}
 			sessions, err := backend.execSessions(target)
 			if err != nil {

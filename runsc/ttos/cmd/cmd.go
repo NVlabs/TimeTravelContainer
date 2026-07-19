@@ -289,6 +289,7 @@ Commands:
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
+  port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                   Manage family-local tmpfs volumes
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--unsafe-no-host-isolation]
@@ -307,6 +308,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 		usage := map[string]string{
 			"container":  "Usage: ttos container COMMAND",
 			"image":      "Usage: ttos image COMMAND",
+			"port":       "Usage: ttos port publish|ls|unpublish [OPTIONS]",
 			"volume":     "Usage: ttos volume COMMAND",
 			"branch":     "Usage: ttos branch rm TARGET [TARGET...]",
 			"completion": "Usage: ttos completion bash|zsh|fish",
@@ -332,6 +334,9 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"volume rm":         "Usage: ttos volume rm VOLUME [VOLUME...]",
 			"volume remove":     "Usage: ttos volume remove VOLUME [VOLUME...]",
 			"branch rm":         "Usage: ttos branch rm TARGET [TARGET...]",
+			"port publish":      "Usage: ttos port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+			"port ls":           "Usage: ttos port ls [--json] CONTAINER[@BRANCH]",
+			"port unpublish":    "Usage: ttos port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"exec wait":         "Usage: ttos exec wait CONTAINER@BRANCH:EXEC_ID",
 		}
 		if text, ok := usage[args[0]+" "+args[1]]; ok {
@@ -395,6 +400,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runRestart(args[1:], stdout, stderr, backend)
 	case "branch":
 		err = runBranch(args[1:], stdout, backend)
+	case "port":
+		err = runPort(args[1:], stdout, stderr, backend)
 	case "volume":
 		err = runVolume(args[1:], stdout, stderr, backend)
 	case "completion":
@@ -4199,6 +4206,103 @@ func runBranch(args []string, stdout io.Writer, backend backend) error {
 	return nil
 }
 
+func portBindingSpec(binding ttosbundle.PortBinding) string {
+	return fmt.Sprintf("%s:%d:%d/%s", binding.HostIP, binding.HostPort, binding.ContainerPort, binding.Protocol)
+}
+
+func parsePortCommandBinding(value, branch string) (ttosbundle.PortBinding, error) {
+	bindings, err := parsePublishedPorts([]string{value})
+	if err != nil {
+		return ttosbundle.PortBinding{}, err
+	}
+	binding := bindings[0]
+	binding.BranchID = branch
+	return binding, nil
+}
+
+func runPort(args []string, stdout, stderr io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttos port publish|ls|unpublish [OPTIONS]")
+	}
+	switch args[0] {
+	case "publish":
+		if len(args) != 3 {
+			return errors.New("usage: ttos port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
+		}
+		target, err := parseSelector(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", args[1], err)
+		}
+		binding, err := parsePortCommandBinding(args[2], target.branch)
+		if err != nil {
+			return err
+		}
+		if err := backend.publishPort(target, binding); err != nil {
+			return fmt.Errorf("publishing port for %s: %w", target, err)
+		}
+		fmt.Fprintf(stdout, "%s %s\n", target, portBindingSpec(binding))
+		return nil
+	case "ls":
+		fs := flag.NewFlagSet("port ls", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		jsonOutput := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("usage: ttos port ls [--json] CONTAINER[@BRANCH]")
+		}
+		value := fs.Arg(0)
+		target, err := parseSelector(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
+		}
+		bindings, err := backend.listPorts(target.container)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(value, "@") {
+			filtered := bindings[:0]
+			for _, binding := range bindings {
+				if binding.Branch() == target.branch {
+					filtered = append(filtered, binding)
+				}
+			}
+			bindings = filtered
+		}
+		if *jsonOutput {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(bindings)
+		}
+		table := tabwriter.NewWriter(stdout, 0, 4, 2, 32, 0)
+		fmt.Fprintln(table, "TARGET\tHOST ENDPOINT\tCONTAINER PORT\tPROTOCOL")
+		for _, binding := range bindings {
+			fmt.Fprintf(table, "%s@%s\t%s:%d\t%d\t%s\n", target.container, binding.Branch(), binding.HostIP, binding.HostPort, binding.ContainerPort, binding.Protocol)
+		}
+		return table.Flush()
+	case "unpublish":
+		if len(args) != 3 {
+			return errors.New("usage: ttos port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]")
+		}
+		target, err := parseSelector(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", args[1], err)
+		}
+		binding, err := parsePortCommandBinding(args[2], target.branch)
+		if err != nil {
+			return err
+		}
+		if err := backend.unpublishPort(target, binding); err != nil {
+			return fmt.Errorf("unpublishing port for %s: %w", target, err)
+		}
+		fmt.Fprintf(stdout, "%s %s\n", target, portBindingSpec(binding))
+		return nil
+	default:
+		return fmt.Errorf("unknown port command %q", args[0])
+	}
+}
+
 type selector struct {
 	container string
 	branch    string
@@ -4374,6 +4478,9 @@ type backend interface {
 	processes(target selector) ([]ProcessInfo, error)
 	rootfsSize(target selector) (uint64, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
+	publishPort(target selector, binding ttosbundle.PortBinding) error
+	listPorts(container string) ([]ttosbundle.PortBinding, error)
+	unpublishPort(target selector, binding ttosbundle.PortBinding) error
 	pause(target selector) error
 	resume(target selector) error
 	destroy(target selector) error
@@ -4394,6 +4501,7 @@ type backend interface {
 type consoleSidecarOwner interface {
 	OwnConsoleSidecar(key string, command *exec.Cmd) error
 	OwnPortSidecar(key string, command *exec.Cmd) error
+	StopPortSidecar(key string) (bool, error)
 }
 
 type runtimeBackend struct {
@@ -6342,6 +6450,9 @@ func buildInspectInfo(container ttosbundle.ContainerInfo, spec *specs.Spec, fami
 	}
 	portBindings := make(map[string][]InspectPortBinding)
 	for _, binding := range container.PublishedPorts {
+		if binding.Branch() != defaultBranchID {
+			continue
+		}
 		key := fmt.Sprintf("%d/%s", binding.ContainerPort, binding.Protocol)
 		portBindings[key] = append(portBindings[key], InspectPortBinding{
 			HostIP: binding.HostIP, HostPort: strconv.Itoa(int(binding.HostPort)),
@@ -6745,7 +6856,7 @@ func (b *runtimeBackend) launch(info ttosbundle.ContainerInfo, detach, interacti
 		}
 		return status, err
 	}
-	if err := b.ensurePublishedPorts(info); err != nil {
+	if err := b.ensurePublishedPortsForBranch(info, defaultBranchID); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
 			return 1, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
@@ -6767,12 +6878,19 @@ func (b *runtimeBackend) launch(info ttosbundle.ContainerInfo, detach, interacti
 
 func portSidecarPaths(dataRoot, container string, binding ttosbundle.PortBinding) (lockPath, errorPath string) {
 	name := strings.NewReplacer(".", "_", ":", "_", "/", "_").Replace(binding.HostIP)
-	base := filepath.Join(dataRoot, "containers", container, "ports", fmt.Sprintf("%s-%d-%d-%s", name, binding.HostPort, binding.ContainerPort, binding.Protocol))
+	prefix := ""
+	if binding.Branch() != defaultBranchID {
+		prefix = "branch-" + binding.Branch() + "-"
+	}
+	base := filepath.Join(dataRoot, "containers", container, "ports", fmt.Sprintf("%s%s-%d-%d-%s", prefix, name, binding.HostPort, binding.ContainerPort, binding.Protocol))
 	return base + ".lock", base + ".log"
 }
 
-func (b *runtimeBackend) ensurePublishedPorts(info ttosbundle.ContainerInfo) error {
+func (b *runtimeBackend) ensurePublishedPortsForBranch(info ttosbundle.ContainerInfo, branch string) error {
 	for _, binding := range info.PublishedPorts {
+		if binding.Branch() != branch {
+			continue
+		}
 		if err := b.ensurePublishedPort(info, binding); err != nil {
 			return err
 		}
@@ -6811,7 +6929,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttosbundle.ContainerInfo, bind
 	defer readyReader.Close()
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
 	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
-	args = append(args, "port-forward", "--branch="+defaultBranchID, "--ready-fd=4", info.ID, endpoint)
+	args = append(args, "port-forward", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
 	command := exec.Command(b.runsc, args...)
 	command.Stdout = errorFile
 	command.Stderr = errorFile
@@ -6846,6 +6964,225 @@ func (b *runtimeBackend) ensurePublishedPort(info ttosbundle.ContainerInfo, bind
 		}
 	} else if err := command.Process.Release(); err != nil {
 		return fmt.Errorf("releasing published-port process: %w", err)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return "", err
+	}
+	for _, family := range families {
+		if family.ID != target.container {
+			continue
+		}
+		for _, branch := range family.Branches {
+			if branch.ID == target.branch {
+				return branch.State, nil
+			}
+		}
+		return "", fmt.Errorf("branch %q does not exist", target.branch)
+	}
+	return "", fmt.Errorf("container %q is not running", target.container)
+}
+
+func (b *runtimeBackend) publishPort(target selector, binding ttosbundle.PortBinding) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	binding.BranchID = target.branch
+	state, err := b.branchRuntimeState(target)
+	if err != nil {
+		return err
+	}
+	if state != "running" && state != "paused" {
+		return fmt.Errorf("branch %q is %s", target.branch, state)
+	}
+	store := b.containerStore()
+	if err := store.AddPortBinding(target.container, binding); err != nil {
+		return err
+	}
+	info.PublishedPorts = append(info.PublishedPorts, binding)
+	if err := b.ensurePublishedPort(info, binding); err != nil {
+		rollbackErr := store.RemovePortBinding(target.container, binding)
+		if rollbackErr != nil {
+			return fmt.Errorf("starting listener: %w (metadata rollback also failed: %v)", err, rollbackErr)
+		}
+		return fmt.Errorf("starting listener: %w", err)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) listPorts(container string) ([]ttosbundle.PortBinding, error) {
+	info, err := b.resolveContainer(container)
+	if err != nil {
+		return nil, err
+	}
+	return append([]ttosbundle.PortBinding(nil), info.PublishedPorts...), nil
+}
+
+func portForwardProcessMatches(pid int, container, branch, endpoint string) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return false
+	}
+	fields := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+	want := map[string]bool{
+		"port-forward":       false,
+		"--branch=" + branch: false,
+		container:            false,
+		endpoint:             false,
+	}
+	for _, field := range fields {
+		if _, ok := want[field]; ok {
+			want[field] = true
+		}
+	}
+	for _, found := range want {
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func portLockHolder(lockPath, container, branch, endpoint string) (int, error) {
+	want, err := os.Stat(lockPath)
+	if err != nil {
+		return 0, err
+	}
+	processes, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	for _, process := range processes {
+		pid, err := strconv.Atoi(process.Name())
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		fds, err := os.ReadDir(filepath.Join("/proc", process.Name(), "fd"))
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			info, err := os.Stat(filepath.Join("/proc", process.Name(), "fd", fd.Name()))
+			if err == nil && os.SameFile(want, info) && portForwardProcessMatches(pid, container, branch, endpoint) {
+				return pid, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("published-port lock is held by an unknown process")
+}
+
+func waitForPortLock(file *os.File, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return nil
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for published-port listener to exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func cleanupPortSidecarFiles(lockPath, errorPath string) error {
+	var errs []error
+	for _, name := range []string{lockPath, errorPath} {
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *runtimeBackend) stopPublishedPort(info ttosbundle.ContainerInfo, binding ttosbundle.PortBinding) error {
+	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	if b.consoleSidecars != nil {
+		stopped, err := b.consoleSidecars.StopPortSidecar(lockPath)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			return cleanupPortSidecarFiles(lockPath, errorPath)
+		}
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		return cleanupPortSidecarFiles(lockPath, errorPath)
+	} else if !errors.Is(err, syscall.EWOULDBLOCK) {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
+	pid, err := portLockHolder(lockPath, info.ID, binding.Branch(), endpoint)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	if err := waitForPortLock(lockFile, 2*time.Second); err != nil {
+		if killErr := syscall.Kill(pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return fmt.Errorf("%w; killing listener also failed: %v", err, killErr)
+		}
+		if lockErr := waitForPortLock(lockFile, 3*time.Second); lockErr != nil {
+			return lockErr
+		}
+	}
+	_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	return cleanupPortSidecarFiles(lockPath, errorPath)
+}
+
+func (b *runtimeBackend) stopPublishedPortsForBranch(info ttosbundle.ContainerInfo, branch string) error {
+	var errs []error
+	for _, binding := range info.PublishedPorts {
+		if binding.Branch() != branch {
+			continue
+		}
+		if err := b.stopPublishedPort(info, binding); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", portBindingSpec(binding), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *runtimeBackend) unpublishPort(target selector, binding ttosbundle.PortBinding) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	binding.BranchID = target.branch
+	found := false
+	for _, existing := range info.PublishedPorts {
+		if existing.Branch() == binding.Branch() && existing.HostIP == binding.HostIP && existing.HostPort == binding.HostPort && existing.ContainerPort == binding.ContainerPort && existing.Protocol == binding.Protocol {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("published port is not configured on branch %q", target.branch)
+	}
+	if err := b.stopPublishedPort(info, binding); err != nil {
+		return fmt.Errorf("stopping listener: %w", err)
+	}
+	if err := b.containerStore().RemovePortBinding(target.container, binding); err != nil {
+		restoreErr := b.ensurePublishedPort(info, binding)
+		if restoreErr != nil {
+			return fmt.Errorf("persisting removal: %w (listener restoration also failed: %v)", err, restoreErr)
+		}
+		return fmt.Errorf("persisting removal: %w; listener was restored", err)
 	}
 	return nil
 }
@@ -7500,7 +7837,7 @@ func (b *runtimeBackend) resume(target selector) error {
 }
 
 func (b *runtimeBackend) destroy(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
@@ -7536,12 +7873,16 @@ func (b *runtimeBackend) destroy(target selector) error {
 	if err := destroyRuntime(); err != nil {
 		return err
 	}
+	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
 		if err := b.containerStore().MarkBranchDeleted(target.container, target.branch); err != nil {
+			if portErr != nil {
+				return fmt.Errorf("persisting deletion of %s: %w (stopping published ports also failed: %v)", target, err, portErr)
+			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
 		}
 	}
-	return nil
+	return portErr
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
@@ -7632,6 +7973,14 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	store := ttosbundle.Store{Root: b.dataRoot}
 	if target.branch != defaultBranchID {
+		if info, err := store.LoadContainer(target.container); err == nil {
+			if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttos: warning: stopping published ports for exited %s: %v\n", target, err)
+			}
+			if err := store.RemovePortBindingsForBranch(target.container, target.branch); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttos: warning: removing published-port metadata for exited %s: %v\n", target, err)
+			}
+		}
 		if err := store.UpdateBranchState(target.container, target.branch, "exited"); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttos: warning: recording branch exit state for %s: %v\n", target, err)
 		}

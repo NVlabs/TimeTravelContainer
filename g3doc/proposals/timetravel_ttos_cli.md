@@ -48,6 +48,8 @@ Sentry-managed `ttos0` virtual NIC, optional persistent `--ip` and
 `--nat`, and persistent IPv4 TCP publication with `-p`/`--publish`. Live fork
 keeps the source proxy and connections, gives the child a fresh proxy realm,
 and resets inherited external child TCP flows instead of rejecting the fork.
+`ttos port publish|ls|unpublish` manages independent persistent listeners for
+the main branch or any existing live child.
 An opt-in internal-console substrate now provides branch-local Sentry pipes for
 non-TTY containers and Sentry devpts PTYs for terminal containers, with
 nonblocking control RPCs, explicit stdin close, terminal resize, and saved
@@ -227,7 +229,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       Docker-style IPv4 TCP `-p`/`--publish`. Persist bindings, reconcile
       listeners after daemon restart, retain the source listener across fork,
       reset inherited child external TCP flows, and leave child branches
-      unpublished until an explicit branch-publication surface is designed.
+      unpublished until explicitly assigned a listener with branch-aware
+      `ttos port publish|ls|unpublish` commands.
 - [x] Add persistent Docker-style `--ip` and `--mac-address` configuration for
       the TTOS virtual NIC. Derive the branch-local `.2` gateway from the
       selected `/24`, validate unicast IPv4 and 48-bit MAC values, and retain

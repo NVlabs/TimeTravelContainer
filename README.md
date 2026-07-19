@@ -160,6 +160,14 @@ manager, or `CAP_NET_ADMIN`.
 - The child receives a fresh proxy realm; inherited external TCP flows are
   reset, while internal loopback and `ttos0` state is cloned.
 - A child branch is not automatically assigned a published host port.
+- `ttos port publish`, `port ls`, and `port unpublish` manage persistent TCP
+  listeners for `main` or any existing live fork without restarting it.
+
+```shell
+ttos port publish web@child 127.0.0.1:8081:80
+ttos port ls web
+ttos port unpublish web@child 127.0.0.1:8081:80
+```
 
 The default `--network none` provides a forkable loopback-only netstack.
 `--network host` is available for conventional execution but is not

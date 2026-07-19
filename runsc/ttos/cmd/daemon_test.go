@@ -176,6 +176,29 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	}
 }
 
+func TestDaemonStopsOwnedPortSidecar(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatalf("starting port sidecar fixture: %v", err)
+	}
+	server := &daemonServer{}
+	if err := server.OwnPortSidecar("port-lock", command); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("OwnPortSidecar: %v", err)
+	}
+	stopped, err := server.StopPortSidecar("port-lock")
+	if err != nil || !stopped {
+		t.Fatalf("StopPortSidecar=(%t, %v), want true, nil", stopped, err)
+	}
+	if command.ProcessState == nil {
+		t.Fatal("port sidecar was not reaped")
+	}
+	if stopped, err := server.StopPortSidecar("missing"); err != nil || stopped {
+		t.Fatalf("StopPortSidecar missing=(%t, %v), want false, nil", stopped, err)
+	}
+}
+
 func TestDaemonCommandUsesStdin(t *testing.T) {
 	for _, test := range []struct {
 		args []string
@@ -211,6 +234,9 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"volume", "import", "--input", "/tmp/cache.tar", "cache"}, true},
 		{[]string{"volume", "commit", "demo", "cache"}, true},
 		{[]string{"branch", "remove", "demo"}, true},
+		{[]string{"port", "publish", "demo", "8080:80"}, true},
+		{[]string{"port", "unpublish", "demo", "8080:80"}, true},
+		{[]string{"port", "ls", "demo"}, false},
 		{[]string{"run", "-d", "alpine"}, true},
 		{[]string{"run", "--detach=false", "alpine"}, false},
 		{[]string{"run", "alpine"}, false},

@@ -95,13 +95,22 @@ type BranchInfo struct {
 	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
 }
 
-// PortBinding describes a TCP listener managed by TTOS for the main branch.
-// Forked children intentionally start with no published host listeners.
+// PortBinding describes a TCP listener managed by TTOS for one live branch.
+// An empty BranchID is the legacy representation of the main branch.
 type PortBinding struct {
 	HostIP        string `json:"host_ip"`
 	HostPort      uint16 `json:"host_port"`
 	ContainerPort uint16 `json:"container_port"`
 	Protocol      string `json:"protocol"`
+	BranchID      string `json:"branch_id,omitempty"`
+}
+
+// Branch returns the branch targeted by p, normalizing legacy main bindings.
+func (p PortBinding) Branch() string {
+	if p.BranchID == "" {
+		return "main"
+	}
+	return p.BranchID
 }
 
 // ContainerInfo is the persistent configuration needed to start a container.
@@ -758,6 +767,34 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 	return "", "", errors.New("could not allocate a unique container ID")
 }
 
+func normalizePortBinding(binding PortBinding) (PortBinding, error) {
+	address, err := netip.ParseAddr(binding.HostIP)
+	if err != nil || !address.Is4() {
+		return PortBinding{}, fmt.Errorf("invalid published-port host address %q", binding.HostIP)
+	}
+	if binding.HostPort == 0 || binding.ContainerPort == 0 {
+		return PortBinding{}, fmt.Errorf("published ports must be between 1 and 65535")
+	}
+	if binding.Protocol != "tcp" {
+		return PortBinding{}, fmt.Errorf("unsupported published-port protocol %q", binding.Protocol)
+	}
+	binding.HostIP = address.String()
+	binding.BranchID = binding.Branch()
+	if err := validateObjectName("branch", binding.BranchID); err != nil {
+		return PortBinding{}, err
+	}
+	return binding, nil
+}
+
+func portHostEndpoint(binding PortBinding) string {
+	return netip.AddrPortFrom(netip.MustParseAddr(binding.HostIP), binding.HostPort).String() + "/" + binding.Protocol
+}
+
+func samePortBinding(a, b PortBinding) bool {
+	return a.Branch() == b.Branch() && a.HostIP == b.HostIP && a.HostPort == b.HostPort &&
+		a.ContainerPort == b.ContainerPort && a.Protocol == b.Protocol
+}
+
 // LoadContainer resolves an exact name, full ID, or unambiguous ID prefix.
 // Legacy name-keyed records are returned with ID set to their directory key.
 func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
@@ -838,11 +875,30 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if _, ok := seenBranches["main"]; !ok {
 		return ContainerInfo{}, fmt.Errorf("container %q branch metadata omits main", key)
 	}
+	seenPortEndpoints := make(map[string]struct{}, len(info.PublishedPorts))
+	for i := range info.PublishedPorts {
+		binding, err := normalizePortBinding(info.PublishedPorts[i])
+		if err != nil {
+			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
+		}
+		if _, ok := seenBranches[binding.BranchID]; !ok {
+			return ContainerInfo{}, fmt.Errorf("container %q published port targets unknown branch %q", key, binding.BranchID)
+		}
+		endpoint := portHostEndpoint(binding)
+		if _, ok := seenPortEndpoints[endpoint]; ok {
+			return ContainerInfo{}, fmt.Errorf("container %q contains duplicate published host endpoint %s", key, endpoint)
+		}
+		seenPortEndpoints[endpoint] = struct{}{}
+		info.PublishedPorts[i] = binding
+	}
 	networkMode, err := normalizeNetworkMode(info.NetworkMode)
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
+	if len(info.PublishedPorts) != 0 && networkMode != "ttos" {
+		return ContainerInfo{}, fmt.Errorf("container %q publishes ports with network mode %q", key, networkMode)
+	}
 	if info.LogDriver == "" {
 		info.LogDriver = DefaultLogDriver
 	}
@@ -1047,6 +1103,15 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 			branch.State = "exited"
 		}
 	}
+	if state == "running" {
+		bindings := info.PublishedPorts[:0]
+		for _, binding := range info.PublishedPorts {
+			if binding.Branch() == "main" {
+				bindings = append(bindings, binding)
+			}
+		}
+		info.PublishedPorts = bindings
+	}
 	switch state {
 	case "running":
 		info.StartedAt = &now
@@ -1059,6 +1124,101 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 		return fmt.Errorf("updating container %q: %w", name, err)
 	}
 	return nil
+}
+
+// AddPortBinding atomically records a branch-local published TCP listener.
+func (s Store) AddPortBinding(name string, binding PortBinding) error {
+	binding, err := normalizePortBinding(binding)
+	if err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	if info.NetworkMode != "ttos" {
+		return fmt.Errorf("container %q uses network mode %q, not ttos", info.Name, info.NetworkMode)
+	}
+	branchFound := false
+	for _, branch := range info.Branches {
+		if branch.ID != binding.BranchID {
+			continue
+		}
+		if branch.State != "running" && branch.State != "paused" {
+			return fmt.Errorf("branch %q is %s", binding.BranchID, branch.State)
+		}
+		branchFound = true
+		break
+	}
+	if !branchFound {
+		return fmt.Errorf("branch %q is not recorded", binding.BranchID)
+	}
+	endpoint := portHostEndpoint(binding)
+	for _, existing := range info.PublishedPorts {
+		if samePortBinding(existing, binding) {
+			return fmt.Errorf("published port for %s already exists on branch %q", endpoint, binding.BranchID)
+		}
+		if portHostEndpoint(existing) == endpoint {
+			return fmt.Errorf("published host endpoint %s is already assigned to branch %q", endpoint, existing.Branch())
+		}
+	}
+	info.PublishedPorts = append(info.PublishedPorts, binding)
+	sort.Slice(info.PublishedPorts, func(i, j int) bool {
+		a, b := info.PublishedPorts[i], info.PublishedPorts[j]
+		if a.Branch() != b.Branch() {
+			return a.Branch() < b.Branch()
+		}
+		if a.HostIP != b.HostIP {
+			return a.HostIP < b.HostIP
+		}
+		if a.HostPort != b.HostPort {
+			return a.HostPort < b.HostPort
+		}
+		return a.ContainerPort < b.ContainerPort
+	})
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// RemovePortBinding atomically removes one exact branch-local listener.
+func (s Store) RemovePortBinding(name string, binding PortBinding) error {
+	binding, err := normalizePortBinding(binding)
+	if err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	for i, existing := range info.PublishedPorts {
+		if !samePortBinding(existing, binding) {
+			continue
+		}
+		info.PublishedPorts = append(info.PublishedPorts[:i], info.PublishedPorts[i+1:]...)
+		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	}
+	return fmt.Errorf("published port is not configured on branch %q", binding.BranchID)
+}
+
+// RemovePortBindingsForBranch atomically forgets every listener for branchID.
+func (s Store) RemovePortBindingsForBranch(name, branchID string) error {
+	if err := validateObjectName("branch", branchID); err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	bindings := info.PublishedPorts[:0]
+	for _, binding := range info.PublishedPorts {
+		if binding.Branch() != branchID {
+			bindings = append(bindings, binding)
+		}
+	}
+	if len(bindings) == len(info.PublishedPorts) {
+		return nil
+	}
+	info.PublishedPorts = bindings
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // RecordBranch appends one immutable branch identity or refreshes its lifecycle data.
@@ -1126,6 +1286,13 @@ func (s Store) MarkBranchDeleted(name, branchID string) error {
 		if info.Branches[i].ID == branchID {
 			info.Branches[i].State = "deleted"
 			info.Branches[i].DeletedAt = &now
+			bindings := info.PublishedPorts[:0]
+			for _, binding := range info.PublishedPorts {
+				if binding.Branch() != branchID {
+					bindings = append(bindings, binding)
+				}
+			}
+			info.PublishedPorts = bindings
 			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 		}
 	}

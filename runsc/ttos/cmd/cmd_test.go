@@ -103,6 +103,41 @@ func TestParseSelector(t *testing.T) {
 	}
 }
 
+func TestPortCommandsAreBranchAware(t *testing.T) {
+	b := &fakeBackend{portList: []ttosbundle.PortBinding{
+		{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"},
+		{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 80, Protocol: "tcp", BranchID: "child"},
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"port", "publish", "web@child", "127.0.0.1:8082:8080"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("port publish status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.publishedTarget != (selector{container: "web", branch: "child"}) || b.publishedBinding != (ttosbundle.PortBinding{HostIP: "127.0.0.1", HostPort: 8082, ContainerPort: 8080, Protocol: "tcp", BranchID: "child"}) {
+		t.Errorf("publish=(%+v, %+v)", b.publishedTarget, b.publishedBinding)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"port", "ls", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("port ls status=%d, stderr=%q", status, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "web@main") || !strings.Contains(stdout.String(), "web@child") {
+		t.Errorf("port ls output=%q", stdout.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"port", "ls", "--json", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("port ls child status=%d, stderr=%q", status, stderr.String())
+	}
+	if strings.Contains(stdout.String(), `"branch_id": "main"`) || !strings.Contains(stdout.String(), `"branch_id": "child"`) {
+		t.Errorf("filtered port JSON=%q", stdout.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"port", "unpublish", "web@child", "127.0.0.1:8081:80/tcp"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("port unpublish status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.unpublishedTarget != (selector{container: "web", branch: "child"}) || b.unpublishedBinding.Branch() != "child" || b.unpublishedBinding.HostPort != 8081 {
+		t.Errorf("unpublish=(%+v, %+v)", b.unpublishedTarget, b.unpublishedBinding)
+	}
+}
+
 func TestWriteTree(t *testing.T) {
 	created := time.Date(2026, 7, 17, 8, 9, 10, 123, time.UTC)
 	deleted := created.Add(time.Second)
@@ -3083,57 +3118,63 @@ type startCall struct {
 }
 
 type fakeBackend struct {
-	mu                sync.Mutex
-	families          []Family
-	processTarget     selector
-	processList       []ProcessInfo
-	rootfsSizes       map[selector]uint64
-	sizeCalls         []selector
-	sizeErr           error
-	err               error
-	killErr           error
-	forkSource        selector
-	forkDestination   string
-	forkPaused        bool
-	paused            selector
-	resumed           selector
-	destroyed         selector
-	signals           []signalCall
-	waited            selector
-	waitCalls         []selector
-	waitStatus        uint32
-	waitStatuses      map[selector]uint32
-	waitRelease       chan struct{}
-	pullReference     string
-	pullPlatform      string
-	pullInfo          ttosimages.Info
-	imageList         []ImageInfo
-	imageInspectID    string
-	imageInspectInfo  ImageInspectInfo
-	imageRemoveID     string
-	imageRemoveForce  bool
-	imageRemoveResult ImageRemoveResult
-	runRequest        runRequest
-	containerID       string
-	runStatus         int
-	created           bool
-	started           string
-	startCalls        []startCall
-	startDetach       bool
-	startInteractive  bool
-	attached          attachRequest
-	logsTarget        selector
-	logsOptions       logsOptions
-	inspectInfo       InspectInfo
-	removed           string
-	removeForce       bool
-	removeVolumes     bool
-	execRequest       execRequest
-	execStatus        int
-	execSessionList   []runscExecSession
-	execControlTarget selector
-	execControlID     string
-	execControlSignal int
+	mu                 sync.Mutex
+	families           []Family
+	processTarget      selector
+	processList        []ProcessInfo
+	rootfsSizes        map[selector]uint64
+	sizeCalls          []selector
+	sizeErr            error
+	err                error
+	killErr            error
+	forkSource         selector
+	forkDestination    string
+	forkPaused         bool
+	publishedTarget    selector
+	publishedBinding   ttosbundle.PortBinding
+	portListContainer  string
+	portList           []ttosbundle.PortBinding
+	unpublishedTarget  selector
+	unpublishedBinding ttosbundle.PortBinding
+	paused             selector
+	resumed            selector
+	destroyed          selector
+	signals            []signalCall
+	waited             selector
+	waitCalls          []selector
+	waitStatus         uint32
+	waitStatuses       map[selector]uint32
+	waitRelease        chan struct{}
+	pullReference      string
+	pullPlatform       string
+	pullInfo           ttosimages.Info
+	imageList          []ImageInfo
+	imageInspectID     string
+	imageInspectInfo   ImageInspectInfo
+	imageRemoveID      string
+	imageRemoveForce   bool
+	imageRemoveResult  ImageRemoveResult
+	runRequest         runRequest
+	containerID        string
+	runStatus          int
+	created            bool
+	started            string
+	startCalls         []startCall
+	startDetach        bool
+	startInteractive   bool
+	attached           attachRequest
+	logsTarget         selector
+	logsOptions        logsOptions
+	inspectInfo        InspectInfo
+	removed            string
+	removeForce        bool
+	removeVolumes      bool
+	execRequest        execRequest
+	execStatus         int
+	execSessionList    []runscExecSession
+	execControlTarget  selector
+	execControlID      string
+	execControlSignal  int
 
 	volumes            []ttosbundle.VolumeInfo
 	ensuredVolume      string
@@ -3271,6 +3312,23 @@ func (b *fakeBackend) fork(source selector, destination string, paused bool) (Br
 		return Branch{}, b.err
 	}
 	return Branch{ID: destination, ParentID: source.branch, State: "paused"}, nil
+}
+
+func (b *fakeBackend) publishPort(target selector, binding ttosbundle.PortBinding) error {
+	b.publishedTarget = target
+	b.publishedBinding = binding
+	return b.err
+}
+
+func (b *fakeBackend) listPorts(container string) ([]ttosbundle.PortBinding, error) {
+	b.portListContainer = container
+	return append([]ttosbundle.PortBinding(nil), b.portList...), b.err
+}
+
+func (b *fakeBackend) unpublishPort(target selector, binding ttosbundle.PortBinding) error {
+	b.unpublishedTarget = target
+	b.unpublishedBinding = binding
+	return b.err
 }
 
 func (b *fakeBackend) pause(target selector) error {

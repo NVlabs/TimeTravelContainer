@@ -451,6 +451,23 @@ currently IPv4/TCP only. The binding is persistent configuration: `ttosd`
 reconciles its rootless user-mode listener after restart. It is also shown in
 Docker-compatible `.HostConfig.PortBindings` inspect output.
 
+Add or remove a listener on any existing live branch without restarting it:
+
+```shell
+ttos port publish web@main 127.0.0.1:8081:80
+ttos port publish web@child 127.0.0.1:8082:80
+ttos port ls web
+ttos port ls --json web@child
+ttos port unpublish web@child 127.0.0.1:8082:80
+```
+
+Omitting `@BRANCH` from `publish` or `unpublish` selects `main`. For `port ls`,
+an unqualified container lists every branch, while a qualified selector filters
+one branch. Dynamically published listeners are persistent and reconciled after
+`ttosd` restarts. Docker-compatible `.HostConfig.PortBindings` continues to
+show only `main`; the complete branch-aware list is available through
+`ttos port ls --json` and `.TTOS.container.published_ports` in `ttos inspect`.
+
 Live-fork policy deliberately distinguishes internal from external flows:
 
 * the source branch's established and connecting NAT TCP flows continue;
@@ -462,8 +479,9 @@ Live-fork policy deliberately distinguishes internal from external flows:
 
 Thus a fork is not rejected merely because an external TCP flow is open. Child
 applications observe ordinary connection-reset behavior and may reconnect
-outbound. Publishing a child branch separately is not implemented yet. UDP NAT
-mappings are runtime-only and are re-created on later child datagrams.
+outbound. A child is not published automatically, but `ttos port publish` can
+assign it an independent host endpoint after the fork. UDP NAT mappings are
+runtime-only and are re-created on later child datagrams.
 
 Modified iptables/conntrack state, nftables, secondary network namespaces,
 hostinet, and plugin stacks still cause `ttos fork` to fail during its atomic

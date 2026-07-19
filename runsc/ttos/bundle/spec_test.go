@@ -767,6 +767,57 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 }
 
+func TestStoreBranchPortBindings(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["true"]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, NetworkMode: "ttos", State: "running", CreatedAt: time.Now(),
+		Branches:       []BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
+		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.PublishedPorts[0].BranchID; got != "main" {
+		t.Fatalf("legacy binding branch=%q, want main", got)
+	}
+	child := PortBinding{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 80, Protocol: "tcp", BranchID: "child"}
+	if err := store.AddPortBinding("demo", child); err != nil {
+		t.Fatalf("AddPortBinding: %v", err)
+	}
+	if err := store.AddPortBinding("demo", PortBinding{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 81, Protocol: "tcp", BranchID: "main"}); err == nil {
+		t.Fatal("AddPortBinding accepted a duplicate host endpoint")
+	}
+	if err := store.RemovePortBinding("demo", child); err != nil {
+		t.Fatalf("RemovePortBinding: %v", err)
+	}
+	if err := store.AddPortBinding("demo", child); err != nil {
+		t.Fatalf("re-adding child binding: %v", err)
+	}
+	if err := store.MarkBranchDeleted("demo", "child"); err != nil {
+		t.Fatalf("MarkBranchDeleted: %v", err)
+	}
+	loaded, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.PublishedPorts) != 1 || loaded.PublishedPorts[0].Branch() != "main" {
+		t.Fatalf("bindings after branch deletion=%+v, want main only", loaded.PublishedPorts)
+	}
+}
+
 func TestContainerIdentityResolution(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
