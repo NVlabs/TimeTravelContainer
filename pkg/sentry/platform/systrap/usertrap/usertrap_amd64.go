@@ -219,9 +219,12 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		return err
 	}
 
-	// Check that another thread has not patched this syscall yet.
-	// 0xb8 is the first byte of "mov sysno, %eax".
-	if prevCode[0] == uint8(0xb8) {
+	// Only patch the exact instruction sequence "mov $sysno, %eax; syscall".
+	// Checking only the first byte is unsafe: for a syscall reached through a
+	// branch, the 5 bytes before the syscall instruction are unrelated code and
+	// may coincidentally begin with 0xb8. This is especially common in
+	// JIT-generated code. Replacing that code corrupts the application.
+	if isPatchableSyscall(prevCode, sysno) {
 		ctx.Debugf("Found the pattern at ip %x:sysno %d", patchAddr, sysno)
 
 		trapAddr, err := s.addTrapLocked(ctx, ac, mm, uint32(sysno))
@@ -287,6 +290,15 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		}
 	}
 	return nil
+}
+
+func isPatchableSyscall(code []byte, sysno uintptr) bool {
+	if len(code) != len(jmpInst) || sysno != uintptr(uint32(sysno)) {
+		return false
+	}
+	return code[0] == 0xb8 &&
+		binary.LittleEndian.Uint32(code[1:5]) == uint32(sysno) &&
+		code[5] == 0x0f && code[6] == 0x05
 }
 
 // HandleFault handles a fault on a patched syscall instruction.
