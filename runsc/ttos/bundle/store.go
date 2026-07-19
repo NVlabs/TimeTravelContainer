@@ -300,6 +300,12 @@ func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount
 		if err := os.WriteFile(name, []byte(file.contents), 0444); err != nil {
 			return nil, fmt.Errorf("writing container network file %q: %w", file.destination, err)
 		}
+		// ttosd starts with a restrictive umask because most data-root state is
+		// private. Docker-generated network files are intentionally readable by
+		// every virtual container user, so enforce their final mode explicitly.
+		if err := os.Chmod(name, 0444); err != nil {
+			return nil, fmt.Errorf("setting permissions on container network file %q: %w", file.destination, err)
+		}
 		mounts = append(mounts, HostMount{Source: name, Destination: file.destination, Readonly: true, Internal: true})
 	}
 	return mounts, nil
