@@ -64,7 +64,6 @@ func TestServiceMethods(t *testing.T) {
 		request   Request
 	}{
 		{"List", Request{ContainerID: "demo"}},
-		{"Check", Request{ContainerID: "demo", Branch: "child"}},
 		{"Fork", Request{ContainerID: "demo", Source: "main", Destination: "child", Paused: true}},
 		{"Pause", Request{ContainerID: "demo", Branch: "child"}},
 		{"Resume", Request{ContainerID: "demo", Branch: "child"}},

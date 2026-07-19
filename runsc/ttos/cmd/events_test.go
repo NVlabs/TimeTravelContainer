@@ -34,7 +34,6 @@ func TestCommandEventsClassifyManagerOperations(t *testing.T) {
 		wantSubject string
 	}{
 		{[]string{"fork", "--paused", "demo@main", "demo@child"}, "branch", "fork", "demo@child"},
-		{[]string{"fork", "--check", "--json", "demo@child"}, "eligibility", "check", "demo@child"},
 		{[]string{"exec", "-dit", "--env", "SECRET=value", "demo@child", "sh"}, "exec", "create", "demo@child"},
 		{[]string{"exec", "kill", "--signal", "TERM", "demo@child:exec-one"}, "exec", "kill", "demo@child:exec-one"},
 		{[]string{"unpause", "demo@child"}, "branch", "resume", "demo@child"},

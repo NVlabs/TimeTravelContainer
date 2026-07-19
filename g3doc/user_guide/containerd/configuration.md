@@ -62,7 +62,7 @@ The service name is `gvisor.timetravel.v1.Branches`. It carries validated JSON
 in protobuf `Any` envelopes and provides these methods:
 
 - `List`: requires `container_id`.
-- `Check`, `Pause`, `Resume`, and `Destroy`: require `container_id`; `branch`
+- `Pause`, `Resume`, and `Destroy`: require `container_id`; `branch`
   defaults to `main`.
 - `Fork`: requires `container_id` and `destination`; `source` defaults to
   `main`, and `paused` requests a paused child.

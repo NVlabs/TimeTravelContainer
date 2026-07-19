@@ -189,19 +189,11 @@ func commandEvents(args []string, status int) []DaemonEvent {
 		event.Subject = firstNonFlag(rest)
 	case "fork":
 		positionals := forkPositionals(rest)
-		if containsArg(rest, "--check") {
-			event.Type = "eligibility"
-			event.Action = "check"
-			if len(positionals) != 0 {
-				event.Subject = positionals[0]
-			}
-		} else {
-			event.Type = "branch"
-			event.Action = "fork"
-			if len(positionals) != 0 {
-				event.Parent = positionals[0]
-				event.Subject = positionals[len(positionals)-1]
-			}
+		event.Type = "branch"
+		event.Action = "fork"
+		if len(positionals) != 0 {
+			event.Parent = positionals[0]
+			event.Subject = positionals[len(positionals)-1]
 		}
 	case "branch":
 		if len(rest) == 0 {
@@ -237,15 +229,6 @@ func commandEvents(args []string, status int) []DaemonEvent {
 		event.Attributes = map[string]string{"command": command}
 	}
 	return []DaemonEvent{event}
-}
-
-func containsArg(args []string, value string) bool {
-	for _, arg := range args {
-		if arg == value {
-			return true
-		}
-	}
-	return false
 }
 
 func firstNonFlag(args []string) string {

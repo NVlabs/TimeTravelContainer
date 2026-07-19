@@ -34,7 +34,6 @@ func TestTimeTravelArgs(t *testing.T) {
 		want      string
 	}{
 		{"list", "List", ttosshim.Request{ContainerID: "demo"}, "demo branches"},
-		{"check main", "Check", ttosshim.Request{ContainerID: "demo"}, "demo check main"},
 		{"pause child", "Pause", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo pause child"},
 		{"resume child", "Resume", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo resume child"},
 		{"destroy child", "Destroy", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo destroy child"},

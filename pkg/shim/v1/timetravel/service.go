@@ -35,7 +35,7 @@ const (
 )
 
 // Request selects one sandbox and branch operation. Branch defaults to main
-// for check/pause/resume/destroy; Source defaults to main for fork.
+// for pause/resume/destroy; Source defaults to main for fork.
 type Request struct {
 	ContainerID string `json:"container_id"`
 	Branch      string `json:"branch,omitempty"`
@@ -50,7 +50,7 @@ type Controller interface {
 	ControlTimeTravel(context.Context, string, *Request) ([]byte, error)
 }
 
-var operations = []string{"List", "Check", "Fork", "Pause", "Resume", "Destroy"}
+var operations = []string{"List", "Fork", "Pause", "Resume", "Destroy"}
 
 func validate(operation string, req *Request) error {
 	if req.ContainerID == "" {
@@ -61,7 +61,7 @@ func validate(operation string, req *Request) error {
 		if req.Branch != "" || req.Source != "" || req.Destination != "" || req.Paused {
 			return fmt.Errorf("list accepts only container_id")
 		}
-	case "Check", "Pause", "Resume", "Destroy":
+	case "Pause", "Resume", "Destroy":
 		if req.Source != "" || req.Destination != "" || req.Paused {
 			return fmt.Errorf("%s accepts container_id and optional branch", operation)
 		}

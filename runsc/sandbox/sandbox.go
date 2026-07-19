@@ -2067,15 +2067,6 @@ func (s *Sandbox) ForkBranch(args *boot.ForkBranchArgs) (boot.BranchInfo, error)
 	return info, nil
 }
 
-// CheckFork validates one source branch without creating a child.
-func (s *Sandbox) CheckFork(id string) (boot.ForkEligibility, error) {
-	var result boot.ForkEligibility
-	if err := s.call(boot.ContMgrCheckFork, &boot.BranchArgs{ID: id}, &result); err != nil {
-		return boot.ForkEligibility{}, fmt.Errorf("checking live branch %q: %w", id, err)
-	}
-	return result, nil
-}
-
 // ListBranches lists all in-memory branches in the sandbox family.
 func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
 	var branches []boot.BranchInfo

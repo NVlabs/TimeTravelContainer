@@ -9,8 +9,8 @@ a development-readiness audit, not a security certification.
 
 ## Executive assessment
 
-TTOS is suitable for controlled integration-test workloads whose resource graph
-passes `ttos fork --check`. It runs several nontrivial unmodified images and its
+TTOS is suitable for controlled integration-test workloads whose resource graph can complete
+`ttos fork` validation. It runs several nontrivial unmodified images and its
 application-memory fork cost is effectively independent of resident byte count
 in the measured range. It does not copy application RAM to disk or duplicate
 all resident pages at fork time.
@@ -203,8 +203,8 @@ replay of external nondeterministic inputs.
 
 ### C1: fork compatibility is deliberately narrower than run compatibility
 
-TTOS can run many resources that it refuses to fork. `fork --check` is the
-authoritative runtime decision and fails before mutating the source.
+TTOS can run many resources that it refuses to fork. `ttos fork` is the authoritative runtime decision: it pauses the source,
+validates before mutation, and resumes it on rejection.
 
 Currently demonstrated as branch-local or safely cloned:
 
@@ -252,7 +252,7 @@ Queued `SCM_RIGHTS` means an internal Unix socket has an unread ancillary
 message carrying one or more FDs. Ordinary queued bytes clone correctly, but
 the rights message adds graph edges to arbitrary file descriptions. Supporting
 it requires cloning those edges with correct aliasing, cycles, reference counts,
-and eligibility checks; this is feasible for fully Sentry-owned targets but is
+and fork validators; this is feasible for fully Sentry-owned targets but is
 not implemented yet.
 
 AIO and io_uring expose memory-mapped submission/completion rings and may retain
@@ -385,6 +385,6 @@ Before calling TTOS a broadly compatible beta:
 6. Expand the live-fork resource matrix only through explicit fail-closed
    validators and branch-isolation tests.
 
-Until those gates pass, end users should run `ttos fork --check` immediately
-before each fork, treat warnings as semantic differences rather than cosmetic
-messages, and use TTOS primarily for trusted, self-contained test workloads.
+Until those gates pass, end users should treat a failed `ttos fork` as an
+authoritative compatibility result, review its resource diagnostics, and use
+TTOS primarily for trusted, self-contained test workloads.

@@ -24,8 +24,8 @@ covers:
   running, forked, paused, and exited states, including effective image
   configuration, persistent immutable branch lineage and deletion tombstones,
   env-file/host-import environment overrides, merged labels,
-  user mounts, sandbox PID, per-branch processes and timings, and explicit
-  fork-eligibility reports;
+  user mounts, sandbox PID, per-branch processes and timings, and transactional
+  fork-rejection diagnostics;
 - Docker-style `container` aliases, multi-container detached `start`, concurrent
   `wait` with argument-ordered exit codes, restart of an exited container, and
   an explicitly forced running-family restart where in-memory managed-volume
@@ -88,13 +88,13 @@ covers:
   in `logs --details`;
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
   over versioned timestamped records, including filtering and legacy-record decoding;
-- `exec`, selective stdin/stdout/stderr `attach`, `fork --check` with a complete
-  visible-mount and hidden-lower decision manifest, live `fork`, `pause`,
+- `exec`, selective stdin/stdout/stderr `attach`, transactional `fork`
+  rejection diagnostics, live `fork`, `pause`,
   `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, JSON
   creation timestamps, and branch-local writable/virtual `ps --size` accounting;
-- attached exec fork rejection while imported host stdio is live, immediate
-  eligibility recovery after exit, and detached exec-session ID/PID cloning
+- attached exec fork rejection while imported host stdio is live, successful
+  fork after the imported resource exits, and detached exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
 - managed-volume and user tmpfs copy-on-write isolation between a parent and
   child branch, including persisted `volume create --opt size=BYTES` quotas and
@@ -231,7 +231,7 @@ to launch a privileged container. Override `DIND_IMAGE`, `TEST_IMAGE`, or
 
 Docker sees one ordinary OCI container and can manage only its `main` process
 tree. It cannot represent TTOS branch IDs, lineage, branch-local filesystems,
-fork eligibility, or simultaneous branch lifecycle states. Do not use Docker
+fork validation outcomes, or simultaneous branch lifecycle states. Do not use Docker
 and `ttos` concurrently to mutate the same sandbox. Use Docker compatibility
 for conventional main-only containers; use `ttos` as the sole source of truth
 for every container family that is live-forked.

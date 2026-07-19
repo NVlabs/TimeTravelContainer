@@ -28,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -79,14 +78,6 @@ type ForkBranchArgs struct {
 	ID string
 	// Paused leaves the new branch stopped after creation.
 	Paused bool
-}
-
-// ForkEligibility is a read-only report for one source branch.
-type ForkEligibility struct {
-	Eligible      bool                           `json:"eligible"`
-	MountManifest []vfs.LiveForkFilesystemRecord `json:"mount_manifest,omitempty"`
-	Issues        []kernel.LiveForkResourceIssue `json:"issues,omitempty"`
-	Reason        string                         `json:"reason,omitempty"`
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -562,57 +553,6 @@ func branchInitStatus(b *sandboxBranch) (kernel.ThreadID, string) {
 		return 1, "exited"
 	}
 	return 0, "not-started"
-}
-
-// CheckFork validates source without creating a branch or changing CoW/VFS
-// state. A running source is paused only for the consistent validation window.
-func (f *SandboxFamily) CheckFork(sourceID string) (*ForkEligibility, error) {
-	if sourceID == "" {
-		sourceID = DefaultBranchID
-	}
-	f.mu.Lock()
-	source := f.branches[sourceID]
-	f.mu.Unlock()
-	if source == nil {
-		return nil, fmt.Errorf("source branch %q does not exist", sourceID)
-	}
-
-	source.opMu.Lock()
-	defer source.opMu.Unlock()
-	f.mu.Lock()
-	if source.state != BranchRunning && source.state != BranchPaused {
-		state := source.state
-		f.mu.Unlock()
-		return nil, fmt.Errorf("source branch %q is %s", sourceID, state)
-	}
-	sourceWasPaused := source.k.IsPaused()
-	f.mu.Unlock()
-
-	if !sourceWasPaused {
-		source.k.Pause()
-	}
-	ctx := source.k.SupervisorContext()
-	mountManifest := source.k.VFS().LiveForkFilesystemEligibilities(ctx)
-	validationErr := source.k.ValidateLiveFork(ctx, kernel.LiveForkValidationOptions{
-		AllowNetworkStack:              f.allowNetworkStack,
-		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
-	})
-	if !sourceWasPaused {
-		source.k.Unpause()
-		if err := control.PostResume(source.k, nil); err != nil {
-			return nil, fmt.Errorf("resuming source branch %q after live-fork validation: %w", sourceID, err)
-		}
-	}
-	result := &ForkEligibility{Eligible: validationErr == nil, MountManifest: mountManifest}
-	if validationErr == nil {
-		return result, nil
-	}
-	result.Reason = validationErr.Error()
-	var resourceErr *kernel.LiveForkResourceError
-	if errors.As(validationErr, &resourceErr) {
-		result.Issues = append([]kernel.LiveForkResourceIssue(nil), resourceErr.Issues...)
-	}
-	return result, nil
 }
 
 // Fork creates a child from args.Source. Both branches remain paused unless

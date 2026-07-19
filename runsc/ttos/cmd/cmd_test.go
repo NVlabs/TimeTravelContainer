@@ -412,42 +412,17 @@ func TestCommandsUseQualifiedBranches(t *testing.T) {
 	}
 }
 
-func TestForkCheckReportsEligibilityWithoutForking(t *testing.T) {
-	b := &fakeBackend{checkResult: ForkEligibility{Eligible: true, Warnings: []ForkWarning{{Resource: "/host/data -> /data", Reason: "shared external view"}}}}
+func TestForkRejectsRemovedCheckFlag(t *testing.T) {
+	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--check", "web@main"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("eligible check status=%d, stderr=%q", status, stderr.String())
+	if status := runCommand([]string{"fork", "--check", "web"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("fork accepted the removed --check flag")
 	}
-	if b.checkTarget != (selector{container: "web", branch: "main"}) || b.forkDestination != "" {
-		t.Errorf("check target=%+v fork destination=%q", b.checkTarget, b.forkDestination)
+	if b.forkDestination != "" {
+		t.Fatalf("removed --check flag attempted a fork to %q", b.forkDestination)
 	}
-	if got, want := stdout.String(), "web@main eligible\nwarning: /host/data -> /data: shared external view\n"; got != want {
-		t.Errorf("eligible output=%q, want %q", got, want)
-	}
-
-	b.checkResult = ForkEligibility{
-		MountManifest: []ForkMountRecord{{MountID: 7, MountPath: "/sys", Mounted: true, FilesystemType: "sysfs", SourceClass: "sentry-owned", ReadOnly: false, Decision: "reject", StableIdentity: "mount:7", Reason: "filesystem requires a read-only mount"}, {Mounted: false, FilesystemType: "9p", SourceClass: "external-gofer", ReadOnly: true, Decision: "share-external", StableIdentity: "gofer:root"}},
-		Reason:        "live fork resource validation failed",
-		Issues:        []ForkResourceIssue{{PID: 0, FD: -1, MountPath: "/sys", FilesystemType: "sysfs", SourceClass: "sentry-owned", Resource: "mount \"/sys\" filesystem \"sysfs\"", Reason: "read-only mount required"}},
-	}
-	stdout.Reset()
-	stderr.Reset()
-	if status := runCommand([]string{"fork", "--check", "web"}, &stdout, &stderr, b); status != 1 {
-		t.Fatalf("ineligible check status=%d, stderr=%q", status, stderr.String())
-	}
-	for _, text := range []string{"web@main ineligible", "reason:", "mapping", "/sys", "sysfs", "read-only mount required"} {
-		if !strings.Contains(stdout.String(), text) {
-			t.Errorf("ineligible output %q does not contain %q", stdout.String(), text)
-		}
-	}
-
-	stdout.Reset()
-	if status := runCommand([]string{"fork", "--check", "--json", "web"}, &stdout, &stderr, b); status != 1 {
-		t.Fatalf("JSON ineligible check status=%d, stderr=%q", status, stderr.String())
-	}
-	var got ForkEligibility
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || !reflect.DeepEqual(got, b.checkResult) {
-		t.Errorf("eligibility JSON=%+v err=%v, want %+v", got, err, b.checkResult)
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -check") {
+		t.Fatalf("stderr=%q, want unknown --check flag", stderr.String())
 	}
 }
 
@@ -1857,15 +1832,9 @@ func TestInspect(t *testing.T) {
 	}
 
 	stdout.Reset()
-	b.checkResult = ForkEligibility{Eligible: true}
-	if status := runCommand([]string{"inspect", "--fork-check", "-f", `{{(index .TTOS.Branches 0).ForkEligibility.Eligible}}`, "demo"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("fork-check inspect status=%d, stderr=%q", status, stderr.String())
-	}
-	if got, want := b.checkTarget, (selector{container: "demo", branch: "main"}); got != want {
-		t.Errorf("fork-check target=%+v, want %+v", got, want)
-	}
-	if got, want := stdout.String(), "true\n"; got != want {
-		t.Errorf("fork-check output=%q, want %q", got, want)
+	stderr.Reset()
+	if status := runCommand([]string{"inspect", "--fork-check", "demo"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("inspect accepted the removed --fork-check flag")
 	}
 
 	if status := runCommand([]string{"inspect", "--type", "image", "demo"}, &stdout, &stderr, b); status == 0 {
@@ -2590,10 +2559,6 @@ if [ "$3" = "timetravel" ] && [ "$4" = "--path" ] && [ "$5" = "/cache" ] && [ "$
 	printf fake-tar >"$7"
 	exit 0
 fi
-if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "check" ] && [ "$6" = "child" ]; then
-	echo '{"eligible":true}'
-	exit 0
-fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--signal" ] && [ "$5" = "15" ] && [ "$6" = "web" ] && [ "$7" = "signal" ] && [ "$8" = "child" ]; then
 	exit 0
 fi
@@ -2715,13 +2680,6 @@ exit 2
 	if len(processes) != 1 || processes[0].PID != 7 || processes[0].UID != 1000 || processes[0].Cmd != "worker" {
 		t.Errorf("processes returned %+v", processes)
 	}
-	eligibility, err := b.checkFork(selector{container: "web", branch: "child"})
-	if err != nil {
-		t.Fatalf("checkFork: %v", err)
-	}
-	if !eligibility.Eligible || len(eligibility.Issues) != 0 {
-		t.Errorf("checkFork returned %+v", eligibility)
-	}
 	if err := b.signal(selector{container: "web", branch: "child"}, 15, false); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
@@ -2783,9 +2741,6 @@ case "$1 $2 $3 $4" in
 "timetravel $id ps main")
 	echo "[{\"uid\":0,\"pid\":1,\"ppid\":0,\"pgid\":1,\"threads\":[1],\"c\":0,\"tty\":\"?\",\"stime\":\"12:00\",\"time\":\"1ms\",\"cmd\":\"init\"}]"
 	;;
-"timetravel $id check main")
-	echo "{\"eligible\":true}"
-	;;
 "timetravel $id pause main"|"timetravel $id resume main")
 	;;
 "delete --force $id ")
@@ -2841,9 +2796,6 @@ esac
 	}
 	if err := b.resume(selector{container: id[:16], branch: "main"}); err != nil {
 		t.Fatalf("resume by ID prefix: %v", err)
-	}
-	if eligibility, err := b.checkFork(target); err != nil || !eligibility.Eligible {
-		t.Fatalf("checkFork by name=(%+v, %v)", eligibility, err)
 	}
 	if err := b.remove("web", true, false); err != nil {
 		t.Fatalf("remove by name: %v", err)
@@ -3125,8 +3077,6 @@ type fakeBackend struct {
 	rootfsSizes       map[selector]uint64
 	sizeCalls         []selector
 	sizeErr           error
-	checkTarget       selector
-	checkResult       ForkEligibility
 	err               error
 	killErr           error
 	forkSource        selector
@@ -3298,11 +3248,6 @@ func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {
 		return 0, b.sizeErr
 	}
 	return b.rootfsSizes[target], nil
-}
-
-func (b *fakeBackend) checkFork(target selector) (ForkEligibility, error) {
-	b.checkTarget = target
-	return b.checkResult, b.err
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {

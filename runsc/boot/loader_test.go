@@ -866,7 +866,8 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 
 	var sharedExternalMounts int
-	for _, eligibility := range l.k.VFS().LiveForkFilesystemEligibilities(l.k.SupervisorContext()) {
+	filesystemRecords := l.k.VFS().LiveForkFilesystemEligibilities(l.k.SupervisorContext())
+	for _, eligibility := range filesystemRecords {
 		switch eligibility.Decision {
 		case vfs.LiveForkFilesystemClone:
 		case vfs.LiveForkFilesystemShareExternal:
@@ -892,17 +893,18 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	ctx := l.k.SupervisorContext()
 	parentTask := l.k.GlobalInit().Leader()
 	l.family.allowSharedFilesystemResources = false
-	eligibility, err := l.family.CheckFork(DefaultBranchID)
-	if err != nil {
-		t.Fatalf("checking rejected shared filesystems: %v", err)
+	_, err = l.family.Fork(&ForkBranchArgs{ID: "shared-filesystem-rejected"})
+	if err == nil {
+		t.Fatal("live fork unexpectedly accepted shared external filesystems")
 	}
-	if eligibility.Eligible || len(eligibility.Issues) != 2 {
-		t.Fatalf("shared-filesystem eligibility report: %+v", eligibility)
+	var sharedResourceErr *kernel.LiveForkResourceError
+	if !errors.As(err, &sharedResourceErr) || len(sharedResourceErr.Issues) != 2 {
+		t.Fatalf("shared-filesystem rejection: %v", err)
 	}
 	sharedPaths := map[string]bool{"": false, "/readonly": false}
-	for _, issue := range eligibility.Issues {
+	for _, issue := range sharedResourceErr.Issues {
 		if issue.PID != 0 || issue.FD != -1 || issue.FilesystemType != "9p" || issue.SourceClass != "external-gofer" || !strings.Contains(issue.Resource, "filesystem \"9p\"") || !strings.Contains(issue.Reason, "not authorized") {
-			t.Errorf("shared-filesystem eligibility issue: %+v", issue)
+			t.Errorf("shared-filesystem rejection issue: %+v", issue)
 		}
 		if _, ok := sharedPaths[issue.MountPath]; !ok {
 			t.Errorf("unexpected shared-filesystem mount path %q: %+v", issue.MountPath, issue)
@@ -912,11 +914,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	for path, seen := range sharedPaths {
 		if !seen {
-			t.Errorf("missing shared-filesystem eligibility path %q", path)
+			t.Errorf("missing shared-filesystem rejection path %q", path)
 		}
 	}
 	manifestSharedPaths := map[string]bool{"": false, "/readonly": false}
-	for _, record := range eligibility.MountManifest {
+	for _, record := range filesystemRecords {
 		if record.Decision != vfs.LiveForkFilesystemShareExternal {
 			continue
 		}
@@ -926,7 +928,12 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	for path, seen := range manifestSharedPaths {
 		if !seen {
-			t.Errorf("mount manifest omitted shared filesystem path %q: %+v", path, eligibility.MountManifest)
+			t.Errorf("filesystem classification omitted shared path %q: %+v", path, filesystemRecords)
+		}
+	}
+	for _, branch := range l.family.List() {
+		if branch.ID == "shared-filesystem-rejected" {
+			t.Fatal("rejected fork left a destination branch")
 		}
 	}
 	l.family.allowSharedFilesystemResources = true
@@ -947,12 +954,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		sysMount.DecRef(ctx)
 		t.Fatalf("temporarily making sysfs writable: %v", err)
 	}
-	eligibility, err = l.family.CheckFork(DefaultBranchID)
-	if err != nil {
-		t.Fatalf("checking writable sysfs rejection: %v", err)
+	_, err = l.family.Fork(&ForkBranchArgs{ID: "writable-sysfs-rejected"})
+	if err == nil {
+		t.Fatal("live fork unexpectedly accepted writable sysfs")
 	}
-	if eligibility.Eligible || len(eligibility.Issues) != 1 || eligibility.Issues[0].MountPath != "/sys" || eligibility.Issues[0].FilesystemType != "sysfs" || eligibility.Issues[0].SourceClass != "sentry-owned" || !strings.Contains(eligibility.Issues[0].Resource, "sysfs") || !strings.Contains(eligibility.Issues[0].Reason, "read-only mount") {
-		t.Fatalf("writable sysfs eligibility report: %+v", eligibility)
+	var sysfsResourceErr *kernel.LiveForkResourceError
+	if !errors.As(err, &sysfsResourceErr) || len(sysfsResourceErr.Issues) != 1 {
+		t.Fatalf("writable sysfs rejection: %v", err)
+	}
+	sysfsIssue := sysfsResourceErr.Issues[0]
+	if sysfsIssue.MountPath != "/sys" || sysfsIssue.FilesystemType != "sysfs" || sysfsIssue.SourceClass != "sentry-owned" || !strings.Contains(sysfsIssue.Resource, "sysfs") || !strings.Contains(sysfsIssue.Reason, "read-only mount") {
+		t.Fatalf("writable sysfs rejection issue: %+v", sysfsIssue)
 	}
 	if err := l.k.VFS().SetMountReadOnly(sysMount, true); err != nil {
 		sysMount.DecRef(ctx)
@@ -970,16 +982,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating AIO ring mapping: %v", err)
 	}
-	eligibility, err = l.family.CheckFork(DefaultBranchID)
-	if err != nil {
-		t.Fatalf("checking AIO ring eligibility: %v", err)
-	}
-	if eligibility.Eligible || len(eligibility.Issues) != 1 {
-		t.Fatalf("AIO ring eligibility report: %+v", eligibility)
-	}
-	if issue := eligibility.Issues[0]; issue.PID != 1 || issue.FD != -1 || !strings.Contains(issue.Resource, "aioMappable") {
-		t.Fatalf("AIO ring eligibility issue: %+v", issue)
-	}
+	l.k.Unpause()
 	if _, err := l.family.Fork(&ForkBranchArgs{ID: "aio-ring"}); err == nil {
 		t.Fatal("live fork unexpectedly accepted an AIO ring mapping")
 	} else {
@@ -995,6 +998,15 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 			t.Fatalf("AIO ring rejection issue: got %+v", issue)
 		}
 	}
+	if l.k.IsPaused() {
+		t.Fatal("running source remained paused after rejected live fork")
+	}
+	for _, branch := range l.family.List() {
+		if branch.ID == "aio-ring" {
+			t.Fatal("rejected live fork left a destination branch")
+		}
+	}
+	l.k.Pause()
 	if aio := parentTask.MemoryManager().DestroyAIOContext(parentTask, aioID); aio == nil {
 		t.Fatal("AIO ring mapping disappeared after rejected live fork")
 	}

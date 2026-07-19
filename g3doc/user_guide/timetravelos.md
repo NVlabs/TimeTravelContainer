@@ -251,14 +251,10 @@ processes in one branch.
 
 ## Live fork, pause, and resume
 
-Always check eligibility when a workload may hold external resources:
-
-```shell
-ttos fork --check web
-ttos fork --check --json web
-```
-
-Create a running child branch:
+Fork atomically pauses the source and validates its frozen resource graph. If
+validation fails, TTOS removes the tentative child, resumes a previously running
+source, writes the reason to stderr, and exits nonzero. Create a running child
+branch directly:
 
 ```shell
 ttos fork web web@test-a
@@ -470,7 +466,8 @@ outbound. Publishing a child branch separately is not implemented yet. UDP NAT
 mappings are runtime-only and are re-created on later child datagrams.
 
 Modified iptables/conntrack state, nftables, secondary network namespaces,
-hostinet, and plugin stacks still fail `ttos fork --check`. `host` mode remains
+hostinet, and plugin stacks still cause `ttos fork` to fail during its atomic
+validation. `host` mode remains
 useful for conventional execution but is not live-forkable because its socket
 state belongs to the host kernel.
 

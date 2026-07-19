@@ -13,9 +13,10 @@ live branch, with branch-local managed-session list, wait, signal, log, and
 reattach support.
 Docker-style `ttos container` aliases cover the ordinary lifecycle surface;
 `start` and `wait` accept multiple containers and preserve argument-order
-output. Container inspect uses Docker-shaped JSON and Go templates while adding
-a `TTOS` section with the family tree, fork timings, per-branch processes, and
-optional live-fork eligibility reports. Bash, Zsh, and Fish completion scripts
+output. Container inspect uses Docker-shaped JSON and Go templates while adding a
+`TTOS` section with the family tree, fork timings, and per-branch processes.
+Live-fork failures return transactional resource diagnostics. Bash, Zsh, and
+Fish completion scripts
 resolve live families/branches, images, volumes, and exec sessions. Branch trees
 show Sentry-reported PID 1 state and live CoW-sharing status alongside persisted
 creation/deletion times and immutable lineage. Timestamped retained console
@@ -118,7 +119,8 @@ of truth for TimeTravel branches. A future Docker integration may expose only
 the `main` branch and leave `ttos` responsible for branch operations. The
 current `runsc install` path is retained for conventional main-only containers,
 but Docker and `ttos` must not concurrently mutate the same sandbox: Docker has
-no object or state representation for branch IDs, lineage, fork eligibility,
+no object or state representation for branch IDs, lineage, fork validation
+outcomes,
 branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ## Object and state model
@@ -315,9 +317,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       `--format json`, and `--type container`.
 - [x] Add a `TTOS` inspect extension containing persistent metadata, the live
       family/branch tree, fork timing, and observational process lists for
-      every running or paused branch. `--fork-check` explicitly adds a
-      per-branch resource-eligibility report without making ordinary inspect
-      mutate pause state.
+      every running or paused branch. Ordinary inspect remains observational and
+      does not pause branches or perform live-fork validation.
 - [x] Initial `ttos logs CONTAINER[@BRANCH]` and `logs -f`, preserving separate
       stdout/stderr streams and backed by branch-local persistent console logs.
 - [x] Add Docker-compatible `logs --tail all|N`, including global logical-line
@@ -371,13 +372,10 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] `ttos ls --json` with a stable machine-readable schema.
 - [x] Mark deleted historical parents in tree output without reparenting their
       descendants.
-- [x] Display structured PID/FD-or-mapping fork-ineligibility issues before
-      attempting a fork.
-- [x] Add `ttos fork --check [--json] SOURCE` as a read-only eligibility
-      report with script-friendly success/failure status.
-      The report is an advisory snapshot of the current pre-mutation network,
-      resource, and mapping graph. A subsequent fork can still lose a race or
-      fail a later VFS/state-serialization check.
+- [x] Return structured PID/FD-or-mapping diagnostics from a rejected fork.
+- [x] Make `ttos fork` the sole authoritative operation: pause the source,
+      validate the frozen network/resource/mapping graph, resume on rejection,
+      and never expose a racy advisory preflight command.
 - [x] Add Bash, Zsh, and Fish completion for family, branch, image, volume,
       and session names.
 
@@ -554,9 +552,9 @@ state still forks entirely in memory.
 - [x] Add `/dev/pts` and `/dev/ptmx` mount support required by interactive
       sessions.
 
-## Mount eligibility framework
+## Mount validation framework
 
-Live-fork preflight now walks both live mounts and otherwise referenced VFS
+Live-fork validation walks both live mounts and otherwise referenced VFS
 filesystems, including image-root gofer lowers hidden beneath OverlayFS. Each
 filesystem implementation explicitly returns one of:
 
@@ -569,12 +567,11 @@ Reject            unsupported, externally mutable, or host/device-backed
 Unclassified filesystems reject by default. Gofer instances must carry a
 stable resource ID, prove that their server connection is read-only, disable
 directfs, and be mounted read-only when visible in the mount table. Restricted
-sysfs also requires a read-only mount. `CheckFork` and `LiveFork` run the same
-closure validation before shared-memory or address-space CoW preparation.
-`ttos fork --check --json` and inspect fork checks expose the complete sorted
-`mount_manifest`, including visible mount ID/path/flags and hidden referenced
-lowers, with filesystem type, source class, clone/share/reject decision, stable
-identity, and reason. Rejections additionally carry PID/FD resource issues.
+sysfs also requires a read-only mount. `LiveFork` runs this closure validation
+while the source is paused and before
+shared-memory or address-space CoW preparation. Rejections carry structured
+PID/FD resource issues, including mount path, filesystem type, source class,
+and reason.
 
 - [x] Add a VFS live-fork mount/filesystem eligibility interface returning the
       decision, stable identity, and rejection reason.
@@ -597,7 +594,7 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       shared across branches.
 - [x] Generate arbitrary user-requested tmpfs, procfs, and restricted sysfs
       mounts from Docker-style CLI flags; verify mode/size, inspect projection,
-      restart persistence, fork eligibility, and parent/child tmpfs CoW with an
+      restart persistence, fork validation, and parent/child tmpfs CoW with an
       unmodified Alpine image.
 - [x] Test tmpfs contents, mappings, metadata, hardlinks, open-unlinked files,
       truncate, fallocate, and mount flags across branches. Standard OCI mount
@@ -760,8 +757,8 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
       sandboxes after daemon restart, and restart missing branch/exec console
       drainers. The current direct-runsc backend has no shim process.
 - [x] Provide durable manager events for branch/container creation, pause,
-      resume, exit, destroy, exec, attach, image operations, and eligibility
-      check observations. `ttos events` supports text/JSON output, time bounds,
+      resume, exit, destroy, exec, attach, image operations, and fork outcomes.
+      `ttos events` supports text/JSON output, time bounds,
       filters, and follow streaming across daemon restarts.
 - [x] Serialize conflicting structural operations per data root and make
       daemon request delivery idempotent. Completed requests replay their exact
@@ -790,7 +787,7 @@ identity, and reason. Rejections additionally carry PID/FD resource issues.
 - [x] Prototype a containerd shim side-channel API for branch lifecycle without
       changing the standard task-v2 API. The versioned TTRPC service
       `gvisor.timetravel.v1.Branches` is registered on the existing shim socket
-      and exposes `List`, `Check`, `Fork`, `Pause`, `Resume`, and `Destroy`; its
+      and exposes `List`, `Fork`, `Pause`, `Resume`, and `Destroy`; its
       public Go client delegates to `runsc timetravel` while task-v2 is unchanged.
 - [x] Keep the image target and its referenced content natively pinned while any
       branch in the family may reference the materialized immutable lower. No
@@ -858,10 +855,11 @@ process, fork its branch, and then attach independently to both branches.
 - [x] Full run/create/start/stop/rm/inspect/logs/exec/attach command
       surface, exercised through Docker-style aliases and the five-image matrix.
 - [x] Initial fork/pause/resume and beautified branch tree.
-- [x] Read-only fork eligibility check.
+- [x] Atomic pause-validate-fork transaction with automatic source resume on
+      rejection.
 - [x] Rich branch-tree diagnostics with PID 1 state, CoW state, immutable lineage
       and deletion tombstones, creation/deletion times, fork timings, and structured
-      fork-ineligibility reports.
+      rejected-fork resource diagnostics.
 - [x] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
 

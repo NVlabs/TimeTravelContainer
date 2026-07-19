@@ -305,9 +305,10 @@ while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
 done
 [ "$(ttos inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
   fail "inspect did not retain host network mode"
-if ttos fork --check "$HOSTNET" >/dev/null 2>&1; then
-  fail "host-network container was incorrectly eligible for a live fork"
+if ttos fork "$HOSTNET" "$HOSTNET@rejected" >"$TTOS_E2E_ROOT/hostnet-fork.out" 2>"$TTOS_E2E_ROOT/hostnet-fork.err"; then
+  fail "host-network container was incorrectly forked"
 fi
+ttos exec "$HOSTNET" true || fail "host-network source did not resume after rejected fork"
 ttos stop --time 1 "$HOSTNET"
 ttos rm "$HOSTNET"
 
@@ -415,7 +416,6 @@ done
 if ttos exec "$PIDS_LIMIT" true >/dev/null 2>&1; then
   fail "exec bypassed a full PID limit"
 fi
-ttos fork --check "$PIDS_LIMIT"
 ttos fork "$PIDS_LIMIT" "$PIDS_LIMIT@child"
 if ttos exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "live-forked child lost its full PID limit"
@@ -710,23 +710,7 @@ ttos exec "$LIFECYCLE" awk '$5 == "/nested/views/proc" { split($6, options, ",")
 if ttos exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
   fail "read-only host bind accepted a write"
 fi
-ttos fork --check "$LIFECYCLE_PREFIX"
-FORK_CHECK_JSON=$(ttos fork --check --json "$LIFECYCLE_PREFIX")
-echo "$FORK_CHECK_JSON" | grep -q '"warnings"' || fail "fork check omitted shared-view warnings"
-echo "$FORK_CHECK_JSON" | grep -q '"mount_manifest"' || fail "fork check omitted the full mount manifest"
-echo "$FORK_CHECK_JSON" | grep -q '"mounted": false' || fail "fork check omitted a hidden referenced filesystem"
-echo "$FORK_CHECK_JSON" | grep -q '"decision": "clone"' || fail "fork check omitted cloned filesystem decisions"
-echo "$FORK_CHECK_JSON" | grep -q '"decision": "share-external"' || fail "fork check omitted shared external filesystem decisions"
-for filesystem_type in 9p overlay tmpfs proc sysfs; do
-  echo "$FORK_CHECK_JSON" | grep -q "\"filesystem_type\": \"$filesystem_type\"" || fail "fork check manifest omitted $filesystem_type"
-done
-echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE" || fail "fork check warning omitted first host bind"
-echo "$FORK_CHECK_JSON" | grep -q "$HOST_FIXTURE_TWO" || fail "fork check warning omitted second host bind"
-echo "$FORK_CHECK_JSON" | grep -q "$HOST_COW_FIXTURE" || fail "fork check warning omitted managed CoW lower"
-echo "$FORK_CHECK_JSON" | grep -q "branch-local memory CoW upper" || fail "fork check omitted managed-overlay semantics"
-echo "$FORK_CHECK_JSON" | grep -q "cannot enforce" || fail "immutable-source warning overstated enforcement"
-
-echo "== attached exec eligibility recovery =="
+echo "== attached exec transactional fork rejection =="
 ttos exec "$LIFECYCLE" rm -f /state/attached-exec-ready /state/attached-exec-release
 ttos exec "$LIFECYCLE" sh -c \
   'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done' \
@@ -737,14 +721,13 @@ while ! ttos exec "$LIFECYCLE" test -e /state/attached-exec-ready >/dev/null 2>&
   [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
   sleep 1
 done
-if ttos fork --check "$LIFECYCLE" >"$TTOS_E2E_ROOT/attached-check.out" 2>"$TTOS_E2E_ROOT/attached-check.err"; then
+if ttos fork "$LIFECYCLE" "$LIFECYCLE@attached-rejected" >"$TTOS_E2E_ROOT/attached-fork.out" 2>"$TTOS_E2E_ROOT/attached-fork.err"; then
   fail "live fork accepted an attached exec with imported host stdio"
 fi
-grep -Eq '\*host.fileDescription' "$TTOS_E2E_ROOT/attached-check.out" "$TTOS_E2E_ROOT/attached-check.err" ||
+grep -Eq '\*host.fileDescription' "$TTOS_E2E_ROOT/attached-fork.out" "$TTOS_E2E_ROOT/attached-fork.err" ||
   fail "attached-exec rejection did not identify its imported host resource"
 ttos exec "$LIFECYCLE" touch /state/attached-exec-release
 wait "$ATTACHED_EXEC_HOST_PID" || fail "attached exec did not exit successfully"
-ttos fork --check "$LIFECYCLE" >/dev/null || fail "fork eligibility did not recover after attached exec exit"
 
 ttos fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
 echo host-mutated >"$HOST_FIXTURE/value"
@@ -791,10 +774,6 @@ grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect om
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
 grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
 [ "$(ttos inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "11|3" ] || fail "internal network files leaked into Docker mount inspection"
-
-FORK_INSPECT=$(ttos inspect --fork-check -f '{{range .TTOS.Branches}}{{.Metadata.ID}}={{if .ForkEligibility}}{{.ForkEligibility.Eligible}}{{else}}error{{end}} {{end}}' "$LIFECYCLE")
-echo "$FORK_INSPECT" | grep -q 'main=true' || fail "inspect fork check omitted eligible main branch: $FORK_INSPECT"
-echo "$FORK_INSPECT" | grep -q 'child=true' || fail "inspect fork check omitted eligible child branch: $FORK_INSPECT"
 
 PS_CHILD=$(ttos ps --filter branch=child --filter status=running --filter ancestor="$ALPINE_IMAGE" --format '{{.ID}}')
 [ "$PS_CHILD" = "$LIFECYCLE_SHORT@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
@@ -888,11 +867,10 @@ ttos branch rm "$LIFECYCLE@process-child"
 echo "== durable daemon events =="
 EVENTS_JSON="$TTOS_E2E_ROOT/events.jsonl"
 ttos events --json >"$EVENTS_JSON"
-for event_type in container branch exec attach eligibility image; do
+for event_type in container branch exec attach image; do
   grep -q "\"type\":\"$event_type\"" "$EVENTS_JSON" || fail "durable events omitted type $event_type"
 done
 grep -q '"action":"fork"' "$EVENTS_JSON" || fail "durable events omitted branch fork"
-grep -q '"action":"check"' "$EVENTS_JSON" || fail "durable events omitted eligibility check"
 EVENT_FOLLOW="$TTOS_E2E_ROOT/events-follow.jsonl"
 EVENT_UNTIL=$(( $(date +%s) + 3 ))
 ttos events --follow --json --since 0s --until "$EVENT_UNTIL" --filter action=pause >"$EVENT_FOLLOW" &

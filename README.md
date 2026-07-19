@@ -14,7 +14,8 @@ copy-on-write as either branch modifies them.
 > TTOS is currently intended for trusted development, integration testing,
 > state-space exploration, and similar workloads. It is not yet a production
 > security boundary or a drop-in replacement for every Docker workload. Always
-> run `ttos fork --check` before relying on a fork.
+> Every `ttos fork` atomically pauses and validates its source. On rejection,
+> TTOS resumes the source and returns a diagnostic with a nonzero status.
 
 TimeTravelOS is forked from [Google's gVisor](https://github.com/google/gvisor).
 It builds on gVisor's Sentry userspace kernel, systrap platform, netstack, VFS,
@@ -65,8 +66,8 @@ for measured results and current limits.
 - Clone internal pipes, eventfd, epoll graphs, timerfd, signalfd, inotify,
   internal Unix sockets, loopback TCP/UDP, and other explicitly validated
   Sentry-owned objects.
-- Validate the complete reachable resource graph before mutation with
-  `ttos fork --check`.
+- Validate the complete reachable resource graph after pausing and before any
+  fork mutation; on failure, remove the tentative child and resume the source.
 - Display immutable ancestry, deleted-parent tombstones, branch state, PID 1
   state, and CoW status with `ttos ls --tree`.
 
@@ -316,10 +317,9 @@ Start an interactive container in the background:
 ./bin/ttos exec -it demo sh
 ```
 
-Check and fork it:
+Fork it:
 
 ```sh
-./bin/ttos fork --check demo
 ./bin/ttos fork demo demo@test-a
 ./bin/ttos fork --paused demo demo@test-b
 ./bin/ttos ls --tree
@@ -409,7 +409,9 @@ recovery, and the full command surface.
   persist them as checkpoint images.
 - The unsafe no-host-isolation mode is only appropriate for trusted workloads.
 
-The authoritative runtime decision is always `ttos fork --check`. The full
+The authoritative runtime decision is `ttos fork` itself: it pauses the source,
+validates the frozen resource graph, and either creates the child or resumes the
+source and fails without leaving a child. The full
 supported/rejected resource matrix and open performance work are documented in
 the [audit](g3doc/proposals/timetravel_ttos_audit.md).
 

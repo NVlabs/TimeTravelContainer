@@ -183,7 +183,7 @@ func timeTravelArgs(operation string, req *ttosshim.Request) ([]string, error) {
 	switch operation {
 	case "List":
 		return []string{req.ContainerID, "branches"}, nil
-	case "Check", "Pause", "Resume", "Destroy":
+	case "Pause", "Resume", "Destroy":
 		return []string{req.ContainerID, strings.ToLower(operation), branch}, nil
 	case "Fork":
 		var args []string

@@ -58,7 +58,7 @@ type LiveForkOptions struct {
 	Metrics *LiveForkMetrics
 }
 
-// LiveForkValidationOptions controls read-only live-fork eligibility checks.
+// LiveForkValidationOptions controls live-fork resource validation.
 type LiveForkValidationOptions struct {
 	// AllowNetworkStack permits validation of an initialized, contained stack.
 	AllowNetworkStack bool

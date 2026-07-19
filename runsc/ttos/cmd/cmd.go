@@ -284,7 +284,6 @@ Commands:
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
-  fork --check [--json] SOURCE    Validate SOURCE without creating a branch
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
   unpause TARGET...               Resume branches (Docker alias)
@@ -2550,8 +2549,6 @@ type InspectBranch struct {
 	OutputRetentionError     string                                `json:"output_retention_error,omitempty"`
 	ExecOutputRetention      map[string]ttosconsole.RetentionStats `json:"exec_output_retention,omitempty"`
 	ExecOutputRetentionError string                                `json:"exec_output_retention_error,omitempty"`
-	ForkEligibility          *ForkEligibility                      `json:"fork_eligibility,omitempty"`
-	ForkCheckError           string                                `json:"fork_check_error,omitempty"`
 }
 
 // TTOSInspectInfo contains state with no direct Docker analogue.
@@ -2588,7 +2585,6 @@ func runInspect(args []string, stdout, stderr io.Writer, backend backend) error 
 	format := fs.String("format", "", "format output using a Go template or 'json'")
 	fs.StringVar(format, "f", "", "format output using a Go template or 'json'")
 	objectType := fs.String("type", "container", "inspect object type (container only)")
-	forkCheck := fs.Bool("fork-check", false, "include live-fork eligibility for each branch")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -2596,7 +2592,7 @@ func runInspect(args []string, stdout, stderr io.Writer, backend backend) error 
 		return fmt.Errorf("inspect type %q is not supported; use 'container'", *objectType)
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttos inspect [--format TEMPLATE] [--fork-check] CONTAINER [CONTAINER...]")
+		return errors.New("usage: ttos inspect [--format TEMPLATE] CONTAINER [CONTAINER...]")
 	}
 	results := make([]InspectInfo, 0, fs.NArg())
 	for _, name := range fs.Args() {
@@ -2606,22 +2602,6 @@ func runInspect(args []string, stdout, stderr io.Writer, backend backend) error 
 		info, err := backend.inspect(name)
 		if err != nil {
 			return err
-		}
-		if *forkCheck {
-			for i := range info.TTOS.Branches {
-				branch := &info.TTOS.Branches[i]
-				switch branch.Metadata.State {
-				case "running", "paused":
-					report, err := backend.checkFork(selector{container: name, branch: branch.Metadata.ID})
-					if err != nil {
-						branch.ForkCheckError = err.Error()
-					} else {
-						branch.ForkEligibility = &report
-					}
-				default:
-					branch.ForkCheckError = fmt.Sprintf("branch is %s", branch.Metadata.State)
-				}
-			}
 		}
 		results = append(results, info)
 	}
@@ -3655,44 +3635,15 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
-	check := fs.Bool("check", false, "report source eligibility without forking")
-	jsonOutput := fs.Bool("json", false, "emit eligibility as JSON (requires --check)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 || fs.NArg() > 2 {
-		return errors.New("usage: ttos fork [--paused] SOURCE [DEST] | ttos fork --check [--json] SOURCE")
+		return errors.New("usage: ttos fork [--paused] SOURCE [DEST]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return fmt.Errorf("invalid source: %w", err)
-	}
-	if *check {
-		if fs.NArg() != 1 || *paused {
-			return errors.New("fork --check accepts one SOURCE and cannot be combined with --paused")
-		}
-		result, err := backend.checkFork(source)
-		if err != nil {
-			return fmt.Errorf("checking %s: %w", source, err)
-		}
-		if *jsonOutput {
-			encoder := json.NewEncoder(stdout)
-			encoder.SetIndent("", "  ")
-			if err := encoder.Encode(result); err != nil {
-				return err
-			}
-		} else {
-			if err := writeForkEligibility(stdout, source, result); err != nil {
-				return err
-			}
-		}
-		if !result.Eligible {
-			return exitStatus{code: 1}
-		}
-		return nil
-	}
-	if *jsonOutput {
-		return errors.New("--json requires --check")
 	}
 	destinationValue := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 	if fs.NArg() == 2 {
@@ -3708,39 +3659,6 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	fmt.Fprintf(stdout, "%s@%s\n", source.container, branch.ID)
 	return nil
-}
-
-func writeForkEligibility(w io.Writer, source selector, result ForkEligibility) error {
-	state := "ineligible"
-	if result.Eligible {
-		state = "eligible"
-	}
-	if _, err := fmt.Fprintf(w, "%s %s\n", source, state); err != nil {
-		return err
-	}
-	if result.Reason != "" {
-		if _, err := fmt.Fprintf(w, "reason: %s\n", result.Reason); err != nil {
-			return err
-		}
-	}
-	for _, warning := range result.Warnings {
-		if _, err := fmt.Fprintf(w, "warning: %s: %s\n", warning.Resource, warning.Reason); err != nil {
-			return err
-		}
-	}
-	if len(result.Issues) == 0 {
-		return nil
-	}
-	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "PID\tFD\tRESOURCE\tREASON")
-	for _, issue := range result.Issues {
-		fd := strconv.Itoa(int(issue.FD))
-		if issue.FD < 0 {
-			fd = "mapping"
-		}
-		fmt.Fprintf(table, "%d\t%s\t%s\t%s\n", issue.PID, fd, issue.Resource, issue.Reason)
-	}
-	return table.Flush()
 }
 
 func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool) error {
@@ -4388,46 +4306,6 @@ type Family struct {
 	Error      string    `json:"error,omitempty"`
 }
 
-// ForkResourceIssue identifies one resource that blocks a live fork.
-type ForkResourceIssue struct {
-	PID            int32  `json:"pid"`
-	FD             int32  `json:"fd"`
-	MountPath      string `json:"mount_path,omitempty"`
-	FilesystemType string `json:"filesystem_type,omitempty"`
-	SourceClass    string `json:"source_class,omitempty"`
-	Resource       string `json:"resource"`
-	Reason         string `json:"reason"`
-}
-
-// ForkMountRecord describes one visible mount or hidden referenced filesystem.
-// Mounted is false for a filesystem reachable only through another filesystem.
-type ForkMountRecord struct {
-	MountID        uint64 `json:"mount_id,omitempty"`
-	MountPath      string `json:"mount_path,omitempty"`
-	Mounted        bool   `json:"mounted"`
-	FilesystemType string `json:"filesystem_type"`
-	SourceClass    string `json:"source_class"`
-	ReadOnly       bool   `json:"read_only"`
-	Decision       string `json:"decision"`
-	StableIdentity string `json:"stable_identity"`
-	Reason         string `json:"reason,omitempty"`
-}
-
-// ForkWarning reports a non-blocking observable sharing property.
-type ForkWarning struct {
-	Resource string `json:"resource"`
-	Reason   string `json:"reason"`
-}
-
-// ForkEligibility is a stable read-only fork validation report.
-type ForkEligibility struct {
-	Eligible      bool                `json:"eligible"`
-	MountManifest []ForkMountRecord   `json:"mount_manifest,omitempty"`
-	Warnings      []ForkWarning       `json:"warnings,omitempty"`
-	Issues        []ForkResourceIssue `json:"issues,omitempty"`
-	Reason        string              `json:"reason,omitempty"`
-}
-
 // ProcessInfo is stable branch-local process information returned by ttos top.
 type ProcessInfo struct {
 	UID     uint32  `json:"uid"`
@@ -4498,7 +4376,6 @@ type backend interface {
 	rootfsSize(target selector) (uint64, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	pause(target selector) error
-	checkFork(target selector) (ForkEligibility, error)
 	resume(target selector) error
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
@@ -7707,48 +7584,6 @@ func (b *runtimeBackend) rootfsSize(target selector) (uint64, error) {
 		return 0, fmt.Errorf("decoding branch rootfs size: %w", err)
 	}
 	return size.WritableBytes, nil
-}
-
-func (b *runtimeBackend) checkFork(target selector) (ForkEligibility, error) {
-	resolved, _, err := b.resolveSelector(target)
-	if err != nil {
-		return ForkEligibility{}, err
-	}
-	target = resolved
-	output, err := b.command("timetravel", target.container, "check", target.branch)
-	if err != nil {
-		return ForkEligibility{}, err
-	}
-	var result ForkEligibility
-	if err := json.Unmarshal(output, &result); err != nil {
-		return ForkEligibility{}, fmt.Errorf("decoding fork eligibility: %w", err)
-	}
-	spec, err := b.containerStore().LoadSpec(target.container)
-	if err != nil {
-		return ForkEligibility{}, fmt.Errorf("loading mounts for fork diagnostics: %w", err)
-	}
-	mounts, _, _, _ := inspectMounts(spec)
-	immutableHostMounts := immutableHostMountDestinations(spec)
-	managedCoWHostMounts := managedCoWHostMountDestinations(spec)
-	for _, mount := range mounts {
-		if mount.Type != "bind" {
-			continue
-		}
-		_, immutableSource := immutableHostMounts[filepath.Clean(mount.Destination)]
-		_, managedCoW := managedCoWHostMounts[filepath.Clean(mount.Destination)]
-		reason := "shared external view; independent host mutations may become visible in every branch"
-		if immutableSource {
-			reason = "user asserted that this shared external source is immutable; TTOS cannot enforce the assertion against independent host writers"
-		}
-		if managedCoW {
-			reason = "branch-local memory CoW upper over a user-asserted immutable host lower; TTOS cannot enforce the lower-source assertion against independent host writers"
-		}
-		result.Warnings = append(result.Warnings, ForkWarning{
-			Resource: mount.Source + " -> " + mount.Destination,
-			Reason:   reason,
-		})
-	}
-	return result, nil
 }
 
 func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
