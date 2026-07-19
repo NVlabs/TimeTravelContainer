@@ -49,12 +49,31 @@ const (
 var (
 	timeTravelGuestAddress   = tcpip.AddrFrom4([4]byte{10, 0, 2, 15})
 	timeTravelGatewayAddress = tcpip.AddrFrom4([4]byte{10, 0, 2, 2})
+	timeTravelGuestMAC       = net.HardwareAddr{0x02, 0x42, 0x0a, 0x00, 0x02, 0x0f}
 )
 
 // TimeTravelNetworkConfig configures TTOS's rootless, in-process virtual NIC.
 // NAT controls whether the branch-local proxy may create outbound host sockets.
 type TimeTravelNetworkConfig struct {
-	NAT bool
+	NAT      bool
+	GuestIP  net.IP
+	GuestMAC net.HardwareAddr
+}
+
+func (c TimeTravelNetworkConfig) addresses() (tcpip.Address, tcpip.Address, tcpip.LinkAddress, tcpip.LinkAddress) {
+	guest := timeTravelGuestAddress
+	if ip := c.GuestIP.To4(); ip != nil {
+		guest = tcpip.AddrFromSlice(ip)
+	}
+	bytes := guest.AsSlice()
+	gateway := tcpip.AddrFrom4([4]byte{bytes[0], bytes[1], bytes[2], 2})
+	mac := c.GuestMAC
+	if len(mac) != 6 {
+		mac = timeTravelGuestMAC
+	}
+	gatewayMAC := append(net.HardwareAddr(nil), mac...)
+	gatewayMAC[len(gatewayMAC)-1] ^= 1
+	return guest, gateway, tcpip.LinkAddress(string(mac)), tcpip.LinkAddress(string(gatewayMAC))
 }
 
 // timeTravelLinkEndpoint is one end of TTOS's in-process virtual wire. Its
@@ -164,7 +183,9 @@ func (*timeTravelLinkEndpoint) SetOnCloseAction(func()) {}
 // by its user-mode NAT. It is intentionally unreachable from serialized guest
 // state except through runtime-only live-fork hooks.
 type proxyRealm struct {
-	nat bool
+	nat            bool
+	guestAddress   tcpip.Address
+	gatewayAddress tcpip.Address
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -177,13 +198,15 @@ type proxyRealm struct {
 	gateway *stack.Stack
 }
 
-func newProxyRealm(nat bool) *proxyRealm {
+func newProxyRealm(nat bool, guestAddress, gatewayAddress tcpip.Address) *proxyRealm {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &proxyRealm{
-		nat:    nat,
-		ctx:    ctx,
-		cancel: cancel,
-		conns:  make(map[net.Conn]struct{}),
+		nat:            nat,
+		ctx:            ctx,
+		cancel:         cancel,
+		conns:          make(map[net.Conn]struct{}),
+		guestAddress:   guestAddress,
+		gatewayAddress: gatewayAddress,
 	}
 }
 
@@ -260,14 +283,15 @@ func (r *proxyRealm) close() {
 	})
 }
 
-func hostAddress(addr tcpip.Address, port uint16) string {
+func (r *proxyRealm) hostAddress(addr tcpip.Address, port uint16) string {
 	ip := net.IP(addr.AsSlice())
-	// 10.0.2.x aliases host 127.0.0.x. The gateway address retains the common
+	// The guest /24 aliases host 127.0.0.x. The gateway address retains the common
 	// 127.0.0.1 mapping; other aliases make host stub resolvers such as
 	// 127.0.0.53 reachable without exposing guest loopback traffic.
-	if bytes := addr.AsSlice(); len(bytes) == 4 && bytes[0] == 10 && bytes[1] == 0 && bytes[2] == 2 && addr != timeTravelGuestAddress {
+	guest := r.guestAddress.AsSlice()
+	if bytes := addr.AsSlice(); len(bytes) == 4 && len(guest) == 4 && bytes[0] == guest[0] && bytes[1] == guest[1] && bytes[2] == guest[2] && addr != r.guestAddress {
 		last := bytes[3]
-		if addr == timeTravelGatewayAddress {
+		if addr == r.gatewayAddress {
 			last = 1
 		}
 		ip = net.IPv4(127, 0, 0, last)
@@ -278,7 +302,7 @@ func hostAddress(addr tcpip.Address, port uint16) string {
 func (r *proxyRealm) installTCPForwarder(gateway *stack.Stack) {
 	forwarder := tcp.NewForwarder(gateway, 0, 1024, func(req *tcp.ForwarderRequest) {
 		id := req.ID()
-		target := hostAddress(id.LocalAddress, id.LocalPort)
+		target := r.hostAddress(id.LocalAddress, id.LocalPort)
 		log.Debugf("TTOS NAT TCP flow %s:%d -> %s", id.RemoteAddress, id.RemotePort, target)
 		hostConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(r.ctx, "tcp", target)
 		if err != nil {
@@ -302,7 +326,7 @@ func (r *proxyRealm) installTCPForwarder(gateway *stack.Stack) {
 func (r *proxyRealm) installUDPForwarder(gateway *stack.Stack) {
 	forwarder := udp.NewForwarder(gateway, func(req *udp.ForwarderRequest) bool {
 		id := req.ID()
-		remote, err := net.ResolveUDPAddr("udp", hostAddress(id.LocalAddress, id.LocalPort))
+		remote, err := net.ResolveUDPAddr("udp", r.hostAddress(id.LocalAddress, id.LocalPort))
 		if err != nil {
 			return false
 		}
@@ -325,6 +349,7 @@ func (r *proxyRealm) installUDPForwarder(gateway *stack.Stack) {
 }
 
 func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetworkConfig, reset bool) (retErr error) {
+	guestAddress, gatewayAddress, guestMAC, gatewayMAC := cfg.addresses()
 	ensureTimeTravelIPTables(dst)
 	if reset {
 		dst.Stack.ResetConfig()
@@ -344,14 +369,16 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		}
 	}
 
-	realm := newProxyRealm(cfg.NAT)
+	realm := newProxyRealm(cfg.NAT, guestAddress, gatewayAddress)
 	defer func() {
 		if retErr != nil {
 			realm.close()
 		}
 	}()
 	guestEP, gatewayEP := newTimeTravelLink(timeTravelMTU)
-	if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, guestEP, stack.NICOptions{
+	guestEP.SetLinkAddress(guestMAC)
+	gatewayEP.SetLinkAddress(gatewayMAC)
+	if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
 		Name:               timeTravelNICName,
 		DeliverLinkPackets: true,
 	}); err != nil {
@@ -360,7 +387,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	if err := dst.Stack.AddProtocolAddress(timeTravelNICID, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   timeTravelGuestAddress,
+			Address:   guestAddress,
 			PrefixLen: 24,
 		},
 	}, stack.AddressProperties{}); err != nil {
@@ -369,9 +396,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	dst.Stack.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4LoopbackSubnet, NIC: 1},
 		{Destination: header.IPv6Loopback.WithPrefix().Subnet(), NIC: 1},
-		// The in-memory point-to-point link has no L2 neighbor resolution; every
-		// non-loopback address is delivered directly to the proxy NIC.
-		{Destination: header.IPv4EmptySubnet, NIC: timeTravelNICID},
+		{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID},
 	})
 
 	gateway := stack.New(stack.Options{
@@ -386,13 +411,13 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	})
 	realm.gateway = gateway
 	const gatewayNICID = tcpip.NICID(1)
-	if err := gateway.CreateNIC(gatewayNICID, gatewayEP); err != nil {
+	if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
 		return fmt.Errorf("creating TTOS proxy NIC: %v", err)
 	}
 	if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   timeTravelGatewayAddress,
+			Address:   gatewayAddress,
 			PrefixLen: 24,
 		},
 	}, stack.AddressProperties{}); err != nil {
@@ -420,11 +445,13 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			child.Stack.SetIPTables(tables)
 			return configureTimeTravelNetwork(child, cfg, true)
 		},
-		ResetChild: resetTimeTravelChildConnections,
-		Close:      realm.close,
+		ResetChild: func(child *sentrynetstack.Stack) error {
+			return resetTimeTravelChildConnections(child, guestAddress)
+		},
+		Close: realm.close,
 	}
 	dst.SetLiveForkNetworkHooks(hooks)
-	log.Infof("Configured TTOS virtual NIC %s at %s/24 (NAT=%t)", timeTravelNICName, timeTravelGuestAddress, cfg.NAT)
+	log.Infof("Configured TTOS virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil
 }
 
@@ -457,8 +484,8 @@ func validateTimeTravelNetwork(s *sentrynetstack.Stack) error {
 	return nil
 }
 
-func containedTimeTravelAddress(addr tcpip.Address) bool {
-	return header.IPv4LoopbackSubnet.Contains(addr) || addr == header.IPv6Loopback || addr == timeTravelGuestAddress
+func containedTimeTravelAddress(addr, guestAddress tcpip.Address) bool {
+	return header.IPv4LoopbackSubnet.Contains(addr) || addr == header.IPv6Loopback || addr == guestAddress
 }
 
 func reverseEndpointID(id stack.TransportEndpointID) stack.TransportEndpointID {
@@ -470,7 +497,7 @@ func reverseEndpointID(id stack.TransportEndpointID) stack.TransportEndpointID {
 	}
 }
 
-func resetTimeTravelChildConnections(s *sentrynetstack.Stack) error {
+func resetTimeTravelChildConnections(s *sentrynetstack.Stack, guestAddress tcpip.Address) error {
 	var externalProxyPeers = make(map[stack.TransportEndpointID]struct{})
 	for _, transportEP := range s.Stack.RegisteredEndpoints() {
 		ep, ok := transportEP.(*tcp.Endpoint)
@@ -492,7 +519,7 @@ func resetTimeTravelChildConnections(s *sentrynetstack.Stack) error {
 			continue
 		}
 		_, proxyPeer := externalProxyPeers[info.ID]
-		if ep.LiveForkExternal() || proxyPeer || (!info.ID.RemoteAddress.Unspecified() && !containedTimeTravelAddress(info.ID.RemoteAddress)) {
+		if ep.LiveForkExternal() || proxyPeer || (!info.ID.RemoteAddress.Unspecified() && !containedTimeTravelAddress(info.ID.RemoteAddress, guestAddress)) {
 			ep.ResetForLiveForkChild()
 		}
 	}

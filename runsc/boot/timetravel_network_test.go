@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -35,17 +36,41 @@ import (
 )
 
 func newTimeTravelNetworkTestStack(t *testing.T, nat bool) *sentrynetstack.Stack {
+	return newTimeTravelNetworkTestStackWithConfig(t, TimeTravelNetworkConfig{NAT: nat})
+}
+
+func newTimeTravelNetworkTestStackWithConfig(t *testing.T, cfg TimeTravelNetworkConfig) *sentrynetstack.Stack {
 	t.Helper()
 	s := sentrynetstack.NewStack(stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        true,
 	}), 1)
-	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: nat}, true); err != nil {
-		t.Fatalf("configureTimeTravelNetwork(NAT=%t): %v", nat, err)
+	if err := configureTimeTravelNetwork(s, cfg, true); err != nil {
+		t.Fatalf("configureTimeTravelNetwork(%+v): %v", cfg, err)
 	}
 	t.Cleanup(s.Destroy)
 	return s
+}
+
+func TestTimeTravelNetworkCustomAddressAndMAC(t *testing.T) {
+	guestIP := net.IPv4(192, 0, 2, 44)
+	guestMAC := net.HardwareAddr{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee}
+	s := newTimeTravelNetworkTestStackWithConfig(t, TimeTravelNetworkConfig{GuestIP: guestIP, GuestMAC: guestMAC})
+	info := s.Stack.NICInfo()[timeTravelNICID]
+	if got := net.HardwareAddr(info.LinkAddress).String(); got != guestMAC.String() {
+		t.Errorf("link address = %s, want %s", got, guestMAC)
+	}
+	wantAddress := tcpip.AddrFromSlice(guestIP.To4())
+	found := false
+	for _, address := range info.ProtocolAddresses {
+		if address.Protocol == ipv4.ProtocolNumber && address.AddressWithPrefix.Address == wantAddress && address.AddressWithPrefix.PrefixLen == 24 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("protocol addresses = %+v, want %s/24", info.ProtocolAddresses, wantAddress)
+	}
 }
 
 func dialTimeTravelGateway(t *testing.T, s *sentrynetstack.Stack, port uint16, timeout time.Duration) (*gonet.TCPConn, error) {
@@ -164,7 +189,7 @@ func TestTimeTravelNetworkLiveForkHooks(t *testing.T) {
 		t.Fatalf("source ValidateLiveFork: %v", err)
 	}
 	child := sentrynetstack.NewStack(stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        true,
 	}), 2)
@@ -216,7 +241,7 @@ func TestTimeTravelNetworkResetsPublishedTCPPair(t *testing.T) {
 		t.Fatal("timed out accepting published connection")
 	}
 	defer appConn.Close()
-	if err := resetTimeTravelChildConnections(s); err != nil {
+	if err := resetTimeTravelChildConnections(s, timeTravelGuestAddress); err != nil {
 		t.Fatalf("resetTimeTravelChildConnections: %v", err)
 	}
 	if _, err := proxyConn.Write(ctx, []byte("must-reset"), make(chan struct{})); err == nil {

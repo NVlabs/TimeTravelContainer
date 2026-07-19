@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"text/template"
@@ -1134,6 +1136,29 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
+func validateVirtualNICOptions(networkMode, ipValue, macValue string) error {
+	if (ipValue != "" || macValue != "") && networkMode != "ttos" {
+		return errors.New("--ip and --mac-address require --network=ttos")
+	}
+	if ipValue != "" {
+		ip, err := netip.ParseAddr(ipValue)
+		if err != nil || !ip.Is4() || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("--ip must be a unicast IPv4 address, got %q", ipValue)
+		}
+		last := ip.As4()[3]
+		if last == 0 || last == 2 || last == 255 {
+			return fmt.Errorf("--ip %q conflicts with the /24 network, gateway, or broadcast address", ipValue)
+		}
+	}
+	if macValue != "" {
+		mac, err := net.ParseMAC(macValue)
+		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
+			return fmt.Errorf("--mac-address must be a unicast 48-bit MAC address, got %q", macValue)
+		}
+	}
+	return nil
+}
+
 func parsePublishedPorts(values []string) ([]ttosbundle.PortBinding, error) {
 	bindings := make([]ttosbundle.PortBinding, 0, len(values))
 	seen := make(map[string]bool)
@@ -1312,6 +1337,8 @@ type runRequest struct {
 	hostname           string
 	networkMode        string
 	networkNAT         bool
+	networkIP          string
+	networkMAC         string
 	publishedPorts     []ttosbundle.PortBinding
 	logDriver          string
 	extraHosts         []string
@@ -1389,7 +1416,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1421,6 +1448,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttos")
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttos virtual NIC")
+	networkIP := fs.String("ip", "", "IPv4 address for the ttos virtual NIC")
+	networkMAC := fs.String("mac-address", "", "MAC address for the ttos virtual NIC")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttos")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -1494,6 +1523,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if *networkNAT && networkMode != "ttos" {
 		return errors.New("--nat requires --network=ttos")
 	}
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+		return err
+	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
 	if err != nil {
 		return err
@@ -1595,6 +1627,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		networkNAT:         *networkNAT,
+		networkIP:          *networkIP,
+		networkMAC:         strings.ToLower(*networkMAC),
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -1648,7 +1682,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1678,6 +1712,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttos")
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttos virtual NIC")
+	networkIP := fs.String("ip", "", "IPv4 address for the ttos virtual NIC")
+	networkMAC := fs.String("mac-address", "", "MAC address for the ttos virtual NIC")
 	logDriverValue := fs.String("log-driver", ttosbundle.DefaultLogDriver, "logging driver: local, json-file, or none")
 	fs.StringVar(networkModeValue, "net", "none", "network mode: none, host, or ttos")
 	entrypoint := fs.String("entrypoint", "", "override the image entrypoint")
@@ -1751,6 +1787,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *networkNAT && networkMode != "ttos" {
 		return errors.New("--nat requires --network=ttos")
 	}
+	if err := validateVirtualNICOptions(networkMode, *networkIP, *networkMAC); err != nil {
+		return err
+	}
 	publishedPorts, err := parsePublishedPorts(publishedPortValues)
 	if err != nil {
 		return err
@@ -1852,6 +1891,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		hostname:           *hostname,
 		networkMode:        networkMode,
 		networkNAT:         *networkNAT,
+		networkIP:          *networkIP,
+		networkMAC:         strings.ToLower(*networkMAC),
 		publishedPorts:     publishedPorts,
 		logDriver:          logDriver,
 		extraHosts:         parsedExtraHosts,
@@ -2754,7 +2795,7 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
-	info, err := backend.pull(reference, *platform)
+	info, err := backend.pull(reference, *platform, !*quiet)
 	if err != nil {
 		return err
 	}
@@ -2922,6 +2963,74 @@ func formatImageSize(size int64) string {
 		}
 	}
 	panic("unreachable")
+}
+
+func shortLayerID(digest string) string {
+	digest = strings.TrimPrefix(digest, "sha256:")
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	if digest == "" {
+		return "image"
+	}
+	return digest
+}
+
+// newImageProgress turns concurrent structured pull events into stable,
+// line-oriented output that also works through the daemon framing protocol.
+func newImageProgress(w io.Writer) ttosimages.ProgressFunc {
+	if w == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	nextPercent := make(map[string]int)
+	return func(event ttosimages.ProgressEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		id := shortLayerID(event.Descriptor.Digest.String())
+		switch event.Phase {
+		case ttosimages.ProgressResolving:
+			fmt.Fprintln(w, "Resolving image metadata")
+		case ttosimages.ProgressDownloading:
+			key := "download:" + id
+			if event.Current == 0 {
+				fmt.Fprintf(w, "%s: Pulling fs layer (%s)\n", id, formatImageSize(event.Total))
+				nextPercent[key] = 10
+				return
+			}
+			percent := 100
+			if event.Total > 0 {
+				percent = int(event.Current * 100 / event.Total)
+			}
+			if percent >= nextPercent[key] && percent < 100 {
+				fmt.Fprintf(w, "%s: Downloading %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
+				nextPercent[key] = (percent/10 + 1) * 10
+			}
+		case ttosimages.ProgressDownloadDone:
+			fmt.Fprintf(w, "%s: Download complete\n", id)
+			delete(nextPercent, "download:"+id)
+		case ttosimages.ProgressAlreadyExists:
+			fmt.Fprintf(w, "%s: Already exists\n", id)
+		case ttosimages.ProgressExtracting:
+			key := "extract:" + id
+			if event.Current == 0 {
+				fmt.Fprintf(w, "%s: Extracting layer %d/%d (%s)\n", id, event.Index, event.Count, formatImageSize(event.Total))
+				nextPercent[key] = 25
+				return
+			}
+			percent := 100
+			if event.Total > 0 {
+				percent = int(event.Current * 100 / event.Total)
+			}
+			if percent >= nextPercent[key] && percent < 100 {
+				fmt.Fprintf(w, "%s: Extracting %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
+				nextPercent[key] = (percent/25 + 1) * 25
+			}
+		case ttosimages.ProgressExtracted:
+			fmt.Fprintf(w, "%s: Pull complete\n", id)
+			delete(nextPercent, "extract:"+id)
+		}
+	}
 }
 
 func formatImageAge(now, created time.Time) string {
@@ -4369,7 +4478,7 @@ type ImageRemoveResult struct {
 }
 
 type backend interface {
-	pull(reference, platform string) (ttosimages.Info, error)
+	pull(reference, platform string, progress bool) (ttosimages.Info, error)
 	listImages() ([]ImageInfo, error)
 	inspectImage(identifier string) (ImageInspectInfo, error)
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
@@ -4717,7 +4826,10 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		AutoRemove:         request.autoRemove,
 		StopTimeout:        &request.stopTimeout,
 		NetworkNAT:         request.networkNAT,
+		NetworkIP:          request.networkIP,
+		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
+		Progress:           newImageProgress(b.stderr),
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -4785,7 +4897,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		AutoRemove:         request.autoRemove,
 		StopTimeout:        &request.stopTimeout,
 		NetworkNAT:         request.networkNAT,
+		NetworkIP:          request.networkIP,
+		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
+		Progress:           newImageProgress(b.stderr),
 	})
 	if err != nil {
 		return "", err
@@ -6509,6 +6624,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []str
 }
 
 func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, networkNAT bool) []string {
+	return b.configuredRunscArgsForNetworkConfig(networkMode, networkNAT, "", "")
+}
+
+func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC string) []string {
 	args := []string{
 		"--root", b.root,
 	}
@@ -6524,6 +6643,12 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, ne
 		"--overlay2=all:memory")
 	if networkMode == "ttos" {
 		args = append(args, "--ttos-network-nat="+strconv.FormatBool(networkNAT))
+		if networkIP != "" {
+			args = append(args, "--ttos-network-ip="+networkIP)
+		}
+		if networkMAC != "" {
+			args = append(args, "--ttos-network-mac="+networkMAC)
+		}
 	}
 	return args
 }
@@ -6537,7 +6662,11 @@ func (b *runtimeBackend) runConfiguredCommandForNetwork(networkMode string, args
 }
 
 func (b *runtimeBackend) runConfiguredCommandForNetworkNAT(networkMode string, networkNAT bool, args ...string) (int, error) {
-	args = append(b.configuredRunscArgsForNetworkNAT(networkMode, networkNAT), args...)
+	return b.runConfiguredCommandWithArgs(b.configuredRunscArgsForNetworkNAT(networkMode, networkNAT), args...)
+}
+
+func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args ...string) (int, error) {
+	args = append(configured, args...)
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return 1, fmt.Errorf("opening runsc launch stdout: %w", err)
@@ -6700,7 +6829,8 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 
 func (b *runtimeBackend) launch(info ttosbundle.ContainerInfo, detach, interactive bool) (int, error) {
 	name, bundleDir := info.ID, info.BundleDir
-	status, err := b.runConfiguredCommandForNetworkNAT(info.NetworkMode, info.NetworkNAT, "create", "--bundle", bundleDir, name)
+	configuredArgs := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
 	}
@@ -6725,7 +6855,7 @@ func (b *runtimeBackend) launch(info ttosbundle.ContainerInfo, detach, interacti
 		}
 		return 1, err
 	}
-	status, err = b.runConfiguredCommandForNetworkNAT(info.NetworkMode, info.NetworkNAT, "start", name)
+	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "start", name)
 	if err != nil || status != 0 {
 		if err == nil {
 			err = fmt.Errorf("runsc start exited with status %d", status)
@@ -6801,7 +6931,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttosbundle.ContainerInfo, bind
 	}
 	defer readyReader.Close()
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
-	args := b.configuredRunscArgsForNetworkNAT(info.NetworkMode, info.NetworkNAT)
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	args = append(args, "port-forward", "--branch="+defaultBranchID, "--ready-fd=4", info.ID, endpoint)
 	command := exec.Command(b.runsc, args...)
 	command.Stdout = errorFile
@@ -6841,11 +6971,16 @@ func (b *runtimeBackend) ensurePublishedPort(info ttosbundle.ContainerInfo, bind
 	return nil
 }
 
-func (b *runtimeBackend) pull(reference, platform string) (ttosimages.Info, error) {
+func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttosimages.Info, error) {
+	var progressFunc ttosimages.ProgressFunc
+	if progress {
+		progressFunc = newImageProgress(b.stderr)
+	}
 	return ttosimages.Pull(context.Background(), ttosimages.PullOptions{
 		Root:      b.dataRoot,
 		Reference: reference,
 		Platform:  platform,
+		Progress:  progressFunc,
 	})
 }
 

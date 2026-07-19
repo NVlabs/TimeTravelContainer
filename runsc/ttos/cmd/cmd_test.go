@@ -752,12 +752,15 @@ func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			backend := &fakeBackend{containerID: "demo"}
 			var stdout, stderr bytes.Buffer
-			args := []string{command, "--network=ttos", "--nat", "-p", "8080:80", "--publish", "127.0.0.1:8443:443/tcp", "busybox"}
+			args := []string{command, "--network=ttos", "--nat", "--ip", "192.0.2.44", "--mac-address", "02:aa:bb:cc:dd:ee", "-p", "8080:80", "--publish", "127.0.0.1:8443:443/tcp", "busybox"}
 			if status := runCommand(args, &stdout, &stderr, backend); status != 0 {
 				t.Fatalf("status=%d, stderr=%q", status, stderr.String())
 			}
 			if backend.runRequest.networkMode != "ttos" || !backend.runRequest.networkNAT {
 				t.Errorf("network request=%+v", backend.runRequest)
+			}
+			if backend.runRequest.networkIP != "192.0.2.44" || backend.runRequest.networkMAC != "02:aa:bb:cc:dd:ee" {
+				t.Errorf("virtual NIC=(%q, %q), want custom IP and MAC", backend.runRequest.networkIP, backend.runRequest.networkMAC)
 			}
 			if !reflect.DeepEqual(backend.runRequest.publishedPorts, wantPorts) {
 				t.Errorf("published ports=%+v, want %+v", backend.runRequest.publishedPorts, wantPorts)
@@ -766,9 +769,28 @@ func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 	}
 }
 
+func TestImageProgressIsHumanReadable(t *testing.T) {
+	var output bytes.Buffer
+	progress := newImageProgress(&output)
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressResolving})
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressDownloading, Total: 1000})
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressDownloading, Current: 500, Total: 1000})
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressDownloadDone, Current: 1000, Total: 1000})
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressExtracting, Total: 1000, Index: 1, Count: 2})
+	progress(ttosimages.ProgressEvent{Phase: ttosimages.ProgressExtracted, Current: 1000, Total: 1000, Index: 1, Count: 2})
+	for _, want := range []string{"Resolving image metadata", "Pulling fs layer", "Downloading 500B / 1kB (50%)", "Download complete", "Extracting layer 1/2", "Pull complete"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("progress output %q does not contain %q", output.String(), want)
+		}
+	}
+}
+
 func TestTimeTravelNetworkingRejectsInvalidCombinations(t *testing.T) {
 	tests := [][]string{
 		{"run", "--nat", "busybox"},
+		{"run", "--ip", "192.0.2.44", "busybox"},
+		{"create", "--network=ttos", "--ip", "192.0.2.2", "busybox"},
+		{"create", "--network=ttos", "--mac-address", "01:00:5e:00:00:01", "busybox"},
 		{"run", "-p", "8080:80", "busybox"},
 		{"create", "--network=ttos", "-p", "8080:80/udp", "busybox"},
 		{"create", "--network=ttos", "-p", "not-a-port", "busybox"},
@@ -2471,6 +2493,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttos", true); !reflect.DeepEqual(got, wantTTOSNAT) {
 		t.Errorf("TTOS NAT runsc args=%q, want %q", got, wantTTOSNAT)
 	}
+	wantCustomNIC := append(append([]string(nil), wantTTOSNAT...), "--ttos-network-ip=192.0.2.44", "--ttos-network-mac=02:aa:bb:cc:dd:ee")
+	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkConfig("ttos", true, "192.0.2.44", "02:aa:bb:cc:dd:ee"); !reflect.DeepEqual(got, wantCustomNIC) {
+		t.Errorf("TTOS custom NIC runsc args=%q, want %q", got, wantCustomNIC)
+	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory",
@@ -3236,7 +3262,7 @@ func (b *fakeBackend) remove(name string, force, volumes bool) error {
 	return b.err
 }
 
-func (b *fakeBackend) pull(reference, platform string) (ttosimages.Info, error) {
+func (b *fakeBackend) pull(reference, platform string, progress bool) (ttosimages.Info, error) {
 	b.pullReference = reference
 	b.pullPlatform = platform
 	return b.pullInfo, b.err

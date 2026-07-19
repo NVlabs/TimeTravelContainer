@@ -62,12 +62,21 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config, disableIPv6 b
 			return fmt.Errorf("creating default loopback interface: %v", err)
 		}
 	case config.NetworkTimeTravel:
+		guestIP := net.ParseIP(conf.TimeTravelNetworkIP)
+		guestMAC, err := net.ParseMAC(conf.TimeTravelNetworkMAC)
+		if conf.TimeTravelNetworkMAC == "" {
+			guestMAC = nil
+		} else if err != nil {
+			return fmt.Errorf("parsing TTOS virtual NIC MAC address: %v", err)
+		}
 		link := boot.DefaultLoopbackLink
 		link.GVisorGRO = conf.GVisorGRO
 		if err := conn.Call(boot.ContMgrSetNetworkArgs, &boot.CreateLinksAndRoutesArgs{
 			LoopbackLinks: []boot.LoopbackLink{link},
-			TimeTravel:    &boot.TimeTravelNetworkConfig{NAT: conf.TimeTravelNetworkNAT},
-			IsRestore:     isRestore,
+			TimeTravel: &boot.TimeTravelNetworkConfig{
+				NAT: conf.TimeTravelNetworkNAT, GuestIP: guestIP, GuestMAC: guestMAC,
+			},
+			IsRestore: isRestore,
 		}, nil); err != nil {
 			return fmt.Errorf("creating TTOS virtual network: %v", err)
 		}

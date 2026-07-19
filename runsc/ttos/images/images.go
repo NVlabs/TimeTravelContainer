@@ -20,8 +20,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -45,6 +47,80 @@ type PullOptions struct {
 	Root      string
 	Reference string
 	Platform  string
+	Progress  ProgressFunc
+}
+
+// ProgressEvent reports human-facing image transfer and extraction progress.
+type ProgressEvent struct {
+	Phase      string
+	Descriptor ocispec.Descriptor
+	Current    int64
+	Total      int64
+	Index      int
+	Count      int
+}
+
+// ProgressFunc consumes image progress events. Calls may be concurrent.
+type ProgressFunc func(ProgressEvent)
+
+const (
+	ProgressResolving     = "resolving"
+	ProgressDownloading   = "downloading"
+	ProgressDownloadDone  = "download-complete"
+	ProgressAlreadyExists = "already-exists"
+	ProgressExtracting    = "extracting"
+	ProgressExtracted     = "extract-complete"
+)
+
+func isLayerDescriptor(desc ocispec.Descriptor) bool {
+	return strings.Contains(strings.ToLower(desc.MediaType), "layer")
+}
+
+type progressFetcher struct {
+	remotes.Fetcher
+	progress ProgressFunc
+}
+
+func (f progressFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	reader, err := f.Fetcher.Fetch(ctx, desc)
+	if err != nil || f.progress == nil || !isLayerDescriptor(desc) {
+		return reader, err
+	}
+	f.progress(ProgressEvent{Phase: ProgressDownloading, Descriptor: desc, Total: desc.Size})
+	return &progressReadCloser{ReadCloser: reader, desc: desc, progress: f.progress}, nil
+}
+
+type progressReadCloser struct {
+	io.ReadCloser
+	desc     ocispec.Descriptor
+	progress ProgressFunc
+	current  int64
+	done     sync.Once
+}
+
+func (r *progressReadCloser) Read(dst []byte) (int, error) {
+	n, err := r.ReadCloser.Read(dst)
+	r.current += int64(n)
+	if n != 0 {
+		r.progress(ProgressEvent{Phase: ProgressDownloading, Descriptor: r.desc, Current: r.current, Total: r.desc.Size})
+	}
+	if err == io.EOF || (r.desc.Size > 0 && r.current >= r.desc.Size) {
+		r.complete()
+	}
+	return n, err
+}
+
+func (r *progressReadCloser) Close() error {
+	if r.desc.Size > 0 && r.current >= r.desc.Size {
+		r.complete()
+	}
+	return r.ReadCloser.Close()
+}
+
+func (r *progressReadCloser) complete() {
+	r.done.Do(func() {
+		r.progress(ProgressEvent{Phase: ProgressDownloadDone, Descriptor: r.desc, Current: r.current, Total: r.desc.Size})
+	})
 }
 
 // ContentLeaseOptions identifies a durable TTOS family lease over one image target.
@@ -138,6 +214,9 @@ func platformMatcher(value string) (platforms.MatchComparer, error) {
 
 // Pull resolves and stores one image in TTOS's native content store.
 func Pull(ctx context.Context, opts PullOptions) (Info, error) {
+	if opts.Progress != nil {
+		opts.Progress(ProgressEvent{Phase: ProgressResolving})
+	}
 	reference, err := NormalizeReference(opts.Reference)
 	if err != nil {
 		return Info{}, err
@@ -180,6 +259,9 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	}
 	children := containerdimages.FilterPlatforms(containerdimages.ChildrenHandler(store.content), matcher)
 	children = containerdimages.LimitManifests(children, matcher, 1)
+	if opts.Progress != nil {
+		fetcher = progressFetcher{Fetcher: fetcher, progress: opts.Progress}
+	}
 	handler := containerdimages.Handlers(remotes.FetchHandler(store.content, fetcher), children)
 	if err := containerdimages.Dispatch(ctx, handler, nil, target); err != nil {
 		return Info{}, fmt.Errorf("pulling %q: %w", reference, err)
@@ -187,6 +269,13 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	manifest, err := containerdimages.Manifest(ctx, store.content, target, matcher)
 	if err != nil {
 		return Info{}, fmt.Errorf("selecting manifest for %q: %w", reference, err)
+	}
+	if opts.Progress != nil {
+		for _, layer := range manifest.Layers {
+			if _, existed := contentBefore[layer.Digest.String()]; existed {
+				opts.Progress(ProgressEvent{Phase: ProgressAlreadyExists, Descriptor: layer, Current: layer.Size, Total: layer.Size})
+			}
+		}
 	}
 	configData, err := content.ReadBlob(ctx, store.content, manifest.Config)
 	if err != nil {

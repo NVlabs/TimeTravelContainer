@@ -42,6 +42,7 @@ type RootFSOptions struct {
 	Reference string
 	Platform  string
 	Root      string
+	Progress  ProgressFunc
 }
 
 // RootFSInfo describes a materialized immutable image root.
@@ -104,8 +105,8 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 	}
 
 	owners := newOwnershipState()
-	for _, layer := range manifest.Layers {
-		if err := applyContentLayer(ctx, store.content, opts.Root, layer, owners); err != nil {
+	for index, layer := range manifest.Layers {
+		if err := applyContentLayer(ctx, store.content, opts.Root, layer, owners, opts.Progress, index+1, len(manifest.Layers)); err != nil {
 			return RootFSInfo{}, fmt.Errorf("applying layer %s: %w", layer.Digest, err)
 		}
 	}
@@ -150,13 +151,42 @@ func prepareEmptyRoot(root string) error {
 	return nil
 }
 
-func applyContentLayer(ctx context.Context, store content.Store, root string, layer ocispec.Descriptor, owners *ownershipState) error {
+func applyContentLayer(ctx context.Context, store content.Store, root string, layer ocispec.Descriptor, owners *ownershipState, progress ProgressFunc, index, count int) error {
 	readerAt, err := store.ReaderAt(ctx, layer)
 	if err != nil {
 		return err
 	}
 	defer readerAt.Close()
-	return applyLayerWithOwnership(ctx, root, content.NewReader(readerAt), owners)
+	reader := io.Reader(content.NewReader(readerAt))
+	if progress != nil {
+		progress(ProgressEvent{Phase: ProgressExtracting, Descriptor: layer, Total: layer.Size, Index: index, Count: count})
+		reader = &progressReader{reader: reader, desc: layer, progress: progress, index: index, count: count}
+	}
+	if err := applyLayerWithOwnership(ctx, root, reader, owners); err != nil {
+		return err
+	}
+	if progress != nil {
+		progress(ProgressEvent{Phase: ProgressExtracted, Descriptor: layer, Current: layer.Size, Total: layer.Size, Index: index, Count: count})
+	}
+	return nil
+}
+
+type progressReader struct {
+	reader   io.Reader
+	desc     ocispec.Descriptor
+	progress ProgressFunc
+	current  int64
+	index    int
+	count    int
+}
+
+func (r *progressReader) Read(dst []byte) (int, error) {
+	n, err := r.reader.Read(dst)
+	r.current += int64(n)
+	if n != 0 {
+		r.progress(ProgressEvent{Phase: ProgressExtracting, Descriptor: r.desc, Current: r.current, Total: r.desc.Size, Index: r.index, Count: r.count})
+	}
+	return n, err
 }
 
 func applyLayer(ctx context.Context, root string, compressed io.Reader) error {

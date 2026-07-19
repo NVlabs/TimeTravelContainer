@@ -69,7 +69,10 @@ type PrepareOptions struct {
 	AutoRemove         bool
 	StopTimeout        *int
 	NetworkNAT         bool
+	NetworkIP          string
+	NetworkMAC         string
 	PublishedPorts     []PortBinding
+	Progress           images.ProgressFunc
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -116,6 +119,8 @@ type ContainerInfo struct {
 	Branches           []BranchInfo      `json:"branches,omitempty"`
 	NetworkMode        string            `json:"network_mode,omitempty"`
 	NetworkNAT         bool              `json:"network_nat,omitempty"`
+	NetworkIP          string            `json:"network_ip,omitempty"`
+	NetworkMAC         string            `json:"network_mac,omitempty"`
 	PublishedPorts     []PortBinding     `json:"published_ports,omitempty"`
 	LogDriver          string            `json:"log_driver,omitempty"`
 	LogOptions         map[string]string `json:"log_options,omitempty"`
@@ -466,6 +471,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if opts.NetworkNAT && networkMode != "ttos" {
 		return Prepared{}, fmt.Errorf("NAT requires network mode ttos")
 	}
+	if (opts.NetworkIP != "" || opts.NetworkMAC != "") && networkMode != "ttos" {
+		return Prepared{}, fmt.Errorf("custom IP and MAC addresses require network mode ttos")
+	}
 	if len(opts.PublishedPorts) != 0 && networkMode != "ttos" {
 		return Prepared{}, fmt.Errorf("published ports require network mode ttos")
 	}
@@ -497,11 +505,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
 		}
 	}
-	pulled, err := s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy)
+	pulled, err := s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy, opts.Progress)
 	if err != nil {
 		return Prepared{}, err
 	}
-	imageInfo, rootfs, err := s.prepareImageRoot(ctx, pulled, opts.Platform)
+	imageInfo, rootfs, err := s.prepareImageRoot(ctx, pulled, opts.Platform, opts.Progress)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -610,6 +618,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		NetworkMode:        networkMode,
 		NetworkNAT:         opts.NetworkNAT,
+		NetworkIP:          opts.NetworkIP,
+		NetworkMAC:         opts.NetworkMAC,
 		PublishedPorts:     append([]PortBinding(nil), opts.PublishedPorts...),
 		LogDriver:          logDriver,
 		LogOptions:         cloneStringMap(opts.LogOptions),
@@ -1708,7 +1718,7 @@ func normalizePullPolicy(policy string) (string, error) {
 	}
 }
 
-func (s Store) resolveImage(ctx context.Context, reference, platform, policy string) (images.Info, error) {
+func (s Store) resolveImage(ctx context.Context, reference, platform, policy string, progress images.ProgressFunc) (images.Info, error) {
 	policy, err := normalizePullPolicy(policy)
 	if err != nil {
 		return images.Info{}, err
@@ -1736,6 +1746,7 @@ func (s Store) resolveImage(ctx context.Context, reference, platform, policy str
 		Root:      s.Root,
 		Reference: reference,
 		Platform:  platform,
+		Progress:  progress,
 	})
 }
 
@@ -1755,7 +1766,7 @@ func selectStoredImage(stored []images.Info, reference, platform string) (images
 	return images.Info{}, false, nil
 }
 
-func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string) (images.RootFSInfo, string, error) {
+func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (images.RootFSInfo, string, error) {
 	imagesDir := filepath.Join(s.Root, "images")
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating image cache: %w", err)
@@ -1780,6 +1791,7 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 		Reference: pulled.Reference,
 		Platform:  platform,
 		Root:      rootfs,
+		Progress:  progress,
 	})
 	if err != nil {
 		return images.RootFSInfo{}, "", err

@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -122,6 +123,14 @@ type Config struct {
 	// TimeTravelNetworkNAT enables outbound host socket proxying for the TTOS
 	// in-process virtual NIC.
 	TimeTravelNetworkNAT bool `flag:"ttos-network-nat"`
+
+	// TimeTravelNetworkIP is the IPv4 address assigned to the TTOS in-process
+	// virtual NIC. An empty value selects the runtime default.
+	TimeTravelNetworkIP string `flag:"ttos-network-ip"`
+
+	// TimeTravelNetworkMAC is the link address exposed by the TTOS in-process
+	// virtual NIC. An empty value selects the runtime default.
+	TimeTravelNetworkMAC string `flag:"ttos-network-mac"`
 
 	// EnableRaw indicates whether raw sockets should be enabled. Raw
 	// sockets are disabled by stripping CAP_NET_RAW from the list of
@@ -496,6 +505,27 @@ func (c *Config) Validate() error {
 	}
 	if c.TimeTravelNetworkNAT && c.Network != NetworkTimeTravel {
 		return fmt.Errorf("ttos-network-nat is only supported with ttos networking")
+	}
+	if c.TimeTravelNetworkIP != "" {
+		if c.Network != NetworkTimeTravel {
+			return fmt.Errorf("ttos-network-ip is only supported with ttos networking")
+		}
+		ip := net.ParseIP(c.TimeTravelNetworkIP)
+		if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("ttos-network-ip must be a unicast IPv4 address, got %q", c.TimeTravelNetworkIP)
+		}
+		if ip.To4()[3] == 0 || ip.To4()[3] == 2 || ip.To4()[3] == 255 {
+			return fmt.Errorf("ttos-network-ip %q conflicts with the /24 network, gateway, or broadcast address", c.TimeTravelNetworkIP)
+		}
+	}
+	if c.TimeTravelNetworkMAC != "" {
+		if c.Network != NetworkTimeTravel {
+			return fmt.Errorf("ttos-network-mac is only supported with ttos networking")
+		}
+		mac, err := net.ParseMAC(c.TimeTravelNetworkMAC)
+		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
+			return fmt.Errorf("ttos-network-mac must be a unicast 48-bit MAC address, got %q", c.TimeTravelNetworkMAC)
+		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
 		return fmt.Errorf("qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.TBFBurst)
