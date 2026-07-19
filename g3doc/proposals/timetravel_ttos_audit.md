@@ -212,7 +212,8 @@ Currently demonstrated as branch-local or safely cloned:
 * tmpfs, managed volumes, in-memory OverlayFS uppers, procfs, cgroupfs, devpts,
   restricted read-only sysfs, POSIX message queues, and namespace handles;
 * SysV shared memory;
-* anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, and inotify;
+* anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, inotify, pidfds,
+  and Sentry-owned netlink sockets;
 * entirely internal Unix socket graphs without queued `SCM_RIGHTS`; and
 * an empty or canonical loopback-only netstack, including internal UDP/TCP
   queues and connections; and

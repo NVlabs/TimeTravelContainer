@@ -136,6 +136,14 @@ type Socket struct {
 var _ socket.Socket = (*Socket)(nil)
 var _ transport.Credentialer = (*Socket)(nil)
 var _ inet.NetlinkSocket = (*Socket)(nil)
+var _ vfs.LiveForkFileDescription = (*Socket)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription. Netlink sockets,
+// their queued datagrams, protocol state, port allocation, and network
+// namespace are all Sentry-owned and are restored into the cloned Kernel.
+func (*Socket) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
 
 // New creates a new Socket.
 // +checklocksignore: we don't have to hold locks during initialization.

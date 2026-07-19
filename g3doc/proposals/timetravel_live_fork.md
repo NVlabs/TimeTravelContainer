@@ -405,6 +405,8 @@ Initial policy:
 | In-memory OverlayFS upper on tmpfs | Clone, including metadata, hardlinks, whiteouts, and sparse size divergence |
 | Read-only immutable gofer lower | Share with explicit hook |
 | SysV SHM | Clone through a branch-local page map with first-fault CoW |
+| pidfd | Clone and rebind its target to the corresponding branch-local task |
+| Sentry netlink socket | Clone its protocol, queued datagrams, port allocation, and network-namespace state |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
 | Loopback netstack socket | Clone on canonical loopback with unmodified default iptables |
 | TTOS virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
@@ -479,8 +481,9 @@ compatibility boundary are summarized in
 [timetravel_ttos_audit.md](timetravel_ttos_audit.md).
 
 The Phase 3 object-graph slice is validated for anonymous pipes, pure Sentry
-eventfds, epoll registration graphs, timerfds, signalfds, inotify watches, and
-connected internal Unix socketpairs. The real-loader fork test installs these
+eventfds, epoll registration graphs, timerfds, signalfds, inotify watches,
+pidfds, Sentry netlink sockets, and connected internal Unix socketpairs. The
+real-loader fork test installs these
 objects in the virtual PID 1 FD table before cloning. It verifies that queued
 bytes, event counters, pending signals, inotify events, and timer expiration
 counts start identical, aliases remain coherent inside each branch, consumption
@@ -490,7 +493,8 @@ not mutate the parent interest. An armed cloned timerfd also expires in the
 running child without making the paused parent readable. Signalfd target-task
 pointers and inotify watch targets resolve inside the cloned graph. A connected
 Unix socketpair preserves its peer topology while its receive queues become
-branch-local.
+branch-local. A cloned pidfd resolves to the corresponding task in its own
+branch, and cloned netlink sockets are distinct branch-local objects.
 
 These resources required no special clone implementation beyond their existing
 state graph and post-load hooks. Timerfd testing exposed and fixed a kernel

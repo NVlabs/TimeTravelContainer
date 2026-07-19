@@ -1235,6 +1235,17 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentTCPClient := liveForkTestFD(t, l.k, tcpFDs[0])
 	parentTCPServer := liveForkTestFD(t, l.k, tcpFDs[1])
 	liveForkTestWrite(t, parentTask, parentTCPClient, "seed")
+	netlinkFile, netlinkErr := socket.New(parentTask, linux.AF_NETLINK, linux.SOCK_RAW, linux.NETLINK_ROUTE)
+	if netlinkErr != nil {
+		t.Fatalf("creating netlink route socket: %v", netlinkErr)
+	}
+	const netlinkFD = int32(33)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, netlinkFD, netlinkFile, kernel.FDFlags{}); err != nil {
+		netlinkFile.DecRef(parentTask)
+		t.Fatalf("installing netlink route socket: %v", err)
+	}
+	netlinkFile.DecRef(parentTask)
+	parentNetlink := liveForkTestFD(t, l.k, netlinkFD)
 	memfdFile, err := tmpfs.NewMemfd(parentTask, parentTask.Credentials(), l.k.ShmMount(), false, "live-fork")
 	if err != nil {
 		t.Fatalf("creating memfd: %v", err)
@@ -1542,6 +1553,10 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUDPServer := liveForkTestFD(t, child.k, udpFDs[1])
 	childTCPClient := liveForkTestFD(t, child.k, tcpFDs[0])
 	childTCPServer := liveForkTestFD(t, child.k, tcpFDs[1])
+	childNetlink := liveForkTestFD(t, child.k, netlinkFD)
+	if parentNetlink.Impl() == childNetlink.Impl() {
+		t.Fatal("parent and child share a netlink socket object")
+	}
 
 	liveForkTestPathRead(t, parentTask, "readonly/fixture", "host-data")
 	liveForkTestPathRead(t, childTask, "readonly/fixture", "host-data")
@@ -1983,6 +1998,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	childUDPServer.DecRef(childTask)
 	childTCPClient.DecRef(childTask)
 	childTCPServer.DecRef(childTask)
+	childNetlink.DecRef(childTask)
 	childMemfd.DecRef(childTask)
 	childOverlayFile.DecRef(childTask)
 	childTruncateFile.DecRef(childTask)
@@ -2170,6 +2186,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	parentUDPServer.DecRef(parentTask)
 	parentTCPClient.DecRef(parentTask)
 	parentTCPServer.DecRef(parentTask)
+	parentNetlink.DecRef(parentTask)
 	parentMemfd.DecRef(parentTask)
 	parentOverlayFile.DecRef(parentTask)
 	parentTruncateFile.DecRef(parentTask)

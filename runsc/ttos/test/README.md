@@ -118,7 +118,8 @@ covers:
 Focused Go tests additionally cover custom TTOS NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTOS's runsc arguments, daemon namespace preflight,
-and private-anonymous-memory write-fault regression cases.
+private-anonymous-memory write-fault regression cases, branch-local pidfd target
+rebinding, and cloning of Sentry-owned netlink sockets.
 
 The test requires network access for image pulls. TTOS resolves OCI registries
 directly and stores verified manifests, configs, and layers in its native

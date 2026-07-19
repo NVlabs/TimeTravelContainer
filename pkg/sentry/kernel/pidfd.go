@@ -44,6 +44,15 @@ type pidFD struct {
 	pid *pid
 }
 
+var _ vfs.LiveForkFileDescription = (*pidFD)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription. pidfds refer only
+// to Sentry-owned task state; state restoration rewires the saved pid object to
+// the corresponding task in the cloned Kernel.
+func (*pidFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
+
 // Release implements vfs.FileDescriptionImpl.Release.
 func (f *pidFD) Release(ctx context.Context) {
 }

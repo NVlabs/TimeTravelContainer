@@ -141,6 +141,59 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	child.Release()
 }
 
+func TestLiveForkClonesPIDFDTarget(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parentTask := parent.GlobalInit().Leader()
+	parentTID := parent.RootPIDNamespace().IDOfTask(parentTask)
+	pidfd, err := parentTask.PIDFDOpen(parentTID, false /* isThread */, false /* nonBlock */)
+	if err != nil {
+		t.Fatalf("PIDFDOpen: %v", err)
+	}
+	const pidfdNumber = int32(10)
+	if _, err := parentTask.FDTable().NewFDAt(parentTask, pidfdNumber, pidfd, kernel.FDFlags{}); err != nil {
+		pidfd.DecRef(parentTask)
+		t.Fatalf("installing pidfd: %v", err)
+	}
+	pidfd.DecRef(parentTask)
+	parent.Pause()
+
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		t.Fatalf("LiveFork with pidfd: %v", err)
+	}
+	childTask := child.GlobalInit().Leader()
+	for name, check := range map[string]struct {
+		task *kernel.Task
+		want *kernel.Task
+	}{
+		"parent": {parentTask, parentTask},
+		"child":  {childTask, childTask},
+	} {
+		file := check.task.GetFile(pidfdNumber)
+		if file == nil {
+			t.Fatalf("%s pidfd is missing", name)
+		}
+		got, err := kernel.PIDFDTask(file)
+		file.DecRef(check.task)
+		if err != nil {
+			t.Fatalf("resolving %s pidfd: %v", name, err)
+		}
+		if got != check.want {
+			t.Errorf("%s pidfd target=%p, want branch-local task %p", name, got, check.want)
+		}
+	}
+
+	child.Release()
+	parent.Release()
+}
+
 // TestLiveForkRunningKernelRepeatedly verifies that restarting the parent after
 // one fork leaves all save-time services quiesceable for a later fork.
 func TestLiveForkRunningKernelRepeatedly(t *testing.T) {

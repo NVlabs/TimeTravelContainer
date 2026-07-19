@@ -64,8 +64,8 @@ for measured results and current limits.
 - Share anonymous memory, tmpfs, SysV shared memory, managed volumes, and
   writable OverlayFS data page-by-page until a branch writes.
 - Clone internal pipes, eventfd, epoll graphs, timerfd, signalfd, inotify,
-  internal Unix sockets, loopback TCP/UDP, and other explicitly validated
-  Sentry-owned objects.
+  pidfds, netlink sockets, internal Unix sockets, loopback TCP/UDP, and other
+  explicitly validated Sentry-owned objects.
 - Validate the complete reachable resource graph after pausing and before any
   fork mutation; on failure, remove the tentative child and resume the source.
 - Display immutable ancestry, deleted-parent tombstones, branch state, PID 1
