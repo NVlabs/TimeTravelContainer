@@ -110,6 +110,8 @@ covers:
 - tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
   the source-read-lock versus CoW-invalidation-write-lock ordering that loaded
   Chromium exercises;
+- exact validation of systrap's `mov $sysno,%eax; syscall` fast-path pattern,
+  preventing false-positive rewriting of unrelated Chromium/V8 JIT code;
 - simultaneous read-only host binds, write rejection, shared-view fork warnings,
   host-side mutation visibility in parent and child, and an explicitly unenforced
   `immutable-source` attestation;

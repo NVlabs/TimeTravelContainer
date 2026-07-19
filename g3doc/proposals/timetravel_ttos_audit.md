@@ -64,6 +64,18 @@ invalidation. The focused regression checks the lock ordering and the real
 validation forks Chromium after loading Google, Wikipedia, and Chromium.org,
 with an authenticated VNC published-port connection active.
 
+An independent, no-fork Chromium/VNC reproduction exposed a systrap syscall
+patcher false positive. The patcher treated any trapped `syscall` whose
+preceding seven-byte window began with `0xb8` as
+`mov $sysno,%eax; syscall`, then rewrote the whole window. JIT-generated code
+can contain that leading byte without containing the expected instruction
+sequence, so Speedometer 3.1 corrupted a Chromium workload frame. Patching now
+requires the complete opcode sequence and the immediate syscall number to
+match the syscall that actually trapped. The fixed default fast path and the
+`--systrap-disable-syscall-patching` control both render the workload normally;
+the bundled Chromium 112 image still stops at 6/580 under both gVisor and
+native Docker, which is a separate browser/benchmark compatibility issue.
+
 ## Performance measurements
 
 The measurements below are retained from the July 18 run and were not repeated
