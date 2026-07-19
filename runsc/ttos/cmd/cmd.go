@@ -6639,6 +6639,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	args = append(args,
 		"--network="+networkMode,
 		"--directfs=false",
+		// TTOS treats container identities as guest-only state and prioritizes
+		// compatibility with Docker images that use helpers such as sudo.
+		"--allow-suid=true",
 		"--allow-rootfs-tar-annotation=true",
 		"--overlay2=all:memory")
 	if networkMode == "ttos" {

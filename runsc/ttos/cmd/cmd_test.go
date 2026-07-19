@@ -2481,15 +2481,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
+	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
+	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTOSNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttos", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory", "--ttos-network-nat=true"}
+	wantTTOSNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttos", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory", "--ttos-network-nat=true"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttos", true); !reflect.DeepEqual(got, wantTTOSNAT) {
 		t.Errorf("TTOS NAT runsc args=%q, want %q", got, wantTTOSNAT)
 	}
@@ -2499,7 +2499,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
-		"--network=none", "--directfs=false", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory",
+		"--network=none", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory",
 	}
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
