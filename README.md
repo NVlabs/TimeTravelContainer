@@ -298,8 +298,7 @@ bazel-bin/runsc/ttcd/ttcd_/ttcd
 No privileged installation is required. Keep the three binaries together so
 `ttc` can discover `runsc` and `ttcd`, or configure `TTC_RUNSC`.
 The [complete user guide](g3doc/user_guide/timetravelcontainer.md) includes a per-user
-installation layout, build dependency list, and migration instructions for an
-existing TimeTravelOS data root.
+installation layout and build dependency list.
 
 ## Quick start
 

@@ -188,22 +188,6 @@ export TTC_DATA_ROOT="$HOME/.local/share/ttc"
 export TTC_RUNSC="$HOME/.local/libexec/ttc/runsc"
 ```
 
-For an existing TimeTravelOS installation, either move its stopped data root
-to the new location or point TTC at it explicitly:
-
-```shell
-ttos daemon stop
-mv "$HOME/.local/share/ttos" "$HOME/.local/share/ttc"
-```
-
-As a non-moving upgrade bridge, `TTC_DATA_ROOT` and `TTC_RUNSC` are preferred,
-but the old explicitly configured `TTOS_DATA_ROOT` and `TTOS_RUNSC` variables
-are still accepted. The old implicit paths are not selected automatically:
-this prevents a new `ttcd` from accidentally attaching to a running `ttosd`.
-The legacy `--network=ttos`, `--ttos-network-*` runsc flags, and
-`dev.timetravelos.*` bundle annotations remain readable; newly written state
-uses the TTC names.
-
 Do not point two incompatible TTC versions at the same live runtime root.
 
 ## Images
