@@ -13,7 +13,7 @@ copy-on-write as either branch modifies them.
 > [!WARNING]
 > TTC is currently intended for trusted development, integration testing,
 > state-space exploration, and similar workloads. It is not yet a production
-> security boundary or a drop-in replacement for every Docker workload. Always
+> security boundary or a drop-in replacement for every Docker workload.
 > Every `ttc fork` atomically pauses and validates its source. On rejection,
 > TTC resumes the source and returns a diagnostic with a nonzero status.
 
@@ -21,6 +21,67 @@ TimeTravelContainer is forked from [Google's gVisor](https://github.com/google/g
 It builds on gVisor's Sentry userspace kernel, systrap platform, netstack, VFS,
 and OCI-compatible `runsc` runtime. Google and the gVisor project are not
 responsible for or affiliated with the TimeTravelContainer-specific modifications.
+
+## Security principles
+
+Upstream gVisor is designed to be a strong production sandbox for potentially
+hostile workloads. Its
+[security model](https://gvisor.dev/docs/architecture_guide/security/) minimizes
+direct access to the host kernel and combines the Sentry boundary with host
+namespaces, chroots, seccomp filters, and separate gofer processes. Its
+[vulnerability policy](https://gvisor.dev/security/) consequently focuses on
+crossing the sandbox boundary.
+
+TTC inherits that architecture but currently has a narrower deployment goal:
+trusted development and integration-test workloads rather than untrusted
+multi-tenant production. TTC intentionally does not promise security or failure
+isolation between live-fork branches in one family because they share a Sentry
+process. Its explicit `--unsafe-no-host-isolation` daemon mode also removes the
+normal host user-namespace and chroot layers and therefore trusts every image
+and process run by that daemon.
+
+Those deliberate limitations are not permission to introduce new escape paths.
+TTC follows these principles:
+
+- In normal rootless mode, guest code must not escape the gVisor boundary,
+  access host resources that were not explicitly attached, or interfere with
+  unrelated container families through a TTC modification.
+- TTC must not create an unintended guest privilege-escalation path. Linux
+  credential transitions explicitly requested by the image or configuration,
+  including SUID/SGID semantics within the virtual kernel, are not themselves
+  vulnerabilities and must not grant corresponding host credentials.
+- Fork, restore, mount, image, and resource-import paths fail closed whenever
+  TTC cannot prove that an operation preserves its declared isolation and
+  ownership rules.
+- Security-relevant relaxations must be explicit, narrowly scoped, documented,
+  and testable. TTC must not silently fall back from normal isolation to an
+  unsafe mode.
+- Upstream gVisor hardening must remain intact unless TTC replaces it with a
+  complete design that has equivalent safety invariants and focused security
+  tests. Performance or compatibility alone does not justify a partial
+  weakening.
+- A vulnerability introduced by TTC remains a bug even if current users are
+  advised to run trusted workloads. The trusted-workload recommendation
+  reflects the project's audit maturity, not an acceptance of sandbox escapes.
+
+The intentionally shared trust boundary between branches and the explicitly
+unsafe daemon mode are excluded from this guarantee as documented. Everything
+else should be treated conservatively until TTC has undergone a dedicated
+security review. Read-only host binds, `--network host`, published ports, and
+`--network ttc --nat` are explicit grants of host-facing access. In particular,
+TTC NAT deliberately maps the guest gateway and same-subnet host aliases to
+host loopback services; use `--network ttc` without `--nat` when that access is
+not wanted.
+
+The current audit has found known within-sandbox policy defects: non-root
+processes receive effective default capabilities, oversized numeric `--user`
+values can be resolved as image-defined usernames, and this branch has not yet
+integrated an upstream gVisor fix for a non-dumpable exiting-task access-check
+race. These do not establish a host escape, but they mean `USER`/`--user` and
+same-sandbox process boundaries must not be relied upon for security until the
+findings in the
+[security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
+are resolved.
 
 ## Why TimeTravelContainer?
 
@@ -50,7 +111,7 @@ This is useful when many tests share an expensive setup phase:
 Fork cost scales primarily with kernel metadata—tasks, mappings, file
 descriptions, queues, and filesystem objects—not with the number of resident
 application bytes. See the
-[performance and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
+[security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
 for measured results and current limits.
 
 ## Features
@@ -152,7 +213,8 @@ MAC         02:42:0a:00:02:0f
 It requires no TAP device, veth pair, bridge, CNI, iptables, network namespace
 manager, or `CAP_NET_ADMIN`.
 
-- `--nat` enables rootless user-mode IPv4 TCP/UDP outbound access.
+- `--nat` enables rootless user-mode IPv4 TCP/UDP outbound access, including
+  deliberate access to host-loopback aliases in the guest NIC's `/24`.
 - `-p`/`--publish` creates persistent rootless IPv4 TCP host listeners.
 - `--ip` and `--mac-address` customize the persistent guest NIC identity.
 - The parent retains established external connections and published listeners

@@ -1,11 +1,13 @@
-# TimeTravelContainer performance and compatibility audit
+# TimeTravelContainer security, performance, and compatibility audit
 
-This audit was refreshed on 2026-07-19 through configurable virtual-NIC
+This audit was refreshed on 2026-07-24 through configurable virtual-NIC
 identity, line-oriented image progress, default guest SUID semantics, rootless
 namespace preflight, orderly daemon shutdown, persistent writable-root restart,
 and the private-memory and interactive-exec fixes. It evaluates the native OCI
-image store, rootless execution, Docker-like CLI, and in-memory live fork. It is
-a development-readiness audit, not a security certification.
+image store, rootless execution, Docker-like CLI, in-memory live fork, and
+TTC-specific changes to gVisor's security boundary. It is a manual
+development-readiness review, not a security certification or a substitute for
+continuous fuzzing and an independent adversarial audit.
 
 ## Executive assessment
 
@@ -35,7 +37,7 @@ The recommended readiness levels are:
 | General Docker CLI replacement | Partial |
 | Parent external TCP continuity with child reset | Demonstrated; reconnect required in child |
 | Replay of external nondeterministic inputs | Not a TTC guarantee |
-| Untrusted production multi-tenancy | Not audited or recommended |
+| Untrusted production multi-tenancy | Known security findings; not recommended |
 
 ## Evidence
 
@@ -53,6 +55,16 @@ native-store implementation verification:
 * the systrap `BenchmarkSandboxFamilyFork` benchmark; and
 * real Python containers with 1 MiB, 128 MiB, and 256 MiB touched application
   allocations and multiple guest threads.
+
+The July 24 security pass additionally reviewed TTC's daemon peer
+authentication and state-directory permissions, OCI/image extraction and
+virtual ownership, mount construction, SUID and capability setup, user-mode
+NAT and published-port host access, Sentry seccomp additions, systrap syscall
+patching, live-fork filesystem/FD/mapping/network validators, and the upstream
+commits newer than TTC's merge base. Focused bundle, ownership, fsgofer, and
+systrap usertrap tests passed. The review found the concrete issues below but
+did not identify a TTC-specific path from a normal rootless guest to host code
+execution or arbitrary unattached host-file access.
 
 The original July 18 real-PTY run exposed a daemon transport EOF defect after
 `exec -it` had already produced its expected output and exit status. The July 19
@@ -82,6 +94,134 @@ match the syscall that actually trapped. The fixed default fast path and the
 `--systrap-disable-syscall-patching` control both render the workload normally;
 the bundled Chromium 112 image still stops at 6/580 under both gVisor and
 native Docker, which is a separate browser/benchmark compatibility issue.
+
+## Security findings
+
+### S1: non-root processes receive effective root-like default capabilities
+
+This is a confirmed within-sandbox privilege escalation and policy bypass.
+`BuildSpec` resolves the configured image user or `--user` override, but
+`buildCapabilities` independently returns TTC's root-oriented Docker default
+set. The generated OCI process then receives that set in its bounding,
+permitted, and effective capability sets even when its UID is nonzero. The
+existing bundle test demonstrates UID 123 with `CAP_DAC_OVERRIDE`,
+`CAP_SETUID`, `CAP_SETGID`, and the other defaults effective.
+
+For comparison, the cached Docker 29 installation was run with
+`docker run --rm --user 123 busybox:1.36`; `/proc/self/status` reported zero
+permitted and effective capabilities while retaining Docker's default bounding
+set. TTC therefore differs materially from the CLI behavior it is emulating.
+
+Sentry constructs credentials directly from those sets. Its `setuid(2)`
+implementation permits an arbitrary UID transition when `CAP_SETUID` is
+effective, so a process launched as UID 1000 can call `setuid(0)` and become
+virtual root. Even without changing UID, `CAP_DAC_OVERRIDE` bypasses ordinary
+guest file permissions. `ttc exec --user ...` has the same problem: upstream
+runsc derives exec capabilities from the container process spec before
+applying the requested exec UID.
+
+This does not grant a host UID or host capability; the escalation remains
+inside the Sentry. It nevertheless violates TTC's stated within-sandbox
+credential boundary and Docker-shaped `--user` expectations.
+
+Required remediation:
+
+1. Make initial-process capability construction UID-aware. A non-root process
+   should not receive default permitted/effective capabilities merely because
+   no capability flags were supplied.
+2. Make `ttc exec --user` recompute the default capability sets for the
+   requested UID rather than inheriting a root container's effective set.
+3. Define and test the interaction of explicit `--cap-add`/`exec --cap`,
+   bounding capabilities, ambient/inheritable sets, SUID, and
+   `noNewPrivileges`.
+4. Add runtime tests proving that a default non-root process and a non-root
+   exec receive `EPERM` from `setuid(0)` while explicitly authorized
+   configurations and UID 0 retain their intended behavior.
+
+### S2: oversized numeric user overrides can resolve to image usernames
+
+This is a confirmed within-sandbox user-policy bypass when an untrusted image
+is combined with a supposedly numeric operator override. TTC resolves OCI
+users with `moby/sys/user` v0.4.0. That implementation uses `strconv.Atoi` to
+classify a user field as numeric; a decimal value larger than the host `int`
+range produces an error and is then treated as a username. A crafted image can
+place that exact digit string in `/etc/passwd` with UID 0. Consequently,
+`ttc run --user <oversized-decimal> ...` resolves to virtual root instead of
+rejecting the out-of-range numeric UID. The group half has the analogous
+numeric-versus-name ambiguity.
+
+An image's own `USER` field alone is not an additional security boundary
+because the image already controls it. The relevant case is an operator or
+higher-level policy using a numeric `--user` override to constrain an
+untrusted image. This is the same vulnerability class as containerd's
+[CVE-2026-46680](https://github.com/containerd/containerd/security/advisories/GHSA-fqw6-gf59-qr4w),
+although TTC reaches it through its own user-resolution path rather than
+containerd's CRI/OCI-spec code.
+
+Required remediation is to recognize syntactically numeric UID/GID fields
+before name lookup, parse them into the supported unsigned range, and return a
+range error without consulting image-controlled passwd/group entries when
+parsing fails or overflows. Regression tests should cover both user and group
+fields at `MaxInt`, `MaxUint32`, and larger values.
+
+### S2: TTC is missing an upstream non-dumpable exiting-task fix
+
+TTC's upstream merge base is `3cc5535a1255`; the reviewed branch is 32 upstream
+commits behind `origin/master`. One intervening upstream commit,
+`0f6b7d133f5b` ("Fix ptrace dumpability bypass check on exit"), fixes a
+concrete access-check race. Before that fix, an exiting task clears its memory
+manager, causing `canTraceStandard` to skip the task's non-dumpable check.
+Another same-credential process can race `pidfd_getfd` and acquire a file
+descriptor from the non-dumpable exiting task. Upstream added a focused
+100-iteration regression for this case.
+
+This is an inherited same-sandbox confidentiality/integrity issue, not a
+demonstrated host escape. Integrate the upstream fix (preferably by rebasing
+the complete upstream delta), ensure the new cached dumpability field is
+included correctly in TTC live-fork state, and run both the upstream
+`PidfdGetfdNonDumpableExitingRace` test and a forked-child variant.
+
+### Reviewed boundaries without a concrete escape finding
+
+- `ttcd` accepts only Unix peers whose `SO_PEERCRED` UID equals the daemon's
+  effective UID. Its socket parent must be owned by that UID with no
+  group/other permissions, and the socket is mode `0600`. Same-UID control is
+  the daemon's intended authorization boundary.
+- Generated names and selectors reject path separators and traversal; private
+  container, image, volume, journal, console, and event subdirectories/files
+  use restrictive modes. No guest-controlled host-path traversal was found in
+  these paths.
+- Image layers use containerd v2.1.5's bounded archive extraction with
+  `WithNoSameOwner`. The critical containerd image-unpack escape
+  [CVE-2025-47290](https://github.com/containerd/containerd/security/advisories/GHSA-cm76-qm8v-3j95)
+  affected only v2.1.0 and was fixed in v2.1.1. TTC's virtual ownership
+  manifest paths are canonicalized and image roots are served read-only below
+  an in-memory overlay.
+- Writable host binds are rejected. Ordinary host binds are read-only shared
+  external views, while managed CoW binds require an explicit immutable-source
+  attestation. Directfs remains disabled in TTC's normal runsc arguments.
+- SUID/SGID transitions occur in Sentry credentials and do not grant host
+  credentials. They are intentional compatibility behavior; the effective
+  default-capability defect above is separate and unintended.
+- TTC NAT broadens the Sentry's host seccomp surface only for IPv4/IPv6
+  TCP/UDP sockets. `--nat` intentionally allows outbound host networking and
+  maps guest same-subnet aliases to host `127.0.0.x`; this is an explicit
+  resource grant, not an implicit property of NAT-disabled `--network ttc`.
+- Live fork fails closed for unrecognized file descriptions, mappings,
+  filesystems, and network stacks. Host/directfs/FUSE resources, queued
+  `SCM_RIGHTS`, AIO/io_uring and packet rings, host-bound Unix endpoints, and
+  unvalidated network configuration are rejected. The reviewed opt-in
+  validators recursively cover epoll and internal Unix endpoint graphs and
+  reject host-backed eventfd resources.
+- The systrap change tightens syscall-patch matching to an exact instruction
+  sequence and does not add host syscalls or relax a seccomp rule.
+
+Deliberate exclusions are the lack of isolation between branches in one
+live-fork family, explicitly attached read-only host views and network
+endpoints, and all defense-in-depth claims in
+`--unsafe-no-host-isolation` mode. Resource-exhaustion limits, side channels,
+and a complete re-audit of unchanged upstream gVisor were also outside this
+focused pass.
 
 ## Performance measurements
 
@@ -419,15 +559,20 @@ a deadlock guard; reaching it is now a test failure, not accepted behavior.
 
 Before calling TTC a broadly compatible beta:
 
-1. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
-2. Shorten source downtime by separating metadata capture from child restore.
-3. Shard image-store locking and replace foreground full-store GC.
-4. Add multi-platform catalog keys and concurrent pull/materialization tests.
-5. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
+1. Resolve all three security findings above, including runtime exploit
+   regressions for non-root credentials and the upstream exiting-task race.
+2. Establish a routine upstream merge and dependency-advisory cadence so
+   published gVisor and image-library security fixes cannot remain unnoticed.
+3. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
+4. Shorten source downtime by separating metadata capture from child restore.
+5. Shard image-store locking and replace foreground full-store GC.
+6. Add multi-platform catalog keys and concurrent pull/materialization tests.
+7. Add OCI fixtures for capabilities, xattrs, sparse files, device entries,
    zstd layers, foreign-layer policy, and private registry authentication.
-6. Expand the live-fork resource matrix only through explicit fail-closed
+8. Expand the live-fork resource matrix only through explicit fail-closed
    validators and branch-isolation tests.
 
 Until those gates pass, end users should treat a failed `ttc fork` as an
 authoritative compatibility result, review its resource diagnostics, and use
-TTC primarily for trusted, self-contained test workloads.
+TTC only for trusted, self-contained test workloads. Non-root guest identity is
+not currently a security boundary.
