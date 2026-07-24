@@ -95,6 +95,7 @@ ttc exec "$MAIN" sh -c '
   ln -s ../value /data/sub/sym
   fallocate -l 8192 /data/allocated
   chmod 0640 /data/value
+  printf base >/data/race
   sync
 '
 
@@ -118,10 +119,66 @@ ttc exec "$MAIN" sh -c '
 
 # Writes before and between nested forks must produce the expected tree.
 ttc fork "$MAIN" f1 >/dev/null
+
+# Start both branches' first writers before either writer exits. Detached exec
+# creation is serialized by ttcd, but the guest writers overlap after sleep.
+RACE_MAIN=$(ttc exec -d "$MAIN@main" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round1-main-%03d" "$i" >/data/race; i=$((i + 1)); done
+')
+RACE_F1=$(ttc exec -d "$MAIN@f1" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round1-f1-%03d" "$i" >/data/race; i=$((i + 1)); done
+')
+[ "$(ttc exec wait "$RACE_MAIN")" = 0 ] || fail "concurrent main writer failed"
+[ "$(ttc exec wait "$RACE_F1")" = 0 ] || fail "concurrent f1 writer failed"
+ttc exec "$MAIN@main" sh -c 'test "$(cat /data/race)" = round1-main-009'
+ttc exec "$MAIN@f1" sh -c 'test "$(cat /data/race)" = round1-f1-009'
+
 ttc exec "$MAIN@main" sh -c 'echo main-1 >>/data/value; echo main >/data/main-only'
 ttc exec "$MAIN@f1" sh -c 'echo f1-1 >>/data/value; echo f1 >/data/f1-only; mv /data/sub /data/f1-sub'
 ttc fork "$MAIN@main" f2 >/dev/null
 ttc fork "$MAIN@f1" g1 >/dev/null
+
+# Every side of both second-generation forks now writes the same inherited
+# pathname concurrently. This exercises simultaneous first-writer object
+# splitting in both sources and both children, plus same-name namespace CoW.
+RACE_MAIN=$(ttc exec -d "$MAIN@main" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round2-main-%03d" "$i" >/data/race; i=$((i + 1)); done
+  printf main >/data/same-name
+')
+RACE_F1=$(ttc exec -d "$MAIN@f1" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round2-f1-%03d" "$i" >/data/race; i=$((i + 1)); done
+  printf f1 >/data/same-name
+')
+RACE_F2=$(ttc exec -d "$MAIN@f2" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round2-f2-%03d" "$i" >/data/race; i=$((i + 1)); done
+  printf f2 >/data/same-name
+')
+RACE_G1=$(ttc exec -d "$MAIN@g1" sh -c '
+  sleep 1
+  i=0
+  while [ "$i" -lt 10 ]; do printf "round2-g1-%03d" "$i" >/data/race; i=$((i + 1)); done
+  printf g1 >/data/same-name
+')
+for session in "$RACE_MAIN" "$RACE_F1" "$RACE_F2" "$RACE_G1"; do
+  [ "$(ttc exec wait "$session")" = 0 ] || fail "four-branch concurrent writer failed: $session"
+done
+for branch_and_value in main:main f1:f1 f2:f2 g1:g1; do
+  branch=${branch_and_value%%:*}
+  value=${branch_and_value#*:}
+  ttc exec "$MAIN@$branch" sh -c \
+    "test \"\$(cat /data/race)\" = round2-$value-009 && test \"\$(cat /data/same-name)\" = $value"
+done
+
 ttc exec "$MAIN@main" sh -c 'echo main-2 >>/data/value; echo main2 >/data/who-main'
 ttc exec "$MAIN@f1" sh -c 'echo f1-2 >>/data/value; echo f12 >/data/who-f1'
 ttc exec "$MAIN@f2" sh -c 'echo f2 >>/data/value; echo f2 >/data/who-f2; rm /data/main-only'

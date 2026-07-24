@@ -73,7 +73,8 @@ covers:
   restricted sysfs mounts, including inspect projection and restart retention;
 - disk-backed named and anonymous volumes, image `VOLUME` initialization,
   direct persistence across stop/start and daemon restart, hard links,
-  symlinks, fallocate, open-FD writes, and parent/child/grandchild CoW;
+  symlinks, fallocate, open-FD writes, parent/child/grandchild CoW, overlapping
+  first writers in two and four branches, and same-path namespace divergence;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
