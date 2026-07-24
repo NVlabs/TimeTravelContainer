@@ -32,6 +32,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
 const (
@@ -73,6 +75,8 @@ type daemonRequest struct {
 type daemonServer struct {
 	listener              net.Listener
 	unsafeNoHostIsolation bool
+	dataRoot              string
+	volumeCapability      ttcvolume.Capability
 
 	stopOnce sync.Once
 
@@ -307,6 +311,8 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	socket := defaultDaemonSocket()
 	unsafeNoHostIsolation := false
+	allowSlowVolumeCopy := false
+	daemonDataRoot := dataRoot()
 	for len(args) != 0 {
 		switch {
 		case args[0] == "--socket" && len(args) >= 2:
@@ -318,6 +324,15 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		case args[0] == "--unsafe-no-host-isolation":
 			unsafeNoHostIsolation = true
 			args = args[1:]
+		case args[0] == "--allow-slow-volume-copy":
+			allowSlowVolumeCopy = true
+			args = args[1:]
+		case args[0] == "--data-root" && len(args) >= 2:
+			daemonDataRoot = args[1]
+			args = args[2:]
+		case strings.HasPrefix(args[0], "--data-root="):
+			daemonDataRoot = strings.TrimPrefix(args[0], "--data-root=")
+			args = args[1:]
 		default:
 			fmt.Fprintf(stderr, "ttcd: unknown option %q\n", args[0])
 			return 2
@@ -327,13 +342,22 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd: socket path must not be empty")
 		return 2
 	}
+	if daemonDataRoot == "" {
+		fmt.Fprintln(stderr, "ttcd: data root must not be empty")
+		return 2
+	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
 	} else if err := preflightDaemonIsolation(false); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
-	if err := serveDaemon(socket, unsafeNoHostIsolation, stdout, stderr); err != nil {
+	manager, err := ttcvolume.OpenManager(daemonDataRoot, allowSlowVolumeCopy)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
+		return 1
+	}
+	if err := serveDaemon(socket, unsafeNoHostIsolation, daemonDataRoot, manager.Capability(), stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
@@ -394,7 +418,7 @@ func secureDaemonDirectory(dir string) error {
 	return nil
 }
 
-func serveDaemon(socket string, unsafeNoHostIsolation bool, stdout, stderr io.Writer) error {
+func serveDaemon(socket string, unsafeNoHostIsolation bool, dataRoot string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -429,11 +453,13 @@ func serveDaemon(socket string, unsafeNoHostIsolation bool, stdout, stderr io.Wr
 	server := &daemonServer{
 		listener:              listener,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
+		dataRoot:              dataRoot,
+		volumeCapability:      volumeCapability,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
 	if stdout != nil {
-		fmt.Fprintf(stdout, "ttcd listening on %s (API v%d, isolation=%s)\n", socket, daemonAPIVersion, daemonIsolationMode(unsafeNoHostIsolation))
+		fmt.Fprintf(stdout, "ttcd listening on %s (API v%d, isolation=%s, volume-copy=%s)\n", socket, daemonAPIVersion, daemonIsolationMode(unsafeNoHostIsolation), volumeCapability.Mode)
 	}
 	for {
 		conn, err := listener.Accept()
@@ -508,6 +534,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"pid":                      os.Getpid(),
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
 			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
+			"data_root":                s.dataRoot,
+			"volume_copy_mode":         s.volumeCapability.Mode,
+			"volume_filesystem_type":   s.volumeCapability.FilesystemType,
+			"volume_device":            s.volumeCapability.Device,
 		})
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
 		_ = writeDaemonStatus(conn, &writeMu, 0)
@@ -516,6 +546,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if request.Options != (daemonWireOptions{}) {
 			opts := optionsFromWire(request.Options)
 			opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+			opts.dataRoot = s.dataRoot
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			backend.consoleSidecars = s
@@ -553,6 +584,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 
 	opts := optionsFromWire(request.Options)
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+	opts.dataRoot = s.dataRoot
 	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
 	if err != nil {
 		stdinReader.Close()
@@ -1027,7 +1059,7 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	}
 }
 
-func startDaemonProcess(socket string, unsafeNoHostIsolation bool) error {
+func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlowVolumeCopy bool) error {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -1036,15 +1068,18 @@ func startDaemonProcess(socket string, unsafeNoHostIsolation bool) error {
 		return fmt.Errorf("finding ttc executable: %w", err)
 	}
 	commandName := executable
-	commandArgs := []string{"_daemon-serve", "--socket", socket}
+	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot}
 	if sibling := filepath.Join(filepath.Dir(executable), "ttcd"); sibling != executable {
 		if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
 			commandName = sibling
-			commandArgs = []string{"--socket", socket}
+			commandArgs = []string{"--socket", socket, "--data-root", dataRoot}
 		}
 	}
 	if unsafeNoHostIsolation {
 		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
+	}
+	if allowSlowVolumeCopy {
+		commandArgs = append(commandArgs, "--allow-slow-volume-copy")
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -1069,11 +1104,15 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 	}
 	if len(args) != 0 && args[0] == "start" {
 		for _, arg := range args[1:] {
-			if arg != "--unsafe-no-host-isolation" {
+			switch arg {
+			case "--unsafe-no-host-isolation":
+				opts.unsafeNoHostIsolation = true
+			case "--allow-slow-volume-copy":
+				opts.allowSlowVolumeCopy = true
+			default:
 				fmt.Fprintf(stderr, "ttc: unknown daemon start option %q\n", arg)
 				return 2
 			}
-			opts.unsafeNoHostIsolation = true
 		}
 		args = args[:1]
 	}
@@ -1092,7 +1131,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		return status
 	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start|status|stop|requests|request inspect|request resolve")
+		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]|status|stop|requests|request inspect|request resolve")
 		return 2
 	}
 	action := args[0]
@@ -1109,7 +1148,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
-		if err := startDaemonProcess(opts.daemonSocket, opts.unsafeNoHostIsolation); err != nil {
+		if err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy); err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}

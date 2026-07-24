@@ -211,7 +211,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return []string{"request", "requests", "start", "status", "stop"}, nil
 		}
 		if rest[0] == "start" && len(rest) == 1 {
-			return []string{"--unsafe-no-host-isolation"}, nil
+			return []string{"--allow-slow-volume-copy", "--unsafe-no-host-isolation"}, nil
 		}
 		if rest[0] == "request" && len(rest) == 1 {
 			return []string{"inspect", "resolve"}, nil

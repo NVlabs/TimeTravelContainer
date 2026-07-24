@@ -71,6 +71,7 @@ type options struct {
 	runsc                 string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	allowSlowVolumeCopy   bool
 	daemonSocket          string
 	direct                bool
 	clientExecutable      string
@@ -301,7 +302,7 @@ Commands:
   branch rm TARGET...             Destroy one or more non-main branches
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   completion SHELL                 Generate Bash, Zsh, or Fish completion
-  daemon start [--unsafe-no-host-isolation]
+  daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -320,7 +321,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"branch":     "Usage: ttc branch rm TARGET [TARGET...]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon":     "Usage: ttc daemon start [--unsafe-no-host-isolation]|status|stop|requests|request",
+			"daemon":     "Usage: ttc daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]|status|stop|requests|request",
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttc pause TARGET [TARGET...]",
 			"resume":     "Usage: ttc resume TARGET [TARGET...]",

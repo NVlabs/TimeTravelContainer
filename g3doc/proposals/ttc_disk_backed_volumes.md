@@ -2,7 +2,10 @@
 
 ## Status
 
-Design approved in principle; implementation has not started. The former
+Implementation in progress. The persistent immutable metadata trie, opaque
+object repository, real `FICLONE` capability probe, explicit slow-copy policy,
+and branch-generation first-write CoW engine are implemented and unit tested.
+Sentry VFS mounting and the user-facing volume CLI remain disabled. The former
 `local-tmpfs` managed-volume driver and its tar snapshot lifecycle have been
 removed. Until this proposal is implemented, TTC rejects named volumes,
 anonymous volumes, and unoverridden OCI image `VOLUME` declarations. Explicit

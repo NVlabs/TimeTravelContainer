@@ -64,6 +64,18 @@ probe automatically and refuses to start in rootless mode when the probe fails,
 so an apparently healthy daemon cannot defer this error until container launch.
 Directly launching `ttcd` performs the same preflight.
 
+The daemon also probes the actual volume object store under `--data-root` with
+`FICLONE`. It fails startup if the backing filesystem lacks working reflinks.
+To explicitly trade first-write performance for compatibility, use:
+
+```shell
+ttc daemon start --allow-slow-volume-copy
+```
+
+This fallback copies a complete shared file on its first write after a fork.
+It is never selected silently. `ttc daemon status` reports the fixed
+`volume_copy_mode`, data root, backing device, and filesystem type.
+
 For trusted local testing only, start the daemon with
 `--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
 setup:
@@ -77,7 +89,7 @@ Isolation mode is fixed for the lifetime of that daemon. All ordinary commands
 inherit it, so do not repeat the flag on `run`, `exec`, or other operations.
 `ttc daemon status` reports `isolation_mode` and
 `unsafe_no_host_isolation`. Stop and explicitly restart the daemon to change
-modes. Ordinary commands do not autostart the service; if it is absent, they
+isolation or volume-copy modes. Ordinary commands do not autostart the service; if it is absent, they
 tell you to run `ttc daemon start`.
 
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but

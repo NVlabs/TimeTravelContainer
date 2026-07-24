@@ -25,6 +25,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
 func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
@@ -324,9 +326,10 @@ func TestDaemonAttachTakeoverParsing(t *testing.T) {
 
 func TestDaemonVersionedCommandTransport(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	dataRoot := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, true, io.Discard, io.Discard)
+		done <- serveDaemon(socket, true, dataRoot, ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -367,10 +370,14 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	}
 
 	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
-	if status != 0 || !strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) || !strings.Contains(stdout, `"unsafe_no_host_isolation":true`) || stderr != "" {
+	if status != 0 ||
+		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
+		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
+		!strings.Contains(stdout, `"data_root":"`+dataRoot+`"`) ||
+		!strings.Contains(stdout, `"volume_copy_mode":"full-copy"`) ||
+		stderr != "" {
 		t.Fatalf("daemon mode status: status=%d stdout=%q stderr=%q", status, stdout, stderr)
 	}
-	dataRoot := t.TempDir()
 	requestID, err := newDaemonRequestID()
 	if err != nil {
 		t.Fatal(err)

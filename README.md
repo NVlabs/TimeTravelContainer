@@ -301,6 +301,18 @@ No subordinate IDs or `uidmap` helpers are needed. `ttc daemon start`
 performs an equivalent disposable user/mount-namespace preflight and fails
 immediately if the kernel or an LSM such as AppArmor rejects it.
 
+Daemon startup also probes `FICLONE` inside the configured `--data-root`.
+Reflinks are required for disk-backed managed-volume CoW. On a filesystem
+without reflinks, trusted users may explicitly accept whole-file first-write
+copies with:
+
+```sh
+ttc daemon start --allow-slow-volume-copy
+```
+
+The selected `volume_copy_mode`, backing device, and filesystem type are shown
+by `ttc daemon status`.
+
 For trusted workloads on hosts that prohibit unprivileged user namespaces:
 
 ```sh

@@ -15,6 +15,7 @@ go_library(
         "//runsc/ttc/bundle",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
+        "//pkg/ttcvolume",
         "//runsc/version",
         "@com_github_moby_sys_signal//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go",
@@ -29,6 +30,7 @@ go_test(
     library = ":cmd",
     deps = [
         "//runsc/ttc/console",
+        "//pkg/ttcvolume",
         "@com_github_opencontainers_runtime_spec//specs-go",
     ],
 )
