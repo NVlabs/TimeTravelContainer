@@ -106,6 +106,54 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	}
 }
 
+func TestActualReflinkPathSucceedsOrFailsClosed(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("actual-reflink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, MainBranch, ino, "base", 0)
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exercise ioctl(FICLONE) even when OpenManager selected the explicitly
+	// allowed full-copy fallback for this test filesystem.
+	repo.copyMode = CopyModeReflink
+	n, cloned, writeErr := repo.WriteAt("child", ino, []byte("CH"), 0)
+	switch manager.Capability().Mode {
+	case CopyModeReflink:
+		if writeErr != nil {
+			t.Fatalf("FICLONE-capable filesystem rejected branch write: %v", writeErr)
+		}
+		if n != 2 || !cloned {
+			t.Fatalf("reflink branch write = n %d, cloned %t; want 2, true", n, cloned)
+		}
+		if got := readAll(t, repo, MainBranch, ino); got != "base" {
+			t.Fatalf("reflink child write changed parent to %q", got)
+		}
+		if got := readAll(t, repo, "child", ino); got != "CHse" {
+			t.Fatalf("reflink child data = %q, want CHse", got)
+		}
+	case CopyModeFull:
+		if writeErr == nil {
+			t.Fatalf("unsupported FICLONE silently fell back: n %d, cloned %t", n, cloned)
+		}
+		if got := readAll(t, repo, MainBranch, ino); got != "base" {
+			t.Fatalf("failed reflink changed parent to %q", got)
+		}
+		if got := readAll(t, repo, "child", ino); got != "base" {
+			t.Fatalf("failed reflink changed child to %q", got)
+		}
+	default:
+		t.Fatalf("unknown manager copy mode %q", manager.Capability().Mode)
+	}
+}
+
 func TestNestedForksAndWritesBetweenForks(t *testing.T) {
 	repo, err := openTestManager(t).Create("nested")
 	if err != nil {
