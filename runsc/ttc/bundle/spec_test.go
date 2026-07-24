@@ -127,8 +127,12 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		t.Errorf("user=%+v", spec.Process.User)
 	}
 	wantCapabilities := []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE", "CAP_SYS_ADMIN"}
-	if !reflect.DeepEqual(spec.Process.Capabilities.Bounding, wantCapabilities) || !reflect.DeepEqual(spec.Process.Capabilities.Effective, wantCapabilities) || !reflect.DeepEqual(spec.Process.Capabilities.Permitted, wantCapabilities) {
-		t.Errorf("capabilities=%+v, want %q", spec.Process.Capabilities, wantCapabilities)
+	if !reflect.DeepEqual(spec.Process.Capabilities.Bounding, wantCapabilities) {
+		t.Errorf("bounding capabilities=%+v, want %q", spec.Process.Capabilities.Bounding, wantCapabilities)
+	}
+	var wantEffectiveCapabilities []string
+	if !reflect.DeepEqual(spec.Process.Capabilities.Effective, wantEffectiveCapabilities) || !reflect.DeepEqual(spec.Process.Capabilities.Permitted, wantEffectiveCapabilities) {
+		t.Errorf("non-root effective/permitted capabilities=%+v, want %q", spec.Process.Capabilities, wantEffectiveCapabilities)
 	}
 	wantMounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
@@ -275,6 +279,51 @@ func TestDockerCapabilitySemantics(t *testing.T) {
 	all, err := buildCapabilities([]string{"all"}, []string{"all"})
 	if err != nil || !reflect.DeepEqual(all, allCapabilityNames()) {
 		t.Errorf("add ALL/drop ALL=(%q, %v), want all", all, err)
+	}
+}
+
+func TestBuildProcessCapabilitiesAreUserAware(t *testing.T) {
+	rootCaps, err := buildProcessCapabilities(0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rootCaps.Bounding, defaultCapabilities) ||
+		!reflect.DeepEqual(rootCaps.Effective, defaultCapabilities) ||
+		!reflect.DeepEqual(rootCaps.Permitted, defaultCapabilities) {
+		t.Errorf("root capabilities=%+v, want defaults in bounding/effective/permitted", rootCaps)
+	}
+
+	nonRootCaps, err := buildProcessCapabilities(1000, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(nonRootCaps.Bounding, defaultCapabilities) {
+		t.Errorf("non-root bounding capabilities=%q, want %q", nonRootCaps.Bounding, defaultCapabilities)
+	}
+	if len(nonRootCaps.Effective) != 0 || len(nonRootCaps.Permitted) != 0 {
+		t.Errorf("non-root capabilities=%+v, want empty effective/permitted sets", nonRootCaps)
+	}
+	if !containsString(nonRootCaps.Bounding, "CAP_SETUID") || !containsString(nonRootCaps.Bounding, "CAP_SETGID") {
+		t.Errorf("non-root bounding set %q does not retain SUID helper capabilities", nonRootCaps.Bounding)
+	}
+
+	explicitCaps, err := buildProcessCapabilities(1000, []string{"SYS_PTRACE"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(explicitCaps.Bounding, "CAP_SYS_PTRACE") {
+		t.Errorf("non-root --cap-add capability missing from bounding set: %+v", explicitCaps)
+	}
+	if len(explicitCaps.Effective) != 0 || len(explicitCaps.Permitted) != 0 {
+		t.Errorf("non-root --cap-add capabilities=%+v, want empty effective/permitted sets", explicitCaps)
+	}
+
+	droppedCaps, err := buildProcessCapabilities(1000, nil, []string{"SETUID", "SETGID"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(droppedCaps.Bounding, "CAP_SETUID") || containsString(droppedCaps.Bounding, "CAP_SETGID") {
+		t.Errorf("explicitly dropped capabilities remain in bounding set: %q", droppedCaps.Bounding)
 	}
 }
 

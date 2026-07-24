@@ -624,11 +624,6 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
 
-	caps, err := capabilities(p, ex.caps, enableRaw)
-	if err != nil {
-		return nil, fmt.Errorf("capabilities error: %v", err)
-	}
-
 	cwd := p.Cwd
 	if ex.cwd != "" {
 		cwd = ex.cwd
@@ -644,6 +639,17 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 	kgid := auth.KGID(p.User.GID)
 	if ex.user.kgidSet {
 		kgid = ex.user.kgid
+	}
+
+	capProcess := p
+	if ex.user.kuidSet {
+		copied := *p
+		copied.Capabilities = capabilitiesForUserTransition(p.Capabilities, p.User.UID, uint32(kuid))
+		capProcess = &copied
+	}
+	caps, err := capabilities(capProcess, ex.caps, enableRaw)
+	if err != nil {
+		return nil, fmt.Errorf("capabilities error: %v", err)
 	}
 
 	return &control.ExecArgs{
@@ -696,8 +702,9 @@ func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) 
 	procCaps := p.Capabilities
 	if procCaps == nil {
 		// If p doesn't have capabilities specified, fallback to the capabilities
-		// specified in the container spec.
-		procCaps = specProc.Capabilities
+		// specified in the container spec, adjusted for a root/non-root user
+		// transition requested by the exec process.
+		procCaps = capabilitiesForUserTransition(specProc.Capabilities, specProc.User.UID, p.User.UID)
 	}
 	// Starting from Docker 19, capabilities are explicitly set for exec (instead
 	// of nil like before). So we can't distinguish 'exec' from
@@ -726,6 +733,29 @@ func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) 
 		NoNewPrivileges:  p.NoNewPrivileges,
 		SupportTTYs:      true,
 	}, nil
+}
+
+// capabilitiesForUserTransition derives default exec capability sets when the
+// requested user crosses the root/non-root boundary. The bounding set remains
+// available to SUID executables. Root gets the bounded capabilities effective
+// and permitted; non-root starts without inherited effective, permitted,
+// inheritable, or ambient capabilities. Explicit exec capabilities are applied
+// by capabilities after this default transition.
+func capabilitiesForUserTransition(caps *specs.LinuxCapabilities, oldUID, newUID uint32) *specs.LinuxCapabilities {
+	if caps == nil || (oldUID == 0) == (newUID == 0) {
+		return caps
+	}
+	adjusted := *caps
+	adjusted.Inheritable = nil
+	adjusted.Ambient = nil
+	if newUID == 0 {
+		adjusted.Effective = append([]string(nil), caps.Bounding...)
+		adjusted.Permitted = append([]string(nil), caps.Bounding...)
+	} else {
+		adjusted.Effective = nil
+		adjusted.Permitted = nil
+	}
+	return &adjusted
 }
 
 // capabilities takes a list of capabilities as strings and returns an

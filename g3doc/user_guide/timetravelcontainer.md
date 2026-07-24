@@ -7,8 +7,10 @@ multiple branches inside one Sentry process.
 
 TTC is currently intended for trusted development and integration-test
 workloads. It is not yet a general Docker replacement or a production security
-boundary. Non-root guest identity is not currently a security boundary. Read
-the [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md)
+boundary. Non-root initial and exec processes use Docker-shaped capability
+defaults, and SUID/SGID elevation remains confined to the Sentry's virtual
+credentials. Read the
+[security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md)
 before depending on live-fork or credential-isolation behavior.
 
 ## What is installed

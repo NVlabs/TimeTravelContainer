@@ -122,6 +122,90 @@ func TestCLIArgs(t *testing.T) {
 				SupportTTYs: true,
 			},
 		},
+		{
+			name: "root spec overridden with non-root user",
+			ex: Exec{
+				user: user{kuid: 1000, kuidSet: true},
+			},
+			spec: specs.Process{
+				User: specs.User{UID: 0, GID: 0},
+				Capabilities: &specs.LinuxCapabilities{
+					Bounding:  []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Effective: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Permitted: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+				},
+				Cwd: "/",
+			},
+			argv: []string{"id"},
+			expected: control.ExecArgs{
+				Argv:             []string{"id"},
+				WorkingDirectory: "/",
+				KUID:             1000,
+				KGID:             0,
+				ExtraKGIDs:       []auth.KGID{},
+				Capabilities: &auth.TaskCapabilities{
+					BoundingCaps: auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
+				},
+				SupportTTYs: true,
+			},
+		},
+		{
+			name: "root spec overridden with explicitly capable non-root user",
+			ex: Exec{
+				user: user{kuid: 1000, kuidSet: true},
+				caps: []string{"CAP_SETUID"},
+			},
+			spec: specs.Process{
+				User: specs.User{UID: 0, GID: 0},
+				Capabilities: &specs.LinuxCapabilities{
+					Bounding:  []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Effective: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Permitted: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+				},
+				Cwd: "/",
+			},
+			argv: []string{"id"},
+			expected: control.ExecArgs{
+				Argv:             []string{"id"},
+				WorkingDirectory: "/",
+				KUID:             1000,
+				KGID:             0,
+				ExtraKGIDs:       []auth.KGID{},
+				Capabilities: &auth.TaskCapabilities{
+					BoundingCaps:  auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
+					EffectiveCaps: auth.CapabilitySetOf(linux.CAP_SETUID),
+					PermittedCaps: auth.CapabilitySetOf(linux.CAP_SETUID),
+				},
+				SupportTTYs: true,
+			},
+		},
+		{
+			name: "non-root spec overridden with root user",
+			ex: Exec{
+				user: user{kuid: 0, kuidSet: true},
+			},
+			spec: specs.Process{
+				User: specs.User{UID: 1000, GID: 1000},
+				Capabilities: &specs.LinuxCapabilities{
+					Bounding: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+				},
+				Cwd: "/",
+			},
+			argv: []string{"id"},
+			expected: control.ExecArgs{
+				Argv:             []string{"id"},
+				WorkingDirectory: "/",
+				KUID:             0,
+				KGID:             1000,
+				ExtraKGIDs:       []auth.KGID{},
+				Capabilities: &auth.TaskCapabilities{
+					BoundingCaps:  auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
+					EffectiveCaps: auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
+					PermittedCaps: auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
+				},
+				SupportTTYs: true,
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -205,6 +289,34 @@ func TestJSONArgs(t *testing.T) {
 				ExtraKGIDs:       []auth.KGID{},
 				Capabilities: &auth.TaskCapabilities{
 					BoundingCaps: auth.CapabilitySetOf(linux.CAP_DAC_READ_SEARCH),
+				},
+				SupportTTYs: true,
+			},
+		},
+		{
+			name: "capabilities fallback clears root privileges for non-root process",
+			ex:   Exec{},
+			spec: specs.Process{
+				User: specs.User{UID: 0, GID: 0},
+				Capabilities: &specs.LinuxCapabilities{
+					Bounding:  []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Effective: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+					Permitted: []string{"CAP_DAC_OVERRIDE", "CAP_SETUID"},
+				},
+			},
+			p: specs.Process{
+				User: specs.User{UID: 1000, GID: 1000},
+				Args: []string{"id"},
+				Cwd:  "/",
+			},
+			expected: control.ExecArgs{
+				Argv:             []string{"id"},
+				WorkingDirectory: "/",
+				KUID:             1000,
+				KGID:             1000,
+				ExtraKGIDs:       []auth.KGID{},
+				Capabilities: &auth.TaskCapabilities{
+					BoundingCaps: auth.CapabilitySetOfMany([]linux.Capability{linux.CAP_DAC_OVERRIDE, linux.CAP_SETUID}),
 				},
 				SupportTTYs: true,
 			},

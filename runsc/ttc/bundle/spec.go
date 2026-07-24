@@ -357,6 +357,22 @@ func buildCapabilities(adds, drops []string) ([]string, error) {
 	return result, nil
 }
 
+func buildProcessCapabilities(uid uint32, adds, drops []string) (*specs.LinuxCapabilities, error) {
+	bounding, err := buildCapabilities(adds, drops)
+	if err != nil {
+		return nil, err
+	}
+	effective := bounding
+	if uid != 0 {
+		effective = nil
+	}
+	return &specs.LinuxCapabilities{
+		Bounding:  append([]string(nil), bounding...),
+		Effective: append([]string(nil), effective...),
+		Permitted: append([]string(nil), effective...),
+	}, nil
+}
+
 // ParseShmSize parses the Docker --shm-size byte syntax.
 func ParseShmSize(value string) (int64, error) {
 	bytes, err := units.RAMInBytes(value)
@@ -591,7 +607,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			}
 		}
 	}
-	capabilities, err := buildCapabilities(opts.CapAdd, opts.CapDrop)
+	capabilities, err := buildProcessCapabilities(uint32(resolvedUser.Uid), opts.CapAdd, opts.CapDrop)
 	if err != nil {
 		return nil, err
 	}
@@ -902,15 +918,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 				GID:            uint32(resolvedUser.Gid),
 				AdditionalGids: additionalGIDs,
 			},
-			Args: args,
-			Env:  env,
-			Cwd:  cwd,
-			Capabilities: &specs.LinuxCapabilities{
-				Bounding:  append([]string(nil), capabilities...),
-				Effective: append([]string(nil), capabilities...),
-				Permitted: append([]string(nil), capabilities...),
-			},
-			Rlimits: rlimits,
+			Args:         args,
+			Env:          env,
+			Cwd:          cwd,
+			Capabilities: capabilities,
+			Rlimits:      rlimits,
 		},
 		Hostname:    hostname,
 		Mounts:      mounts,

@@ -73,16 +73,17 @@ TTC NAT deliberately maps the guest gateway and same-subnet host aliases to
 host loopback services; use `--network ttc` without `--nat` when that access is
 not wanted.
 
-The current audit has one unresolved within-sandbox policy defect: non-root
-processes receive effective default capabilities. `CAP_SETUID` permits a
-process to call `setuid(0)` directly; this does not require a SUID binary and
-is separate from TTC's intentional guest SUID/SGID execution semantics.
-`CAP_DAC_OVERRIDE` similarly bypasses guest file permissions without changing
-UID. This does not establish a host escape, but it means `USER`/`--user` must
-not be relied upon as a privilege boundary until the finding in the
+The concrete credential-policy defects found by the current audit have been
+fixed. A non-root initial or exec process retains the configured capability
+bounding set but does not inherit root's effective or permitted capabilities;
+this prevents a direct `setuid(0)` or `CAP_DAC_OVERRIDE` bypass. Root-owned
+SUID/SGID programs can still elevate inside the Sentry because their required
+capabilities remain bounded unless explicitly dropped. Numeric-ID parsing and
+the upstream exiting-task race are also covered by focused regressions. These
+fixes strengthen the virtual credential boundary but do not change TTC's
+trusted-workload status or constitute a security certification; see the
 [security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
-is resolved. The numeric-ID parsing and upstream exiting-task findings from
-the July 24 audit have been fixed and retain focused regression tests.
+for scope and exclusions.
 
 ## Why TimeTravelContainer?
 

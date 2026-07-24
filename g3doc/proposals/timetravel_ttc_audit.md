@@ -97,15 +97,12 @@ native Docker, which is a separate browser/benchmark compatibility issue.
 
 ## Security findings
 
-### S1: non-root processes receive effective root-like default capabilities
+### Resolved S1: non-root processes received effective root-like capabilities
 
-This is a confirmed within-sandbox privilege escalation and policy bypass.
+The audit confirmed a within-sandbox privilege escalation and policy bypass.
 `BuildSpec` resolves the configured image user or `--user` override, but
-`buildCapabilities` independently returns TTC's root-oriented Docker default
-set. The generated OCI process then receives that set in its bounding,
-permitted, and effective capability sets even when its UID is nonzero. The
-existing bundle test demonstrates UID 123 with `CAP_DAC_OVERRIDE`,
-`CAP_SETUID`, `CAP_SETGID`, and the other defaults effective.
+previously applied TTC's root-oriented Docker default set to the bounding,
+permitted, and effective sets even when its UID was nonzero.
 
 For comparison, the cached Docker 29 installation was run with
 `docker run --rm --user 123 busybox:1.36`; `/proc/self/status` reported zero
@@ -118,27 +115,40 @@ effective, so a process launched as UID 1000 can call `setuid(0)` and become
 virtual root. No SUID executable is involved in this path: the process invokes
 the syscall directly using its already-effective capability. Even without
 changing UID, `CAP_DAC_OVERRIDE` bypasses ordinary guest file permissions.
-`ttc exec --user ...` has the same problem: upstream runsc derives exec
-capabilities from the container process spec before applying the requested
-exec UID.
+`ttc exec --user ...` had the same problem: runsc derived exec capabilities
+from the container process spec before applying the requested exec UID.
 
-This does not grant a host UID or host capability; the escalation remains
-inside the Sentry. It nevertheless violates TTC's stated within-sandbox
+This did not grant a host UID or host capability; the escalation remained
+inside the Sentry. It nevertheless violated TTC's stated within-sandbox
 credential boundary and Docker-shaped `--user` expectations.
 
-Required remediation:
+This is fixed. Initial process construction is UID-aware: UID 0 receives the
+configured bounding capabilities in its effective and permitted sets, while a
+non-root process receives an empty effective/permitted set and retains the
+configured bounding set. As in Docker, `--cap-add` extends that bounding set
+but does not make capabilities effective for a non-root initial process.
+Explicit `--cap-drop`, including dropping `SETUID`/`SETGID`, removes
+capabilities from the bounding set and can intentionally prevent SUID helpers
+from regaining them.
 
-1. Make initial-process capability construction UID-aware. A non-root process
-   should not receive default permitted/effective capabilities merely because
-   no capability flags were supplied.
-2. Make `ttc exec --user` recompute the default capability sets for the
-   requested UID rather than inheriting a root container's effective set.
-3. Define and test the interaction of explicit `--cap-add`/`exec --cap`,
-   bounding capabilities, ambient/inheritable sets, SUID, and
-   `noNewPrivileges`.
-4. Add runtime tests proving that a default non-root process and a non-root
-   exec receive `EPERM` from `setuid(0)` while explicitly authorized
-   configurations and UID 0 retain their intended behavior.
+The runsc exec path now recalculates defaults when `--user` crosses the
+root/non-root boundary. Root-to-non-root exec clears inherited effective,
+permitted, inheritable, and ambient sets but retains bounding capabilities;
+non-root-to-root exec restores effective/permitted capabilities from the
+bounding set. An explicitly supplied exec process capability specification is
+still honored.
+
+Focused unit tests cover root and non-root initial processes, bounding-set
+retention, explicit drops, CLI exec transitions, explicit exec capability
+arguments, and OCI process-file fallback. An isolated real TTC run additionally
+confirmed all of the following:
+
+- a UID 1000 initial process and `exec --user 1000` report zero permitted and
+  effective capabilities while retaining the default bounding set;
+- direct `setresuid(0)`/`setresgid(0)` fails with `EPERM`; and
+- a root-owned mode-4755 helper executed by UID 1000 becomes effective UID 0
+  and receives the bounded capabilities, preserving TTC's intended SUID
+  compatibility.
 
 ### Resolved S2: oversized numeric IDs could resolve to image names
 
@@ -564,9 +574,8 @@ a deadlock guard; reaching it is now a test failure, not accepted behavior.
 
 Before calling TTC a broadly compatible beta:
 
-1. Resolve the remaining effective-capability finding, including runtime
-   exploit regressions for initial and exec non-root credentials. Retain the
-   numeric-ID and upstream exiting-task regressions already added.
+1. Retain the non-root credential, numeric-ID, and upstream exiting-task
+   security regressions and complete an independent security review.
 2. Establish a routine upstream merge and dependency-advisory cadence so
    published gVisor and image-library security fixes cannot remain unnoticed.
 3. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
