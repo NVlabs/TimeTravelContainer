@@ -80,6 +80,9 @@ type options struct {
 
 // Run executes ttc with args and returns a process exit status.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 0 && args[0] == "_cp-helper" {
+		return runCopyHelper(args[1:], stdin, stdout, stderr)
+	}
 	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
 		return 0
 	}
@@ -109,6 +112,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if args[0] == "daemon" {
 		return runDaemonControl(opts, args[1:], stdout, stderr)
+	}
+	if args[0] == "cp" {
+		args, err = normalizeCopyCommandArgs(args)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttc: %v\n", err)
+			return 2
+		}
 	}
 	if opts.unsafeNoHostIsolation && !opts.direct {
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' or '--direct' only; ordinary commands inherit the running daemon's mode")
@@ -286,6 +296,7 @@ Commands:
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   exec ls|wait|kill ...          Manage detached exec sessions
+  cp [OPTIONS] SRC_PATH DEST_PATH Copy files between host and a live branch
   inspect [OPTIONS] CONTAINER... Show Docker and TTC branch/process state
   events [OPTIONS]               Stream durable manager lifecycle events
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
@@ -329,6 +340,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"resume":     "Usage: ttc resume TARGET [TARGET...]",
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 		}
 		if text, ok := usage[args[0]]; ok {
 			fmt.Fprintln(stdout, text)
@@ -380,6 +392,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runLogs(args[1:], stderr, backend)
 	case "exec":
 		err = runExec(args[1:], stdout, stderr, backend)
+	case "cp":
+		err = runCopy(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":

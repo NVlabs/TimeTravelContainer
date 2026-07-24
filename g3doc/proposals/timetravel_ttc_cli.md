@@ -293,6 +293,13 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] Support Docker-style `exec -t`/`-it` with a transient Sentry-internal
       devpts PTY, raw host-terminal mode, resize propagation, stdin close, exact
       exit status, and execution in any running live branch.
+- [x] Add branch-aware `ttc cp` with Docker directory and trailing `/.`
+      semantics, `-a` ownership preservation, `-L` source-link following, and
+      `-` tar streaming in both directions. Execute a donated TTC helper inside
+      the selected Sentry VFS so images need no `tar` or `cp`, validate archive
+      paths and symlink ancestors, and serialize copy-in against live fork.
+      Running branches are supported initially; stopped-container VFS access
+      remains future work.
 - [x] `ttc create` as persistent image-root and OCI-bundle preparation.
 - [x] `ttc start CONTAINER` for created/exited base containers, detached by
       default with optional `--attach`. Multiple detached containers start in

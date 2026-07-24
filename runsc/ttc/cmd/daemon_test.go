@@ -211,6 +211,9 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 		{[]string{"exec", "-dit", "demo", "sh"}, true},
 		{[]string{"run", "--interactive", "alpine"}, true},
 		{[]string{"start", "-ai", "demo"}, true},
+		{[]string{"cp", "-", "demo:/tmp"}, true},
+		{[]string{"cp", "local", "demo:/tmp"}, false},
+		{[]string{"cp", "demo:/tmp", "-"}, false},
 		{[]string{"exec", "ls", "demo"}, false},
 		{[]string{"exec", "demo", "true"}, false},
 		{[]string{"logs", "-f", "demo"}, false},
@@ -241,12 +244,32 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"start", "demo"}, true},
 		{[]string{"start", "-ai", "demo"}, false},
 		{[]string{"start", "--attach=false", "demo"}, true},
+		{[]string{"cp", "local", "demo:/tmp"}, true},
+		{[]string{"cp", "demo:/tmp", "local"}, true},
 		{[]string{"exec", "-d", "demo", "true"}, false},
 		{[]string{"logs", "-f", "demo"}, false},
 		{[]string{"wait", "demo"}, false},
 	} {
 		if got := daemonCommandNeedsMutationLock(test.args); got != test.want {
 			t.Errorf("daemonCommandNeedsMutationLock(%q)=%t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
+func TestDaemonCommandNeedsMutationJournal(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"cp", "local", "demo:/tmp"}, true},
+		{[]string{"cp", "-", "demo:/tmp"}, true},
+		{[]string{"cp", "demo:/tmp", "local"}, false},
+		{[]string{"cp", "demo:/tmp", "-"}, false},
+		{[]string{"fork", "demo", "child"}, true},
+		{[]string{"logs", "demo"}, false},
+	} {
+		if got := daemonCommandNeedsMutationJournal(test.args); got != test.want {
+			t.Errorf("daemonCommandNeedsMutationJournal(%q)=%t, want %t", test.args, got, test.want)
 		}
 	}
 }

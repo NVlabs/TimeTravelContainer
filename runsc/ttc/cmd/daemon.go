@@ -629,7 +629,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
-	if request.RequestID != "" && daemonCommandNeedsMutationLock(request.Args) {
+	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
 		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
 		if err != nil {
 			unlock()
@@ -693,6 +693,9 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	switch args[0] {
 	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "kill", "stop", "restart", "fork":
 		return true
+	case "cp":
+		_, _, _, err := parseCopyCommandArgs(args[1:])
+		return err == nil
 	case "run":
 		return daemonCommandBoolFlag(args[1:], 'd', "--detach")
 	case "start":
@@ -706,6 +709,27 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	default:
 		return false
 	}
+}
+
+// daemonCommandNeedsMutationJournal identifies state-changing commands whose
+// small output can be durably buffered for retry. Container-to-host cp still
+// takes the lifecycle lock, but its arbitrarily large archive is streamed.
+func daemonCommandNeedsMutationJournal(args []string) bool {
+	if !daemonCommandNeedsMutationLock(args) {
+		return false
+	}
+	if len(args) != 0 && args[0] == "container" {
+		args = args[1:]
+	}
+	if len(args) == 0 || args[0] != "cp" {
+		return true
+	}
+	_, _, destination, err := parseCopyCommandArgs(args[1:])
+	if err != nil {
+		return false
+	}
+	_, destinationContainer, err := splitCopyContainerEndpoint(destination)
+	return err == nil && destinationContainer
 }
 
 func daemonCommandBoolFlag(args []string, short byte, long string) bool {
@@ -906,6 +930,9 @@ func daemonCommandUsesStdin(args []string) bool {
 		}
 	}
 	switch args[0] {
+	case "cp":
+		_, source, _, err := parseCopyCommandArgs(args[1:])
+		return err == nil && source == "-"
 	case "attach", "run", "start":
 	case "exec":
 		if len(args) > 1 && (args[1] == "ls" || args[1] == "wait" || args[1] == "kill") {
@@ -933,7 +960,7 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
 	}
-	if daemonCommandNeedsMutationLock(args) && opts.dataRoot != "" {
+	if daemonCommandNeedsMutationJournal(args) && opts.dataRoot != "" {
 		requestID, err := newDaemonRequestID()
 		if err != nil {
 			return 1, err

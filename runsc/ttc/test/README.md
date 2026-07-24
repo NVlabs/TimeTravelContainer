@@ -75,6 +75,9 @@ covers:
   direct persistence across stop/start and daemon restart, hard links,
   symlinks, fallocate, open-FD writes, parent/child/grandchild CoW, overlapping
   first writers in two and four branches, and same-path namespace divergence;
+- branch-aware `ttc cp` in both directions without guest utilities, including
+  Docker directory and trailing `/.` semantics, binary tar streaming through
+  the daemon, hard links, symlinks, modes, and parent/child divergence;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
@@ -170,6 +173,26 @@ A passing result is stronger than the unit suite: it proves image pulling,
 layer extraction, OCI generation, rootless runsc startup, versioned daemon
 transport and restart recovery, nontrivial userspace, console sidecars, and
 TimeTravel branch operations on the executing host.
+
+## Branch-aware copy integration
+
+`e2e_cp.sh` is the focused host-to-container, container-to-host, and tar-stream
+test for `ttc cp`. It copies into main, forks, writes distinct files into both
+branches, exports the child, and imports the child's binary tar stream into the
+parent. It also checks directory `/.` behavior, symlinks, hard links, and modes.
+
+```shell
+bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
+  //runsc/ttc/test:e2e_cp
+
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+  "$PWD/runsc/ttc/test/e2e_cp.sh"
+```
+
+Use `TTC_UNSAFE_NO_HOST_ISOLATION=1` only on a trusted host that cannot create
+unprivileged user namespaces. Set `TTC_ALLOW_SLOW_VOLUME_COPY=1` when the
+test's data root is on a filesystem without `FICLONE`.
 
 ### Upgrading from the containerd-backed image store
 

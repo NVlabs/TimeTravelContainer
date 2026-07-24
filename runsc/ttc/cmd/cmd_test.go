@@ -51,6 +51,7 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 		{"pause", []string{"pause", "--help"}, "Usage: ttc pause"},
 		{"unpause", []string{"unpause", "--help"}, "Usage: ttc unpause"},
 		{"top", []string{"top", "--help"}, "Usage: ttc top"},
+		{"cp", []string{"cp", "--help"}, "Usage: ttc cp"},
 		{"events", []string{"events", "--help"}, "Usage: ttc events"},
 		{"image inspect", []string{"image", "inspect", "--help"}, "Usage: ttc image inspect"},
 		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttc exec wait"},
@@ -3058,6 +3059,16 @@ type fakeBackend struct {
 	execControlTarget  selector
 	execControlID      string
 	execControlSignal  int
+	copyStdin          io.Reader
+	copyExportTarget   selector
+	copyExportPath     string
+	copyExportFollow   bool
+	copyExportData     []byte
+	copyImportTarget   selector
+	copyImportPath     string
+	copyImportArchive  bool
+	copyImportRaw      bool
+	copyImportData     []byte
 
 	preservedRootfs []selector
 }
@@ -3249,6 +3260,33 @@ func (b *fakeBackend) preserveRootfs(target selector) error {
 	return b.err
 }
 
+func (b *fakeBackend) copyInput() io.Reader {
+	return b.copyStdin
+}
+
+func (b *fakeBackend) exportContainerPath(target selector, source string, followLink bool, output io.Writer) error {
+	b.copyExportTarget = target
+	b.copyExportPath = source
+	b.copyExportFollow = followLink
+	if _, err := output.Write(b.copyExportData); err != nil {
+		return err
+	}
+	return b.err
+}
+
+func (b *fakeBackend) importContainerPath(target selector, destination string, preserveOwner, rawArchive bool, input io.Reader) error {
+	b.copyImportTarget = target
+	b.copyImportPath = destination
+	b.copyImportArchive = preserveOwner
+	b.copyImportRaw = rawArchive
+	data, err := io.ReadAll(input)
+	b.copyImportData = data
+	if err != nil {
+		return err
+	}
+	return b.err
+}
+
 func TestManagedVolumeMountParsing(t *testing.T) {
 	request, err := parseMountRequests(
 		[]string{"/anonymous", "named:/cache:ro,nocopy"},
@@ -3336,6 +3374,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
+		{args: []string{"_complete", "cp", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
 		{args: []string{"_complete", "exec", "wait", "demo@main", "exec-"}, want: []string{"exec-123"}},
 	}

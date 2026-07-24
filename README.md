@@ -147,7 +147,7 @@ containerd daemon:
 - lifecycle: `run`, `create`, `start`, `stop`, `restart`, `wait`,
   `kill`, and `rm`;
 - observation: `inspect`, `ps`, `top`, `logs`, and `events`;
-- interaction: `exec` and `attach`;
+- interaction: `exec`, `attach`, and branch-aware `cp`;
 - TimeTravel: `fork`, `pause`, `resume`, `branch rm`, and `ls --tree`;
 - storage: disk-backed managed `volume` create, list, inspect, and remove;
 - completion: Bash, Zsh, and Fish scripts.
@@ -434,6 +434,18 @@ After the fork, interact with branches independently:
 ./bin/ttc resume demo@test-a
 ```
 
+Copy files between the host and either running branch:
+
+```sh
+./bin/ttc cp ./test-input demo@test-a:/tmp/input
+./bin/ttc cp demo@test-a:/tmp/result ./result-a
+./bin/ttc cp demo@test-b:/tmp/result - >result-b.tar
+```
+
+`ttc cp` implements Docker's directory, trailing `/.`, `-a`, `-L`, and tar
+stream conventions. It injects TTC's own copy helper through an executable
+file descriptor, so the image does not need to contain `tar` or `cp`.
+
 Attach to a branch's init console and detach with Ctrl-P, Ctrl-Q:
 
 ```sh
@@ -481,6 +493,9 @@ recovery, and the full command surface.
   GPU/TPU proxy state, and unrecognized resources are rejected by live-fork
   validation.
 - TTC user-mode NAT is currently IPv4 TCP/UDP; published ports are IPv4 TCP.
+- `ttc cp` currently operates on running branches. Resume a paused branch
+  before copying; stopped branches have no in-memory Sentry filesystem to
+  access.
 - A stopped child branch cannot be recreated from memory. Start/restart rebuilds
   the main branch from persistent configuration, its immutable image, the last
   exported main rootfs upper.

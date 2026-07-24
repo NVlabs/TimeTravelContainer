@@ -341,6 +341,54 @@ into persistent logs:
 ttc logs --follow --tail 100 web@test-b
 ```
 
+## Copy files between the host and a branch
+
+`ttc cp` uses Docker-compatible endpoint syntax. Exactly one operand must be a
+container selector:
+
+```shell
+ttc cp ./fixtures web:/tmp/fixtures
+ttc cp ./fixtures/. web@test-b:/tmp/fixtures
+ttc cp web@test-b:/tmp/report.json ./report.json
+ttc cp -a web@test-b:/var/lib/app ./saved-state
+ttc cp -L web@test-b:/tmp/latest ./resolved-latest
+```
+
+The selector is `CONTAINER[@BRANCH]:PATH`; omitting `@BRANCH` selects `main`.
+A relative container path is interpreted from `/`. As with Docker, copying a
+directory to an existing directory nests its basename, while copying it to a
+nonexistent path creates exactly that path. A trailing `/.` copies only the
+directory contents. Destination parents must already exist.
+
+By default, copied entries use the destination side's user and group while
+retaining modes and timestamps. `-a`/`--archive` preserves numeric source
+UID/GID values as well. `-L`/`--follow-link` dereferences a symbolic link used
+as the source operand. Regular files, directories, symbolic and hard links,
+FIFOs/device nodes where permitted, and extended attributes are carried in the
+archive stream.
+
+Use `-` to stream an unmodified tar archive:
+
+```shell
+ttc cp web@test-b:/tmp/results - >results.tar
+mkdir -p host-results
+ttc cp web@test-b:/tmp/results/. host-results
+
+ttc exec web@test-a mkdir -p /tmp/restored
+ttc cp - web@test-a:/tmp/restored <results.tar
+```
+
+The import form requires an existing destination directory because the input
+archive has no separate source operand. TTC runs its own donated copy helper in
+the selected branch, so neither `tar` nor `cp` needs to exist in the image and
+the binary stream is not routed through a guest shell.
+
+Copy currently requires a running branch. Resume a paused branch first.
+Stopped containers do not retain a live Sentry VFS, so Docker's stopped-
+container copy behavior is not yet available. A copy process temporarily owns
+host stream FDs; `ttcd` therefore serializes copy operations with lifecycle
+mutations such as fork, pause, stop, and branch removal.
+
 ## Filesystems and volumes
 
 The ordinary container root is writable by default. While the container is

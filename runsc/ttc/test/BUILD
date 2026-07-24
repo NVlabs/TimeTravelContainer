@@ -21,6 +21,15 @@ sh_binary(
     ],
 )
 
+# Manual because it pulls a public image and starts a rootless sandbox.
+sh_binary(
+    name = "e2e_cp",
+    srcs = ["e2e_cp.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it pulls public images and starts a privileged, isolated
 # Docker-in-Docker daemon. The host Docker configuration is not modified.
 sh_binary(
