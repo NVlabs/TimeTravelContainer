@@ -41,7 +41,7 @@ func (r *Repository) getTreeNode(id string) (treeNode, error) {
 	if len(id) != sha256.Size*2 {
 		return treeNode{}, fmt.Errorf("invalid metadata node ID %q", id)
 	}
-	data, err := os.ReadFile(filepath.Join(r.path, "nodes", id))
+	data, err := r.readFile(filepath.Join("nodes", id))
 	if err != nil {
 		return treeNode{}, err
 	}
@@ -75,13 +75,14 @@ func (r *Repository) putTreeNode(node treeNode) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	id := hex.EncodeToString(sum[:])
-	path := filepath.Join(r.path, "nodes", id)
-	if _, err := os.Stat(path); err == nil {
+	path := filepath.Join("nodes", id)
+	if file, err := r.openFile(path, 0, 0); err == nil {
+		file.Close()
 		return id, nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := atomicWriteFile(filepath.Join(r.path, "staging"), path, data, 0600); err != nil {
+	if err := r.atomicWriteFile(path, data, 0600); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return id, nil
 		}

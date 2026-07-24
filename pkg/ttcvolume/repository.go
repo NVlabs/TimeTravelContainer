@@ -178,6 +178,11 @@ type Inode struct {
 	Size           int64  `json:"size,omitempty"`
 	Object         string `json:"object,omitempty"`
 	DataGeneration uint64 `json:"data_generation,omitempty"`
+	Target         string `json:"target,omitempty"`
+	AtimeNsec      int64  `json:"atime_nsec,omitempty"`
+	BtimeNsec      int64  `json:"btime_nsec,omitempty"`
+	CtimeNsec      int64  `json:"ctime_nsec,omitempty"`
+	MtimeNsec      int64  `json:"mtime_nsec,omitempty"`
 }
 
 // DirectoryEntry is one persistent name-to-virtual-inode mapping.
@@ -188,9 +193,10 @@ type DirectoryEntry struct {
 
 // Repository is one named persistent volume.
 type Repository struct {
-	manager *Manager
-	path    string
-	info    VolumeInfo
+	path     string
+	dir      *os.File
+	copyMode CopyMode
+	info     VolumeInfo
 }
 
 // Create creates a new volume with an empty main branch.
@@ -219,7 +225,17 @@ func (m *Manager) Create(name string) (*Repository, error) {
 		}
 	}
 	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1}
-	repo := &Repository{manager: m, path: path, info: info}
+	repo, err := m.openPath(path, info)
+	if err != nil {
+		_ = os.RemoveAll(path)
+		return nil, err
+	}
+	keepRepo := false
+	defer func() {
+		if !keepRepo {
+			repo.Close()
+		}
+	}()
 	if err := writeJSONAtomic(filepath.Join(path, "staging"), filepath.Join(path, "volume.json"), info); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
@@ -229,7 +245,11 @@ func (m *Manager) Create(name string) (*Repository, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	rootMeta := Inode{Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2}
+	now := time.Now().UnixNano()
+	rootMeta := Inode{
+		Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2,
+		AtimeNsec: now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
+	}
 	root, err = repo.setInode(root, rootMeta)
 	if err != nil {
 		_ = os.RemoveAll(path)
@@ -244,6 +264,7 @@ func (m *Manager) Create(name string) (*Repository, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
+	keepRepo = true
 	return repo, nil
 }
 
@@ -297,10 +318,72 @@ func (m *Manager) Open(nameOrID string) (*Repository, error) {
 			if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
 				return nil, fmt.Errorf("volume %q uses unsupported format %q", info.Name, strings.TrimSpace(string(format)))
 			}
-			return &Repository{manager: m, path: path, info: info}, nil
+			return m.openPath(path, info)
 		}
 	}
 	return nil, fs.ErrNotExist
+}
+
+func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info}, nil
+}
+
+// OpenRepositoryFD opens a repository from an already-open O_DIRECTORY file.
+// The descriptor is duplicated, so the caller retains ownership of dir.
+func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
+	if dir == nil {
+		return nil, errors.New("nil repository directory")
+	}
+	dup, err := unix.Dup(int(dir.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	repo := &Repository{dir: os.NewFile(uintptr(dup), "ttc-volume-repository"), copyMode: mode}
+	if err := repo.readJSON("volume.json", &repo.info); err != nil {
+		repo.Close()
+		return nil, err
+	}
+	if !validID(repo.info.ID) {
+		repo.Close()
+		return nil, fmt.Errorf("invalid repository identity %q", repo.info.ID)
+	}
+	format, err := repo.readFile("format")
+	if err != nil {
+		repo.Close()
+		return nil, err
+	}
+	if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
+		repo.Close()
+		return nil, fmt.Errorf("unsupported repository format %q", strings.TrimSpace(string(format)))
+	}
+	return repo, nil
+}
+
+// Close releases the repository directory descriptor.
+func (r *Repository) Close() error {
+	if r == nil || r.dir == nil {
+		return nil
+	}
+	err := r.dir.Close()
+	r.dir = nil
+	return err
+}
+
+// Directory duplicates the repository directory descriptor for donation to a
+// Sentry process or another trusted repository client.
+func (r *Repository) Directory() (*os.File, error) {
+	if r == nil || r.dir == nil {
+		return nil, errors.New("repository is closed")
+	}
+	dup, err := unix.Dup(int(r.dir.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(dup), "ttc-volume-"+r.info.ID), nil
 }
 
 // Info returns persistent identity metadata.
@@ -309,7 +392,7 @@ func (r *Repository) Info() VolumeInfo {
 }
 
 func (r *Repository) withLock(fn func() error) error {
-	lock, err := os.OpenFile(filepath.Join(r.path, "lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := r.openFile("lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -318,7 +401,7 @@ func (r *Repository) withLock(fn func() error) error {
 		return err
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	if err := readJSON(filepath.Join(r.path, "volume.json"), &r.info); err != nil {
+	if err := r.readJSON("volume.json", &r.info); err != nil {
 		return err
 	}
 	return fn()
@@ -367,7 +450,7 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 		return Branch{}, err
 	}
 	var branch Branch
-	if err := readJSON(filepath.Join(r.path, "branches", id+".json"), &branch); err != nil {
+	if err := r.readJSON(filepath.Join("branches", id+".json"), &branch); err != nil {
 		return Branch{}, err
 	}
 	if branch.ID != id || branch.Root == "" || branch.Generation == 0 {
@@ -377,7 +460,7 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 }
 
 func (r *Repository) writeBranch(branch Branch) error {
-	return writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "branches", branch.ID+".json"), branch)
+	return r.writeJSONAtomic(filepath.Join("branches", branch.ID+".json"), branch)
 }
 
 // Branch returns a branch root.
@@ -385,13 +468,27 @@ func (r *Repository) Branch(id string) (Branch, error) {
 	return r.readBranch(id)
 }
 
-// Fork creates child as an O(1) metadata-root fork of source. Advancing both
-// branch generations ensures that either side's next regular-file write clones.
-func (r *Repository) Fork(source, child string) error {
+// ForkTransaction is a published but not yet committed O(1) branch fork.
+//
+// The source kernel must remain paused until Commit or Abort returns. This
+// prevents branch mutations from racing rollback.
+type ForkTransaction struct {
+	repo      *Repository
+	source    Branch
+	published Branch
+	child     Branch
+	done      bool
+}
+
+// BeginFork creates child as an O(1) metadata-root fork of source. Advancing
+// both branch generations ensures that either side's next regular-file write
+// clones.
+func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 	if err := validateName(child, "branch"); err != nil {
-		return err
+		return nil, err
 	}
-	return r.withLock(func() error {
+	var tx ForkTransaction
+	err := r.withLock(func() error {
 		sourceBranch, err := r.readBranch(source)
 		if err != nil {
 			return err
@@ -401,6 +498,7 @@ func (r *Repository) Fork(source, child string) error {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		tx.source = sourceBranch
 		sourceBranch.Generation++
 		childBranch := Branch{
 			ID: child, Parent: source, Root: sourceBranch.Root,
@@ -413,8 +511,90 @@ func (r *Repository) Fork(source, child string) error {
 		if err := r.writeBranch(sourceBranch); err != nil {
 			return err
 		}
-		return r.writeBranch(childBranch)
+		if err := r.writeBranch(childBranch); err != nil {
+			// writeBranch may fail after its rename succeeded (for example,
+			// while fsyncing the directory). Remove the child pointer before
+			// restoring the source generation; the opposite order could make a
+			// shared object writable through the source while the child exists.
+			childPath := filepath.Join("branches", child+".json")
+			if removeErr := r.unlink(childPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return fmt.Errorf("publishing child branch: %w (removing possibly-published child also failed: %v)", err, removeErr)
+			}
+			if syncErr := r.syncDirectory("branches"); syncErr != nil {
+				return fmt.Errorf("publishing child branch: %w (syncing child removal also failed: %v)", err, syncErr)
+			}
+			if rollbackErr := r.writeBranch(tx.source); rollbackErr != nil {
+				return fmt.Errorf("publishing child branch: %w (restoring source branch also failed: %v)", err, rollbackErr)
+			}
+			return err
+		}
+		tx.repo = r
+		tx.published = sourceBranch
+		tx.child = childBranch
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+// Commit makes a successfully completed fork transaction permanent.
+func (tx *ForkTransaction) Commit() error {
+	if tx == nil || tx.done {
+		return nil
+	}
+	tx.done = true
+	return nil
+}
+
+// Abort removes the child branch and restores the exact source branch record.
+// It fails closed if either pointer changed after BeginFork.
+func (tx *ForkTransaction) Abort() error {
+	if tx == nil || tx.done {
+		return nil
+	}
+	err := tx.repo.withLock(func() error {
+		source, err := tx.repo.readBranch(tx.source.ID)
+		if err != nil {
+			return err
+		}
+		child, err := tx.repo.readBranch(tx.child.ID)
+		if err != nil {
+			return err
+		}
+		if source != tx.published {
+			return fmt.Errorf("cannot abort fork: source branch %q changed after publication", source.ID)
+		}
+		if child != tx.child {
+			return fmt.Errorf("cannot abort fork: child branch %q changed after publication", child.ID)
+		}
+		if err := tx.repo.unlink(filepath.Join("branches", tx.child.ID+".json")); err != nil {
+			return err
+		}
+		if err := tx.repo.syncDirectory("branches"); err != nil {
+			return err
+		}
+		// Remove the child before restoring the source generation. A crash in
+		// between leaves only a conservative generation bump. Restoring the
+		// source first could expose the same mutable object through a child that
+		// still exists.
+		return tx.repo.writeBranch(tx.source)
+	})
+	if err != nil {
+		return err
+	}
+	tx.done = true
+	return nil
+}
+
+// Fork creates and immediately commits an O(1) branch fork.
+func (r *Repository) Fork(source, child string) error {
+	tx, err := r.BeginFork(source, child)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateRegular creates one empty regular file.
@@ -446,10 +626,12 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		}
 		created = r.info.NextInode
 		r.info.NextInode++
+		now := time.Now().UnixNano()
 		inode := Inode{
 			Number: created, Type: "regular", Mode: mode & 07777,
 			UID: uid, GID: gid, Nlink: 1, Object: object,
 			DataGeneration: branch.Generation,
+			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
 		root, err := r.setInode(branch.Root, inode)
 		if err != nil {
@@ -462,7 +644,79 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 			return err
 		}
 		branch.Root = root
-		if err := writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "volume.json"), r.info); err != nil {
+		if err := r.writeJSONAtomic("volume.json", r.info); err != nil {
+			return err
+		}
+		return r.writeBranch(branch)
+	})
+	return created, err
+}
+
+// CreateDirectory creates an empty directory.
+func (r *Repository) CreateDirectory(branchID string, parent uint64, name string, mode uint32, uid, gid uint32) (uint64, error) {
+	return r.createNonRegular(branchID, parent, name, Inode{
+		Type: "directory", Mode: mode & 07777, UID: uid, GID: gid, Nlink: 2,
+	})
+}
+
+// CreateSymlink creates a symbolic link.
+func (r *Repository) CreateSymlink(branchID string, parent uint64, name, target string, uid, gid uint32) (uint64, error) {
+	if len(target) > 4096 {
+		return 0, syscall.ENAMETOOLONG
+	}
+	return r.createNonRegular(branchID, parent, name, Inode{
+		Type: "symlink", Mode: 0777, UID: uid, GID: gid, Nlink: 1, Target: target,
+	})
+}
+
+func (r *Repository) createNonRegular(branchID string, parent uint64, name string, inode Inode) (uint64, error) {
+	if err := validateEntryName(name); err != nil {
+		return 0, err
+	}
+	var created uint64
+	err := r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		parentInode, err := r.getInode(branch.Root, parent)
+		if err != nil {
+			return err
+		}
+		if parentInode.Type != "directory" {
+			return syscall.ENOTDIR
+		}
+		if _, err := r.lookup(branch.Root, parent, name); err == nil {
+			return os.ErrExist
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		created = r.info.NextInode
+		r.info.NextInode++
+		now := time.Now().UnixNano()
+		inode.Number = created
+		inode.AtimeNsec = now
+		inode.BtimeNsec = now
+		inode.CtimeNsec = now
+		inode.MtimeNsec = now
+		root, err := r.setInode(branch.Root, inode)
+		if err != nil {
+			return err
+		}
+		if inode.Type == "directory" {
+			parentInode.Nlink++
+			root, err = r.setInode(root, parentInode)
+			if err != nil {
+				return err
+			}
+		}
+		raw, _ := json.Marshal(DirectoryEntry{Name: name, Inode: created})
+		root, err = r.treeSet(root, entryKey(parent, name), raw)
+		if err != nil {
+			return err
+		}
+		branch.Root = root
+		if err := r.writeJSONAtomic("volume.json", r.info); err != nil {
 			return err
 		}
 		return r.writeBranch(branch)
@@ -586,6 +840,204 @@ func (r *Repository) Unlink(branchID string, parent uint64, name string) error {
 	})
 }
 
+// RemoveDirectory removes an empty directory.
+func (r *Repository) RemoveDirectory(branchID string, parent uint64, name string) error {
+	if err := validateEntryName(name); err != nil {
+		return err
+	}
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		ino, err := r.lookup(branch.Root, parent, name)
+		if err != nil {
+			return err
+		}
+		inode, err := r.getInode(branch.Root, ino)
+		if err != nil {
+			return err
+		}
+		if inode.Type != "directory" {
+			return syscall.ENOTDIR
+		}
+		entries, err := r.treePrefix(branch.Root, entryPrefix(ino))
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return syscall.ENOTEMPTY
+		}
+		parentInode, err := r.getInode(branch.Root, parent)
+		if err != nil {
+			return err
+		}
+		if parentInode.Type != "directory" {
+			return syscall.ENOTDIR
+		}
+		root, err := r.treeDelete(branch.Root, entryKey(parent, name))
+		if err != nil {
+			return err
+		}
+		root, err = r.treeDelete(root, inodeKey(ino))
+		if err != nil {
+			return err
+		}
+		if parentInode.Nlink > 0 {
+			parentInode.Nlink--
+		}
+		root, err = r.setInode(root, parentInode)
+		if err != nil {
+			return err
+		}
+		branch.Root = root
+		return r.writeBranch(branch)
+	})
+}
+
+// Rename atomically moves oldName, optionally replacing newName. Callers are
+// responsible for rejecting directory ancestry cycles before invoking it.
+func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, newParent uint64, newName string, noReplace bool) error {
+	if err := validateEntryName(oldName); err != nil {
+		return err
+	}
+	if err := validateEntryName(newName); err != nil {
+		return err
+	}
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		oldParentInode, err := r.getInode(branch.Root, oldParent)
+		if err != nil {
+			return err
+		}
+		newParentInode, err := r.getInode(branch.Root, newParent)
+		if err != nil {
+			return err
+		}
+		if oldParentInode.Type != "directory" || newParentInode.Type != "directory" {
+			return syscall.ENOTDIR
+		}
+		movedIno, err := r.lookup(branch.Root, oldParent, oldName)
+		if err != nil {
+			return err
+		}
+		moved, err := r.getInode(branch.Root, movedIno)
+		if err != nil {
+			return err
+		}
+		replacedIno, replacedErr := r.lookup(branch.Root, newParent, newName)
+		if replacedErr == nil && noReplace {
+			return os.ErrExist
+		}
+		if replacedErr != nil && !errors.Is(replacedErr, os.ErrNotExist) {
+			return replacedErr
+		}
+		if replacedErr == nil && replacedIno == movedIno {
+			return nil
+		}
+		root := branch.Root
+		if replacedErr == nil {
+			replaced, err := r.getInode(root, replacedIno)
+			if err != nil {
+				return err
+			}
+			switch {
+			case moved.Type == "directory" && replaced.Type != "directory":
+				return syscall.ENOTDIR
+			case moved.Type != "directory" && replaced.Type == "directory":
+				return syscall.EISDIR
+			case replaced.Type == "directory":
+				entries, err := r.treePrefix(root, entryPrefix(replacedIno))
+				if err != nil {
+					return err
+				}
+				if len(entries) != 0 {
+					return syscall.ENOTEMPTY
+				}
+			}
+			root, err = r.treeDelete(root, entryKey(newParent, newName))
+			if err != nil {
+				return err
+			}
+			if replaced.Nlink > 1 && replaced.Type != "directory" {
+				replaced.Nlink--
+				root, err = r.setInode(root, replaced)
+			} else {
+				root, err = r.treeDelete(root, inodeKey(replacedIno))
+			}
+			if err != nil {
+				return err
+			}
+			if replaced.Type == "directory" && newParentInode.Nlink > 0 {
+				newParentInode.Nlink--
+			}
+		}
+		root, err = r.treeDelete(root, entryKey(oldParent, oldName))
+		if err != nil {
+			return err
+		}
+		raw, _ := json.Marshal(DirectoryEntry{Name: newName, Inode: movedIno})
+		root, err = r.treeSet(root, entryKey(newParent, newName), raw)
+		if err != nil {
+			return err
+		}
+		if moved.Type == "directory" && oldParent != newParent {
+			if oldParentInode.Nlink > 0 {
+				oldParentInode.Nlink--
+			}
+			newParentInode.Nlink++
+		}
+		if oldParent == newParent {
+			oldParentInode = newParentInode
+		}
+		root, err = r.setInode(root, oldParentInode)
+		if err != nil {
+			return err
+		}
+		if newParent != oldParent {
+			root, err = r.setInode(root, newParentInode)
+			if err != nil {
+				return err
+			}
+		}
+		branch.Root = root
+		return r.writeBranch(branch)
+	})
+}
+
+// UpdateMetadata replaces branch-local metadata fields while retaining
+// identity, type, link count, data object and generation.
+func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		current, err := r.getInode(branch.Root, updated.Number)
+		if err != nil {
+			return err
+		}
+		current.Mode = updated.Mode & 07777
+		current.UID = updated.UID
+		current.GID = updated.GID
+		current.AtimeNsec = updated.AtimeNsec
+		current.BtimeNsec = updated.BtimeNsec
+		current.CtimeNsec = updated.CtimeNsec
+		current.MtimeNsec = updated.MtimeNsec
+		if current.Type == "symlink" {
+			current.Target = updated.Target
+		}
+		branch.Root, err = r.setInode(branch.Root, current)
+		if err != nil {
+			return err
+		}
+		return r.writeBranch(branch)
+	})
+}
+
 func (r *Repository) ensurePrivate(branch *Branch, inode *Inode) (bool, error) {
 	if inode.Type != "regular" {
 		return false, syscall.EINVAL
@@ -634,7 +1086,7 @@ func (r *Repository) WriteAt(branchID string, ino uint64, data []byte, offset in
 		if err != nil {
 			return err
 		}
-		file, err := os.OpenFile(filepath.Join(r.path, "objects", inode.Object), os.O_WRONLY, 0)
+		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_WRONLY, 0)
 		if err != nil {
 			return err
 		}
@@ -679,12 +1131,95 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	if !validID(inode.Object) {
 		return 0, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 	}
-	file, err := os.Open(filepath.Join(r.path, "objects", inode.Object))
+	file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_RDONLY, 0)
 	if err != nil {
 		return 0, err
 	}
 	defer file.Close()
 	return file.ReadAt(data, offset)
+}
+
+// OpenDataFile opens the host data object selected by branchID and ino.
+// Writable opens first pass through the branch-generation CoW gate. Callers
+// must close the returned descriptor and must revoke every writable descriptor
+// and mapping before BeginFork.
+func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*os.File, Inode, bool, error) {
+	var (
+		file   *os.File
+		inode  Inode
+		cloned bool
+	)
+	open := func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		inode, err = r.getInode(branch.Root, ino)
+		if err != nil {
+			return err
+		}
+		if inode.Type != "regular" {
+			return syscall.EINVAL
+		}
+		if writable {
+			cloned, err = r.ensurePrivate(&branch, &inode)
+			if err != nil {
+				return err
+			}
+		}
+		flags := os.O_RDONLY
+		if writable {
+			flags = os.O_RDWR
+		}
+		file, err = r.openFile(filepath.Join("objects", inode.Object), flags, 0)
+		return err
+	}
+	var err error
+	if writable {
+		err = r.withLock(open)
+	} else {
+		err = open()
+	}
+	if err != nil {
+		if file != nil {
+			file.Close()
+		}
+		return nil, Inode{}, false, err
+	}
+	return file, inode, cloned, nil
+}
+
+// SyncData makes the selected data object durable.
+func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error {
+	file, _, _, err := r.OpenDataFile(branchID, ino, false)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if dataOnly {
+		return unix.Fdatasync(int(file.Fd()))
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	// Branch and immutable-node publication precede every exposed mutation.
+	// Sync their directories so fsync(file) also preserves name resolution.
+	for _, dir := range []string{"nodes", "branches", "objects"} {
+		if err := r.syncDirectory(dir); err != nil {
+			return err
+		}
+	}
+	return r.dir.Sync()
+}
+
+// SyncMetadata makes repository namespace and inode metadata durable.
+func (r *Repository) SyncMetadata() error {
+	for _, dir := range []string{"nodes", "branches", "objects"} {
+		if err := r.syncDirectory(dir); err != nil {
+			return err
+		}
+	}
+	return r.dir.Sync()
 }
 
 // Truncate applies the same first-writer CoW rule as WriteAt.
@@ -706,8 +1241,17 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 		if err != nil {
 			return err
 		}
-		if err := os.Truncate(filepath.Join(r.path, "objects", inode.Object), size); err != nil {
+		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_WRONLY, 0)
+		if err != nil {
 			return err
+		}
+		err = file.Truncate(size)
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		inode.Size = size
 		branch.Root, err = r.setInode(branch.Root, inode)
@@ -748,9 +1292,9 @@ func (r *Repository) createObject(source string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	staging := filepath.Join(r.path, "staging", "object-"+id)
-	destination := filepath.Join(r.path, "objects", id)
-	dst, err := os.OpenFile(staging, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	staging := filepath.Join("staging", "object-"+id)
+	destination := filepath.Join("objects", id)
+	dst, err := r.openFile(staging, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		return "", err
 	}
@@ -758,25 +1302,25 @@ func (r *Repository) createObject(source string) (string, error) {
 	defer func() {
 		dst.Close()
 		if !keep {
-			os.Remove(staging)
+			_ = r.unlink(staging)
 		}
 	}()
 	if source != "" {
-		src, err := os.Open(filepath.Join(r.path, "objects", source))
+		src, err := r.openFile(filepath.Join("objects", source), os.O_RDONLY, 0)
 		if err != nil {
 			return "", err
 		}
-		switch r.manager.capability.Mode {
+		switch r.copyMode {
 		case CopyModeReflink:
 			err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
 		case CopyModeFull:
 			_, err = io.Copy(dst, src)
 		default:
-			err = fmt.Errorf("unknown volume copy mode %q", r.manager.capability.Mode)
+			err = fmt.Errorf("unknown volume copy mode %q", r.copyMode)
 		}
 		src.Close()
 		if err != nil {
-			return "", fmt.Errorf("privatizing volume object %q using %s: %w", source, r.manager.capability.Mode, err)
+			return "", fmt.Errorf("privatizing volume object %q using %s: %w", source, r.copyMode, err)
 		}
 	}
 	if err := dst.Sync(); err != nil {
@@ -785,10 +1329,10 @@ func (r *Repository) createObject(source string) (string, error) {
 	if err := dst.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Rename(staging, destination); err != nil {
+	if err := unix.Renameat(int(r.dir.Fd()), staging, int(r.dir.Fd()), destination); err != nil {
 		return "", err
 	}
-	if err := syncDirectory(filepath.Dir(destination)); err != nil {
+	if err := r.syncDirectory(filepath.Dir(destination)); err != nil {
 		return "", err
 	}
 	keep = true
@@ -892,4 +1436,115 @@ func syncDirectory(path string) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func (r *Repository) openFile(name string, flags int, mode fs.FileMode) (*os.File, error) {
+	if r == nil || r.dir == nil {
+		return nil, errors.New("repository is closed")
+	}
+	if err := validateInternalPath(name); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Openat(int(r.dir.Fd()), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(mode.Perm()))
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func (r *Repository) readFile(name string) ([]byte, error) {
+	file, err := r.openFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+func (r *Repository) readJSON(name string, value any) error {
+	data, err := r.readFile(name)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, value); err != nil {
+		return fmt.Errorf("decoding repository file %q: %w", name, err)
+	}
+	return nil
+}
+
+func (r *Repository) writeJSONAtomic(name string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return r.atomicWriteFile(name, append(data, '\n'), 0600)
+}
+
+func (r *Repository) atomicWriteFile(name string, data []byte, mode fs.FileMode) error {
+	if err := validateInternalPath(name); err != nil {
+		return err
+	}
+	id, err := randomID()
+	if err != nil {
+		return err
+	}
+	staging := filepath.Join("staging", "publish-"+id)
+	file, err := r.openFile(staging, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		file.Close()
+		if !keep {
+			_ = r.unlink(staging)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := unix.Renameat(int(r.dir.Fd()), staging, int(r.dir.Fd()), name); err != nil {
+		return err
+	}
+	if err := r.syncDirectory(filepath.Dir(name)); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
+func (r *Repository) unlink(name string) error {
+	if err := validateInternalPath(name); err != nil {
+		return err
+	}
+	return unix.Unlinkat(int(r.dir.Fd()), name, 0)
+}
+
+func (r *Repository) syncDirectory(name string) error {
+	if name == "." {
+		return r.dir.Sync()
+	}
+	dir, err := r.openFile(name, os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func validateInternalPath(name string) error {
+	if name == "" || filepath.IsAbs(name) {
+		return fmt.Errorf("invalid repository path %q", name)
+	}
+	clean := filepath.Clean(name)
+	if clean != name || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid repository path %q", name)
+	}
+	return nil
 }

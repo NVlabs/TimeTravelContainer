@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -208,6 +209,201 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 	}
 	if matches, err := filepath.Glob(filepath.Join(root, "volumes-v2", id, "*.tar")); err != nil || len(matches) != 0 {
 		t.Fatalf("unexpected tar persistence: matches=%v err=%v", matches, err)
+	}
+}
+
+func TestRepositoryOperatesThroughDonatedDirectoryFD(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("donated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, MainBranch, ino, "before", 0)
+	dir, err := repo.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	donated, err := OpenRepositoryFD(dir, manager.Capability().Mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer donated.Close()
+
+	// Remove all pathname knowledge from this instance. Operations must remain
+	// relative to the donated repository descriptor.
+	donated.path = ""
+	if err := donated.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, donated, "child", ino, "CH", 0)
+	if got := readAll(t, donated, MainBranch, ino); got != "before" {
+		t.Fatalf("donated-FD parent=%q", got)
+	}
+	if got := readAll(t, donated, "child", ino); got != "CHfore" {
+		t.Fatalf("donated-FD child=%q", got)
+	}
+}
+
+func TestForkTransactionAbortRestoresSource(t *testing.T) {
+	manager, err := OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("transaction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "data", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.WriteAt(MainBranch, ino, []byte("before"), 0); err != nil {
+		t.Fatal(err)
+	}
+	before, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := repo.BeginFork(MainBranch, "aborted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if advanced.Generation != before.Generation+1 {
+		t.Fatalf("source generation after BeginFork=%d, want %d", advanced.Generation, before.Generation+1)
+	}
+	if err := tx.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("source after Abort=%+v, want %+v", after, before)
+	}
+	if _, err := repo.Branch("aborted"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("aborted child lookup error=%v, want not exist", err)
+	}
+	if _, _, err := repo.WriteAt(MainBranch, ino, []byte("after!"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, repo, MainBranch, ino); got != "after!" {
+		t.Fatalf("source contents after abort=%q, want after!", got)
+	}
+}
+
+func TestForkTransactionCommitRetainsBranches(t *testing.T) {
+	manager, err := OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	tx, err := repo.BeginFork(MainBranch, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Branch(MainBranch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Branch("child"); err != nil {
+		t.Fatal(err)
+	}
+	// Commit and Abort are idempotent after completion.
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Branch("child"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
+	manager, err := OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("namespace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	dir, err := repo.CreateDirectory(MainBranch, RootInode, "dir", 0750, 12, 34)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := repo.CreateSymlink(MainBranch, dir, "link", "../target", 12, 34)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := repo.CreateRegular(MainBranch, dir, "file", 0640, 12, 34)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Link(MainBranch, RootInode, "hard", file); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Rename("child", dir, "file", dir, "renamed", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Unlink("child", RootInode, "hard"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RemoveDirectory("child", RootInode, "dir"); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("removing non-empty directory error=%v, want ENOTEMPTY", err)
+	}
+	if _, err := repo.Lookup(MainBranch, dir, "file"); err != nil {
+		t.Fatalf("parent file disappeared: %v", err)
+	}
+	if _, err := repo.Lookup(MainBranch, dir, "renamed"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("parent unexpectedly sees child rename: %v", err)
+	}
+	if got, err := repo.Inode(MainBranch, link); err != nil {
+		t.Fatal(err)
+	} else if got.Type != "symlink" || got.Target != "../target" {
+		t.Fatalf("symlink inode=%+v", got)
+	}
+	childFile, err := repo.Inode("child", file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childFile.Mode = 0600
+	childFile.UID = 99
+	childFile.MtimeNsec = 123
+	if err := repo.UpdateMetadata("child", childFile); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.Inode("child", file); err != nil {
+		t.Fatal(err)
+	} else if got.Mode != 0600 || got.UID != 99 || got.MtimeNsec != 123 {
+		t.Fatalf("updated child inode=%+v", got)
+	}
+	if got, err := repo.Inode(MainBranch, file); err != nil {
+		t.Fatal(err)
+	} else if got.Mode != 0640 || got.UID != 12 {
+		t.Fatalf("parent metadata changed=%+v", got)
 	}
 }
 
