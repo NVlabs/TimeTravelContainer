@@ -636,9 +636,9 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 }
 
 // configureOverlay mounts the lower layer using "lowerOpts", mounts the upper
-// layer using tmpfs, and return overlay mount options. "cleanup" must be called
-// after the options have been used to mount the overlay, to release refs on
-// lower and upper mounts.
+// layer using tmpfs (or TTC's persistent ttcvol for a TTC rootfs), and returns
+// overlay mount options. "cleanup" must be called after the options have been
+// used to mount the overlay, to release refs on lower and upper mounts.
 func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Config, creds *auth.Credentials, lowerOpts *vfs.MountOptions, lowerFSName string, filestoreFD *fd.FD, mountConf specutils.GoferMountConf, dst string, rootfsUpperTarFD *fd.FD) (*vfs.MountOptions, func(), error) {
 	// First copy options from lower layer to upper layer and overlay. Clear
 	// filesystem specific options.
@@ -681,12 +681,28 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		return nil, nil, fmt.Errorf("lower layer's root has unsupported file type %v", rootType)
 	}
 
-	// Upper is a tmpfs mount to keep all modifications inside the sandbox.
+	// Upper is normally tmpfs. TTC root filesystems instead donate a private
+	// ttcvol repository so every namespace and data mutation is persistent as
+	// it occurs; no exit-time archive is involved.
 	tmpfsOpts := tmpfs.FilesystemOpts{
 		RootFileType: uint16(rootType),
 		// If a mount is being overlaid, it should not be limited by the default
 		// tmpfs size limit.
 		DisableDefaultSizeLimit: true,
+	}
+	upperFSName := tmpfs.Name
+	if repository, ok := c.l.ttcVolumeRepositories[specutils.TTCRootfsUpperSource]; ok && dst == "/" {
+		if rootType != linux.S_IFDIR {
+			return nil, nil, fmt.Errorf("persistent TTC rootfs upper requires a directory root")
+		}
+		if filestoreFD != nil || rootfsUpperTarFD != nil {
+			return nil, nil, fmt.Errorf("persistent TTC rootfs upper is mutually exclusive with filestore and tar-backed uppers")
+		}
+		tmpfsOpts.DiskVolume = &tmpfs.DiskVolumeOptions{
+			Repository: repository.repository,
+			Branch:     repository.config.Branch,
+		}
+		upperFSName = tmpfs.DiskVolumeName
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
@@ -713,7 +729,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		tmpfsOpts.SourceTar = rootfsUpperTarFD.ReleaseToFile("rootfs-upper-tar-fd")
 	}
 	upperOpts.GetFilesystemOptions.InternalData = tmpfsOpts
-	upper, err := c.l.k.VFS().MountDisconnected(ctx, creds, "" /* source */, tmpfs.Name, &upperOpts)
+	upper, err := c.l.k.VFS().MountDisconnected(ctx, creds, "" /* source */, upperFSName, &upperOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create upper layer for overlay, opts: %+v: %v", upperOpts, err)
 	}

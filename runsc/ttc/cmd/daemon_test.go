@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -81,9 +80,6 @@ func TestStopDaemonContainersStopsDescendantsBeforeMain(t *testing.T) {
 		if b.signals[i].target != want {
 			t.Errorf("signal[%d] target=%+v, want %+v", i, b.signals[i].target, want)
 		}
-	}
-	if got, want := b.preservedRootfs, []selector{{container: "web", branch: defaultBranchID}}; !reflect.DeepEqual(got, want) {
-		t.Errorf("preserved rootfs=%+v, want %+v", got, want)
 	}
 }
 

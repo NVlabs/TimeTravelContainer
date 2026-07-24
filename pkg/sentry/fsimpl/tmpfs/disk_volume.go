@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
@@ -74,6 +75,14 @@ func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[ui
 		}
 	case "symlink":
 		inode, err = fs.newSymlink(auth.KUID(meta.UID), auth.KGID(meta.GID), linux.FileMode(meta.Mode), meta.Target, parent)
+	case "fifo":
+		inode, err = fs.newNamedPipe(auth.KUID(meta.UID), auth.KGID(meta.GID), linux.FileMode(meta.Mode), parent)
+	case "char":
+		inode, err = fs.newDeviceFileLocked(auth.KUID(meta.UID), auth.KGID(meta.GID), linux.S_IFCHR|linux.FileMode(meta.Mode), meta.DevMajor, meta.DevMinor, parent)
+	case "block":
+		inode, err = fs.newDeviceFileLocked(auth.KUID(meta.UID), auth.KGID(meta.GID), linux.S_IFBLK|linux.FileMode(meta.Mode), meta.DevMajor, meta.DevMinor, parent)
+	case "socket":
+		inode, err = fs.newSocketFile(auth.KUID(meta.UID), auth.KGID(meta.GID), linux.S_IFSOCK|linux.FileMode(meta.Mode), nil, parent)
 	default:
 		return nil, fmt.Errorf("unsupported persistent inode %d type %q", ino, meta.Type)
 	}
@@ -144,6 +153,18 @@ func (fs *filesystem) diskMetadata(inode *inode) ttcvolume.Inode {
 	case *symlink:
 		meta.Type = "symlink"
 		meta.Target = impl.target
+	case *namedPipe:
+		meta.Type = "fifo"
+	case *deviceFile:
+		if impl.kind == vfs.BlockDevice {
+			meta.Type = "block"
+		} else {
+			meta.Type = "char"
+		}
+		meta.DevMajor = impl.major
+		meta.DevMinor = impl.minor
+	case *socketFile:
+		meta.Type = "socket"
 	}
 	return meta
 }

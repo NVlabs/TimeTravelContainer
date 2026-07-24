@@ -3766,11 +3766,6 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 			return err
 		}
-		if target.branch == defaultBranchID {
-			if err := backend.preserveRootfs(target); err != nil {
-				return fmt.Errorf("preserving writable rootfs for %s after stop: %w", target, err)
-			}
-		}
 		fmt.Fprintln(stdout, target)
 	}
 	return nil
@@ -4375,7 +4370,6 @@ type backend interface {
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
 	wait(target selector) (uint32, error)
-	preserveRootfs(target selector) error
 }
 
 type consoleSidecarOwner interface {
@@ -4771,6 +4765,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
 		Progress:           newImageProgress(b.stderr),
+		VolumeCopyMode:     b.volumeCopyMode,
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -4842,6 +4837,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
 		Progress:           newImageProgress(b.stderr),
+		VolumeCopyMode:     b.volumeCopyMode,
 	})
 	if err != nil {
 		return "", err
@@ -4856,9 +4852,6 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	}
 	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
-	}
-	if err := b.containerStore().RefreshRootfsSeed(info.ID); err != nil {
-		return 1, fmt.Errorf("refreshing persistent filesystem seeds before starting %q: %w", name, err)
 	}
 	status, err := b.launch(info, detach, interactive)
 	if err == nil {
@@ -4946,11 +4939,6 @@ func (b *runtimeBackend) removeStoppedRuntime(name string) error {
 		}
 		if family.State != "stopped" && family.State != "exited" {
 			return fmt.Errorf("container %q is already %s", name, family.State)
-		}
-		if b.dataRoot != "" {
-			if err := b.containerStore().FinalizeRootfsExitSnapshot(name); err != nil {
-				return fmt.Errorf("preserving writable rootfs from stopped container %q: %w", name, err)
-			}
 		}
 		if _, err := b.command("delete", "--force", name); err != nil {
 			return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
@@ -6583,7 +6571,6 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// TTC treats container identities as guest-only state and prioritizes
 		// compatibility with Docker images that use helpers such as sudo.
 		"--allow-suid=true",
-		"--allow-rootfs-tar-annotation=true",
 		"--overlay2=all:memory")
 	if networkMode == "ttc" {
 		args = append(args, "--ttc-network-nat="+strconv.FormatBool(networkNAT))
@@ -7152,17 +7139,6 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 		Platform:  platform,
 		Progress:  progressFunc,
 	})
-}
-
-func (b *runtimeBackend) preserveRootfs(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
-	if err != nil {
-		return err
-	}
-	if resolved.branch != defaultBranchID {
-		return fmt.Errorf("writable rootfs persistence is only supported for the main branch")
-	}
-	return b.containerStore().FinalizeRootfsExitSnapshot(resolved.container)
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {

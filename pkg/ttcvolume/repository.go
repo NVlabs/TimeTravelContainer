@@ -19,6 +19,7 @@ package ttcvolume
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,16 @@ const MainBranch = mainBranch
 
 // RootInode is the virtual inode number of every volume root.
 const RootInode = rootInode
+
+// ScopedBranchID maps one user-visible live branch name to a repository branch
+// name that cannot collide with the same name in another sandbox family.
+func ScopedBranchID(scope, visibleBranchID string) string {
+	if scope == "" {
+		return visibleBranchID
+	}
+	sum := sha256.Sum256([]byte(scope + "\x00" + visibleBranchID))
+	return fmt.Sprintf("b-%x", sum[:])
+}
 
 // CopyMode describes how shared regular-file objects are privatized.
 type CopyMode string
@@ -179,6 +190,8 @@ type Inode struct {
 	Object         string            `json:"object,omitempty"`
 	DataGeneration uint64            `json:"data_generation,omitempty"`
 	Target         string            `json:"target,omitempty"`
+	DevMajor       uint32            `json:"dev_major,omitempty"`
+	DevMinor       uint32            `json:"dev_minor,omitempty"`
 	AtimeNsec      int64             `json:"atime_nsec,omitempty"`
 	BtimeNsec      int64             `json:"btime_nsec,omitempty"`
 	CtimeNsec      int64             `json:"ctime_nsec,omitempty"`
@@ -219,6 +232,33 @@ func (m *Manager) Create(name string) (*Repository, error) {
 		return nil, err
 	}
 	path := filepath.Join(m.volumes, id)
+	return m.createAt(path, name, id)
+}
+
+// CreatePrivate creates a repository at path without adding it to the named
+// volume catalog. TTC uses this for a container-family-owned rootfs upper.
+func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
+	if err := validateName(name, "repository"); err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(m.root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("private repository path %q is outside data root %q", path, m.root)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return nil, fmt.Errorf("private repository path %q already exists", path)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	id, err := randomID()
+	if err != nil {
+		return nil, err
+	}
+	return m.createAt(path, name, id)
+}
+
+func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 	for _, dir := range []string{path, filepath.Join(path, "nodes"), filepath.Join(path, "objects"), filepath.Join(path, "staging"), filepath.Join(path, "branches")} {
 		if err := os.Mkdir(dir, 0700); err != nil {
 			_ = os.RemoveAll(path)
@@ -267,6 +307,30 @@ func (m *Manager) Create(name string) (*Repository, error) {
 	}
 	keepRepo = true
 	return repo, nil
+}
+
+// OpenPrivate opens a repository created by CreatePrivate.
+func (m *Manager) OpenPrivate(path string) (*Repository, error) {
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(m.root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("private repository path %q is outside data root %q", path, m.root)
+	}
+	var info VolumeInfo
+	if err := readJSON(filepath.Join(path, "volume.json"), &info); err != nil {
+		return nil, err
+	}
+	if !validID(info.ID) {
+		return nil, fmt.Errorf("private repository has invalid identity %q", info.ID)
+	}
+	format, err := os.ReadFile(filepath.Join(path, "format"))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
+		return nil, fmt.Errorf("private repository uses unsupported format %q", strings.TrimSpace(string(format)))
+	}
+	return m.openPath(path, info)
 }
 
 // List returns all valid v2 volumes.
@@ -687,6 +751,19 @@ func (r *Repository) CreateSymlink(branchID string, parent uint64, name, target 
 	}
 	return r.createNonRegular(branchID, parent, name, Inode{
 		Type: "symlink", Mode: 0777, UID: uid, GID: gid, Nlink: 1, Target: target,
+	})
+}
+
+// CreateSpecial creates a FIFO, device, or unbound Unix socket inode.
+func (r *Repository) CreateSpecial(branchID string, parent uint64, name, kind string, mode uint32, uid, gid, major, minor uint32) (uint64, error) {
+	switch kind {
+	case "fifo", "char", "block", "socket":
+	default:
+		return 0, fmt.Errorf("unsupported special inode type %q", kind)
+	}
+	return r.createNonRegular(branchID, parent, name, Inode{
+		Type: kind, Mode: mode & 07777, UID: uid, GID: gid, Nlink: 1,
+		DevMajor: major, DevMinor: minor,
 	})
 }
 

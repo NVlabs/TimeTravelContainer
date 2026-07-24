@@ -358,13 +358,31 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			return err
 		}
 		if fs.diskVolume != nil {
-			if opts.Mode.FileType() != linux.S_IFREG {
-				childInode.decLinksLocked(ctx)
-				return linuxerr.EOPNOTSUPP
+			var (
+				ino uint64
+				err error
+			)
+			if opts.Mode.FileType() == linux.S_IFREG {
+				ino, err = fs.diskVolume.Repository.CreateRegular(
+					fs.diskVolume.Branch, parentDir.inode.ino, name,
+					childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
+			} else {
+				kind := ""
+				switch opts.Mode.FileType() {
+				case linux.S_IFIFO:
+					kind = "fifo"
+				case linux.S_IFCHR:
+					kind = "char"
+				case linux.S_IFBLK:
+					kind = "block"
+				case linux.S_IFSOCK:
+					kind = "socket"
+				}
+				ino, err = fs.diskVolume.Repository.CreateSpecial(
+					fs.diskVolume.Branch, parentDir.inode.ino, name, kind,
+					childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load(),
+					opts.DevMajor, opts.DevMinor)
 			}
-			ino, err := fs.diskVolume.Repository.CreateRegular(
-				fs.diskVolume.Branch, parentDir.inode.ino, name,
-				childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
 			if err != nil {
 				childInode.decLinksLocked(ctx)
 				return err

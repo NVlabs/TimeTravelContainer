@@ -15,7 +15,6 @@
 package bundle
 
 import (
-	"archive/tar"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -125,6 +125,40 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	}
 	if linkInode.Type != "symlink" || linkInode.Target != "nested/payload" {
 		t.Fatalf("symlink inode = %+v", linkInode)
+	}
+}
+
+func TestBuildSpecDonatesPersistentRootfsUpper(t *testing.T) {
+	rootfs := t.TempDir()
+	repository := filepath.Join(t.TempDir(), "rootfs-upper")
+	spec, err := BuildSpec(
+		ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}},
+		SpecOptions{
+			Name:                      "persistent",
+			RootFS:                    rootfs,
+			RootfsUpperRepositoryPath: repository,
+			RootfsUpperCopyMode:       string(ttcvolume.CopyModeReflink),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositories) != 1 {
+		t.Fatalf("repositories = %+v, want one rootfs upper", repositories)
+	}
+	got := repositories[0]
+	if got.Source != specutils.TTCRootfsUpperSource || got.Path != repository || got.Branch != ttcvolume.MainBranch || got.CopyMode != string(ttcvolume.CopyModeReflink) {
+		t.Fatalf("rootfs upper repository = %+v", got)
+	}
+	if _, ok := spec.Annotations[specutils.AnnotationRootfsUpperTar]; ok {
+		t.Fatal("generated TTC spec still has a rootfs upper tar annotation")
+	}
+	if _, ok := spec.Annotations[specutils.AnnotationMountTarOnExit]; ok {
+		t.Fatal("generated TTC spec still has an exit-time tar annotation")
 	}
 }
 
@@ -1121,67 +1155,6 @@ func TestContainerIdentityResolution(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyDir); err != nil {
 		t.Errorf("legacy directory changed: %v", err)
-	}
-}
-
-func TestFinalizeRootfsExitSnapshot(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	containerDir := filepath.Join(root, "containers", "demo")
-	bundleDir := filepath.Join(containerDir, "bundle")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Root: &specs.Root{Path: "/rootfs"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-		ID: "demo", Name: "demo", BundleDir: bundleDir, CreatedAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	pending, ready, err := store.RootfsExitSnapshotPaths("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.Create(pending)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := tar.NewWriter(file)
-	contents := "preserved"
-	if err := writer.WriteHeader(&tar.Header{Name: "./shutdown-state", Mode: 0644, Size: int64(len(contents))}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.Write([]byte(contents)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(ready, []byte("complete\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.FinalizeRootfsExitSnapshot("demo"); err != nil {
-		t.Fatalf("FinalizeRootfsExitSnapshot: %v", err)
-	}
-	snapshot, err := store.RootfsSnapshotPath("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info, err := os.Stat(snapshot); err != nil {
-		t.Fatal(err)
-	} else if info.Size() == 0 || info.Mode().Perm() != 0600 {
-		t.Fatalf("rootfs snapshot info=%+v", info)
-	}
-	if _, err := os.Stat(pending); !os.IsNotExist(err) {
-		t.Errorf("pending rootfs archive remains: %v", err)
-	}
-	if _, err := os.Stat(ready); !os.IsNotExist(err) {
-		t.Errorf("rootfs ready marker remains: %v", err)
 	}
 }
 

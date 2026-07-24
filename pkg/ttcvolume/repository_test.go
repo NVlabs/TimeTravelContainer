@@ -542,3 +542,68 @@ func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 		t.Fatalf("reopened child metadata=%+v", got)
 	}
 }
+
+func TestPrivateRepositoryIsDurableAndNotCatalogued(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "containers", "family", "rootfs-upper")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.CreatePrivate(path, "rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := repo.Info().ID
+	if _, err := repo.CreateSpecial(MainBranch, RootInode, ".wh.deleted", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	volumes, err := manager.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != 0 {
+		t.Fatalf("private repository appeared in named volume catalog: %+v", volumes)
+	}
+	repo, err = manager.OpenPrivate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if repo.Info().ID != id {
+		t.Fatalf("reopened ID = %q, want %q", repo.Info().ID, id)
+	}
+	ino, err := repo.Lookup(MainBranch, RootInode, ".wh.deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Type != "char" || meta.DevMajor != 0 || meta.DevMinor != 0 {
+		t.Fatalf("whiteout metadata = %+v", meta)
+	}
+	if _, err := manager.CreatePrivate(filepath.Join(root, "..", "escape"), "bad"); err == nil {
+		t.Fatal("CreatePrivate accepted path outside data root")
+	}
+}
+
+func TestScopedBranchID(t *testing.T) {
+	if got := ScopedBranchID("", "child"); got != "child" {
+		t.Fatalf("unscoped branch = %q, want child", got)
+	}
+	a := ScopedBranchID("family-a", "child")
+	if a != ScopedBranchID("family-a", "child") {
+		t.Fatal("scoped branch ID is not deterministic")
+	}
+	if a == ScopedBranchID("family-b", "child") || a == "child" {
+		t.Fatalf("scoped branch IDs collide: %q", a)
+	}
+}

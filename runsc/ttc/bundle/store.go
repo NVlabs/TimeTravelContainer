@@ -15,7 +15,6 @@
 package bundle
 
 import (
-	"archive/tar"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -37,16 +36,15 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
-	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	"gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
 const (
-	imageRootFormatVersion = "v3"
-	containerIDBytes       = 32
-	rootfsSnapshotFile     = "rootfs-upper.tar"
+	imageRootFormatVersion   = "v3"
+	containerIDBytes         = 32
+	rootfsUpperRepositoryDir = "rootfs-upper"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
 )
@@ -74,6 +72,9 @@ type PrepareOptions struct {
 	NetworkMAC         string
 	PublishedPorts     []PortBinding
 	Progress           images.ProgressFunc
+	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
+	// Empty permits Store-only callers to probe either supported mode.
+	VolumeCopyMode ttcvolume.CopyMode
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -116,52 +117,54 @@ func (p PortBinding) Branch() string {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	ID                 string            `json:"id"`
-	Name               string            `json:"name"`
-	Reference          string            `json:"reference"`
-	Digest             string            `json:"digest"`
-	ImageSize          int64             `json:"image_size,omitempty"`
-	LeaseID            string            `json:"lease_id,omitempty"`
-	Platform           string            `json:"platform"`
-	BundleDir          string            `json:"bundle_dir"`
-	RootFS             string            `json:"rootfs"`
-	Branches           []BranchInfo      `json:"branches,omitempty"`
-	NetworkMode        string            `json:"network_mode,omitempty"`
-	NetworkNAT         bool              `json:"network_nat,omitempty"`
-	NetworkIP          string            `json:"network_ip,omitempty"`
-	NetworkMAC         string            `json:"network_mac,omitempty"`
-	PublishedPorts     []PortBinding     `json:"published_ports,omitempty"`
-	LogDriver          string            `json:"log_driver,omitempty"`
-	LogOptions         map[string]string `json:"log_options,omitempty"`
-	LogAttributes      map[string]string `json:"log_attributes,omitempty"`
-	ConsoleLogMaxBytes int64             `json:"console_log_max_bytes,omitempty"`
-	ConsoleLogMaxFiles int               `json:"console_log_max_files,omitempty"`
-	Terminal           bool              `json:"terminal,omitempty"`
-	OpenStdin          bool              `json:"open_stdin,omitempty"`
-	AutoRemove         bool              `json:"auto_remove,omitempty"`
-	StopSignal         string            `json:"stop_signal,omitempty"`
-	StopTimeout        *int              `json:"stop_timeout,omitempty"`
-	PidsLimit          *int64            `json:"pids_limit,omitempty"`
-	MemoryLimit        *int64            `json:"memory_limit,omitempty"`
-	NanoCPUs           *int64            `json:"nano_cpus,omitempty"`
-	CPUShares          *uint64           `json:"cpu_shares,omitempty"`
-	CPUPeriod          *uint64           `json:"cpu_period,omitempty"`
-	CPUQuota           *int64            `json:"cpu_quota,omitempty"`
-	ShmSize            *int64            `json:"shm_size,omitempty"`
-	GroupAdd           []string          `json:"group_add,omitempty"`
-	CapAdd             []string          `json:"cap_add,omitempty"`
-	CapDrop            []string          `json:"cap_drop,omitempty"`
-	Ulimits            []Ulimit          `json:"ulimits,omitempty"`
-	ExtraHosts         []string          `json:"extra_hosts,omitempty"`
-	DNS                []string          `json:"dns,omitempty"`
-	DNSSearch          []string          `json:"dns_search,omitempty"`
-	DNSOptions         []string          `json:"dns_options,omitempty"`
-	Volumes            []ManagedVolume   `json:"volumes,omitempty"`
-	State              string            `json:"state"`
-	ExitStatus         *int              `json:"exit_status,omitempty"`
-	CreatedAt          time.Time         `json:"created_at"`
-	StartedAt          *time.Time        `json:"started_at,omitempty"`
-	ExitedAt           *time.Time        `json:"exited_at,omitempty"`
+	ID                  string            `json:"id"`
+	Name                string            `json:"name"`
+	Reference           string            `json:"reference"`
+	Digest              string            `json:"digest"`
+	ImageSize           int64             `json:"image_size,omitempty"`
+	LeaseID             string            `json:"lease_id,omitempty"`
+	Platform            string            `json:"platform"`
+	BundleDir           string            `json:"bundle_dir"`
+	RootFS              string            `json:"rootfs"`
+	Branches            []BranchInfo      `json:"branches,omitempty"`
+	NetworkMode         string            `json:"network_mode,omitempty"`
+	NetworkNAT          bool              `json:"network_nat,omitempty"`
+	NetworkIP           string            `json:"network_ip,omitempty"`
+	NetworkMAC          string            `json:"network_mac,omitempty"`
+	PublishedPorts      []PortBinding     `json:"published_ports,omitempty"`
+	LogDriver           string            `json:"log_driver,omitempty"`
+	LogOptions          map[string]string `json:"log_options,omitempty"`
+	LogAttributes       map[string]string `json:"log_attributes,omitempty"`
+	ConsoleLogMaxBytes  int64             `json:"console_log_max_bytes,omitempty"`
+	ConsoleLogMaxFiles  int               `json:"console_log_max_files,omitempty"`
+	Terminal            bool              `json:"terminal,omitempty"`
+	OpenStdin           bool              `json:"open_stdin,omitempty"`
+	AutoRemove          bool              `json:"auto_remove,omitempty"`
+	StopSignal          string            `json:"stop_signal,omitempty"`
+	StopTimeout         *int              `json:"stop_timeout,omitempty"`
+	PidsLimit           *int64            `json:"pids_limit,omitempty"`
+	MemoryLimit         *int64            `json:"memory_limit,omitempty"`
+	NanoCPUs            *int64            `json:"nano_cpus,omitempty"`
+	CPUShares           *uint64           `json:"cpu_shares,omitempty"`
+	CPUPeriod           *uint64           `json:"cpu_period,omitempty"`
+	CPUQuota            *int64            `json:"cpu_quota,omitempty"`
+	ShmSize             *int64            `json:"shm_size,omitempty"`
+	GroupAdd            []string          `json:"group_add,omitempty"`
+	CapAdd              []string          `json:"cap_add,omitempty"`
+	CapDrop             []string          `json:"cap_drop,omitempty"`
+	Ulimits             []Ulimit          `json:"ulimits,omitempty"`
+	ExtraHosts          []string          `json:"extra_hosts,omitempty"`
+	DNS                 []string          `json:"dns,omitempty"`
+	DNSSearch           []string          `json:"dns_search,omitempty"`
+	DNSOptions          []string          `json:"dns_options,omitempty"`
+	Volumes             []ManagedVolume   `json:"volumes,omitempty"`
+	RootfsUpperID       string            `json:"rootfs_upper_id,omitempty"`
+	RootfsUpperCopyMode string            `json:"rootfs_upper_copy_mode,omitempty"`
+	State               string            `json:"state"`
+	ExitStatus          *int              `json:"exit_status,omitempty"`
+	CreatedAt           time.Time         `json:"created_at"`
+	StartedAt           *time.Time        `json:"started_at,omitempty"`
+	ExitedAt            *time.Time        `json:"exited_at,omitempty"`
 }
 
 func cloneIntPointer(value *int) *int {
@@ -525,6 +528,26 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			os.RemoveAll(containerDir)
 		}
 	}()
+	rootfsUpperID := ""
+	if !opts.ReadonlyRootfs {
+		manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+		if err != nil {
+			return Prepared{}, fmt.Errorf("opening rootfs upper store: %w", err)
+		}
+		if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
+			return Prepared{}, fmt.Errorf("volume backing capability changed while preparing rootfs: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
+		}
+		rootfsUpper, err := manager.CreatePrivate(filepath.Join(containerDir, rootfsUpperRepositoryDir), "rootfs")
+		if err != nil {
+			return Prepared{}, fmt.Errorf("creating persistent rootfs upper: %w", err)
+		}
+		opts.RootfsUpperRepositoryPath = rootfsUpper.HostPath()
+		opts.RootfsUpperCopyMode = string(manager.Capability().Mode)
+		rootfsUpperID = rootfsUpper.Info().ID
+		if err := rootfsUpper.Close(); err != nil {
+			return Prepared{}, fmt.Errorf("closing persistent rootfs upper: %w", err)
+		}
+	}
 	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
@@ -537,21 +560,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	spec, err := BuildSpec(imageInfo.Image, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
-	}
-	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
-	if spec.Root == nil || !spec.Root.Readonly {
-		pending, ready, err := s.RootfsExitSnapshotPaths(id)
-		if err != nil {
-			return Prepared{}, err
-		}
-		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
-	}
-	if len(exitTargets) != 0 {
-		encoded, err := json.Marshal(exitTargets)
-		if err != nil {
-			return Prepared{}, fmt.Errorf("encoding final rootfs snapshot path: %w", err)
-		}
-		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
 	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
@@ -573,48 +581,50 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	metadata := ContainerInfo{
-		ID:                 id,
-		Name:               opts.Name,
-		Reference:          imageInfo.Reference,
-		Digest:             pulled.Digest,
-		ImageSize:          pulled.Size,
-		LeaseID:            leaseID,
-		Platform:           imageInfo.Platform,
-		BundleDir:          bundleDir,
-		RootFS:             rootfs,
-		NetworkMode:        networkMode,
-		NetworkNAT:         opts.NetworkNAT,
-		NetworkIP:          opts.NetworkIP,
-		NetworkMAC:         opts.NetworkMAC,
-		PublishedPorts:     append([]PortBinding(nil), opts.PublishedPorts...),
-		LogDriver:          logDriver,
-		LogOptions:         cloneStringMap(opts.LogOptions),
-		LogAttributes:      logAttributes,
-		ConsoleLogMaxBytes: opts.ConsoleLogMaxBytes,
-		ConsoleLogMaxFiles: opts.ConsoleLogMaxFiles,
-		Terminal:           opts.Terminal,
-		OpenStdin:          opts.OpenStdin,
-		AutoRemove:         opts.AutoRemove,
-		StopSignal:         AnnotationValue(spec.Annotations, StopSignalAnnotation),
-		StopTimeout:        cloneIntPointer(opts.StopTimeout),
-		PidsLimit:          cloneInt64Pointer(opts.PidsLimit),
-		MemoryLimit:        cloneInt64Pointer(opts.MemoryLimit),
-		NanoCPUs:           cloneInt64Pointer(opts.NanoCPUs),
-		CPUShares:          cloneUint64Pointer(opts.CPUShares),
-		CPUPeriod:          cloneUint64Pointer(opts.CPUPeriod),
-		CPUQuota:           cloneInt64Pointer(opts.CPUQuota),
-		ShmSize:            cloneInt64Pointer(&shmSize),
-		GroupAdd:           append([]string(nil), opts.GroupAdd...),
-		CapAdd:             append([]string(nil), opts.CapAdd...),
-		CapDrop:            append([]string(nil), opts.CapDrop...),
-		Ulimits:            append([]Ulimit(nil), opts.Ulimits...),
-		ExtraHosts:         append([]string(nil), opts.ExtraHosts...),
-		DNS:                append([]string(nil), opts.DNS...),
-		DNSSearch:          append([]string(nil), opts.DNSSearch...),
-		DNSOptions:         append([]string(nil), opts.DNSOptions...),
-		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
-		State:              "created",
-		CreatedAt:          time.Now().UTC(),
+		ID:                  id,
+		Name:                opts.Name,
+		Reference:           imageInfo.Reference,
+		Digest:              pulled.Digest,
+		ImageSize:           pulled.Size,
+		LeaseID:             leaseID,
+		Platform:            imageInfo.Platform,
+		BundleDir:           bundleDir,
+		RootFS:              rootfs,
+		NetworkMode:         networkMode,
+		NetworkNAT:          opts.NetworkNAT,
+		NetworkIP:           opts.NetworkIP,
+		NetworkMAC:          opts.NetworkMAC,
+		PublishedPorts:      append([]PortBinding(nil), opts.PublishedPorts...),
+		LogDriver:           logDriver,
+		LogOptions:          cloneStringMap(opts.LogOptions),
+		LogAttributes:       logAttributes,
+		ConsoleLogMaxBytes:  opts.ConsoleLogMaxBytes,
+		ConsoleLogMaxFiles:  opts.ConsoleLogMaxFiles,
+		Terminal:            opts.Terminal,
+		OpenStdin:           opts.OpenStdin,
+		AutoRemove:          opts.AutoRemove,
+		StopSignal:          AnnotationValue(spec.Annotations, StopSignalAnnotation),
+		StopTimeout:         cloneIntPointer(opts.StopTimeout),
+		PidsLimit:           cloneInt64Pointer(opts.PidsLimit),
+		MemoryLimit:         cloneInt64Pointer(opts.MemoryLimit),
+		NanoCPUs:            cloneInt64Pointer(opts.NanoCPUs),
+		CPUShares:           cloneUint64Pointer(opts.CPUShares),
+		CPUPeriod:           cloneUint64Pointer(opts.CPUPeriod),
+		CPUQuota:            cloneInt64Pointer(opts.CPUQuota),
+		ShmSize:             cloneInt64Pointer(&shmSize),
+		GroupAdd:            append([]string(nil), opts.GroupAdd...),
+		CapAdd:              append([]string(nil), opts.CapAdd...),
+		CapDrop:             append([]string(nil), opts.CapDrop...),
+		Ulimits:             append([]Ulimit(nil), opts.Ulimits...),
+		ExtraHosts:          append([]string(nil), opts.ExtraHosts...),
+		DNS:                 append([]string(nil), opts.DNS...),
+		DNSSearch:           append([]string(nil), opts.DNSSearch...),
+		DNSOptions:          append([]string(nil), opts.DNSOptions...),
+		Volumes:             append([]ManagedVolume(nil), opts.ManagedVolumes...),
+		RootfsUpperID:       rootfsUpperID,
+		RootfsUpperCopyMode: opts.RootfsUpperCopyMode,
+		State:               "created",
+		CreatedAt:           time.Now().UTC(),
 	}
 	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
@@ -663,9 +673,12 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	if len(volumes) == 0 {
 		return nil, nil
 	}
-	manager, err := ttcvolume.OpenManager(s.Root, true)
+	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
 	if err != nil {
 		return nil, err
+	}
+	if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
+		return nil, fmt.Errorf("volume backing capability changed while preparing managed volumes: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 	}
 	ownerManifest, err := ownership.Read(ownership.ManifestPath(rootfs))
 	if err != nil {
@@ -1121,62 +1134,6 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	return &spec, nil
 }
 
-// RefreshRootfsSeed atomically updates a persistent OCI bundle with the last
-// writable-root snapshot.
-func (s Store) RefreshRootfsSeed(name string) error {
-	if err := s.FinalizeRootfsExitSnapshot(name); err != nil {
-		return fmt.Errorf("finalizing previous rootfs exit snapshot: %w", err)
-	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	spec, err := s.LoadSpec(info.ID)
-	if err != nil {
-		return err
-	}
-	if spec.Annotations == nil {
-		spec.Annotations = make(map[string]string)
-	}
-	rootfsSnapshot, err := s.RootfsSnapshotPath(info.ID)
-	if err != nil {
-		return err
-	}
-	if spec.Root != nil && spec.Root.Readonly {
-		delete(spec.Annotations, specutils.AnnotationRootfsUpperTar)
-	} else if snapshotInfo, statErr := os.Stat(rootfsSnapshot); statErr == nil {
-		if !snapshotInfo.Mode().IsRegular() {
-			return fmt.Errorf("container rootfs snapshot %q is not a regular file", rootfsSnapshot)
-		}
-		spec.Annotations[specutils.AnnotationRootfsUpperTar] = rootfsSnapshot
-	} else if os.IsNotExist(statErr) {
-		delete(spec.Annotations, specutils.AnnotationRootfsUpperTar)
-	} else {
-		return fmt.Errorf("stating container rootfs snapshot: %w", statErr)
-	}
-	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
-	if spec.Root == nil || !spec.Root.Readonly {
-		pending, ready, err := s.RootfsExitSnapshotPaths(info.ID)
-		if err != nil {
-			return err
-		}
-		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
-	}
-	if len(exitTargets) == 0 {
-		delete(spec.Annotations, specutils.AnnotationMountTarOnExit)
-	} else {
-		encoded, err := json.Marshal(exitTargets)
-		if err != nil {
-			return fmt.Errorf("encoding final rootfs snapshot path: %w", err)
-		}
-		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
-	}
-	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
-		return fmt.Errorf("updating rootfs seed for container %q: %w", name, err)
-	}
-	return nil
-}
-
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
@@ -1606,122 +1563,6 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 		return nil, nil
 	}
 	return statsByExec, nil
-}
-
-// RootfsSnapshotPath returns the private persistent upper-layer seed path for
-// a container. The image root remains immutable; this archive contains only
-// the container's writable overlay changes.
-func (s Store) RootfsSnapshotPath(container string) (string, error) {
-	if err := validateName(container); err != nil {
-		return "", err
-	}
-	return filepath.Join(s.Root, "containers", container, rootfsSnapshotFile), nil
-}
-
-// RootfsExitSnapshotPaths returns the pending rootfs upper-layer archive and
-// its completion marker for one container run.
-func (s Store) RootfsExitSnapshotPaths(container string) (string, string, error) {
-	if err := validateName(container); err != nil {
-		return "", "", err
-	}
-	base := filepath.Join(s.Root, "containers", container, ".rootfs-upper.exit")
-	return base + ".tar", base + ".ready", nil
-}
-
-// FinalizeRootfsExitSnapshot atomically publishes a completed rootfs export.
-func (s Store) FinalizeRootfsExitSnapshot(container string) error {
-	info, err := s.LoadContainer(container)
-	if err != nil {
-		return err
-	}
-	pending, ready, err := s.RootfsExitSnapshotPaths(info.ID)
-	if err != nil {
-		return err
-	}
-	marker, err := os.ReadFile(ready)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("reading rootfs exit snapshot marker: %w", err)
-	}
-	if len(marker) == 0 {
-		return nil
-	}
-	if strings.TrimSpace(string(marker)) != "complete" {
-		return errors.New("invalid rootfs exit snapshot marker")
-	}
-	source, err := os.Open(pending)
-	if err != nil {
-		return fmt.Errorf("opening rootfs exit snapshot: %w", err)
-	}
-	defer source.Close()
-	if stat, err := source.Stat(); err != nil {
-		return fmt.Errorf("stating rootfs exit snapshot: %w", err)
-	} else if !stat.Mode().IsRegular() {
-		return fmt.Errorf("rootfs exit snapshot %q is not a regular file", pending)
-	}
-	if err := validateTarSnapshot(source); err != nil {
-		return fmt.Errorf("validating rootfs exit snapshot: %w", err)
-	}
-	destination, err := s.RootfsSnapshotPath(info.ID)
-	if err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(destination), ".rootfs-upper-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temporary rootfs snapshot: %w", err)
-	}
-	tempPath := temp.Name()
-	keep := false
-	defer func() {
-		if !keep {
-			temp.Close()
-			os.Remove(tempPath)
-		}
-	}()
-	if _, err := io.Copy(temp, source); err != nil {
-		return fmt.Errorf("copying rootfs snapshot: %w", err)
-	}
-	if err := temp.Chmod(0600); err != nil {
-		return fmt.Errorf("securing rootfs snapshot: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("syncing rootfs snapshot: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("closing rootfs snapshot: %w", err)
-	}
-	if err := os.Rename(tempPath, destination); err != nil {
-		return fmt.Errorf("publishing rootfs snapshot: %w", err)
-	}
-	keep = true
-	if err := os.Remove(ready); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing rootfs exit marker: %w", err)
-	}
-	if err := os.Remove(pending); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing pending rootfs exit snapshot: %w", err)
-	}
-	return nil
-}
-
-func validateTarSnapshot(file *os.File) error {
-	reader := tar.NewReader(file)
-	for {
-		header, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		clean := filepath.Clean(header.Name)
-		if filepath.IsAbs(header.Name) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("archive entry %q escapes the snapshot root", header.Name)
-		}
-	}
-	_, err := file.Seek(0, io.SeekStart)
-	return err
 }
 
 func normalizePullPolicy(policy string) (string, error) {

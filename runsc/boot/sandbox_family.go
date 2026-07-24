@@ -15,7 +15,6 @@
 package boot
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -353,11 +353,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 }
 
 func (f *SandboxFamily) volumeBranchID(visibleBranchID string) string {
-	if f.volumeBranchScope == "" {
-		return visibleBranchID
-	}
-	sum := sha256.Sum256([]byte(f.volumeBranchScope + "\x00" + visibleBranchID))
-	return fmt.Sprintf("b-%x", sum[:])
+	return ttcvolume.ScopedBranchID(f.volumeBranchScope, visibleBranchID)
 }
 
 func (f *SandboxFamily) injectForkFailure(stage SandboxForkStage) error {

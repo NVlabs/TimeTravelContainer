@@ -126,7 +126,12 @@ type SpecOptions struct {
 	HostMounts       []HostMount
 	FilesystemMounts []FilesystemMount
 	ManagedVolumes   []ManagedVolume
-	Ulimits          []Ulimit
+	// RootfsUpperRepositoryPath identifies the family-owned ttcvol repository
+	// used as the root OverlayFS upper. It is runtime-internal and never
+	// exposed in the guest namespace.
+	RootfsUpperRepositoryPath string
+	RootfsUpperCopyMode       string
+	Ulimits                   []Ulimit
 }
 
 // ManagedVolume is one persistent TTC volume attachment. RepositoryPath is
@@ -769,7 +774,21 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		}
 		annotations[TmpfsConfigAnnotation] = string(encoded)
 	}
-	volumeRepositories := make([]specutils.TTCVolumeRepository, 0, len(opts.ManagedVolumes))
+	volumeRepositories := make([]specutils.TTCVolumeRepository, 0, len(opts.ManagedVolumes)+1)
+	if opts.RootfsUpperRepositoryPath != "" || opts.RootfsUpperCopyMode != "" {
+		if opts.ReadonlyRootfs {
+			return nil, fmt.Errorf("read-only rootfs cannot have a writable upper repository")
+		}
+		if opts.RootfsUpperRepositoryPath == "" || opts.RootfsUpperCopyMode == "" {
+			return nil, fmt.Errorf("rootfs upper repository path and copy mode must be specified together")
+		}
+		volumeRepositories = append(volumeRepositories, specutils.TTCVolumeRepository{
+			Source:   specutils.TTCRootfsUpperSource,
+			Path:     opts.RootfsUpperRepositoryPath,
+			Branch:   "main",
+			CopyMode: opts.RootfsUpperCopyMode,
+		})
+	}
 	for _, volume := range opts.ManagedVolumes {
 		destination := filepath.Clean(volume.Destination)
 		if !filepath.IsAbs(destination) || destination == "/" {

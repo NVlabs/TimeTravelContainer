@@ -2397,15 +2397,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
+	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory"}
+	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
+	wantTTCNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -2415,7 +2415,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 	wantUnsafe := []string{
 		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
-		"--network=none", "--directfs=false", "--allow-suid=true", "--allow-rootfs-tar-annotation=true", "--overlay2=all:memory",
+		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
 	}
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
@@ -3069,8 +3069,6 @@ type fakeBackend struct {
 	copyImportArchive  bool
 	copyImportRaw      bool
 	copyImportData     []byte
-
-	preservedRootfs []selector
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3253,11 +3251,6 @@ func (b *fakeBackend) wait(target selector) (uint32, error) {
 		<-release
 	}
 	return status, err
-}
-
-func (b *fakeBackend) preserveRootfs(target selector) error {
-	b.preservedRootfs = append(b.preservedRootfs, target)
-	return b.err
 }
 
 func (b *fakeBackend) copyInput() io.Reader {

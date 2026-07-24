@@ -81,6 +81,10 @@ const (
 	// repository directories donated to the Sentry.
 	AnnotationTTCVolumeRepositories = "dev.timetravelcontainer.volume-repositories"
 
+	// TTCRootfsUpperSource is the reserved, guest-invisible source key for a
+	// container family's persistent writable rootfs upper repository.
+	TTCRootfsUpperSource = "/run/ttc/rootfs-upper"
+
 	// RootfsMountTarSource is the reserved source key used to export the root
 	// filesystem through AnnotationMountTarOnExit.
 	RootfsMountTarSource       = "dev.timetravelcontainer.rootfs"
