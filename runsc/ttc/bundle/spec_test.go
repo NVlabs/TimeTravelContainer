@@ -541,6 +541,61 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 }
 
+func TestBuildSpecRejectsOverflowingNumericIDsBeforeImageLookup(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	overflow := strings.Repeat("9", 64)
+	if err := os.WriteFile(filepath.Join(root, "etc/passwd"), []byte(fmt.Sprintf("%s:x:0:0::/root:/bin/sh\n", overflow)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc/group"), []byte(fmt.Sprintf("%s:x:0:\n", overflow)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	for _, tc := range []struct {
+		name string
+		opts SpecOptions
+	}{
+		{
+			name: "user",
+			opts: SpecOptions{User: overflow},
+		},
+		{
+			name: "primary group",
+			opts: SpecOptions{User: "123:" + overflow},
+		},
+		{
+			name: "additional group",
+			opts: SpecOptions{GroupAdd: []string{overflow}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.opts.RootFS = root
+			if _, err := BuildSpec(image, tc.opts); err == nil {
+				t.Fatalf("BuildSpec accepted overflowing numeric ID %q through image name lookup", overflow)
+			}
+		})
+	}
+}
+
+func TestBuildSpecAcceptsMaximumNumericUserAndGroupIDs(t *testing.T) {
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{
+		Cmd:  []string{"true"},
+		User: "2147483647:2147483647",
+	}}, SpecOptions{RootFS: t.TempDir()})
+	if err != nil {
+		t.Fatalf("BuildSpec rejected maximum numeric IDs: %v", err)
+	}
+	if got, want := spec.Process.User.UID, uint32(maxContainerID); got != want {
+		t.Errorf("UID=%d, want %d", got, want)
+	}
+	if got, want := spec.Process.User.GID, uint32(maxContainerID); got != want {
+		t.Errorf("GID=%d, want %d", got, want)
+	}
+}
+
 func TestPullPolicyAndStoredImageSelection(t *testing.T) {
 	for _, policy := range []string{"", "missing", "always", "never"} {
 		got, err := normalizePullPolicy(policy)

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -459,6 +460,53 @@ func buildRlimits(configured []Ulimit) ([]specs.POSIXRlimit, error) {
 	return result, nil
 }
 
+const maxContainerID = 1<<31 - 1
+
+// validateNumericID rejects syntactically numeric IDs that cannot be
+// represented by the user package. Without this check, strconv.Atoi overflow
+// in mobyuser.GetExecUser causes an all-decimal user or group argument to be
+// treated as a name and looked up in the image's passwd or group file.
+func validateNumericID(value, kind string) error {
+	if value == "" || !isDecimalInteger(value) {
+		return nil
+	}
+	id, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || id < 0 || id > maxContainerID {
+		return fmt.Errorf("numeric %s %q must be in range 0-%d", kind, value, maxContainerID)
+	}
+	return nil
+}
+
+func isDecimalInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	firstDigit := 0
+	if value[0] == '+' || value[0] == '-' {
+		firstDigit = 1
+	}
+	if firstDigit == len(value) {
+		return false
+	}
+	for i := firstDigit; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateUserSpecNumericIDs(userSpec string) error {
+	user, group, _ := strings.Cut(userSpec, ":")
+	if err := validateNumericID(user, "user ID"); err != nil {
+		return err
+	}
+	if err := validateNumericID(group, "group ID"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // BuildSpec combines an OCI image configuration with ttc run overrides.
 func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if err := validateResourceLimits(opts); err != nil {
@@ -512,6 +560,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 	if opts.User != "" {
 		userSpec = opts.User
 	}
+	if err := validateUserSpecNumericIDs(userSpec); err != nil {
+		return nil, fmt.Errorf("resolving user %q: %w", userSpec, err)
+	}
 	resolvedUser, err := mobyuser.GetExecUserPath(userSpec, &mobyuser.ExecUser{}, filepath.Join(rootfs, "etc/passwd"), filepath.Join(rootfs, "etc/group"))
 	if err != nil {
 		return nil, fmt.Errorf("resolving user %q: %w", userSpec, err)
@@ -525,6 +576,9 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		seenGIDs[gid] = struct{}{}
 	}
 	for _, group := range opts.GroupAdd {
+		if err := validateNumericID(group, "additional group ID"); err != nil {
+			return nil, fmt.Errorf("resolving additional group %q: %w", group, err)
+		}
 		gids, err := mobyuser.GetAdditionalGroupsPath([]string{group}, filepath.Join(rootfs, "etc/group"))
 		if err != nil {
 			return nil, fmt.Errorf("resolving additional group %q: %w", group, err)

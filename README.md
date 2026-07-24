@@ -73,15 +73,16 @@ TTC NAT deliberately maps the guest gateway and same-subnet host aliases to
 host loopback services; use `--network ttc` without `--nat` when that access is
 not wanted.
 
-The current audit has found known within-sandbox policy defects: non-root
-processes receive effective default capabilities, oversized numeric `--user`
-values can be resolved as image-defined usernames, and this branch has not yet
-integrated an upstream gVisor fix for a non-dumpable exiting-task access-check
-race. These do not establish a host escape, but they mean `USER`/`--user` and
-same-sandbox process boundaries must not be relied upon for security until the
-findings in the
+The current audit has one unresolved within-sandbox policy defect: non-root
+processes receive effective default capabilities. `CAP_SETUID` permits a
+process to call `setuid(0)` directly; this does not require a SUID binary and
+is separate from TTC's intentional guest SUID/SGID execution semantics.
+`CAP_DAC_OVERRIDE` similarly bypasses guest file permissions without changing
+UID. This does not establish a host escape, but it means `USER`/`--user` must
+not be relied upon as a privilege boundary until the finding in the
 [security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
-are resolved.
+is resolved. The numeric-ID parsing and upstream exiting-task findings from
+the July 24 audit have been fixed and retain focused regression tests.
 
 ## Why TimeTravelContainer?
 

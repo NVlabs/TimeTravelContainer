@@ -115,10 +115,12 @@ set. TTC therefore differs materially from the CLI behavior it is emulating.
 Sentry constructs credentials directly from those sets. Its `setuid(2)`
 implementation permits an arbitrary UID transition when `CAP_SETUID` is
 effective, so a process launched as UID 1000 can call `setuid(0)` and become
-virtual root. Even without changing UID, `CAP_DAC_OVERRIDE` bypasses ordinary
-guest file permissions. `ttc exec --user ...` has the same problem: upstream
-runsc derives exec capabilities from the container process spec before
-applying the requested exec UID.
+virtual root. No SUID executable is involved in this path: the process invokes
+the syscall directly using its already-effective capability. Even without
+changing UID, `CAP_DAC_OVERRIDE` bypasses ordinary guest file permissions.
+`ttc exec --user ...` has the same problem: upstream runsc derives exec
+capabilities from the container process spec before applying the requested
+exec UID.
 
 This does not grant a host UID or host capability; the escalation remains
 inside the Sentry. It nevertheless violates TTC's stated within-sandbox
@@ -138,17 +140,17 @@ Required remediation:
    exec receive `EPERM` from `setuid(0)` while explicitly authorized
    configurations and UID 0 retain their intended behavior.
 
-### S2: oversized numeric user overrides can resolve to image usernames
+### Resolved S2: oversized numeric IDs could resolve to image names
 
-This is a confirmed within-sandbox user-policy bypass when an untrusted image
-is combined with a supposedly numeric operator override. TTC resolves OCI
-users with `moby/sys/user` v0.4.0. That implementation uses `strconv.Atoi` to
-classify a user field as numeric; a decimal value larger than the host `int`
-range produces an error and is then treated as a username. A crafted image can
-place that exact digit string in `/etc/passwd` with UID 0. Consequently,
-`ttc run --user <oversized-decimal> ...` resolves to virtual root instead of
-rejecting the out-of-range numeric UID. The group half has the analogous
-numeric-versus-name ambiguity.
+The audit confirmed a within-sandbox user-policy bypass when an untrusted
+image was combined with a supposedly numeric operator override. TTC resolves
+OCI users with `moby/sys/user` v0.4.0. That implementation uses
+`strconv.Atoi` to classify a user field as numeric; a decimal value larger
+than the host `int` range produces an error and is then treated as a username.
+A crafted image could place that exact digit string in `/etc/passwd` with UID
+0. Consequently, `ttc run --user <oversized-decimal> ...` resolved to virtual
+root instead of rejecting the out-of-range numeric UID. Explicit primary and
+additional groups had analogous numeric-versus-name ambiguities.
 
 An image's own `USER` field alone is not an additional security boundary
 because the image already controls it. The relevant case is an operator or
@@ -158,16 +160,18 @@ untrusted image. This is the same vulnerability class as containerd's
 although TTC reaches it through its own user-resolution path rather than
 containerd's CRI/OCI-spec code.
 
-Required remediation is to recognize syntactically numeric UID/GID fields
-before name lookup, parse them into the supported unsigned range, and return a
-range error without consulting image-controlled passwd/group entries when
-parsing fails or overflows. Regression tests should cover both user and group
-fields at `MaxInt`, `MaxUint32`, and larger values.
+This is fixed. TTC now recognizes signed decimal syntax before consulting
+image-controlled passwd/group files and requires numeric user, primary-group,
+and additional-group IDs to be within the range supported by the resolver,
+`0..2^31-1`. Overflow and negative values return a range error without name
+lookup. Focused tests place the overflowing decimal string in both
+`/etc/passwd` and `/etc/group` with ID 0 and verify rejection for all three
+entry points; the maximum supported numeric UID/GID remains accepted.
 
-### S2: TTC is missing an upstream non-dumpable exiting-task fix
+### Resolved S2: missing upstream non-dumpable exiting-task fix
 
-TTC's upstream merge base is `3cc5535a1255`; the reviewed branch is 32 upstream
-commits behind `origin/master`. One intervening upstream commit,
+At audit time, TTC's upstream merge base was `3cc5535a1255` and the branch was
+32 upstream commits behind `origin/master`. One intervening upstream commit,
 `0f6b7d133f5b` ("Fix ptrace dumpability bypass check on exit"), fixes a
 concrete access-check race. Before that fix, an exiting task clears its memory
 manager, causing `canTraceStandard` to skip the task's non-dumpable check.
@@ -175,11 +179,12 @@ Another same-credential process can race `pidfd_getfd` and acquire a file
 descriptor from the non-dumpable exiting task. Upstream added a focused
 100-iteration regression for this case.
 
-This is an inherited same-sandbox confidentiality/integrity issue, not a
-demonstrated host escape. Integrate the upstream fix (preferably by rebasing
-the complete upstream delta), ensure the new cached dumpability field is
-included correctly in TTC live-fork state, and run both the upstream
-`PidfdGetfdNonDumpableExitingRace` test and a forked-child variant.
+This was an inherited same-sandbox confidentiality/integrity issue, not a
+demonstrated host escape. TTC has cherry-picked the exact upstream fix as
+`eaef285a5`. The task's cached dumpability bit is normal saved state, so TTC's
+state-stream live fork includes it without a separate unsaved resource.
+Upstream's `PidfdGetfdNonDumpableExitingRace` regression passes under both
+systrap directfs and shared-filesystem variants.
 
 ### Reviewed boundaries without a concrete escape finding
 
@@ -559,8 +564,9 @@ a deadlock guard; reaching it is now a test failure, not accepted behavior.
 
 Before calling TTC a broadly compatible beta:
 
-1. Resolve all three security findings above, including runtime exploit
-   regressions for non-root credentials and the upstream exiting-task race.
+1. Resolve the remaining effective-capability finding, including runtime
+   exploit regressions for initial and exec non-root credentials. Retain the
+   numeric-ID and upstream exiting-task regressions already added.
 2. Establish a routine upstream merge and dependency-advisory cadence so
    published gVisor and image-library security fixes cannot remain unnoticed.
 3. Add task/VMA/FD/queue/filesystem scaling benchmarks with regression budgets.
