@@ -40,7 +40,9 @@ const (
 
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
-	// All filesystem state is in-memory.
+	if fs.diskVolume != nil {
+		return fs.diskVolume.Repository.SyncMetadata()
+	}
 	return nil
 }
 
@@ -289,6 +291,11 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if i.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
 		}
+		if fs.diskVolume != nil {
+			if err := fs.diskVolume.Repository.Link(fs.diskVolume.Branch, parentDir.inode.ino, name, i.ino); err != nil {
+				return err
+			}
+		}
 		i.incLinksLocked()
 		i.watches.Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false /* unlinked */)
 		parentDir.insertChildLocked(fs.newDentry(i), name)
@@ -306,6 +313,21 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		childDir, err := fs.newDirectory(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		if err != nil {
 			return err
+		}
+		if fs.diskVolume != nil {
+			ino, err := fs.diskVolume.Repository.CreateDirectory(
+				fs.diskVolume.Branch, parentDir.inode.ino, name,
+				childDir.inode.mode.Load()&07777, childDir.inode.uid.Load(), childDir.inode.gid.Load())
+			if err != nil {
+				childDir.inode.decLinksLocked(ctx)
+				childDir.inode.decLinksLocked(ctx)
+				return err
+			}
+			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
+			if err != nil {
+				return err
+			}
+			fs.applyDiskMetadata(&childDir.inode, meta)
 		}
 		parentDir.inode.incLinksLocked() // from child's ".."
 		parentDir.inode.incRef()         // child directory holds a reference to parent
@@ -334,6 +356,24 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		}
 		if err != nil {
 			return err
+		}
+		if fs.diskVolume != nil {
+			if opts.Mode.FileType() != linux.S_IFREG {
+				childInode.decLinksLocked(ctx)
+				return linuxerr.EOPNOTSUPP
+			}
+			ino, err := fs.diskVolume.Repository.CreateRegular(
+				fs.diskVolume.Branch, parentDir.inode.ino, name,
+				childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
+			if err != nil {
+				childInode.decLinksLocked(ctx)
+				return err
+			}
+			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
+			if err != nil {
+				return err
+			}
+			fs.applyDiskMetadata(childInode, meta)
 		}
 		child := fs.newDentry(childInode)
 		parentDir.insertChildLocked(child, name)
@@ -429,6 +469,20 @@ afterTrailingSymlink:
 		childInode, err := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, parentDir)
 		if err != nil {
 			return nil, err
+		}
+		if fs.diskVolume != nil {
+			ino, err := fs.diskVolume.Repository.CreateRegular(
+				fs.diskVolume.Branch, parentDir.inode.ino, name,
+				childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
+			if err != nil {
+				childInode.decLinksLocked(ctx)
+				return nil, err
+			}
+			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
+			if err != nil {
+				return nil, err
+			}
+			fs.applyDiskMetadata(childInode, meta)
 		}
 		child := fs.newDentry(childInode)
 		parentDir.insertChildLocked(child, name)
@@ -670,6 +724,15 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD); err != nil {
 		return err
 	}
+	if fs.diskVolume != nil {
+		if err := fs.diskVolume.Repository.Rename(
+			fs.diskVolume.Branch,
+			oldParentDir.inode.ino, oldName,
+			newParentDir.inode.ino, newName,
+			opts.Flags&linux.RENAME_NOREPLACE != 0); err != nil {
+			return err
+		}
+	}
 	if replaced != nil {
 		newParentDir.removeChildLocked(replaced)
 		if replaced.inode.isDir() {
@@ -751,6 +814,11 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 		return err
 	}
+	if fs.diskVolume != nil {
+		if err := fs.diskVolume.Repository.RemoveDirectory(fs.diskVolume.Branch, parentDir.inode.ino, name); err != nil {
+			return err
+		}
+	}
 	parentDir.removeChildLocked(child)
 	// Linux sends the parent's IN_DELETE|IN_ISDIR at rmdir() time, but
 	// defers the child's IN_DELETE_SELF/IN_IGNORED until the last ref is
@@ -830,6 +898,20 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 		if err != nil {
 			return err
 		}
+		if fs.diskVolume != nil {
+			ino, err := fs.diskVolume.Repository.CreateSymlink(
+				fs.diskVolume.Branch, parentDir.inode.ino, name, target,
+				childInode.uid.Load(), childInode.gid.Load())
+			if err != nil {
+				childInode.decLinksLocked(ctx)
+				return err
+			}
+			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
+			if err != nil {
+				return err
+			}
+			fs.applyDiskMetadata(childInode, meta)
+		}
 		child := fs.newDentry(childInode)
 		parentDir.insertChildLocked(child, name)
 		return nil
@@ -882,6 +964,11 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	defer mntns.DecRef(ctx)
 	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 		return err
+	}
+	if fs.diskVolume != nil {
+		if err := fs.diskVolume.Repository.Unlink(fs.diskVolume.Branch, parentDir.inode.ino, name); err != nil {
+			return err
+		}
 	}
 	// Generate inotify events. Note that this must take place before the link
 	// count of the child is decremented, or else the watches may be dropped

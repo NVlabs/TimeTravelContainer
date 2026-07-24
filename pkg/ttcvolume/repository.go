@@ -169,20 +169,21 @@ type Branch struct {
 
 // Inode is branch-resolved virtual inode metadata.
 type Inode struct {
-	Number         uint64 `json:"number"`
-	Type           string `json:"type"`
-	Mode           uint32 `json:"mode"`
-	UID            uint32 `json:"uid"`
-	GID            uint32 `json:"gid"`
-	Nlink          uint32 `json:"nlink"`
-	Size           int64  `json:"size,omitempty"`
-	Object         string `json:"object,omitempty"`
-	DataGeneration uint64 `json:"data_generation,omitempty"`
-	Target         string `json:"target,omitempty"`
-	AtimeNsec      int64  `json:"atime_nsec,omitempty"`
-	BtimeNsec      int64  `json:"btime_nsec,omitempty"`
-	CtimeNsec      int64  `json:"ctime_nsec,omitempty"`
-	MtimeNsec      int64  `json:"mtime_nsec,omitempty"`
+	Number         uint64            `json:"number"`
+	Type           string            `json:"type"`
+	Mode           uint32            `json:"mode"`
+	UID            uint32            `json:"uid"`
+	GID            uint32            `json:"gid"`
+	Nlink          uint32            `json:"nlink"`
+	Size           int64             `json:"size,omitempty"`
+	Object         string            `json:"object,omitempty"`
+	DataGeneration uint64            `json:"data_generation,omitempty"`
+	Target         string            `json:"target,omitempty"`
+	AtimeNsec      int64             `json:"atime_nsec,omitempty"`
+	BtimeNsec      int64             `json:"btime_nsec,omitempty"`
+	CtimeNsec      int64             `json:"ctime_nsec,omitempty"`
+	MtimeNsec      int64             `json:"mtime_nsec,omitempty"`
+	Xattrs         map[string]string `json:"xattrs,omitempty"`
 }
 
 // DirectoryEntry is one persistent name-to-virtual-inode mapping.
@@ -324,6 +325,20 @@ func (m *Manager) Open(nameOrID string) (*Repository, error) {
 	return nil, fs.ErrNotExist
 }
 
+// Remove deletes an unused volume repository by name or ID.
+func (m *Manager) Remove(nameOrID string) error {
+	repository, err := m.Open(nameOrID)
+	if err != nil {
+		return err
+	}
+	path := repository.path
+	repository.Close()
+	if path == "" || filepath.Dir(path) != m.volumes {
+		return errors.New("invalid volume repository path")
+	}
+	return os.RemoveAll(path)
+}
+
 func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
 	dir, err := os.Open(path)
 	if err != nil {
@@ -389,6 +404,12 @@ func (r *Repository) Directory() (*os.File, error) {
 // Info returns persistent identity metadata.
 func (r *Repository) Info() VolumeInfo {
 	return r.info
+}
+
+// HostPath returns the manager-side repository directory. Donated Sentry
+// repositories intentionally return an empty path.
+func (r *Repository) HostPath() string {
+	return r.path
 }
 
 func (r *Repository) withLock(fn func() error) error {
@@ -1011,6 +1032,17 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 // UpdateMetadata replaces branch-local metadata fields while retaining
 // identity, type, link count, data object and generation.
 func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {
+	return r.updateMetadata(branchID, updated, false)
+}
+
+// UpdateAfterWrite replaces metadata and grows the logical size. The size is
+// merged using max so writers through concurrent mounts of one named volume
+// cannot accidentally shrink each other's file.
+func (r *Repository) UpdateAfterWrite(branchID string, updated Inode) error {
+	return r.updateMetadata(branchID, updated, true)
+}
+
+func (r *Repository) updateMetadata(branchID string, updated Inode, growSize bool) error {
 	return r.withLock(func() error {
 		branch, err := r.readBranch(branchID)
 		if err != nil {
@@ -1027,7 +1059,10 @@ func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {
 		current.BtimeNsec = updated.BtimeNsec
 		current.CtimeNsec = updated.CtimeNsec
 		current.MtimeNsec = updated.MtimeNsec
-		if current.Type == "symlink" {
+		current.Xattrs = updated.Xattrs
+		if current.Type == "regular" && growSize && updated.Size > current.Size {
+			current.Size = updated.Size
+		} else if current.Type == "symlink" {
 			current.Target = updated.Target
 		}
 		branch.Root, err = r.setInode(branch.Root, current)
@@ -1263,6 +1298,53 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 	return cloned, err
 }
 
+// Allocate reserves host filesystem space for a regular file. The only mode
+// currently exposed by gVisor's fallocate syscall is mode 0, which also grows
+// the logical file to offset+length.
+func (r *Repository) Allocate(branchID string, ino uint64, offset, length int64) (bool, error) {
+	if offset < 0 || length <= 0 || offset > int64(^uint64(0)>>1)-length {
+		return false, syscall.EINVAL
+	}
+	var cloned bool
+	err := r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		inode, err := r.getInode(branch.Root, ino)
+		if err != nil {
+			return err
+		}
+		cloned, err = r.ensurePrivate(&branch, &inode)
+		if err != nil {
+			return err
+		}
+		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		err = unix.Fallocate(int(file.Fd()), 0, offset, length)
+		closeErr := file.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		end := offset + length
+		if end <= inode.Size {
+			return nil
+		}
+		inode.Size = end
+		branch.Root, err = r.setInode(branch.Root, inode)
+		if err != nil {
+			return err
+		}
+		return r.writeBranch(branch)
+	})
+	return cloned, err
+}
+
 // ListDirectory returns entries in deterministic name order.
 func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryEntry, error) {
 	branch, err := r.readBranch(branchID)
@@ -1314,7 +1396,25 @@ func (r *Repository) createObject(source string) (string, error) {
 		case CopyModeReflink:
 			err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
 		case CopyModeFull:
-			_, err = io.Copy(dst, src)
+			// Avoid os.File's copy_file_range fast path. Full-copy mode is the
+			// explicit portability fallback and the Sentry's host seccomp
+			// policy intentionally exposes only read/write for copying data.
+			buf := make([]byte, 256<<10)
+			for {
+				n, readErr := src.Read(buf)
+				if n != 0 {
+					if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+						err = writeErr
+						break
+					}
+				}
+				if readErr != nil {
+					if readErr != io.EOF {
+						err = readErr
+					}
+					break
+				}
+			}
 		default:
 			err = fmt.Errorf("unknown volume copy mode %q", r.copyMode)
 		}

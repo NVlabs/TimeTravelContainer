@@ -82,6 +82,7 @@ go_library(
         "ancestry_mutex.go",
         "dentry_list.go",
         "device_file.go",
+        "disk_volume.go",
         "directory.go",
         "filesystem.go",
         "filesystem_mutex.go",
@@ -136,7 +137,9 @@ go_library(
         "//pkg/sentry/vfs/memxattr",
         "//pkg/sync",
         "//pkg/sync/locking",
+        "//pkg/ttcvolume",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

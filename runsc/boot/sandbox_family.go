@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -286,6 +287,7 @@ type SandboxFamily struct {
 	watchdogOpts                   *watchdog.Opts
 	testOnlyForkFailureInjector    func(SandboxForkStage) error
 	testOnlyExecFailureInjector    func(SandboxExecStage) error
+	volumeBranchScope              string
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -293,6 +295,9 @@ type SandboxFamilyOptions struct {
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
 	WatchdogOpts                   *watchdog.Opts
+	// VolumeBranchScope distinguishes repository branch names created by this
+	// sandbox from identically named live branches in other sandboxes.
+	VolumeBranchScope string
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
@@ -333,6 +338,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		watchdogOpts:                   opts.WatchdogOpts,
 		testOnlyForkFailureInjector:    opts.TestOnlyForkFailureInjector,
 		testOnlyExecFailureInjector:    opts.TestOnlyExecFailureInjector,
+		volumeBranchScope:              opts.VolumeBranchScope,
 		defaultStarted:                 make(chan struct{}),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
@@ -344,6 +350,14 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 			},
 		},
 	}
+}
+
+func (f *SandboxFamily) volumeBranchID(visibleBranchID string) string {
+	if f.volumeBranchScope == "" {
+		return visibleBranchID
+	}
+	sum := sha256.Sum256([]byte(f.volumeBranchScope + "\x00" + visibleBranchID))
+	return fmt.Sprintf("b-%x", sum[:])
 }
 
 func (f *SandboxFamily) injectForkFailure(stage SandboxForkStage) error {
@@ -626,6 +640,7 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 
 	child, err := source.k.LiveFork(source.k.SupervisorContext(), kernel.LiveForkOptions{
 		Clocks:                         sentrytime.NewCalibratedClocks(),
+		ChildBranchID:                  f.volumeBranchID(args.ID),
 		AllowNetworkStack:              f.allowNetworkStack,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 		Metrics:                        &metrics.Kernel,

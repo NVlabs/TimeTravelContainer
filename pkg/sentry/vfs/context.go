@@ -39,6 +39,14 @@ const (
 	// CtxLiveForkFilesystemResources is a Context.Value key for in-process
 	// filesystem resources indexed by stable filesystem ID.
 	CtxLiveForkFilesystemResources
+
+	// CtxLiveForkChildBranchID is the destination branch ID for an in-process
+	// live fork.
+	CtxLiveForkChildBranchID
+
+	// CtxLiveForkTransactions collects filesystem-side transactions that must
+	// commit only after the child kernel has been restored successfully.
+	CtxLiveForkTransactions
 )
 
 // MountNamespaceFromContext returns the MountNamespace used by ctx. If ctx is
@@ -60,6 +68,56 @@ type LiveForkFilesystemResources map[checkpoint.ResourceID]any
 func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFilesystemResources {
 	resources, _ := ctx.Value(CtxLiveForkFilesystemResources).(LiveForkFilesystemResources)
 	return resources
+}
+
+// LiveForkChildBranchIDFromContext returns the destination live-fork branch.
+func LiveForkChildBranchIDFromContext(ctx goContext.Context) string {
+	id, _ := ctx.Value(CtxLiveForkChildBranchID).(string)
+	return id
+}
+
+// LiveForkTransaction is a filesystem-side mutation coupled to Kernel.LiveFork.
+type LiveForkTransaction interface {
+	Commit() error
+	Abort() error
+}
+
+// LiveForkTransactions is a transaction list populated during VFS.PrepareSave.
+// VFS preparation is serialized, so it does not require an internal lock.
+type LiveForkTransactions struct {
+	transactions []LiveForkTransaction
+}
+
+// Add registers tx for commit or rollback by Kernel.LiveFork.
+func (ts *LiveForkTransactions) Add(tx LiveForkTransaction) {
+	ts.transactions = append(ts.transactions, tx)
+}
+
+// Commit commits all registered transactions in preparation order.
+func (ts *LiveForkTransactions) Commit() error {
+	for _, tx := range ts.transactions {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Abort rolls all registered transactions back in reverse preparation order.
+func (ts *LiveForkTransactions) Abort() error {
+	var first error
+	for i := len(ts.transactions) - 1; i >= 0; i-- {
+		if err := ts.transactions[i].Abort(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// LiveForkTransactionsFromContext returns the filesystem transaction list.
+func LiveForkTransactionsFromContext(ctx goContext.Context) *LiveForkTransactions {
+	transactions, _ := ctx.Value(CtxLiveForkTransactions).(*LiveForkTransactions)
+	return transactions
 }
 
 // RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used

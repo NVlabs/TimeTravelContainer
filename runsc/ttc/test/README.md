@@ -71,15 +71,14 @@ covers:
   sides of a live fork;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
-- explicit rejection of named/anonymous `-v` and `--mount type=volume`, image
-  `VOLUME` declarations, and `ttc volume` commands while the removed
-  tmpfs-plus-tar implementation is replaced by the disk-backed reflink CoW
-  design;
+- disk-backed named and anonymous volumes, image `VOLUME` initialization,
+  direct persistence across stop/start and daemon restart, hard links,
+  symlinks, fallocate, open-FD writes, and parent/child/grandchild CoW;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
-- Redis startup with its image-declared `/data` volume explicitly replaced by
-  a UID/GID-configured tmpfs, while physical rootfs files remain caller-owned;
+- Redis startup with its image-declared `/data` automatically backed by an
+  anonymous persistent TTC volume;
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;

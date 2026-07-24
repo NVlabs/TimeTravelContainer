@@ -47,6 +47,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/flag"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -301,6 +302,7 @@ Commands:
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
   port COMMAND                    Publish, list, or unpublish branch TCP ports
+  volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]
                                   Start the per-user service in one fixed mode
@@ -409,7 +411,7 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	case "port":
 		err = runPort(args[1:], stdout, stderr, backend)
 	case "volume":
-		err = managedVolumesUnavailable()
+		err = runVolume(args[1:], stdout, backend)
 	case "completion":
 		err = runCompletion(args[1:], stdout)
 	case "_complete":
@@ -611,6 +613,7 @@ func expandCombinedShortBools(args []string, boolNames string, valueNames ...str
 type mountRequests struct {
 	host       []ttcbundle.HostMount
 	filesystem []ttcbundle.FilesystemMount
+	managed    []ttcbundle.ManagedVolume
 }
 
 func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequests, error) {
@@ -625,20 +628,36 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 	}
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
-		if len(parts) < 2 {
-			return mountRequests{}, managedVolumesUnavailable()
+		if len(parts) == 1 {
+			if parts[0] == "" {
+				return mountRequests{}, fmt.Errorf("invalid volume specification %q", value)
+			}
+			request.managed = append(request.managed, ttcbundle.ManagedVolume{Destination: parts[0], Anonymous: true})
+			continue
 		}
 		if len(parts) > 3 || parts[0] == "" || parts[1] == "" {
-			if !isHostMountSource(parts[0]) {
-				return mountRequests{}, managedVolumesUnavailable()
-			}
-			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER:ro", value)
+			return mountRequests{}, fmt.Errorf("invalid volume specification %q", value)
 		}
 		if isHostMountSource(parts[0]) {
 			hostVolumes = append(hostVolumes, value)
 			continue
 		}
-		return mountRequests{}, managedVolumesUnavailable()
+		volume := ttcbundle.ManagedVolume{Name: parts[0], Destination: parts[1]}
+		if len(parts) == 3 {
+			for _, option := range strings.Split(parts[2], ",") {
+				switch option {
+				case "ro", "readonly":
+					volume.Readonly = true
+				case "rw", "":
+					volume.Readonly = false
+				case "nocopy", "volume-nocopy":
+					volume.NoCopy = true
+				default:
+					return mountRequests{}, fmt.Errorf("unsupported managed-volume option %q in %q", option, value)
+				}
+			}
+		}
+		request.managed = append(request.managed, volume)
 	}
 	for _, value := range mountSpecs {
 		mountType := ""
@@ -651,7 +670,11 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 		}
 		switch mountType {
 		case "volume":
-			return mountRequests{}, managedVolumesUnavailable()
+			volume, err := parseManagedVolumeLongMount(value)
+			if err != nil {
+				return mountRequests{}, err
+			}
+			request.managed = append(request.managed, volume)
 		case "tmpfs", "proc", "procfs", "sysfs":
 			mount, err := parseFilesystemLongMount(value)
 			if err != nil {
@@ -670,8 +693,72 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 	return request, nil
 }
 
+func parseManagedVolumeLongMount(value string) (ttcbundle.ManagedVolume, error) {
+	var volume ttcbundle.ManagedVolume
+	seen := make(map[string]bool)
+	for _, field := range strings.Split(value, ",") {
+		key, raw, found := strings.Cut(strings.TrimSpace(field), "=")
+		canonical := key
+		switch key {
+		case "src":
+			canonical = "source"
+		case "dst":
+			canonical = "target"
+		case "readonly":
+			canonical = "ro"
+		}
+		if seen[canonical] {
+			return ttcbundle.ManagedVolume{}, fmt.Errorf("duplicate --mount field %q in %q", key, value)
+		}
+		seen[canonical] = true
+		if !found {
+			switch canonical {
+			case "ro":
+				volume.Readonly = true
+			case "volume-nocopy":
+				volume.NoCopy = true
+			default:
+				return ttcbundle.ManagedVolume{}, fmt.Errorf("invalid --mount field %q in %q", field, value)
+			}
+			continue
+		}
+		raw = strings.TrimSpace(raw)
+		switch canonical {
+		case "type":
+			if raw != "volume" {
+				return ttcbundle.ManagedVolume{}, fmt.Errorf("--mount %q is not a volume", value)
+			}
+		case "source":
+			volume.Name = raw
+		case "target":
+			volume.Destination = raw
+		case "ro":
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return ttcbundle.ManagedVolume{}, err
+			}
+			volume.Readonly = parsed
+		case "volume-nocopy":
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return ttcbundle.ManagedVolume{}, err
+			}
+			volume.NoCopy = parsed
+		default:
+			return ttcbundle.ManagedVolume{}, fmt.Errorf("unsupported --mount field %q in %q", key, value)
+		}
+	}
+	if volume.Destination == "" {
+		return ttcbundle.ManagedVolume{}, fmt.Errorf("managed volume mount %q requires target", value)
+	}
+	if volume.Name == "" {
+		volume.Anonymous = true
+	}
+	return volume, nil
+}
+
 func managedVolumesUnavailable() error {
-	return errors.New("TTC managed volumes are temporarily unavailable while the disk-backed reflink CoW driver is implemented; use explicit --tmpfs for ephemeral data or a read-only host bind")
+	return errors.New("managed volume syntax was used where a host bind mount was required")
 }
 
 func parseTmpfsMount(value string) (ttcbundle.FilesystemMount, error) {
@@ -1262,6 +1349,7 @@ type runRequest struct {
 	entrypoint         []string
 	hostMounts         []ttcbundle.HostMount
 	filesystemMounts   []ttcbundle.FilesystemMount
+	managedVolumes     []ttcbundle.ManagedVolume
 	consoleLogMaxBytes int64
 	consoleLogMaxFiles int
 	logOptions         map[string]string
@@ -1376,8 +1464,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
-	fs.Var(&volumes, "v", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -1550,6 +1638,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
+		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
@@ -1639,8 +1728,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
-	fs.Var(&volumes, "v", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -1813,6 +1902,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
+		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
@@ -4142,6 +4232,107 @@ type ImageRemoveResult struct {
 	Deleted  string
 }
 
+type volumeCommandBackend interface {
+	createVolume(name string) (ttcvolume.VolumeInfo, error)
+	listVolumes() ([]ttcvolume.VolumeInfo, error)
+	removeVolume(name string, force bool) error
+	volumeDriver() (string, error)
+}
+
+func runVolume(args []string, stdout io.Writer, b backend) error {
+	volumes, ok := b.(volumeCommandBackend)
+	if !ok {
+		return errors.New("volume commands are not supported by this backend")
+	}
+	if len(args) == 0 {
+		return errors.New("usage: ttc volume create|ls|inspect|rm")
+	}
+	switch args[0] {
+	case "create":
+		if len(args) != 2 {
+			return errors.New("usage: ttc volume create NAME")
+		}
+		info, err := volumes.createVolume(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, info.Name)
+		return nil
+	case "ls", "list":
+		if len(args) != 1 {
+			return errors.New("usage: ttc volume ls")
+		}
+		list, err := volumes.listVolumes()
+		if err != nil {
+			return err
+		}
+		driver, err := volumes.volumeDriver()
+		if err != nil {
+			return err
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "DRIVER\tVOLUME NAME")
+		for _, info := range list {
+			fmt.Fprintf(tw, "%s\t%s\n", driver, info.Name)
+		}
+		return tw.Flush()
+	case "inspect":
+		if len(args) < 2 {
+			return errors.New("usage: ttc volume inspect NAME [NAME...]")
+		}
+		list, err := volumes.listVolumes()
+		if err != nil {
+			return err
+		}
+		driver, err := volumes.volumeDriver()
+		if err != nil {
+			return err
+		}
+		byName := make(map[string]ttcvolume.VolumeInfo, len(list))
+		for _, info := range list {
+			byName[info.Name] = info
+			byName[info.ID] = info
+		}
+		result := make([]map[string]any, 0, len(args)-1)
+		for _, name := range args[1:] {
+			info, ok := byName[name]
+			if !ok {
+				return fmt.Errorf("volume %q does not exist", name)
+			}
+			result = append(result, map[string]any{
+				"Name": info.Name, "Driver": driver,
+				"CreatedAt": info.CreatedAt, "Scope": "local",
+				"Labels": map[string]string{}, "Options": map[string]string{},
+				"TTC": map[string]any{"ID": info.ID, "NextInode": info.NextInode},
+			})
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(result)
+	case "rm", "remove":
+		fs := flag.NewFlagSet("volume rm", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		force := fs.Bool("force", false, "do not report an error if the volume is already absent")
+		fs.BoolVar(force, "f", false, "remove even when referenced")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return errors.New("usage: ttc volume rm [--force] NAME [NAME...]")
+		}
+		for _, name := range fs.Args() {
+			if err := volumes.removeVolume(name, *force); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown volume command %q", args[0])
+	}
+}
+
 type backend interface {
 	pull(reference, platform string, progress bool) (ttcimages.Info, error)
 	listImages() ([]ImageInfo, error)
@@ -4184,6 +4375,8 @@ type runtimeBackend struct {
 	runsc                 string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	allowSlowVolumeCopy   bool
+	volumeCopyMode        ttcvolume.CopyMode
 	clientExecutable      string
 	clientTERM            string
 	stdin                 io.Reader
@@ -4415,6 +4608,81 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 	return result, nil
 }
 
+func (b *runtimeBackend) volumeManager() (*ttcvolume.Manager, error) {
+	manager, err := ttcvolume.OpenManager(b.dataRoot, b.allowSlowVolumeCopy)
+	if err != nil {
+		return nil, err
+	}
+	if b.volumeCopyMode != "" && manager.Capability().Mode != b.volumeCopyMode {
+		return nil, fmt.Errorf("volume backing capability changed while ttcd was running: startup mode was %s, current mode is %s", b.volumeCopyMode, manager.Capability().Mode)
+	}
+	return manager, nil
+}
+
+func (b *runtimeBackend) createVolume(name string) (ttcvolume.VolumeInfo, error) {
+	manager, err := b.volumeManager()
+	if err != nil {
+		return ttcvolume.VolumeInfo{}, err
+	}
+	repository, err := manager.Create(name)
+	if err != nil {
+		return ttcvolume.VolumeInfo{}, err
+	}
+	defer repository.Close()
+	return repository.Info(), nil
+}
+
+func (b *runtimeBackend) listVolumes() ([]ttcvolume.VolumeInfo, error) {
+	manager, err := b.volumeManager()
+	if err != nil {
+		return nil, err
+	}
+	return manager.List()
+}
+
+func (b *runtimeBackend) volumeDriver() (string, error) {
+	manager, err := b.volumeManager()
+	if err != nil {
+		return "", err
+	}
+	return "ttc-" + string(manager.Capability().Mode), nil
+}
+
+func (b *runtimeBackend) removeVolume(name string, force bool) error {
+	manager, err := b.volumeManager()
+	if err != nil {
+		return err
+	}
+	repository, err := manager.Open(name)
+	if err != nil {
+		if force && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	info := repository.Info()
+	repository.Close()
+	store := ttcbundle.Store{Root: b.dataRoot}
+	containers, err := store.ListContainers()
+	if err != nil {
+		return err
+	}
+	var users []string
+	for _, container := range containers {
+		for _, volume := range container.Volumes {
+			if volume.ID == info.ID {
+				users = append(users, container.Name)
+				break
+			}
+		}
+	}
+	if len(users) != 0 {
+		sort.Strings(users)
+		return fmt.Errorf("volume %q is used by container(s) %s and cannot be removed", info.Name, strings.Join(users, ", "))
+	}
+	return manager.Remove(info.ID)
+}
+
 func validateImageRemoval(digest string, users []string, force bool) error {
 	if len(users) != 0 && !force {
 		return fmt.Errorf("image %s is used by container(s) %s; use --force to remove its image records", digest, strings.Join(users, ", "))
@@ -4472,6 +4740,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			FilesystemMounts: request.filesystemMounts,
+			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
@@ -4542,6 +4811,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
 			FilesystemMounts: request.filesystemMounts,
+			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
 		Platform:           request.platform,
@@ -5950,6 +6220,14 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 				Type: "bind", Source: mount.Source, Destination: mount.Destination,
 				Mode: mode, RW: !readonly, Propagation: "rprivate",
 			})
+		case mount.Type == "ttcvol":
+			name := filepath.Base(mount.Source)
+			volumes[mount.Destination] = struct{}{}
+			mounts = append(mounts, InspectMount{
+				Type: "volume", Name: name, Source: name,
+				Destination: mount.Destination, Driver: "ttc-volume",
+				Mode: mode, RW: !readonly, Propagation: "",
+			})
 		case mount.Type == "tmpfs" && mount.Source == "tmpfs" && mount.Destination != "/dev":
 			if inspectOptions, ok := dockerTmpfs[mount.Destination]; ok {
 				tmpfs[mount.Destination] = inspectOptions
@@ -6013,6 +6291,20 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 		args = append(args, process.Args[1:]...)
 	}
 	mounts, binds, volumes, tmpfs := inspectMounts(spec)
+	volumeByDestination := make(map[string]ttcbundle.ManagedVolume, len(container.Volumes))
+	for _, volume := range container.Volumes {
+		volumeByDestination[filepath.Clean(volume.Destination)] = volume
+		volumes[filepath.Clean(volume.Destination)] = struct{}{}
+	}
+	for i := range mounts {
+		if mounts[i].Type != "volume" {
+			continue
+		}
+		if volume, ok := volumeByDestination[filepath.Clean(mounts[i].Destination)]; ok {
+			mounts[i].Name = volume.Name
+			mounts[i].Source = volume.Name
+		}
+	}
 	externalViews := make([]InspectExternalView, 0)
 	immutableHostMounts := immutableHostMountDestinations(spec)
 	managedCoWHostMounts := managedCoWHostMountDestinations(spec)
@@ -6234,7 +6526,19 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}
-	_ = volumes // Kept for Docker-compatible `rm -v`; no managed volumes exist.
+	if volumes {
+		manager, err := b.volumeManager()
+		if err != nil {
+			return err
+		}
+		for _, volume := range info.Volumes {
+			if volume.Anonymous {
+				if err := manager.Remove(volume.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("removing anonymous volume %q: %w", volume.Name, err)
+				}
+			}
+		}
+	}
 	return nil
 }
 

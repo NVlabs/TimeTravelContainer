@@ -13,6 +13,14 @@ sh_binary(
     ],
 )
 
+sh_binary(
+    name = "e2e_managed_volumes",
+    srcs = ["e2e_managed_volumes.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it pulls public images and starts a privileged, isolated
 # Docker-in-Docker daemon. The host Docker configuration is not modified.
 sh_binary(

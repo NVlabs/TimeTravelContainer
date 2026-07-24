@@ -108,6 +108,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		"HostNetworkRawSockets": func(opt *Options) { opt.HostNetworkRawSockets = !opt.HostNetworkRawSockets },
 		"TimeTravelNetworkNAT":  func(opt *Options) { opt.TimeTravelNetworkNAT = !opt.TimeTravelNetworkNAT },
 		"HostFilesystem":        func(opt *Options) { opt.HostFilesystem = !opt.HostFilesystem },
+		"TTCVolume":             func(opt *Options) { opt.TTCVolume = !opt.TTCVolume },
 		"ProfileEnable":         func(opt *Options) { opt.ProfileEnable = !opt.ProfileEnable },
 		"NVProxy":               func(opt *Options) { opt.NVProxy = !opt.NVProxy },
 		"NVProxyCaps":           func(opt *Options) { opt.NVProxyCaps = ^opt.NVProxyCaps },

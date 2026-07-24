@@ -31,6 +31,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
@@ -124,7 +125,21 @@ type SpecOptions struct {
 	Entrypoint       []string
 	HostMounts       []HostMount
 	FilesystemMounts []FilesystemMount
+	ManagedVolumes   []ManagedVolume
 	Ulimits          []Ulimit
+}
+
+// ManagedVolume is one persistent TTC volume attachment. RepositoryPath is
+// runtime-internal and is donated by directory FD; it is not guest-visible.
+type ManagedVolume struct {
+	Name           string `json:"name"`
+	ID             string `json:"id"`
+	Destination    string `json:"destination"`
+	Readonly       bool   `json:"readonly,omitempty"`
+	Anonymous      bool   `json:"anonymous,omitempty"`
+	NoCopy         bool   `json:"no_copy,omitempty"`
+	RepositoryPath string `json:"-"`
+	CopyMode       string `json:"-"`
 }
 
 // HostMount describes a host path exposed through a gofer bind. Writable
@@ -754,6 +769,41 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		}
 		annotations[TmpfsConfigAnnotation] = string(encoded)
 	}
+	volumeRepositories := make([]specutils.TTCVolumeRepository, 0, len(opts.ManagedVolumes))
+	for _, volume := range opts.ManagedVolumes {
+		destination := filepath.Clean(volume.Destination)
+		if !filepath.IsAbs(destination) || destination == "/" {
+			return nil, fmt.Errorf("managed volume destination %q must be an absolute non-root path", volume.Destination)
+		}
+		if _, ok := seenDestinations[destination]; ok {
+			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+		}
+		if volume.ID == "" || volume.RepositoryPath == "" || volume.CopyMode == "" {
+			return nil, fmt.Errorf("managed volume %q is missing resolved repository metadata", volume.Name)
+		}
+		seenDestinations[destination] = struct{}{}
+		source := filepath.Join("/run/ttc/volumes", volume.ID)
+		options := []string{"rw"}
+		if volume.Readonly {
+			options[0] = "ro"
+		}
+		mounts = append(mounts, specs.Mount{
+			Destination: destination,
+			Type:        "ttcvol",
+			Source:      source,
+			Options:     options,
+		})
+		volumeRepositories = append(volumeRepositories, specutils.TTCVolumeRepository{
+			Source: source, Path: volume.RepositoryPath, Branch: "main", CopyMode: volume.CopyMode,
+		})
+	}
+	if len(volumeRepositories) != 0 {
+		encoded, err := json.Marshal(volumeRepositories)
+		if err != nil {
+			return nil, fmt.Errorf("encoding TTC volume repositories: %w", err)
+		}
+		annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+	}
 	for _, mount := range opts.HostMounts {
 		if !mount.Readonly && !mount.ManagedCoW {
 			return nil, fmt.Errorf("host mount %q at %q is writable; use an explicit managed CoW mount", mount.Source, mount.Destination)
@@ -829,7 +879,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
 		}
 		if _, explicitlyMounted := seenDestinations[clean]; !explicitlyMounted {
-			return nil, fmt.Errorf("image volume %q requires TTC managed volumes, which are temporarily unavailable while the disk-backed reflink CoW driver is implemented", destination)
+			return nil, fmt.Errorf("image volume %q was not resolved to a TTC managed volume", destination)
 		}
 	}
 	return &specs.Spec{

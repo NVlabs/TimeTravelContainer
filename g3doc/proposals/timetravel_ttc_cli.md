@@ -1,10 +1,8 @@
 # TimeTravelContainer `ttc` product and CLI roadmap
 
-Status: implemented for the documented rootless systrap scope, except managed
-volumes. The former tmpfs-plus-tar managed-volume implementation was removed
-before release because it had the wrong durability model. All managed-volume
-sections and checked tasks below are historical, not current behavior. The
-replacement is specified in
+Status: implemented for the documented rootless systrap scope. The original
+tmpfs-plus-tar managed-volume prototype was removed before release and replaced
+by the direct-to-disk `ttcvol` filesystem specified in
 [ttc_disk_backed_volumes.md](ttc_disk_backed_volumes.md).
 
 Implementation status: the roadmap is implemented. The `ttc` client is available at
@@ -40,11 +38,12 @@ or `--mount` syntax. An explicit `:cow,immutable-source` or
 branch-local Sentry-memory OverlayFS upper over the user-attested immutable host
 lower; ordinary writable Docker binds remain rejected to avoid silently changing
 their host-write semantics.
-Named managed tmpfs volumes can be attached at one or
-more paths, and their state forks CoW with each live branch. `ttc volume inspect
---usage CONTAINER[@BRANCH] VOLUME` resolves the selected live branch and
-reports logical used bytes for every destination alias without walking or
-serializing the volume. Containers default
+Named and anonymous disk-backed managed volumes can be attached through
+Docker-compatible syntax, initialized from image contents, and fork their
+immutable metadata root plus regular-file backing objects CoW with each live
+branch. `ttc volume create|ls|inspect|rm` manages repositories. Advanced usage
+accounting, import/export, and branch promotion remain roadmap items.
+Containers default
 to isolated `--network none`; Docker-style `--network/--net host` persists
 hostinet configuration across start/restart and is rejected by live-fork
 validation as an external resource. Rootless `--network ttc` adds a
@@ -648,49 +647,27 @@ and reason.
 
 ### Managed volumes
 
-- [x] `ttc volume create NAME` for a forkable managed volume.
-- [x] Support pure tmpfs managed volumes.
-- [x] Support a user-attested immutable host lower plus main-MemoryFile tmpfs OverlayFS
-      upper.
-- [x] Generalize the already-supported root OverlayFS live-fork tests to
-      arbitrary submounts.
-- [x] Fork every managed tmpfs volume together with its branch and verify
-      parent/child/grandchild write isolation.
-- [x] Preserve volume aliases and sharing among processes inside one branch
-      without sharing writes across branches.
-- [x] Reject writable host binds without a managed CoW upper.
-- [x] Initial named-volume attachment, read-only aliases, metadata inspection,
-      listing, in-use removal rejection, and removal.
-- [x] Add anonymous volumes, image-path ownership initialization, Docker copy-up
-      and `volume-nocopy`, inspect projection, and `rm -v`/`--rm` cleanup.
-- [x] Add Docker-style managed-volume quotas with `volume create --opt
-      size=BYTES`; persist the limit, expose it in inspect, enforce it through
-      Sentry tmpfs, and clone independent remaining capacity across live fork.
-- [x] Add branch-local logical used-byte inspection with `ttc volume inspect
-      --usage CONTAINER[@BRANCH] VOLUME`, including alias destinations,
-      read-only flags, quota context, and parent/child post-fork divergence.
-- [x] Initial family-local semantics: attaching a name instantiates one tmpfs
-      per sandbox family; the same name in unrelated families does not share
-      data.
-- [x] Retain explicitly committed managed-volume contents across sandbox-family
-      teardown. `ttc volume commit CONTAINER[@BRANCH] VOLUME` atomically
-      publishes the selected live branch as the volume's persistent seed.
-- [x] Add tar export of a selected branch's managed volume without making
-      disk checkpointing part of live fork.
-- [x] Add `ttc volume import --input TAR VOLUME` and automatically seed a new
-      sandbox family's Sentry-owned tmpfs from the validated archive.
-- [x] Automatically pause, commit, and resume main before explicit stop or
-      restart and before forced removal of a sole-branch live family. Forced
-      restart with descendants selects main; forced removal with descendants
-      preserves the latest explicit commit/import instead of silently selecting
-      a branch.
-- [x] Add a Sentry post-init-exit snapshot hook so unplanned natural exit and
-      writes performed by a shutdown signal handler are captured. The Sentry
-      retains the root mount namespace until pending managed-volume archives are
-      synced, then writes completion markers; TTC validates and atomically
-      promotes them. Manager-driven stop still takes an earlier quiescent
-      snapshot before delivering the stop signal, which the final snapshot
-      supersedes after exit.
+- [x] Replace the pre-release tmpfs/tar prototype with a direct-to-disk Sentry
+      filesystem and remove its import/export/commit lifecycle.
+- [x] Probe `FICLONE` at daemon startup and require explicit
+      `--allow-slow-volume-copy` opt-in for whole-file first-write copying.
+- [x] Implement persistent immutable namespace/inode trees, opaque data
+      objects, stable virtual inodes, hard links, symlinks, xattrs, truncate,
+      fallocate, and fsync.
+- [x] Fork mounted volumes transactionally in O(number of volumes), retaining
+      parent/child/grandchild isolation for namespace changes, regular writes,
+      open file descriptions, and mappings.
+- [x] Add `ttc volume create|ls|inspect|rm`, named and anonymous `-v`,
+      `--mount type=volume`, image `VOLUME`, Docker copy-on-create,
+      `volume-nocopy`, inspect projection, and `rm -v`.
+- [x] Reject volume removal while any persisted container still attaches it.
+- [x] Enforce a single writable sandbox-family attachment until coherent
+      cross-Sentry invalidation is implemented; permit additional read-only
+      attachments.
+- [ ] Add sparse-aware slow copying, quotas/accounting, branch/object garbage
+      collection, import/export, and explicit branch-head promotion.
+- [ ] Add device/FIFO/socket nodes, ACLs, exhaustive crash fault injection,
+      and reflink end-to-end qualification on supported host filesystems.
 
 ## Image and storage backend
 

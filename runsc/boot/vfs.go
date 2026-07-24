@@ -166,6 +166,7 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
+	vfsObj.MustRegisterFilesystemType(tmpfs.DiskVolumeName, &tmpfs.DiskVolumeFilesystemType{}, &vfs.RegisterFilesystemTypeOptions{})
 	vfsObj.MustRegisterFilesystemType(mqfs.Name, &mqfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
@@ -855,11 +856,12 @@ func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec,
 }
 
 type mountInfo struct {
-	mount          *specs.Mount
-	goferFD        *fd.FD
-	hint           *MountHint
-	goferMountConf specutils.GoferMountConf
-	filestoreFD    *fd.FD
+	mount               *specs.Mount
+	goferFD             *fd.FD
+	hint                *MountHint
+	goferMountConf      specutils.GoferMountConf
+	filestoreFD         *fd.FD
+	ttcVolumeRepository *ttcVolumeRepository
 }
 
 func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
@@ -880,6 +882,13 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 			hint:  c.l.mountHints.FindMount(c.mounts[i].Source),
 		}
 		specutils.MaybeConvertToBindMount(info.mount)
+		if info.mount.Type == tmpfs.DiskVolumeName {
+			repository, ok := c.l.ttcVolumeRepositories[info.mount.Source]
+			if !ok {
+				return nil, fmt.Errorf("no TTC volume repository was donated for source %q", info.mount.Source)
+			}
+			info.ttcVolumeRepository = &repository
+		}
 		if specutils.HasMountConfig(*info.mount) {
 			info.goferMountConf = c.goferMountConfs[goferMntIdx]
 			if info.goferMountConf.ShouldUseLisafs() || info.goferMountConf.ShouldUseErofs() {
@@ -1043,6 +1052,18 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 				tmpfsOpts.SourceTarFSCheckpoint = true
 			}
 			internalData = tmpfsOpts
+		}
+
+	case tmpfs.DiskVolumeName:
+		if m.ttcVolumeRepository == nil {
+			return "", nil, fmt.Errorf("TTC volume source %q has no donated repository", m.mount.Source)
+		}
+		internalData = tmpfs.FilesystemOpts{
+			DisableDefaultSizeLimit: true,
+			DiskVolume: &tmpfs.DiskVolumeOptions{
+				Repository: m.ttcVolumeRepository.repository,
+				Branch:     m.ttcVolumeRepository.config.Branch,
+			},
 		}
 
 	case Bind:

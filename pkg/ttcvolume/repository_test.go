@@ -434,3 +434,63 @@ func TestTreeMutationIsPathCopyAndForkWritesNoNodes(t *testing.T) {
 		t.Fatalf("one mutation wrote %d nodes, want bounded path-copy", delta)
 	}
 }
+
+func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "file", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Xattrs = map[string]string{"user.test": "parent"}
+	if err := repo.UpdateMetadata(MainBranch, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if cloned, err := repo.Allocate("child", ino, 0, 8192); err != nil {
+		t.Fatal(err)
+	} else if !cloned {
+		t.Fatal("first child allocation did not privatize the file object")
+	}
+	child, err := repo.Inode("child", ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.Xattrs["user.test"] = "child"
+	if err := repo.UpdateMetadata("child", child); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.Inode(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	} else if got.Size != 0 || got.Xattrs["user.test"] != "parent" {
+		t.Fatalf("parent metadata changed after child allocation: %+v", got)
+	}
+	repo.Close()
+
+	manager, err = OpenManager(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.Inode("child", ino); err != nil {
+		t.Fatal(err)
+	} else if got.Size != 8192 || got.Xattrs["user.test"] != "child" {
+		t.Fatalf("reopened child metadata=%+v", got)
+	}
+}

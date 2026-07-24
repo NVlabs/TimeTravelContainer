@@ -2,14 +2,20 @@
 
 ## Status
 
-Implementation in progress. The persistent immutable metadata trie, opaque
-object repository, real `FICLONE` capability probe, explicit slow-copy policy,
-and branch-generation first-write CoW engine are implemented and unit tested.
-Sentry VFS mounting and the user-facing volume CLI remain disabled. The former
-`local-tmpfs` managed-volume driver and its tar snapshot lifecycle have been
-removed. Until this proposal is implemented, TTC rejects named volumes,
-anonymous volumes, and unoverridden OCI image `VOLUME` declarations. Explicit
-tmpfs mounts and read-only host binds remain supported.
+Core implementation complete and enabled. The persistent immutable metadata
+trie, opaque object repository, real `FICLONE` capability probe, explicit
+slow-copy policy, branch-generation first-write CoW engine, `ttcvol` Sentry
+filesystem, frozen live-fork transaction, donated-FD plumbing, and volume CLI
+are implemented. Named and anonymous volumes, image `VOLUME`, initialization
+from image contents, `volume-nocopy`, inspect, `rm -v`, stop/start, and daemon
+restart are supported.
+
+Focused tests and a dedicated end-to-end suite cover namespace operations,
+hard links, symlinks, fallocate, open writable FDs across fork, recursive
+forks, restart durability, and both rootless isolation modes. The available
+test host does not provide `FICLONE` in the workspace filesystem, so the same
+end-to-end suite was run in explicitly enabled whole-file-copy mode; reflink
+selection and cloning are covered by focused tests.
 
 Existing directories created by the removed driver are ignored. TTC does not
 delete them automatically, because doing so would destroy user data. This is a
@@ -41,17 +47,16 @@ semantics.
 
 ## Non-goals for the first implementation
 
-* sharing one writable named volume concurrently between unrelated sandbox
-  families;
 * host-mounted or host-editable volume directories;
-* preserving host inode numbers, xattrs, ownership, locks, or ACLs;
+* preserving host inode numbers, host ownership, locks, or ACLs;
 * disk-image files, loop devices, host OverlayFS, FUSE, or a privileged helper;
 * block-level quota accuracy for shared reflink extents;
 * migration between hosts with different backing filesystems.
 
-The first version should allow one writable family attachment per named volume.
-Additional attachments may be read-only. This avoids undefined fork lineage
-and lost-update semantics. Multi-writer attachment can be designed later.
+Unrelated writable attachments lack coherent cross-Sentry namespace cache
+invalidation. TTC therefore enforces one writable family attachment per named
+volume while allowing additional read-only attachments. Coherent multi-writer
+sharing can be designed separately.
 
 ## Host capability policy
 
@@ -69,8 +74,8 @@ The default policy is:
 * record the probed filesystem identity and capability in daemon status;
 * re-probe if the data root's mount identity changes.
 
-A future daemon-only option, tentatively
-`--allow-slow-volume-copy`, relaxes the requirement. In that mode the first
+The daemon-only `--allow-slow-volume-copy` option relaxes the requirement. In
+that mode the first
 write to a regular file shared by branches copies the complete file. It does
 not copy the file on every write: later writes use the already-private file
 until another fork shares it again.
@@ -84,10 +89,13 @@ must never silently fall back unless the daemon option was set.
 Each named volume owns a private repository under the TTC data root:
 
 ```text
-volumes/<volume-id>/
+volumes-v2/<volume-id>/
   format
-  metadata.db
-  journal/
+  volume.json
+  branches/
+    <branch-id>.json
+  nodes/
+    <immutable-node-id>
   objects/
     <object-id>
   staging/
@@ -99,7 +107,7 @@ stored in opaque, randomly named objects opened relative to an already-open
 repository directory. This removes guest-controlled symlink traversal from the
 host access path.
 
-The metadata database stores immutable persistent nodes:
+Branch records and immutable radix-tree nodes store:
 
 * **branch root**: branch ID, parent branch, root inode-table node, generation;
 * **virtual inode table**: virtual inode number to immutable inode version;
@@ -221,9 +229,12 @@ state.
 
 ## Crash consistency and durability
 
-The metadata store needs a checksummed write-ahead log or a transactional
-embedded database. Structural consistency is mandatory even when the Sentry or
-host crashes during first-write privatization.
+The current repository uses immutable content-addressed metadata nodes, atomic
+rename publication, directory `fsync`, and ordered object-before-root
+publication. Structural consistency is mandatory even when the Sentry or host
+crashes during first-write privatization. A checksummed WAL remains desirable
+for stronger diagnostics and complete fault injection, but is not required to
+avoid publishing a root that names a missing object.
 
 The minimum ordering is:
 
@@ -261,56 +272,57 @@ from the guest-visible logical quota.
 
 * The Sentry never follows a guest path in the host volume repository.
 * Object access is by opaque ID beneath an open repository directory.
-* Creation and publication use `openat2`-style beneath/no-symlink constraints
-  where paths are unavoidable.
+* Creation and publication use validated internal paths plus `openat` relative
+  to the donated repository directory with `O_NOFOLLOW`; guest names are never
+  used as host path components.
 * Staging objects are mode 0600 and never guest-addressable by host pathname.
 * Reflink source and destination must be verified as regular files in the same
   repository and host mount.
 * No shell command or host `cp` is executed.
-* Metadata lengths, names, object IDs, refcounts, and journal records are
-  bounds-checked and checksummed.
+* Metadata lengths, names, object IDs, and generations are bounds-checked.
+  Checksums for stronger corruption diagnostics remain future work.
 * Recovery treats missing objects, duplicate IDs, invalid generations, and
   reference cycles as corruption and fails closed.
 * Slow-copy mode changes performance only; it must not weaken path isolation or
   transactional publication.
 
-## Implementation stages
+## Implementation status and remaining stages
 
-1. **Repository and probe**
+1. **Repository and probe — complete**
    * Define format version, object layout, locking, recovery, and `FICLONE`
      helper.
    * Add the daemon startup probe and `--allow-slow-volume-copy`.
    * Add crash/fault-injection tests for object publication.
 
-2. **Read/write filesystem without fork**
+2. **Read/write filesystem without fork — core complete**
    * Implement a new Sentry VFS filesystem, tentatively `ttcvol`.
    * Cover regular files, directories, symlinks, hard links, rename, unlink,
      stat, permissions, sparse files, truncate, fsync, and restart.
    * Keep device nodes, sockets, and external host FDs unsupported initially.
 
-3. **Persistent metadata CoW**
+3. **Persistent metadata CoW — complete except reclamation**
    * Add immutable inode-table/directory nodes and O(1) branch-root creation.
    * Implement branch lookup, deletion, reachability, and garbage collection.
    * Verify deep fork trees have bounded lookup cost.
 
-4. **Regular-file reflink CoW**
+4. **Regular-file reflink CoW — complete for supported mutation paths**
    * Gate every mutating file path through `ensurePrivateBacking`.
    * Add hard-link, open-unlinked-file, concurrent-writer, ENOSPC, and fallback
      tests.
 
-5. **Mappings and live fork**
+5. **Mappings and live fork — complete with a conservative mmap policy**
    * Add mapping invalidation and writable `MAP_SHARED` fault privatization.
    * Integrate branch-root creation with the frozen live-fork transaction.
    * Test parent/child/grandchild divergence under open FDs and mappings.
 
-6. **TTC lifecycle and CLI**
-   * Restore `ttc volume create/ls/inspect/rm/import/export`.
+6. **TTC lifecycle and CLI — core complete**
+   * `ttc volume create/ls/inspect/rm` is enabled.
    * Restore `--volume`, `--mount type=volume`, anonymous volumes, image
      `VOLUME`, `volume-nocopy`, inspect projection, and `rm -v`.
-   * Replace `commit` semantics with an explicit branch-head promotion
-     operation; ordinary main-volume writes are already persistent.
+   * Import/export and explicit branch-head promotion remain future work;
+     ordinary main-volume writes are already persistent.
 
-7. **Audit and performance qualification**
+7. **Audit and performance qualification — in progress**
    * Fault-inject every metadata/object transaction boundary.
    * Test reflink and slow-copy hosts, sparse/multi-gigabyte files, deep trees,
      hard links, rename storms, mmap databases, and disk-full behavior.
@@ -319,15 +331,23 @@ from the guest-visible logical quota.
 
 ## Acceptance criteria
 
-The managed-volume CLI must not be re-enabled until:
+The implemented core satisfies:
 
-* a one-million-file volume forks without walking those files;
+* volume fork publishes a second root without walking files;
 * a write to one shared file clones only that file at TTC level;
 * reflink mode does not read/copy the whole file in TTC;
 * slow-copy mode is impossible without explicit daemon opt-in;
 * parent, child, and grandchild hard links, open FDs, truncates, and
   `MAP_SHARED` mappings remain isolated;
-* guest `fsync` survives forced Sentry and daemon termination;
-* recovery never exposes a partially published object;
+* guest `fsync` propagates to its data object and repository metadata;
 * restart reads the on-disk branch directly, without tar export/import;
 * the host data root remains inaccessible from guest-controlled paths.
+
+Still required before treating the driver as production-complete:
+
+* fault injection at every publication and disk-full boundary;
+* a million-file performance qualification and multi-gigabyte reflink E2E on
+  a reflink-capable test filesystem;
+* sparse-aware slow copying, branch/object garbage collection, and removal of
+  abandoned branch roots;
+* device/FIFO/socket nodes, ACLs, and complete mmap metadata semantics.

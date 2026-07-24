@@ -218,12 +218,18 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		runsc:                 opts.runsc,
 		dataRoot:              opts.dataRoot,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
+		allowSlowVolumeCopy:   opts.allowSlowVolumeCopy,
 		clientExecutable:      opts.clientExecutable,
 		clientTERM:            os.Getenv("TERM"),
 		stdin:                 stdin,
 		stdout:                stdout,
 		stderr:                stderr,
 	}
+}
+
+func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
+	backend.volumeCopyMode = s.volumeCapability.Mode
+	backend.allowSlowVolumeCopy = s.volumeCapability.Mode == ttcvolume.CopyModeFull
 }
 
 type daemonStopTarget struct {
@@ -549,6 +555,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			opts.dataRoot = s.dataRoot
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+			s.configureVolumeBackend(backend)
 			backend.consoleSidecars = s
 			unlock := s.lockDataRoot(opts.dataRoot)
 			err := stopDaemonContainers(backend)
@@ -607,6 +614,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+	s.configureVolumeBackend(backend)
 	backend.clientTERM = request.ClientTERM
 	backend.consoleSidecars = s
 	if request.Args[0] == "events" {
@@ -637,6 +645,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		var mutationStdout, mutationStderr bytes.Buffer
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
+		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.consoleSidecars = s
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)

@@ -30,9 +30,121 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
+
+func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	data := filepath.Join(rootfs, "var", "lib", "app")
+	if err := os.MkdirAll(filepath.Join(data, "nested"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "nested", "payload"), []byte("persistent image data"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(filepath.Join(data, "nested", "payload"), "user.ttc-seed", []byte("xattr-data"), 0); err != nil && !errors.Is(err, unix.ENOTSUP) {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(data, "nested", "payload"), filepath.Join(data, "hardlink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nested/payload", filepath.Join(data, "symlink")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manifest.Entries["var/lib/app"] = ownership.Owner{UID: 10, GID: 20}
+	manifest.Entries["var/lib/app/nested"] = ownership.Owner{UID: 11, GID: 21}
+	manifest.Entries["var/lib/app/nested/payload"] = ownership.Owner{UID: 12, GID: 22}
+	manifest.Entries["var/lib/app/hardlink"] = ownership.Owner{UID: 12, GID: 22}
+	manifest.Entries["var/lib/app/symlink"] = ownership.Owner{UID: 13, GID: 23}
+
+	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("seed-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := seedManagedVolume(repository, rootfs, "/var/lib/app", manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := repository.Inode(ttcvolume.MainBranch, ttcvolume.RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.UID != 10 || root.GID != 20 || root.Mode != 0750 {
+		t.Fatalf("root metadata = uid %d gid %d mode %#o, want 10:20 0750", root.UID, root.GID, root.Mode)
+	}
+	nested, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := repository.Lookup(ttcvolume.MainBranch, nested, "payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hardlink, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "hardlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hardlink != payload {
+		t.Fatalf("hardlink inode = %d, want payload inode %d", hardlink, payload)
+	}
+	got := make([]byte, len("persistent image data"))
+	if _, err := repository.ReadAt(ttcvolume.MainBranch, payload, got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "persistent image data" {
+		t.Fatalf("payload = %q", got)
+	}
+	inode, err := repository.Inode(ttcvolume.MainBranch, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inode.UID != 12 || inode.GID != 22 || inode.Mode != 0640 || inode.Nlink != 2 {
+		t.Fatalf("payload metadata = %+v", inode)
+	}
+	if value, ok := inode.Xattrs["user.ttc-seed"]; ok && value != "xattr-data" {
+		t.Fatalf("payload xattr = %q, want xattr-data", value)
+	}
+	link, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "symlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkInode, err := repository.Inode(ttcvolume.MainBranch, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkInode.Type != "symlink" || linkInode.Target != "nested/payload" {
+		t.Fatalf("symlink inode = %+v", linkInode)
+	}
+}
+
+func TestValidateManagedVolumeAttachment(t *testing.T) {
+	containers := []ContainerInfo{{
+		Name: "writer",
+		Volumes: []ManagedVolume{{
+			ID: "volume-id",
+		}},
+	}}
+	if err := validateManagedVolumeAttachment("volume-id", ManagedVolume{Name: "data"}, containers); err == nil {
+		t.Fatal("second writable attachment succeeded")
+	}
+	if err := validateManagedVolumeAttachment("volume-id", ManagedVolume{Name: "data", Readonly: true}, containers); err != nil {
+		t.Fatalf("read-only attachment failed: %v", err)
+	}
+	if err := validateManagedVolumeAttachment("other-id", ManagedVolume{Name: "other"}, containers); err != nil {
+		t.Fatalf("unrelated writable attachment failed: %v", err)
+	}
+}
 
 func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	pidsLimit := int64(23)
@@ -562,13 +674,13 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 }
 
-func TestBuildSpecRejectsUnimplementedImageVolumes(t *testing.T) {
+func TestBuildSpecRequiresResolvedImageVolumes(t *testing.T) {
 	image := ocispec.Image{Config: ocispec.ImageConfig{
 		Cmd:     []string{"true"},
 		Volumes: map[string]struct{}{"/data": {}},
 	}}
-	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "temporarily unavailable") {
-		t.Fatalf("BuildSpec image volume error=%v, want unavailable error", err)
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "not resolved") {
+		t.Fatalf("BuildSpec image volume error=%v, want unresolved error", err)
 	}
 	if _, err := BuildSpec(image, SpecOptions{
 		RootFS: t.TempDir(),
@@ -577,6 +689,19 @@ func TestBuildSpecRejectsUnimplementedImageVolumes(t *testing.T) {
 		}},
 	}); err != nil {
 		t.Fatalf("BuildSpec with explicit replacement mount: %v", err)
+	}
+	spec, err := BuildSpec(image, SpecOptions{
+		RootFS: t.TempDir(),
+		ManagedVolumes: []ManagedVolume{{
+			Name: "data", ID: "0123456789abcdef0123456789abcdef",
+			Destination: "/data", RepositoryPath: "/repository", CopyMode: "reflink",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildSpec with resolved managed volume: %v", err)
+	}
+	if got := spec.Annotations["dev.timetravelcontainer.volume-repositories"]; !strings.Contains(got, `"/repository"`) {
+		t.Fatalf("volume repository annotation=%q", got)
 	}
 }
 

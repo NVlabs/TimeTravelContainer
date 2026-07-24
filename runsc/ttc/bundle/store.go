@@ -29,10 +29,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	"gvisor.dev/gvisor/runsc/ttc/images"
@@ -152,6 +156,7 @@ type ContainerInfo struct {
 	DNS                []string          `json:"dns,omitempty"`
 	DNSSearch          []string          `json:"dns_search,omitempty"`
 	DNSOptions         []string          `json:"dns_options,omitempty"`
+	Volumes            []ManagedVolume   `json:"volumes,omitempty"`
 	State              string            `json:"state"`
 	ExitStatus         *int              `json:"exit_status,omitempty"`
 	CreatedAt          time.Time         `json:"created_at"`
@@ -500,6 +505,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	opts.ManagedVolumes, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
+	if err != nil {
+		return Prepared{}, err
+	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
@@ -603,6 +612,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		DNS:                append([]string(nil), opts.DNS...),
 		DNSSearch:          append([]string(nil), opts.DNSSearch...),
 		DNSOptions:         append([]string(nil), opts.DNSOptions...),
+		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		State:              "created",
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -616,6 +626,281 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	keep = true
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+}
+
+func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, error) {
+	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
+	mounted := make(map[string]bool)
+	for _, mount := range opts.HostMounts {
+		mounted[filepath.Clean(mount.Destination)] = true
+	}
+	for _, mount := range opts.FilesystemMounts {
+		mounted[filepath.Clean(mount.Destination)] = true
+	}
+	for _, volume := range volumes {
+		destination := filepath.Clean(volume.Destination)
+		if mounted[destination] {
+			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+		}
+		mounted[destination] = true
+	}
+	imageDestinations := make([]string, 0, len(image.Config.Volumes))
+	for destination := range image.Config.Volumes {
+		imageDestinations = append(imageDestinations, destination)
+	}
+	sort.Strings(imageDestinations)
+	for _, destination := range imageDestinations {
+		clean := filepath.Clean(destination)
+		if !filepath.IsAbs(clean) || clean == "/" {
+			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
+		}
+		if mounted[clean] {
+			continue
+		}
+		volumes = append(volumes, ManagedVolume{Destination: clean, Anonymous: true})
+		mounted[clean] = true
+	}
+	if len(volumes) == 0 {
+		return nil, nil
+	}
+	manager, err := ttcvolume.OpenManager(s.Root, true)
+	if err != nil {
+		return nil, err
+	}
+	ownerManifest, err := ownership.Read(ownership.ManifestPath(rootfs))
+	if err != nil {
+		return nil, fmt.Errorf("loading image ownership for managed volumes: %w", err)
+	}
+	seenIDs := make(map[string]string)
+	for i := range volumes {
+		if volumes[i].Name == "" {
+			id, err := randomObjectID("anonymous volume", 16)
+			if err != nil {
+				return nil, err
+			}
+			volumes[i].Name = "anon-" + id
+			volumes[i].Anonymous = true
+		}
+		repository, err := manager.Open(volumes[i].Name)
+		created := false
+		if errors.Is(err, os.ErrNotExist) {
+			repository, err = manager.Create(volumes[i].Name)
+			created = err == nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolving managed volume %q: %w", volumes[i].Name, err)
+		}
+		if created && !volumes[i].NoCopy {
+			if err := seedManagedVolume(repository, rootfs, volumes[i].Destination, ownerManifest); err != nil {
+				repository.Close()
+				_ = manager.Remove(volumes[i].Name)
+				return nil, fmt.Errorf("initializing managed volume %q from image path %q: %w", volumes[i].Name, volumes[i].Destination, err)
+			}
+		}
+		info := repository.Info()
+		if err := validateManagedVolumeAttachment(info.ID, volumes[i], containers); err != nil {
+			repository.Close()
+			return nil, err
+		}
+		volumes[i].ID = info.ID
+		volumes[i].RepositoryPath = repository.HostPath()
+		volumes[i].CopyMode = string(manager.Capability().Mode)
+		repository.Close()
+		if previous, ok := seenIDs[info.ID]; ok {
+			return nil, fmt.Errorf("managed volume %q is mounted more than once (%q and %q); aliases are not yet supported", volumes[i].Name, previous, volumes[i].Destination)
+		}
+		seenIDs[info.ID] = volumes[i].Destination
+	}
+	return volumes, nil
+}
+
+func validateManagedVolumeAttachment(volumeID string, requested ManagedVolume, containers []ContainerInfo) error {
+	if requested.Readonly {
+		return nil
+	}
+	for _, container := range containers {
+		for _, attached := range container.Volumes {
+			if attached.ID == volumeID && !attached.Readonly {
+				return fmt.Errorf("managed volume %q already has a writable attachment to container %q; unrelated writable sandbox families are not coherent", requested.Name, container.Name)
+			}
+		}
+	}
+	return nil
+}
+
+type hostFileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// seedManagedVolume implements Docker's copy-on-create volume behavior. The
+// repository is known to be new and empty. Data goes directly from the
+// immutable image root into persistent opaque volume objects; tmpfs and tar
+// staging are deliberately not involved.
+func seedManagedVolume(repository *ttcvolume.Repository, rootfs, destination string, manifest *ownership.Manifest) error {
+	relativeDestination := strings.TrimPrefix(filepath.Clean(destination), string(filepath.Separator))
+	sourceRoot := filepath.Join(rootfs, relativeDestination)
+	rootInfo, err := os.Lstat(sourceRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("image path is %s, but managed volumes require a directory", rootInfo.Mode().Type())
+	}
+
+	root, err := repository.Inode(ttcvolume.MainBranch, ttcvolume.RootInode)
+	if err != nil {
+		return err
+	}
+	root.Mode = uint32(rootInfo.Mode().Perm())
+	if owner, ok := manifest.Lookup(filepath.ToSlash(relativeDestination)); ok {
+		root.UID, root.GID = owner.UID, owner.GID
+	}
+	root.AtimeNsec = rootInfo.ModTime().UnixNano()
+	root.MtimeNsec = rootInfo.ModTime().UnixNano()
+	root.CtimeNsec = rootInfo.ModTime().UnixNano()
+	root.Xattrs, err = readImageXattrs(sourceRoot)
+	if err != nil {
+		return err
+	}
+	if err := repository.UpdateMetadata(ttcvolume.MainBranch, root); err != nil {
+		return err
+	}
+
+	directories := map[string]uint64{".": ttcvolume.RootInode}
+	hardlinks := make(map[hostFileIdentity]uint64)
+	copyBuffer := make([]byte, 256*1024)
+	err = filepath.Walk(sourceRoot, func(hostPath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(sourceRoot, hostPath)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		parent := directories[filepath.Dir(relative)]
+		if parent == 0 {
+			return fmt.Errorf("missing imported parent for %q", relative)
+		}
+		name := filepath.Base(relative)
+		imageRelative := filepath.Join(relativeDestination, relative)
+		owner, _ := manifest.Lookup(filepath.ToSlash(imageRelative))
+		mode := uint32(info.Mode().Perm())
+
+		var ino uint64
+		switch {
+		case info.IsDir():
+			ino, err = repository.CreateDirectory(ttcvolume.MainBranch, parent, name, mode, owner.UID, owner.GID)
+			if err == nil {
+				directories[relative] = ino
+			}
+		case info.Mode().IsRegular():
+			var identity hostFileIdentity
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+				identity = hostFileIdentity{dev: uint64(stat.Dev), ino: stat.Ino}
+				if existing := hardlinks[identity]; existing != 0 {
+					return repository.Link(ttcvolume.MainBranch, parent, name, existing)
+				}
+			}
+			ino, err = repository.CreateRegular(ttcvolume.MainBranch, parent, name, mode, owner.UID, owner.GID)
+			if err != nil {
+				break
+			}
+			source, openErr := os.Open(hostPath)
+			if openErr != nil {
+				return openErr
+			}
+			destination, _, _, openErr := repository.OpenDataFile(ttcvolume.MainBranch, ino, true)
+			if openErr != nil {
+				source.Close()
+				return openErr
+			}
+			_, copyErr := io.CopyBuffer(destination, source, copyBuffer)
+			sourceCloseErr := source.Close()
+			destinationCloseErr := destination.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if sourceCloseErr != nil {
+				return sourceCloseErr
+			}
+			if destinationCloseErr != nil {
+				return destinationCloseErr
+			}
+			if identity != (hostFileIdentity{}) {
+				hardlinks[identity] = ino
+			}
+		case info.Mode()&os.ModeSymlink != 0:
+			target, readErr := os.Readlink(hostPath)
+			if readErr != nil {
+				return readErr
+			}
+			ino, err = repository.CreateSymlink(ttcvolume.MainBranch, parent, name, target, owner.UID, owner.GID)
+		default:
+			return fmt.Errorf("image path %q has unsupported type %s", imageRelative, info.Mode().Type())
+		}
+		if err != nil {
+			return err
+		}
+		inode, err := repository.Inode(ttcvolume.MainBranch, ino)
+		if err != nil {
+			return err
+		}
+		inode.Size = info.Size()
+		inode.AtimeNsec = info.ModTime().UnixNano()
+		inode.MtimeNsec = info.ModTime().UnixNano()
+		inode.CtimeNsec = info.ModTime().UnixNano()
+		inode.Xattrs, err = readImageXattrs(hostPath)
+		if err != nil {
+			return err
+		}
+		return repository.UpdateAfterWrite(ttcvolume.MainBranch, inode)
+	})
+	if err != nil {
+		return err
+	}
+	return repository.SyncMetadata()
+}
+
+func readImageXattrs(name string) (map[string]string, error) {
+	size, err := unix.Llistxattr(name, nil)
+	if err != nil {
+		if errors.Is(err, unix.ENOTSUP) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	names := make([]byte, size)
+	size, err = unix.Llistxattr(name, names)
+	if err != nil {
+		return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
+	}
+	result := make(map[string]string)
+	for _, attribute := range strings.Split(string(names[:size]), "\x00") {
+		if attribute == "" {
+			continue
+		}
+		valueSize, err := unix.Lgetxattr(name, attribute, nil)
+		if err != nil {
+			return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+		}
+		value := make([]byte, valueSize)
+		valueSize, err = unix.Lgetxattr(name, attribute, value)
+		if err != nil {
+			return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+		}
+		result[attribute] = string(value[:valueSize])
+	}
+	return result, nil
 }
 
 func randomObjectID(kind string, size int) (string, error) {

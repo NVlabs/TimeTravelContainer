@@ -38,6 +38,10 @@ type LiveForkOptions struct {
 	// Clocks is the host clock source installed in the cloned Timekeeper.
 	Clocks sentrytime.Clocks
 
+	// ChildBranchID identifies the destination branch to branch-aware
+	// filesystems.
+	ChildBranchID string
+
 	// RestoreOptions are passed to filesystem restore completion hooks.
 	RestoreOptions vfs.CompleteRestoreOptions
 
@@ -209,7 +213,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	}
 
 	var child *Kernel
-	err := k.quiescePausedAnd(ctx, func() error {
+	err := k.quiescePausedAnd(ctx, func() (retErr error) {
 		validationStarted := time.Now()
 		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 			stack := rootNS.Stack()
@@ -252,11 +256,27 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if opts.AllowSharedFilesystemResources {
 			fsResources = make(vfs.LiveForkFilesystemResources)
 		}
+		fsTransactions := &vfs.LiveForkTransactions{}
+		fsTransactionsCommitted := false
+		defer func() {
+			if fsTransactionsCommitted {
+				return
+			}
+			if err := fsTransactions.Abort(); err != nil {
+				if retErr == nil {
+					retErr = fmt.Errorf("aborting live-fork filesystem transactions: %w", err)
+				} else {
+					retErr = fmt.Errorf("%w; aborting live-fork filesystem transactions: %v", retErr, err)
+				}
+			}
+		}()
 		saveCtx := context.WithValues(k.SupervisorContext(), map[any]any{
 			pgalloc.CtxMemoryFile:              k.mf,
 			pgalloc.CtxMemoryFileMap:           mfs,
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
+			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
+			vfs.CtxLiveForkTransactions:        fsTransactions,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
@@ -306,6 +326,8 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			pgalloc.CtxMemoryFileMap:           mfs,
 			pgalloc.CtxLiveForkClone:           true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
+			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
+			vfs.CtxLiveForkTransactions:        fsTransactions,
 		})
 		metadataStarted := time.Now()
 		k.filteringLiveForkDanglingEndpoints = true
@@ -363,6 +385,10 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := injectLiveForkFailure(opts, LiveForkStageChildPaused); err != nil {
 			return err
 		}
+		if err := fsTransactions.Commit(); err != nil {
+			return fmt.Errorf("committing live-fork filesystem transactions: %w", err)
+		}
+		fsTransactionsCommitted = true
 		ownerTransferred = true
 		return nil
 	})

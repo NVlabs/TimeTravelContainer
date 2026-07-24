@@ -95,6 +95,29 @@ func (f *MmapCachedFile) SetFD(fd int) {
 	f.fd.Store(int32(fd))
 }
 
+// ReplaceFD changes the backing file descriptor and discards every cached
+// internal mapping, which will be recreated lazily. Ownership of fd transfers
+// to f on success. This is used by branchable filesystems after invalidating
+// all application translations and publishing a copy-on-write backing object.
+//
+// The caller must ensure that MappableRelease is not concurrent and that no
+// application translation can access the old internal mappings.
+func (f *MmapCachedFile) ReplaceFD(fd int) error {
+	if fd < 0 {
+		return unix.EBADF
+	}
+	f.mapsMu.Lock()
+	for chunkStart, m := range f.mappings {
+		f.unmapAndRemove(chunkStart, m)
+	}
+	f.mapsMu.Unlock()
+	oldFD := int(f.fd.Swap(int32(fd)))
+	if oldFD >= 0 {
+		unix.Close(oldFD)
+	}
+	return nil
+}
+
 func (f *MmapCachedFile) close() {
 	if fd := f.fd.RacyLoad(); fd >= 0 {
 		unix.Close(int(fd))

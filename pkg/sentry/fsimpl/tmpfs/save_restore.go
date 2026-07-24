@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
 var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
@@ -73,6 +74,29 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			file.prepareLiveFork()
 		}
 		fs.liveForkMu.Unlock()
+		if fs.diskVolume != nil {
+			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
+			if resources == nil {
+				return fmt.Errorf("CtxLiveForkFilesystemResources was not provided for TTC volume")
+			}
+			if _, ok := resources[fs.diskVolume.ResourceID]; ok {
+				return fmt.Errorf("live-fork resource for TTC volume %q already exists", fs.diskVolume.ResourceID)
+			}
+			childBranch := vfs.LiveForkChildBranchIDFromContext(ctx)
+			if childBranch == "" {
+				return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
+			}
+			transactions := vfs.LiveForkTransactionsFromContext(ctx)
+			if transactions == nil {
+				return fmt.Errorf("CtxLiveForkTransactions was not provided for TTC volume")
+			}
+			tx, err := fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+			if err != nil {
+				return fmt.Errorf("forking TTC volume %q: %w", fs.diskVolume.ResourceID, err)
+			}
+			resources[fs.diskVolume.ResourceID] = fs.diskVolume.Repository
+			transactions.Add(tx)
+		}
 	}
 	resourceID := fs.mf.ResourceID()
 	if !resourceID.Ok() {
@@ -95,5 +119,22 @@ func (fs *filesystem) BeforeResume(ctx context.Context) {}
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
 func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
+	if fs.diskVolume != nil && pgalloc.IsLiveForkClone(ctx) {
+		resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
+		resource, ok := resources[fs.diskVolume.ResourceID]
+		if !ok {
+			return fmt.Errorf("TTC volume resource %q was not provided", fs.diskVolume.ResourceID)
+		}
+		repository, ok := resource.(*ttcvolume.Repository)
+		if !ok {
+			return fmt.Errorf("TTC volume resource %q has type %T", fs.diskVolume.ResourceID, resource)
+		}
+		childBranch := vfs.LiveForkChildBranchIDFromContext(ctx)
+		if childBranch == "" {
+			return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
+		}
+		fs.diskVolume.Repository = repository
+		fs.diskVolume.Branch = childBranch
+	}
 	return nil
 }

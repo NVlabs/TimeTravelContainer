@@ -105,10 +105,10 @@ ttc() {
 
 ttc_daemon_start() {
   if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-    ttc daemon start --unsafe-no-host-isolation
+    ttc daemon start --unsafe-no-host-isolation --allow-slow-volume-copy
     return
   fi
-  ttc daemon start
+  ttc daemon start --allow-slow-volume-copy
 }
 
 ttc_daemon_crash() {
@@ -236,17 +236,15 @@ ttc image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
   fail "image inspection did not report the materialized BusyBox root"
 
-echo "== obsolete managed-volume surface is rejected =="
-if ttc run --name "$PREFIX-volume-rejected" --volume /etc "$BUSYBOX_IMAGE" true >"$TTC_E2E_ROOT/volume.out" 2>"$TTC_E2E_ROOT/volume.err"; then
-  fail "anonymous volume unexpectedly used the removed tmpfs driver"
-fi
-grep -q "disk-backed reflink CoW driver" "$TTC_E2E_ROOT/volume.err" ||
-  fail "anonymous-volume rejection omitted the replacement-driver diagnostic"
-if ttc volume create cache >"$TTC_E2E_ROOT/volume-command.out" 2>"$TTC_E2E_ROOT/volume-command.err"; then
-  fail "volume create unexpectedly used the removed tmpfs driver"
-fi
-grep -q "disk-backed reflink CoW driver" "$TTC_E2E_ROOT/volume-command.err" ||
-  fail "volume-command rejection omitted the replacement-driver diagnostic"
+echo "== disk-backed managed volume =="
+MATRIX_VOLUME="$PREFIX-volume"
+ttc volume create "$MATRIX_VOLUME" >/dev/null
+ttc run --name "$PREFIX-volume-write" -v "$MATRIX_VOLUME:/data" "$BUSYBOX_IMAGE" \
+  sh -c 'echo persistent >/data/value'
+ttc rm "$PREFIX-volume-write"
+[ "$(ttc run --rm -v "$MATRIX_VOLUME:/data:ro" "$BUSYBOX_IMAGE" cat /data/value)" = persistent ] ||
+  fail "named volume did not persist direct disk data across containers"
+ttc volume rm "$MATRIX_VOLUME"
 
 ttc container create --name "$MULTI_A" "$BUSYBOX_IMAGE" sh -c 'exit 3'
 ttc container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
@@ -425,10 +423,9 @@ ttc create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 ttc start --attach "$PREFIX-nginx"
 ttc rm "$PREFIX-nginx"
 
-ttc run --name "$PREFIX-redis" --tmpfs /data:mode=0750,uid=999,gid=1000 "$REDIS_IMAGE" sh -c \
-  'test "$(stat -c %u:%g /data)" = 999:1000 && echo redis-owner-ok'
-[ "$(ttc inspect -f '{{index .HostConfig.Tmpfs "/data"}}' "$PREFIX-redis")" = "mode=0750,uid=999,gid=1000" ] ||
-  fail "Redis image VOLUME was not explicitly replaced by tmpfs"
+[ "$(ttc run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
+  'test -d /data && echo redis-volume-ok >/data/ttc-volume && cat /data/ttc-volume')" = redis-volume-ok ] ||
+  fail "Redis image VOLUME was not backed by a TTC managed volume"
 ttc rm "$PREFIX-redis"
 
 echo "== persisted stop signal and timeout policy =="

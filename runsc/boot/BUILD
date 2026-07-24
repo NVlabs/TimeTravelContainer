@@ -144,6 +144,7 @@ go_library(
         "//pkg/tcpip/transport/udp",
         "//pkg/waiter",
         "//pkg/timing",
+        "//pkg/ttcvolume",
         "//pkg/unet",
         "//pkg/urpc",
         "//runsc/boot/filter",

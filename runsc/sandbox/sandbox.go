@@ -993,6 +993,25 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", specutils.RootfsTarUpperPath(args.Spec), os.O_RDONLY, lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
+	volumeRepositories, err := specutils.TTCVolumeRepositories(args.Spec)
+	if err != nil {
+		return err
+	}
+	for _, repository := range volumeRepositories {
+		dir, err := os.Open(repository.Path)
+		if err != nil {
+			return fmt.Errorf("opening TTC volume repository for source %q: %w", repository.Source, err)
+		}
+		info, err := dir.Stat()
+		if err != nil || !info.IsDir() {
+			dir.Close()
+			if err != nil {
+				return fmt.Errorf("stating TTC volume repository for source %q: %w", repository.Source, err)
+			}
+			return fmt.Errorf("TTC volume repository for source %q is not a directory", repository.Source)
+		}
+		donations.DonateAndClose("ttc-volume-fds", dir)
+	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
 		return err

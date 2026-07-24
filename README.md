@@ -149,7 +149,7 @@ containerd daemon:
 - observation: `inspect`, `ps`, `top`, `logs`, and `events`;
 - interaction: `exec` and `attach`;
 - TimeTravel: `fork`, `pause`, `resume`, `branch rm`, and `ls --tree`;
-- storage: managed `volume` create, inspect, import, export, commit, and remove;
+- storage: disk-backed managed `volume` create, list, inspect, and remove;
 - completion: Bash, Zsh, and Fish scripts.
 
 Run/create supports common Docker-shaped options for environment variables,
@@ -194,11 +194,23 @@ never grants host root; OCI `noNewPrivileges` still suppresses elevation.
 - Directfs is disabled so host open-file descriptions do not silently become
   shared branch state.
 
-The former tmpfs-plus-tar managed-volume driver has been removed because it did
-not provide normal durable-volume semantics. Named, anonymous, and unoverridden
-image-declared volumes are temporarily rejected. The replacement is a
-disk-backed Sentry filesystem with lazy metadata CoW and host reflink file CoW;
-see the [disk-backed volume design](g3doc/proposals/ttc_disk_backed_volumes.md).
+Managed volumes use TTC's `ttcvol` Sentry filesystem. File contents are always
+ordinary files beneath the TTC data root; no tmpfs or tar export/import path is
+involved. Forking publishes another immutable metadata-tree root in O(1), and
+the first branch to modify a shared regular file creates a host reflink. The
+backing filesystem then performs extent-level CoW. New volumes receive the
+image destination's initial contents unless `volume-nocopy` is requested.
+
+```sh
+ttc volume create cache
+ttc run -d --name app -v cache:/var/cache/app alpine:3.20 sleep 600
+ttc volume inspect cache
+ttc rm app
+ttc volume rm cache
+```
+
+See the [disk-backed volume design](g3doc/proposals/ttc_disk_backed_volumes.md)
+for repository, durability, and fork details.
 
 ### Rootless virtual networking
 
@@ -472,8 +484,11 @@ recovery, and the full command surface.
 - A stopped child branch cannot be recreated from memory. Start/restart rebuilds
   the main branch from persistent configuration, its immutable image, the last
   exported main rootfs upper.
-- Managed volumes are unavailable until the disk-backed reflink CoW driver is
-  implemented.
+- Managed-volume regular files, directories, symlinks, hard links, xattrs,
+  truncate, fallocate, fsync, restart, and branch CoW are supported. Device
+  nodes, FIFOs, Unix sockets, ACLs, repository garbage collection, sparse-aware
+  slow copying, and unrelated concurrent writable attachment remain open; TTC
+  rejects the latter while allowing additional read-only attachments.
 - Read-only host binds remain shared external views rather than snapshots.
 - Uncommon OCI metadata such as device nodes, privileged security xattrs, and
   executable file capabilities needs broader rootless virtualization coverage.
@@ -491,12 +506,13 @@ the [audit](g3doc/proposals/timetravel_ttc_audit.md).
 
 ## Testing
 
-Run the focused TTC command, networking, memory, and tmpfs tests through the
+Run the focused TTC command, networking, memory, tmpfs, and volume tests through the
 Docker build wrapper:
 
 ```sh
 make test TARGETS="//runsc/ttc/cmd:cmd_test //runsc/boot:boot_test \
-  //pkg/sentry/mm:mm_test //pkg/sentry/fsimpl/tmpfs:tmpfs_test"
+  //pkg/sentry/mm:mm_test //pkg/sentry/fsimpl/tmpfs:tmpfs_test \
+  //pkg/ttcvolume:ttcvolume_test"
 ```
 
 The public-image end-to-end matrix exercises BusyBox, Alpine, Python, nginx,

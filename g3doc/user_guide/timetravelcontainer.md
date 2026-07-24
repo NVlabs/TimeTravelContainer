@@ -364,13 +364,37 @@ ttc run -d --name work \
   alpine:3.20 sleep 600
 ```
 
-Managed volumes are temporarily unavailable. TTC rejects named volumes,
-anonymous volumes, and image `VOLUME` declarations that are not replaced by an
-explicit supported mount. The removed tmpfs-plus-tar implementation did not
-provide normal write-through durability. Its replacement will use a
-disk-backed Sentry filesystem, lazy persistent metadata trees, per-file
-reflinks, and host-filesystem extent CoW. See the
+Managed volumes are persistent disk-backed `ttcvol` filesystems:
+
+```shell
+ttc volume create database
+ttc run -d --name db -v database:/var/lib/db alpine:3.20 sleep 600
+ttc volume ls
+ttc volume inspect database
+```
+
+`-v /work` creates an anonymous volume. The long form is
+`--mount type=volume,source=database,target=/var/lib/db,readonly`; omit
+`source` for an anonymous volume. A newly created volume is initialized from
+the image directory at its mount destination. Add `volume-nocopy` (or
+`nocopy` in `-v` syntax) to start empty. Image `VOLUME` declarations create
+anonymous volumes automatically when no explicit mount overrides them.
+
+Writes go directly to opaque regular files beneath the TTC data root. On live
+fork, TTC duplicates only an immutable metadata-tree root. The first write to
+one shared regular file reflinks that file, after which the host filesystem
+performs extent CoW. Stop/start reopens the same repository; there is no tar
+export/import. `ttc rm -v` also removes anonymous volumes, while named volumes
+remain until `ttc volume rm`.
+
+The daemon requires `FICLONE` by default. On a host without reflinks, starting
+it with `--allow-slow-volume-copy` explicitly selects whole-file copying on
+the first write after each fork. See the
 [disk-backed volume design](../proposals/ttc_disk_backed_volumes.md).
+
+One named volume may have one writable container family at a time. TTC rejects
+a second writable attachment because separate Sentry namespace caches are not
+yet coherent; additional read-only attachments are allowed.
 
 A host bind must be read-only:
 

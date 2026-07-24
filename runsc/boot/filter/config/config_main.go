@@ -320,8 +320,8 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	},
 	unix.SYS_TIMER_CREATE: seccomp.PerArg{
 		seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
-		seccomp.AnyValue{}, /* sevp */
-		seccomp.AnyValue{}, /* timerid */
+		seccomp.AnyValue{},                            /* sevp */
+		seccomp.AnyValue{},                            /* timerid */
 	},
 	unix.SYS_TIMER_DELETE: seccomp.MatchAll{},
 	unix.SYS_TIMER_SETTIME: seccomp.PerArg{
@@ -479,6 +479,50 @@ func hostFilesystemFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
+		},
+	})
+}
+
+// ttcVolumeFilters contains the descriptor-relative host filesystem syscalls
+// used by TTC's userspace managed-volume filesystem. Repository directory
+// descriptors are opened and donated by runsc; paths are always resolved
+// relative to one of those descriptors with O_NOFOLLOW.
+func ttcVolumeFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_OPENAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
+			seccomp.AnyValue{},
+		},
+		unix.SYS_UNLINKAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(0),
+		},
+		unix.SYS_RENAMEAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+		},
+		unix.SYS_FLOCK: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.LOCK_EX),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.LOCK_UN),
+			},
+		},
+		unix.SYS_FDATASYNC: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+		},
+		unix.SYS_IOCTL: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(linux.FICLONE),
+			seccomp.NonNegativeFD{},
 		},
 	})
 }

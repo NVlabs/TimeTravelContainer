@@ -79,6 +79,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/raw"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot/filter"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -254,6 +255,8 @@ type Loader struct {
 	finalMountExports   []finalMountExport
 	finalMountNamespace *vfs.MountNamespace
 
+	ttcVolumeRepositories map[string]ttcVolumeRepository
+
 	// cpuQuota and cpuPeriod are the raw host CFS settings that should be
 	// exposed through sandbox cgroupfs.
 	cpuQuota  int64
@@ -339,6 +342,11 @@ type finalMountExport struct {
 	destination string
 	archive     *os.File
 	ready       *os.File
+}
+
+type ttcVolumeRepository struct {
+	config     specutils.TTCVolumeRepository
+	repository *ttcvolume.Repository
 }
 
 type execID struct {
@@ -462,6 +470,9 @@ type Args struct {
 	// RootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	RootfsUpperTarFD int
+	// TTCVolumeFDs are ordered according to
+	// specutils.TTCVolumeRepositories(Args.Spec).
+	TTCVolumeFDs []int
 	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
 	MountTarOnExitFDs      []int
 	MountTarOnExitReadyFDs []int
@@ -673,6 +684,34 @@ func New(args Args) (*Loader, error) {
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
 	}
+	volumeConfigs, err := specutils.TTCVolumeRepositories(args.Spec)
+	if err != nil {
+		return nil, err
+	}
+	if len(volumeConfigs) != len(args.TTCVolumeFDs) {
+		return nil, fmt.Errorf("got %d TTC volume FDs, want %d", len(args.TTCVolumeFDs), len(volumeConfigs))
+	}
+	l.ttcVolumeRepositories = make(map[string]ttcVolumeRepository, len(volumeConfigs))
+	keepTTCVolumeRepositories := false
+	defer func() {
+		if keepTTCVolumeRepositories {
+			return
+		}
+		for _, volume := range l.ttcVolumeRepositories {
+			_ = volume.repository.Close()
+		}
+	}()
+	for i, volumeConfig := range volumeConfigs {
+		donated := os.NewFile(uintptr(args.TTCVolumeFDs[i]), "ttc-volume-"+volumeConfig.Source)
+		repository, err := ttcvolume.OpenRepositoryFD(donated, ttcvolume.CopyMode(volumeConfig.CopyMode))
+		donated.Close()
+		if err != nil {
+			return nil, fmt.Errorf("opening TTC volume repository for source %q: %w", volumeConfig.Source, err)
+		}
+		l.ttcVolumeRepositories[volumeConfig.Source] = ttcVolumeRepository{
+			config: volumeConfig, repository: repository,
+		}
+	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
 		return nil, err
@@ -819,6 +858,7 @@ func New(args Args) (*Loader, error) {
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
+		VolumeBranchScope:              l.sandboxID,
 	})
 
 	if err := registerFilesystems(l.k, &l.root); err != nil {
@@ -903,6 +943,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("starting control server: %w", err)
 	}
 
+	keepTTCVolumeRepositories = true
 	return l, nil
 }
 
@@ -1044,6 +1085,9 @@ func (l *Loader) Destroy() {
 	if l.root.devGoferFD != nil {
 		_ = l.root.devGoferFD.Close()
 	}
+	for _, volume := range l.ttcVolumeRepositories {
+		_ = volume.repository.Close()
+	}
 	for i := range l.finalMountExports {
 		_ = l.finalMountExports[i].archive.Close()
 		_ = l.finalMountExports[i].ready.Close()
@@ -1165,6 +1209,7 @@ func (l *Loader) installSeccompFilters() error {
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
 			TimeTravelNetworkNAT:  l.root.conf.Network == config.NetworkTimeTravel && l.root.conf.TimeTravelNetworkNAT,
 			HostFilesystem:        l.root.conf.DirectFS,
+			TTCVolume:             len(l.ttcVolumeRepositories) != 0,
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,

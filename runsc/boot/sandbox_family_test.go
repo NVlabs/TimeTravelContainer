@@ -26,6 +26,23 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
+	first := &SandboxFamily{volumeBranchScope: "sandbox-a"}
+	second := &SandboxFamily{volumeBranchScope: "sandbox-b"}
+	if got, want := first.volumeBranchID("child"), first.volumeBranchID("child"); got != want {
+		t.Fatalf("volume branch ID is not deterministic: got %q, want %q", got, want)
+	}
+	if first.volumeBranchID("child") == first.volumeBranchID("other") {
+		t.Fatal("distinct visible branch IDs collided")
+	}
+	if first.volumeBranchID("child") == second.volumeBranchID("child") {
+		t.Fatal("identically named branches in distinct sandboxes collided")
+	}
+	if got := (&SandboxFamily{}).volumeBranchID("child"); got != "child" {
+		t.Fatalf("unscoped test family branch ID=%q, want child", got)
+	}
+}
+
 func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 	stages := []SandboxForkStage{
 		SandboxForkStagePlaceholderRegistered,

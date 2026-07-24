@@ -32,6 +32,7 @@ package tmpfs
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -45,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -52,10 +54,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
 // Name is the default filesystem name.
 const Name = "tmpfs"
+
+// DiskVolumeName is TTC's persistent disk-backed managed-volume filesystem.
+const DiskVolumeName = "ttcvol"
 
 // Mount options for tmpfs.
 const (
@@ -72,6 +78,24 @@ const (
 //
 // +stateify savable
 type FilesystemType struct{}
+
+// DiskVolumeFilesystemType implements TTC's managed-volume filesystem.
+//
+// +stateify savable
+type DiskVolumeFilesystemType struct{}
+
+// DiskVolumeOptions configures a persistent managed-volume mount.
+type DiskVolumeOptions struct {
+	Repository *ttcvolume.Repository
+	Branch     string
+}
+
+// +stateify savable
+type diskVolumeState struct {
+	ResourceID checkpoint.ResourceID
+	Branch     string
+	Repository *ttcvolume.Repository `state:"nosave"`
+}
 
 // filesystem implements vfs.FilesystemImpl.
 //
@@ -136,6 +160,9 @@ type filesystem struct {
 
 	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
 	ovlWhiteout *deviceFile
+
+	// diskVolume is non-nil for TTC-managed persistent volumes.
+	diskVolume *diskVolumeState
 }
 
 // AllocatedBytes returns the logical number of bytes allocated by this tmpfs.
@@ -150,8 +177,16 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Name implements vfs.FilesystemType.Name.
+func (DiskVolumeFilesystemType) Name() string {
+	return DiskVolumeName
+}
+
 // Release implements vfs.FilesystemType.Release.
 func (FilesystemType) Release(ctx context.Context) {}
+
+// Release implements vfs.FilesystemType.Release.
+func (DiskVolumeFilesystemType) Release(ctx context.Context) {}
 
 // FilesystemOpts is used to pass configuration data to tmpfs.
 //
@@ -197,6 +232,10 @@ type FilesystemOpts struct {
 	// TarWrite.
 	SourceTar             io.ReadCloser
 	SourceTarFSCheckpoint bool
+
+	// DiskVolume selects TTC's persistent repository for namespace metadata
+	// and regular-file contents.
+	DiskVolume *DiskVolumeOptions `state:"nosave"`
 }
 
 // Amount of total physical RAM, in bytes. It is immutable after initialization.
@@ -232,6 +271,17 @@ func getDefaultInodeLimit(disable bool) uint64 {
 	}
 
 	return totalHostMem / hostarch.PageSize / 2
+}
+
+// GetFilesystem implements vfs.FilesystemType.GetFilesystem.
+func (fstype DiskVolumeFilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+	tmpfsOpts, ok := opts.InternalData.(FilesystemOpts)
+	if !ok || tmpfsOpts.DiskVolume == nil {
+		return nil, nil, linuxerr.EINVAL
+	}
+	tmpfsOpts.FilesystemType = &fstype
+	opts.InternalData = tmpfsOpts
+	return FilesystemType{}.GetFilesystem(ctx, vfsObj, creds, source, opts)
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -414,34 +464,61 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		allowXattrPrefix: allowXattrPrefix,
 		liveForkFiles:    make(map[*regularFile]struct{}),
 	}
+	if tmpfsOptsOk && tmpfsOpts.DiskVolume != nil {
+		if tmpfsOpts.DiskVolume.Repository == nil {
+			return nil, nil, errors.New("ttcvol requires a repository")
+		}
+		branch := tmpfsOpts.DiskVolume.Branch
+		if branch == "" {
+			branch = ttcvolume.MainBranch
+		}
+		info := tmpfsOpts.DiskVolume.Repository.Info()
+		fs.diskVolume = &diskVolumeState{
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID},
+			Branch:     branch,
+			Repository: tmpfsOpts.DiskVolume.Repository,
+		}
+	}
 	fs.vfsfs.Init(vfsObj, newFSType, &fs)
 	if tmpfsOptsOk && tmpfsOpts.MaxFilenameLen > 0 {
 		fs.maxFilenameLen = tmpfsOpts.MaxFilenameLen
 	}
 
 	var root *dentry
-	switch rootFileType {
-	case linux.S_IFREG:
-		inode, err := fs.newRegularFile(rootKUID, rootKGID, rootMode, nil /* parentDir */)
-		if err != nil {
-			return nil, nil, err
+	if fs.diskVolume != nil {
+		if rootFileType != linux.S_IFDIR {
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, errors.New("ttcvol root must be a directory")
 		}
-		root = fs.newDentry(inode)
-	case linux.S_IFLNK:
-		inode, err := fs.newSymlink(rootKUID, rootKGID, rootMode, tmpfsOpts.RootSymlinkTarget, nil /* parentDir */)
+		root, err = fs.loadDiskVolume(ctx)
 		if err != nil {
-			return nil, nil, err
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, fmt.Errorf("loading TTC volume %q branch %q: %w", fs.diskVolume.ResourceID.Path, fs.diskVolume.Branch, err)
 		}
-		root = fs.newDentry(inode)
-	case linux.S_IFDIR:
-		dirInode, err := fs.newDirectory(rootKUID, rootKGID, rootMode, nil /* parentDir */)
-		if err != nil {
-			return nil, nil, err
+	} else {
+		switch rootFileType {
+		case linux.S_IFREG:
+			inode, err := fs.newRegularFile(rootKUID, rootKGID, rootMode, nil /* parentDir */)
+			if err != nil {
+				return nil, nil, err
+			}
+			root = fs.newDentry(inode)
+		case linux.S_IFLNK:
+			inode, err := fs.newSymlink(rootKUID, rootKGID, rootMode, tmpfsOpts.RootSymlinkTarget, nil /* parentDir */)
+			if err != nil {
+				return nil, nil, err
+			}
+			root = fs.newDentry(inode)
+		case linux.S_IFDIR:
+			dirInode, err := fs.newDirectory(rootKUID, rootKGID, rootMode, nil /* parentDir */)
+			if err != nil {
+				return nil, nil, err
+			}
+			root = &dirInode.dentry
+		default:
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 		}
-		root = &dirInode.dentry
-	default:
-		fs.vfsfs.DecRef(ctx)
-		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 	}
 	fs.root = root
 
@@ -469,7 +546,19 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // LiveForkFilesystemEligibility implements vfs.FilesystemImplLiveForkExtension.
-func (*filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	if fs.diskVolume != nil {
+		return vfs.LiveForkFilesystemEligibility{
+			// The repository descriptor is physically shared, but the mounted
+			// filesystem is logically cloned: PrepareSave publishes a distinct
+			// branch root and regular-file objects pass through first-writer
+			// CoW before either branch may modify them.
+			Decision:       vfs.LiveForkFilesystemClone,
+			StableIdentity: fs.diskVolume.ResourceID.String(),
+			SourceClass:    "ttc-managed-volume",
+			Reason:         "persistent namespace root and regular-file objects are branch copy-on-write",
+		}
+	}
 	return vfs.LiveForkFilesystemEligibility{Decision: vfs.LiveForkFilesystemClone, Reason: "Sentry-owned tmpfs state is cloned with MemoryFile page CoW"}
 }
 
@@ -764,6 +853,10 @@ func (i *inode) decRef(ctx context.Context) {
 			}
 		case *regularFile:
 			impl.inode.fs.unregisterLiveForkFile(impl)
+			if i.fs.diskVolume != nil {
+				impl.diskMmap.MappableRelease()
+				break
+			}
 			// Release memory used by regFile to store data. Since regFile is
 			// no longer usable, we don't need to grab any locks or update any
 			// metadata.
@@ -938,6 +1031,9 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.
 		i.ctime.Store(now)
 	}
 
+	if i.fs.diskVolume != nil {
+		return i.fs.persistDiskMetadata(i)
+	}
 	return nil
 }
 
@@ -1057,7 +1153,10 @@ func (i *inode) setXattr(creds *auth.Credentials, opts *vfs.SetXattrOptions) err
 	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
 		return err
 	}
-	return i.xattrs.SetXattr(creds, mode, kuid, kgid, opts)
+	if err := i.xattrs.SetXattr(creds, mode, kuid, kgid, opts); err != nil {
+		return err
+	}
+	return i.fs.persistDiskMetadata(i)
 }
 
 func (i *inode) removeXattr(creds *auth.Credentials, name string) error {
@@ -1070,7 +1169,10 @@ func (i *inode) removeXattr(creds *auth.Credentials, name string) error {
 	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
 		return err
 	}
-	return i.xattrs.RemoveXattr(creds, mode, kuid, name)
+	if err := i.xattrs.RemoveXattr(creds, mode, kuid, name); err != nil {
+		return err
+	}
+	return i.fs.persistDiskMetadata(i)
 }
 
 // fileDescription is embedded by tmpfs implementations of
@@ -1132,9 +1234,14 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	return fd.dentry().inode.removeXattr(auth.CredentialsFromContext(ctx), name)
 }
 
-// Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all
-// filesystem state is in-memory.
-func (*fileDescription) Sync(context.Context) error {
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (fd *fileDescription) Sync(context.Context) error {
+	if fs := fd.filesystem(); fs.diskVolume != nil {
+		if _, ok := fd.inode().impl.(*regularFile); ok {
+			return fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, fd.inode().ino, false)
+		}
+		return fs.diskVolume.Repository.SyncMetadata()
+	}
 	return nil
 }
 

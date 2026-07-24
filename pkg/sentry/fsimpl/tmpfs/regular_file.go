@@ -20,6 +20,7 @@ import (
 	"io"
 	"math"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -86,6 +87,11 @@ type regularFile struct {
 	// Protected by dataMu.
 	seals uint32
 
+	// diskMmap maps the current persistent volume object. It is rebuilt after
+	// restore and replaced whenever branch-generation CoW selects a new object.
+	diskMmap   fsutil.MmapCachedFile `state:"nosave"`
+	diskObject string                `state:"nosave"`
+
 	// initiallyUnlinked is true if this file was created using NewZeroFile or
 	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
 	// be true when the equivalent shmem file in Linux would use
@@ -111,6 +117,9 @@ func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.
 	file := &regularFile{
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
+	}
+	if fs.diskVolume != nil {
+		file.diskMmap.SetFD(-1)
 	}
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
@@ -139,6 +148,10 @@ func (fs *filesystem) unregisterLiveForkFile(file *regularFile) {
 // afterLoad is invoked by stateify.
 func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	rf.inode.fs.registerLiveForkFile(rf)
+	if rf.inode.fs.diskVolume != nil {
+		rf.diskMmap.SetFD(-1)
+		rf.diskObject = ""
+	}
 	if !pgalloc.IsLiveForkClone(ctx) {
 		return
 	}
@@ -155,12 +168,52 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 func (rf *regularFile) prepareLiveFork() {
 	rf.mapsMu.Lock()
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	if rf.inode.fs.diskVolume != nil {
+		rf.mapsMu.Unlock()
+		return
+	}
 	rf.dataMu.Lock()
 	rf.cow.RemoveAll()
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		rf.cow.Insert(rf.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
 	}
 	rf.dataMu.Unlock()
+	rf.mapsMu.Unlock()
+}
+
+// ensureDiskMmapLocked opens a branch-private object and installs it as the
+// backing for future translations.
+//
+// Preconditions: rf.mapsMu is locked.
+func (rf *regularFile) ensureDiskMmapLocked() error {
+	volume := rf.inode.fs.diskVolume
+	file, meta, _, err := volume.Repository.OpenDataFile(volume.Branch, rf.inode.ino, true)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if rf.diskObject == meta.Object && rf.diskMmap.FD() >= 0 {
+		return nil
+	}
+	newFD, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		return err
+	}
+	if err := rf.diskMmap.ReplaceFD(newFD); err != nil {
+		unix.Close(newFD)
+		return err
+	}
+	rf.diskObject = meta.Object
+	return nil
+}
+
+// invalidateDiskObject revokes application translations after another write
+// path caused repository object CoW. The next fault lazily installs the new
+// object FD.
+func (rf *regularFile) invalidateDiskObject() {
+	rf.mapsMu.Lock()
+	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	rf.diskObject = ""
 	rf.mapsMu.Unlock()
 }
 
@@ -287,6 +340,9 @@ func (rf *regularFile) truncate(newSize uint64) error {
 		return err
 	}
 	rf.inode.touchCMtimeLocked()
+	if rf.inode.fs.diskVolume != nil {
+		return rf.inode.fs.persistDiskMetadata(&rf.inode)
+	}
 	return nil
 }
 
@@ -311,6 +367,29 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 	oldSize := rf.size.RacyLoad()
 	if newSize == oldSize {
 		// Nothing to do.
+		return nil
+	}
+	if rf.inode.fs.diskVolume != nil {
+		if newSize > oldSize {
+			if rf.seals&linux.F_SEAL_GROW != 0 {
+				return linuxerr.EPERM
+			}
+		} else if rf.seals&linux.F_SEAL_SHRINK != 0 {
+			return linuxerr.EPERM
+		}
+		cloned, err := rf.inode.fs.diskVolume.Repository.Truncate(rf.inode.fs.diskVolume.Branch, rf.inode.ino, int64(newSize))
+		if err != nil {
+			return err
+		}
+		rf.size.Store(newSize)
+		rf.mapsMu.Lock()
+		if cloned {
+			rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+			rf.diskObject = ""
+		} else if newSize < oldSize {
+			rf.mappings.Invalidate(memmap.MappableRange{offsetPageEnd(int64(newSize)), offsetPageEnd(int64(oldSize))}, memmap.InvalidateOpts{InvalidatePrivate: true})
+		}
+		rf.mapsMu.Unlock()
 		return nil
 	}
 
@@ -365,6 +444,11 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
 	rf.mapsMu.Lock()
 	defer rf.mapsMu.Unlock()
+	if rf.inode.fs.diskVolume != nil {
+		rf.diskMmap.AddMapping(ar, offset)
+		rf.mappings.AddMapping(ms, ar, offset, writable)
+		return nil
+	}
 	rf.dataMu.RLock()
 	defer rf.dataMu.RUnlock()
 
@@ -394,6 +478,10 @@ func (rf *regularFile) RemoveMapping(ctx context.Context, ms memmap.MappingSpace
 	defer rf.mapsMu.Unlock()
 
 	rf.mappings.RemoveMapping(ms, ar, offset, writable)
+	if rf.inode.fs.diskVolume != nil {
+		rf.diskMmap.RemoveMapping(ar, offset)
+		return
+	}
 
 	if writable {
 		pagesBefore := rf.writableMappingPages
@@ -414,6 +502,32 @@ func (rf *regularFile) CopyMapping(ctx context.Context, ms memmap.MappingSpace, 
 
 // Translate implements memmap.Mappable.Translate.
 func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	if rf.inode.fs.diskVolume != nil {
+		rf.mapsMu.Lock()
+		defer rf.mapsMu.Unlock()
+		// Privatize on the first mapping fault after a fork, including a read
+		// fault. This preserves coherent MAP_SHARED views without invalidating
+		// another MappingSpace from inside an MM fault lock.
+		if err := rf.ensureDiskMmapLocked(); err != nil {
+			return nil, &memmap.BusError{err}
+		}
+		pgend := offsetPageEnd(int64(rf.size.Load()))
+		if required.Start >= pgend {
+			return nil, &memmap.BusError{io.EOF}
+		}
+		if optional.End > pgend {
+			optional.End = pgend
+		}
+		if required.End > pgend {
+			required.End = pgend
+		}
+		return []memmap.Translation{{
+			Source: optional,
+			File:   &rf.diskMmap,
+			Offset: optional.Start,
+			Perms:  hostarch.AnyAccess,
+		}}, nil
+	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	mayHuge := rf.huge && rf.inode.fs.mf.HugepagesEnabled()
 
@@ -554,12 +668,30 @@ func (fd *regularFileFD) Release(context.Context) {
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	f := fd.inode().impl.(*regularFile)
-	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 
 	// To be consistent with Linux, inode.mu must be locked throughout.
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
 	end := offset + length
+	if end < offset {
+		return linuxerr.EFBIG
+	}
+	if f.inode.fs.diskVolume != nil {
+		cloned, err := f.inode.fs.diskVolume.Repository.Allocate(
+			f.inode.fs.diskVolume.Branch, f.inode.ino, int64(offset), int64(length))
+		if err != nil {
+			return err
+		}
+		if end > f.size.Load() {
+			f.size.Store(end)
+		}
+		if cloned {
+			f.invalidateDiskObject()
+		}
+		f.inode.touchCMtimeLocked()
+		return f.inode.fs.persistDiskMetadata(&f.inode)
+	}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	pgEnd, ok := hostarch.PageRoundUp(end)
 	if !ok {
 		return linuxerr.EFBIG
@@ -665,6 +797,51 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, nil
 	}
 	f := fd.inode().impl.(*regularFile)
+	if f.inode.fs.diskVolume != nil {
+		file, _, _, err := f.inode.fs.diskVolume.Repository.OpenDataFile(f.inode.fs.diskVolume.Branch, f.inode.ino, false)
+		if err != nil {
+			return 0, err
+		}
+		defer file.Close()
+		const maxBounce = 64 << 10
+		buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
+		var done int64
+		for dst.NumBytes() != 0 {
+			want := min(dst.NumBytes(), int64(len(buf)))
+			n, readErr := file.ReadAt(buf[:want], offset+done)
+			if n != 0 {
+				copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
+				done += int64(copied)
+				dst = dst.DropFirst(copied)
+				if copyErr != nil {
+					return done, copyErr
+				}
+				if copied != n {
+					return done, io.ErrShortWrite
+				}
+			}
+			if readErr != nil {
+				if readErr == io.EOF && done != 0 {
+					readErr = nil
+				}
+				oldAtime := f.inode.atime.Load()
+				f.inode.touchAtime(fd.vfsfd.Mount())
+				if f.inode.atime.Load() != oldAtime {
+					_ = f.inode.fs.persistDiskMetadata(&f.inode)
+				}
+				return done, readErr
+			}
+			if n == 0 {
+				return done, io.ErrNoProgress
+			}
+		}
+		oldAtime := f.inode.atime.Load()
+		f.inode.touchAtime(fd.vfsfd.Mount())
+		if f.inode.atime.Load() != oldAtime {
+			_ = f.inode.fs.persistDiskMetadata(&f.inode)
+		}
+		return done, nil
+	}
 	// memCgID can be 0 here because regularFileReadWriter.ReadToBlocks() never
 	// allocates from pgalloc.
 	rw := getRegularFileReadWriter(f, offset, 0)
@@ -727,6 +904,70 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, offset, err
 	}
 	src = src.TakeFirst64(srclen)
+
+	if f.inode.fs.diskVolume != nil {
+		file, _, cloned, err := f.inode.fs.diskVolume.Repository.OpenDataFile(
+			f.inode.fs.diskVolume.Branch, f.inode.ino, true)
+		if err != nil {
+			return 0, offset, err
+		}
+		defer file.Close()
+		if cloned {
+			f.invalidateDiskObject()
+		}
+		const maxBounce = 64 << 10
+		buf := make([]byte, min(srclen, int64(maxBounce)))
+		var done int64
+		for src.NumBytes() != 0 {
+			want := min(src.NumBytes(), int64(len(buf)))
+			n, readErr := src.TakeFirst64(want).CopyIn(ctx, buf[:want])
+			if n != 0 {
+				written, writeErr := file.WriteAt(buf[:n], offset+done)
+				done += int64(written)
+				src = src.DropFirst(written)
+				if writeErr != nil {
+					return done, offset + done, writeErr
+				}
+				if written != n {
+					return done, offset + done, io.ErrShortWrite
+				}
+			}
+			if readErr != nil {
+				return done, offset + done, readErr
+			}
+			if n == 0 {
+				return done, offset + done, io.ErrNoProgress
+			}
+		}
+		if end := uint64(offset + done); end > f.size.Load() {
+			f.size.Store(end)
+		}
+		f.inode.touchCMtimeLocked()
+		for {
+			old := f.inode.mode.Load()
+			if f.inode.mode.CompareAndSwap(old, vfs.ClearSUIDAndSGID(old)) {
+				break
+			}
+		}
+		f.inode.xattrs.KillPriv()
+		status := fd.vfsfd.StatusFlags()
+		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {
+			dataOnly := opts.Flags&linux.RWF_SYNC == 0 && status&linux.O_SYNC == 0
+			var err error
+			if dataOnly {
+				err = unix.Fdatasync(int(file.Fd()))
+			} else {
+				err = file.Sync()
+			}
+			if err != nil {
+				return done, offset + done, err
+			}
+		}
+		if err := f.inode.fs.persistDiskWriteMetadata(&f.inode); err != nil {
+			return done, offset + done, err
+		}
+		return done, offset + done, nil
+	}
 
 	// Perform the write.
 	rw := getRegularFileReadWriter(f, offset, pgalloc.MemoryCgroupIDFromContext(ctx))

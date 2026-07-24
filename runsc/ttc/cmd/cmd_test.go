@@ -3249,18 +3249,26 @@ func (b *fakeBackend) preserveRootfs(target selector) error {
 	return b.err
 }
 
-func TestManagedVolumesAreUnavailable(t *testing.T) {
-	for _, tc := range []struct {
-		volumes []string
-		mounts  []string
-	}{
-		{volumes: []string{"/cache"}},
-		{volumes: []string{"named:/cache"}},
-		{mounts: []string{"type=volume,source=named,target=/cache"}},
-	} {
-		if _, err := parseMountRequests(tc.volumes, tc.mounts, nil); err == nil || !strings.Contains(err.Error(), "temporarily unavailable") {
-			t.Fatalf("parseMountRequests(%q, %q) error=%v, want managed-volume unavailable error", tc.volumes, tc.mounts, err)
-		}
+func TestManagedVolumeMountParsing(t *testing.T) {
+	request, err := parseMountRequests(
+		[]string{"/anonymous", "named:/cache:ro,nocopy"},
+		[]string{"type=volume,source=long,target=/long,readonly"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(request.managed) != 3 {
+		t.Fatalf("managed volumes=%+v, want three", request.managed)
+	}
+	if got := request.managed[0]; !got.Anonymous || got.Destination != "/anonymous" {
+		t.Errorf("anonymous short volume=%+v", got)
+	}
+	if got := request.managed[1]; got.Name != "named" || got.Destination != "/cache" || !got.Readonly || !got.NoCopy {
+		t.Errorf("named short volume=%+v", got)
+	}
+	if got := request.managed[2]; got.Name != "long" || got.Destination != "/long" || !got.Readonly {
+		t.Errorf("long volume=%+v", got)
 	}
 }
 

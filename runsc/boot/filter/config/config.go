@@ -39,6 +39,7 @@ type Options struct {
 	HostNetworkRawSockets bool
 	TimeTravelNetworkNAT  bool
 	HostFilesystem        bool
+	TTCVolume             bool
 	ProfileEnable         bool
 	NVProxy               bool
 	NVProxyCaps           nvconf.DriverCaps
@@ -68,6 +69,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "HostNetworkRawSockets=%t ", opt.HostNetworkRawSockets)
 	fmt.Fprintf(&sb, "TimeTravelNetworkNAT=%t ", opt.TimeTravelNetworkNAT)
 	fmt.Fprintf(&sb, "HostFilesystem=%t ", opt.HostFilesystem)
+	fmt.Fprintf(&sb, "TTCVolume=%t ", opt.TTCVolume)
 	fmt.Fprintf(&sb, "ProfileEnable=%t ", opt.ProfileEnable)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "NVProxy=%t ", opt.NVProxy)
@@ -94,6 +96,9 @@ func Warnings(opt Options) []string {
 	}
 	if opt.HostFilesystem {
 		warnings = append(warnings, "host filesystem enabled: syscall filters less restrictive!")
+	}
+	if opt.TTCVolume {
+		warnings = append(warnings, "TTC managed volumes enabled: syscall filters permit access through donated repository descriptors")
 	}
 	if isInstrumentationEnabled() {
 		warnings = append(warnings, "instrumentation enabled: syscall filters less restrictive!")
@@ -153,6 +158,9 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	}
 	if opt.HostFilesystem {
 		s.Merge(hostFilesystemFilters())
+	}
+	if opt.TTCVolume {
+		s.Merge(ttcVolumeFilters())
 	}
 	if opt.NVProxy {
 		s.Merge(nvproxy.Filters(opt.NVProxyCaps))

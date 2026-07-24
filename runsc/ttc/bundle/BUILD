@@ -14,6 +14,7 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/ttcvolume",
         "//runsc/specutils",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
@@ -23,6 +24,7 @@ go_library(
         "@com_github_moby_sys_user//:user",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
         "@com_github_opencontainers_runtime_spec//specs-go",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -31,4 +33,8 @@ go_test(
     size = "small",
     srcs = ["spec_test.go"],
     library = ":bundle",
+    deps = [
+        "//pkg/ttcvolume",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )

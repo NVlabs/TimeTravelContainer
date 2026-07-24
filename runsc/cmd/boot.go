@@ -105,6 +105,9 @@ type Boot struct {
 	// overlayfs mount for certain gofer mounts.
 	goferFilestoreFDs sandboxsetup.IntFlags
 
+	// ttcVolumeFDs are repository directory FDs for TTC-managed volumes.
+	ttcVolumeFDs sandboxsetup.IntFlags
+
 	// mountTarOnExitFDs and markers are ordered final snapshot outputs.
 	mountTarOnExitFDs      sandboxsetup.IntFlags
 	mountTarOnExitReadyFDs sandboxsetup.IntFlags
@@ -274,6 +277,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
 	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
+	f.Var(&b.ttcVolumeFDs, "ttc-volume-fds", "ordered TTC managed-volume repository directory FDs")
 	f.Var(&b.mountTarOnExitFDs, "mount-tar-on-exit-fds", "ordered final tar output FDs for shared mounts")
 	f.Var(&b.mountTarOnExitReadyFDs, "mount-tar-on-exit-ready-fds", "ordered completion marker FDs for final shared mount tar outputs")
 	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
@@ -625,6 +629,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		FSRestoreFDs:             b.fsRestoreFDs.GetFDs(),
 		FSRestoreCheckpointGofer: b.fsRestoreCheckpointGofer,
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
+		TTCVolumeFDs:             b.ttcVolumeFDs.GetArray(),
 		MountTarOnExitFDs:        b.mountTarOnExitFDs.GetArray(),
 		MountTarOnExitReadyFDs:   b.mountTarOnExitReadyFDs.GetArray(),
 	}

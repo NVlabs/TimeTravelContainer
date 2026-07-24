@@ -77,6 +77,10 @@ const (
 	AnnotationMountTarOnExit       = "dev.timetravelcontainer.tar.mounts.on-exit"
 	legacyAnnotationMountTarOnExit = "dev.timetravelos.tar.mounts.on-exit"
 
+	// AnnotationTTCVolumeRepositories maps ttcvol mount sources to host
+	// repository directories donated to the Sentry.
+	AnnotationTTCVolumeRepositories = "dev.timetravelcontainer.volume-repositories"
+
 	// RootfsMountTarSource is the reserved source key used to export the root
 	// filesystem through AnnotationMountTarOnExit.
 	RootfsMountTarSource       = "dev.timetravelcontainer.rootfs"
@@ -289,6 +293,21 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		if strings.HasPrefix(annotation, mountHintPrefix) && strings.HasSuffix(annotation, ".source") && source != "" {
 			spec.Annotations[annotation] = absPath(bundleDir, source)
 		}
+	}
+	if encoded := spec.Annotations[AnnotationTTCVolumeRepositories]; encoded != "" {
+		var repositories []TTCVolumeRepository
+		if err := json.Unmarshal([]byte(encoded), &repositories); err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationTTCVolumeRepositories, err)
+		}
+		for i := range repositories {
+			repositories[i].Source = absPath(bundleDir, repositories[i].Source)
+			repositories[i].Path = absPath(bundleDir, repositories[i].Path)
+		}
+		normalized, err := json.Marshal(repositories)
+		if err != nil {
+			return fmt.Errorf("normalizing %s: %w", AnnotationTTCVolumeRepositories, err)
+		}
+		spec.Annotations[AnnotationTTCVolumeRepositories] = string(normalized)
 	}
 	encodedMountTarOnExit := spec.Annotations[AnnotationMountTarOnExit]
 	if encodedMountTarOnExit == "" {
@@ -956,6 +975,50 @@ func RootfsTarUpperPath(spec *specs.Spec) string {
 type MountTarOnExitTarget struct {
 	Path      string `json:"path"`
 	ReadyPath string `json:"ready_path"`
+}
+
+// TTCVolumeRepository describes one repository directory donated for a ttcvol
+// mount. Source matches the OCI mount source and Path is never exposed inside
+// the sandbox.
+type TTCVolumeRepository struct {
+	Source   string `json:"source"`
+	Path     string `json:"path"`
+	Branch   string `json:"branch"`
+	CopyMode string `json:"copy_mode"`
+}
+
+// TTCVolumeRepositories parses and validates persistent-volume donations in
+// deterministic source order.
+func TTCVolumeRepositories(spec *specs.Spec) ([]TTCVolumeRepository, error) {
+	if spec == nil || spec.Annotations == nil || spec.Annotations[AnnotationTTCVolumeRepositories] == "" {
+		return nil, nil
+	}
+	var repositories []TTCVolumeRepository
+	if err := json.Unmarshal([]byte(spec.Annotations[AnnotationTTCVolumeRepositories]), &repositories); err != nil {
+		return nil, fmt.Errorf("decoding %s: %w", AnnotationTTCVolumeRepositories, err)
+	}
+	seen := make(map[string]bool, len(repositories))
+	for _, repository := range repositories {
+		if repository.Source == "" || repository.Path == "" || repository.Branch == "" {
+			return nil, fmt.Errorf("%s contains an empty source, path, or branch", AnnotationTTCVolumeRepositories)
+		}
+		if !filepath.IsAbs(repository.Path) {
+			return nil, fmt.Errorf("%s repository path %q must be absolute", AnnotationTTCVolumeRepositories, repository.Path)
+		}
+		if seen[repository.Source] {
+			return nil, fmt.Errorf("%s contains duplicate source %q", AnnotationTTCVolumeRepositories, repository.Source)
+		}
+		seen[repository.Source] = true
+		switch repository.CopyMode {
+		case "reflink", "full-copy":
+		default:
+			return nil, fmt.Errorf("%s source %q has invalid copy mode %q", AnnotationTTCVolumeRepositories, repository.Source, repository.CopyMode)
+		}
+	}
+	sort.Slice(repositories, func(i, j int) bool {
+		return repositories[i].Source < repositories[j].Source
+	})
+	return repositories, nil
 }
 
 // MountTarOnExitPath associates one shared mount with a guest destination and host outputs.
