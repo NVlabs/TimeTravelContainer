@@ -477,7 +477,7 @@ Failure handling:
 As of 2026-07-19, the implementation spans the documented Phase 0-7 slices on
 systrap. Kernel metadata streams through an in-memory pipe; branches share the
 platform and eligible MemoryFile pages; visible PIDs and register state are
-preserved; and private anonymous memory, tmpfs, SysV SHM, managed volumes, and
+preserved; and private anonymous memory, tmpfs, SysV SHM, and
 the in-memory OverlayFS upper detach copy-on-write. Focused tests cover
 bidirectional writes, application write faults, recursive branch trees, and
 arbitrary release order, while real multithreaded Python measurements confirm

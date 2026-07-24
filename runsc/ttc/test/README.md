@@ -18,8 +18,8 @@ covers:
 - Docker-compatible 64-hex container IDs from `create` and detached `run`,
   distinct persisted names, 12-character `ps` IDs, and lifecycle lookup by
   exact name, full ID, and unambiguous ID prefix;
-- Docker-compatible foreground and detached `run --rm`, including anonymous-volume
-  cleanup, plus persisted `create --rm` cleanup after a later detached start;
+- Docker-compatible foreground and detached `run --rm`, plus persisted
+  `create --rm` cleanup after a later detached start;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
   configuration, persistent immutable branch lineage and deletion tombstones,
@@ -28,10 +28,9 @@ covers:
   fork-rejection diagnostics;
 - Docker-style `container` aliases, multi-container detached `start`, concurrent
   `wait` with argument-ordered exit codes, restart of an exited container, and
-  an explicitly forced running-family restart where in-memory managed-volume
-  contents are expected to be recreated; writable-rootfs upper-layer state,
-  including shutdown-handler writes, is exported on main exit and restored by
-  a later start;
+  an explicitly forced running-family restart; writable-rootfs upper-layer
+  state, including shutdown-handler writes, is exported on main exit and
+  restored by a later start;
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
@@ -54,8 +53,8 @@ covers:
 - Docker `--shm-size` parsing, OCI tmpfs sizing, inspect persistence, restart
   retention, and identical capacity in both sides of a live fork;
 - Docker `--read-only` rootfs persistence through restart and live fork,
-  including write rejection in both branches while custom tmpfs and managed
-  volumes remain writable;
+  including write rejection in both branches while custom tmpfs remains
+  writable;
 - image `STOPSIGNAL` inheritance plus Docker `--stop-signal` and
   `--stop-timeout` inspect persistence, graceful-stop delivery, and final exit-code reconciliation;
 - Docker `--pids-limit` OCI and inspect persistence, Sentry-side process and
@@ -72,15 +71,15 @@ covers:
   sides of a live fork;
 - Docker-style custom tmpfs mode/size plus alternate private procfs and
   restricted sysfs mounts, including inspect projection and restart retention;
-- anonymous `-v CONTAINER[:OPTIONS]` and source-less `--mount type=volume`,
-  Docker-style 64-hex volume identities, image `VOLUME` materialization, initial
-  image-tree copy-up with `volume-nocopy` opt-out, `rm -v` cleanup, and
-  branch-local CoW behavior after a live fork;
+- explicit rejection of named/anonymous `-v` and `--mount type=volume`, image
+  `VOLUME` declarations, and `ttc volume` commands while the removed
+  tmpfs-plus-tar implementation is replaced by the disk-backed reflink CoW
+  design;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;
-- Redis image ownership fidelity for its `999:1000` image-declared `/data`
-  volume while physical rootfs files remain caller-owned;
+- Redis startup with its image-declared `/data` volume explicitly replaced by
+  a UID/GID-configured tmpfs, while physical rootfs files remain caller-owned;
 - immediate-exit console integrity with 256 KiB on each of stdout and stderr,
   verified in both foreground output and persistent logs;
 - detached output and bounded multi-generation logs;
@@ -97,16 +96,7 @@ covers:
 - attached exec fork rejection while imported host stdio is live, successful
   fork after the imported resource exits, and detached exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
-- managed-volume and user tmpfs copy-on-write isolation between a parent and
-  child branch, including persisted `volume create --opt size=BYTES` quotas and
-  independent quota enforcement after live fork, `volume inspect --usage
-  CONTAINER[@BRANCH]` assertions for branch-local logical-byte divergence, and
-  branch-selected `volume export` tar isolation, atomic `volume commit` of a
-  selected live branch, teardown and restoration into a new sandbox family,
-  validated `volume import`, replacement-seed semantics, and automatic
-  pause/commit/resume preservation across Docker-style restart, and validated
-  atomic preservation of normal-exit plus shutdown-handler writes into a fresh
-  sandbox family;
+- user tmpfs copy-on-write isolation between a parent and child branch;
 - tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
   the source-read-lock versus CoW-invalidation-write-lock ordering that loaded
   Chromium exercises;
@@ -118,7 +108,7 @@ covers:
 - explicit managed OverlayFS host submounts, immutable-lower protection, inspect
   and fork diagnostics, parent/child/grandchild CoW divergence, and continued
   operation after deletion of the source branch;
-- graceful stop, branch removal, container removal, and volume removal.
+- graceful stop, branch removal, and container removal.
 
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default

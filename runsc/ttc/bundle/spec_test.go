@@ -30,7 +30,6 @@ import (
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/runsc/specutils"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -96,10 +95,6 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 			{Type: "proc", Destination: "/alt-proc", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 			{Type: "sysfs", Destination: "/alt-sys", Readonly: true, Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		},
-		ManagedVolumes: []ManagedVolume{
-			{Name: "cache", Destination: "/cache", QuotaBytes: 65536},
-			{Name: "cache", Destination: "/cache-ro", Readonly: true, QuotaBytes: 65536},
-		},
 	})
 	if err != nil {
 		t.Fatalf("BuildSpec: %v", err)
@@ -144,8 +139,6 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 		{Destination: "/alt-proc", Type: "proc", Source: "proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		{Destination: "/alt-sys", Type: "sysfs", Source: "sysfs", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
 		{Destination: "/mnt/fixture", Type: "bind", Source: host, Options: []string{"rbind", "ro"}},
-		{Destination: "/cache", Type: "tmpfs", Source: "ttc-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755", "size=65536"}},
-		{Destination: "/cache-ro", Type: "tmpfs", Source: "ttc-volume-cache", Options: []string{"ro", "nosuid", "nodev", "mode=0755", "size=65536"}},
 	}
 	if !reflect.DeepEqual(spec.Mounts, wantMounts) {
 		t.Errorf("mounts=%+v, want %+v", spec.Mounts, wantMounts)
@@ -192,18 +185,6 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	}
 	if got := spec.Annotations[PidsLimitAnnotation]; got != "sentry" {
 		t.Errorf("pids enforcement annotation=%q, want sentry", got)
-	}
-	wantVolumeAnnotations := map[string]string{
-		"dev.gvisor.spec.mount.ttc0.source":  "ttc-volume-cache",
-		"dev.gvisor.spec.mount.ttc0.share":   "container",
-		"dev.gvisor.spec.mount.ttc0.type":    "tmpfs",
-		"dev.gvisor.spec.mount.ttc0.options": "rw,nosuid,nodev,mode=0755,size=65536",
-		"dev.gvisor.spec.mount.ttc0.copyup":  "true",
-	}
-	for key, want := range wantVolumeAnnotations {
-		if got := spec.Annotations[key]; got != want {
-			t.Errorf("annotation %q=%q, want %q", key, got, want)
-		}
 	}
 	wantConfigAnnotations := map[string]string{
 		"dev.timetravelcontainer.config.entrypoint": `["/entry"]`,
@@ -529,15 +510,6 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: missing, Destination: "/data", Readonly: true}}}); err == nil {
 		t.Error("BuildSpec accepted missing host source")
 	}
-	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ManagedVolumes: []ManagedVolume{{Name: "-bad", Destination: "/data"}}}); err == nil {
-		t.Error("BuildSpec accepted invalid managed volume name")
-	}
-	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "relative"}}}); err == nil {
-		t.Error("BuildSpec accepted relative managed volume destination")
-	}
-	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{{Source: host, Destination: "/data", Readonly: true}}, ManagedVolumes: []ManagedVolume{{Name: "data", Destination: "/data"}}}); err == nil {
-		t.Error("BuildSpec accepted duplicate host/managed destination")
-	}
 	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), FilesystemMounts: []FilesystemMount{{Type: "ramfs", Destination: "/data"}}}); err == nil {
 		t.Error("BuildSpec accepted unsupported filesystem mount type")
 	}
@@ -587,6 +559,24 @@ func TestBuildSpecRejectsInvalidOverrides(t *testing.T) {
 	}
 	if unlimitedSpec.Linux.Resources != nil || unlimitedSpec.Annotations[PidsLimitAnnotation] != "" {
 		t.Errorf("unlimited pids unexpectedly enabled enforcement: resources=%+v annotation=%q", unlimitedSpec.Linux.Resources, unlimitedSpec.Annotations[PidsLimitAnnotation])
+	}
+}
+
+func TestBuildSpecRejectsUnimplementedImageVolumes(t *testing.T) {
+	image := ocispec.Image{Config: ocispec.ImageConfig{
+		Cmd:     []string{"true"},
+		Volumes: map[string]struct{}{"/data": {}},
+	}}
+	if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "temporarily unavailable") {
+		t.Fatalf("BuildSpec image volume error=%v, want unavailable error", err)
+	}
+	if _, err := BuildSpec(image, SpecOptions{
+		RootFS: t.TempDir(),
+		FilesystemMounts: []FilesystemMount{{
+			Type: "tmpfs", Destination: "/data", Options: []string{"rw"},
+		}},
+	}); err != nil {
+		t.Fatalf("BuildSpec with explicit replacement mount: %v", err)
 	}
 }
 
@@ -1009,182 +999,6 @@ func TestContainerIdentityResolution(t *testing.T) {
 	}
 }
 
-func TestVolumeStoreLifecycle(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	created, err := store.EnsureVolumeWithQuota("cache", 65536)
-	if err != nil {
-		t.Fatalf("EnsureVolume: %v", err)
-	}
-	again, err := store.EnsureVolume("cache")
-	if err != nil {
-		t.Fatalf("second EnsureVolume: %v", err)
-	}
-	if created != again || created.Driver != "local-tmpfs" || created.QuotaBytes != 65536 {
-		t.Errorf("idempotent volume metadata: first=%+v second=%+v", created, again)
-	}
-	if _, err := store.EnsureVolumeWithQuota("cache", 32768); err == nil {
-		t.Fatal("EnsureVolumeWithQuota accepted a conflicting quota")
-	}
-	volumes, err := store.ListVolumes()
-	if err != nil || len(volumes) != 1 || volumes[0].Name != "cache" {
-		t.Fatalf("ListVolumes=%+v, err=%v", volumes, err)
-	}
-
-	containerDir := filepath.Join(root, "containers", "demo")
-	bundleDir := filepath.Join(containerDir, "bundle")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-		Name:      "demo",
-		BundleDir: bundleDir,
-		State:     "created",
-		CreatedAt: time.Now(),
-		Volumes:   []ManagedVolume{{Name: "cache", Destination: "/cache"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.RemoveVolume("cache"); err == nil {
-		t.Fatal("RemoveVolume accepted a volume referenced by a container")
-	}
-	if err := store.RemoveContainer("demo"); err != nil {
-		t.Fatalf("RemoveContainer: %v", err)
-	}
-	if err := store.RemoveVolume("cache"); err != nil {
-		t.Fatalf("RemoveVolume: %v", err)
-	}
-	if volumes, err := store.ListVolumes(); err != nil || len(volumes) != 0 {
-		t.Fatalf("volumes after remove=%+v, err=%v", volumes, err)
-	}
-}
-
-func TestVolumeSnapshotImportIsAtomicAndValidated(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	if _, err := store.CreateVolume("cache"); err != nil {
-		t.Fatalf("CreateVolume: %v", err)
-	}
-	writeTar := func(path, name, contents string) {
-		t.Helper()
-		file, err := os.Create(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		writer := tar.NewWriter(file)
-		if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(contents))}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := writer.Write([]byte(contents)); err != nil {
-			t.Fatal(err)
-		}
-		if err := writer.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := file.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	good := filepath.Join(root, "good.tar")
-	writeTar(good, "./state", "branch-state")
-	if err := store.ImportVolumeSnapshot("cache", good); err != nil {
-		t.Fatalf("ImportVolumeSnapshot: %v", err)
-	}
-	info, err := store.LoadVolume("cache")
-	if err != nil {
-		t.Fatalf("LoadVolume: %v", err)
-	}
-	if info.SnapshotBytes == 0 || info.SnapshotUpdatedAt == nil {
-		t.Fatalf("snapshot metadata=%+v", info)
-	}
-	snapshot, err := store.VolumeSnapshotPath("cache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := os.ReadFile(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bad := filepath.Join(root, "bad.tar")
-	writeTar(bad, "../escape", "rejected")
-	if err := store.ImportVolumeSnapshot("cache", bad); err == nil {
-		t.Fatal("ImportVolumeSnapshot accepted an escaping archive entry")
-	}
-	got, err := os.ReadFile(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Error("rejected import replaced the prior snapshot")
-	}
-}
-
-func TestFinalizeVolumeExitSnapshots(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	if _, err := store.CreateVolume("cache"); err != nil {
-		t.Fatal(err)
-	}
-	containerDir := filepath.Join(root, "containers", "demo")
-	bundleDir := filepath.Join(containerDir, "bundle")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Root: &specs.Root{Path: "/rootfs"}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-		ID: "demo", Name: "demo", BundleDir: bundleDir, CreatedAt: time.Now(),
-		Volumes: []ManagedVolume{{Name: "cache", Destination: "/cache"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	pending, ready, err := store.VolumeExitSnapshotPaths("demo", "cache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.Create(pending)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := tar.NewWriter(file)
-	contents := "shutdown-state"
-	if err := writer.WriteHeader(&tar.Header{Name: "./state", Mode: 0644, Size: int64(len(contents))}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.Write([]byte(contents)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(ready, []byte("complete\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.FinalizeVolumeExitSnapshots("demo"); err != nil {
-		t.Fatalf("FinalizeVolumeExitSnapshots: %v", err)
-	}
-	info, err := store.LoadVolume("cache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.SnapshotUpdatedAt == nil || info.SnapshotBytes == 0 {
-		t.Fatalf("snapshot metadata=%+v", info)
-	}
-	if _, err := os.Stat(pending); !os.IsNotExist(err) {
-		t.Errorf("pending archive remains: %v", err)
-	}
-	if _, err := os.Stat(ready); !os.IsNotExist(err) {
-		t.Errorf("ready marker remains: %v", err)
-	}
-}
-
 func TestFinalizeRootfsExitSnapshot(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
@@ -1243,117 +1057,6 @@ func TestFinalizeRootfsExitSnapshot(t *testing.T) {
 	}
 	if _, err := os.Stat(ready); !os.IsNotExist(err) {
 		t.Errorf("rootfs ready marker remains: %v", err)
-	}
-}
-
-func TestRefreshVolumeSeeds(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	if _, err := store.CreateVolume("cache"); err != nil {
-		t.Fatalf("CreateVolume: %v", err)
-	}
-	snapshot, err := store.VolumeSnapshotPath("cache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.Create(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tar.NewWriter(file).Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	containerDir := filepath.Join(root, "containers", "demo")
-	bundleDir := filepath.Join(containerDir, "bundle")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	spec := specs.Spec{
-		Root:   &specs.Root{Path: "/rootfs"},
-		Mounts: []specs.Mount{{Source: "ttc-volume-cache", Destination: "/cache"}},
-		Annotations: map[string]string{
-			"dev.gvisor.spec.mount.ttc0.source": "ttc-volume-cache",
-			"dev.gvisor.spec.mount.ttc0.copyup": "true",
-		},
-	}
-	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
-		Volumes: []ManagedVolume{{Name: "cache", Destination: "/cache"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	rootfsSnapshot, err := store.RootfsSnapshotPath("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootfsFile, err := os.Create(rootfsSnapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tar.NewWriter(rootfsFile).Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rootfsFile.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.RefreshVolumeSeeds("demo"); err != nil {
-		t.Fatalf("RefreshVolumeSeeds: %v", err)
-	}
-	updated, err := store.LoadSpec("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var seeds map[string]string
-	if err := json.Unmarshal([]byte(updated.Annotations[specutils.AnnotationMountTar]), &seeds); err != nil {
-		t.Fatalf("decoding mount seeds: %v", err)
-	}
-	if got := seeds["ttc-volume-cache"]; got != snapshot {
-		t.Errorf("seed path=%q, want %q", got, snapshot)
-	}
-	if got := updated.Annotations[specutils.AnnotationRootfsUpperTar]; got != rootfsSnapshot {
-		t.Errorf("rootfs seed path=%q, want %q", got, rootfsSnapshot)
-	}
-	if got := updated.Annotations["dev.gvisor.spec.mount.ttc0.copyup"]; got != "" {
-		t.Errorf("seeded volume retained copyup=%q", got)
-	}
-	var exitTargets map[string]specutils.MountTarOnExitTarget
-	if err := json.Unmarshal([]byte(updated.Annotations[specutils.AnnotationMountTarOnExit]), &exitTargets); err != nil {
-		t.Fatalf("decoding final mount targets: %v", err)
-	}
-	pending, ready, err := store.VolumeExitSnapshotPaths("demo", "cache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := exitTargets["ttc-volume-cache"], (specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}); got != want {
-		t.Errorf("final mount target=%+v, want %+v", got, want)
-	}
-	rootPending, rootReady, err := store.RootfsExitSnapshotPaths("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := exitTargets[specutils.RootfsMountTarSource], (specutils.MountTarOnExitTarget{Path: rootPending, ReadyPath: rootReady}); got != want {
-		t.Errorf("final rootfs target=%+v, want %+v", got, want)
-	}
-}
-
-func TestBuildSpecVolumeSeed(t *testing.T) {
-	seed := filepath.Join(t.TempDir(), "snapshot.tar")
-	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{
-		RootFS:         t.TempDir(),
-		ManagedVolumes: []ManagedVolume{{Name: "cache", Destination: "/cache", SeedTar: seed}},
-	})
-	if err != nil {
-		t.Fatalf("BuildSpec: %v", err)
-	}
-	want := fmt.Sprintf(`{"ttc-volume-cache":%q}`, seed)
-	if got := spec.Annotations[specutils.AnnotationMountTar]; got != want {
-		t.Errorf("mount tar annotation=%q, want %q", got, want)
 	}
 }
 
@@ -1420,67 +1123,6 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	}
 	if _, err := store.RemoveImageRoots(""); err == nil {
 		t.Fatal("RemoveImageRoots accepted an empty digest")
-	}
-}
-
-func TestResolveManagedVolumesIncludesImageDeclarations(t *testing.T) {
-	store := Store{Root: t.TempDir()}
-	image := ocispec.Image{Config: ocispec.ImageConfig{Volumes: map[string]struct{}{
-		"/image-data": {}, "/override": {}, "/dev": {},
-	}}}
-	resolved, err := store.resolveManagedVolumes(image, SpecOptions{
-		ManagedVolumes: []ManagedVolume{{Name: "named", Destination: "/override", NoCopy: true}},
-	})
-	if err != nil {
-		t.Fatalf("resolveManagedVolumes: %v", err)
-	}
-	if len(resolved) != 2 {
-		t.Fatalf("resolved volumes=%+v, want explicit plus image volume", resolved)
-	}
-	if got := resolved[0]; got.Name != "named" || got.Destination != "/override" || got.Anonymous || !got.NoCopy {
-		t.Errorf("explicit volume=%+v", got)
-	}
-	got := resolved[1]
-	if got.Destination != "/image-data" || !got.Anonymous || got.NoCopy {
-		t.Errorf("image volume=%+v", got)
-	}
-	if len(got.Name) != 2*volumeIDBytes {
-		t.Fatalf("anonymous name length=%d, want %d", len(got.Name), 2*volumeIDBytes)
-	}
-	if _, err := hex.DecodeString(got.Name); err != nil {
-		t.Errorf("anonymous name %q is not hexadecimal: %v", got.Name, err)
-	}
-}
-
-func TestBuildSpecVolumeNoCopy(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "data"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(root, "data"), 0750); err != nil {
-		t.Fatal(err)
-	}
-	manifest := ownership.NewManifest()
-	manifest.Entries["."] = ownership.Owner{}
-	manifest.Entries["data"] = ownership.Owner{UID: 999, GID: 1000}
-	if err := ownership.Write(ownership.ManifestPath(root), manifest); err != nil {
-		t.Fatal(err)
-	}
-	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{
-		RootFS: root, ManagedVolumes: []ManagedVolume{{Name: "empty", Destination: "/data", NoCopy: true}},
-	})
-	if err != nil {
-		t.Fatalf("BuildSpec: %v", err)
-	}
-	if got := spec.Annotations["dev.gvisor.spec.mount.ttc0.copyup"]; got != "" {
-		t.Errorf("volume-nocopy emitted copyup annotation %q", got)
-	}
-	wantOptions := "rw,nosuid,nodev,mode=0750,uid=999,gid=1000"
-	if got := spec.Annotations["dev.gvisor.spec.mount.ttc0.options"]; got != wantOptions {
-		t.Errorf("volume master options=%q, want %q", got, wantOptions)
-	}
-	if got := strings.Join(spec.Mounts[len(spec.Mounts)-1].Options, ","); got != wantOptions {
-		t.Errorf("volume mount options=%q, want %q", got, wantOptions)
 	}
 }
 

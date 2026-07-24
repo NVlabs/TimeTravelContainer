@@ -164,9 +164,6 @@ type containerInfo struct {
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
 
-	// mountTarFDs are tar seeds keyed by shared mount source.
-	mountTarFDs map[string]*fd.FD
-
 	// useCPUNums indicates whether to use platform assigned CPU numbers as CPU numbers in the sentry.
 	useCPUNums bool
 }
@@ -465,8 +462,6 @@ type Args struct {
 	// RootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	RootfsUpperTarFD int
-	// MountTarFDs are ordered according to specutils.MountTarPaths(Args.Spec).
-	MountTarFDs []int
 	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
 	MountTarOnExitFDs      []int
 	MountTarOnExitReadyFDs []int
@@ -677,17 +672,6 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("rootfs upper tar file is mutually exclusive with filesystem checkpoint restore")
 		}
 		l.root.rootfsUpperTarFD = fd.New(args.RootfsUpperTarFD)
-	}
-	mountTarPaths, err := specutils.MountTarPaths(args.Spec)
-	if err != nil {
-		return nil, err
-	}
-	if len(mountTarPaths) != len(args.MountTarFDs) {
-		return nil, fmt.Errorf("got %d mount tar FDs, want %d", len(args.MountTarFDs), len(mountTarPaths))
-	}
-	l.root.mountTarFDs = make(map[string]*fd.FD, len(mountTarPaths))
-	for i, seed := range mountTarPaths {
-		l.root.mountTarFDs[seed.Source] = fd.New(args.MountTarFDs[i])
 	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
@@ -1059,9 +1043,6 @@ func (l *Loader) Destroy() {
 	}
 	if l.root.devGoferFD != nil {
 		_ = l.root.devGoferFD.Close()
-	}
-	for _, f := range l.root.mountTarFDs {
-		_ = f.Close()
 	}
 	for i := range l.finalMountExports {
 		_ = l.finalMountExports[i].archive.Close()

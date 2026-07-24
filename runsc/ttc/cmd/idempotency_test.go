@@ -123,20 +123,20 @@ func TestResolveDaemonMutationIsExplicitAndNeverReexecutes(t *testing.T) {
 	id := fmt.Sprintf("%032x", 42)
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: id,
-		Options: daemonWireOptions{DataRoot: root}, Args: []string{"volume", "create", "important"},
+		Options: daemonWireOptions{DataRoot: root}, Args: []string{"image", "rm", "important"},
 	}
 	record, replay, err := beginDaemonMutation(root, request)
 	if err != nil || replay {
 		t.Fatalf("beginDaemonMutation()=(%+v, %t, %v)", record, replay, err)
 	}
-	if got := strings.Join(record.Command, " "); got != "volume create important" {
+	if got := strings.Join(record.Command, " "); got != "image rm important" {
 		t.Fatalf("recorded command=%q", got)
 	}
-	record, err = resolveDaemonMutation(root, id, "succeeded", "verified volume metadata")
+	record, err = resolveDaemonMutation(root, id, "succeeded", "verified image metadata")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != "completed" || record.Status != 0 || record.Resolution != "succeeded" || record.Note != "verified volume metadata" {
+	if record.State != "completed" || record.Status != 0 || record.Resolution != "succeeded" || record.Note != "verified image metadata" {
 		t.Fatalf("resolved record=%+v", record)
 	}
 	if !strings.Contains(string(record.Stderr), "not re-executed") {

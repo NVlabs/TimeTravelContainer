@@ -39,10 +39,6 @@ container_id_valid() {
   esac
 }
 
-volume_used_bytes() {
-  ttc volume inspect --usage "$1" "$2" | grep used_bytes | tr -cd "0123456789"
-}
-
 [ -n "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
@@ -93,22 +89,11 @@ VNET="$PREFIX-vnet"
 DAEMON_STOP="$PREFIX-daemon-stop"
 STOP_POLICY="$PREFIX-stop-policy"
 PIDS_LIMIT="$PREFIX-pids-limit"
-ANON_VOLUME="$PREFIX-anon-volume"
-ANON_NOCOPY="$PREFIX-anon-nocopy"
 HOSTNET_PORT=$((20000 + ($$ % 30000)))
 NAT_FIXTURE_PORT=$((20000 + (($$ + 1000) % 30000)))
 PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
 CHILD_PUBLISHED_PORT=$((20000 + (($$ + 3000) % 30000)))
 NAT_FIXTURE_PID=
-VOLUME="$PREFIX-state"
-QUOTA_VOLUME="$PREFIX-quota"
-QUOTA_CONTAINER="$PREFIX-quota-container"
-QUOTA_RESTORED="$PREFIX-quota-restored"
-QUOTA_IMPORTED="$PREFIX-quota-imported"
-NATURAL_VOLUME="$PREFIX-natural-exit"
-NATURAL_WRITER="$PREFIX-natural-writer"
-NATURAL_READER="$PREFIX-natural-reader"
-
 ttc() {
   "$TTC" \
     --data-root "$DATA_ROOT" \
@@ -139,10 +124,9 @@ ttc_daemon_crash() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$ANON_VOLUME" "$ANON_NOCOPY" "$QUOTA_CONTAINER" "$QUOTA_RESTORED" "$QUOTA_IMPORTED" "$NATURAL_WRITER" "$NATURAL_READER" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
     ttc rm --force "$container" >/dev/null 2>&1 || true
   done
-  ttc volume rm "$VOLUME" "$QUOTA_VOLUME" "$NATURAL_VOLUME" >/dev/null 2>&1 || true
   ttc daemon stop >/dev/null 2>&1 || true
   if [ -n "$NAT_FIXTURE_PID" ]; then
     kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
@@ -181,10 +165,8 @@ ttc run --rm --pull always --name "$AUTO_FOREGROUND" "$BUSYBOX_IMAGE" true
 if ttc inspect "$AUTO_FOREGROUND" >/dev/null 2>&1; then
   fail "foreground --rm retained its container"
 fi
-AUTO_DETACHED_ID=$(ttc run --rm --detach --name "$AUTO_DETACHED" --volume /auto "$BUSYBOX_IMAGE" sh -c "sleep 2")
+AUTO_DETACHED_ID=$(ttc run --rm --detach --name "$AUTO_DETACHED" "$BUSYBOX_IMAGE" sh -c "sleep 2")
 container_id_valid "$AUTO_DETACHED_ID" || fail "detached --rm returned invalid ID: $AUTO_DETACHED_ID"
-AUTO_DETACHED_VOLUME=$(ttc inspect -f "{{(index .Mounts 0).Name}}" "$AUTO_DETACHED_ID")
-container_id_valid "$AUTO_DETACHED_VOLUME" || fail "detached --rm generated invalid anonymous volume name: $AUTO_DETACHED_VOLUME"
 [ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED_ID")" = true ] ||
   fail "inspect omitted detached auto-remove policy"
 deadline=$(( $(date +%s) + 15 ))
@@ -192,9 +174,6 @@ while ttc inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached --rm did not remove its container"
   sleep 1
 done
-if ttc volume inspect "$AUTO_DETACHED_VOLUME" >/dev/null 2>&1; then
-  fail "detached --rm retained its anonymous volume"
-fi
 AUTO_CREATED_ID=$(ttc create --rm --name "$AUTO_CREATED" "$BUSYBOX_IMAGE" sh -c "sleep 1")
 [ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED_ID")" = true ] ||
   fail "create --rm did not persist its policy"
@@ -257,31 +236,17 @@ ttc image inspect "$BUSYBOX_IMAGE" |
   grep -q '"Materialized": true' ||
   fail "image inspection did not report the materialized BusyBox root"
 
-echo "== anonymous Docker volumes and live-fork isolation =="
-ttc run --name "$ANON_VOLUME" --detach --volume /etc "$BUSYBOX_IMAGE" sh -c 'test -s /etc/passwd; echo parent >/etc/branch; sleep 300' >/dev/null
-ANON_NAME=$(ttc inspect -f "{{(index .Mounts 0).Name}}" "$ANON_VOLUME")
-container_id_valid "$ANON_NAME" || fail "anonymous volume name is not a 64-character ID: $ANON_NAME"
-[ "$(ttc inspect -f '{{(index .Mounts 0).Type}}|{{(index .Mounts 0).Destination}}' "$ANON_VOLUME")" = "volume|/etc" ] ||
-  fail "anonymous short volume was not exposed through Docker inspect"
-ttc exec "$ANON_VOLUME" sh -c 'test -s /etc/passwd; test "$(cat /etc/branch)" = parent' || fail "anonymous volume did not copy image contents"
-ttc fork "$ANON_VOLUME" "$ANON_VOLUME@child" >/dev/null
-ttc exec "$ANON_VOLUME@child" sh -c 'test -s /etc/passwd; echo child >/etc/branch'
-[ "$(ttc exec "$ANON_VOLUME" cat /etc/branch)" = parent ] || fail "anonymous-volume child write leaked into parent"
-[ "$(ttc exec "$ANON_VOLUME@child" cat /etc/branch)" = child ] || fail "anonymous-volume child write was not retained"
-if ttc rm --volumes "$ANON_VOLUME" >"$TTC_E2E_ROOT/descendant-rm.out" 2>"$TTC_E2E_ROOT/descendant-rm.err"; then
-  fail "unforced rm accepted a live family with a descendant"
+echo "== obsolete managed-volume surface is rejected =="
+if ttc run --name "$PREFIX-volume-rejected" --volume /etc "$BUSYBOX_IMAGE" true >"$TTC_E2E_ROOT/volume.out" 2>"$TTC_E2E_ROOT/volume.err"; then
+  fail "anonymous volume unexpectedly used the removed tmpfs driver"
 fi
-grep -q "stop it or use --force" "$TTC_E2E_ROOT/descendant-rm.err" ||
-  fail "unforced descendant removal lacked a force diagnostic"
-ttc rm --force --volumes "$ANON_VOLUME"
-if ttc volume inspect "$ANON_NAME" >/dev/null 2>&1; then
-  fail "rm --volumes retained an anonymous volume"
+grep -q "disk-backed reflink CoW driver" "$TTC_E2E_ROOT/volume.err" ||
+  fail "anonymous-volume rejection omitted the replacement-driver diagnostic"
+if ttc volume create cache >"$TTC_E2E_ROOT/volume-command.out" 2>"$TTC_E2E_ROOT/volume-command.err"; then
+  fail "volume create unexpectedly used the removed tmpfs driver"
 fi
-
-ttc run --name "$ANON_NOCOPY" --volume /etc:volume-nocopy "$BUSYBOX_IMAGE" sh -c 'test ! -e /etc/passwd'
-NOCOPY_NAME=$(ttc inspect -f "{{(index .Mounts 0).Name}}" "$ANON_NOCOPY")
-container_id_valid "$NOCOPY_NAME" || fail "volume-nocopy generated invalid anonymous volume name"
-ttc rm -v "$ANON_NOCOPY"
+grep -q "disk-backed reflink CoW driver" "$TTC_E2E_ROOT/volume-command.err" ||
+  fail "volume-command rejection omitted the replacement-driver diagnostic"
 
 ttc container create --name "$MULTI_A" "$BUSYBOX_IMAGE" sh -c 'exit 3'
 ttc container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
@@ -460,14 +425,11 @@ ttc create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 ttc start --attach "$PREFIX-nginx"
 ttc rm "$PREFIX-nginx"
 
-ttc run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
+ttc run --name "$PREFIX-redis" --tmpfs /data:mode=0750,uid=999,gid=1000 "$REDIS_IMAGE" sh -c \
   'test "$(stat -c %u:%g /data)" = 999:1000 && echo redis-owner-ok'
-REDIS_VOLUME=$(ttc inspect -f '{{(index .Mounts 0).Name}}|{{(index .Mounts 0).Destination}}' "$PREFIX-redis")
-case "$REDIS_VOLUME" in
-  *"|/data") ;;
-  *) fail "Redis image VOLUME was not materialized: $REDIS_VOLUME" ;;
-esac
-ttc rm --volumes "$PREFIX-redis"
+[ "$(ttc inspect -f '{{index .HostConfig.Tmpfs "/data"}}' "$PREFIX-redis")" = "mode=0750,uid=999,gid=1000" ] ||
+  fail "Redis image VOLUME was not explicitly replaced by tmpfs"
+ttc rm "$PREFIX-redis"
 
 echo "== persisted stop signal and timeout policy =="
 ttc run --name "$STOP_POLICY" --detach --stop-signal SIGUSR1 --stop-timeout 3 \
@@ -539,56 +501,7 @@ grep -q "does not support reading" "$TTC_E2E_ROOT/nolog.err" ||
   fail "none log-driver rejection lacked a compatibility diagnostic"
 ttc rm --force "$NOLOG"
 
-echo "== natural-exit managed-volume preservation =="
-ttc volume create "$NATURAL_VOLUME"
-ttc run --name "$NATURAL_WRITER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'if [ -e /rootfs-before ]; then test "$(cat /rootfs-before)" = before-exit; test "$(cat /rootfs-final)" = shutdown-handler; exit; fi; trap "echo shutdown-handler >/natural/final; echo shutdown-handler >/rootfs-final" EXIT; echo before-exit >/natural/before; echo before-exit >/rootfs-before'
-ttc volume inspect "$NATURAL_VOLUME" | grep -q '"snapshot_bytes":' || fail "natural exit did not publish managed-volume snapshot metadata"
-ttc start "$NATURAL_WRITER" || fail "natural-exit restart did not restore writable rootfs state"
-ttc run --name "$NATURAL_READER" --mount "type=volume,source=$NATURAL_VOLUME,destination=/natural,volume-nocopy" "$BUSYBOX_IMAGE" sh -c 'test "$(cat /natural/before)" = before-exit; test "$(cat /natural/final)" = shutdown-handler'
-ttc rm "$NATURAL_WRITER" "$NATURAL_READER"
-ttc volume rm "$NATURAL_VOLUME"
-
-echo "== managed-volume quota enforcement across live fork =="
-ttc volume create --opt size=64k "$QUOTA_VOLUME"
-ttc run --detach --name "$QUOTA_CONTAINER" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota,volume-nocopy" "$BUSYBOX_IMAGE" sh -c "sleep 300" >/dev/null
-ttc exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/base bs=4096 count=15 2>/dev/null"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "initial managed-volume usage is incorrect"
-ttc fork "$QUOTA_CONTAINER" child
-[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "fork changed parent managed-volume usage"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 61440 ] || fail "fork did not clone child managed-volume usage"
-ttc exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/child bs=4096 count=1 2>/dev/null"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 61440 ] || fail "child write changed parent managed-volume usage"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "child managed-volume usage did not diverge"
-ttc volume export --output "$TTC_E2E_ROOT/quota-parent.tar" "$QUOTA_CONTAINER" "$QUOTA_VOLUME" >/dev/null
-ttc volume export --output "$TTC_E2E_ROOT/quota-child.tar" "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME" >/dev/null
-if tar -tf "$TTC_E2E_ROOT/quota-parent.tar" | grep -qx './child'; then
-  fail "child-only file leaked into parent volume export"
-fi
-tar -tf "$TTC_E2E_ROOT/quota-child.tar" | grep -qx './child' || fail "child volume export omitted child-only file"
-[ "$(tar -xOf "$TTC_E2E_ROOT/quota-child.tar" ./child | wc -c)" -eq 4096 ] || fail "child volume export serialized incorrect file data"
-ttc exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/parent bs=4096 count=1 2>/dev/null"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER" "$QUOTA_VOLUME")" = 65536 ] || fail "parent managed-volume usage did not advance independently"
-[ "$(volume_used_bytes "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME")" = 65536 ] || fail "parent write changed child managed-volume usage"
-if ttc exec "$QUOTA_CONTAINER@child" sh -c "dd if=/dev/zero of=/quota/overflow bs=4096 count=1 2>/dev/null"; then
-  fail "child managed-volume quota was not enforced"
-fi
-if ttc exec "$QUOTA_CONTAINER" sh -c "dd if=/dev/zero of=/quota/overflow bs=4096 count=1 2>/dev/null"; then
-  fail "parent managed-volume quota was not enforced"
-fi
-[ "$(ttc exec "$QUOTA_CONTAINER" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "parent managed-volume quota size is incorrect"
-[ "$(ttc exec "$QUOTA_CONTAINER@child" sh -c 'df -k /quota | tail -n 1 | xargs | cut -d" " -f2')" = 64 ] || fail "child managed-volume quota size is incorrect"
-ttc volume commit "$QUOTA_CONTAINER@child" "$QUOTA_VOLUME" >/dev/null
-ttc volume inspect "$QUOTA_VOLUME" | grep -q '"snapshot_bytes":' || fail "volume commit did not publish snapshot metadata"
-ttc rm --force "$QUOTA_CONTAINER"
-ttc run --name "$QUOTA_RESTORED" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota" "$BUSYBOX_IMAGE" sh -c 'test -f /quota/child; test ! -e /quota/parent; test "$(wc -c </quota/child)" -eq 4096'
-ttc rm "$QUOTA_RESTORED"
-ttc volume import --input "$TTC_E2E_ROOT/quota-parent.tar" "$QUOTA_VOLUME" >/dev/null
-ttc run --name "$QUOTA_IMPORTED" --mount "type=volume,source=$QUOTA_VOLUME,destination=/quota" "$BUSYBOX_IMAGE" sh -c 'test -f /quota/base; test ! -e /quota/child; test ! -e /quota/parent'
-ttc rm "$QUOTA_IMPORTED"
-ttc volume rm "$QUOTA_VOLUME"
-
-echo "== detached lifecycle, managed-volume CoW, and live fork =="
-ttc volume create "$VOLUME"
+echo "== detached lifecycle, tmpfs CoW, and live fork =="
 LIFECYCLE_ID=$(ttc run --name "$LIFECYCLE" --detach --read-only \
   --ulimit nofile=256:256 \
   --shm-size 32m \
@@ -598,8 +511,7 @@ LIFECYCLE_ID=$(ttc run --name "$LIFECYCLE" --detach --read-only \
   --env-file "$ENV_FILE" --env FROM_FILE=lifecycle \
   --label-file "$LABEL_FILE" --label suite=lifecycle \
   --log-driver json-file --log-opt max-size=64k --log-opt max-file=3 --log-opt labels=suite --log-opt env=FROM_FILE \
-  --volume "$VOLUME:/state" \
-  --volume "$VOLUME:/state-view:ro" \
+  --tmpfs /state:mode=0755 \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly,immutable-source" \
   --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host,cow,immutable-source" \
@@ -611,7 +523,7 @@ LIFECYCLE_ID=$(ttc run --name "$LIFECYCLE" --detach --read-only \
   --mount type=sysfs,target=/repeat-sys,readonly \
   --mount type=sysfs,target=/nested/views/sys,readonly \
   "$ALPINE_IMAGE" sh -c \
-  'grep -Eq "^192\.0\.2\.10[[:space:]]+ttc\.local$" /etc/hosts; grep -Eq "^2001:db8::10[[:space:]]+v6\.local$" /etc/hosts; grep -qx "nameserver 203.0.113.53" /etc/resolv.conf; grep -qx "search example.test" /etc/resolv.conf; grep -qx "options ndots:2" /etc/resolv.conf; echo parent >/state/value; echo scratch-parent >/scratch/value; test "$(cat /cow-host/value)" = host-cow-lower; echo parent >/cow-host/value; echo parent-created >/cow-host/created; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /state-view/value; test -r /alt-proc/self/status; test -r /repeat-proc/1/status; test -r /nested/views/proc/self/status; test -r /alt-sys/kernel; test -r /repeat-sys/kernel; test -r /nested/views/sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
+  'grep -Eq "^192\.0\.2\.10[[:space:]]+ttc\.local$" /etc/hosts; grep -Eq "^2001:db8::10[[:space:]]+v6\.local$" /etc/hosts; grep -qx "nameserver 203.0.113.53" /etc/resolv.conf; grep -qx "search example.test" /etc/resolv.conf; grep -qx "options ndots:2" /etc/resolv.conf; echo parent >/state/value; echo scratch-parent >/scratch/value; test "$(cat /cow-host/value)" = host-cow-lower; echo parent >/cow-host/value; echo parent-created >/cow-host/created; id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]; test -r /alt-proc/self/status; test -r /repeat-proc/1/status; test -r /nested/views/proc/self/status; test -r /alt-sys/kernel; test -r /repeat-sys/kernel; test -r /nested/views/sys/kernel; i=0; while :; do echo "tick:$i"; i=$((i+1)); sleep 1; done')
 container_id_valid "$LIFECYCLE_ID" || fail "detached run returned invalid container ID: $LIFECYCLE_ID"
 LIFECYCLE_PREFIX=$(printf %.16s "$LIFECYCLE_ID")
 LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
@@ -664,7 +576,6 @@ while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q "tick:"; do
   sleep 1
 done
 
-ttc exec "$LIFECYCLE" touch /state/restart-persist
 ttc container restart --force --time 2 "$LIFECYCLE"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
@@ -674,11 +585,6 @@ done
 
 ttc exec "$LIFECYCLE" grep -qx "$LIFECYCLE" /etc/hostname ||
   fail "restarted container did not retain /etc/hostname"
-ttc exec "$LIFECYCLE" test -f /state/restart-persist ||
-  fail "automatic restart preservation lost managed-volume state"
-ttc volume inspect "$VOLUME" | grep -q '"snapshot_bytes":' ||
-  fail "automatic restart preservation did not publish volume snapshot metadata"
-
 ttc exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" ||
   fail "restarted container did not retain generated network files"
 
@@ -708,11 +614,7 @@ echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environ
 if ttc exec "$LIFECYCLE" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&1; then
   fail "read-only root filesystem accepted a parent write"
 fi
-[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent managed volume was not initialized"
-[ "$(ttc exec "$LIFECYCLE" cat /state-view/value)" = "parent" ] || fail "read-only managed-volume alias did not share parent contents"
-if ttc exec "$LIFECYCLE" sh -c "echo forbidden >/state-view/value" >/dev/null 2>&1; then
-  fail "read-only managed-volume alias accepted a parent write"
-fi
+[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent state tmpfs was not initialized"
 [ "$(ttc exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
 [ "$(ttc exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "managed overlay did not retain the parent copy-up"
 [ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "managed overlay modified its immutable host lower"
@@ -723,7 +625,6 @@ ttc exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/k
 for path in /repeat-proc/1/status /nested/views/proc/self/status /repeat-sys/kernel /nested/views/sys/kernel; do
   ttc exec "$LIFECYCLE" test -r "$path" || fail "nested or repeated pseudo-filesystem path $path was not readable"
 done
-ttc exec "$LIFECYCLE" grep -Eq " /state-view ro(,| )" /proc/self/mountinfo || fail "read-only managed-volume alias lost its bind-style remount flag"
 ttc exec "$LIFECYCLE" grep -Eq " /host-fixture ro(,| )" /proc/self/mountinfo || fail "read-only host bind lost its remount flag"
 ttc exec "$LIFECYCLE" awk '$5 == "/nested/views/proc" { split($6, options, ","); for (i in options) seen[options[i]] = 1; exit !(seen["ro"] && seen["nosuid"] && seen["nodev"] && seen["noexec"]) } END { if (!seen["ro"]) exit 1 }' /proc/self/mountinfo || fail "nested procfs mount flags were not retained"
 [ "$(ttc exec "$LIFECYCLE" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"
@@ -765,7 +666,6 @@ ttc exec "$LIFECYCLE@child" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff:
 for path in /repeat-proc/1/status /nested/views/proc/self/status /repeat-sys/kernel /nested/views/sys/kernel; do
   ttc exec "$LIFECYCLE@child" test -r "$path" || fail "live-forked child lost pseudo-filesystem path $path"
 done
-ttc exec "$LIFECYCLE@child" grep -Eq " /state-view ro(,| )" /proc/self/mountinfo || fail "live-forked child lost read-only volume alias flags"
 
 ttc exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf" || fail "parent branch lost generated network files"
 ttc exec "$LIFECYCLE@child" sh -c "grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" || fail "live-forked child lost generated network files"
@@ -780,7 +680,6 @@ echo "$LIFECYCLE_ENV" | grep -qx 'FROM_FILE=lifecycle' || fail "forked-container
 echo "$LIFECYCLE_ENV" | grep -qx 'TTC_E2E_HOST_IMPORT=host-import' || fail "forked-container inspect omitted imported host environment"
 INSPECT_JSON="$TTC_E2E_ROOT/lifecycle-inspect.json"
 ttc inspect --format json "$LIFECYCLE" >"$INSPECT_JSON"
-grep -q "\"Name\":\"$VOLUME\"" "$INSPECT_JSON" || fail "inspect omitted the managed volume"
 grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the read-only host bind"
 grep -q "\"Source\":\"$HOST_FIXTURE_TWO\"" "$INSPECT_JSON" || fail "inspect omitted the second read-only host bind"
 grep -q "\"Source\":\"$HOST_COW_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the managed CoW host lower"
@@ -814,13 +713,8 @@ ttc exec "$LIFECYCLE@child" sh -c "echo child >/cow-host/value; echo child-creat
 [ "$(ttc exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "child managed-overlay write leaked into parent"
 [ "$(ttc exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "child managed-overlay copy-up was not retained"
 [ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "child managed-overlay write reached the host lower"
-[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent managed volume"
-[ "$(ttc exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child managed-volume write was not retained"
-[ "$(ttc exec "$LIFECYCLE" cat /state-view/value)" = "parent" ] || fail "child write leaked through parent read-only volume alias"
-[ "$(ttc exec "$LIFECYCLE@child" cat /state-view/value)" = "child" ] || fail "child read-only volume alias did not follow branch-local contents"
-if ttc exec "$LIFECYCLE@child" sh -c "echo forbidden >/state-view/value" >/dev/null 2>&1; then
-  fail "read-only managed-volume alias accepted a child write"
-fi
+[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent state tmpfs"
+[ "$(ttc exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child state-tmpfs write was not retained"
 
 if ttc exec "$LIFECYCLE@child" sh -c "echo forbidden >/child-root-forbidden" >/dev/null 2>&1; then
   fail "read-only root filesystem accepted a child write"
@@ -906,7 +800,6 @@ ttc stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
   fail "inspect did not report the stopped family as exited"
 ttc branch rm "$LIFECYCLE@grandchild"
 ttc rm "$LIFECYCLE_ID"
-ttc volume rm "$VOLUME"
 
 echo "== intentional daemon stop terminates managed containers =="
 ttc run --detach --name "$DAEMON_STOP" "$BUSYBOX_IMAGE" sleep 300 >/dev/null

@@ -17,7 +17,6 @@ package boot
 import (
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -137,10 +136,6 @@ type MountHint struct {
 	// settings (like seccomp filters) that can not be selectively enabled on
 	// containers.
 	SuppressDirectFS bool `json:"suppressDirectFS"`
-
-	// CopyUp requests Docker-style population of a newly created shared tmpfs
-	// from the destination path before the mount is attached.
-	CopyUp bool `json:"copyUp"`
 }
 
 func (m *MountHint) setField(key, val string) error {
@@ -158,12 +153,6 @@ func (m *MountHint) setField(key, val string) error {
 		m.Mount.Options = specutils.FilterMountOptions(strings.Split(val, ","))
 	case "directfs":
 		return m.setDirectFS(val)
-	case "copyup":
-		copyUp, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("invalid copyup value %q: %w", val, err)
-		}
-		m.CopyUp = copyUp
 	default:
 		return fmt.Errorf("invalid mount annotation: %s=%s", key, val)
 	}

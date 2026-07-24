@@ -993,17 +993,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateLogFile("rootfs-upper-tar-fd", specutils.RootfsTarUpperPath(args.Spec), os.O_RDONLY, lfOpts); err != nil {
 		return fmt.Errorf("donating rootfs tar file: %w", err)
 	}
-	mountTarPaths, err := specutils.MountTarPaths(args.Spec)
-	if err != nil {
-		return err
-	}
-	for _, seed := range mountTarPaths {
-		file, err := os.Open(seed.Path)
-		if err != nil {
-			return fmt.Errorf("opening tar seed for mount %q: %w", seed.Source, err)
-		}
-		donations.DonateAndClose("mount-tar-fds", file)
-	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
 		return err
@@ -2128,28 +2117,6 @@ func (s *Sandbox) BranchRootfsSize(branchID, cid string) (control.RootfsSize, er
 		return control.RootfsSize{}, fmt.Errorf("getting rootfs size in live branch %q: %w", branchID, err)
 	}
 	return size, nil
-}
-
-// BranchFilesystemSize gets logical writable usage for a mounted filesystem.
-func (s *Sandbox) BranchFilesystemSize(branchID, cid, path string) (control.FilesystemSize, error) {
-	args := &boot.BranchFilesystemSizeArgs{BranchID: branchID, CID: cid, Path: path}
-	var size control.FilesystemSize
-	if err := s.call(boot.ContMgrBranchFilesystemSize, args, &size); err != nil {
-		return control.FilesystemSize{}, fmt.Errorf("getting filesystem size at %q in live branch %q: %w", path, branchID, err)
-	}
-	return size, nil
-}
-
-// BranchFilesystemTar exports writable state for a mounted filesystem.
-func (s *Sandbox) BranchFilesystemTar(branchID, cid, path string, out *os.File) error {
-	args := &boot.BranchFilesystemTarArgs{
-		BranchID: branchID, CID: cid, Path: path,
-		FilePayload: urpc.FilePayload{Files: []*os.File{out}},
-	}
-	if err := s.call(boot.ContMgrBranchFilesystemTar, args, nil); err != nil {
-		return fmt.Errorf("exporting filesystem at %q in live branch %q: %w", path, branchID, err)
-	}
-	return nil
 }
 
 // SignalBranch sends a signal within one in-memory branch.

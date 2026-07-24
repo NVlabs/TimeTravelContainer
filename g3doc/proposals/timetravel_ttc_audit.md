@@ -49,7 +49,7 @@ native-store implementation verification:
 * the complete public-image matrix with BusyBox 1.36, Alpine 3.20, Python
   3.12-alpine, nginx 1.27-alpine, and Redis 7-alpine;
 * exec, logs, attach, daemon restart, pause/resume, recursive fork, internal
-  pipes and sockets, tmpfs, managed-volume CoW, and writable overlay CoW;
+  pipes and sockets, tmpfs, and writable overlay CoW;
 * a rootless in-process `ttc0` NIC, NAT-disabled isolation, TCP/UDP user-mode
   NAT, persistent parent-bound TCP publication, and child external-flow reset;
 * the systrap `BenchmarkSandboxFamilyFork` benchmark; and
@@ -393,7 +393,7 @@ validates before mutation, and resumes it on rejection.
 Currently demonstrated as branch-local or safely cloned:
 
 * processes, threads, PID namespaces, anonymous private mappings, and memfd;
-* tmpfs, managed volumes, in-memory OverlayFS uppers, procfs, cgroupfs, devpts,
+* tmpfs, in-memory OverlayFS uppers, procfs, cgroupfs, devpts,
   restricted read-only sysfs, POSIX message queues, and namespace handles;
 * SysV shared memory;
 * anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, inotify, pidfds,

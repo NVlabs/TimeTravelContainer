@@ -26,7 +26,7 @@ var topLevelCompletionCommands = []string{
 	"attach", "branch", "completion", "container", "create", "daemon", "events", "exec", "fork",
 	"help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
 	"port", "ps", "pull", "restart", "resume", "rm", "rmi", "run", "start", "stop",
-	"top", "unpause", "volume", "wait",
+	"top", "unpause", "wait",
 }
 
 const bashCompletion = `# bash completion for ttc
@@ -225,14 +225,6 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return imageCompletionCandidates(backend)
 		}
 		return nil, nil
-	case "volume":
-		if len(rest) == 0 {
-			return []string{"commit", "create", "export", "import", "inspect", "ls", "rm"}, nil
-		}
-		if rest[0] == "inspect" || rest[0] == "rm" || rest[0] == "remove" {
-			return volumeCompletionCandidates(backend)
-		}
-		return nil, nil
 	case "branch":
 		if len(rest) == 0 {
 			return []string{"rm"}, nil
@@ -299,18 +291,6 @@ func imageCompletionCandidates(backend backend) ([]string, error) {
 		if image.Digest != "" {
 			candidates = append(candidates, image.Digest)
 		}
-	}
-	return candidates, nil
-}
-
-func volumeCompletionCandidates(backend backend) ([]string, error) {
-	volumes, err := backend.listVolumes()
-	if err != nil {
-		return nil, err
-	}
-	candidates := make([]string, 0, len(volumes))
-	for _, volume := range volumes {
-		candidates = append(candidates, volume.Name)
 	}
 	return candidates, nil
 }

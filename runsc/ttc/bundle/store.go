@@ -32,7 +32,6 @@ import (
 	"time"
 	"unicode"
 
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -43,8 +42,6 @@ import (
 const (
 	imageRootFormatVersion = "v3"
 	containerIDBytes       = 32
-	volumeIDBytes          = 32
-	volumeSnapshotFile     = "snapshot.tar"
 	rootfsSnapshotFile     = "rootfs-upper.tar"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
@@ -124,7 +121,6 @@ type ContainerInfo struct {
 	Platform           string            `json:"platform"`
 	BundleDir          string            `json:"bundle_dir"`
 	RootFS             string            `json:"rootfs"`
-	Volumes            []ManagedVolume   `json:"volumes,omitempty"`
 	Branches           []BranchInfo      `json:"branches,omitempty"`
 	NetworkMode        string            `json:"network_mode,omitempty"`
 	NetworkNAT         bool              `json:"network_nat,omitempty"`
@@ -368,30 +364,6 @@ type ConsolePaths struct {
 	PID            string
 }
 
-// VolumeUsage is branch-local logical usage for one attachment of a managed
-// volume. Repeated aliases intentionally report the same UsedBytes value.
-type VolumeUsage struct {
-	Container   string `json:"container"`
-	Branch      string `json:"branch"`
-	Destination string `json:"destination"`
-	UsedBytes   uint64 `json:"used_bytes"`
-	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
-	Readonly    bool   `json:"readonly,omitempty"`
-}
-
-// VolumeInfo is persistent metadata for a managed volume. Live contents remain in
-// Sentry tmpfs; an explicit commit or import may publish a tar seed in this store.
-// Usage is populated dynamically by volume inspect --usage and is never persisted.
-type VolumeInfo struct {
-	Name              string         `json:"name"`
-	Driver            string         `json:"driver"`
-	QuotaBytes        int64          `json:"quota_bytes,omitempty"`
-	CreatedAt         time.Time      `json:"created_at"`
-	SnapshotBytes     int64          `json:"snapshot_bytes,omitempty"`
-	SnapshotUpdatedAt *time.Time     `json:"snapshot_updated_at,omitempty"`
-	Usage             *[]VolumeUsage `json:"usage,omitempty"`
-}
-
 func cloneStringMap(values map[string]string) map[string]string {
 	if len(values) == 0 {
 		return nil
@@ -528,25 +500,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
-	opts.ManagedVolumes, err = s.resolveManagedVolumes(imageInfo.Image, opts.SpecOptions)
-	if err != nil {
-		return Prepared{}, err
-	}
-	for i := range opts.ManagedVolumes {
-		info, err := s.EnsureVolume(opts.ManagedVolumes[i].Name)
-		if err != nil {
-			return Prepared{}, err
-		}
-		opts.ManagedVolumes[i].QuotaBytes = info.QuotaBytes
-		if info.SnapshotUpdatedAt != nil {
-			snapshot, err := s.VolumeSnapshotPath(info.Name)
-			if err != nil {
-				return Prepared{}, err
-			}
-			opts.ManagedVolumes[i].SeedTar = snapshot
-			opts.ManagedVolumes[i].NoCopy = true
-		}
-	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
@@ -584,20 +537,10 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		}
 		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
 	}
-	for _, volume := range opts.ManagedVolumes {
-		if volume.Readonly {
-			continue
-		}
-		pending, ready, err := s.VolumeExitSnapshotPaths(id, volume.Name)
-		if err != nil {
-			return Prepared{}, err
-		}
-		exitTargets["ttc-volume-"+volume.Name] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
-	}
 	if len(exitTargets) != 0 {
 		encoded, err := json.Marshal(exitTargets)
 		if err != nil {
-			return Prepared{}, fmt.Errorf("encoding final managed volume snapshot paths: %w", err)
+			return Prepared{}, fmt.Errorf("encoding final rootfs snapshot path: %w", err)
 		}
 		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
 	}
@@ -630,7 +573,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		Platform:           imageInfo.Platform,
 		BundleDir:          bundleDir,
 		RootFS:             rootfs,
-		Volumes:            append([]ManagedVolume(nil), opts.ManagedVolumes...),
 		NetworkMode:        networkMode,
 		NetworkNAT:         opts.NetworkNAT,
 		NetworkIP:          opts.NetworkIP,
@@ -682,68 +624,6 @@ func randomObjectID(kind string, size int) (string, error) {
 		return "", fmt.Errorf("generating %s ID: %w", kind, err)
 	}
 	return hex.EncodeToString(data), nil
-}
-
-func (s Store) resolveManagedVolumes(image ocispec.Image, opts SpecOptions) ([]ManagedVolume, error) {
-	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
-	occupied := map[string]bool{
-		"/proc": true, "/dev": true, "/dev/pts": true, "/dev/shm": true, "/sys": true,
-	}
-	for _, mount := range opts.HostMounts {
-		occupied[filepath.Clean(mount.Destination)] = true
-	}
-	for _, mount := range opts.ManagedVolumes {
-		occupied[filepath.Clean(mount.Destination)] = true
-	}
-	for _, mount := range opts.FilesystemMounts {
-		occupied[filepath.Clean(mount.Destination)] = true
-	}
-	imageDestinations := make([]string, 0, len(image.Config.Volumes))
-	for destination := range image.Config.Volumes {
-		imageDestinations = append(imageDestinations, destination)
-	}
-	sort.Strings(imageDestinations)
-	for _, destination := range imageDestinations {
-		clean := filepath.Clean(destination)
-		if !filepath.IsAbs(clean) || clean == "/" {
-			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
-		}
-		if occupied[clean] {
-			continue
-		}
-		occupied[clean] = true
-		volumes = append(volumes, ManagedVolume{Destination: clean, Anonymous: true})
-	}
-
-	known := make(map[string]bool)
-	if existing, err := s.ListVolumes(); err != nil {
-		return nil, err
-	} else {
-		for _, volume := range existing {
-			known[volume.Name] = true
-		}
-	}
-	for i := range volumes {
-		if volumes[i].Name != "" {
-			continue
-		}
-		volumes[i].Anonymous = true
-		for attempt := 0; attempt < 100; attempt++ {
-			name, err := randomObjectID("volume", volumeIDBytes)
-			if err != nil {
-				return nil, err
-			}
-			if !known[name] {
-				volumes[i].Name = name
-				known[name] = true
-				break
-			}
-		}
-		if volumes[i].Name == "" {
-			return nil, errors.New("could not allocate a unique volume ID")
-		}
-	}
-	return volumes, nil
 }
 
 func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {
@@ -956,14 +836,11 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	return &spec, nil
 }
 
-// RefreshVolumeSeeds atomically updates a persistent OCI bundle to seed every
-// managed volume that has a committed snapshot.
-func (s Store) RefreshVolumeSeeds(name string) error {
+// RefreshRootfsSeed atomically updates a persistent OCI bundle with the last
+// writable-root snapshot.
+func (s Store) RefreshRootfsSeed(name string) error {
 	if err := s.FinalizeRootfsExitSnapshot(name); err != nil {
 		return fmt.Errorf("finalizing previous rootfs exit snapshot: %w", err)
-	}
-	if err := s.FinalizeVolumeExitSnapshots(name); err != nil {
-		return fmt.Errorf("finalizing previous managed volume exit snapshots: %w", err)
 	}
 	info, err := s.LoadContainer(name)
 	if err != nil {
@@ -992,7 +869,6 @@ func (s Store) RefreshVolumeSeeds(name string) error {
 	} else {
 		return fmt.Errorf("stating container rootfs snapshot: %w", statErr)
 	}
-	seeds := make(map[string]string)
 	exitTargets := make(map[string]specutils.MountTarOnExitTarget)
 	if spec.Root == nil || !spec.Root.Readonly {
 		pending, ready, err := s.RootfsExitSnapshotPaths(info.ID)
@@ -1001,58 +877,17 @@ func (s Store) RefreshVolumeSeeds(name string) error {
 		}
 		exitTargets[specutils.RootfsMountTarSource] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
 	}
-	for _, volume := range info.Volumes {
-		volumeInfo, err := s.LoadVolume(volume.Name)
-		if err != nil {
-			return err
-		}
-		if !volume.Readonly {
-			pending, ready, err := s.VolumeExitSnapshotPaths(info.ID, volume.Name)
-			if err != nil {
-				return err
-			}
-			exitTargets["ttc-volume-"+volume.Name] = specutils.MountTarOnExitTarget{Path: pending, ReadyPath: ready}
-		}
-		if volumeInfo.SnapshotUpdatedAt == nil {
-			continue
-		}
-		path, err := s.VolumeSnapshotPath(volume.Name)
-		if err != nil {
-			return err
-		}
-		seeds["ttc-volume-"+volume.Name] = path
-	}
-	if len(seeds) == 0 {
-		delete(spec.Annotations, specutils.AnnotationMountTar)
-	} else {
-		encoded, err := json.Marshal(seeds)
-		if err != nil {
-			return fmt.Errorf("encoding managed volume seed paths: %w", err)
-		}
-		spec.Annotations[specutils.AnnotationMountTar] = string(encoded)
-		const mountHintPrefix = "dev.gvisor.spec.mount."
-		for annotation, source := range spec.Annotations {
-			if !strings.HasPrefix(annotation, mountHintPrefix) || !strings.HasSuffix(annotation, ".source") {
-				continue
-			}
-			if _, ok := seeds[source]; !ok {
-				continue
-			}
-			prefix := strings.TrimSuffix(annotation, "source")
-			delete(spec.Annotations, prefix+"copyup")
-		}
-	}
 	if len(exitTargets) == 0 {
 		delete(spec.Annotations, specutils.AnnotationMountTarOnExit)
 	} else {
 		encoded, err := json.Marshal(exitTargets)
 		if err != nil {
-			return fmt.Errorf("encoding final managed volume snapshot paths: %w", err)
+			return fmt.Errorf("encoding final rootfs snapshot path: %w", err)
 		}
 		spec.Annotations[specutils.AnnotationMountTarOnExit] = string(encoded)
 	}
 	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
-		return fmt.Errorf("updating managed volume seeds for container %q: %w", name, err)
+		return fmt.Errorf("updating rootfs seed for container %q: %w", name, err)
 	}
 	return nil
 }
@@ -1488,79 +1323,6 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 	return statsByExec, nil
 }
 
-// CreateVolume creates metadata for a family-local managed tmpfs volume.
-func (s Store) CreateVolume(name string) (VolumeInfo, error) {
-	return s.CreateVolumeWithQuota(name, 0)
-}
-
-// CreateVolumeWithQuota creates a managed volume with an optional byte limit.
-func (s Store) CreateVolumeWithQuota(name string, quotaBytes int64) (VolumeInfo, error) {
-	if quotaBytes < 0 {
-		return VolumeInfo{}, fmt.Errorf("volume quota cannot be negative: %d", quotaBytes)
-	}
-	if err := validateVolumeName(name); err != nil {
-		return VolumeInfo{}, err
-	}
-	volumesDir := filepath.Join(s.Root, "volumes")
-	if err := os.MkdirAll(volumesDir, 0700); err != nil {
-		return VolumeInfo{}, fmt.Errorf("creating volume state root: %w", err)
-	}
-	volumeDir := filepath.Join(volumesDir, name)
-	if err := os.Mkdir(volumeDir, 0700); err != nil {
-		return VolumeInfo{}, fmt.Errorf("creating volume %q: %w", name, err)
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			os.RemoveAll(volumeDir)
-		}
-	}()
-	info := VolumeInfo{Name: name, Driver: "local-tmpfs", QuotaBytes: quotaBytes, CreatedAt: time.Now().UTC()}
-	if err := writeJSON(filepath.Join(volumeDir, "volume.json"), &info); err != nil {
-		return VolumeInfo{}, fmt.Errorf("writing volume %q metadata: %w", name, err)
-	}
-	keep = true
-	return info, nil
-}
-
-// EnsureVolume returns an existing volume or creates it idempotently.
-func (s Store) EnsureVolume(name string) (VolumeInfo, error) {
-	return s.EnsureVolumeWithQuota(name, 0)
-}
-
-// EnsureVolumeWithQuota creates a volume or validates an explicit quota on an existing one.
-func (s Store) EnsureVolumeWithQuota(name string, quotaBytes int64) (VolumeInfo, error) {
-	if quotaBytes < 0 {
-		return VolumeInfo{}, fmt.Errorf("volume quota cannot be negative: %d", quotaBytes)
-	}
-	info, err := s.LoadVolume(name)
-	if err == nil {
-		if quotaBytes > 0 && info.QuotaBytes != quotaBytes {
-			return VolumeInfo{}, fmt.Errorf("volume %q already exists with quota %d bytes", name, info.QuotaBytes)
-		}
-		return info, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return VolumeInfo{}, err
-	}
-	info, err = s.CreateVolumeWithQuota(name, quotaBytes)
-	if err == nil {
-		return info, nil
-	}
-	if errors.Is(err, os.ErrExist) {
-		return s.EnsureVolumeWithQuota(name, quotaBytes)
-	}
-	return VolumeInfo{}, err
-}
-
-// VolumeSnapshotPath returns the private persistent seed path for name.
-func (s Store) VolumeSnapshotPath(name string) (string, error) {
-	if err := validateVolumeName(name); err != nil {
-		return "", err
-	}
-	return filepath.Join(s.Root, "volumes", name, volumeSnapshotFile), nil
-}
-
 // RootfsSnapshotPath returns the private persistent upper-layer seed path for
 // a container. The image root remains immutable; this archive contains only
 // the container's writable overlay changes.
@@ -1614,7 +1376,7 @@ func (s Store) FinalizeRootfsExitSnapshot(container string) error {
 	} else if !stat.Mode().IsRegular() {
 		return fmt.Errorf("rootfs exit snapshot %q is not a regular file", pending)
 	}
-	if err := validateVolumeSnapshot(source); err != nil {
+	if err := validateTarSnapshot(source); err != nil {
 		return fmt.Errorf("validating rootfs exit snapshot: %w", err)
 	}
 	destination, err := s.RootfsSnapshotPath(info.ID)
@@ -1658,78 +1420,7 @@ func (s Store) FinalizeRootfsExitSnapshot(container string) error {
 	return nil
 }
 
-// VolumeExitSnapshotPaths returns the per-container pending archive and marker paths.
-func (s Store) VolumeExitSnapshotPaths(containerID, name string) (string, string, error) {
-	if err := validateName(containerID); err != nil {
-		return "", "", err
-	}
-	if err := validateVolumeName(name); err != nil {
-		return "", "", err
-	}
-	base := filepath.Join(s.Root, "volumes", name, ".exit-"+containerID)
-	return base + ".tar", base + ".ready", nil
-}
-
-// FinalizeVolumeExitSnapshots validates and atomically publishes completed exit archives.
-func (s Store) FinalizeVolumeExitSnapshots(container string) error {
-	info, err := s.LoadContainer(container)
-	if err != nil {
-		return err
-	}
-	seen := make(map[string]struct{})
-	for _, volume := range info.Volumes {
-		if volume.Readonly {
-			continue
-		}
-		if _, ok := seen[volume.Name]; ok {
-			continue
-		}
-		seen[volume.Name] = struct{}{}
-		pending, ready, err := s.VolumeExitSnapshotPaths(info.ID, volume.Name)
-		if err != nil {
-			return err
-		}
-		marker, err := os.ReadFile(ready)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("reading exit snapshot marker for volume %q: %w", volume.Name, err)
-		}
-		if len(marker) == 0 {
-			continue
-		}
-		if strings.TrimSpace(string(marker)) != "complete" {
-			return fmt.Errorf("invalid exit snapshot marker for volume %q", volume.Name)
-		}
-		if err := s.ImportVolumeSnapshot(volume.Name, pending); err != nil {
-			return fmt.Errorf("publishing exit snapshot for volume %q: %w", volume.Name, err)
-		}
-		if err := os.Remove(ready); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing exit snapshot marker for volume %q: %w", volume.Name, err)
-		}
-		if err := os.Remove(pending); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing pending exit snapshot for volume %q: %w", volume.Name, err)
-		}
-	}
-	return nil
-}
-
-// FinalizeAllVolumeExitSnapshots publishes completed archives from all containers.
-func (s Store) FinalizeAllVolumeExitSnapshots() error {
-	containers, err := s.ListContainers()
-	if err != nil {
-		return err
-	}
-	for _, container := range containers {
-		if err := s.FinalizeVolumeExitSnapshots(container.ID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateVolumeSnapshot(file *os.File) error {
+func validateTarSnapshot(file *os.File) error {
 	reader := tar.NewReader(file)
 	for {
 		header, err := reader.Next()
@@ -1741,142 +1432,11 @@ func validateVolumeSnapshot(file *os.File) error {
 		}
 		clean := filepath.Clean(header.Name)
 		if filepath.IsAbs(header.Name) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("archive entry %q escapes the volume root", header.Name)
+			return fmt.Errorf("archive entry %q escapes the snapshot root", header.Name)
 		}
 	}
 	_, err := file.Seek(0, io.SeekStart)
 	return err
-}
-
-// ImportVolumeSnapshot atomically replaces the persistent seed for name.
-func (s Store) ImportVolumeSnapshot(name, sourcePath string) error {
-	if _, err := s.LoadVolume(name); err != nil {
-		return err
-	}
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		return fmt.Errorf("opening volume snapshot %q: %w", sourcePath, err)
-	}
-	defer source.Close()
-	if info, err := source.Stat(); err != nil {
-		return fmt.Errorf("stating volume snapshot %q: %w", sourcePath, err)
-	} else if !info.Mode().IsRegular() {
-		return fmt.Errorf("volume snapshot %q is not a regular file", sourcePath)
-	}
-	if err := validateVolumeSnapshot(source); err != nil {
-		return fmt.Errorf("validating volume snapshot %q: %w", sourcePath, err)
-	}
-
-	destination, err := s.VolumeSnapshotPath(name)
-	if err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(destination), ".snapshot-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temporary volume snapshot: %w", err)
-	}
-	tempPath := temp.Name()
-	keep := false
-	defer func() {
-		if !keep {
-			temp.Close()
-			os.Remove(tempPath)
-		}
-	}()
-	if _, err := io.Copy(temp, source); err != nil {
-		return fmt.Errorf("copying volume snapshot: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("syncing volume snapshot: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("closing volume snapshot: %w", err)
-	}
-	if err := os.Rename(tempPath, destination); err != nil {
-		return fmt.Errorf("publishing volume snapshot: %w", err)
-	}
-	keep = true
-	return nil
-}
-
-// LoadVolume returns persistent managed-volume metadata.
-func (s Store) LoadVolume(name string) (VolumeInfo, error) {
-	if err := validateVolumeName(name); err != nil {
-		return VolumeInfo{}, err
-	}
-	data, err := os.ReadFile(filepath.Join(s.Root, "volumes", name, "volume.json"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return VolumeInfo{}, fmt.Errorf("volume %q does not exist: %w", name, err)
-		}
-		return VolumeInfo{}, fmt.Errorf("reading volume %q: %w", name, err)
-	}
-	var info VolumeInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return VolumeInfo{}, fmt.Errorf("decoding volume %q: %w", name, err)
-	}
-	if info.QuotaBytes < 0 {
-		return VolumeInfo{}, fmt.Errorf("volume %q has invalid negative quota", name)
-	}
-	if info.Name != name || info.Driver != "local-tmpfs" {
-		return VolumeInfo{}, fmt.Errorf("volume %q has invalid metadata", name)
-	}
-	if snapshot, err := s.VolumeSnapshotPath(name); err == nil {
-		if stat, statErr := os.Stat(snapshot); statErr == nil {
-			updated := stat.ModTime().UTC()
-			info.SnapshotBytes = stat.Size()
-			info.SnapshotUpdatedAt = &updated
-		} else if !os.IsNotExist(statErr) {
-			return VolumeInfo{}, fmt.Errorf("stating volume %q snapshot: %w", name, statErr)
-		}
-	}
-	return info, nil
-}
-
-// ListVolumes returns managed volumes ordered by name.
-func (s Store) ListVolumes() ([]VolumeInfo, error) {
-	entries, err := os.ReadDir(filepath.Join(s.Root, "volumes"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []VolumeInfo{}, nil
-		}
-		return nil, fmt.Errorf("listing volumes: %w", err)
-	}
-	volumes := make([]VolumeInfo, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		info, err := s.LoadVolume(entry.Name())
-		if err != nil {
-			return nil, err
-		}
-		volumes = append(volumes, info)
-	}
-	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
-	return volumes, nil
-}
-
-// RemoveVolume removes an unused managed volume's metadata.
-func (s Store) RemoveVolume(name string) error {
-	if _, err := s.LoadVolume(name); err != nil {
-		return err
-	}
-	containers, err := s.ListContainers()
-	if err != nil {
-		return err
-	}
-	for _, container := range containers {
-		for _, volume := range container.Volumes {
-			if volume.Name == name {
-				return fmt.Errorf("volume %q is used by container %q", name, container.Name)
-			}
-		}
-	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "volumes", name)); err != nil {
-		return fmt.Errorf("removing volume %q: %w", name, err)
-	}
-	return nil
 }
 
 func normalizePullPolicy(policy string) (string, error) {
@@ -2051,10 +1611,6 @@ func writeJSON(path string, value any) error {
 
 func validateName(name string) error {
 	return validateObjectName("container", name)
-}
-
-func validateVolumeName(name string) error {
-	return validateObjectName("volume", name)
 }
 
 func validateObjectName(kind, name string) error {

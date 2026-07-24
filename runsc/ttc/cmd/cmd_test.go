@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -54,7 +53,6 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 		{"top", []string{"top", "--help"}, "Usage: ttc top"},
 		{"events", []string{"events", "--help"}, "Usage: ttc events"},
 		{"image inspect", []string{"image", "inspect", "--help"}, "Usage: ttc image inspect"},
-		{"volume remove", []string{"volume", "rm", "--help"}, "Usage: ttc volume rm"},
 		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttc exec wait"},
 		{"daemon", []string{"daemon", "--help"}, "Usage: ttc daemon"},
 	} {
@@ -238,7 +236,7 @@ func TestPsDockerFiltersLatestAndFormatting(t *testing.T) {
 	b := &fakeBackend{families: []Family{
 		{
 			ID: "web", Image: "docker.io/library/alpine:3.20", Digest: digest,
-			CreatedAt: base, Volumes: []string{"cache"},
+			CreatedAt: base,
 			Branches: []Branch{
 				{ID: "main", State: "running", CreatedAt: base},
 				{ID: "child", ParentID: "main", State: "paused", CreatedAt: base.Add(2 * time.Hour)},
@@ -256,7 +254,6 @@ func TestPsDockerFiltersLatestAndFormatting(t *testing.T) {
 		"ps", "--all",
 		"--filter", "status=paused",
 		"--filter", "ancestor=alpine:3.20",
-		"--filter", "volume=cache",
 		"--filter", "name=web@child",
 		"--format", "{{.ID}}|{{.Image}}|{{.State}}|{{.ImageID}}",
 	}
@@ -676,7 +673,7 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "-h", "demo-host", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "-v", "cache:/cache", "--mount", "type=volume,source=data,target=/data,readonly", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "-h", "demo-host", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
@@ -726,13 +723,6 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(b.runRequest.hostMounts, wantMounts) {
 		t.Errorf("host mounts=%+v, want %+v", b.runRequest.hostMounts, wantMounts)
-	}
-	wantVolumes := []ttcbundle.ManagedVolume{
-		{Name: "cache", Destination: "/cache"},
-		{Name: "data", Destination: "/data", Readonly: true},
-	}
-	if !reflect.DeepEqual(b.runRequest.managedVolumes, wantVolumes) {
-		t.Errorf("managed volumes=%+v, want %+v", b.runRequest.managedVolumes, wantVolumes)
 	}
 	wantFilesystems := []ttcbundle.FilesystemMount{
 		{Type: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}, HostConfig: true, InspectOptions: "mode=0700,size=1m"},
@@ -1930,7 +1920,6 @@ func TestBuildInspectInfo(t *testing.T) {
 			{Type: "proc", Source: "proc", Destination: "/proc"},
 			{Type: "bind", Source: "/host/data", Destination: "/data", Options: []string{"rbind", "ro"}},
 			{Type: "bind", Source: "/state/network/hosts", Destination: "/etc/hosts", Options: []string{"rbind", "ro"}},
-			{Type: "tmpfs", Source: "ttc-volume-cache", Destination: "/cache", Options: []string{"rw"}},
 			{Type: "tmpfs", Source: "tmpfs", Destination: "/scratch", Options: []string{"rw", "mode=0700", "size=1m"}},
 			{Type: "tmpfs", Source: "tmpfs", Destination: "/worktmp", Options: []string{"rw", "size=2097152", "mode=0750"}},
 			{Type: "proc", Source: "proc", Destination: "/alt-proc", Options: []string{"ro", "nosuid", "nodev", "noexec"}},
@@ -1963,7 +1952,7 @@ func TestBuildInspectInfo(t *testing.T) {
 	if !reflect.DeepEqual(info.Config.Entrypoint, []string{"/bin/sh"}) || !reflect.DeepEqual(info.Config.Cmd, []string{"-c", "sleep 10"}) || info.Config.Labels["suite"] != "ttc" {
 		t.Errorf("Docker config reconstruction=%+v", info.Config)
 	}
-	if len(info.Mounts) != 5 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Name != "cache" || !info.Mounts[1].RW || info.Mounts[2].Type != "tmpfs" || !info.Mounts[2].RW || info.Mounts[3].Type != "proc" || info.Mounts[3].RW || info.Mounts[4].Type != "sysfs" || info.Mounts[4].RW {
+	if len(info.Mounts) != 4 || info.Mounts[0].Type != "bind" || info.Mounts[0].RW || info.Mounts[1].Type != "tmpfs" || !info.Mounts[1].RW || info.Mounts[2].Type != "proc" || info.Mounts[2].RW || info.Mounts[3].Type != "sysfs" || info.Mounts[3].RW {
 		t.Errorf("mounts=%+v", info.Mounts)
 	}
 	if got := info.TTC.ExternalViews; len(got) != 1 || got[0].Source != "/host/data" || got[0].Destination != "/data" || !got[0].Readonly || got[0].Semantics != "shared-external-view" {
@@ -2024,9 +2013,6 @@ func TestBuildInspectInfo(t *testing.T) {
 		t.Errorf("Docker log-config inspect template=%q, want %q", got, want)
 	}
 
-	if _, ok := info.Config.Volumes["/cache"]; !ok {
-		t.Errorf("volumes=%v", info.Config.Volumes)
-	}
 	if len(info.TTC.Branches) != 2 || info.TTC.Branches[0].Metadata.ID != "child" {
 		t.Errorf("TTC branches=%+v", info.TTC.Branches)
 	}
@@ -2056,84 +2042,6 @@ func TestRemove(t *testing.T) {
 	}
 	if b.removed != "demo" || !b.removeForce || !b.removeVolumes || stdout.String() != "demo\n" {
 		t.Errorf("removed=%q force=%t volumes=%t output=%q", b.removed, b.removeForce, b.removeVolumes, stdout.String())
-	}
-}
-
-func TestVolumeCommands(t *testing.T) {
-	b := &fakeBackend{}
-	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"volume", "create", "--opt", "size=64k", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume create status=%d stderr=%q", status, stderr.String())
-	}
-	if b.ensuredVolume != "cache" || b.volumeQuota != 65536 || stdout.String() != "cache\n" {
-		t.Errorf("create ensured=%q quota=%d output=%q", b.ensuredVolume, b.volumeQuota, stdout.String())
-	}
-
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "ls", "-q"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume ls status=%d stderr=%q", status, stderr.String())
-	}
-	if stdout.String() != "cache\n" {
-		t.Errorf("quiet list output=%q", stdout.String())
-	}
-
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "inspect", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume inspect status=%d stderr=%q", status, stderr.String())
-	}
-	var inspected []ttcbundle.VolumeInfo
-	if err := json.Unmarshal(stdout.Bytes(), &inspected); err != nil {
-		t.Fatalf("decoding volume inspect: %v", err)
-	}
-	if len(inspected) != 1 || inspected[0].Name != "cache" || inspected[0].Driver != "local-tmpfs" || inspected[0].QuotaBytes != 65536 {
-		t.Errorf("inspect returned %+v", inspected)
-	}
-
-	b.volumeUsageResult = []ttcbundle.VolumeUsage{{
-		Container: "demo", Branch: "child", Destination: "/cache",
-		UsedBytes: 12288, QuotaBytes: 65536,
-	}}
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "inspect", "--usage", "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume inspect usage status=%d stderr=%q", status, stderr.String())
-	}
-	inspected = nil
-	if err := json.Unmarshal(stdout.Bytes(), &inspected); err != nil {
-		t.Fatalf("decoding volume usage inspect: %v", err)
-	}
-	if b.volumeUsageTarget != (selector{container: "demo", branch: "child"}) || b.volumeUsageName != "cache" || len(inspected) != 1 || inspected[0].Usage == nil || len(*inspected[0].Usage) != 1 || (*inspected[0].Usage)[0].UsedBytes != 12288 {
-		t.Errorf("usage target=%+v name=%q inspect=%+v", b.volumeUsageTarget, b.volumeUsageName, inspected)
-	}
-
-	exportPath := filepath.Join(t.TempDir(), "cache.tar")
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "export", "--output", exportPath, "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume export status=%d stderr=%q", status, stderr.String())
-	}
-	if b.volumeExportTarget != (selector{container: "demo", branch: "child"}) || b.volumeExportName != "cache" || b.volumeExportPath != exportPath || stdout.String() != exportPath+"\n" {
-		t.Errorf("export target=%+v name=%q path=%q output=%q", b.volumeExportTarget, b.volumeExportName, b.volumeExportPath, stdout.String())
-	}
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "import", "--input", exportPath, "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume import status=%d stderr=%q", status, stderr.String())
-	}
-	if b.volumeImportName != "cache" || b.volumeImportPath != exportPath || stdout.String() != "cache\n" {
-		t.Errorf("import name=%q path=%q output=%q", b.volumeImportName, b.volumeImportPath, stdout.String())
-	}
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "commit", "demo@child", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume commit status=%d stderr=%q", status, stderr.String())
-	}
-	if b.volumeCommitTarget != (selector{container: "demo", branch: "child"}) || b.volumeCommitName != "cache" || stdout.String() != "cache\n" {
-		t.Errorf("commit target=%+v name=%q output=%q", b.volumeCommitTarget, b.volumeCommitName, stdout.String())
-	}
-
-	stdout.Reset()
-	if status := runCommand([]string{"volume", "rm", "cache"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("volume rm status=%d stderr=%q", status, stderr.String())
-	}
-	if b.removedVolume != "cache" || stdout.String() != "cache\n" {
-		t.Errorf("remove volume=%q output=%q", b.removedVolume, stdout.String())
 	}
 }
 
@@ -2185,9 +2093,6 @@ func TestStopGraceful(t *testing.T) {
 	if b.waited != (selector{container: "web", branch: "child"}) {
 		t.Errorf("wait target=%+v", b.waited)
 	}
-	if len(b.preservedVolumes) != 0 {
-		t.Errorf("child stop preserved global volume seed: %+v", b.preservedVolumes)
-	}
 }
 
 func TestStopEscalatesToKill(t *testing.T) {
@@ -2205,10 +2110,6 @@ func TestStopEscalatesToKill(t *testing.T) {
 	}
 	if len(b.signals) != 2 || b.signals[0].signal != 12 || b.signals[1].signal != 9 {
 		t.Errorf("signal calls=%+v, want configured SIGUSR2 then SIGKILL", b.signals)
-	}
-	wantPreserved := []selector{{container: "web", branch: "main"}}
-	if !reflect.DeepEqual(b.preservedVolumes, wantPreserved) {
-		t.Errorf("preserved=%+v, want %+v", b.preservedVolumes, wantPreserved)
 	}
 }
 
@@ -2322,13 +2223,6 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 			if test.wantResume && b.resumed != wantTarget {
 				t.Errorf("resumed=%+v, want %+v", b.resumed, wantTarget)
 			}
-			var wantPreserved []selector
-			if test.state == "running" || test.state == "paused" {
-				wantPreserved = append(wantPreserved, wantTarget)
-			}
-			if !reflect.DeepEqual(b.preservedVolumes, wantPreserved) {
-				t.Errorf("preserved=%+v, want %+v", b.preservedVolumes, wantPreserved)
-			}
 		})
 	}
 
@@ -2341,13 +2235,6 @@ func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
 	}
 	if got, want := restartDataLossReason(descendantInfo), `live descendant branch "child"`; got != want {
 		t.Errorf("descendant restart reason=%q, want %q", got, want)
-	}
-	volumeInfo := InspectInfo{
-		State: InspectState{Status: "running", Running: true},
-		TTC:   TTCInspectInfo{Runtime: &Family{Volumes: []string{"cache"}}},
-	}
-	if got, want := restartDataLossReason(volumeInfo), ""; got != want {
-		t.Errorf("volume restart reason=%q, want %q", got, want)
 	}
 	b := &fakeBackend{inspectInfo: descendantInfo}
 	var stdout, stderr bytes.Buffer
@@ -2643,7 +2530,7 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(), Volumes: []ttcbundle.ManagedVolume{{Name: "cache", Destination: "/cache", QuotaBytes: 65536}, {Name: "cache", Destination: "/cache-ro", QuotaBytes: 65536, Readonly: true}}})
+	metadata, err := json.Marshal(ttcbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
 	}
@@ -2676,20 +2563,6 @@ exit 2
 	}
 	if got, err := b.rootfsSize(selector{container: "web", branch: "child"}); err != nil || got != 32768 {
 		t.Fatalf("rootfsSize(child)=(%d, %v), want (32768, nil)", got, err)
-	}
-	usage, err := b.volumeUsage(selector{container: "web", branch: "child"}, "cache")
-	if err != nil {
-		t.Fatalf("volumeUsage(child): %v", err)
-	}
-	if len(usage) != 2 || usage[0].Destination != "/cache" || usage[0].UsedBytes != 12288 || usage[0].QuotaBytes != 65536 || usage[0].Readonly || usage[1].Destination != "/cache-ro" || !usage[1].Readonly || usage[1].UsedBytes != 12288 {
-		t.Errorf("volumeUsage(child)=%+v", usage)
-	}
-	exportPath := filepath.Join(dir, "cache.tar")
-	if err := b.exportVolume(selector{container: "web", branch: "child"}, "cache", exportPath); err != nil {
-		t.Fatalf("exportVolume(child): %v", err)
-	}
-	if data, err := os.ReadFile(exportPath); err != nil || string(data) != "fake-tar" {
-		t.Fatalf("exported volume=(%q, %v), want fake-tar", data, err)
 	}
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"root":{"readonly":true}}`), 0600); err != nil {
 		t.Fatalf("writing read-only config: %v", err)
@@ -3072,7 +2945,6 @@ exit 2
 		BundleDir: bundleDir,
 		State:     "created",
 		CreatedAt: createdAt,
-		Volumes:   []ttcbundle.ManagedVolume{{Name: "cache", Destination: "/cache"}},
 	})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
@@ -3090,7 +2962,7 @@ exit 2
 		t.Fatalf("listFamilies returned %+v", families)
 	}
 
-	if families[0].Image != "docker.io/library/alpine:3.20" || families[0].Digest != "sha256:abcd" || !families[0].CreatedAt.Equal(createdAt) || !families[0].Branches[0].CreatedAt.Equal(createdAt) || !reflect.DeepEqual(families[0].Volumes, []string{"cache"}) {
+	if families[0].Image != "docker.io/library/alpine:3.20" || families[0].Digest != "sha256:abcd" || !families[0].CreatedAt.Equal(createdAt) || !families[0].Branches[0].CreatedAt.Equal(createdAt) {
 		t.Errorf("persistent family metadata=%+v", families[0])
 	}
 	store := ttcbundle.Store{Root: dataRoot}
@@ -3187,22 +3059,7 @@ type fakeBackend struct {
 	execControlID      string
 	execControlSignal  int
 
-	volumes            []ttcbundle.VolumeInfo
-	ensuredVolume      string
-	volumeQuota        int64
-	removedVolume      string
-	volumeUsageTarget  selector
-	volumeUsageName    string
-	volumeUsageResult  []ttcbundle.VolumeUsage
-	volumeExportTarget selector
-	volumeExportName   string
-	volumeExportPath   string
-	volumeImportName   string
-	volumeImportPath   string
-	volumeCommitTarget selector
-	volumeCommitName   string
-	preservedVolumes   []selector
-	preservedRootfs    []selector
+	preservedRootfs []selector
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3387,95 +3244,23 @@ func (b *fakeBackend) wait(target selector) (uint32, error) {
 	return status, err
 }
 
-func (b *fakeBackend) ensureVolume(name string, quotaBytes int64) (ttcbundle.VolumeInfo, error) {
-	b.volumeQuota = quotaBytes
-	b.ensuredVolume = name
-	if b.err != nil {
-		return ttcbundle.VolumeInfo{}, b.err
-	}
-	for _, volume := range b.volumes {
-		if volume.Name == name {
-			return volume, nil
-		}
-	}
-	volume := ttcbundle.VolumeInfo{Name: name, Driver: "local-tmpfs", QuotaBytes: quotaBytes}
-	b.volumes = append(b.volumes, volume)
-	return volume, nil
-}
-
-func (b *fakeBackend) listVolumes() ([]ttcbundle.VolumeInfo, error) {
-	return append([]ttcbundle.VolumeInfo(nil), b.volumes...), b.err
-}
-
-func (b *fakeBackend) inspectVolume(name string) (ttcbundle.VolumeInfo, error) {
-	for _, volume := range b.volumes {
-		if volume.Name == name {
-			return volume, b.err
-		}
-	}
-	return ttcbundle.VolumeInfo{}, fmt.Errorf("volume %q does not exist", name)
-}
-
-func (b *fakeBackend) volumeUsage(target selector, name string) ([]ttcbundle.VolumeUsage, error) {
-	b.volumeUsageTarget = target
-	b.volumeUsageName = name
-	return append([]ttcbundle.VolumeUsage(nil), b.volumeUsageResult...), b.err
-}
-
-func (b *fakeBackend) exportVolume(target selector, name, outputPath string) error {
-	b.volumeExportTarget = target
-	b.volumeExportName = name
-	b.volumeExportPath = outputPath
-	return b.err
-}
-
-func (b *fakeBackend) importVolume(name, inputPath string) (ttcbundle.VolumeInfo, error) {
-	b.volumeImportName = name
-	b.volumeImportPath = inputPath
-	return ttcbundle.VolumeInfo{Name: name}, b.err
-}
-
-func (b *fakeBackend) commitVolume(target selector, name string) (ttcbundle.VolumeInfo, error) {
-	b.volumeCommitTarget = target
-	b.volumeCommitName = name
-	return ttcbundle.VolumeInfo{Name: name}, b.err
-}
-
-func (b *fakeBackend) preserveVolumes(target selector) error {
-	b.preservedVolumes = append(b.preservedVolumes, target)
-	return b.err
-}
-
 func (b *fakeBackend) preserveRootfs(target selector) error {
 	b.preservedRootfs = append(b.preservedRootfs, target)
 	return b.err
 }
 
-func (b *fakeBackend) removeVolume(name string) error {
-	b.removedVolume = name
-	return b.err
-}
-
-func TestParseAnonymousManagedVolumes(t *testing.T) {
-	request, err := parseMountRequests(
-		[]string{"/cache", "/readonly:ro", "/empty:volume-nocopy", "named:/named:ro,volume-nocopy"},
-		[]string{"type=volume,target=/long", "type=volume,dst=/long-nocopy,volume-nocopy"}, nil)
-	if err != nil {
-		t.Fatalf("parseMountRequests: %v", err)
-	}
-	want := []ttcbundle.ManagedVolume{
-		{Destination: "/cache", Anonymous: true},
-		{Destination: "/readonly", Readonly: true, Anonymous: true},
-		{Destination: "/empty", Anonymous: true, NoCopy: true},
-		{Name: "named", Destination: "/named", Readonly: true, NoCopy: true},
-		{Destination: "/long", Anonymous: true},
-		{Destination: "/long-nocopy", Anonymous: true, NoCopy: true},
-	}
-	if !reflect.DeepEqual(request.managed, want) {
-		t.Errorf("managed volumes=%+v, want %+v", request.managed, want)
-	}
-	if _, err := parseMountRequests([]string{"relative"}, nil, nil); err == nil {
-		t.Fatal("relative anonymous volume destination was accepted")
+func TestManagedVolumesAreUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		volumes []string
+		mounts  []string
+	}{
+		{volumes: []string{"/cache"}},
+		{volumes: []string{"named:/cache"}},
+		{mounts: []string{"type=volume,source=named,target=/cache"}},
+	} {
+		if _, err := parseMountRequests(tc.volumes, tc.mounts, nil); err == nil || !strings.Contains(err.Error(), "temporarily unavailable") {
+			t.Fatalf("parseMountRequests(%q, %q) error=%v, want managed-volume unavailable error", tc.volumes, tc.mounts, err)
+		}
 	}
 }
 
@@ -3531,7 +3316,6 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 			{ID: "main", State: "running"}, {ID: "child", State: "paused"}, {ID: "old", State: "deleted"},
 		}}},
 		imageList:       []ImageInfo{{Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc"}},
-		volumes:         []ttcbundle.VolumeInfo{{Name: "cache"}},
 		execSessionList: []runscExecSession{{ID: "exec-123", State: "running"}},
 	}
 	tests := []struct {
@@ -3545,7 +3329,6 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
-		{args: []string{"_complete", "volume", "rm", "ca"}, want: []string{"cache"}},
 		{args: []string{"_complete", "exec", "wait", "demo@main", "exec-"}, want: []string{"exec-123"}},
 	}
 	for _, test := range tests {

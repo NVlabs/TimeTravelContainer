@@ -39,12 +39,6 @@ type RootfsSize struct {
 	WritableBytes uint64 `json:"writable_bytes"`
 }
 
-// FilesystemSize is logical writable usage for the filesystem mounted at a
-// container path.
-type FilesystemSize struct {
-	WritableBytes uint64 `json:"writable_bytes"`
-}
-
 // RootfsUpperLayerSize returns allocated bytes in the container writable
 // overlay upper without walking, serializing, or faulting in file contents.
 func RootfsUpperLayerSize(k *kernel.Kernel, containerID string, out *RootfsSize) error {
@@ -69,64 +63,6 @@ func RootfsUpperLayerSize(k *kernel.Kernel, containerID string, out *RootfsSize)
 	}
 	out.WritableBytes = bytes
 	return nil
-}
-
-// FilesystemWritableSize returns allocated bytes in the filesystem containing
-// path without walking, serializing, or faulting in file contents.
-func FilesystemWritableSize(k *kernel.Kernel, containerID, path string, out *FilesystemSize) error {
-	f := Fs{Kernel: k}
-	ctx := k.SupervisorContext()
-	mntns, err := f.mountNamespaceForContainer(containerID)
-	if err != nil {
-		return err
-	}
-	defer mntns.DecRef(ctx)
-
-	root := mntns.Root(ctx)
-	defer root.DecRef(ctx)
-	vd, err := k.VFS().GetDentryAt(ctx, auth.NewRootCredentials(k.RootUserNamespace()), &vfs.PathOperation{
-		Root:               root,
-		Start:              root,
-		Path:               fspath.Parse(path),
-		FollowFinalSymlink: true,
-	}, &vfs.GetDentryOptions{})
-	if err != nil {
-		return fmt.Errorf("resolving filesystem path %q: %w", path, err)
-	}
-	defer vd.DecRef(ctx)
-
-	impl := vd.Mount().Filesystem().Impl()
-	if usage, ok := impl.(interface {
-		UpperLayerAllocatedBytes() (uint64, error)
-	}); ok {
-		bytes, err := usage.UpperLayerAllocatedBytes()
-		if err != nil {
-			return err
-		}
-		out.WritableBytes = bytes
-		return nil
-	}
-	usage, ok := impl.(interface {
-		AllocatedBytes() uint64
-	})
-	if !ok {
-		return fmt.Errorf("filesystem at %q does not expose allocated-byte accounting", path)
-	}
-	out.WritableBytes = usage.AllocatedBytes()
-	return nil
-}
-
-// TarFilesystem writes the writable state of the filesystem containing path to
-// outFD. For tmpfs this is the complete tree; for OverlayFS it is the upper.
-func TarFilesystem(k *kernel.Kernel, containerID, path string, outFD *os.File) error {
-	f := Fs{Kernel: k}
-	ctx := k.SupervisorContext()
-	mntns, err := f.mountNamespaceForContainer(containerID)
-	if err != nil {
-		return err
-	}
-	defer mntns.DecRef(ctx)
-	return TarFilesystemMountNamespace(k, mntns, path, outFD)
 }
 
 // TarFilesystemMountNamespace exports a writable filesystem through a retained mount namespace.

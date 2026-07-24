@@ -300,7 +300,6 @@ Commands:
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
   branch rm TARGET...             Destroy one or more non-main branches
   port COMMAND                    Publish, list, or unpublish branch TCP ports
-  volume COMMAND                   Manage family-local tmpfs volumes
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--unsafe-no-host-isolation]
                                   Start the per-user service in one fixed mode
@@ -319,7 +318,6 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container":  "Usage: ttc container COMMAND",
 			"image":      "Usage: ttc image COMMAND",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-			"volume":     "Usage: ttc volume COMMAND",
 			"branch":     "Usage: ttc branch rm TARGET [TARGET...]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
 			"daemon":     "Usage: ttc daemon start [--unsafe-no-host-isolation]|status|stop|requests|request",
@@ -340,9 +338,6 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container unpause": "Usage: ttc container unpause CONTAINER [CONTAINER...]",
 			"container top":     "Usage: ttc container top CONTAINER [PS OPTIONS]",
 			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
-			"volume commit":     "Usage: ttc volume commit CONTAINER@BRANCH VOLUME",
-			"volume rm":         "Usage: ttc volume rm VOLUME [VOLUME...]",
-			"volume remove":     "Usage: ttc volume remove VOLUME [VOLUME...]",
 			"branch rm":         "Usage: ttc branch rm TARGET [TARGET...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER[@BRANCH]",
@@ -413,7 +408,7 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 	case "port":
 		err = runPort(args[1:], stdout, stderr, backend)
 	case "volume":
-		err = runVolume(args[1:], stdout, stderr, backend)
+		err = managedVolumesUnavailable()
 	case "completion":
 		err = runCompletion(args[1:], stdout)
 	case "_complete":
@@ -614,7 +609,6 @@ func expandCombinedShortBools(args []string, boolNames string, valueNames ...str
 
 type mountRequests struct {
 	host       []ttcbundle.HostMount
-	managed    []ttcbundle.ManagedVolume
 	filesystem []ttcbundle.FilesystemMount
 }
 
@@ -630,36 +624,20 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 	}
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
-		if len(parts) == 1 || (len(parts) == 2 && filepath.IsAbs(parts[0]) && !filepath.IsAbs(parts[1])) {
-			readonly, noCopy, err := parseVolumeOptions(value, parts[1:])
-			if err != nil {
-				return mountRequests{}, err
-			}
-			volume, err := normalizeManagedVolume("", parts[0], readonly)
-			if err != nil {
-				return mountRequests{}, err
-			}
-			volume.NoCopy = noCopy
-			request.managed = append(request.managed, volume)
-			continue
+		if len(parts) < 2 {
+			return mountRequests{}, managedVolumesUnavailable()
 		}
 		if len(parts) > 3 || parts[0] == "" || parts[1] == "" {
-			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want [SOURCE:]CONTAINER[:OPTIONS]", value)
+			if !isHostMountSource(parts[0]) {
+				return mountRequests{}, managedVolumesUnavailable()
+			}
+			return mountRequests{}, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER:ro", value)
 		}
 		if isHostMountSource(parts[0]) {
 			hostVolumes = append(hostVolumes, value)
 			continue
 		}
-		readonly, noCopy, err := parseVolumeOptions(value, parts[2:])
-		if err != nil {
-			return mountRequests{}, err
-		}
-		volume, err := normalizeManagedVolume(parts[0], parts[1], readonly)
-		if err != nil {
-			return mountRequests{}, err
-		}
-		volume.NoCopy = noCopy
-		request.managed = append(request.managed, volume)
+		return mountRequests{}, managedVolumesUnavailable()
 	}
 	for _, value := range mountSpecs {
 		mountType := ""
@@ -672,11 +650,7 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 		}
 		switch mountType {
 		case "volume":
-			volume, err := parseManagedLongMount(value)
-			if err != nil {
-				return mountRequests{}, err
-			}
-			request.managed = append(request.managed, volume)
+			return mountRequests{}, managedVolumesUnavailable()
 		case "tmpfs", "proc", "procfs", "sysfs":
 			mount, err := parseFilesystemLongMount(value)
 			if err != nil {
@@ -693,6 +667,10 @@ func parseMountRequests(volumeSpecs, mountSpecs, tmpfsSpecs []string) (mountRequ
 		return mountRequests{}, err
 	}
 	return request, nil
+}
+
+func managedVolumesUnavailable() error {
+	return errors.New("TTC managed volumes are temporarily unavailable while the disk-backed reflink CoW driver is implemented; use explicit --tmpfs for ephemeral data or a read-only host bind")
 }
 
 func parseTmpfsMount(value string) (ttcbundle.FilesystemMount, error) {
@@ -914,88 +892,6 @@ func isHostMountSource(source string) bool {
 	return filepath.IsAbs(source) || source == "." || strings.HasPrefix(source, "."+string(filepath.Separator))
 }
 
-func parseVolumeOptions(spec string, optionParts []string) (readonly, noCopy bool, err error) {
-	if len(optionParts) == 0 {
-		return false, false, nil
-	}
-	for _, option := range strings.Split(optionParts[0], ",") {
-		switch option {
-		case "ro", "readonly":
-			readonly = true
-		case "rw", "":
-			readonly = false
-		case "volume-nocopy", "nocopy":
-			noCopy = true
-		default:
-			return false, false, fmt.Errorf("unsupported volume option %q in %q", option, spec)
-		}
-	}
-	return readonly, noCopy, nil
-}
-
-func parseManagedLongMount(value string) (ttcbundle.ManagedVolume, error) {
-	name := ""
-	destination := ""
-	readonly := false
-	noCopy := false
-	for _, field := range strings.Split(value, ",") {
-		key, raw, found := strings.Cut(field, "=")
-		key = strings.TrimSpace(key)
-		if !found {
-			if key == "ro" || key == "readonly" {
-				readonly = true
-				continue
-			}
-			if key == "volume-nocopy" || key == "nocopy" {
-				noCopy = true
-				continue
-			}
-			return ttcbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", field, value)
-		}
-		raw = strings.TrimSpace(raw)
-		switch key {
-		case "type":
-			if raw != "volume" {
-				return ttcbundle.ManagedVolume{}, fmt.Errorf("managed mount %q has type %q", value, raw)
-			}
-		case "source", "src":
-			name = raw
-		case "destination", "dst", "target":
-			destination = raw
-		case "readonly", "ro":
-			parsed, err := strconv.ParseBool(raw)
-			if err != nil {
-				return ttcbundle.ManagedVolume{}, fmt.Errorf("invalid readonly value %q in %q", raw, value)
-			}
-			readonly = parsed
-		case "volume-nocopy", "nocopy":
-			parsed, err := strconv.ParseBool(raw)
-			if err != nil {
-				return ttcbundle.ManagedVolume{}, fmt.Errorf("invalid volume-nocopy value %q in %q", raw, value)
-			}
-			noCopy = parsed
-		default:
-			return ttcbundle.ManagedVolume{}, fmt.Errorf("unsupported managed-volume field %q in %q", key, value)
-		}
-	}
-	volume, err := normalizeManagedVolume(name, destination, readonly)
-	if err != nil {
-		return ttcbundle.ManagedVolume{}, err
-	}
-	volume.NoCopy = noCopy
-	return volume, nil
-}
-
-func normalizeManagedVolume(name, destination string, readonly bool) (ttcbundle.ManagedVolume, error) {
-	if name != "" && isHostMountSource(name) {
-		return ttcbundle.ManagedVolume{}, fmt.Errorf("managed volume name %q looks like a host path", name)
-	}
-	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
-		return ttcbundle.ManagedVolume{}, fmt.Errorf("managed volume destination %q must be an absolute non-root path", destination)
-	}
-	return ttcbundle.ManagedVolume{Name: name, Destination: filepath.Clean(destination), Readonly: readonly, Anonymous: name == ""}, nil
-}
-
 func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, error) {
 	mounts := make([]ttcbundle.HostMount, 0, len(volumeSpecs)+len(mountSpecs))
 	for _, value := range volumeSpecs {
@@ -1100,7 +996,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 		}
 		if mountType != "bind" {
 			if mountType == "volume" || (mountType == "" && source != "" && !filepath.IsAbs(source)) {
-				return nil, fmt.Errorf("managed volume %q is not implemented yet", source)
+				return nil, managedVolumesUnavailable()
 			}
 			return nil, fmt.Errorf("--mount %q must specify type=bind", value)
 		}
@@ -1119,7 +1015,7 @@ func normalizeHostMount(source, destination string, readonly, immutableSource, m
 	}
 	if !filepath.IsAbs(source) {
 		if source != "." && !strings.HasPrefix(source, "."+string(filepath.Separator)) {
-			return ttcbundle.HostMount{}, fmt.Errorf("managed volume %q is not implemented yet", source)
+			return ttcbundle.HostMount{}, managedVolumesUnavailable()
 		}
 		absolute, err := filepath.Abs(source)
 		if err != nil {
@@ -1368,7 +1264,6 @@ type runRequest struct {
 	consoleLogMaxBytes int64
 	consoleLogMaxFiles int
 	logOptions         map[string]string
-	managedVolumes     []ttcbundle.ManagedVolume
 	autoRemove         bool
 	readonlyRootfs     bool
 	stopSignal         string
@@ -1480,9 +1375,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
+	fs.Var(&volumes, "volume", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&volumes, "v", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
@@ -1654,7 +1549,6 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
-		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
@@ -1744,9 +1638,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
-	fs.Var(&volumes, "v", "attach [NAME:]CONTAINER[:OPTIONS] or HOST:CONTAINER:ro")
-	fs.Var(&mounts, "mount", "attach type=volume|bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
+	fs.Var(&volumes, "volume", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&volumes, "v", "attach a read-only HOST:CONTAINER:ro bind (managed volumes are temporarily unavailable)")
+	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
 	var extraHostValues, dnsValues, dnsSearchValues, dnsOptionValues stringSlice
@@ -1918,7 +1812,6 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		dnsOptions:         parsedDNSOptions,
 		hostMounts:         parsedMounts.host,
 		filesystemMounts:   parsedMounts.filesystem,
-		managedVolumes:     parsedMounts.managed,
 		autoRemove:         *autoRemove,
 		readonlyRootfs:     *readonlyRootfs,
 		stopSignal:         *stopSignal,
@@ -3097,8 +2990,8 @@ func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
 	quiet := fs.Bool("quiet", false, "only display branch-qualified selectors")
 	fs.BoolVar(quiet, "q", false, "only display branch-qualified selectors")
 	var filters stringSlice
-	fs.Var(&filters, "filter", "filter output (name, id, status, ancestor, volume, or branch)")
-	fs.Var(&filters, "f", "filter output (name, id, status, ancestor, volume, or branch)")
+	fs.Var(&filters, "filter", "filter output (name, id, status, ancestor, or branch)")
+	fs.Var(&filters, "f", "filter output (name, id, status, ancestor, or branch)")
 	format := fs.String("format", "", "format rows using a Go template or json")
 	last := fs.Int("last", -1, "show the most recently created N branches")
 	fs.IntVar(last, "n", -1, "show the most recently created N branches")
@@ -3190,21 +3083,20 @@ func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 type psRow struct {
-	ID         string   `json:"id"`
-	Names      string   `json:"names"`
-	Container  string   `json:"container"`
-	Branch     string   `json:"branch"`
-	Image      string   `json:"image"`
-	ImageID    string   `json:"image_id,omitempty"`
-	State      string   `json:"state"`
-	Status     string   `json:"status"`
-	Parent     string   `json:"parent"`
-	CreatedAt  string   `json:"created_at"`
-	RunningFor string   `json:"running_for"`
-	Volumes    []string `json:"volumes,omitempty"`
-	Size       string   `json:"size,omitempty"`
-	SizeRW     uint64   `json:"size_rw,omitempty"`
-	SizeRootFS uint64   `json:"size_root_fs,omitempty"`
+	ID         string `json:"id"`
+	Names      string `json:"names"`
+	Container  string `json:"container"`
+	Branch     string `json:"branch"`
+	Image      string `json:"image"`
+	ImageID    string `json:"image_id,omitempty"`
+	State      string `json:"state"`
+	Status     string `json:"status"`
+	Parent     string `json:"parent"`
+	CreatedAt  string `json:"created_at"`
+	RunningFor string `json:"running_for"`
+	Size       string `json:"size,omitempty"`
+	SizeRW     uint64 `json:"size_rw,omitempty"`
+	SizeRootFS uint64 `json:"size_root_fs,omitempty"`
 
 	created   time.Time
 	digest    string
@@ -3303,7 +3195,6 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 				Parent:     parent,
 				CreatedAt:  createdAt,
 				RunningFor: runningFor,
-				Volumes:    append([]string(nil), family.Volumes...),
 				created:    created,
 				digest:     family.Digest,
 				imageSize:  family.ImageSize,
@@ -3328,7 +3219,7 @@ func parsePsFilters(values []string) (psFilters, error) {
 			if _, err := regexp.Compile(match); err != nil {
 				return nil, fmt.Errorf("invalid ps name filter %q: %w", match, err)
 			}
-		case "id", "status", "ancestor", "volume", "branch":
+		case "id", "status", "ancestor", "branch":
 		default:
 			return nil, fmt.Errorf("unsupported ps filter %q", key)
 		}
@@ -3352,13 +3243,6 @@ func matchPsFilters(row psRow, filters psFilters) bool {
 					(row.State == "stopped" && strings.EqualFold(match, "exited"))
 			case "ancestor":
 				matched = matchPsAncestor(row, match)
-			case "volume":
-				for _, volume := range row.Volumes {
-					if volume == match {
-						matched = true
-						break
-					}
-				}
 			case "branch":
 				matched = row.Branch == match
 			}
@@ -3421,7 +3305,7 @@ func writePsFormat(w io.Writer, rows []psRow, format string) error {
 			ID: "ID", Names: "NAMES", Container: "CONTAINER", Branch: "BRANCH",
 			Image: "IMAGE", ImageID: "IMAGE ID", State: "STATE", Status: "STATUS",
 			Parent: "PARENT", CreatedAt: "CREATED AT", RunningFor: "CREATED",
-			Volumes: []string{"VOLUMES"}, Size: "SIZE",
+			Size: "SIZE",
 		}
 		if err := executePsTemplate(w, tmpl, header); err != nil {
 			return err
@@ -3774,11 +3658,6 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if timeoutSet {
 			stopTimeout = timeout
 		}
-		if target.branch == defaultBranchID {
-			if err := backend.preserveVolumes(target); err != nil {
-				return fmt.Errorf("preserving managed volumes for %s before stop: %w", target, err)
-			}
-		}
 		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
 			return err
 		}
@@ -3869,12 +3748,6 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 			stopTimeout = timeout
 		}
 		target := selector{container: name, branch: defaultBranchID}
-		switch info.State.Status {
-		case "running", "paused", "restarting":
-			if err := backend.preserveVolumes(target); err != nil {
-				return fmt.Errorf("preserving managed volumes for %s before restart: %w", target, err)
-			}
-		}
 		switch info.State.Status {
 		case "paused":
 			if err := backend.resume(target); err != nil {
@@ -3995,207 +3868,6 @@ func parseSignal(value string) (int, error) {
 		return 0, fmt.Errorf("unknown signal %q", value)
 	}
 	return int(signal), nil
-}
-
-func parseVolumeQuotaOptions(options []string) (int64, error) {
-	quotaBytes := int64(0)
-	seen := false
-	for _, option := range options {
-		key, value, ok := strings.Cut(option, "=")
-		if !ok || key != "size" || value == "" {
-			return 0, fmt.Errorf("unsupported volume option %q; want size=BYTES", option)
-		}
-		if seen {
-			return 0, errors.New("volume size option may be specified only once")
-		}
-		parsed, err := ttcbundle.ParseShmSize(value)
-		if err != nil {
-			return 0, fmt.Errorf("invalid volume size: %w", err)
-		}
-		if parsed <= 0 {
-			return 0, errors.New("volume size must be greater than zero")
-		}
-		quotaBytes = parsed
-		seen = true
-	}
-	return quotaBytes, nil
-}
-
-func runVolume(args []string, stdout, stderr io.Writer, backend backend) error {
-	if len(args) == 0 {
-		return errors.New("usage: ttc volume create|ls|inspect|import|commit|export|rm [OPTIONS]")
-	}
-	switch args[0] {
-	case "create":
-		fs := flag.NewFlagSet("volume create", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		driver := fs.String("driver", "local-tmpfs", "volume driver")
-		fs.StringVar(driver, "d", "local-tmpfs", "volume driver")
-		var options stringSlice
-		fs.Var(&options, "opt", "driver option (size=BYTES)")
-		fs.Var(&options, "o", "driver option (size=BYTES)")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() > 1 {
-			return errors.New("usage: ttc volume create [--driver local-tmpfs] [--opt size=BYTES] [NAME]")
-		}
-		if *driver != "local-tmpfs" {
-			return fmt.Errorf("unsupported volume driver %q", *driver)
-		}
-		quotaBytes, err := parseVolumeQuotaOptions(options)
-		if err != nil {
-			return err
-		}
-		name := "ttc-volume-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-		if fs.NArg() == 1 {
-			name = fs.Arg(0)
-		}
-		info, err := backend.ensureVolume(name, quotaBytes)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, info.Name)
-		return nil
-	case "ls", "list":
-		fs := flag.NewFlagSet("volume ls", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		quiet := fs.Bool("quiet", false, "only display volume names")
-		fs.BoolVar(quiet, "q", false, "only display volume names")
-		jsonOutput := fs.Bool("json", false, "emit stable JSON")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() != 0 {
-			return errors.New("usage: ttc volume ls [--quiet|--json]")
-		}
-		volumes, err := backend.listVolumes()
-		if err != nil {
-			return err
-		}
-		if *jsonOutput {
-			encoder := json.NewEncoder(stdout)
-			encoder.SetIndent("", "  ")
-			return encoder.Encode(volumes)
-		}
-		if !*quiet {
-			fmt.Fprintln(stdout, "DRIVER\tVOLUME NAME")
-		}
-		for _, volume := range volumes {
-			if *quiet {
-				fmt.Fprintln(stdout, volume.Name)
-			} else {
-				fmt.Fprintf(stdout, "%s\t%s\n", volume.Driver, volume.Name)
-			}
-		}
-		return nil
-	case "inspect":
-		fs := flag.NewFlagSet("volume inspect", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		usageTarget := fs.String("usage", "", "include branch-local usage for CONTAINER[@BRANCH]")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() == 0 {
-			return errors.New("usage: ttc volume inspect [--usage CONTAINER[@BRANCH]] VOLUME [VOLUME...]")
-		}
-		var target selector
-		if *usageTarget != "" {
-			var err error
-			target, err = parseSelector(*usageTarget)
-			if err != nil {
-				return fmt.Errorf("invalid usage target: %w", err)
-			}
-		}
-		volumes := make([]ttcbundle.VolumeInfo, 0, fs.NArg())
-		for _, name := range fs.Args() {
-			volume, err := backend.inspectVolume(name)
-			if err != nil {
-				return err
-			}
-			if *usageTarget != "" {
-				usage, err := backend.volumeUsage(target, name)
-				if err != nil {
-					return err
-				}
-				volume.Usage = &usage
-			}
-			volumes = append(volumes, volume)
-		}
-		encoder := json.NewEncoder(stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(volumes)
-	case "import":
-		fs := flag.NewFlagSet("volume import", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		inputPath := fs.String("input", "", "absolute host path to a tar archive")
-		fs.StringVar(inputPath, "i", "", "absolute host path to a tar archive")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() != 1 || *inputPath == "" {
-			return errors.New("usage: ttc volume import --input PATH VOLUME")
-		}
-		if !filepath.IsAbs(*inputPath) {
-			return fmt.Errorf("volume import input path %q must be absolute", *inputPath)
-		}
-		info, err := backend.importVolume(fs.Arg(0), filepath.Clean(*inputPath))
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, info.Name)
-		return nil
-	case "commit":
-		if len(args) != 3 {
-			return errors.New("usage: ttc volume commit CONTAINER[@BRANCH] VOLUME")
-		}
-		target, err := parseSelector(args[1])
-		if err != nil {
-			return err
-		}
-		info, err := backend.commitVolume(target, args[2])
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, info.Name)
-		return nil
-	case "export":
-		fs := flag.NewFlagSet("volume export", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		outputPath := fs.String("output", "", "absolute host path for the tar archive")
-		fs.StringVar(outputPath, "o", "", "absolute host path for the tar archive")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if fs.NArg() != 2 || *outputPath == "" {
-			return errors.New("usage: ttc volume export --output PATH CONTAINER[@BRANCH] VOLUME")
-		}
-		if !filepath.IsAbs(*outputPath) {
-			return fmt.Errorf("volume export output path %q must be absolute", *outputPath)
-		}
-		target, err := parseSelector(fs.Arg(0))
-		if err != nil {
-			return err
-		}
-		if err := backend.exportVolume(target, fs.Arg(1), filepath.Clean(*outputPath)); err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, filepath.Clean(*outputPath))
-		return nil
-	case "rm", "remove":
-		if len(args) < 2 {
-			return errors.New("usage: ttc volume rm VOLUME [VOLUME...]")
-		}
-		for _, name := range args[1:] {
-			if err := backend.removeVolume(name); err != nil {
-				return err
-			}
-			fmt.Fprintln(stdout, name)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown volume command %q", args[0])
-	}
 }
 
 func runBranch(args []string, stdout io.Writer, backend backend) error {
@@ -4416,7 +4088,6 @@ type Family struct {
 	State      string    `json:"state"`
 	CreatedAt  time.Time `json:"created_at"`
 	SandboxPID int       `json:"sandbox_pid,omitempty"`
-	Volumes    []string  `json:"volumes,omitempty"`
 	Branches   []Branch  `json:"branches"`
 	Error      string    `json:"error,omitempty"`
 }
@@ -4498,16 +4169,7 @@ type backend interface {
 	destroy(target selector) error
 	signal(target selector, signal int, all bool) error
 	wait(target selector) (uint32, error)
-	ensureVolume(name string, quotaBytes int64) (ttcbundle.VolumeInfo, error)
-	listVolumes() ([]ttcbundle.VolumeInfo, error)
-	inspectVolume(name string) (ttcbundle.VolumeInfo, error)
-	volumeUsage(target selector, name string) ([]ttcbundle.VolumeUsage, error)
-	exportVolume(target selector, name, outputPath string) error
-	importVolume(name, inputPath string) (ttcbundle.VolumeInfo, error)
-	commitVolume(target selector, name string) (ttcbundle.VolumeInfo, error)
-	preserveVolumes(target selector) error
 	preserveRootfs(target selector) error
-	removeVolume(name string) error
 }
 
 type consoleSidecarOwner interface {
@@ -4807,7 +4469,6 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			CapDrop:          request.capDrop,
 			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
-			ManagedVolumes:   request.managedVolumes,
 			HostMounts:       request.hostMounts,
 			FilesystemMounts: request.filesystemMounts,
 		},
@@ -4879,7 +4540,6 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			Ulimits:          request.ulimits,
 			Entrypoint:       request.entrypoint,
 			HostMounts:       request.hostMounts,
-			ManagedVolumes:   request.managedVolumes,
 			FilesystemMounts: request.filesystemMounts,
 		},
 		Reference:          request.reference,
@@ -4912,7 +4572,7 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err := b.removeStoppedRuntime(info.ID); err != nil {
 		return 1, err
 	}
-	if err := b.containerStore().RefreshVolumeSeeds(info.ID); err != nil {
+	if err := b.containerStore().RefreshRootfsSeed(info.ID); err != nil {
 		return 1, fmt.Errorf("refreshing persistent filesystem seeds before starting %q: %w", name, err)
 	}
 	status, err := b.launch(info, detach, interactive)
@@ -6190,11 +5850,6 @@ func waitStatusExitCode(status uint32) int {
 
 func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
 	store := ttcbundle.Store{Root: b.dataRoot}
-	if !detach || status != 0 {
-		if err := store.FinalizeVolumeExitSnapshots(name); err != nil && b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: finalizing managed volumes for %s: %v\n", name, err)
-		}
-	}
 	state := "exited"
 	var exitStatus *int
 	if detach && status == 0 {
@@ -6293,13 +5948,6 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 			mounts = append(mounts, InspectMount{
 				Type: "bind", Source: mount.Source, Destination: mount.Destination,
 				Mode: mode, RW: !readonly, Propagation: "rprivate",
-			})
-		case mount.Type == "tmpfs" && strings.HasPrefix(mount.Source, "ttc-volume-"):
-			name := strings.TrimPrefix(mount.Source, "ttc-volume-")
-			volumes[mount.Destination] = struct{}{}
-			mounts = append(mounts, InspectMount{
-				Type: "volume", Name: name, Source: name, Destination: mount.Destination,
-				Driver: "local-tmpfs", Mode: mode, RW: !readonly,
 			})
 		case mount.Type == "tmpfs" && mount.Source == "tmpfs" && mount.Destination != "/dev":
 			if inspectOptions, ok := dockerTmpfs[mount.Destination]; ok {
@@ -6555,9 +6203,6 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	store := b.containerStore()
-	if err := store.FinalizeVolumeExitSnapshots(name); err != nil {
-		return fmt.Errorf("finalizing managed volumes before removing %q: %w", name, err)
-	}
 	info, err := store.LoadContainer(name)
 	if err != nil {
 		return err
@@ -6575,19 +6220,6 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		if !force && live {
 			return fmt.Errorf("container %q is %s; stop it or use --force", name, family.State)
 		}
-		hasDescendants := false
-		for _, branch := range family.Branches {
-			if branch.ID != defaultBranchID && branch.State != "deleted" {
-				hasDescendants = true
-				break
-			}
-		}
-		if live && !hasDescendants {
-			target := selector{container: runtimeID, branch: defaultBranchID}
-			if err := b.preserveVolumes(target); err != nil {
-				return fmt.Errorf("preserving managed volumes for %s before removal: %w", target, err)
-			}
-		}
 		args := []string{"delete"}
 		if force {
 			args = append(args, "--force")
@@ -6601,16 +6233,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}
-	if volumes {
-		for _, volume := range info.Volumes {
-			if !volume.Anonymous {
-				continue
-			}
-			if err := store.RemoveVolume(volume.Name); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("removing anonymous volume %q: %w", volume.Name, err)
-			}
-		}
-	}
+	_ = volumes // Kept for Docker-compatible `rm -v`; no managed volumes exist.
 	return nil
 }
 
@@ -7212,191 +6835,6 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 	})
 }
 
-func (b *runtimeBackend) ensureVolume(name string, quotaBytes int64) (ttcbundle.VolumeInfo, error) {
-	return (ttcbundle.Store{Root: b.dataRoot}).EnsureVolumeWithQuota(name, quotaBytes)
-}
-
-func (b *runtimeBackend) listVolumes() ([]ttcbundle.VolumeInfo, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
-	if err := store.FinalizeAllVolumeExitSnapshots(); err != nil {
-		return nil, err
-	}
-	return store.ListVolumes()
-}
-
-func (b *runtimeBackend) inspectVolume(name string) (ttcbundle.VolumeInfo, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
-	if err := store.FinalizeAllVolumeExitSnapshots(); err != nil {
-		return ttcbundle.VolumeInfo{}, err
-	}
-	return store.LoadVolume(name)
-}
-
-func (b *runtimeBackend) volumeUsage(target selector, name string) ([]ttcbundle.VolumeUsage, error) {
-	resolved, container, err := b.resolveSelector(target)
-	if err != nil {
-		return nil, err
-	}
-	var usages []ttcbundle.VolumeUsage
-	seen := make(map[string]bool)
-	for _, attachment := range container.Volumes {
-		if attachment.Name != name || seen[attachment.Destination] {
-			continue
-		}
-		seen[attachment.Destination] = true
-		output, err := b.command(
-			"timetravel", "--path", attachment.Destination,
-			resolved.container, "filesystem-size", resolved.branch,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("getting usage for volume %q at %s in %s: %w", name, attachment.Destination, target, err)
-		}
-		var size struct {
-			WritableBytes uint64 `json:"writable_bytes"`
-		}
-		if err := json.Unmarshal(output, &size); err != nil {
-			return nil, fmt.Errorf("decoding usage for volume %q at %s: %w", name, attachment.Destination, err)
-		}
-		usages = append(usages, ttcbundle.VolumeUsage{
-			Container: container.Name, Branch: resolved.branch,
-			Destination: attachment.Destination, UsedBytes: size.WritableBytes,
-			QuotaBytes: attachment.QuotaBytes, Readonly: attachment.Readonly,
-		})
-	}
-	if len(usages) == 0 {
-		return nil, fmt.Errorf("volume %q is not attached to %s", name, target)
-	}
-	sort.Slice(usages, func(i, j int) bool { return usages[i].Destination < usages[j].Destination })
-	return usages, nil
-}
-
-func (b *runtimeBackend) exportVolume(target selector, name, outputPath string) error {
-	resolved, container, err := b.resolveSelector(target)
-	if err != nil {
-		return err
-	}
-	var destination string
-	for _, attachment := range container.Volumes {
-		if attachment.Name == name {
-			destination = attachment.Destination
-			break
-		}
-	}
-	if destination == "" {
-		return fmt.Errorf("volume %q is not attached to %s", name, target)
-	}
-
-	dir := filepath.Dir(outputPath)
-	temp, err := os.CreateTemp(dir, "."+filepath.Base(outputPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("creating temporary volume export: %w", err)
-	}
-	tempPath := temp.Name()
-	if err := temp.Close(); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("closing temporary volume export: %w", err)
-	}
-	defer os.Remove(tempPath)
-	if _, err := b.command(
-		"timetravel", "--path", destination, "--output", tempPath,
-		resolved.container, "filesystem-tar", resolved.branch,
-	); err != nil {
-		return fmt.Errorf("exporting volume %q from %s: %w", name, target, err)
-	}
-	if err := os.Rename(tempPath, outputPath); err != nil {
-		return fmt.Errorf("publishing volume export %q: %w", outputPath, err)
-	}
-	return nil
-}
-
-func (b *runtimeBackend) importVolume(name, inputPath string) (ttcbundle.VolumeInfo, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
-	if err := store.ImportVolumeSnapshot(name, inputPath); err != nil {
-		return ttcbundle.VolumeInfo{}, err
-	}
-	return store.LoadVolume(name)
-}
-
-func (b *runtimeBackend) commitVolume(target selector, name string) (ttcbundle.VolumeInfo, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
-	if _, err := store.LoadVolume(name); err != nil {
-		return ttcbundle.VolumeInfo{}, err
-	}
-	snapshot, err := store.VolumeSnapshotPath(name)
-	if err != nil {
-		return ttcbundle.VolumeInfo{}, err
-	}
-	if err := b.exportVolume(target, name, snapshot); err != nil {
-		return ttcbundle.VolumeInfo{}, err
-	}
-	return store.LoadVolume(name)
-}
-
-func (b *runtimeBackend) preserveVolumes(target selector) (retErr error) {
-	resolved, container, err := b.resolveSelector(target)
-	if err != nil {
-		return err
-	}
-	target = resolved
-	namesByValue := make(map[string]struct{})
-	for _, volume := range container.Volumes {
-		namesByValue[volume.Name] = struct{}{}
-	}
-	if len(namesByValue) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(namesByValue))
-	for name := range namesByValue {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	families, err := b.listRuntimeFamilies()
-	if err != nil {
-		return fmt.Errorf("checking runtime state: %w", err)
-	}
-	state := ""
-	for _, family := range families {
-		if family.ID != target.container {
-			continue
-		}
-		state = family.State
-		for _, branch := range family.Branches {
-			if branch.ID == target.branch {
-				state = branch.State
-				break
-			}
-		}
-		break
-	}
-	switch state {
-	case "", "created", "stopped", "exited", "failed", "dead", "deleted":
-		return nil
-	case "running", "restarting":
-		if err := b.pause(target); err != nil {
-			return fmt.Errorf("pausing %s for volume preservation: %w", target, err)
-		}
-		defer func() {
-			if err := b.resume(target); err != nil {
-				if retErr == nil {
-					retErr = fmt.Errorf("resuming %s after volume preservation: %w", target, err)
-				} else {
-					retErr = fmt.Errorf("%w; resuming %s also failed: %v", retErr, target, err)
-				}
-			}
-		}()
-	case "paused":
-	default:
-		return fmt.Errorf("cannot preserve managed volumes from %s in state %q", target, state)
-	}
-	for _, name := range names {
-		if _, err := b.commitVolume(target, name); err != nil {
-			return fmt.Errorf("committing volume %q: %w", name, err)
-		}
-	}
-	return nil
-}
-
 func (b *runtimeBackend) preserveRootfs(target selector) error {
 	resolved, _, err := b.resolveSelector(target)
 	if err != nil {
@@ -7406,14 +6844,6 @@ func (b *runtimeBackend) preserveRootfs(target selector) error {
 		return fmt.Errorf("writable rootfs persistence is only supported for the main branch")
 	}
 	return b.containerStore().FinalizeRootfsExitSnapshot(resolved.container)
-}
-
-func (b *runtimeBackend) removeVolume(name string) error {
-	store := ttcbundle.Store{Root: b.dataRoot}
-	if err := store.RemoveVolume(name); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {
@@ -7448,15 +6878,6 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		if state == "" {
 			state = "created"
 		}
-		volumes := make([]string, 0, len(container.Volumes))
-		seenVolumes := make(map[string]bool)
-		for _, volume := range container.Volumes {
-			if !seenVolumes[volume.Name] {
-				volumes = append(volumes, volume.Name)
-				seenVolumes[volume.Name] = true
-			}
-		}
-		sort.Strings(volumes)
 		byID[container.ID] = Family{
 			ID:        container.ID,
 			Name:      container.Name,
@@ -7465,7 +6886,6 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			ImageSize: container.ImageSize,
 			State:     state,
 			CreatedAt: container.CreatedAt,
-			Volumes:   volumes,
 			Branches:  persistentBranches(container.Branches),
 		}
 	}
@@ -7479,7 +6899,6 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family.Digest = persistent.Digest
 				family.ImageSize = persistent.ImageSize
 				family.CreatedAt = persistent.CreatedAt
-				family.Volumes = persistent.Volumes
 				family.Branches = mergeBranchHistory(persistent.Branches, family.Branches)
 				for i := range family.Branches {
 					if family.Branches[i].ID == defaultBranchID {
@@ -7999,9 +7418,6 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 		return
 	}
 	exitStatus := waitStatusExitCode(status)
-	if err := store.FinalizeVolumeExitSnapshots(target.container); err != nil && b.stderr != nil {
-		fmt.Fprintf(b.stderr, "ttc: warning: finalizing managed volumes for %s: %v\n", target, err)
-	}
 	if err := store.UpdateState(target.container, "exited", &exitStatus); err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttc: warning: recording exit state for %s: %v\n", target, err)
 	}

@@ -229,10 +229,6 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"container", "restart", "demo"}, true},
 		{[]string{"image", "rm", "alpine"}, true},
 		{[]string{"image", "pull", "alpine"}, true},
-		{[]string{"volume", "create", "cache"}, true},
-		{[]string{"volume", "export", "--output", "/tmp/cache.tar", "demo", "cache"}, true},
-		{[]string{"volume", "import", "--input", "/tmp/cache.tar", "cache"}, true},
-		{[]string{"volume", "commit", "demo", "cache"}, true},
 		{[]string{"branch", "remove", "demo"}, true},
 		{[]string{"port", "publish", "demo", "8080:80"}, true},
 		{[]string{"port", "unpublish", "demo", "8080:80"}, true},
@@ -381,22 +377,23 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	}
 	mutation := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: requestID,
-		Options: daemonWireOptions{DataRoot: dataRoot}, Args: []string{"volume", "create"},
+		Options: daemonWireOptions{DataRoot: dataRoot}, Args: []string{"image", "rm", "missing"},
 	}
 	status, firstStdout, stderr := exchange(mutation)
-	if status != 0 || firstStdout == "" || stderr != "" {
+	if status == 0 || firstStdout != "" || stderr == "" {
 		t.Fatalf("first mutation: status=%d stdout=%q stderr=%q", status, firstStdout, stderr)
 	}
+	firstStatus, firstStderr := status, stderr
 	status, replayStdout, stderr := exchange(mutation)
-	if status != 0 || replayStdout != firstStdout || stderr != "" {
-		t.Fatalf("replayed mutation: status=%d stdout=%q want=%q stderr=%q", status, replayStdout, firstStdout, stderr)
+	if status != firstStatus || replayStdout != firstStdout || stderr != firstStderr {
+		t.Fatalf("replayed mutation: status=%d stdout=%q stderr=%q, want status=%d stdout=%q stderr=%q", status, replayStdout, stderr, firstStatus, firstStdout, firstStderr)
 	}
-	volumes, err := os.ReadDir(filepath.Join(dataRoot, "volumes"))
+	records, err := listDaemonMutations(dataRoot, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(volumes) != 1 {
-		t.Fatalf("idempotent mutation created %d volumes, want 1", len(volumes))
+	if len(records) != 1 {
+		t.Fatalf("idempotent replay recorded %d mutations, want 1", len(records))
 	}
 
 	status, _, stderr = exchange(daemonRequest{Version: daemonAPIVersion + 1, Action: "ping"})

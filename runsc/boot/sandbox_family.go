@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -95,23 +94,6 @@ type BranchProcessesArgs struct {
 type BranchRootfsSizeArgs struct {
 	BranchID string
 	CID      string
-}
-
-// BranchFilesystemSizeArgs selects a mounted filesystem inside one container
-// and live branch.
-type BranchFilesystemSizeArgs struct {
-	BranchID string
-	CID      string
-	Path     string
-}
-
-// BranchFilesystemTarArgs selects a mounted filesystem and carries one output
-// file for its tar archive.
-type BranchFilesystemTarArgs struct {
-	urpc.FilePayload
-	BranchID string
-	CID      string
-	Path     string
 }
 
 // BranchWaitArgs selects a process inside one live branch. PID 0 selects the
@@ -875,27 +857,6 @@ func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) erro
 	}
 	defer done()
 	return control.RootfsUpperLayerSize(b.k, cid, out)
-}
-
-// FilesystemSize returns branch-local logical writable usage for the
-// filesystem containing path.
-func (f *SandboxFamily) FilesystemSize(id, cid, path string, out *control.FilesystemSize) error {
-	b, done, err := f.beginControl(id)
-	if err != nil {
-		return err
-	}
-	defer done()
-	return control.FilesystemWritableSize(b.k, cid, path, out)
-}
-
-// FilesystemTar exports the writable state of a branch-local mounted filesystem.
-func (f *SandboxFamily) FilesystemTar(id, cid, path string, out *os.File) error {
-	b, done, err := f.beginControl(id)
-	if err != nil {
-		return err
-	}
-	defer done()
-	return control.TarFilesystem(b.k, cid, path, out)
 }
 
 // Signal sends a signal within one branch. Foreground process-group delivery

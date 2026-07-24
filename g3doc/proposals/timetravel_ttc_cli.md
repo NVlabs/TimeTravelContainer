@@ -1,6 +1,11 @@
 # TimeTravelContainer `ttc` product and CLI roadmap
 
-Status: implemented for the documented rootless systrap scope.
+Status: implemented for the documented rootless systrap scope, except managed
+volumes. The former tmpfs-plus-tar managed-volume implementation was removed
+before release because it had the wrong durability model. All managed-volume
+sections and checked tasks below are historical, not current behavior. The
+replacement is specified in
+[ttc_disk_backed_volumes.md](ttc_disk_backed_volumes.md).
 
 Implementation status: the roadmap is implemented. The `ttc` client is available at
 `//runsc/ttc:ttc`. It controls existing TimeTravel-enabled runsc OCI

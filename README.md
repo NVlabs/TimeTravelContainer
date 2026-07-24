@@ -124,8 +124,8 @@ for measured results and current limits.
 - Fork any eligible branch recursively into a running or initially paused child.
 - Preserve guest PIDs, threads, registers, credentials, clocks, signals,
   namespaces, file-offset topology, and supported kernel resources.
-- Share anonymous memory, tmpfs, SysV shared memory, managed volumes, and
-  writable OverlayFS data page-by-page until a branch writes.
+- Share anonymous memory, tmpfs, SysV shared memory, and writable OverlayFS
+  data page-by-page until a branch writes.
 - Clone internal pipes, eventfd, epoll graphs, timerfd, signalfd, inotify,
   pidfds, netlink sockets, internal Unix sockets, loopback TCP/UDP, and other
   explicitly validated Sentry-owned objects.
@@ -186,8 +186,6 @@ never grants host root; OCI `noNewPrivileges` still suppresses elevation.
 - Live-forked branches share upper-layer pages CoW.
 - Main-branch rootfs changes, including shutdown-handler writes, are exported
   on exit and seed the next `ttc start`.
-- Managed named volumes fork CoW and can be committed, imported, exported, and
-  restored across lifecycle operations.
 - Arbitrary Sentry-owned tmpfs, alternate procfs, restricted read-only sysfs,
   `/dev`, `/dev/shm`, and private devpts mounts are supported.
 - Read-only host binds are allowed as shared external views.
@@ -196,9 +194,11 @@ never grants host root; OCI `noNewPrivileges` still suppresses elevation.
 - Directfs is disabled so host open-file descriptions do not silently become
   shared branch state.
 
-Child-branch filesystem changes are not automatically promoted into the main
-branch's restart seed. Commit the relevant managed volume explicitly when that
-is the desired result.
+The former tmpfs-plus-tar managed-volume driver has been removed because it did
+not provide normal durable-volume semantics. Named, anonymous, and unoverridden
+image-declared volumes are temporarily rejected. The replacement is a
+disk-backed Sentry filesystem with lazy metadata CoW and host reflink file CoW;
+see the [disk-backed volume design](g3doc/proposals/ttc_disk_backed_volumes.md).
 
 ### Rootless virtual networking
 
@@ -423,18 +423,6 @@ Stop and remove the family:
 ./bin/ttc rm --force demo
 ```
 
-### Rootfs and managed-volume example
-
-```sh
-./bin/ttc volume create --opt size=256m state
-./bin/ttc run -d --name db \
-  --volume state:/var/lib/app \
-  alpine:3.20 sleep 600
-./bin/ttc fork db db@test
-./bin/ttc volume inspect --usage db@test state
-./bin/ttc volume commit db@test state
-```
-
 ### Rootless network example
 
 ```sh
@@ -471,7 +459,9 @@ recovery, and the full command surface.
 - TTC user-mode NAT is currently IPv4 TCP/UDP; published ports are IPv4 TCP.
 - A stopped child branch cannot be recreated from memory. Start/restart rebuilds
   the main branch from persistent configuration, its immutable image, the last
-  exported main rootfs upper, and persistent volume seeds.
+  exported main rootfs upper.
+- Managed volumes are unavailable until the disk-backed reflink CoW driver is
+  implemented.
 - Read-only host binds remain shared external views rather than snapshots.
 - Uncommon OCI metadata such as device nodes, privileged security xattrs, and
   executable file capabilities needs broader rootless virtualization coverage.

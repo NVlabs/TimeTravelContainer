@@ -157,8 +157,8 @@ place the same three files together under `/usr/local/libexec/ttc` and link
 
 ## State and runtime paths
 
-Image content, materialized immutable roots, container metadata, logs, and
-managed-volume snapshots default to:
+Image content, materialized immutable roots, container metadata, and logs
+default to:
 
 ```text
 $TTC_DATA_ROOT
@@ -271,10 +271,10 @@ ttc resume web@test-b
 ```
 
 The source is paused while its kernel metadata is cloned, then returned to its
-previous state. Application memory, tmpfs files, managed volumes, and writable
-overlay state begin shared and detach copy-on-write. Virtual PIDs and threads
-are reproduced in the child; both branches may therefore observe PID 1 and the
-same initial process tree.
+previous state. Application memory, tmpfs files, and writable overlay state
+begin shared and detach copy-on-write. Virtual PIDs and threads are reproduced
+in the child; both branches may therefore observe PID 1 and the same initial
+process tree.
 
 Manage branches independently:
 
@@ -339,8 +339,7 @@ handler writes therefore survive stop/start. A read-only root (`--read-only`)
 has no writable upper, and child-branch changes are not promoted to the main
 container's restart seed.
 
-Plain tmpfs mounts remain ephemeral across stop/start. Use a managed volume for
-tmpfs-backed data that must be forkable and restart-persistent.
+Plain tmpfs mounts remain ephemeral across stop/start.
 
 Arbitrary Sentry-owned tmpfs, alternate procfs, and restricted read-only sysfs
 mounts are supported:
@@ -353,19 +352,13 @@ ttc run -d --name work \
   alpine:3.20 sleep 600
 ```
 
-Managed named volumes fork with the family:
-
-```shell
-ttc volume create --opt size=256m state
-ttc run -d --name db --volume state:/var/lib/app alpine:3.20 sleep 600
-ttc fork db db@test
-ttc volume inspect --usage db@test state
-ttc volume commit db@test state
-```
-
-Volume names are configuration identities. Separate container families get
-separate in-memory instances. `volume commit` explicitly promotes one branch's
-contents to the persistent seed used by a later restart or new family.
+Managed volumes are temporarily unavailable. TTC rejects named volumes,
+anonymous volumes, and image `VOLUME` declarations that are not replaced by an
+explicit supported mount. The removed tmpfs-plus-tar implementation did not
+provide normal write-through durability. Its replacement will use a
+disk-backed Sentry filesystem, lazy persistent metadata trees, per-file
+reflinks, and host-filesystem extent CoW. See the
+[disk-backed volume design](../proposals/ttc_disk_backed_volumes.md).
 
 A host bind must be read-only:
 
@@ -528,11 +521,11 @@ interrupted operation.
 
 `ttc daemon stop` is an orderly manager shutdown: it resumes paused branches,
 stops descendants before their source branches using each container's normal
-stop policy, persists managed volumes and writable rootfs state, and then exits
-the daemon. If a stop fails, the daemon remains available and reports the
-failure. In contrast, an unexpected `ttcd` crash does not terminate Sentry
-sandboxes; after restarting the daemon, TTC reconciles those live containers
-and their console/port sidecars.
+stop policy, persists writable rootfs state, and then exits the daemon. If a
+stop fails, the daemon remains available and reports the failure. In contrast,
+an unexpected `ttcd` crash does not terminate Sentry sandboxes; after restarting
+the daemon, TTC reconciles those live containers and their console/port
+sidecars.
 
 ## Shell completion
 
