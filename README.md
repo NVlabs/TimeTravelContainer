@@ -455,6 +455,7 @@ and the trusted no-user-namespace variant.
 - [End-user guide](g3doc/user_guide/timetravelcontainer.md)
 - [Performance and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
+- [Deferred transparent systrap stub-reallocation design](g3doc/proposals/timetravel_systrap_stub_reallocation.md)
 - [Product and CLI roadmap](g3doc/proposals/timetravel_ttc_cli.md)
 - [End-to-end test guide](runsc/ttc/test/README.md)
 - [Upstream gVisor documentation](https://gvisor.dev/docs/)

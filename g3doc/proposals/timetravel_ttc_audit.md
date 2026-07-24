@@ -19,6 +19,13 @@ TTC is not a drop-in Docker daemon or a universally compatible Linux container
 runtime. The biggest performance cost is full kernel-metadata serialization
 while the source is paused.
 
+Transparent relocation of systrap's platform-private stub arena is deliberately
+deferred. It must not be introduced as a compact but discoverable mapping
+without simultaneously replacing the global layout, immutable-filter, helper
+lifecycle, and shared-state security assumptions. The complete future
+implementation and security gates are recorded in the
+[deferred systrap stub-reallocation design](timetravel_systrap_stub_reallocation.md).
+
 The recommended readiness levels are:
 
 | Use case | Assessment |
