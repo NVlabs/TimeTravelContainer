@@ -20,7 +20,7 @@ import (
 )
 
 // timeTravelNATFilters permits the socket forms used by Go's net package for
-// TTOS's Sentry-local user-mode TCP/UDP proxy. hostInetFilters already permits
+// TTC's Sentry-local user-mode TCP/UDP proxy. hostInetFilters already permits
 // the subsequent operations and equivalent sockets with explicit IPPROTO_*;
 // Go intentionally passes protocol 0 and lets the host kernel select it.
 func timeTravelNATFilters() seccomp.SyscallRules {

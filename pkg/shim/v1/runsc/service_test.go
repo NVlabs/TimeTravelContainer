@@ -22,7 +22,7 @@ import (
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	ttosshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
+	ttcshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 )
 
@@ -30,15 +30,15 @@ func TestTimeTravelArgs(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		operation string
-		request   ttosshim.Request
+		request   ttcshim.Request
 		want      string
 	}{
-		{"list", "List", ttosshim.Request{ContainerID: "demo"}, "demo branches"},
-		{"pause child", "Pause", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo pause child"},
-		{"resume child", "Resume", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo resume child"},
-		{"destroy child", "Destroy", ttosshim.Request{ContainerID: "demo", Branch: "child"}, "demo destroy child"},
-		{"fork main", "Fork", ttosshim.Request{ContainerID: "demo", Destination: "child"}, "demo fork child"},
-		{"fork paused descendant", "Fork", ttosshim.Request{ContainerID: "demo", Source: "child", Destination: "grandchild", Paused: true}, "--source child --paused demo fork grandchild"},
+		{"list", "List", ttcshim.Request{ContainerID: "demo"}, "demo branches"},
+		{"pause child", "Pause", ttcshim.Request{ContainerID: "demo", Branch: "child"}, "demo pause child"},
+		{"resume child", "Resume", ttcshim.Request{ContainerID: "demo", Branch: "child"}, "demo resume child"},
+		{"destroy child", "Destroy", ttcshim.Request{ContainerID: "demo", Branch: "child"}, "demo destroy child"},
+		{"fork main", "Fork", ttcshim.Request{ContainerID: "demo", Destination: "child"}, "demo fork child"},
+		{"fork paused descendant", "Fork", ttcshim.Request{ContainerID: "demo", Source: "child", Destination: "grandchild", Paused: true}, "--source child --paused demo fork grandchild"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			args, err := timeTravelArgs(test.operation, &test.request)
@@ -50,7 +50,7 @@ func TestTimeTravelArgs(t *testing.T) {
 			}
 		})
 	}
-	if _, err := timeTravelArgs("Unknown", &ttosshim.Request{ContainerID: "demo"}); err == nil {
+	if _, err := timeTravelArgs("Unknown", &ttcshim.Request{ContainerID: "demo"}); err == nil {
 		t.Fatal("unknown operation succeeded")
 	}
 }

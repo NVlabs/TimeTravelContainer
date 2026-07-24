@@ -38,7 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/runsc/config"
-	"gvisor.dev/gvisor/runsc/ttos/ownership"
+	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
 // LINT.IfChange
@@ -74,7 +74,7 @@ type Config struct {
 	// Gofer process's EGID.
 	EGID int
 
-	// VirtualOwners overrides host UID/GID values for an immutable TTOS image
+	// VirtualOwners overrides host UID/GID values for an immutable TTC image
 	// root. It is nil for ordinary gofer mounts.
 	VirtualOwners *ownership.Manifest
 }

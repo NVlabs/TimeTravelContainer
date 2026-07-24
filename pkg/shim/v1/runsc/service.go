@@ -48,7 +48,7 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
-	ttosshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
+	ttcshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -175,7 +175,7 @@ func (s *runscService) getContainer(id string) (*Container, error) {
 	return c, nil
 }
 
-func timeTravelArgs(operation string, req *ttosshim.Request) ([]string, error) {
+func timeTravelArgs(operation string, req *ttcshim.Request) ([]string, error) {
 	branch := req.Branch
 	if branch == "" {
 		branch = "main"
@@ -201,7 +201,7 @@ func timeTravelArgs(operation string, req *ttosshim.Request) ([]string, error) {
 
 // ControlTimeTravel implements the additive shim branch API without changing
 // containerd task-v2 semantics.
-func (s *runscService) ControlTimeTravel(ctx context.Context, operation string, req *ttosshim.Request) ([]byte, error) {
+func (s *runscService) ControlTimeTravel(ctx context.Context, operation string, req *ttcshim.Request) ([]byte, error) {
 	if _, err := s.getContainer(req.ContainerID); err != nil {
 		return nil, err
 	}

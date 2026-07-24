@@ -34,8 +34,8 @@ func TestSandboxUsesHostNetworkNamespace(t *testing.T) {
 		want bool
 	}{
 		{name: "host", conf: config.Config{Network: config.NetworkHost}, want: true},
-		{name: "ttos NAT", conf: config.Config{Network: config.NetworkTimeTravel, TimeTravelNetworkNAT: true}, want: true},
-		{name: "ttos isolated", conf: config.Config{Network: config.NetworkTimeTravel}, want: false},
+		{name: "ttc NAT", conf: config.Config{Network: config.NetworkTimeTravel, TimeTravelNetworkNAT: true}, want: true},
+		{name: "ttc isolated", conf: config.Config{Network: config.NetworkTimeTravel}, want: false},
 		{name: "none", conf: config.Config{Network: config.NetworkNone}, want: false},
 		{name: "sandbox", conf: config.Config{Network: config.NetworkSandbox}, want: false},
 	}

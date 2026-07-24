@@ -42,7 +42,7 @@ import (
 
 const (
 	timeTravelNICID   = tcpip.NICID(2)
-	timeTravelNICName = "ttos0"
+	timeTravelNICName = "ttc0"
 	timeTravelMTU     = uint32(65535)
 )
 
@@ -52,7 +52,7 @@ var (
 	timeTravelGuestMAC       = net.HardwareAddr{0x02, 0x42, 0x0a, 0x00, 0x02, 0x0f}
 )
 
-// TimeTravelNetworkConfig configures TTOS's rootless, in-process virtual NIC.
+// TimeTravelNetworkConfig configures TTC's rootless, in-process virtual NIC.
 // NAT controls whether the branch-local proxy may create outbound host sockets.
 type TimeTravelNetworkConfig struct {
 	NAT      bool
@@ -76,7 +76,7 @@ func (c TimeTravelNetworkConfig) addresses() (tcpip.Address, tcpip.Address, tcpi
 	return guest, gateway, tcpip.LinkAddress(string(mac)), tcpip.LinkAddress(string(gatewayMAC))
 }
 
-// timeTravelLinkEndpoint is one end of TTOS's in-process virtual wire. Its
+// timeTravelLinkEndpoint is one end of TTC's in-process virtual wire. Its
 // peer and dispatcher are runtime resources: a live-fork child reconstructs a
 // fresh pair in configureTimeTravelNetwork instead of serializing the proxy
 // stack reachable through the peer dispatcher.
@@ -271,7 +271,7 @@ func (r *proxyRealm) close() {
 		r.mu.Unlock()
 		if r.gateway != nil {
 			stats := r.gateway.Stats()
-			log.Debugf("Closing TTOS proxy realm (IPv4 received=%d valid=%d delivered=%d disabled=%d invalid-src=%d invalid-dst=%d malformed=%d prerouting-drop=%d input-drop=%d; TCP valid=%d invalid=%d checksum=%d; sent=%d)",
+			log.Debugf("Closing TTC proxy realm (IPv4 received=%d valid=%d delivered=%d disabled=%d invalid-src=%d invalid-dst=%d malformed=%d prerouting-drop=%d input-drop=%d; TCP valid=%d invalid=%d checksum=%d; sent=%d)",
 				stats.IP.PacketsReceived.Value(), stats.IP.ValidPacketsReceived.Value(), stats.IP.PacketsDelivered.Value(),
 				stats.IP.DisabledPacketsReceived.Value(), stats.IP.InvalidSourceAddressesReceived.Value(), stats.IP.InvalidDestinationAddressesReceived.Value(), stats.IP.MalformedPacketsReceived.Value(),
 				stats.IP.IPTablesPreroutingDropped.Value(), stats.IP.IPTablesInputDropped.Value(),
@@ -303,10 +303,10 @@ func (r *proxyRealm) installTCPForwarder(gateway *stack.Stack) {
 	forwarder := tcp.NewForwarder(gateway, 0, 1024, func(req *tcp.ForwarderRequest) {
 		id := req.ID()
 		target := r.hostAddress(id.LocalAddress, id.LocalPort)
-		log.Debugf("TTOS NAT TCP flow %s:%d -> %s", id.RemoteAddress, id.RemotePort, target)
+		log.Debugf("TTC NAT TCP flow %s:%d -> %s", id.RemoteAddress, id.RemotePort, target)
 		hostConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(r.ctx, "tcp", target)
 		if err != nil {
-			log.Debugf("TTOS NAT TCP dial %s failed: %v", target, err)
+			log.Debugf("TTC NAT TCP dial %s failed: %v", target, err)
 			req.Complete(true)
 			return
 		}
@@ -357,14 +357,14 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			Name:               "lo",
 			DeliverLinkPackets: true,
 		}); err != nil {
-			return fmt.Errorf("creating TTOS loopback NIC: %v", err)
+			return fmt.Errorf("creating TTC loopback NIC: %v", err)
 		}
 		for _, addr := range []tcpip.ProtocolAddress{
 			{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: header.IPv4Loopback.WithPrefix()},
 			{Protocol: ipv6.ProtocolNumber, AddressWithPrefix: header.IPv6Loopback.WithPrefix()},
 		} {
 			if err := dst.Stack.AddProtocolAddress(1, addr, stack.AddressProperties{}); err != nil {
-				return fmt.Errorf("adding TTOS loopback address: %v", err)
+				return fmt.Errorf("adding TTC loopback address: %v", err)
 			}
 		}
 	}
@@ -382,7 +382,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		Name:               timeTravelNICName,
 		DeliverLinkPackets: true,
 	}); err != nil {
-		return fmt.Errorf("creating TTOS guest NIC: %v", err)
+		return fmt.Errorf("creating TTC guest NIC: %v", err)
 	}
 	if err := dst.Stack.AddProtocolAddress(timeTravelNICID, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
@@ -391,7 +391,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			PrefixLen: 24,
 		},
 	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("adding TTOS guest address: %v", err)
+		return fmt.Errorf("adding TTC guest address: %v", err)
 	}
 	dst.Stack.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4LoopbackSubnet, NIC: 1},
@@ -412,7 +412,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	realm.gateway = gateway
 	const gatewayNICID = tcpip.NICID(1)
 	if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
-		return fmt.Errorf("creating TTOS proxy NIC: %v", err)
+		return fmt.Errorf("creating TTC proxy NIC: %v", err)
 	}
 	if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
@@ -421,13 +421,13 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			PrefixLen: 24,
 		},
 	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("adding TTOS proxy address: %v", err)
+		return fmt.Errorf("adding TTC proxy address: %v", err)
 	}
 	if err := gateway.SetPromiscuousMode(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTOS proxy promiscuous mode: %v", err)
+		return fmt.Errorf("enabling TTC proxy promiscuous mode: %v", err)
 	}
 	if err := gateway.SetSpoofing(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTOS proxy spoofing: %v", err)
+		return fmt.Errorf("enabling TTC proxy spoofing: %v", err)
 	}
 	gateway.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: gatewayNICID}})
 	if cfg.NAT {
@@ -451,7 +451,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		Close: realm.close,
 	}
 	dst.SetLiveForkNetworkHooks(hooks)
-	log.Infof("Configured TTOS virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
+	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil
 }
 
@@ -466,13 +466,13 @@ func validateTimeTravelNetwork(s *sentrynetstack.Stack) error {
 	}
 	interfaces := s.Interfaces()
 	if len(interfaces) != 2 {
-		return fmt.Errorf("TTOS network has %d interfaces, want loopback and %s", len(interfaces), timeTravelNICName)
+		return fmt.Errorf("TTC network has %d interfaces, want loopback and %s", len(interfaces), timeTravelNICName)
 	}
 	if lo, ok := interfaces[1]; !ok || lo.Name != "lo" {
-		return fmt.Errorf("TTOS network canonical loopback is missing")
+		return fmt.Errorf("TTC network canonical loopback is missing")
 	}
 	if nic, ok := interfaces[int32(timeTravelNICID)]; !ok || nic.Name != timeTravelNICName {
-		return fmt.Errorf("TTOS virtual NIC %s is missing", timeTravelNICName)
+		return fmt.Errorf("TTC virtual NIC %s is missing", timeTravelNICName)
 	}
 	for _, route := range s.RouteTable() {
 		if route.OutputInterface != 0 {

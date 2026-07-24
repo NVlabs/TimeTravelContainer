@@ -151,10 +151,15 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")
 
 	// Flags that control sandbox runtime behavior: network related.
-	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none, ttos. Using network inside the sandbox is more secure because it's isolated from the host network.")
-	flagSet.Bool("ttos-network-nat", false, "enable rootless user-mode TCP/UDP NAT for --network=ttos")
-	flagSet.String("ttos-network-ip", "", "IPv4 address for the --network=ttos virtual NIC (default 10.0.2.15)")
-	flagSet.String("ttos-network-mac", "", "MAC address for the --network=ttos virtual NIC")
+	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none, ttc. Using network inside the sandbox is more secure because it's isolated from the host network.")
+	ttcNetworkNAT := flagSet.Bool("ttc-network-nat", false, "enable rootless user-mode TCP/UDP NAT for --network=ttc")
+	ttcNetworkIP := flagSet.String("ttc-network-ip", "", "IPv4 address for the --network=ttc virtual NIC (default 10.0.2.15)")
+	ttcNetworkMAC := flagSet.String("ttc-network-mac", "", "MAC address for the --network=ttc virtual NIC")
+	// Keep old low-level runsc arguments working for bundles and launchers
+	// produced before the TimeTravelContainer rename.
+	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", false, "deprecated alias for --ttc-network-nat")
+	flagSet.StringVar(ttcNetworkIP, "ttos-network-ip", "", "deprecated alias for --ttc-network-ip")
+	flagSet.StringVar(ttcNetworkMAC, "ttos-network-mac", "", "deprecated alias for --ttc-network-mac")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
 	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")
 	flagSet.Bool("allow-live-tcp-migration", true, "allow TCP connection state to be migrated. If false, connected TCP endpoints will be terminated during save/restore.")
@@ -183,7 +188,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
-	flagSet.Bool("unsafe-no-host-isolation", false, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelOS workloads")
+	flagSet.Bool("unsafe-no-host-isolation", false, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelContainer workloads")
 
 	// Test flags, not to be used outside tests, ever.
 	flagSet.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")

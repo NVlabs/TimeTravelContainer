@@ -861,6 +861,22 @@ func TestMountTarOnExitPathsPrefersWritableDestination(t *testing.T) {
 	}
 }
 
+func TestMountTarOnExitPathsAcceptsLegacyTimeTravelOSAnnotation(t *testing.T) {
+	spec := specs.Spec{
+		Root: &specs.Root{},
+		Annotations: map[string]string{
+			legacyAnnotationMountTarOnExit: `{"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`,
+		},
+	}
+	paths, err := MountTarOnExitPaths(&spec)
+	if err != nil {
+		t.Fatalf("MountTarOnExitPaths: %v", err)
+	}
+	if len(paths) != 1 || paths[0].Source != RootfsMountTarSource || paths[0].Destination != "/" {
+		t.Fatalf("legacy final mount paths=%+v, want current rootfs source", paths)
+	}
+}
+
 func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	const bundleDir = "/bundle"
 	spec := specs.Spec{
@@ -874,7 +890,7 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 			"dev.gvisor.spec.mount.host.source":  "/host/data",
 			"dev.gvisor.spec.mount.cache.type":   "tmpfs",
 			AnnotationMountTar:                   `{"volumes/cache":"/snapshots/cache.tar"}`,
-			AnnotationMountTarOnExit:             `{"volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`,
+			AnnotationMountTarOnExit:             `{"volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelcontainer.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`,
 			"example.source":                     "relative-but-not-a-mount-hint",
 		},
 	}
@@ -893,7 +909,7 @@ func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	if got, want := spec.Annotations[AnnotationMountTar], `{"/bundle/volumes/cache":"/snapshots/cache.tar"}`; got != want {
 		t.Errorf("mount tar annotation=%q, want %q", got, want)
 	}
-	if got, want := spec.Annotations[AnnotationMountTarOnExit], `{"/bundle/volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`; got != want {
+	if got, want := spec.Annotations[AnnotationMountTarOnExit], `{"/bundle/volumes/cache":{"path":"/snapshots/cache.final.tar","ready_path":"/snapshots/cache.ready"},"dev.timetravelcontainer.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`; got != want {
 		t.Errorf("final mount tar annotation=%q, want %q", got, want)
 	}
 	if got, want := spec.Annotations["example.source"], "relative-but-not-a-mount-hint"; got != want {

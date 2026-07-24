@@ -32,7 +32,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	rsc "gvisor.dev/gvisor/pkg/shim/v1/runsc"
-	ttosshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
+	ttcshim "gvisor.dev/gvisor/pkg/shim/v1/timetravel"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -320,17 +320,17 @@ func (s *shimRedirector) Restore(ctx context.Context, r *extension.RestoreReques
 func (s *shimRedirector) RegisterTTRPC(server *ttrpc.Server) error {
 	task.RegisterTaskService(server, s)
 	api.RegisterTTRPCSandboxService(server, s)
-	ttosshim.Register(server, s)
+	ttcshim.Register(server, s)
 	return nil
 }
 
 // ControlTimeTravel routes the additive branch API through the active shim
 // extension when it implements the API, and otherwise through the runsc shim.
-func (s *shimRedirector) ControlTimeTravel(ctx context.Context, operation string, req *ttosshim.Request) ([]byte, error) {
+func (s *shimRedirector) ControlTimeTravel(ctx context.Context, operation string, req *ttcshim.Request) ([]byte, error) {
 	s.mu.Lock()
-	controller, ok := s.getLocked().(ttosshim.Controller)
+	controller, ok := s.getLocked().(ttcshim.Controller)
 	if !ok {
-		controller, ok = s.main.(ttosshim.Controller)
+		controller, ok = s.main.(ttcshim.Controller)
 	}
 	s.mu.Unlock()
 	if !ok {

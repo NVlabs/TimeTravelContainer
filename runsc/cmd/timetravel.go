@@ -37,7 +37,7 @@ import (
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/sandbox"
-	ttosconsole "gvisor.dev/gvisor/runsc/ttos/console"
+	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 // TimeTravel controls experimental in-memory sandbox branches.
@@ -77,7 +77,7 @@ func (*TimeTravel) Name() string { return "timetravel" }
 
 // Synopsis implements subcommands.Command.Synopsis.
 func (*TimeTravel) Synopsis() string {
-	return "manage experimental in-memory TimeTravelOS branches"
+	return "manage experimental in-memory TimeTravelContainer branches"
 }
 
 // Usage implements subcommands.Command.Usage.
@@ -348,9 +348,9 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			err error
 		}
 		var writer io.Writer = &util.Writer{}
-		var logWriter *ttosconsole.RotatingWriter
+		var logWriter *ttcconsole.RotatingWriter
 		if t.consoleLog != "" {
-			logWriter, err = ttosconsole.NewRotatingWriterWithStats(t.consoleLog, t.consoleLogMax, t.consoleLogFiles, t.consoleRetentionStats)
+			logWriter, err = ttcconsole.NewRotatingWriterWithStats(t.consoleLog, t.consoleLogMax, t.consoleLogFiles, t.consoleRetentionStats)
 			if err != nil {
 				break
 			}
@@ -451,7 +451,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				err = fmt.Errorf("handing console reads to coordinator: %w", releaseErr)
 			}
 			_ = releaseWriter.Close()
-			copyErr := ttosconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
+			copyErr := ttcconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
 			_ = finalReader.Close()
 			var encodedStatus [4]byte
 			_, statusErr := io.ReadFull(statusReader, encodedStatus[:])
@@ -535,7 +535,7 @@ type consoleDrainResult struct {
 	err       error
 }
 
-// followConsole drains both output streams into versioned TTOS multiplexed
+// followConsole drains both output streams into versioned TTC multiplexed
 // frames. DecodeFrame also accepts the legacy Docker-compatible representation.
 // It remains connected until both guest writers close.
 func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) error {
@@ -549,8 +549,8 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 		eof          bool
 	}
 	streams := []streamState{
-		{kernelStream: kernel.InternalConsoleStdout, frameStream: ttosconsole.StreamStdout},
-		{kernelStream: kernel.InternalConsoleStderr, frameStream: ttosconsole.StreamStderr},
+		{kernelStream: kernel.InternalConsoleStdout, frameStream: ttcconsole.StreamStdout},
+		{kernelStream: kernel.InternalConsoleStderr, frameStream: ttcconsole.StreamStderr},
 	}
 	finish := func(err error) consoleDrainResult {
 		return consoleDrainResult{
@@ -578,13 +578,13 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 				return finish(err)
 			}
 			if len(readResult.Data) != 0 {
-				if err := ttosconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), readResult.Data); err != nil {
+				if err := ttcconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), readResult.Data); err != nil {
 					return finish(fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err))
 				}
 				progress = true
 			}
 			if readResult.EOF {
-				if err := ttosconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), nil); err != nil {
+				if err := ttcconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), nil); err != nil {
 					return finish(fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err))
 				}
 				stream.eof = true

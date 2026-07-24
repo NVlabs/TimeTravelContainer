@@ -182,7 +182,7 @@ type CreateLinksAndRoutesArgs struct {
 	FDBasedLinks  []FDBasedLink
 	XDPLinks      []XDPLink
 
-	// TimeTravel configures the rootless TTOS in-process virtual NIC. It has no
+	// TimeTravel configures the rootless TTC in-process virtual NIC. It has no
 	// donated host FDs; any NAT connections are created by a branch-local proxy.
 	TimeTravel *TimeTravelNetworkConfig
 

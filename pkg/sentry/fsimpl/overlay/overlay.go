@@ -513,7 +513,7 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 }
 
 // UpperLayerAllocatedBytes returns logical allocated bytes in the writable
-// upper filesystem. TTOS root overlays use a Sentry-owned tmpfs upper.
+// upper filesystem. TTC root overlays use a Sentry-owned tmpfs upper.
 func (fs *filesystem) UpperLayerAllocatedBytes() (uint64, error) {
 	if !fs.opts.UpperRoot.Ok() {
 		return 0, fmt.Errorf("overlay filesystem has no writable upper layer")

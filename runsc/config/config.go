@@ -120,17 +120,17 @@ type Config struct {
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
 
-	// TimeTravelNetworkNAT enables outbound host socket proxying for the TTOS
+	// TimeTravelNetworkNAT enables outbound host socket proxying for the TTC
 	// in-process virtual NIC.
-	TimeTravelNetworkNAT bool `flag:"ttos-network-nat"`
+	TimeTravelNetworkNAT bool `flag:"ttc-network-nat"`
 
-	// TimeTravelNetworkIP is the IPv4 address assigned to the TTOS in-process
+	// TimeTravelNetworkIP is the IPv4 address assigned to the TTC in-process
 	// virtual NIC. An empty value selects the runtime default.
-	TimeTravelNetworkIP string `flag:"ttos-network-ip"`
+	TimeTravelNetworkIP string `flag:"ttc-network-ip"`
 
-	// TimeTravelNetworkMAC is the link address exposed by the TTOS in-process
+	// TimeTravelNetworkMAC is the link address exposed by the TTC in-process
 	// virtual NIC. An empty value selects the runtime default.
-	TimeTravelNetworkMAC string `flag:"ttos-network-mac"`
+	TimeTravelNetworkMAC string `flag:"ttc-network-mac"`
 
 	// EnableRaw indicates whether raw sockets should be enabled. Raw
 	// sockets are disabled by stripping CAP_NET_RAW from the list of
@@ -383,7 +383,7 @@ type Config struct {
 	// UnsafeNoHostIsolation runs the Sentry and gofer as the invoking user
 	// without placing either process in host namespaces or chroots. The Sentry
 	// still implements the guest's namespaces and credentials, but this option
-	// removes host-side defense in depth. It exists for TimeTravelOS deployments
+	// removes host-side defense in depth. It exists for TimeTravelContainer deployments
 	// where unprivileged user namespaces are unavailable and workloads are
 	// trusted.
 	UnsafeNoHostIsolation bool `flag:"unsafe-no-host-isolation"`
@@ -504,27 +504,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
 	if c.TimeTravelNetworkNAT && c.Network != NetworkTimeTravel {
-		return fmt.Errorf("ttos-network-nat is only supported with ttos networking")
+		return fmt.Errorf("ttc-network-nat is only supported with ttc networking")
 	}
 	if c.TimeTravelNetworkIP != "" {
 		if c.Network != NetworkTimeTravel {
-			return fmt.Errorf("ttos-network-ip is only supported with ttos networking")
+			return fmt.Errorf("ttc-network-ip is only supported with ttc networking")
 		}
 		ip := net.ParseIP(c.TimeTravelNetworkIP)
 		if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
-			return fmt.Errorf("ttos-network-ip must be a unicast IPv4 address, got %q", c.TimeTravelNetworkIP)
+			return fmt.Errorf("ttc-network-ip must be a unicast IPv4 address, got %q", c.TimeTravelNetworkIP)
 		}
 		if ip.To4()[3] == 0 || ip.To4()[3] == 2 || ip.To4()[3] == 255 {
-			return fmt.Errorf("ttos-network-ip %q conflicts with the /24 network, gateway, or broadcast address", c.TimeTravelNetworkIP)
+			return fmt.Errorf("ttc-network-ip %q conflicts with the /24 network, gateway, or broadcast address", c.TimeTravelNetworkIP)
 		}
 	}
 	if c.TimeTravelNetworkMAC != "" {
 		if c.Network != NetworkTimeTravel {
-			return fmt.Errorf("ttos-network-mac is only supported with ttos networking")
+			return fmt.Errorf("ttc-network-mac is only supported with ttc networking")
 		}
 		mac, err := net.ParseMAC(c.TimeTravelNetworkMAC)
 		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
-			return fmt.Errorf("ttos-network-mac must be a unicast 48-bit MAC address, got %q", c.TimeTravelNetworkMAC)
+			return fmt.Errorf("ttc-network-mac must be a unicast 48-bit MAC address, got %q", c.TimeTravelNetworkMAC)
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -782,7 +782,7 @@ func (n *NetworkType) Set(v string) error {
 		*n = NetworkHost
 	case "none":
 		*n = NetworkNone
-	case "ttos":
+	case "ttc", "ttos":
 		*n = NetworkTimeTravel
 	case "plugin":
 		*n = NetworkPlugin
@@ -807,7 +807,7 @@ func (n NetworkType) String() string {
 	case NetworkNone:
 		return "none"
 	case NetworkTimeTravel:
-		return "ttos"
+		return "ttc"
 	case NetworkPlugin:
 		return "plugin"
 	}

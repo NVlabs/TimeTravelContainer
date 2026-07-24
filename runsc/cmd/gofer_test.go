@@ -27,7 +27,7 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
-	"gvisor.dev/gvisor/runsc/ttos/ownership"
+	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
 func TestLoadRootfsOwnership(t *testing.T) {

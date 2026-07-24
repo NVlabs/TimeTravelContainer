@@ -50,12 +50,12 @@ When you are done, restart containerd to pick up the changes.
 sudo systemctl restart containerd
 ```
 
-## TimeTravelOS branch side channel
+## TimeTravelContainer branch side channel
 
-The TimeTravelOS shim adds a versioned TTRPC service to the existing shim Unix
+The TimeTravelContainer shim adds a versioned TTRPC service to the existing shim Unix
 socket. It does not add methods to containerd task-v2 and does not change the
 meaning of standard containerd pause, resume, exec, or lifecycle operations.
-Containerd continues to control the `main` task; TTOS remains authoritative for
+Containerd continues to control the `main` task; TTC remains authoritative for
 the live branch tree.
 
 The service name is `gvisor.timetravel.v1.Branches`. It carries validated JSON
@@ -90,7 +90,7 @@ result, err := timetravel.Call(ctx, client, "Fork", timetravel.Request{
 
 An adapter obtains the per-sandbox shim address from containerd runtime
 metadata, then connects with the same local permissions as an ordinary shim
-client. The current `ttos` daemon remains on its direct-runsc backend; this
+client. The current `ttc` daemon remains on its direct-runsc backend; this
 side channel is the integration boundary for a future containerd-backed daemon.
 
 ## Debug

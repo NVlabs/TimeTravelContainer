@@ -230,8 +230,8 @@ func createLoaderWithGoferMountConfs(conf *config.Config, spec *specs.Spec, moun
 	return l, cleanupGofers, nil
 }
 
-// TestTTOSMaxTasks validates TTOS-specific activation of sandbox-wide task limits.
-func TestTTOSMaxTasks(t *testing.T) {
+// TestTTCMaxTasks validates TTC-specific activation of sandbox-wide task limits.
+func TestTTCMaxTasks(t *testing.T) {
 	positive := &specs.LinuxPids{Limit: 7}
 	nonPositive := &specs.LinuxPids{Limit: 0}
 	for _, test := range []struct {
@@ -242,17 +242,18 @@ func TestTTOSMaxTasks(t *testing.T) {
 	}{
 		{name: "nil spec"},
 		{name: "ordinary OCI resources are not sandbox-wide", spec: &specs.Spec{Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}},
-		{name: "marker requires resources", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}}, wantErr: true},
-		{name: "marker requires positive limit", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: nonPositive}}}, wantErr: true},
-		{name: "TTOS limit", spec: &specs.Spec{Annotations: map[string]string{ttosPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
+		{name: "marker requires resources", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}}, wantErr: true},
+		{name: "marker requires positive limit", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: nonPositive}}}, wantErr: true},
+		{name: "TTC limit", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
+		{name: "legacy TimeTravelOS limit", spec: &specs.Spec{Annotations: map[string]string{legacyPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := ttosMaxTasks(test.spec)
+			got, err := ttcMaxTasks(test.spec)
 			if (err != nil) != test.wantErr {
-				t.Fatalf("ttosMaxTasks() error=%v, wantErr=%t", err, test.wantErr)
+				t.Fatalf("ttcMaxTasks() error=%v, wantErr=%t", err, test.wantErr)
 			}
 			if got != test.want {
-				t.Errorf("ttosMaxTasks()=%d, want %d", got, test.want)
+				t.Errorf("ttcMaxTasks()=%d, want %d", got, test.want)
 			}
 		})
 	}
@@ -825,12 +826,12 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/readonly", Type: "bind", Source: hostBind, Options: []string{"rbind", "ro"}},
-		{Destination: "/managed", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
-		{Destination: "/managed-alias", Type: "tmpfs", Source: "ttos-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
+		{Destination: "/managed", Type: "tmpfs", Source: "ttc-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
+		{Destination: "/managed-alias", Type: "tmpfs", Source: "ttc-volume-cache", Options: []string{"rw", "nosuid", "nodev", "mode=0755"}},
 	}
 	spec.Annotations = map[string]string{
 		InternalConsoleAnnotation:               "init",
-		"dev.gvisor.spec.mount.managed.source":  "ttos-volume-cache",
+		"dev.gvisor.spec.mount.managed.source":  "ttc-volume-cache",
 		"dev.gvisor.spec.mount.managed.share":   "container",
 		"dev.gvisor.spec.mount.managed.type":    "tmpfs",
 		"dev.gvisor.spec.mount.managed.options": "rw,nosuid,nodev,mode=0755",
@@ -1285,7 +1286,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	truncateFile.DecRef(parentTask)
 	parentTruncateFile := liveForkTestFD(t, l.k, truncateFD)
-	devMountFile := liveForkTestCreateFile(t, parentTask, "dev/shm/ttos-mount-state")
+	devMountFile := liveForkTestCreateFile(t, parentTask, "dev/shm/ttc-mount-state")
 	const devMountFD = int32(26)
 	if _, err := parentTask.FDTable().NewFDAt(parentTask, devMountFD, devMountFile, kernel.FDFlags{}); err != nil {
 		devMountFile.DecRef(parentTask)
@@ -2134,7 +2135,7 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 		pty := liveForkTestOpenPath(t, task, "dev/ptmx", linux.O_RDWR|linux.O_NONBLOCK)
 		pty.DecRef(branchCtx)
 		liveForkTestPathRead(t, task, overlayPath, "prnt")
-		liveForkTestPathRead(t, task, "dev/shm/ttos-mount-state", "prnt")
+		liveForkTestPathRead(t, task, "dev/shm/ttc-mount-state", "prnt")
 		liveForkTestPathRead(t, task, "managed/state", "prnt")
 		liveForkTestPathRead(t, task, "managed-alias/state", "prnt")
 		liveForkTestPathRead(t, task, "readonly/fixture", "hoMUTATED")

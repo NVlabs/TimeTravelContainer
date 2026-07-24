@@ -67,7 +67,7 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config, disableIPv6 b
 		if conf.TimeTravelNetworkMAC == "" {
 			guestMAC = nil
 		} else if err != nil {
-			return fmt.Errorf("parsing TTOS virtual NIC MAC address: %v", err)
+			return fmt.Errorf("parsing TTC virtual NIC MAC address: %v", err)
 		}
 		link := boot.DefaultLoopbackLink
 		link.GVisorGRO = conf.GVisorGRO
@@ -78,7 +78,7 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config, disableIPv6 b
 			},
 			IsRestore: isRestore,
 		}, nil); err != nil {
-			return fmt.Errorf("creating TTOS virtual network: %v", err)
+			return fmt.Errorf("creating TTC virtual network: %v", err)
 		}
 	case config.NetworkSandbox:
 		// Build the path to the net namespace of the sandbox process.

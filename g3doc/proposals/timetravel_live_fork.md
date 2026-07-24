@@ -1,15 +1,15 @@
-# TimeTravelOS live container fork
+# TimeTravelContainer live container fork
 
 Status: implemented for the documented systrap scope; unsupported external
 resources are rejected by design.
 
 Follow-on product, mount, volume, exec, attach/detach, image-management, and
 Docker-like CLI work is tracked in
-[timetravel_ttos_cli.md](timetravel_ttos_cli.md).
+[timetravel_ttc_cli.md](timetravel_ttc_cli.md).
 
 ## Summary
 
-TimeTravelOS adds an in-memory operation that forks a paused gVisor sandbox
+TimeTravelContainer adds an in-memory operation that forks a paused gVisor sandbox
 into two independently runnable branches. The operation clones Sentry kernel
 metadata, preserves virtual Linux observables, shares existing physical pages,
 and performs page-level copy-on-write (CoW) after either branch writes. It does
@@ -47,7 +47,7 @@ latency rather than branch failure isolation.
 * Migrating or persisting branches.
 * Cloning host-network/hostinet or arbitrary external links, writable gofer
   mounts, host FDs, devices, GPU state, packet mmap rings, KCOV, AIO, or
-  io_uring. TTOS's own virtual NIC is supported by an explicit parent-retain,
+  io_uring. TTC's own virtual NIC is supported by an explicit parent-retain,
   child-reset policy for external proxy flows.
 * Security isolation between branches in the same Sentry process.
 * Constant-time cloning of arbitrary kernel metadata. Pause time may scale with
@@ -202,8 +202,8 @@ The child must therefore receive an external stop before `StartPaused()` starts
 its task goroutines.
 
 Checkpoint-only package-global state requires audit. Registered loopback UDP,
-established internal TCP endpoints, and the TTOS virtual-NIC hooks pass
-recursive-fork tests. The TTOS gateway/proxy is runtime-only rather than
+established internal TCP endpoints, and the TTC virtual-NIC hooks pass
+recursive-fork tests. The TTC gateway/proxy is runtime-only rather than
 serialized: each child reconstructs a fresh realm and resets inherited external
 TCP endpoints. All remaining package-global registries must still reject unless
 they can be proven Kernel-local.
@@ -305,7 +305,7 @@ not only mmap faults.
 Syscall writes need special lock ordering after a fork. `IOSequence.CopyInTo`
 may invoke the tmpfs writer while holding the source `MemoryManager.activeMu`
 for reading, but breaking file CoW invalidates mappings and may need that same
-lock for writing. When a write overlaps a live-fork-shared tmpfs range, TTOS
+lock for writing. When a write overlaps a live-fork-shared tmpfs range, TTC
 therefore stages source data through a bounded buffer before invalidation. The
 ordinary non-CoW path remains direct. Regression coverage maps the destination
 file in the source memory manager and verifies that `pwrite()` neither reenters
@@ -361,11 +361,11 @@ The implemented validator accepts:
 * canonical loopback netstack TCP/UDP where endpoints and queued packets are
   contained in the cloned Kernel;
 * purely internal Unix sockets without queued `SCM_RIGHTS`; and
-* the TTOS in-process virtual NIC with its unmodified routes and firewall state.
+* the TTC in-process virtual NIC with its unmodified routes and firewall state.
 
-The TTOS NIC has an explicit external-flow policy. The source keeps its
+The TTC NIC has an explicit external-flow policy. The source keeps its
 gateway/proxy, published listener, and host-facing connections. The child
-reconstructs a fresh link and proxy realm, retains internal loopback/`ttos0`
+reconstructs a fresh link and proxy realm, retains internal loopback/`ttc0`
 queues, resets inherited TCP endpoints that terminate outside the branch, and
 starts unpublished. Hostinet, plugin stacks, arbitrary external links,
 secondary network namespaces, and modified firewall/conntrack state remain
@@ -393,13 +393,13 @@ Existing RPCs default to the original branch until they acquire an explicit
 branch selector. Then add branch-aware variants for processes, exec, signal,
 wait, pause, resume, events, and destroy.
 
-The external CLI should be a TimeTravelOS command first, even if implemented in
+The external CLI should be a TimeTravelContainer command first, even if implemented in
 the runsc tree:
 
 ```text
-ttos fork <sandbox> --from <branch> --name <child>
-ttos branches <sandbox>
-ttos pause|resume|destroy <sandbox>:<branch>
+ttc fork <sandbox> --from <branch> --name <child>
+ttc branches <sandbox>
+ttc pause|resume|destroy <sandbox>:<branch>
 ```
 
 Do not claim OCI runtime compatibility for multiple branches until state
@@ -426,8 +426,8 @@ Initial policy:
 | Sentry netlink socket | Clone its protocol, queued datagrams, port allocation, and network-namespace state |
 | Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
 | Loopback netstack socket | Clone on canonical loopback with unmodified default iptables |
-| TTOS virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
-| Host TCP/UDP/Unix socket outside the TTOS proxy policy | Reject |
+| TTC virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
+| Host TCP/UDP/Unix socket outside the TTC proxy policy | Reject |
 | Writable or mutable gofer mount | Reject |
 | Host FD/device/FUSE/GPU | Reject |
 | AIO/io_uring/KCOV/packet mmap | Reject |
@@ -487,7 +487,7 @@ that resident application bytes are not eagerly copied.
 signal, wait, exec, event, console, pause/resume, and destroy control. The
 current gate accepts an immutable read-only gofer lower with directfs disabled,
 a writable in-memory OverlayFS upper, supported Sentry virtual filesystems and
-managed mounts, canonical loopback, and the TTOS virtual NIC. It validates
+managed mounts, canonical loopback, and the TTC virtual NIC. It validates
 reachable FD/VMA/mount/network resources before page-ownership mutation and
 continues to fail closed for host FDs, writable gofer state, unsupported special
 mappings, host networking, devices, and unrecognized implementations.
@@ -495,7 +495,7 @@ mappings, host networking, devices, and unrecognized implementations.
 The early Phase 0-2 measurements and phase-by-phase paragraphs below are
 retained as implementation history. The current performance baseline and
 compatibility boundary are summarized in
-[timetravel_ttos_audit.md](timetravel_ttos_audit.md).
+[timetravel_ttc_audit.md](timetravel_ttc_audit.md).
 
 The Phase 3 object-graph slice is validated for anonymous pipes, pure Sentry
 eventfds, epoll registration graphs, timerfds, signalfds, inotify watches,
@@ -670,9 +670,9 @@ from the corresponding mappings in other branches.
 
 ### Phase 6: contained networking
 
-Enable internal Unix sockets, loopback netstack connections, and the TTOS
+Enable internal Unix sockets, loopback netstack connections, and the TTC
 in-process virtual NIC through explicit validation and clone hooks. Host
-networking and arbitrary external links remain rejected; TTOS proxy flows use
+networking and arbitrary external links remain rejected; TTC proxy flows use
 the documented source-retain/child-reset policy.
 
 Gate: connection state, packet queues, polling, and peer relationships clone
@@ -797,7 +797,7 @@ not an absolute microsecond target.
    constant time.
 6. **Randomness semantics:** resolved policy: application-resident PRNG state is
    cloned as ordinary memory, while later `getrandom` and `/dev/{u,}random`
-   reads remain fresh host-backed entropy requests and are not replayed. TTOS
+   reads remain fresh host-backed entropy requests and are not replayed. TTC
    does not promise identical future entropy streams across branches.
 
 If the multiple-Kernel Phase 0 gate fails because of pervasive process-global
@@ -818,4 +818,4 @@ architectural question with executable evidence:
 
 That gate passed. The later phases described above subsequently added
 private-memory and filesystem CoW, resource validation, networking, recursive
-families, and the user-facing TTOS lifecycle.
+families, and the user-facing TTC lifecycle.

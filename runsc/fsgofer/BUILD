@@ -21,7 +21,7 @@ go_library(
         "//pkg/log",
         "//pkg/marshal/primitive",
         "//runsc/config",
-        "//runsc/ttos/ownership",
+        "//runsc/ttc/ownership",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
@@ -44,7 +44,7 @@ go_test(
     srcs = ["virtual_ownership_test.go"],
     library = ":fsgofer",
     deps = [
-        "//runsc/ttos/ownership",
+        "//runsc/ttc/ownership",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

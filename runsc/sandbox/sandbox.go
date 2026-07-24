@@ -1424,10 +1424,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 }
 
 // sandboxUsesHostNetworkNamespace reports whether host sockets created by the
-// Sentry must use the caller's network namespace. TTOS NAT terminates guest
+// Sentry must use the caller's network namespace. TTC NAT terminates guest
 // connections in the Sentry and creates corresponding host sockets, so putting
 // the Sentry in an otherwise empty network namespace makes every outbound flow
-// unreachable. Guest processes still see only the in-process TTOS netstack.
+// unreachable. Guest processes still see only the in-process TTC netstack.
 func sandboxUsesHostNetworkNamespace(conf *config.Config) bool {
 	return conf.Network == config.NetworkHost ||
 		(conf.Network == config.NetworkTimeTravel && conf.TimeTravelNetworkNAT)

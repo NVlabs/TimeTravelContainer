@@ -77,11 +77,13 @@ const (
 	AnnotationMountTar = "dev.gvisor.tar.mounts"
 
 	// AnnotationMountTarOnExit maps shared mount sources to pending tar outputs.
-	AnnotationMountTarOnExit = "dev.timetravelos.tar.mounts.on-exit"
+	AnnotationMountTarOnExit       = "dev.timetravelcontainer.tar.mounts.on-exit"
+	legacyAnnotationMountTarOnExit = "dev.timetravelos.tar.mounts.on-exit"
 
 	// RootfsMountTarSource is the reserved source key used to export the root
 	// filesystem through AnnotationMountTarOnExit.
-	RootfsMountTarSource = "dev.timetravelos.rootfs"
+	RootfsMountTarSource       = "dev.timetravelcontainer.rootfs"
+	legacyRootfsMountTarSource = "dev.timetravelos.rootfs"
 
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
@@ -310,14 +312,20 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 		spec.Annotations[AnnotationMountTar] = string(encoded)
 	}
-	if encoded := spec.Annotations[AnnotationMountTarOnExit]; encoded != "" {
+	encodedMountTarOnExit := spec.Annotations[AnnotationMountTarOnExit]
+	if encodedMountTarOnExit == "" {
+		encodedMountTarOnExit = spec.Annotations[legacyAnnotationMountTarOnExit]
+	}
+	if encoded := encodedMountTarOnExit; encoded != "" {
 		var targets map[string]MountTarOnExitTarget
 		if err := json.Unmarshal([]byte(encoded), &targets); err != nil {
 			return fmt.Errorf("normalizing %s: %w", AnnotationMountTarOnExit, err)
 		}
 		normalized := make(map[string]MountTarOnExitTarget, len(targets))
 		for source, target := range targets {
-			if source != RootfsMountTarSource {
+			if source == legacyRootfsMountTarSource {
+				source = RootfsMountTarSource
+			} else if source != RootfsMountTarSource {
 				source = absPath(bundleDir, source)
 			}
 			if _, ok := normalized[source]; ok {
@@ -330,6 +338,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 			return fmt.Errorf("normalizing %s: %w", AnnotationMountTarOnExit, err)
 		}
 		spec.Annotations[AnnotationMountTarOnExit] = string(encoded)
+		delete(spec.Annotations, legacyAnnotationMountTarOnExit)
 	}
 
 	if containerName := containerNameNoRemap(spec); len(containerName) > 0 {
@@ -1011,12 +1020,26 @@ type MountTarOnExitPath struct {
 
 // MountTarOnExitPaths returns final shared-mount exports in deterministic source order.
 func MountTarOnExitPaths(spec *specs.Spec) ([]MountTarOnExitPath, error) {
-	if spec == nil || spec.Annotations == nil || spec.Annotations[AnnotationMountTarOnExit] == "" {
+	if spec == nil || spec.Annotations == nil {
+		return nil, nil
+	}
+	encoded := spec.Annotations[AnnotationMountTarOnExit]
+	if encoded == "" {
+		encoded = spec.Annotations[legacyAnnotationMountTarOnExit]
+	}
+	if encoded == "" {
 		return nil, nil
 	}
 	var targets map[string]MountTarOnExitTarget
-	if err := json.Unmarshal([]byte(spec.Annotations[AnnotationMountTarOnExit]), &targets); err != nil {
+	if err := json.Unmarshal([]byte(encoded), &targets); err != nil {
 		return nil, fmt.Errorf("decoding %s: %w", AnnotationMountTarOnExit, err)
+	}
+	if target, ok := targets[legacyRootfsMountTarSource]; ok {
+		if _, exists := targets[RootfsMountTarSource]; exists {
+			return nil, fmt.Errorf("%s contains duplicate rootfs sources", AnnotationMountTarOnExit)
+		}
+		delete(targets, legacyRootfsMountTarSource)
+		targets[RootfsMountTarSource] = target
 	}
 	type mountDestination struct {
 		path     string

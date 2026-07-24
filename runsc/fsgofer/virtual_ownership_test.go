@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/runsc/ttos/ownership"
+	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
 func TestConnectionStatScopesVirtualOwnership(t *testing.T) {

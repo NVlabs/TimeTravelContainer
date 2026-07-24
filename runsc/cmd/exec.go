@@ -67,7 +67,7 @@ type Exec struct {
 	consoleSocket string
 
 	// internalConsole requests Sentry-owned branch-local pipe or PTY stdio. It
-	// is used by TTOS instead of donating host descriptors into the sandbox.
+	// is used by TTC instead of donating host descriptors into the sandbox.
 	internalConsole         string
 	internalConsoleTerminal bool
 	internalConsoleStdin    bool
@@ -243,7 +243,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 }
 
 // execManagedDetached creates a managed Sentry-owned session without leaving a
-// host shim attached to its console. TTOS starts the sole persistent drainer.
+// host shim attached to its console. TTC starts the sole persistent drainer.
 func (ex *Exec) execManagedDetached(conf *config.Config, c *container.Container, e *control.ExecArgs, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
 	pid, err := c.Execute(conf, e)
 	if err != nil {

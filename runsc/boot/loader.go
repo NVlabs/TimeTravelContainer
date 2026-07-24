@@ -497,23 +497,33 @@ const (
 // InternalConsoleAnnotation requests Sentry-internal, detachable stdio and
 // names the console session registered for the container init process.
 const (
-	InternalConsoleAnnotation = "dev.timetravelos.internal-console"
-	ttosPidsLimitAnnotation   = "dev.timetravelos.resource.pids-limit"
+	InternalConsoleAnnotation = "dev.timetravelcontainer.internal-console"
+	ttcPidsLimitAnnotation    = "dev.timetravelcontainer.resource.pids-limit"
+
+	legacyInternalConsoleAnnotation = "dev.timetravelos.internal-console"
+	legacyPidsLimitAnnotation       = "dev.timetravelos.resource.pids-limit"
 )
 
-func ttosMaxTasks(spec *specs.Spec) (uint64, error) {
+func ttcAnnotation(annotations map[string]string, current, legacy string) string {
+	if value := annotations[current]; value != "" {
+		return value
+	}
+	return annotations[legacy]
+}
+
+func ttcMaxTasks(spec *specs.Spec) (uint64, error) {
 	if spec == nil {
 		return 0, nil
 	}
-	if _, ok := spec.Annotations[ttosPidsLimitAnnotation]; !ok {
+	if ttcAnnotation(spec.Annotations, ttcPidsLimitAnnotation, legacyPidsLimitAnnotation) == "" {
 		return 0, nil
 	}
 	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
-		return 0, fmt.Errorf("%s requires linux.resources.pids", ttosPidsLimitAnnotation)
+		return 0, fmt.Errorf("%s requires linux.resources.pids", ttcPidsLimitAnnotation)
 	}
 	limit := spec.Linux.Resources.Pids.Limit
 	if limit <= 0 {
-		return 0, fmt.Errorf("%s requires a positive PID limit, got %d", ttosPidsLimitAnnotation, limit)
+		return 0, fmt.Errorf("%s requires a positive PID limit, got %d", ttcPidsLimitAnnotation, limit)
 	}
 	return uint64(limit), nil
 }
@@ -778,7 +788,7 @@ func New(args Args) (*Loader, error) {
 		cpufs = afs
 	}
 
-	maxTasks, err := ttosMaxTasks(args.Spec)
+	maxTasks, err := ttcMaxTasks(args.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +855,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating init process for root container: %w", err)
 	}
 	l.root.procArgs = procArgs
-	if args.Spec.Annotations[InternalConsoleAnnotation] != "" && !args.Spec.Process.Terminal {
+	if ttcAnnotation(args.Spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation) != "" && !args.Spec.Process.Terminal {
 		fdTable, err := l.newInternalConsoleFDTable(&l.root)
 		if err != nil {
 			return nil, fmt.Errorf("preparing root internal console: %w", err)
@@ -1470,7 +1480,7 @@ func initialInternalPTYWinsize(rows, cols uint64) linux.Winsize {
 }
 
 func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable, error) {
-	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
+	consoleID := ttcAnnotation(info.spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation)
 	if consoleID == "" {
 		return nil, fmt.Errorf("internal console annotation is empty")
 	}
@@ -1512,7 +1522,7 @@ func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
-	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
+	consoleID := ttcAnnotation(info.spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation)
 	var fdTable *kernel.FDTable
 	var ttyFile *host.TTYFileDescription
 	var err error
@@ -1725,7 +1735,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	targetKernel := branch.k
 
 	// Hold the lock for the entire operation so legacy OCI exec publication cannot
-	// race with destroyContainer(). TTOS-managed sessions are instead published
+	// race with destroyContainer(). TTC-managed sessions are instead published
 	// in the selected sandboxBranch while its operation lease is held.
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1876,7 +1886,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	keepProcess = true
 
 	if targetKernel == l.k && args.ExecID == "" {
-		// Standard OCI exec/wait uses Loader.processes. Stable TTOS sessions are
+		// Standard OCI exec/wait uses Loader.processes. Stable TTC sessions are
 		// branch-owned, including when their selected branch is main.
 		eid := execID{cid: args.ContainerID, pid: tgid}
 		l.processes[eid] = &execProcess{

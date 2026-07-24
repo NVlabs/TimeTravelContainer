@@ -41,7 +41,7 @@ import (
 	"gvisor.dev/gvisor/runsc/fsgofer/filter"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
-	"gvisor.dev/gvisor/runsc/ttos/ownership"
+	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
 var caps = []string{
@@ -146,7 +146,7 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.Var(&g.mountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured. They must follow this order: root first, then mounts as defined in the spec.")
 	f.IntVar(&g.devIoFD, "dev-io-fd", -1, "optional FD to connect /dev gofer server")
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
-	f.IntVar(&g.rootfsOwnershipFD, "rootfs-ownership-fd", -1, "optional open TTOS rootfs ownership manifest preserved across gofer re-exec")
+	f.IntVar(&g.rootfsOwnershipFD, "rootfs-ownership-fd", -1, "optional open TTC rootfs ownership manifest preserved across gofer re-exec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
 
@@ -356,7 +356,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 }
 
 func loadRootfsOwnership(spec *specs.Spec, inheritedFD int) (_ *ownership.Manifest, manifestFile *os.File, retErr error) {
-	name := spec.Annotations[ownership.Annotation]
+	name := ownership.AnnotationValue(spec.Annotations)
 	if name == "" {
 		if inheritedFD >= 0 {
 			return nil, nil, fmt.Errorf("rootfs ownership fd %d supplied without %q annotation", inheritedFD, ownership.Annotation)

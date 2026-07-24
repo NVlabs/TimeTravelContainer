@@ -93,7 +93,7 @@ func TestTimeTravelNetworkWithoutNAT(t *testing.T) {
 	s := newTimeTravelNetworkTestStack(t, false)
 	if conn, err := dialTimeTravelGateway(t, s, port, 250*time.Millisecond); err == nil {
 		conn.Close()
-		t.Fatal("connection through NAT-disabled TTOS network unexpectedly succeeded")
+		t.Fatal("connection through NAT-disabled TTC network unexpectedly succeeded")
 	}
 }
 
@@ -119,17 +119,17 @@ func TestTimeTravelNetworkTCPNAT(t *testing.T) {
 	conn, err := dialTimeTravelGateway(t, s, uint16(listener.Addr().(*net.TCPAddr).Port), 2*time.Second)
 	if err != nil {
 		t.Logf("guest IPv4 sent=%d received=%d", s.Stack.Stats().IP.PacketsSent.Value(), s.Stack.Stats().IP.PacketsReceived.Value())
-		t.Fatalf("dial through TTOS NAT: %v", err)
+		t.Fatalf("dial through TTC NAT: %v", err)
 	}
-	payload := []byte("ttos-nat-echo")
+	payload := []byte("ttc-nat-echo")
 	if _, err := conn.Write(payload); err != nil {
 		conn.Close()
-		t.Fatalf("write through TTOS NAT: %v", err)
+		t.Fatalf("write through TTC NAT: %v", err)
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(conn, got); err != nil {
 		conn.Close()
-		t.Fatalf("read through TTOS NAT: %v", err)
+		t.Fatalf("read through TTC NAT: %v", err)
 	}
 	conn.Close()
 	if string(got) != string(payload) {
@@ -167,13 +167,13 @@ func TestTimeTravelNetworkUDPNATAndHostAlias(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("SetDeadline: %v", err)
 	}
-	payload := []byte("ttos-udp-echo")
+	payload := []byte("ttc-udp-echo")
 	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("UDP write through TTOS NAT: %v", err)
+		t.Fatalf("UDP write through TTC NAT: %v", err)
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("UDP read through TTOS NAT: %v", err)
+		t.Fatalf("UDP read through TTC NAT: %v", err)
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("UDP NAT echo = %q, want %q", got, payload)

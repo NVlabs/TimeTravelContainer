@@ -76,6 +76,29 @@ func TestFromFlags(t *testing.T) {
 	}
 }
 
+func TestLegacyTimeTravelOSNetworkFlags(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	for name, value := range map[string]string{
+		"network":          "ttos",
+		"ttos-network-nat": "true",
+		"ttos-network-ip":  "192.0.2.44",
+		"ttos-network-mac": "02:aa:bb:cc:dd:ee",
+	} {
+		if err := testFlags.Set(name, value); err != nil {
+			t.Fatalf("setting %s: %v", name, err)
+		}
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Network != NetworkTimeTravel || !c.TimeTravelNetworkNAT ||
+		c.TimeTravelNetworkIP != "192.0.2.44" || c.TimeTravelNetworkMAC != "02:aa:bb:cc:dd:ee" {
+		t.Errorf("legacy network flags produced config %+v", c)
+	}
+}
+
 func TestToFlagsFromFlags(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
