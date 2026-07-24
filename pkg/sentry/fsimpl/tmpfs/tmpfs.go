@@ -151,6 +151,11 @@ type filesystem struct {
 	// pagesUsed is the number of pages used by this filesystem.
 	pagesUsed atomicbitops.Uint64
 
+	// diskBytes is the page-rounded logical size of regular files in a
+	// persistent ttcvol branch. It is separate from pagesUsed because ttcvol
+	// data pages are owned by host files, not the tmpfs MemoryFile.
+	diskBytes atomicbitops.Uint64
+
 	// inodesUsed is the number of inodes used by this filesystem.
 	inodesUsed atomicbitops.Uint64
 
@@ -169,6 +174,9 @@ type filesystem struct {
 // It intentionally reports branch-local logical usage after a live fork even
 // when the underlying MemoryFile pages are physically shared copy-on-write.
 func (fs *filesystem) AllocatedBytes() uint64 {
+	if fs.diskVolume != nil {
+		return fs.diskBytes.Load()
+	}
 	return fs.pagesUsed.Load() * hostarch.PageSize
 }
 
@@ -854,6 +862,7 @@ func (i *inode) decRef(ctx context.Context) {
 		case *regularFile:
 			impl.inode.fs.unregisterLiveForkFile(impl)
 			if i.fs.diskVolume != nil {
+				i.fs.adjustDiskBytes(impl.size.Load(), 0)
 				impl.diskMmap.MappableRelease()
 				break
 			}

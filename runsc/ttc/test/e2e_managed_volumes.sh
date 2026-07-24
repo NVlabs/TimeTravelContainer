@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Manual end-to-end coverage for TTC's disk-backed, branchable volume driver.
+# Manual end-to-end coverage for TTC's disk-backed, branchable rootfs upper and
+# managed-volume driver.
 set -eu
 
 TTC=${TTC:-}
@@ -47,6 +48,8 @@ SECOND="$PREFIX-second"
 VOLUME="$PREFIX-data"
 SEEDED_VOLUME="$PREFIX-seeded"
 EMPTY_VOLUME="$PREFIX-empty"
+ROOTFS_CONTAINER="$PREFIX-rootfs"
+CREATED_CONTAINER="$PREFIX-created"
 
 ttc() {
   "$TTC" \
@@ -73,6 +76,51 @@ if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
   set -- "$@" --allow-slow-volume-copy
 fi
 ttc "$@"
+
+# The ordinary writable root uses the same direct-to-disk branch machinery.
+# Stopping never exports a tar, and cp reconstructs fully stopped branches from
+# their persistent layers without starting the image entrypoint.
+HOST_IMPORT="$TTC_E2E_ROOT/rootfs-import"
+CHILD_EXPORT="$TTC_E2E_ROOT/rootfs-child-export"
+CREATED_EXPORT="$TTC_E2E_ROOT/rootfs-created-export"
+printf 'offline-import\n' >"$HOST_IMPORT"
+ttc run -d --name "$ROOTFS_CONTAINER" "$BUSYBOX_IMAGE" \
+  sh -c 'echo base >/rootfs-base; while :; do sleep 60; done' >/dev/null
+ttc fork "$ROOTFS_CONTAINER" child >/dev/null
+ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
+ttc exec "$ROOTFS_CONTAINER" test ! -e /rootfs-child
+ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
+find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/objects" -type f -size +0c | grep . >/dev/null ||
+  fail "running rootfs did not create a non-empty disk object"
+if find "$DATA_ROOT/containers/$ROOTFS_ID" -type f -name '*.tar' | grep . >/dev/null; then
+  fail "writable rootfs unexpectedly created a tar persistence image"
+fi
+ttc stop "$ROOTFS_CONTAINER@child" >/dev/null
+ttc stop "$ROOTFS_CONTAINER" >/dev/null
+ttc cp "$ROOTFS_CONTAINER@child:/rootfs-child" "$CHILD_EXPORT"
+[ "$(cat "$CHILD_EXPORT")" = child ] ||
+  fail "stopped child cp selected the wrong persistent rootfs branch"
+ttc cp "$HOST_IMPORT" "$ROOTFS_CONTAINER:/rootfs-offline-import"
+ttc start "$ROOTFS_CONTAINER" >/dev/null
+ttc exec "$ROOTFS_CONTAINER" sh -c '
+  test "$(cat /rootfs-base)" = base
+  test "$(cat /rootfs-offline-import)" = offline-import
+  test ! -e /rootfs-child
+'
+ttc stop "$ROOTFS_CONTAINER" >/dev/null
+ttc rm --force "$ROOTFS_CONTAINER" >/dev/null
+
+# A created-but-never-started container also has a complete persistent VFS
+# view for offline cp.
+ttc create --name "$CREATED_CONTAINER" "$BUSYBOX_IMAGE" sleep 60 >/dev/null
+ttc cp "$HOST_IMPORT" "$CREATED_CONTAINER:/created-import"
+ttc cp "$CREATED_CONTAINER:/created-import" "$CREATED_EXPORT"
+[ "$(cat "$CREATED_EXPORT")" = offline-import ] ||
+  fail "created-container offline cp did not round-trip"
+ttc start "$CREATED_CONTAINER" >/dev/null
+ttc exec "$CREATED_CONTAINER" test -f /created-import
+ttc stop "$CREATED_CONTAINER" >/dev/null
+ttc rm "$CREATED_CONTAINER" >/dev/null
 
 # A new volume copies the image destination directly into its repository once;
 # nocopy creates the same mount with an empty root.

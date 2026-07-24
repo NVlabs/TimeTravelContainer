@@ -28,9 +28,9 @@ covers:
   fork-rejection diagnostics;
 - Docker-style `container` aliases, multi-container detached `start`, concurrent
   `wait` with argument-ordered exit codes, restart of an exited container, and
-  an explicitly forced running-family restart; writable-rootfs upper-layer
-  state, including shutdown-handler writes, is exported on main exit and
-  restored by a later start;
+  an explicitly forced running-family restart; writable-rootfs state, including
+  shutdown-handler writes, is updated directly in the family-owned `ttcvol`
+  repository and reopened without an exit export/start restore;
 - persisted `--network host` startup using an unmodified BusyBox HTTP server,
   Docker inspect projection, host-loopback reachability, and live-fork
   rejection for the externally shared network stack;
@@ -112,6 +112,12 @@ covers:
   and fork diagnostics, parent/child/grandchild CoW divergence, and continued
   operation after deletion of the source branch;
 - graceful stop, branch removal, and container removal.
+
+The dedicated disk-volume suite additionally covers the ordinary rootfs upper:
+direct disk objects while running, absence of tar snapshots, O(1) branch
+creation and divergence, stopped main/child `ttc cp`, copy into a
+created-but-never-started container, and stop/start reopening without explicit
+save or restore.
 
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default

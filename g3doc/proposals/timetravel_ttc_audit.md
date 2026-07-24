@@ -211,7 +211,7 @@ systrap directfs and shared-filesystem variants.
   [CVE-2025-47290](https://github.com/containerd/containerd/security/advisories/GHSA-cm76-qm8v-3j95)
   affected only v2.1.0 and was fixed in v2.1.1. TTC's virtual ownership
   manifest paths are canonicalized and image roots are served read-only below
-  an in-memory overlay.
+  a private, Sentry-managed disk-backed `ttcvol` overlay upper.
 - Writable host binds are rejected. Ordinary host binds are read-only shared
   external views, while managed CoW binds require an explicit immutable-source
   attestation. Directfs remains disabled in TTC's normal runsc arguments.
@@ -393,7 +393,7 @@ validates before mutation, and resumes it on rejection.
 Currently demonstrated as branch-local or safely cloned:
 
 * processes, threads, PID namespaces, anonymous private mappings, and memfd;
-* tmpfs, in-memory OverlayFS uppers, procfs, cgroupfs, devpts,
+* tmpfs, TTC `ttcvol` and in-memory OverlayFS uppers, procfs, cgroupfs, devpts,
   restricted read-only sysfs, POSIX message queues, and namespace handles;
 * SysV shared memory;
 * anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, inotify, pidfds,
@@ -485,12 +485,12 @@ port publication, but this is not the Docker network API. Host mode cannot be
 live-forked.
 
 Restart recreates an exited main branch from persistent configuration, the
-immutable image, and the last atomically exported writable-rootfs upper layer.
-The main branch exports that upper layer after init exits, including shutdown
-handler writes. A stopped branch does not retain its in-memory Kernel; child
-branch filesystem changes are not promoted automatically. Managed-volume state
-must be committed/imported or captured by the documented stop/exit preservation
-path.
+immutable image, and the main rootfs repository branch. Rootfs and managed
+volume mutations are applied directly to opaque host files and immutable
+metadata-tree roots; stop/start performs no TTC export/import. A stopped branch
+does not retain its in-memory Kernel, and child process state cannot be started,
+but its persistent filesystem branch remains available to stopped-branch
+`ttc cp`. Child changes are not promoted automatically.
 
 ### C2: current gVisor networking and the TTC subset
 

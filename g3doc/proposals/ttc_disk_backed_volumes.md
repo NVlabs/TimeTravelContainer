@@ -2,13 +2,15 @@
 
 ## Status
 
-Core implementation complete and enabled. The persistent immutable metadata
-trie, opaque object repository, real `FICLONE` capability probe, explicit
-slow-copy policy, branch-generation first-write CoW engine, `ttcvol` Sentry
-filesystem, frozen live-fork transaction, donated-FD plumbing, and volume CLI
-are implemented. Named and anonymous volumes, image `VOLUME`, initialization
-from image contents, `volume-nocopy`, inspect, `rm -v`, stop/start, and daemon
-restart are supported.
+Core implementation complete and enabled for both the ordinary writable
+container root and managed volumes. The persistent immutable metadata trie,
+opaque object repository, real `FICLONE` capability probe, explicit slow-copy
+policy, branch-generation first-write CoW engine, `ttcvol` Sentry filesystem,
+frozen live-fork transaction, donated-FD plumbing, and volume CLI are
+implemented. Every writable family receives a private rootfs-upper repository;
+stop/start and daemon shutdown/restart require no TTC serialization. Named and
+anonymous volumes, image `VOLUME`, initialization from image contents,
+`volume-nocopy`, inspect, `rm -v`, and stopped-branch `ttc cp` are supported.
 
 Focused tests and a dedicated end-to-end suite cover namespace operations,
 hard links, symlinks, fallocate, open writable FDs across fork, recursive
@@ -86,7 +88,7 @@ must never silently fall back unless the daemon option was set.
 
 ## On-disk repository
 
-Each named volume owns a private repository under the TTC data root:
+Each named volume owns a repository under the TTC data root:
 
 ```text
 volumes-v2/<volume-id>/
@@ -101,6 +103,15 @@ volumes-v2/<volume-id>/
   staging/
   lock
 ```
+
+Each writable container family owns the same repository format privately at:
+
+```text
+containers/<family-id>/rootfs-upper/
+```
+
+The family-owned rootfs repository is not listed by `ttc volume ls`, cannot be
+attached to an unrelated container, and is removed only with the family.
 
 Guest paths never map directly to paths under `objects/`. Regular-file data is
 stored in opaque, randomly named objects opened relative to an already-open
@@ -294,11 +305,12 @@ from the guest-visible logical quota.
    * Add the daemon startup probe and `--allow-slow-volume-copy`.
    * Add crash/fault-injection tests for object publication.
 
-2. **Read/write filesystem without fork — core complete**
+2. **Read/write filesystem without fork — complete**
    * Implement a new Sentry VFS filesystem, tentatively `ttcvol`.
    * Cover regular files, directories, symlinks, hard links, rename, unlink,
      stat, permissions, sparse files, truncate, fsync, and restart.
-   * Keep device nodes, sockets, and external host FDs unsupported initially.
+   * Device nodes, FIFOs, and Unix socket pathnames are persistent. A rebuilt
+     socket pathname is unbound, matching the loss of its live endpoint.
 
 3. **Persistent metadata CoW — complete except reclamation**
    * Add immutable inode-table/directory nodes and O(1) branch-root creation.
@@ -319,8 +331,10 @@ from the guest-visible logical quota.
    * `ttc volume create/ls/inspect/rm` is enabled.
    * Restore `--volume`, `--mount type=volume`, anonymous volumes, image
      `VOLUME`, `volume-nocopy`, inspect projection, and `rm -v`.
-   * Import/export and explicit branch-head promotion remain future work;
-     ordinary main-volume writes are already persistent.
+   * `ttc cp` imports/exports running branches and reconstructs fully stopped
+     branches in a transient helper Sentry without a checkpoint restore.
+   * Explicit branch-head promotion remains future work; ordinary rootfs and
+     managed-volume writes are already persistent.
 
 7. **Audit and performance qualification — in progress**
    * Fault-inject every metadata/object transaction boundary.

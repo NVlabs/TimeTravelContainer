@@ -296,7 +296,7 @@ Commands:
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   exec ls|wait|kill ...          Manage detached exec sessions
-  cp [OPTIONS] SRC_PATH DEST_PATH Copy files between host and a live branch
+  cp [OPTIONS] SRC_PATH DEST_PATH Copy files between host and a container branch
   inspect [OPTIONS] CONTAINER... Show Docker and TTC branch/process state
   events [OPTIONS]               Stream durable manager lifecycle events
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
@@ -2550,7 +2550,8 @@ type InspectExternalView struct {
 	Semantics               string `json:"semantics"`
 }
 
-// InspectGraphDriver describes TTC's immutable lower root and Sentry-memory upper layer.
+// InspectGraphDriver describes TTC's immutable image lower and persistent,
+// branchable userspace upper layer.
 type InspectGraphDriver struct {
 	Name string            `json:"Name"`
 	Data map[string]string `json:"Data"`
@@ -6413,6 +6414,14 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			HostIP: binding.HostIP, HostPort: strconv.Itoa(int(binding.HostPort)),
 		})
 	}
+	driver := "ttc-disk-overlay"
+	if container.RootfsUpperCopyMode == string(ttcvolume.CopyModeReflink) {
+		driver = "ttc-reflink-overlay"
+	}
+	upper := ""
+	if container.RootfsUpperID != "" {
+		upper = "ttcvol:" + container.RootfsUpperID
+	}
 	return InspectInfo{
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
@@ -6420,11 +6429,11 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
 			Error: stateError, StartedAt: inspectTimestamp(container.StartedAt), FinishedAt: inspectTimestamp(container.ExitedAt),
 		},
-		Image: container.Digest, Name: "/" + container.Name, Driver: "ttc-memory-overlay",
+		Image: container.Digest, Name: "/" + container.Name, Driver: driver,
 		Platform: container.Platform, RestartCount: 0,
 		GraphDriver: InspectGraphDriver{
-			Name: "ttc-memory-overlay",
-			Data: map[string]string{"LowerDir": container.RootFS, "UpperDir": "sentry-memory"},
+			Name: driver,
+			Data: map[string]string{"LowerDir": container.RootFS, "UpperDir": upper},
 		},
 		Config: InspectConfig{
 			Hostname: hostname, User: configUser, AttachStdin: container.OpenStdin, AttachStdout: true, AttachStderr: true,

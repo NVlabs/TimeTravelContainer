@@ -382,6 +382,7 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 			return err
 		}
 		rf.size.Store(newSize)
+		rf.inode.fs.adjustDiskBytes(oldSize, newSize)
 		rf.mapsMu.Lock()
 		if cloned {
 			rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
@@ -677,6 +678,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		return linuxerr.EFBIG
 	}
 	if f.inode.fs.diskVolume != nil {
+		oldSize := f.size.Load()
 		cloned, err := f.inode.fs.diskVolume.Repository.Allocate(
 			f.inode.fs.diskVolume.Branch, f.inode.ino, int64(offset), int64(length))
 		if err != nil {
@@ -685,6 +687,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		if end > f.size.Load() {
 			f.size.Store(end)
 		}
+		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
 		if cloned {
 			f.invalidateDiskObject()
 		}
@@ -906,6 +909,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	src = src.TakeFirst64(srclen)
 
 	if f.inode.fs.diskVolume != nil {
+		oldSize := f.size.Load()
 		file, _, cloned, err := f.inode.fs.diskVolume.Repository.OpenDataFile(
 			f.inode.fs.diskVolume.Branch, f.inode.ino, true)
 		if err != nil {
@@ -942,6 +946,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		if end := uint64(offset + done); end > f.size.Load() {
 			f.size.Store(end)
 		}
+		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
 		f.inode.touchCMtimeLocked()
 		for {
 			old := f.inode.mode.Load()

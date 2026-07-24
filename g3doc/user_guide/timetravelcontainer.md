@@ -383,21 +383,33 @@ archive has no separate source operand. TTC runs its own donated copy helper in
 the selected branch, so neither `tar` nor `cp` needs to exist in the image and
 the binary stream is not routed through a guest shell.
 
-Copy currently requires a running branch. Resume a paused branch first.
-Stopped containers do not retain a live Sentry VFS, so Docker's stopped-
-container copy behavior is not yet available. A copy process temporarily owns
-host stream FDs; `ttcd` therefore serializes copy operations with lifecycle
-mutations such as fork, pause, stop, and branch removal.
+Copy supports running and fully stopped branches. Resume a paused branch first.
+For a stopped family, TTC launches a short-lived helper Sentry whose process is
+the donated TTC copy helper, mounts the immutable image lower plus the selected
+persistent `ttcvol` rootfs/volume branch, and exits when the copy completes.
+It neither launches the image entrypoint nor restores process memory. TTC
+rejects offline access to one stopped child while another branch in the same
+family remains live, because two Sentries would otherwise cache one repository
+concurrently. A copy process temporarily owns host stream FDs; `ttcd` therefore
+serializes copy operations with lifecycle mutations such as fork, pause, stop,
+and branch removal.
 
 ## Filesystems and volumes
 
-The ordinary container root is writable by default. While the container is
-running it is a Sentry-owned memory overlay, so live forks share it copy-on-write.
-When the main container exits, TTC exports only that overlay's upper layer and
-uses it as the seed for the next `ttc start`; normal rootfs changes and shutdown
-handler writes therefore survive stop/start. A read-only root (`--read-only`)
-has no writable upper, and child-branch changes are not promoted to the main
-container's restart seed.
+The ordinary container root is writable by default. Its immutable image lower
+is covered by a family-owned, disk-backed `ttcvol` upper managed by the Sentry.
+Every namespace, metadata, and regular-file mutation updates that repository
+directly. Acknowledged data writes use normal host page-cache semantics, and
+guest `fsync`/`fdatasync` propagate to backing files. TTC performs no rootfs
+export on stop and no rootfs import on start.
+
+Live fork publishes a new immutable metadata-tree root without walking the
+filesystem. Both branches initially reference the same opaque regular-file
+objects; the first write in either branch reflinks the affected file, after
+which the backing filesystem performs block/extent CoW. A read-only root
+(`--read-only`) has no writable upper. Restart recreates process/kernel state
+only for `main`, while each stopped child retains its filesystem branch for
+offline `ttc cp`.
 
 Plain tmpfs mounts remain ephemeral across stop/start.
 
@@ -605,11 +617,12 @@ interrupted operation.
 
 `ttc daemon stop` is an orderly manager shutdown: it resumes paused branches,
 stops descendants before their source branches using each container's normal
-stop policy, persists writable rootfs state, and then exits the daemon. If a
-stop fails, the daemon remains available and reports the failure. In contrast,
-an unexpected `ttcd` crash does not terminate Sentry sandboxes; after restarting
-the daemon, TTC reconciles those live containers and their console/port
-sidecars.
+stop policy, and then exits the daemon. Rootfs and managed-volume writes were
+already applied directly to their repositories; shutdown performs no TTC
+save/export step. If a stop fails, the daemon remains available and reports
+the failure. In contrast, an unexpected `ttcd` crash does not terminate Sentry
+sandboxes; after restarting the daemon, TTC reconciles those live containers
+and their console/port sidecars.
 
 ## Shell completion
 

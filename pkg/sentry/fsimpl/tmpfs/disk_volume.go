@@ -19,6 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -90,6 +91,9 @@ func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[ui
 		return nil, err
 	}
 	fs.applyDiskMetadata(inode, meta)
+	if meta.Type == "regular" {
+		fs.adjustDiskBytes(0, uint64(meta.Size))
+	}
 	loaded[ino] = inode
 	if dir, ok := inode.impl.(*directory); ok {
 		entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, ino)
@@ -115,6 +119,37 @@ func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[ui
 		}
 	}
 	return inode, nil
+}
+
+func pageRoundedDiskBytes(size uint64) uint64 {
+	if size == 0 {
+		return 0
+	}
+	return (size + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1)
+}
+
+func (fs *filesystem) adjustDiskBytes(oldSize, newSize uint64) {
+	oldBytes := pageRoundedDiskBytes(oldSize)
+	newBytes := pageRoundedDiskBytes(newSize)
+	if oldBytes == newBytes {
+		return
+	}
+	for {
+		current := fs.diskBytes.Load()
+		var next uint64
+		if newBytes > oldBytes {
+			next = current + newBytes - oldBytes
+		} else {
+			delta := oldBytes - newBytes
+			if delta > current {
+				panic(fmt.Sprintf("ttcvol disk byte accounting underflow: current=%d delta=%d", current, delta))
+			}
+			next = current - delta
+		}
+		if fs.diskBytes.CompareAndSwap(current, next) {
+			return
+		}
+	}
 }
 
 func (fs *filesystem) applyDiskMetadata(inode *inode, meta ttcvolume.Inode) {

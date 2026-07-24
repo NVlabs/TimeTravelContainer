@@ -182,10 +182,12 @@ never grants host root; OCI `noNewPrivileges` still suppresses elevation.
 ### Forkable and persistent storage
 
 - The image root is an immutable lower layer.
-- The running container gets a Sentry-memory OverlayFS upper by default.
-- Live-forked branches share upper-layer pages CoW.
-- Main-branch rootfs changes, including shutdown-handler writes, are exported
-  on exit and seed the next `ttc start`.
+- Every writable container family owns a disk-backed `ttcvol` OverlayFS upper.
+- Rootfs mutations update that repository as they happen. Stop, start, daemon
+  shutdown, and daemon restart perform no TTC save or restore step.
+- Live fork publishes a new immutable metadata-tree root in O(1). Regular-file
+  contents remain shared until the first branch write, which creates a reflink;
+  the host filesystem then provides extent-level CoW.
 - Arbitrary Sentry-owned tmpfs, alternate procfs, restricted read-only sysfs,
   `/dev`, `/dev/shm`, and private devpts mounts are supported.
 - Read-only host binds are allowed as shared external views.
@@ -194,12 +196,11 @@ never grants host root; OCI `noNewPrivileges` still suppresses elevation.
 - Directfs is disabled so host open-file descriptions do not silently become
   shared branch state.
 
-Managed volumes use TTC's `ttcvol` Sentry filesystem. File contents are always
-ordinary files beneath the TTC data root; no tmpfs or tar export/import path is
-involved. Forking publishes another immutable metadata-tree root in O(1), and
-the first branch to modify a shared regular file creates a host reflink. The
-backing filesystem then performs extent-level CoW. New volumes receive the
-image destination's initial contents unless `volume-nocopy` is requested.
+The family-owned rootfs upper and managed volumes use TTC's `ttcvol` Sentry
+filesystem. File contents are always ordinary opaque files beneath the TTC
+data root; no tmpfs or tar export/import path is involved. New managed volumes
+receive the image destination's initial contents unless `volume-nocopy` is
+requested.
 
 ```sh
 ttc volume create cache
@@ -493,17 +494,20 @@ recovery, and the full command surface.
   GPU/TPU proxy state, and unrecognized resources are rejected by live-fork
   validation.
 - TTC user-mode NAT is currently IPv4 TCP/UDP; published ports are IPv4 TCP.
-- `ttc cp` currently operates on running branches. Resume a paused branch
-  before copying; stopped branches have no in-memory Sentry filesystem to
-  access.
+- `ttc cp` operates on running and fully stopped branches. Resume a paused
+  branch first. For stopped branches TTC reconstructs the merged VFS in a
+  short-lived helper Sentry from the immutable image and persistent `ttcvol`
+  branch; it does not start the image entrypoint or restore a checkpoint.
 - A stopped child branch cannot be recreated from memory. Start/restart rebuilds
-  the main branch from persistent configuration, its immutable image, the last
-  exported main rootfs upper.
+  the main branch from persistent configuration, its immutable image, and its
+  directly persistent rootfs branch. A stopped child filesystem remains
+  accessible through `ttc cp`, but its process/kernel state cannot be started.
 - Managed-volume regular files, directories, symlinks, hard links, xattrs,
-  truncate, fallocate, fsync, restart, and branch CoW are supported. Device
-  nodes, FIFOs, Unix sockets, ACLs, repository garbage collection, sparse-aware
-  slow copying, and unrelated concurrent writable attachment remain open; TTC
-  rejects the latter while allowing additional read-only attachments.
+  truncate, fallocate, fsync, restart, branch CoW, device nodes, FIFOs, and
+  Unix socket pathnames are supported. Live socket endpoints, ACLs, repository
+  garbage collection, sparse-aware slow copying, and unrelated concurrent
+  writable attachment remain open; TTC rejects the latter while allowing
+  additional read-only attachments.
 - Read-only host binds remain shared external views rather than snapshots.
 - Uncommon OCI metadata such as device nodes, privileged security xattrs, and
   executable file capabilities needs broader rootless virtualization coverage.

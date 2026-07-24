@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"archive/tar"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,11 @@ import (
 	"syscall"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/specutils"
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
 
 const (
@@ -277,27 +282,62 @@ func (b *runtimeBackend) importContainerPath(target selector, destination string
 }
 
 func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, input io.Reader, output io.Writer) error {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
-	state, err := b.branchRuntimeState(resolved)
+	families, err := b.listRuntimeFamilies()
 	if err != nil {
 		return err
 	}
-	if state != "running" {
-		return fmt.Errorf("cannot copy to or from branch %q while it is %s; resume it first", resolved.branch, state)
+	for _, family := range families {
+		if family.ID != resolved.container {
+			continue
+		}
+		if family.State == "stopped" || family.State == "exited" {
+			break
+		}
+		for _, branch := range family.Branches {
+			if branch.ID != resolved.branch {
+				continue
+			}
+			if branch.State != "running" {
+				return fmt.Errorf("cannot copy to or from branch %q while it is %s; resume it first", resolved.branch, branch.State)
+			}
+			return b.runLiveCopyHelper(resolved, helperArgs, input, output)
+		}
+		return fmt.Errorf("cannot copy the offline branch %q while another branch in its family is live", resolved.branch)
 	}
+	for _, branch := range info.Branches {
+		if branch.ID != resolved.branch {
+			continue
+		}
+		if branch.State == "deleted" {
+			return fmt.Errorf("branch %q is deleted", resolved.branch)
+		}
+		return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+	}
+	return fmt.Errorf("branch %q does not exist", resolved.branch)
+}
+
+func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
 	executable := b.clientExecutable
 	if executable == "" {
 		executable = currentExecutable()
 	}
 	helper, err := os.Open(executable)
 	if err != nil {
-		return fmt.Errorf("opening TTC copy helper %q: %w", executable, err)
+		return nil, fmt.Errorf("opening TTC copy helper %q: %w", executable, err)
+	}
+	return helper, nil
+}
+
+func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []string, input io.Reader, output io.Writer) error {
+	helper, err := b.openCopyHelper()
+	if err != nil {
+		return err
 	}
 	defer helper.Close()
-
 	args := []string{
 		"--root", b.root, "exec", "--branch", resolved.branch,
 		"--user", "0:0",
@@ -327,6 +367,164 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 		return fmt.Errorf("running container copy helper: %w", err)
 	}
 	return nil
+}
+
+func offlineCopyCapabilities() *specs.LinuxCapabilities {
+	values := []string{
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE",
+		"CAP_FOWNER",
+		"CAP_MKNOD",
+		"CAP_SETFCAP",
+	}
+	return &specs.LinuxCapabilities{
+		Bounding:  append([]string(nil), values...),
+		Effective: append([]string(nil), values...),
+		Permitted: append([]string(nil), values...),
+	}
+}
+
+func offlineCopyBranch(scope, visible string) string {
+	if visible == defaultBranchID {
+		return ttcvolume.MainBranch
+	}
+	return ttcvolume.ScopedBranchID(scope, visible)
+}
+
+func offlineCopySpec(original *specs.Spec, scope, branch string, helperArgs []string) (*specs.Spec, error) {
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		return nil, fmt.Errorf("cloning container spec: %w", err)
+	}
+	var cloned specs.Spec
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return nil, fmt.Errorf("cloning container spec: %w", err)
+	}
+	if cloned.Process == nil {
+		return nil, errors.New("container spec has no process")
+	}
+	cloned.Process.Args = append([]string{"ttc", copyHelperArg}, helperArgs...)
+	cloned.Process.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	cloned.Process.Cwd = "/"
+	cloned.Process.Terminal = false
+	cloned.Process.ConsoleSize = nil
+	cloned.Process.User = specs.User{UID: 0, GID: 0}
+	cloned.Process.Capabilities = offlineCopyCapabilities()
+	cloned.Process.Rlimits = nil
+	cloned.Process.NoNewPrivileges = false
+	cloned.Hooks = nil
+	if cloned.Linux != nil {
+		cloned.Linux.CgroupsPath = ""
+		cloned.Linux.Resources = nil
+	}
+	if cloned.Annotations == nil {
+		cloned.Annotations = make(map[string]string)
+	}
+	delete(cloned.Annotations, "dev.timetravelcontainer.internal-console")
+	delete(cloned.Annotations, "dev.timetravelos.internal-console")
+	repositories, err := specutils.TTCVolumeRepositories(&cloned)
+	if err != nil {
+		return nil, err
+	}
+	if cloned.Root == nil || !cloned.Root.Readonly {
+		hasRootUpper := false
+		for _, repository := range repositories {
+			if repository.Source == specutils.TTCRootfsUpperSource {
+				hasRootUpper = true
+				break
+			}
+		}
+		if !hasRootUpper {
+			return nil, errors.New("writable container predates persistent rootfs uppers; recreate it before using stopped-container cp")
+		}
+	}
+	persistentBranch := offlineCopyBranch(scope, branch)
+	for i := range repositories {
+		repositories[i].Branch = persistentBranch
+	}
+	encoded, err = json.Marshal(repositories)
+	if err != nil {
+		return nil, fmt.Errorf("encoding offline copy repositories: %w", err)
+	}
+	if len(repositories) == 0 {
+		delete(cloned.Annotations, specutils.AnnotationTTCVolumeRepositories)
+	} else {
+		cloned.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+	}
+	return &cloned, nil
+}
+
+func writeOfflineCopySpec(bundleDir string, spec *specs.Spec) error {
+	encoded, err := json.MarshalIndent(spec, "", "  ")
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), encoded, 0600); err != nil {
+		return fmt.Errorf("writing offline copy spec: %w", err)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.ContainerInfo, helperArgs []string, input io.Reader, output io.Writer) error {
+	original, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	spec, err := offlineCopySpec(original, info.ID, resolved.branch, helperArgs)
+	if err != nil {
+		return err
+	}
+	tempRoot := filepath.Join(b.dataRoot, "tmp")
+	if err := os.MkdirAll(tempRoot, 0700); err != nil {
+		return fmt.Errorf("creating TTC temporary directory: %w", err)
+	}
+	bundleDir, err := os.MkdirTemp(tempRoot, "offline-cp-bundle-")
+	if err != nil {
+		return fmt.Errorf("creating offline copy bundle: %w", err)
+	}
+	defer os.RemoveAll(bundleDir)
+	if err := writeOfflineCopySpec(bundleDir, spec); err != nil {
+		return err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return err
+	}
+	runtimeID := "ttc-cp-" + requestID
+	helper, err := b.openCopyHelper()
+	if err != nil {
+		return err
+	}
+	defer helper.Close()
+	args := b.configuredRunscArgsForNetwork("none")
+	args = append(args, "run", "--bundle", bundleDir, "--exec-fd", "3", runtimeID)
+	command := exec.Command(b.runsc, args...)
+	command.ExtraFiles = []*os.File{helper}
+	command.Stdout = output
+	command.Stderr = b.stderr
+	var closeInput func()
+	if input != nil {
+		closeInput, err = setCommandStdin(command, input)
+		if err != nil {
+			return err
+		}
+		defer closeInput()
+	}
+	runErr := command.Run()
+	_, cleanupErr := b.command("delete", "--force", runtimeID)
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			runErr = fmt.Errorf("offline container copy helper exited with status %d", exitErr.ExitCode())
+		} else {
+			runErr = fmt.Errorf("running offline container copy helper: %w", runErr)
+		}
+	}
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("removing offline copy runtime: %w", cleanupErr)
+	}
+	return errors.Join(runErr, cleanupErr)
 }
 
 func runCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int {

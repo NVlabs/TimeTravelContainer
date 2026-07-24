@@ -17,11 +17,16 @@ package cmd
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func TestParseCopyCommandArgs(t *testing.T) {
@@ -57,6 +62,72 @@ func TestSplitCopyContainerEndpoint(t *testing.T) {
 		if container != test.container || got != (copyContainerEndpoint{target: test.target, path: test.path}) {
 			t.Errorf("splitCopyContainerEndpoint(%q) = (%+v, %t), want (%+v, %t)", test.value, got, container, copyContainerEndpoint{target: test.target, path: test.path}, test.container)
 		}
+	}
+}
+
+func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
+	repositories := []specutils.TTCVolumeRepository{
+		{Source: specutils.TTCRootfsUpperSource, Path: "/data/root", Branch: ttcvolume.MainBranch, CopyMode: string(ttcvolume.CopyModeReflink)},
+		{Source: "/run/ttc/volumes/data", Path: "/data/volume", Branch: ttcvolume.MainBranch, CopyMode: string(ttcvolume.CopyModeReflink)},
+	}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := &specs.Spec{
+		Process: &specs.Process{
+			Args:     []string{"/image-entrypoint"},
+			Terminal: true,
+			User:     specs.User{UID: 1000, GID: 1000},
+		},
+		Root: &specs.Root{Path: "/image"},
+		Linux: &specs.Linux{
+			CgroupsPath: "ttc/original",
+			Resources:   &specs.LinuxResources{},
+		},
+		Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories:  string(encoded),
+			"dev.timetravelcontainer.internal-console": "init",
+		},
+	}
+	cloned, err := offlineCopySpec(original, "family", "child", []string{"export", "/tmp/value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cloned.Process.Args, []string{"ttc", copyHelperArg, "export", "/tmp/value"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("helper args = %q, want %q", got, want)
+	}
+	if cloned.Process.Terminal || cloned.Process.User.UID != 0 || cloned.Process.Capabilities == nil {
+		t.Fatalf("helper process = %+v", cloned.Process)
+	}
+	if cloned.Linux.CgroupsPath != "" || cloned.Linux.Resources != nil {
+		t.Fatalf("offline helper retained cgroup settings: %+v", cloned.Linux)
+	}
+	if _, ok := cloned.Annotations["dev.timetravelcontainer.internal-console"]; ok {
+		t.Fatal("offline helper retained TTC console interception")
+	}
+	gotRepositories, err := specutils.TTCVolumeRepositories(cloned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBranch := ttcvolume.ScopedBranchID("family", "child")
+	for _, repository := range gotRepositories {
+		if repository.Branch != wantBranch {
+			t.Fatalf("repository %q branch = %q, want %q", repository.Source, repository.Branch, wantBranch)
+		}
+	}
+	if original.Process.Args[0] != "/image-entrypoint" || original.Linux.CgroupsPath != "ttc/original" {
+		t.Fatal("offline copy mutated the stored container spec")
+	}
+}
+
+func TestOfflineCopySpecRejectsLegacyWritableRoot(t *testing.T) {
+	_, err := offlineCopySpec(&specs.Spec{
+		Process: &specs.Process{Args: []string{"true"}},
+		Root:    &specs.Root{Path: "/image"},
+	}, "family", defaultBranchID, []string{"export", "/"})
+	if err == nil || !strings.Contains(err.Error(), "predates persistent rootfs") {
+		t.Fatalf("offlineCopySpec error = %v", err)
 	}
 }
 

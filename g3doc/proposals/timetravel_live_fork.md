@@ -477,8 +477,9 @@ Failure handling:
 As of 2026-07-19, the implementation spans the documented Phase 0-7 slices on
 systrap. Kernel metadata streams through an in-memory pipe; branches share the
 platform and eligible MemoryFile pages; visible PIDs and register state are
-preserved; and private anonymous memory, tmpfs, SysV SHM, and
-the in-memory OverlayFS upper detach copy-on-write. Focused tests cover
+preserved; private anonymous memory, tmpfs, and SysV SHM detach copy-on-write;
+and the disk-backed rootfs upper publishes a new `ttcvol` metadata-tree root
+with reflink-on-first-write file data. Focused tests cover
 bidirectional writes, application write faults, recursive branch trees, and
 arbitrary release order, while real multithreaded Python measurements confirm
 that resident application bytes are not eagerly copied.
@@ -486,7 +487,7 @@ that resident application bytes are not eagerly copied.
 `runsc` owns a transactional `SandboxFamily` with branch-local process,
 signal, wait, exec, event, console, pause/resume, and destroy control. The
 current gate accepts an immutable read-only gofer lower with directfs disabled,
-a writable in-memory OverlayFS upper, supported Sentry virtual filesystems and
+a writable `ttcvol` OverlayFS upper, supported Sentry virtual filesystems and
 managed mounts, canonical loopback, and the TTC virtual NIC. It validates
 reachable FD/VMA/mount/network resources before page-ownership mutation and
 continues to fail closed for host FDs, writable gofer state, unsupported special
@@ -550,9 +551,10 @@ branch-wide invalidation before installing the writable translation. Private
 tmpfs MemoryFiles and broader truncate/fallocate/mapping stress remain in
 Phase 4.
 
-The runsc gate now also accepts a writable root backed specifically by an
-in-memory OverlayFS upper; self-backed and anonymous-filestore uppers remain
-ineligible. The real-loader fixture uses that writable root and verifies upper
+The runsc gate accepts a writable root backed specifically by a TTC-managed
+OverlayFS upper; TTC now supplies a persistent `ttcvol` upper, while generic
+self-backed and anonymous-filestore uppers remain ineligible. The real-loader
+fixture uses that writable root and verifies upper
 file content and mode divergence, mapped upper writes, child unlink with a
 still-open FD, branch-local hardlink topology, partial truncation and sparse
 allocation, a parent-only new entry, and child-only copy-up, mutation, and

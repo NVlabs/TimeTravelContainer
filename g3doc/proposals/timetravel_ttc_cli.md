@@ -552,11 +552,12 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [x] Make an orderly `ttc daemon stop` resume paused branches, stop descendants
-      before ancestors with normal stop policy, persist writable rootfs and
-      managed-volume state, and leave the daemon running if container shutdown
-      fails. Preserve live sandboxes after an unexpected daemon crash for
-      restart reconciliation, including console drains and port sidecars.
+- [x] Make an orderly `ttc daemon stop` resume paused branches and stop
+      descendants before ancestors with normal stop policy. Writable rootfs and
+      managed-volume state is already persistent, so daemon shutdown performs
+      no serialization. Leave the daemon running if container shutdown fails,
+      and preserve live sandboxes after an unexpected daemon crash for restart
+      reconciliation, including console drains and port sidecars.
 - [x] Propagate the invoking client's `TERM` for terminal runs and execs when no
       image/container or command value exists, with an `xterm` fallback.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published
@@ -708,14 +709,17 @@ and reason.
       in fork-check JSON and inspect fork-check results. Records include visible
       mounts and hidden referenced lowers with stable identity and
       clone/share-external/reject decisions.
-- [x] Place an in-memory OverlayFS upper over the immutable image lower by
-      default.
+- [x] Place a private disk-backed `ttcvol` OverlayFS upper over the immutable
+      image lower by default. Apply mutations directly to the repository so
+      stop/start has no rootfs save/restore step.
 - [x] Track an image-target content pin for every family and release it only
       during family removal, after all live branches have been destroyed. TTC
       creates no host snapshot resources in the current directory-lower design.
-- [x] Keep root and managed-volume mutable state in Sentry tmpfs/OverlayFS
-      memory so it participates in live fork; no host service or snapshotter owns
-      a branch-local writable layer.
+- [x] Keep root and managed-volume namespace semantics in the Sentry while
+      storing their immutable metadata trees and opaque regular-file objects in
+      `ttcvol` repositories. Live fork publishes new branch roots in O(1), and
+      first-write reflinks provide file then extent CoW without a host
+      snapshotter.
 - [x] Add a manual networked end-to-end matrix for unmodified BusyBox, Alpine,
       Python, nginx, and Redis images, covering rootless prerequisites, OCI startup,
       Docker-like lifecycle commands and inspect across created, running,
@@ -742,8 +746,8 @@ and reason.
 - [x] Provide an explicitly started rootless per-user socket and private runtime
       directory, with peer-UID checks and a `0600` socket. Keep isolation mode
       exclusively in daemon startup configuration; clients never send it.
-- [x] Persist family configuration, image references, managed-volume metadata and
-      optional committed tar seeds, lineage, and tombstones; live branch memory
+- [x] Persist family configuration, image references, rootfs/managed-volume
+      repository identities, lineage, and tombstones; live process memory
       remains exclusively in the Sentry.
 - [x] Reconcile persisted metadata with the native image catalog and live runsc
       sandboxes after daemon restart, and restart missing branch/exec console
@@ -861,12 +865,11 @@ bundle.
 
 ## Open semantic decisions
 
-- [x] Define `start` for an exited main branch as OCI recreation from the immutable
-      image, persistent configuration, and the main branch's last exit-exported
-      writable-rootfs upper layer. Managed volumes start from their latest
-      explicitly committed, imported, manager-preserved, or natural-exit main
-      seed. An explicit stop/restart snapshot precedes signal delivery, and the
-      Sentry final snapshot captures later shutdown-handler writes before teardown.
+- [x] Define `start` for an exited main branch as OCI recreation from the
+      immutable image, persistent configuration, and the existing main
+      rootfs/managed-volume repository branches. Writes, including shutdown
+      handler writes, update those repositories directly; stop/restart takes no
+      TTC snapshot and performs no export/import.
 - [x] Output attachment does not reject or migrate with fork: every branch owns
       one drain, while host readers remain attached only to the selected log.
 - [x] Drain to a persistent host log instead of blocking guest output merely

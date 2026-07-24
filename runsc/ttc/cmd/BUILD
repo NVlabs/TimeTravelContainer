@@ -11,11 +11,12 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__", "//runsc/ttcd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/ttcvolume",
         "//runsc/flag",
+        "//runsc/specutils",
         "//runsc/ttc/bundle",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
-        "//pkg/ttcvolume",
         "//runsc/version",
         "@com_github_moby_sys_signal//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go",
@@ -30,8 +31,9 @@ go_test(
     srcs = ["cmd_test.go", "cp_test.go", "daemon_test.go", "daemon_terminal_test.go", "events_test.go", "idempotency_test.go"],
     library = ":cmd",
     deps = [
-        "//runsc/ttc/console",
         "//pkg/ttcvolume",
+        "//runsc/specutils",
+        "//runsc/ttc/console",
         "@com_github_opencontainers_runtime_spec//specs-go",
     ],
 )
