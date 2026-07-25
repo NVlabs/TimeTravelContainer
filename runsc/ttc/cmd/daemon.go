@@ -698,7 +698,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "kill", "stop", "restart", "fork":
+	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "kill", "stop", "restart", "fork", "checkpoint", "restore":
 		return true
 	case "cp":
 		_, _, _, err := parseCopyCommandArgs(args[1:])
@@ -734,6 +734,11 @@ func daemonCommandNeedsMutationJournal(args []string) bool {
 		return false
 	}
 	if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+		return false
+	}
+	// Checkpoint publishes a caller-named host file and therefore cannot be
+	// safely replayed by the data-root mutation journal.
+	if len(args) != 0 && args[0] == "checkpoint" {
 		return false
 	}
 	if len(args) == 0 || args[0] != "cp" {

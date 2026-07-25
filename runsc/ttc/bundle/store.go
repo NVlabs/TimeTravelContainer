@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	"gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
@@ -83,6 +85,34 @@ type Prepared struct {
 	RootFS    string
 	Image     images.RootFSInfo
 	Container ContainerInfo
+}
+
+// RestoreRepository identifies one unpacked ttcvol branch snapshot by its OCI
+// repository source.
+type RestoreRepository struct {
+	Source       string
+	SnapshotPath string
+}
+
+// RestoreHostMount identifies one manager-owned readonly bind captured in a
+// checkpoint.
+type RestoreHostMount struct {
+	MountIndex   int
+	Source       string
+	SnapshotPath string
+}
+
+// RestoreOptions describes a standalone TTC checkpoint being materialized as
+// a new, unrelated container family.
+type RestoreOptions struct {
+	Name             string
+	Container        ContainerInfo
+	Spec             *specs.Spec
+	Repositories     []RestoreRepository
+	HostMounts       []RestoreHostMount
+	VolumeCopyMode   ttcvolume.CopyMode
+	RestorePaused    bool
+	CheckpointBranch string
 }
 
 // BranchInfo is immutable branch lineage plus its last known lifecycle state.
@@ -636,6 +666,327 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}
 	keep = true
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+}
+
+// PrepareRestore imports a standalone checkpoint's writable filesystems and
+// creates a new family bundle locked to the checkpointed image digest.
+func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepared, error) {
+	if opts.Spec == nil {
+		return Prepared{}, errors.New("checkpoint has no OCI spec")
+	}
+	if err := validateName(opts.Name); err != nil {
+		return Prepared{}, err
+	}
+	containers, err := s.ListContainers()
+	if err != nil {
+		return Prepared{}, err
+	}
+	for _, existing := range containers {
+		if existing.Name == opts.Name || existing.ID == opts.Name {
+			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
+		}
+	}
+	pulled, err := s.resolveImage(ctx, opts.Container.Digest, opts.Container.Platform, "never", nil)
+	if err != nil {
+		return Prepared{}, fmt.Errorf("resolving checkpoint image %s: %w", opts.Container.Digest, err)
+	}
+	if pulled.Digest != opts.Container.Digest {
+		return Prepared{}, fmt.Errorf("checkpoint image resolved to %s, want %s", pulled.Digest, opts.Container.Digest)
+	}
+	imageInfo, rootfs, err := s.prepareImageRoot(ctx, pulled, opts.Container.Platform, nil)
+	if err != nil {
+		return Prepared{}, err
+	}
+	id, containerDir, err := s.createContainerDir(containers)
+	if err != nil {
+		return Prepared{}, err
+	}
+	keep := false
+	leaseID := ""
+	var importedVolumeIDs []string
+	defer func() {
+		if keep {
+			return
+		}
+		if manager, err := ttcvolume.OpenManager(s.Root, true); err == nil {
+			for _, volumeID := range importedVolumeIDs {
+				_ = manager.Remove(volumeID)
+			}
+		}
+		if leaseID != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
+			cancel()
+		}
+		_ = os.RemoveAll(containerDir)
+	}()
+
+	specData, err := json.Marshal(opts.Spec)
+	if err != nil {
+		return Prepared{}, err
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(specData, &spec); err != nil {
+		return Prepared{}, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(&spec)
+	if err != nil {
+		return Prepared{}, err
+	}
+	snapshotBySource := make(map[string]string, len(opts.Repositories))
+	for _, snapshot := range opts.Repositories {
+		if snapshot.Source == "" || snapshot.SnapshotPath == "" {
+			return Prepared{}, errors.New("checkpoint contains an invalid repository snapshot")
+		}
+		if _, ok := snapshotBySource[snapshot.Source]; ok {
+			return Prepared{}, fmt.Errorf("checkpoint contains duplicate repository source %q", snapshot.Source)
+		}
+		snapshotBySource[snapshot.Source] = snapshot.SnapshotPath
+	}
+	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	if err != nil {
+		return Prepared{}, err
+	}
+	if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
+		return Prepared{}, fmt.Errorf("volume backing capability changed during restore: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
+	}
+	copyMode := manager.Capability().Mode
+	var rootfsUpperID string
+	volumeIDMap := make(map[string]ttcvolume.VolumeInfo)
+	for index := range repositories {
+		repository := &repositories[index]
+		snapshotPath := snapshotBySource[repository.Source]
+		if snapshotPath == "" {
+			return Prepared{}, fmt.Errorf("checkpoint omits repository source %q", repository.Source)
+		}
+		if repository.Source == specutils.TTCRootfsUpperSource {
+			path := filepath.Join(containerDir, rootfsUpperRepositoryDir)
+			imported, snapshot, err := manager.ImportPrivateSnapshot(path, "rootfs", snapshotPath)
+			if err != nil {
+				return Prepared{}, fmt.Errorf("importing rootfs upper: %w", err)
+			}
+			info := imported.Info()
+			rootfsUpperID = info.ID
+			repository.Path = imported.HostPath()
+			repository.Branch = ttcvolume.MainBranch
+			repository.CopyMode = string(copyMode)
+			repository.RestoreID = snapshot.RepositoryID
+			if err := imported.Close(); err != nil {
+				return Prepared{}, err
+			}
+			continue
+		}
+		name := fmt.Sprintf("restore-%s-%d", id[:12], index)
+		imported, snapshot, err := manager.ImportSnapshot(name, snapshotPath)
+		if err != nil {
+			return Prepared{}, fmt.Errorf("importing managed volume %q: %w", repository.Source, err)
+		}
+		info := imported.Info()
+		importedVolumeIDs = append(importedVolumeIDs, info.ID)
+		volumeIDMap[filepath.Base(repository.Source)] = info
+		repository.Path = imported.HostPath()
+		repository.Branch = ttcvolume.MainBranch
+		repository.CopyMode = string(copyMode)
+		repository.RestoreID = snapshot.RepositoryID
+		if err := imported.Close(); err != nil {
+			return Prepared{}, err
+		}
+	}
+	if len(snapshotBySource) != len(repositories) {
+		return Prepared{}, fmt.Errorf("checkpoint has %d repository snapshots, OCI spec uses %d", len(snapshotBySource), len(repositories))
+	}
+	encodedRepositories, err := json.Marshal(repositories)
+	if err != nil {
+		return Prepared{}, err
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
+	if len(repositories) == 0 {
+		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
+	} else {
+		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
+	}
+	if spec.Root == nil {
+		return Prepared{}, errors.New("checkpoint OCI spec has no root")
+	}
+	spec.Root.Path = rootfs
+	hostMountByIndex := make(map[int]RestoreHostMount, len(opts.HostMounts))
+	for _, mount := range opts.HostMounts {
+		if mount.MountIndex < 0 || mount.Source == "" || mount.SnapshotPath == "" {
+			return Prepared{}, errors.New("checkpoint contains an invalid host mount")
+		}
+		if _, ok := hostMountByIndex[mount.MountIndex]; ok {
+			return Prepared{}, fmt.Errorf("checkpoint contains duplicate host mount index %d", mount.MountIndex)
+		}
+		hostMountByIndex[mount.MountIndex] = mount
+	}
+	for index := range spec.Mounts {
+		mount := &spec.Mounts[index]
+		snapshot, ok := hostMountByIndex[index]
+		if !ok {
+			continue
+		}
+		if mount.Type != "bind" || mount.Source != snapshot.Source {
+			return Prepared{}, fmt.Errorf("checkpoint host mount %d does not match OCI spec", index)
+		}
+		destination := filepath.Join(containerDir, "checkpoint-mounts", strconv.Itoa(index))
+		if err := copyRestoreHostPath(snapshot.SnapshotPath, destination); err != nil {
+			return Prepared{}, fmt.Errorf("restoring host mount %q: %w", mount.Source, err)
+		}
+		delete(hostMountByIndex, index)
+		mount.Source = destination
+	}
+	if len(hostMountByIndex) != 0 {
+		return Prepared{}, fmt.Errorf("checkpoint contains host mounts not present in OCI spec")
+	}
+	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.CgroupsPath != "" {
+		spec.Linux.CgroupsPath = filepath.Join("ttc", id)
+	}
+
+	leaseID = images.ContainerLeaseID(id)
+	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID, Digest: pulled.Digest}); err != nil {
+		return Prepared{}, err
+	}
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.Mkdir(bundleDir, 0700); err != nil {
+		return Prepared{}, err
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
+		return Prepared{}, err
+	}
+
+	metadataData, err := json.Marshal(opts.Container)
+	if err != nil {
+		return Prepared{}, err
+	}
+	var metadata ContainerInfo
+	if err := json.Unmarshal(metadataData, &metadata); err != nil {
+		return Prepared{}, err
+	}
+	now := time.Now().UTC()
+	metadata.ID = id
+	metadata.Name = opts.Name
+	metadata.Reference = opts.Container.Reference
+	metadata.Digest = pulled.Digest
+	metadata.ImageSize = pulled.Size
+	metadata.LeaseID = leaseID
+	metadata.Platform = imageInfo.Platform
+	metadata.BundleDir = bundleDir
+	metadata.RootFS = rootfs
+	metadata.PublishedPorts = nil
+	metadata.RootfsUpperID = rootfsUpperID
+	metadata.RootfsUpperCopyMode = string(copyMode)
+	metadata.State = "created"
+	metadata.ExitStatus = nil
+	metadata.CreatedAt = now
+	metadata.StartedAt = nil
+	metadata.ExitedAt = nil
+	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	for index := range metadata.Volumes {
+		oldID := metadata.Volumes[index].ID
+		if info, ok := volumeIDMap[oldID]; ok {
+			metadata.Volumes[index].ID = info.ID
+			metadata.Volumes[index].Name = info.Name
+			metadata.Volumes[index].Anonymous = true
+		}
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
+		return Prepared{}, err
+	}
+	keep = true
+	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+}
+
+func copyRestoreHostPath(source, destination string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode().IsRegular() {
+		return copyRestoreHostFile(source, destination, info.Mode().Perm())
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("checkpoint host mount snapshot has unsupported mode %v", info.Mode())
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	if err := os.Mkdir(destination, 0700); err != nil {
+		return err
+	}
+	var directories []struct {
+		path string
+		mode os.FileMode
+	}
+	err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == source {
+			return nil
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			if err := os.Mkdir(target, 0700); err != nil {
+				return err
+			}
+			directories = append(directories, struct {
+				path string
+				mode os.FileMode
+			}{target, entryInfo.Mode().Perm()})
+			return nil
+		case entryInfo.Mode().IsRegular():
+			return copyRestoreHostFile(path, target, entryInfo.Mode().Perm())
+		case entryInfo.Mode()&os.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		default:
+			return fmt.Errorf("checkpoint host mount entry %q has unsupported mode %v", path, entryInfo.Mode())
+		}
+	})
+	for index := len(directories) - 1; index >= 0; index-- {
+		if chmodErr := os.Chmod(directories[index].path, directories[index].mode); err == nil && chmodErr != nil {
+			err = chmodErr
+		}
+	}
+	if chmodErr := os.Chmod(destination, info.Mode().Perm()); err == nil && chmodErr != nil {
+		err = chmodErr
+	}
+	return err
+}
+
+func copyRestoreHostFile(source, destination string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	return output.Close()
 }
 
 func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, error) {

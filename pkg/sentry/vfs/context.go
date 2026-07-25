@@ -36,6 +36,10 @@ const (
 	// gofer.InternalFilesystemOptions.UniqueID) to host FDs.
 	CtxRestoreFilesystemFDMap
 
+	// CtxRestoreFilesystemResources maps serialized filesystem identities to
+	// replacement in-process resources supplied by a standalone restore.
+	CtxRestoreFilesystemResources
+
 	// CtxLiveForkFilesystemResources is a Context.Value key for in-process
 	// filesystem resources indexed by stable filesystem ID.
 	CtxLiveForkFilesystemResources
@@ -48,6 +52,23 @@ const (
 	// commit only after the child kernel has been restored successfully.
 	CtxLiveForkTransactions
 )
+
+// RestoreFilesystemResource associates an implementation-specific resource
+// with the persistent branch that should back the restored filesystem.
+type RestoreFilesystemResource struct {
+	Resource any
+	Branch   string
+}
+
+// RestoreFilesystemResources is keyed by the identity stored in checkpoint
+// state, which may differ from the identity of a newly imported repository.
+type RestoreFilesystemResources map[checkpoint.ResourceID]RestoreFilesystemResource
+
+// RestoreFilesystemResourcesFromContext returns standalone-restore resources.
+func RestoreFilesystemResourcesFromContext(ctx goContext.Context) RestoreFilesystemResources {
+	resources, _ := ctx.Value(CtxRestoreFilesystemResources).(RestoreFilesystemResources)
+	return resources
+}
 
 // MountNamespaceFromContext returns the MountNamespace used by ctx. If ctx is
 // not associated with a MountNamespace, MountNamespaceFromContext returns nil.

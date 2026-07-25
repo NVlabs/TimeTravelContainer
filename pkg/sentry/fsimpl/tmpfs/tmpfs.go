@@ -46,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
@@ -848,6 +849,11 @@ func (i *inode) tryIncRef() bool {
 func (i *inode) decRef(ctx context.Context) {
 	i.refs.DecRef(func() {
 		i.watches.HandleDeletion(ctx)
+		if i.fs.diskVolume != nil && i.nlink.Load() == 0 {
+			if err := i.fs.diskVolume.Repository.ReapOrphan(i.fs.diskVolume.Branch, i.ino); err != nil {
+				log.Warningf("failed to reclaim TTC volume inode %d: %v", i.ino, err)
+			}
+		}
 		// Remove pages used if child being removed is a SymLink or Regular File.
 		switch impl := i.impl.(type) {
 		case *directory:

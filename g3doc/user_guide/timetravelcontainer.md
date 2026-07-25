@@ -303,6 +303,57 @@ ttc branch rm web@test-a
 `ttc rm web` removes the whole family and requires all live branches to be
 stopped unless `--force` is used.
 
+## Durable checkpoint and restore
+
+`ttc fork` is the fast, in-memory operation for creating another branch in the
+same live family. Use `ttc checkpoint` when the state must survive removal of
+the source container or a daemon restart:
+
+```shell
+ttc checkpoint web@test-a web-test-a.ttc
+ttc restore --name recovered web-test-a.ttc
+```
+
+Checkpoint accepts either a running or paused branch. TTC briefly creates a
+private, paused in-memory fork, resumes the source, and serializes the private
+snapshot. The potentially slow file write therefore does not keep a running
+source paused. The private branch is removed after the archive is complete and
+does not appear in the family tree. Consequently, the selected branch must be
+eligible for live fork; if validation fails, TTC leaves the source unchanged
+and returns the same resource diagnostic used by `ttc fork`.
+
+The checkpoint contains the selected branch's process tree, threads, memory,
+supported kernel and internal-network state, writable root filesystem, managed
+volumes, container configuration, and snapshots of its read-only host binds.
+It does not contain the common immutable OCI image. The manifest records the
+exact image digest and platform, and restore refuses to substitute different
+image content. That digest must already be present in the restoring TTC
+daemon's image store.
+
+Restore creates a new container ID, name, writable repositories, virtual
+network identity, and one `main` branch. It has no fork ancestry or mutable
+storage relationship with the source family. A checkpoint made from a running
+branch restores running; one made from a paused branch restores paused:
+
+```shell
+ttc restore --name paused-copy paused.ttc
+ttc resume paused-copy
+```
+
+Published host ports are not recreated automatically. Add the desired
+forwardings to the restored container with `ttc port publish`. Connections to
+external hosts are disconnected in the snapshot, as they are for the child of
+a live fork; internal sockets and pipes are retained when supported.
+
+Checkpoint files are intended to be restored by a compatible TTC build. They
+wrap gVisor's versioned state data and are not a stable interchange format
+between arbitrary TTC or upstream gVisor versions. Compression defaults to
+fast DEFLATE and may be disabled:
+
+```shell
+ttc checkpoint --compression none web raw-checkpoint.ttc
+```
+
 ## Exec, attach, detach, and logs
 
 Run a command in a selected branch:

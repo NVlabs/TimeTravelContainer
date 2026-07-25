@@ -7,7 +7,7 @@ package(
 
 go_library(
     name = "cmd",
-    srcs = ["cmd.go", "completion.go", "cp.go", "daemon.go", "daemon_requests.go", "daemon_stdin_lease.go", "daemon_terminal.go", "events.go", "idempotency.go"],
+    srcs = ["checkpoint.go", "cmd.go", "completion.go", "cp.go", "daemon.go", "daemon_requests.go", "daemon_stdin_lease.go", "daemon_terminal.go", "events.go", "idempotency.go"],
     visibility = ["//runsc/ttc:__subpackages__", "//runsc/ttcd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
@@ -15,6 +15,7 @@ go_library(
         "//runsc/flag",
         "//runsc/specutils",
         "//runsc/ttc/bundle",
+        "//runsc/ttc/checkpoint",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
         "//runsc/version",

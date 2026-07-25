@@ -607,3 +607,214 @@ func TestScopedBranchID(t *testing.T) {
 		t.Fatalf("scoped branch IDs collide: %q", a)
 	}
 }
+
+func TestSnapshotRoundTripIsBranchScoped(t *testing.T) {
+	manager := openTestManager(t)
+	source, err := manager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "value", 0640, 12, 34)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, source, MainBranch, ino, "snapshot", 0)
+	if err := source.Link(MainBranch, RootInode, "hard", ino); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, source, MainBranch, ino, "changed!", 0)
+
+	snapshotDir := filepath.Join(t.TempDir(), "snapshot")
+	snapshot, err := source.ExportSnapshot("checkpoint", snapshotDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RepositoryID != source.Info().ID || snapshot.BranchID != "checkpoint" {
+		t.Fatalf("snapshot metadata = %+v", snapshot)
+	}
+	importPath := filepath.Join(manager.root, "restored")
+	restored, imported, err := manager.ImportPrivateSnapshot(importPath, "restored", snapshotDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if imported.RepositoryID != source.Info().ID {
+		t.Fatalf("imported source ID = %q, want %q", imported.RepositoryID, source.Info().ID)
+	}
+	gotIno, err := restored.Lookup(MainBranch, RootInode, "value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, restored, MainBranch, gotIno); got != "snapshot" {
+		t.Fatalf("restored data = %q, want snapshot", got)
+	}
+	hard, err := restored.Lookup(MainBranch, RootInode, "hard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hard != gotIno {
+		t.Fatalf("restored hard link inode = %d, want %d", hard, gotIno)
+	}
+	meta, err := restored.Inode(MainBranch, gotIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Mode != 0640 || meta.UID != 12 || meta.GID != 34 || meta.Nlink != 2 {
+		t.Fatalf("restored inode metadata = %+v", meta)
+	}
+	if _, err := restored.Branch("checkpoint"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("import retained source branch: %v", err)
+	}
+}
+
+func TestUnlinkedInodeRemainsCheckpointable(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "open", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "still open", 0)
+	if err := repository.Unlink(MainBranch, RootInode, "open"); err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := repository.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatalf("unlinked inode disappeared: %v", err)
+	}
+	if orphan.Nlink != 0 {
+		t.Fatalf("unlinked inode nlink=%d, want 0", orphan.Nlink)
+	}
+	snapshotPath := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := repository.ExportSnapshot(MainBranch, snapshotPath); err != nil {
+		t.Fatal(err)
+	}
+	imported, _, err := manager.ImportPrivateSnapshot(filepath.Join(manager.root, "imported"), "imported", snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imported.Close()
+	restored, err := imported.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatalf("restored unlinked inode is unavailable: %v", err)
+	}
+	if restored.Nlink != 0 || restored.Object == "" {
+		t.Fatalf("restored unlinked inode=%+v", restored)
+	}
+	data, _, _, err := imported.OpenDataFile(MainBranch, ino, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	got, err := io.ReadAll(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "still open" {
+		t.Fatalf("restored unlinked data=%q", got)
+	}
+	if err := imported.ReapOrphan(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := imported.Inode(MainBranch, ino); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reaped inode lookup=%v, want not exist", err)
+	}
+	if err := imported.ReapOrphan(MainBranch, RootInode); err == nil {
+		t.Fatal("ReapOrphan accepted root")
+	}
+}
+
+func TestRemoveBranchKeepsMain(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := repository.Fork(MainBranch, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch("temporary"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Branch("temporary"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed branch lookup = %v, want not exist", err)
+	}
+	if _, err := repository.Branch(MainBranch); err != nil {
+		t.Fatalf("main branch was removed: %v", err)
+	}
+	if err := repository.RemoveBranch(MainBranch); err == nil {
+		t.Fatal("RemoveBranch accepted main")
+	}
+}
+
+func TestImportSnapshotRejectsSymlinkMetadata(t *testing.T) {
+	manager := openTestManager(t)
+	source, err := manager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	snapshotPath := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := source.ExportSnapshot(MainBranch, snapshotPath); err != nil {
+		t.Fatal(err)
+	}
+	metadata := filepath.Join(snapshotPath, "snapshot.json")
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	data, err := os.ReadFile(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(metadata); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.ImportPrivateSnapshot(filepath.Join(manager.root, "imported"), "imported", snapshotPath); err == nil {
+		t.Fatal("ImportPrivateSnapshot accepted symlinked metadata")
+	}
+}
+
+func TestImportSnapshotRejectsSymlinkNode(t *testing.T) {
+	manager := openTestManager(t)
+	source, err := manager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	snapshotPath := filepath.Join(t.TempDir(), "snapshot")
+	snapshot, err := source.ExportSnapshot(MainBranch, snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := filepath.Join(snapshotPath, "nodes", snapshot.Root)
+	outside := filepath.Join(t.TempDir(), "outside-node")
+	data, err := os.ReadFile(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(node); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, node); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.ImportPrivateSnapshot(filepath.Join(manager.root, "imported"), "imported", snapshotPath); err == nil {
+		t.Fatal("ImportPrivateSnapshot accepted a symlinked node")
+	}
+}

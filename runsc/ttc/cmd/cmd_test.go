@@ -3112,6 +3112,9 @@ type fakeBackend struct {
 	copyImportArchive  bool
 	copyImportRaw      bool
 	copyImportData     []byte
+	checkpointRequest  checkpointRequest
+	restoreSource      string
+	restoreName        string
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {
@@ -3321,6 +3324,114 @@ func (b *fakeBackend) importContainerPath(target selector, destination string, p
 		return err
 	}
 	return b.err
+}
+
+func (b *fakeBackend) checkpoint(request checkpointRequest) error {
+	b.checkpointRequest = request
+	return b.err
+}
+
+func (b *fakeBackend) restoreCheckpoint(source, name string) (string, error) {
+	b.restoreSource = source
+	b.restoreName = name
+	return b.containerID, b.err
+}
+
+func TestCheckpointAndRestoreCommands(t *testing.T) {
+	b := &fakeBackend{containerID: "restored-id"}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"checkpoint", "--compression=none", "web@child", "/tmp/web.ttc"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("checkpoint status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.checkpointRequest.target != (selector{container: "web", branch: "child"}) ||
+		b.checkpointRequest.destination != "/tmp/web.ttc" ||
+		b.checkpointRequest.compression != "none" {
+		t.Fatalf("checkpoint request=%+v", b.checkpointRequest)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"restore", "--name", "recovered", "/tmp/web.ttc"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("restore status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.restoreSource != "/tmp/web.ttc" || b.restoreName != "recovered" {
+		t.Fatalf("restore=(%q, %q)", b.restoreSource, b.restoreName)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "restored-id" {
+		t.Fatalf("restore stdout=%q", got)
+	}
+}
+
+func TestNormalizeCheckpointCommandArgs(t *testing.T) {
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		args []string
+		path string
+	}{
+		{args: []string{"checkpoint", "--compression=none", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
+		{args: []string{"restore", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
+	}
+	for _, test := range tests {
+		got, err := normalizeCheckpointCommandArgs(test.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(workingDirectory, test.path)
+		if got[len(got)-1] != want {
+			t.Errorf("normalizeCheckpointCommandArgs(%q)=%q, want final path %q", test.args, got, want)
+		}
+	}
+}
+
+func TestCopyCheckpointHostDirectory(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "data"), []byte("value"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nested/data", filepath.Join(source, "link")); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "snapshot")
+	if err := copyCheckpointHostPath(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(destination, "nested", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "value" {
+		t.Fatalf("copied data=%q", data)
+	}
+	target, err := os.Readlink(filepath.Join(destination, "link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "nested/data" {
+		t.Fatalf("copied symlink=%q", target)
+	}
+}
+
+func TestCopyCheckpointHostFileCreatesParent(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.WriteFile(source, []byte("value"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "host-mounts", "5")
+	if err := copyCheckpointHostPath(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "value" {
+		t.Fatalf("copied data=%q", data)
+	}
 }
 
 func TestManagedVolumeMountParsing(t *testing.T) {

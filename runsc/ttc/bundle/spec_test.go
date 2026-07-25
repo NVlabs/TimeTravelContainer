@@ -1255,3 +1255,34 @@ func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyRestoreHostDirectory(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "data"), []byte("value"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nested/data", filepath.Join(source, "link")); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "restored")
+	if err := copyRestoreHostPath(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(destination, "nested", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "value" {
+		t.Fatalf("restored data=%q", data)
+	}
+	target, err := os.Readlink(filepath.Join(destination, "link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "nested/data" {
+		t.Fatalf("restored symlink=%q", target)
+	}
+}

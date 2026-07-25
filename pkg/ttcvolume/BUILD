@@ -9,6 +9,7 @@ go_library(
     name = "ttcvolume",
     srcs = [
         "repository.go",
+        "snapshot.go",
         "tree.go",
     ],
     visibility = ["//visibility:public"],

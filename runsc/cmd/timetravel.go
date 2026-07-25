@@ -30,6 +30,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -68,6 +69,8 @@ type TimeTravel struct {
 	consolePIDFile        string
 	consoleLogMax         int64
 	consoleLogFiles       int
+	checkpointImagePath   string
+	checkpointCompression CheckpointCompression
 }
 
 // Name implements subcommands.Command.Name.
@@ -83,6 +86,7 @@ func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
+		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
@@ -115,6 +119,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.consolePIDFile, "console-pid-file", "", "host path for the console-follow process identity")
 	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
+	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
+	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -199,6 +205,18 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.ResumeBranch(f.Arg(2))
 	case "destroy":
 		err = cont.Sandbox.DestroyBranch(f.Arg(2))
+	case "checkpoint":
+		if t.checkpointImagePath == "" {
+			util.Fatalf("--image-path is required for checkpoint")
+		}
+		if err := os.MkdirAll(t.checkpointImagePath, 0700); err != nil {
+			util.Fatalf("creating checkpoint image path: %v", err)
+		}
+		err = cont.Sandbox.CheckpointBranch(conf, cont.ID, f.Arg(2), t.checkpointImagePath, sandbox.CheckpointOpts{
+			Compression:                t.checkpointCompression.Level(),
+			Resume:                     false,
+			SaveRestoreExecContainerID: cont.ID,
+		})
 	case "ps":
 		output, err = cont.Sandbox.BranchProcesses(f.Arg(2), cont.ID)
 	case "size":

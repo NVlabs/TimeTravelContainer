@@ -128,7 +128,14 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	waitStatus := args[1].(*unix.WaitStatus)
 
 	if conf.Rootless {
-		return util.Errorf("Rootless mode not supported with %q", r.Name())
+		if conf.Network == config.NetworkSandbox {
+			return util.Errorf("sandbox network isn't supported with --rootless, use --network=ttc, --network=none, or --network=host")
+		}
+		if err := specutils.MaybeRunAsRoot(); err != nil {
+			return util.Errorf("Error executing inside namespace: %v", err)
+		}
+		// As with create and run, execution continues after re-exec inside the
+		// caller's unprivileged user namespace.
 	}
 
 	bundleDir := r.bundleDir

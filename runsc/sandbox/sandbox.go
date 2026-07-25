@@ -1703,6 +1703,37 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	return nil
 }
 
+// CheckpointBranch writes one TimeTravelContainer branch using the ordinary
+// gVisor statefile format. This path is invoked only for durable checkpoints;
+// Sandbox.ForkBranch remains entirely in memory.
+func (s *Sandbox) CheckpointBranch(conf *config.Config, cid, branchID, imagePath string, opts CheckpointOpts) error {
+	log.Debugf("Checkpoint sandbox %q branch %q, imagePath %q, opts %+v", s.ID, branchID, imagePath, opts)
+
+	saveOpts := control.SaveOpts{
+		Metadata:                       opts.Compression.ToMetadata(),
+		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
+		Resume:                         opts.Resume,
+		ExecOpts: control.SaveRestoreExecOpts{
+			Argv:        opts.SaveRestoreExecArgv,
+			Timeout:     opts.SaveRestoreExecTimeout,
+			ContainerID: opts.SaveRestoreExecContainerID,
+		},
+	}
+	defer func() {
+		for _, file := range saveOpts.FilePayload.Files {
+			_ = file.Close()
+		}
+	}()
+	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, &saveOpts); err != nil {
+		return err
+	}
+	args := boot.BranchCheckpointArgs{SaveOpts: saveOpts, BranchID: branchID}
+	if err := s.call(boot.ContMgrCheckpointBranch, &args, nil); err != nil {
+		return fmt.Errorf("checkpointing container %q branch %q: %w", cid, branchID, err)
+	}
+	return nil
+}
+
 func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
 	clientSockFile, err := s.maybeStartCheckpointGoferAndGetSocket(conf, s.CgroupJSON.Cgroup, imagePath, "-allow-checkpoint-writes")
 	if err != nil {

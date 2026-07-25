@@ -119,7 +119,10 @@ func (fs *filesystem) BeforeResume(ctx context.Context) {}
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
 func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
-	if fs.diskVolume != nil && pgalloc.IsLiveForkClone(ctx) {
+	if fs.diskVolume == nil {
+		return nil
+	}
+	if pgalloc.IsLiveForkClone(ctx) {
 		resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
 		resource, ok := resources[fs.diskVolume.ResourceID]
 		if !ok {
@@ -135,6 +138,23 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 		}
 		fs.diskVolume.Repository = repository
 		fs.diskVolume.Branch = childBranch
+		return nil
 	}
+	resources := vfs.RestoreFilesystemResourcesFromContext(ctx)
+	resource, ok := resources[fs.diskVolume.ResourceID]
+	if !ok {
+		return fmt.Errorf("TTC volume restore resource %q was not provided", fs.diskVolume.ResourceID)
+	}
+	repository, ok := resource.Resource.(*ttcvolume.Repository)
+	if !ok {
+		return fmt.Errorf("TTC volume restore resource %q has type %T", fs.diskVolume.ResourceID, resource.Resource)
+	}
+	if resource.Branch == "" {
+		return fmt.Errorf("TTC volume restore resource %q has no branch", fs.diskVolume.ResourceID)
+	}
+	fs.diskVolume.Repository = repository
+	fs.diskVolume.Branch = resource.Branch
+	info := repository.Info()
+	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}
 	return nil
 }

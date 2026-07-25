@@ -392,9 +392,16 @@ func (f *SandboxFamily) ReplaceDefaultKernel(k *kernel.Kernel) error {
 	if len(f.branches) != 1 {
 		return fmt.Errorf("cannot replace default kernel with %d live child branches", len(f.branches)-1)
 	}
-	b := f.branches[DefaultBranchID]
+	b, ok := f.branches[DefaultBranchID]
+	if !ok || b == nil {
+		return errors.New("default branch is unavailable during kernel replacement")
+	}
 	b.k = k
-	b.state = kernelBranchState(k)
+	// The replacement Kernel has not been loaded yet. In particular, its
+	// TaskSet is still uninitialized, so querying Kernel.IsPaused is invalid.
+	// Loader.Run replaces this transitional value with the restored Kernel's
+	// actual state after Kernel.Start.
+	b.state = BranchPaused
 	return nil
 }
 
@@ -403,6 +410,105 @@ func (f *SandboxFamily) HasChildren() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.branches) != 1
+}
+
+// Checkpoint serializes one branch against concurrent branch lifecycle
+// operations. The callback owns checkpoint I/O; Fork never calls this method.
+func (f *SandboxFamily) Checkpoint(id string, defaultWatchdog *watchdog.Watchdog, save func(*kernel.Kernel, *watchdog.Watchdog, []ExecSessionInfo) error) error {
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, cannot checkpoint", id, state)
+	}
+	dog := b.watchdog
+	if dog == nil {
+		dog = defaultWatchdog
+	}
+	sessions := make([]ExecSessionInfo, 0, len(b.execSessions))
+	for _, session := range b.execSessions {
+		sessions = append(sessions, cloneExecSessionInfo(session.info))
+	}
+	f.mu.Unlock()
+	if dog == nil {
+		return fmt.Errorf("branch %q has no watchdog", id)
+	}
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
+	return save(b.k, dog, sessions)
+}
+
+// RestoreDefaultExecSessions reinstates TTC control-plane identities after a
+// standalone checkpoint is loaded as a new family. The task graph and internal
+// consoles themselves were restored as Kernel state. Watchers are started
+// separately after Kernel.Start initializes ThreadGroup.liveGoroutines.
+func (f *SandboxFamily) RestoreDefaultExecSessions(sessions []ExecSessionInfo) error {
+	f.mu.Lock()
+	b := f.branches[DefaultBranchID]
+	if b == nil || b.k == nil {
+		f.mu.Unlock()
+		return errors.New("default branch is unavailable during exec-session restore")
+	}
+	if len(b.execSessions) != 0 {
+		f.mu.Unlock()
+		return errors.New("default branch already has exec sessions during restore")
+	}
+	for _, info := range sessions {
+		if info.State != ExecSessionRunning {
+			continue
+		}
+		if info.ID == "" || info.PID <= 0 {
+			f.mu.Unlock()
+			return fmt.Errorf("invalid restored exec session %+v", info)
+		}
+		if _, ok := b.execSessions[info.ID]; ok {
+			f.mu.Unlock()
+			return fmt.Errorf("duplicate restored exec session %q", info.ID)
+		}
+		tg := b.k.RootPIDNamespace().ThreadGroupWithID(info.PID)
+		if tg == nil || tg.Leader().Origin != kernel.OriginExec {
+			f.mu.Unlock()
+			return fmt.Errorf("restored exec session %q has no exec thread group with PID %d", info.ID, info.PID)
+		}
+		session := &execSession{info: cloneExecSessionInfo(info), tg: tg}
+		b.execSessions[info.ID] = session
+	}
+	f.mu.Unlock()
+	return nil
+}
+
+// WatchRestoredDefaultExecSessions starts exit tracking after the restored
+// Kernel has started all task goroutines.
+func (f *SandboxFamily) WatchRestoredDefaultExecSessions() error {
+	f.mu.Lock()
+	b := f.branches[DefaultBranchID]
+	if b == nil || b.k == nil {
+		f.mu.Unlock()
+		return errors.New("default branch is unavailable while starting restored exec-session watchers")
+	}
+	restored := make([]struct {
+		id      string
+		session *execSession
+	}, 0, len(b.execSessions))
+	for id, session := range b.execSessions {
+		if session.info.State == ExecSessionRunning {
+			restored = append(restored, struct {
+				id      string
+				session *execSession
+			}{id, session})
+		}
+	}
+	f.mu.Unlock()
+	for _, item := range restored {
+		f.watchExecSession(DefaultBranchID, item.id, item.session)
+	}
+	return nil
 }
 
 // QuiesceControls rejects new Kernel-lifetime control operations and waits for

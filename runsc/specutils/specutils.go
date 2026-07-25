@@ -18,6 +18,7 @@ package specutils
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -989,6 +990,9 @@ type TTCVolumeRepository struct {
 	Path     string `json:"path"`
 	Branch   string `json:"branch"`
 	CopyMode string `json:"copy_mode"`
+	// RestoreID is the repository identity serialized in a TTC checkpoint.
+	// Empty during ordinary creation and live fork.
+	RestoreID string `json:"restore_id,omitempty"`
 }
 
 // TTCVolumeRepositories parses and validates persistent-volume donations in
@@ -1017,6 +1021,14 @@ func TTCVolumeRepositories(spec *specs.Spec) ([]TTCVolumeRepository, error) {
 		case "reflink", "full-copy":
 		default:
 			return nil, fmt.Errorf("%s source %q has invalid copy mode %q", AnnotationTTCVolumeRepositories, repository.Source, repository.CopyMode)
+		}
+		if repository.RestoreID != "" {
+			if len(repository.RestoreID) != 32 {
+				return nil, fmt.Errorf("%s source %q has invalid restore ID %q", AnnotationTTCVolumeRepositories, repository.Source, repository.RestoreID)
+			}
+			if _, err := hex.DecodeString(repository.RestoreID); err != nil {
+				return nil, fmt.Errorf("%s source %q has invalid restore ID %q", AnnotationTTCVolumeRepositories, repository.Source, repository.RestoreID)
+			}
 		}
 	}
 	sort.Slice(repositories, func(i, j int) bool {

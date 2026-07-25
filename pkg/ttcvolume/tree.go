@@ -41,6 +41,9 @@ func (r *Repository) getTreeNode(id string) (treeNode, error) {
 	if len(id) != sha256.Size*2 {
 		return treeNode{}, fmt.Errorf("invalid metadata node ID %q", id)
 	}
+	if _, err := hex.DecodeString(id); err != nil {
+		return treeNode{}, fmt.Errorf("invalid metadata node ID %q", id)
+	}
 	data, err := r.readFile(filepath.Join("nodes", id))
 	if err != nil {
 		return treeNode{}, err
@@ -59,6 +62,9 @@ func (r *Repository) getTreeNode(id string) (treeNode, error) {
 			return treeNode{}, fmt.Errorf("metadata node %q has invalid edge %q", id, edge)
 		}
 		if len(child) != sha256.Size*2 {
+			return treeNode{}, fmt.Errorf("metadata node %q has invalid child %q", id, child)
+		}
+		if _, err := hex.DecodeString(child); err != nil {
 			return treeNode{}, fmt.Errorf("metadata node %q has invalid child %q", id, child)
 		}
 	}

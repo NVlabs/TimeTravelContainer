@@ -175,6 +175,12 @@ func shouldValidateAnnotation(key string) bool {
 	if strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source") {
 		return false
 	}
+	// Root.Path is already permitted to change. This annotation is its
+	// gVisor-internal projection and must follow it for a TTC checkpoint whose
+	// immutable image cache lives under a different data root.
+	if key == "dev.gvisor.spec.rootfs.source" {
+		return false
+	}
 	// Flag annotations controlling debug logging can change. They don't impact
 	// the restorability of the snapshot.
 	if strings.HasPrefix(key, annotationFlagPrefix) {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package volume implements TTC's persistent, branchable managed-volume
+// Package ttcvolume implements TTC's persistent, branchable managed-volume
 // repository. Namespace metadata is stored in an immutable radix trie, while
 // regular-file contents live in opaque host files.
 package ttcvolume
@@ -553,6 +553,63 @@ func (r *Repository) Branch(id string) (Branch, error) {
 	return r.readBranch(id)
 }
 
+// RemoveBranch removes a non-main branch pointer after its Kernel no longer
+// exists. Immutable nodes and objects remain eligible for repository-wide
+// garbage collection.
+func (r *Repository) RemoveBranch(id string) error {
+	if id == mainBranch {
+		return errors.New("cannot remove the main volume branch")
+	}
+	if err := validateName(id, "branch"); err != nil {
+		return err
+	}
+	return r.withLock(func() error {
+		if _, err := r.readBranch(id); err != nil {
+			return err
+		}
+		if err := r.unlink(filepath.Join("branches", id+".json")); err != nil {
+			return err
+		}
+		return r.syncDirectory("branches")
+	})
+}
+
+// ReapOrphan removes inode metadata after the Sentry has released the last
+// reference to an unlinked inode. Until this point the inode must remain in the
+// branch tree so live fork and durable checkpoint can reconstruct open file
+// descriptions and mappings.
+func (r *Repository) ReapOrphan(branchID string, ino uint64) error {
+	if ino == rootInode {
+		return errors.New("cannot reap the root inode")
+	}
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		inode, err := r.getInode(branch.Root, ino)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if inode.Nlink != 0 {
+			// Filesystem teardown also drops the Sentry's in-memory link
+			// references. The persistent namespace is still authoritative and
+			// must remain unchanged in that case.
+			return nil
+		}
+		root, err := r.treeDelete(branch.Root, inodeKey(ino))
+		if err != nil {
+			return err
+		}
+		branch.Root = root
+		branch.Generation++
+		return r.writeBranch(branch)
+	})
+}
+
 // ForkTransaction is a published but not yet committed O(1) branch fork.
 //
 // The source kernel must remain paused until Commit or Abort returns. This
@@ -926,10 +983,14 @@ func (r *Repository) Unlink(branchID string, parent uint64, name string) error {
 		}
 		if inode.Nlink > 1 {
 			inode.Nlink--
-			root, err = r.setInode(root, inode)
 		} else {
-			root, err = r.treeDelete(root, inodeKey(ino))
+			// Keep zero-link inode metadata in the immutable branch tree.
+			// Sentry may still hold an open file description or mapping, and a
+			// checkpoint must retain the inode's backing object. The Sentry
+			// reaps it after the final in-memory reference is released.
+			inode.Nlink = 0
 		}
+		root, err = r.setInode(root, inode)
 		if err != nil {
 			return err
 		}
@@ -977,7 +1038,10 @@ func (r *Repository) RemoveDirectory(branchID string, parent uint64, name string
 		if err != nil {
 			return err
 		}
-		root, err = r.treeDelete(root, inodeKey(ino))
+		// An open directory remains observable after unlink. Retain its inode
+		// metadata until repository GC, just like regular-file orphans.
+		inode.Nlink = 0
+		root, err = r.setInode(root, inode)
 		if err != nil {
 			return err
 		}
@@ -1062,10 +1126,12 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 			}
 			if replaced.Nlink > 1 && replaced.Type != "directory" {
 				replaced.Nlink--
-				root, err = r.setInode(root, replaced)
 			} else {
-				root, err = r.treeDelete(root, inodeKey(replacedIno))
+				// Preserve a replaced-but-open inode for live fork and durable
+				// checkpoint restoration. It is no longer reachable by name.
+				replaced.Nlink = 0
 			}
+			root, err = r.setInode(root, replaced)
 			if err != nil {
 				return err
 			}

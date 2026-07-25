@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -62,6 +63,10 @@ const (
 	// ContainerSpecsKey is the key used to add and pop the container specs to the
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
+	// TTCExecSessionsKey stores branch-local managed exec identities for a TTC
+	// branch checkpoint. Its presence distinguishes TTC restoration from the
+	// upstream behavior that terminates restored exec processes.
+	TTCExecSessionsKey = "ttc_exec_sessions"
 
 	annotationCheckpointPrefix = "dev.gvisor.internal.checkpoint."
 
@@ -384,7 +389,7 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	l.k.SetMemoryFile(r.mainMF)
 	if err := l.family.ReplaceDefaultKernel(l.k); err != nil {
-		return err
+		return fmt.Errorf("updating TTC family default branch: %w", err)
 	}
 
 	if l.root.conf.ProfileEnable {
@@ -407,6 +412,22 @@ func (r *restorer) restore(l *Loader) error {
 
 	fdmap := make(map[checkpoint.ResourceID]int)
 	mfmap := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	filesystemResources := make(vfs.RestoreFilesystemResources)
+	for _, donated := range l.ttcVolumeRepositories {
+		info := donated.repository.Info()
+		restoreID := donated.config.RestoreID
+		if restoreID == "" {
+			restoreID = info.ID
+		}
+		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
+		if _, ok := filesystemResources[key]; ok {
+			return fmt.Errorf("duplicate TTC volume restore identity %q", restoreID)
+		}
+		filesystemResources[key] = vfs.RestoreFilesystemResource{
+			Resource: donated.repository,
+			Branch:   donated.config.Branch,
+		}
+	}
 	for _, cont := range r.containers {
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)
@@ -429,6 +450,7 @@ func (r *restorer) restore(l *Loader) error {
 	log.Debugf("Restore using mfmap: %v", mfmap)
 	ctx = context.WithValues(ctx, map[any]any{
 		vfs.CtxRestoreFilesystemFDMap:     fdmap,
+		vfs.CtxRestoreFilesystemResources: filesystemResources,
 		pgalloc.CtxMemoryFileMap:          mfmap,
 		devutil.CtxDevGoferClientProvider: l.k,
 	})
@@ -528,19 +550,40 @@ func (r *restorer) restore(l *Loader) error {
 		}
 	}
 
-	// Kill all processes that have been exec'd since they cannot be properly
-	// restored -- the caller is no longer connected.
-	log.Debugf("Killing any exec session that existed previously")
-	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
-		if tg.Leader().Origin == kernel.OriginExec {
-			log.Infof("Killing exec'd process, PID: %d", tg.ID())
-			if err := l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
-				log.Warningf("Failed to kill exec process after restore: %v", err)
+	execSessionsRaw, ttcCheckpoint := r.metadata[TTCExecSessionsKey]
+	var restoredExecSessions []ExecSessionInfo
+	if ttcCheckpoint {
+		if err := json.Unmarshal([]byte(execSessionsRaw), &restoredExecSessions); err != nil {
+			return fmt.Errorf("decoding TTC exec sessions: %w", err)
+		}
+		for i := range restoredExecSessions {
+			name := l.k.ContainerName(restoredExecSessions[i].ContainerID)
+			newCID, ok := l.containerIDs[name]
+			if !ok {
+				return fmt.Errorf("remapping TTC exec session %q container %q", restoredExecSessions[i].ID, restoredExecSessions[i].ContainerID)
+			}
+			restoredExecSessions[i].ContainerID = newCID
+		}
+	} else {
+		// Preserve upstream behavior for ordinary runsc checkpoints, whose
+		// caller is no longer connected to exec-created processes.
+		log.Debugf("Killing any exec session that existed previously")
+		for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
+			if tg.Leader().Origin == kernel.OriginExec {
+				log.Infof("Killing exec'd process, PID: %d", tg.ID())
+				if err := l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
+					log.Warningf("Failed to kill exec process after restore: %v", err)
+				}
 			}
 		}
 	}
 
 	l.k.RestoreContainerMapping(l.containerIDs)
+	if ttcCheckpoint {
+		if err := l.family.RestoreDefaultExecSessions(restoredExecSessions); err != nil {
+			return fmt.Errorf("restoring TTC exec sessions: %w", err)
+		}
+	}
 	l.k.SetSaver(l)
 	l.createRemappedNvproxyDeviceFiles(ctx)
 
@@ -553,6 +596,11 @@ func (r *restorer) restore(l *Loader) error {
 	r.timer.Reached("Starting sandbox")
 	if err := r.cm.onStart(); err != nil {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
+	}
+	if ttcCheckpoint {
+		if err := l.family.WatchRestoredDefaultExecSessions(); err != nil {
+			return fmt.Errorf("starting restored TTC exec-session watchers: %w", err)
+		}
 	}
 
 	r.stateFile.Close()
@@ -660,9 +708,15 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 
 // saveWithOpts saves the kernel with the given options.
 func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
+	return l.saveKernelWithOpts(l.k, l.watchdog, nil, saveOpts, execOpts)
+}
+
+// saveKernelWithOpts writes one selected Kernel. Branch selection happens
+// before this function; live fork continues to use its in-memory state pipe.
+func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, execSessions []ExecSessionInfo, saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
 	defer func() {
 		// This closure is required to capture the final value of err.
-		l.k.OnCheckpointAttempt(err)
+		k.OnCheckpointAttempt(err)
 	}()
 
 	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
@@ -684,6 +738,13 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		return err
 	}
 	saveOpts.Metadata[ContainerSpecsKey] = specsStr
+	if execSessions != nil {
+		encoded, err := json.Marshal(execSessions)
+		if err != nil {
+			return fmt.Errorf("encoding TTC exec sessions: %w", err)
+		}
+		saveOpts.Metadata[TTCExecSessionsKey] = string(encoded)
+	}
 
 	// Save start time of the runsc process.
 	saveOpts.StartTime = starttime.Get()
@@ -696,8 +757,8 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 	}
 
 	state := control.State{
-		Kernel:   l.k,
-		Watchdog: l.watchdog,
+		Kernel:   k,
+		Watchdog: dog,
 	}
 	return state.SaveWithOpts(saveOpts, execOpts)
 }

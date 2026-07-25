@@ -43,6 +43,24 @@ func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	}
 }
 
+func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	replacement := &kernel.Kernel{}
+	if err := family.ReplaceDefaultKernel(replacement); err != nil {
+		t.Fatal(err)
+	}
+	family.mu.Lock()
+	branch := family.branches[DefaultBranchID]
+	family.mu.Unlock()
+	if branch.k != replacement || branch.state != BranchPaused {
+		t.Fatalf("replacement branch=%+v", branch)
+	}
+}
+
 func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 	stages := []SandboxForkStage{
 		SandboxForkStagePlaceholderRegistered,

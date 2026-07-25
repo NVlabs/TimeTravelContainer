@@ -120,6 +120,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
+	if args[0] == "checkpoint" || args[0] == "restore" {
+		args, err = normalizeCheckpointCommandArgs(args)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttc: %v\n", err)
+			return 2
+		}
+	}
 	if opts.unsafeNoHostIsolation && !opts.direct {
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' or '--direct' only; ordinary commands inherit the running daemon's mode")
 		return 2
@@ -306,6 +313,8 @@ Commands:
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
   fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
+  checkpoint TARGET FILE          Save one branch as a standalone checkpoint
+  restore [--name NAME] FILE      Restore a checkpoint as a new container
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
   unpause TARGET...               Resume branches (Docker alias)
@@ -341,6 +350,8 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
+			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER[@BRANCH] FILE",
+			"restore":    "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
 			fmt.Fprintln(stdout, text)
@@ -408,6 +419,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runTop(args[1:], stdout, stderr, backend)
 	case "fork":
 		err = runFork(args[1:], stdout, stderr, backend)
+	case "checkpoint":
+		err = runCheckpoint(args[1:], stdout, backend)
+	case "restore":
+		err = runRestoreCheckpoint(args[1:], stdout, backend)
 	case "pause":
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume", "unpause":

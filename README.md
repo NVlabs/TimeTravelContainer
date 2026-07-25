@@ -48,6 +48,8 @@ and kernel objects rather than the amount of resident application memory.
 - Pause and resume a running branch.
 - Fork a branch into a running or initially paused child.
 - Fork children again to build a tree of experiments.
+- Save one live or paused branch to a checkpoint file and restore it later as
+  an independent container.
 - Preserve process trees, threads, memory, credentials, timers, signals,
   internal pipes, internal sockets, and supported IPC resources.
 - Share memory page-by-page until one branch writes.
@@ -66,7 +68,8 @@ The `ttc` command provides a Docker-like interface:
   and `rm`
 - Interaction: `exec`, `attach`, `logs`, and `cp`
 - Inspection: `inspect`, `ps`, `top`, and `events`
-- Branching: `fork`, `pause`, `resume`, `branch rm`, and `ls --tree`
+- Branching: `fork`, `pause`, `resume`, `checkpoint`, `restore`, `branch rm`,
+  and `ls --tree`
 - Storage: `volume create`, `volume ls`, `volume inspect`, and `volume rm`
 - Shell completion for Bash, Zsh, and Fish
 
@@ -321,6 +324,14 @@ ttc exec demo@test-b cat /tmp/result
 The two branches now have different memory, process, and filesystem states
 while retaining the same initial container history.
 
+Save a branch to a durable checkpoint and restore it as a new, unrelated
+container:
+
+```sh
+ttc checkpoint demo@test-a demo-test-a.ttc
+ttc restore --name recovered demo-test-a.ttc
+```
+
 Pause and resume a branch:
 
 ```sh
@@ -398,6 +409,12 @@ checkpoint containing all container memory.
 For implementation details, see the
 [live-fork design](g3doc/proposals/timetravel_live_fork.md).
 
+Durable checkpointing is a separate, explicitly requested operation. It
+captures one selected branch's process, memory, filesystem, and supported
+runtime state in a file. The immutable OCI image is identified by its exact
+digest instead of being copied into the checkpoint. Restoring creates a new
+container family with no ancestry or mutable storage shared with the source.
+
 ## Current limitations
 
 - TTC is not yet a production security boundary for hostile workloads.
@@ -416,15 +433,22 @@ For implementation details, see the
 - A stopped child branch retains its filesystem for `ttc cp`, but its former
   live process and memory state cannot be started again. Restarting a container
   starts its main branch from its persistent configuration and filesystem.
-- Read-only host binds are shared views of host files, not branch snapshots.
+- Read-only host binds remain shared views during live fork. Durable
+  checkpoints include a private snapshot of their contents.
 - A managed volume cannot be attached writable to unrelated container families
   at the same time.
 - TTC does not yet implement the Docker Engine API, Compose, Swarm, general
   device or accelerator passthrough, or Docker named networks.
 - One image reference currently records one selected platform. Image signature,
   attestation, and content-trust policy are not yet implemented.
-- Live branches cannot currently be migrated to another runtime process or
-  host.
+- Live branches require a durable checkpoint to move to another runtime
+  process or host.
+- Checkpoint restore requires the exact recorded image digest to be available
+  in the destination TTC image store and currently requires a compatible TTC
+  build.
+- Creating a durable checkpoint requires the selected branch to be eligible
+  for live fork, because TTC first makes a short-lived private branch before
+  writing the archive.
 - `--unsafe-no-host-isolation` is suitable only for trusted workloads.
 
 The authoritative compatibility check is the `ttc fork` operation itself. It

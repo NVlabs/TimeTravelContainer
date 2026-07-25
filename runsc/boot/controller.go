@@ -43,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -56,6 +57,9 @@ import (
 const (
 	// ContMgrCheckpoint checkpoints a container.
 	ContMgrCheckpoint = "containerManager.Checkpoint"
+
+	// ContMgrCheckpointBranch checkpoints one TimeTravelContainer branch.
+	ContMgrCheckpointBranch = "containerManager.CheckpointBranch"
 
 	// ContMgrCreateSubcontainer creates a sub-container.
 	ContMgrCreateSubcontainer = "containerManager.CreateSubcontainer"
@@ -586,6 +590,20 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 	return cm.l.save(o)
 }
 
+// CheckpointBranch saves one branch. Disk checkpoint writers are introduced
+// only through this explicit RPC and are not part of live fork.
+func (cm *containerManager) CheckpointBranch(o *BranchCheckpointArgs, _ *struct{}) error {
+	log.Debugf("containerManager.CheckpointBranch: branch=%q", o.BranchID)
+	saveOpts, err := control.ConvertToStateSaveOpts(&o.SaveOpts)
+	if err != nil {
+		return err
+	}
+	defer saveOpts.Close()
+	return cm.l.family.Checkpoint(o.BranchID, cm.l.watchdog, func(k *kernel.Kernel, dog *watchdog.Watchdog, sessions []ExecSessionInfo) error {
+		return cm.l.saveKernelWithOpts(k, dog, sessions, saveOpts, &o.ExecOpts)
+	})
+}
+
 // PortForwardOpts contains options for port forwarding to a port in a
 // container.
 type PortForwardOpts struct {
@@ -629,6 +647,13 @@ type RestoreOpts struct {
 	// RestoreOpts.HavePagesFile is unknown and must be determined by
 	// containerManager.Restore.
 	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
+}
+
+// BranchCheckpointArgs selects one branch and carries the ordinary gVisor
+// checkpoint writers.
+type BranchCheckpointArgs struct {
+	control.SaveOpts
+	BranchID string
 }
 
 // Restore loads a container from a statefile.
