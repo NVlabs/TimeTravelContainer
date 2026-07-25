@@ -798,6 +798,49 @@ func TestImageProgressIsHumanReadable(t *testing.T) {
 	}
 }
 
+func TestImageProgressRepaintsOneTerminalLinePerLayer(t *testing.T) {
+	var output bytes.Buffer
+	progress := newImageProgressWithTerminal(&output, true, 80)
+	first := ttcimages.ProgressEvent{Phase: ttcimages.ProgressDownloading, Total: 10 << 20}
+	first.Descriptor.Digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	second := ttcimages.ProgressEvent{Phase: ttcimages.ProgressDownloading, Total: 20 << 20}
+	second.Descriptor.Digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	progress(ttcimages.ProgressEvent{Phase: ttcimages.ProgressResolving})
+	progress(first)
+	progress(second)
+	first.Current = 5 << 20
+	progress(first)
+	first.Phase = ttcimages.ProgressDownloadDone
+	first.Current = first.Total
+	progress(first)
+	second.Phase = ttcimages.ProgressAlreadyExists
+	second.Current = second.Total
+	progress(second)
+	first.Phase = ttcimages.ProgressExtracting
+	first.Current = 4 << 20
+	first.Index = 1
+	first.Count = 2
+	progress(first)
+	first.Phase = ttcimages.ProgressExtracted
+	first.Current = first.Total
+	progress(first)
+
+	got := output.String()
+	for _, want := range []string{
+		"Resolving image metadata\n",
+		"\x1b[1A",
+		"\x1b[2A",
+		"\r\x1b[2Kaaaaaaaaaaaa: Downloading",
+		"bbbbbbbbbbbb: Already exists",
+		"Extracting 1/2",
+		"aaaaaaaaaaaa: Pull complete",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("interactive progress output %q does not contain %q", got, want)
+		}
+	}
+}
+
 func TestTimeTravelNetworkingRejectsInvalidCombinations(t *testing.T) {
 	tests := [][]string{
 		{"run", "--nat", "busybox"},

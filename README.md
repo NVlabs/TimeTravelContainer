@@ -80,11 +80,13 @@ and does not require a Docker or containerd daemon.
 
 ### Rootless images and containers
 
-- Pull images using familiar names such as `alpine:3.20`.
+- Pull and fully prepare images using familiar names such as `alpine:3.20`.
 - Select image tags, digests, and multi-architecture variants.
 - Use Docker configuration files and credential helpers for authenticated
   registries.
-- See human-readable download, reuse, and extraction progress.
+- See live, per-layer download and extraction progress. TTC refreshes stable
+  layer rows in a terminal and uses ordinary line-oriented output when
+  redirected.
 - Run images containing arbitrary users without subordinate UID/GID ranges or
   `newuidmap`/`newgidmap`.
 - Use image workflows that rely on `sudo`, `su`, or SUID/SGID programs; their

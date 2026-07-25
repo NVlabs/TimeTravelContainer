@@ -1670,6 +1670,13 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	return info, filepath.Join(finalDir, "rootfs"), nil
 }
 
+// EnsureImageRoot materializes the selected immutable image root if it is not
+// already cached. It is used by explicit pulls so that a successful `ttc pull`
+// leaves the image ready to run.
+func (s Store) EnsureImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (images.RootFSInfo, string, error) {
+	return s.prepareImageRoot(ctx, pulled, platform, progress)
+}
+
 func imageRootKey(digest, platform string) string {
 	return safeComponent(imageRootFormatVersion + "-" + digest + "-" + platform)
 }

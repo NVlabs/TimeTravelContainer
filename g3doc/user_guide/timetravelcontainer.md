@@ -229,10 +229,12 @@ ttc run --pull always IMAGE        # refresh the registry reference
 ttc run --pull never IMAGE         # require a local image record
 ```
 
-`ttc pull` contacts the registry even when all blobs are already cached.
-Normal pulls and implicit image preparation print line-oriented resolve,
-download, cache-reuse, and extraction progress that survives daemon stream
-forwarding. `ttc pull -q` suppresses progress and prints only the digest.
+`ttc pull` contacts the registry even when all blobs are already cached and
+materializes the immutable image root, leaving the image ready to run.
+In a terminal, `ttc pull` maintains one live status row per layer while
+downloading, reusing, and extracting content.
+Redirected output remains line-oriented and contains no terminal control
+sequences. `ttc pull -q` suppresses progress and prints only the digest.
 `--pull missing` is the fastest offline path after the first pull.
 
 ## Run and inspect containers

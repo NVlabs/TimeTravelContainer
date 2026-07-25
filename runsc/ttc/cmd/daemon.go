@@ -63,13 +63,15 @@ type daemonWireOptions struct {
 }
 
 type daemonRequest struct {
-	Version    int               `json:"version"`
-	Action     string            `json:"action"`
-	RequestID  string            `json:"request_id,omitempty"`
-	ClientTERM string            `json:"client_term,omitempty"`
-	Options    daemonWireOptions `json:"options,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	Stdin      bool              `json:"stdin,omitempty"`
+	Version        int               `json:"version"`
+	Action         string            `json:"action"`
+	RequestID      string            `json:"request_id,omitempty"`
+	ClientTERM     string            `json:"client_term,omitempty"`
+	StderrTerminal bool              `json:"stderr_terminal,omitempty"`
+	StderrWidth    int               `json:"stderr_width,omitempty"`
+	Options        daemonWireOptions `json:"options,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Stdin          bool              `json:"stdin,omitempty"`
 }
 
 type daemonServer struct {
@@ -213,6 +215,7 @@ func daemonIsolationMode(unsafeNoHostIsolation bool) string {
 }
 
 func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *runtimeBackend {
+	progressTerminal, progressWidth := terminalWriterInfo(stderr)
 	return &runtimeBackend{
 		root:                  opts.root,
 		runsc:                 opts.runsc,
@@ -221,6 +224,8 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		allowSlowVolumeCopy:   opts.allowSlowVolumeCopy,
 		clientExecutable:      opts.clientExecutable,
 		clientTERM:            os.Getenv("TERM"),
+		progressTerminal:      progressTerminal,
+		progressWidth:         progressWidth,
 		stdin:                 stdin,
 		stdout:                stdout,
 		stderr:                stderr,
@@ -616,6 +621,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 	s.configureVolumeBackend(backend)
 	backend.clientTERM = request.ClientTERM
+	backend.progressTerminal = request.StderrTerminal
+	backend.progressWidth = request.StderrWidth
 	backend.consoleSidecars = s
 	if request.Args[0] == "events" {
 		status := 0
@@ -720,6 +727,14 @@ func daemonCommandNeedsMutationJournal(args []string) bool {
 	}
 	if len(args) != 0 && args[0] == "container" {
 		args = args[1:]
+	}
+	// Explicit image pulls are content-addressed and naturally idempotent.
+	// Stream their progress live instead of buffering it for mutation replay.
+	if len(args) != 0 && args[0] == "pull" {
+		return false
+	}
+	if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+		return false
 	}
 	if len(args) == 0 || args[0] != "cp" {
 		return true
@@ -956,9 +971,11 @@ func daemonCommandUsesStdin(args []string) bool {
 }
 
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	stderrTerminal, stderrWidth := terminalWriterInfo(stderr)
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
+		StderrTerminal: stderrTerminal, StderrWidth: stderrWidth,
 	}
 	if daemonCommandNeedsMutationJournal(args) && opts.dataRoot != "" {
 		requestID, err := newDaemonRequestID()

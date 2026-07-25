@@ -2973,60 +2973,246 @@ func shortLayerID(digest string) string {
 	return digest
 }
 
-// newImageProgress turns concurrent structured pull events into stable,
-// line-oriented output that also works through the daemon framing protocol.
+type imageLayerProgress struct {
+	id             string
+	phase          string
+	current        int64
+	total          int64
+	index          int
+	count          int
+	paintedCurrent int64
+}
+
+type imageProgressRenderer struct {
+	w           io.Writer
+	terminal    bool
+	width       int
+	nextPercent map[string]int
+	layers      map[string]*imageLayerProgress
+	order       []string
+	rendered    int
+	lastPaint   time.Time
+	mu          sync.Mutex
+}
+
+func terminalWriterInfo(w io.Writer) (bool, int) {
+	if strings.EqualFold(os.Getenv("TERM"), "dumb") {
+		return false, 0
+	}
+	file, ok := w.(interface{ Fd() uintptr })
+	if !ok || !term.IsTerminal(int(file.Fd())) {
+		return false, 0
+	}
+	width, _, err := term.GetSize(int(file.Fd()))
+	if err != nil || width <= 0 {
+		width = 80
+	}
+	return true, width
+}
+
+// newImageProgress turns concurrent structured pull events into human-facing
+// output. Terminals receive one repaintable line per layer; redirected output
+// remains stable and line-oriented.
 func newImageProgress(w io.Writer) ttcimages.ProgressFunc {
+	terminal, width := terminalWriterInfo(w)
+	return newImageProgressWithTerminal(w, terminal, width)
+}
+
+func newImageProgressWithTerminal(w io.Writer, terminal bool, width int) ttcimages.ProgressFunc {
 	if w == nil {
 		return nil
 	}
-	var mu sync.Mutex
-	nextPercent := make(map[string]int)
-	return func(event ttcimages.ProgressEvent) {
-		mu.Lock()
-		defer mu.Unlock()
-		id := shortLayerID(event.Descriptor.Digest.String())
-		switch event.Phase {
-		case ttcimages.ProgressResolving:
-			fmt.Fprintln(w, "Resolving image metadata")
-		case ttcimages.ProgressDownloading:
-			key := "download:" + id
-			if event.Current == 0 {
-				fmt.Fprintf(w, "%s: Pulling fs layer (%s)\n", id, formatImageSize(event.Total))
-				nextPercent[key] = 10
-				return
-			}
-			percent := 100
-			if event.Total > 0 {
-				percent = int(event.Current * 100 / event.Total)
-			}
-			if percent >= nextPercent[key] && percent < 100 {
-				fmt.Fprintf(w, "%s: Downloading %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
-				nextPercent[key] = (percent/10 + 1) * 10
-			}
-		case ttcimages.ProgressDownloadDone:
-			fmt.Fprintf(w, "%s: Download complete\n", id)
-			delete(nextPercent, "download:"+id)
-		case ttcimages.ProgressAlreadyExists:
-			fmt.Fprintf(w, "%s: Already exists\n", id)
-		case ttcimages.ProgressExtracting:
-			key := "extract:" + id
-			if event.Current == 0 {
-				fmt.Fprintf(w, "%s: Extracting layer %d/%d (%s)\n", id, event.Index, event.Count, formatImageSize(event.Total))
-				nextPercent[key] = 25
-				return
-			}
-			percent := 100
-			if event.Total > 0 {
-				percent = int(event.Current * 100 / event.Total)
-			}
-			if percent >= nextPercent[key] && percent < 100 {
-				fmt.Fprintf(w, "%s: Extracting %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
-				nextPercent[key] = (percent/25 + 1) * 25
-			}
-		case ttcimages.ProgressExtracted:
-			fmt.Fprintf(w, "%s: Pull complete\n", id)
-			delete(nextPercent, "extract:"+id)
+	renderer := &imageProgressRenderer{
+		w:           w,
+		terminal:    terminal,
+		width:       width,
+		nextPercent: make(map[string]int),
+		layers:      make(map[string]*imageLayerProgress),
+	}
+	return renderer.update
+}
+
+func (r *imageProgressRenderer) update(event ttcimages.ProgressEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.terminal {
+		r.updatePlain(event)
+		return
+	}
+	if event.Phase == ttcimages.ProgressResolving {
+		fmt.Fprintln(r.w, "Resolving image metadata")
+		return
+	}
+	digest := event.Descriptor.Digest.String()
+	key := digest
+	if key == "" {
+		key = "image"
+	}
+	layer := r.layers[key]
+	added := false
+	if layer == nil {
+		layer = &imageLayerProgress{id: shortLayerID(digest)}
+		r.layers[key] = layer
+		r.order = append(r.order, key)
+		added = true
+	}
+	phaseChanged := layer.phase != event.Phase
+	previousCurrent := layer.current
+	layer.phase = event.Phase
+	layer.current = event.Current
+	layer.total = event.Total
+	layer.index = event.Index
+	layer.count = event.Count
+	force := added || phaseChanged || event.Current == 0 ||
+		(previousCurrent == 0 && event.Current > 0) ||
+		event.Phase == ttcimages.ProgressDownloadDone ||
+		event.Phase == ttcimages.ProgressAlreadyExists ||
+		event.Phase == ttcimages.ProgressExtracted
+	if !force {
+		if !imageProgressMustPaint(layer, event) || (!r.lastPaint.IsZero() && time.Since(r.lastPaint) < 80*time.Millisecond) {
+			return
 		}
+	}
+	r.paint()
+}
+
+func imageProgressMustPaint(layer *imageLayerProgress, event ttcimages.ProgressEvent) bool {
+	switch event.Phase {
+	case ttcimages.ProgressDownloadDone, ttcimages.ProgressAlreadyExists, ttcimages.ProgressExtracted:
+		return true
+	}
+	if event.Current == 0 {
+		return true
+	}
+	threshold := int64(128 << 10)
+	if event.Total > 0 && event.Total/100 > threshold {
+		threshold = event.Total / 100
+	}
+	return event.Current-layer.paintedCurrent >= threshold
+}
+
+func (r *imageProgressRenderer) paint() {
+	if r.rendered > 0 {
+		fmt.Fprintf(r.w, "\x1b[%dA", r.rendered)
+	}
+	for _, key := range r.order {
+		layer := r.layers[key]
+		line := formatInteractiveLayerProgress(layer, r.width)
+		fmt.Fprintf(r.w, "\r\x1b[2K%s\n", line)
+		layer.paintedCurrent = layer.current
+	}
+	r.rendered = len(r.order)
+	r.lastPaint = time.Now()
+}
+
+func formatInteractiveLayerProgress(layer *imageLayerProgress, width int) string {
+	prefix := layer.id + ": "
+	switch layer.phase {
+	case ttcimages.ProgressDownloading:
+		if layer.current == 0 {
+			return fitTerminalLine(prefix+"Pulling fs layer ("+formatImageSize(layer.total)+")", width)
+		}
+		return fitTerminalLine(prefix+formatImageTransfer("Downloading", layer.current, layer.total, width-len(prefix)), width)
+	case ttcimages.ProgressDownloadDone:
+		return fitTerminalLine(prefix+"Download complete", width)
+	case ttcimages.ProgressAlreadyExists:
+		return fitTerminalLine(prefix+"Already exists", width)
+	case ttcimages.ProgressExtracting:
+		status := "Extracting"
+		if layer.count > 0 {
+			status = fmt.Sprintf("Extracting %d/%d", layer.index, layer.count)
+		}
+		return fitTerminalLine(prefix+formatImageTransfer(status, layer.current, layer.total, width-len(prefix)), width)
+	case ttcimages.ProgressExtracted:
+		return fitTerminalLine(prefix+"Pull complete", width)
+	default:
+		return fitTerminalLine(prefix+layer.phase, width)
+	}
+}
+
+func formatImageTransfer(status string, current, total int64, available int) string {
+	detail := formatImageSize(current)
+	if total > 0 {
+		detail += " / " + formatImageSize(total)
+	}
+	if total <= 0 {
+		return status + " " + detail
+	}
+	barWidth := available - len(status) - len(detail) - 5
+	if barWidth < 10 {
+		return status + " " + detail
+	}
+	if barWidth > 30 {
+		barWidth = 30
+	}
+	completed := int(float64(current) * float64(barWidth) / float64(total))
+	if completed < 0 {
+		completed = 0
+	}
+	if completed > barWidth {
+		completed = barWidth
+	}
+	bar := strings.Repeat("=", completed)
+	if completed < barWidth {
+		bar += ">"
+		bar += strings.Repeat(" ", barWidth-completed-1)
+	}
+	return fmt.Sprintf("%s [%s] %s", status, bar, detail)
+}
+
+func fitTerminalLine(line string, width int) string {
+	if width <= 0 || len(line) <= width {
+		return line
+	}
+	if width == 1 {
+		return "~"
+	}
+	return line[:width-1] + "~"
+}
+
+func (r *imageProgressRenderer) updatePlain(event ttcimages.ProgressEvent) {
+	id := shortLayerID(event.Descriptor.Digest.String())
+	switch event.Phase {
+	case ttcimages.ProgressResolving:
+		fmt.Fprintln(r.w, "Resolving image metadata")
+	case ttcimages.ProgressDownloading:
+		key := "download:" + id
+		if event.Current == 0 {
+			fmt.Fprintf(r.w, "%s: Pulling fs layer (%s)\n", id, formatImageSize(event.Total))
+			r.nextPercent[key] = 10
+			return
+		}
+		percent := 100
+		if event.Total > 0 {
+			percent = int(event.Current * 100 / event.Total)
+		}
+		if percent >= r.nextPercent[key] && percent < 100 {
+			fmt.Fprintf(r.w, "%s: Downloading %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
+			r.nextPercent[key] = (percent/10 + 1) * 10
+		}
+	case ttcimages.ProgressDownloadDone:
+		fmt.Fprintf(r.w, "%s: Download complete\n", id)
+		delete(r.nextPercent, "download:"+id)
+	case ttcimages.ProgressAlreadyExists:
+		fmt.Fprintf(r.w, "%s: Already exists\n", id)
+	case ttcimages.ProgressExtracting:
+		key := "extract:" + id
+		if event.Current == 0 {
+			fmt.Fprintf(r.w, "%s: Extracting layer %d/%d (%s)\n", id, event.Index, event.Count, formatImageSize(event.Total))
+			r.nextPercent[key] = 25
+			return
+		}
+		percent := 100
+		if event.Total > 0 {
+			percent = int(event.Current * 100 / event.Total)
+		}
+		if percent >= r.nextPercent[key] && percent < 100 {
+			fmt.Fprintf(r.w, "%s: Extracting %s / %s (%d%%)\n", id, formatImageSize(event.Current), formatImageSize(event.Total), percent)
+			r.nextPercent[key] = (percent/25 + 1) * 25
+		}
+	case ttcimages.ProgressExtracted:
+		fmt.Fprintf(r.w, "%s: Pull complete\n", id)
+		delete(r.nextPercent, "extract:"+id)
 	}
 }
 
@@ -4388,6 +4574,8 @@ type runtimeBackend struct {
 	volumeCopyMode        ttcvolume.CopyMode
 	clientExecutable      string
 	clientTERM            string
+	progressTerminal      bool
+	progressWidth         int
 	stdin                 io.Reader
 	stdout                io.Writer
 	stderr                io.Writer
@@ -4413,6 +4601,10 @@ func environmentHasKey(env []string, key string) bool {
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
 	return ttcbundle.Store{Root: b.dataRoot}
+}
+
+func (b *runtimeBackend) imageProgress() ttcimages.ProgressFunc {
+	return newImageProgressWithTerminal(b.stderr, b.progressTerminal, b.progressWidth)
 }
 
 func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.ContainerInfo, error) {
@@ -4765,7 +4957,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
-		Progress:           newImageProgress(b.stderr),
+		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 	})
 	if err != nil {
@@ -4837,7 +5029,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
-		Progress:           newImageProgress(b.stderr),
+		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 	})
 	if err != nil {
@@ -7140,14 +7332,22 @@ func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBi
 func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcimages.Info, error) {
 	var progressFunc ttcimages.ProgressFunc
 	if progress {
-		progressFunc = newImageProgress(b.stderr)
+		progressFunc = b.imageProgress()
 	}
-	return ttcimages.Pull(context.Background(), ttcimages.PullOptions{
+	ctx := context.Background()
+	info, err := ttcimages.Pull(ctx, ttcimages.PullOptions{
 		Root:      b.dataRoot,
 		Reference: reference,
 		Platform:  platform,
 		Progress:  progressFunc,
 	})
+	if err != nil {
+		return ttcimages.Info{}, err
+	}
+	if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
+		return ttcimages.Info{}, fmt.Errorf("preparing pulled image root: %w", err)
+	}
+	return info, nil
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {

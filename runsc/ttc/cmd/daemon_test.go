@@ -275,6 +275,8 @@ func TestDaemonCommandNeedsMutationJournal(t *testing.T) {
 		{[]string{"cp", "demo:/tmp", "local"}, false},
 		{[]string{"cp", "demo:/tmp", "-"}, false},
 		{[]string{"fork", "demo", "child"}, true},
+		{[]string{"pull", "alpine"}, false},
+		{[]string{"image", "pull", "alpine"}, false},
 		{[]string{"logs", "demo"}, false},
 	} {
 		if got := daemonCommandNeedsMutationJournal(test.args); got != test.want {
