@@ -383,7 +383,9 @@ archive has no separate source operand. TTC runs its own donated copy helper in
 the selected branch, so neither `tar` nor `cp` needs to exist in the image and
 the binary stream is not routed through a guest shell.
 
-Copy supports running and fully stopped branches. Resume a paused branch first.
+Copy supports running, paused, and fully stopped branches. For a paused branch,
+TTC runs only its trusted copy helper while the branch's existing tasks remain
+stopped.
 For a stopped family, TTC launches a short-lived helper Sentry whose process is
 the donated TTC copy helper, mounts the immutable image lower plus the selected
 persistent `ttcvol` rootfs/volume branch, and exits when the copy completes.

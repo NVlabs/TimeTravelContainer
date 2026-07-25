@@ -331,7 +331,8 @@ from the guest-visible logical quota.
    * `ttc volume create/ls/inspect/rm` is enabled.
    * Restore `--volume`, `--mount type=volume`, anonymous volumes, image
      `VOLUME`, `volume-nocopy`, inspect projection, and `rm -v`.
-   * `ttc cp` imports/exports running branches and reconstructs fully stopped
+   * `ttc cp` imports/exports running branches, admits only its trusted helper
+     while an existing branch remains paused, and reconstructs fully stopped
      branches in a transient helper Sentry without a checkpoint restore.
    * Explicit branch-head promotion remains future work; ordinary rootfs and
      managed-volume writes are already persistent.

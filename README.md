@@ -106,7 +106,7 @@ TTC also supports:
   terminal mounts
 - Read-only host-directory binds
 - Branch-local writable views over explicitly immutable host directories
-- File copying to or from running and fully stopped containers
+- File copying to or from running, paused, and fully stopped containers
 
 ```sh
 ttc volume create cache
@@ -328,7 +328,7 @@ ttc pause demo@test-a
 ttc resume demo@test-a
 ```
 
-Copy files between the host and a running or fully stopped branch:
+Copy files between the host and a running, paused, or fully stopped branch:
 
 ```sh
 ttc cp ./test-input demo@test-a:/tmp/input
@@ -416,7 +416,6 @@ For implementation details, see the
 - A stopped child branch retains its filesystem for `ttc cp`, but its former
   live process and memory state cannot be started again. Restarting a container
   starts its main branch from its persistent configuration and filesystem.
-- A paused branch must be resumed before using `ttc cp`.
 - Read-only host binds are shared views of host files, not branch snapshots.
 - A managed volume cannot be attached writable to unrelated container families
   at the same time.

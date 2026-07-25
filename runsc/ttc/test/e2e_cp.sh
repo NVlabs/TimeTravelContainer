@@ -67,8 +67,7 @@ trap cleanup EXIT HUP INT TERM
 
 rm -rf "$HOST_SOURCE" "$HOST_EXPORT" "$HOST_CONTENTS" "$ARCHIVE" \
   "$TTC_E2E_ROOT/parent" "$TTC_E2E_ROOT/child" \
-  "$TTC_E2E_ROOT/paused-copy" "$TTC_E2E_ROOT/paused.stdout" \
-  "$TTC_E2E_ROOT/paused.stderr"
+  "$TTC_E2E_ROOT/paused-copy" "$TTC_E2E_ROOT/paused-input"
 mkdir -p "$HOST_SOURCE/nested" "$HOST_EXPORT" "$HOST_CONTENTS"
 printf 'binary\000payload\n' >"$HOST_SOURCE/nested/value"
 ln "$HOST_SOURCE/nested/value" "$HOST_SOURCE/hard"
@@ -106,15 +105,19 @@ ttc cp "$TTC_E2E_ROOT/child" "$CONTAINER@child:/data/branch"
 ttc exec "$CONTAINER@main" sh -c 'test "$(cat /data/branch)" = parent'
 ttc exec "$CONTAINER@child" sh -c 'test "$(cat /data/branch)" = child'
 
-# Paused branches fail promptly instead of starting a helper that cannot run.
+# A trusted management helper copies in both directions while all existing
+# guest tasks remain paused.
 ttc pause "$CONTAINER@child" >/dev/null
-if ttc cp "$CONTAINER@child:/tmp/import/branch" "$TTC_E2E_ROOT/paused-copy" \
-    >"$TTC_E2E_ROOT/paused.stdout" 2>"$TTC_E2E_ROOT/paused.stderr"; then
-  fail "copy from a paused branch unexpectedly succeeded"
+ttc cp "$CONTAINER@child:/data/branch" "$TTC_E2E_ROOT/paused-copy"
+[ "$(cat "$TTC_E2E_ROOT/paused-copy")" = child ] ||
+  fail "copy from paused branch returned the wrong data"
+printf 'paused-import\n' >"$TTC_E2E_ROOT/paused-input"
+ttc cp "$TTC_E2E_ROOT/paused-input" "$CONTAINER@child:/data/paused-import"
+if ttc exec "$CONTAINER@child" true >/dev/null 2>&1; then
+  fail "paused-branch copy resumed ordinary guest execution"
 fi
-grep -q 'resume it first' "$TTC_E2E_ROOT/paused.stderr" ||
-  fail "paused-branch copy did not return an actionable diagnostic"
 ttc resume "$CONTAINER@child" >/dev/null
+ttc exec "$CONTAINER@child" sh -c 'test "$(cat /data/paused-import)" = paused-import'
 
 # Container-to-host copying preserves nested regular files, hard links, and
 # symlinks. A trailing '/.' copies only the source directory's contents.

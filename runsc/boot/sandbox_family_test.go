@@ -339,6 +339,66 @@ func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyPausedManagementControlPreservesPause(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	childInfo, err := family.Fork(&ForkBranchArgs{ID: "paused-copy", Paused: true})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	child, release, err := family.beginPausedManagementControl(childInfo.ID)
+	if err != nil {
+		t.Fatalf("beginPausedManagementControl: %v", err)
+	}
+	if child.state != BranchPaused {
+		t.Fatalf("branch state during management control = %q, want paused", child.state)
+	}
+	if child.k.IsPaused() {
+		t.Fatal("management execution window retained the TaskSet-wide stop")
+	}
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		resumeDone <- family.Resume(childInfo.ID)
+	}()
+	select {
+	case err := <-resumeDone:
+		t.Fatalf("Resume completed during paused management execution: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("Resume after paused management execution: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Resume remained blocked after paused management execution")
+	}
+	if child.k.IsPaused() {
+		t.Fatal("resumed child remained paused")
+	}
+	if err := family.Destroy(childInfo.ID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+}
+
 func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

@@ -77,7 +77,9 @@ covers:
   first writers in two and four branches, and same-path namespace divergence;
 - branch-aware `ttc cp` in both directions without guest utilities, including
   Docker directory and trailing `/.` semantics, binary tar streaming through
-  the daemon, hard links, symlinks, modes, and parent/child divergence;
+  the daemon, hard links, symlinks, modes, parent/child divergence, and
+  management-only copying while ordinary tasks in the target branch remain
+  paused;
 - Alpine dynamic linking and package-tool startup;
 - Python threading, JSON, and in-memory SQLite;
 - nginx configuration loading;

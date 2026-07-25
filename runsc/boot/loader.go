@@ -1753,11 +1753,22 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if branchID != DefaultBranchID && args.StdioIsPty && args.InternalConsoleID == "" {
 		return 0, fmt.Errorf("branch exec with a host TTY is unsupported")
 	}
-	branch, branchDone, err := l.family.beginRunningControl(branchID)
+	var branch *sandboxBranch
+	var branchDone func()
+	var err error
+	if args.PausedManagement {
+		branch, branchDone, err = l.family.beginPausedManagementControl(branchID)
+	} else {
+		branch, branchDone, err = l.family.beginRunningControl(branchID)
+	}
 	if err != nil {
 		return 0, err
 	}
-	defer branchDone()
+	defer func() {
+		if branchDone != nil {
+			branchDone()
+		}
+	}()
 	targetKernel := branch.k
 
 	// Hold the lock for the entire operation so legacy OCI exec publication cannot
@@ -1903,7 +1914,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if err := l.family.injectExecFailure(SandboxExecStageProcessCreated); err != nil {
 		return 0, err
 	}
-	l.family.publishExecSession(branch, args.ExecID, tgid, newTG)
+	var managementDone chan struct{}
+	if args.PausedManagement {
+		managementDone = make(chan struct{})
+	}
+	l.family.publishExecSession(branch, args.ExecID, tgid, newTG, managementDone)
 	if err := l.family.injectExecFailure(SandboxExecStageSessionPublished); err != nil {
 		return 0, err
 	}
@@ -1922,6 +1937,15 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		log.Debugf("updated processes: %v", l.processes)
 	}
 
+	if args.PausedManagement {
+		release := branchDone
+		branchDone = nil
+		go func() {
+			newTG.WaitExited()
+			release()
+			close(managementDone)
+		}()
+	}
 	return tgid, nil
 }
 

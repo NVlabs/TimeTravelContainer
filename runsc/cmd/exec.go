@@ -80,6 +80,10 @@ type Exec struct {
 
 	// execFD is the host file descriptor used for program execution.
 	execFD int
+
+	// pausedManagement admits a TTC management helper while all pre-existing
+	// tasks in the selected paused branch remain stopped.
+	pausedManagement bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -132,6 +136,7 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&ex.internalConsoleCols, "internal-console-cols", 0, "initial internal PTY columns")
 	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
+	f.BoolVar(&ex.pausedManagement, "paused-management", false, "TTC-internal: run a management helper while existing branch tasks remain paused")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -160,6 +165,13 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	e.BranchID = ex.branch
 	e.ExecID = ex.execID
+	e.PausedManagement = ex.pausedManagement
+	if ex.pausedManagement && ex.execFD < 0 {
+		util.Fatalf("--paused-management requires --exec-fd")
+	}
+	if ex.pausedManagement && ex.detach {
+		util.Fatalf("--paused-management cannot be detached")
+	}
 	if ex.internalConsole != "" {
 		if ex.consoleSocket != "" {
 			util.Fatalf("--internal-console and --console-socket cannot be combined")
@@ -178,8 +190,11 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		e.ConsoleRows = uint16(ex.internalConsoleRows)
 		e.ConsoleCols = uint16(ex.internalConsoleCols)
 	}
-	if ex.execID != "" && e.InternalConsoleID == "" {
+	if ex.execID != "" && e.InternalConsoleID == "" && !ex.pausedManagement {
 		util.Fatalf("--exec-id requires --internal-console")
+	}
+	if ex.pausedManagement && ex.execID == "" {
+		util.Fatalf("--paused-management requires --exec-id")
 	}
 	if ex.branch != boot.DefaultBranchID && e.StdioIsPty && e.InternalConsoleID == "" {
 		util.Fatalf("branch exec with a host PTY is unsupported; use --internal-console")
@@ -307,7 +322,14 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 
 	// Wait for the process to exit.
 	var ws unix.WaitStatus
-	if e.BranchID == "" || e.BranchID == boot.DefaultBranchID {
+	if e.PausedManagement {
+		status, waitErr := c.Sandbox.WaitExecSession(&boot.ExecSessionArgs{
+			BranchID: e.BranchID,
+			ExecID:   e.ExecID,
+		})
+		ws = unix.WaitStatus(status)
+		err = waitErr
+	} else if e.BranchID == "" || e.BranchID == boot.DefaultBranchID {
 		ws, err = c.WaitPID(pid)
 	} else {
 		ws, err = c.WaitBranchPID(e.BranchID, pid)

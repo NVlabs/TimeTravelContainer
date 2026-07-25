@@ -301,10 +301,14 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 			if branch.ID != resolved.branch {
 				continue
 			}
-			if branch.State != "running" {
-				return fmt.Errorf("cannot copy to or from branch %q while it is %s; resume it first", resolved.branch, branch.State)
+			switch branch.State {
+			case "running":
+				return b.runLiveCopyHelper(resolved, helperArgs, input, output, false)
+			case "paused":
+				return b.runLiveCopyHelper(resolved, helperArgs, input, output, true)
+			default:
+				return fmt.Errorf("cannot copy to or from branch %q while it is %s", resolved.branch, branch.State)
 			}
-			return b.runLiveCopyHelper(resolved, helperArgs, input, output)
 		}
 		return fmt.Errorf("cannot copy the offline branch %q while another branch in its family is live", resolved.branch)
 	}
@@ -332,7 +336,15 @@ func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
 	return helper, nil
 }
 
-func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []string, input io.Reader, output io.Writer) error {
+func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []string, input io.Reader, output io.Writer, paused bool) error {
+	execID := ""
+	if paused {
+		requestID, err := newDaemonRequestID()
+		if err != nil {
+			return fmt.Errorf("allocating paused copy session ID: %w", err)
+		}
+		execID = "ttc-cp-" + requestID
+	}
 	helper, err := b.openCopyHelper()
 	if err != nil {
 		return err
@@ -343,9 +355,12 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 		"--user", "0:0",
 		"--cap", "CAP_CHOWN", "--cap", "CAP_DAC_OVERRIDE",
 		"--cap", "CAP_FOWNER", "--cap", "CAP_MKNOD",
-		"--exec-fd", "3", resolved.container,
-		"ttc", copyHelperArg,
+		"--exec-fd", "3",
 	}
+	if paused {
+		args = append(args, "--paused-management", "--exec-id", execID)
+	}
+	args = append(args, resolved.container, "ttc", copyHelperArg)
 	args = append(args, helperArgs...)
 	command := exec.Command(b.runsc, args...)
 	command.ExtraFiles = []*os.File{helper}

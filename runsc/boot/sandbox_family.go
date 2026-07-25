@@ -237,8 +237,9 @@ type ExecWaitArgs struct {
 var ErrExecWaitCancelled = errors.New("exec wait client disconnected")
 
 type execSession struct {
-	info ExecSessionInfo
-	tg   *kernel.ThreadGroup
+	info           ExecSessionInfo
+	tg             *kernel.ThreadGroup
+	managementDone <-chan struct{}
 }
 
 type consoleWaitLease struct {
@@ -445,7 +446,7 @@ func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecA
 	if args.ExecID == "" {
 		return nil
 	}
-	if args.InternalConsoleID == "" {
+	if args.InternalConsoleID == "" && !args.PausedManagement {
 		return fmt.Errorf("exec session %q requires a Sentry-owned internal console", args.ExecID)
 	}
 	f.mu.Lock()
@@ -476,7 +477,7 @@ func (f *SandboxFamily) abortExecSession(b *sandboxBranch, id string) {
 	f.mu.Unlock()
 }
 
-func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kernel.ThreadID, tg *kernel.ThreadGroup) {
+func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kernel.ThreadID, tg *kernel.ThreadGroup, managementDone <-chan struct{}) {
 	if id == "" {
 		return
 	}
@@ -486,6 +487,7 @@ func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kern
 		session.info.PID = pid
 		session.info.State = ExecSessionRunning
 		session.tg = tg
+		session.managementDone = managementDone
 	}
 	f.mu.Unlock()
 	if session != nil {
@@ -1001,7 +1003,7 @@ func (f *SandboxFamily) ExecSessions(args *ExecSessionsArgs) ([]ExecSessionInfo,
 
 // WaitExecSession waits for one exec process and retains its exit status.
 func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan struct{}) (uint32, error) {
-	_, session, done, err := f.execSession(args)
+	b, session, done, err := f.execSession(args)
 	if err != nil {
 		return 0, err
 	}
@@ -1019,10 +1021,20 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 	case <-cancel:
 		return 0, ErrExecWaitCancelled
 	}
+	if session.managementDone != nil {
+		select {
+		case <-session.managementDone:
+		case <-cancel:
+			return 0, ErrExecWaitCancelled
+		}
+	}
 	status := uint32(session.tg.ExitStatus())
 	f.mu.Lock()
 	session.info.State = ExecSessionExited
 	session.info.ExitStatus = &status
+	if session.info.ConsoleID == "" && b.execSessions[args.ExecID] == session {
+		delete(b.execSessions, args.ExecID)
+	}
 	f.mu.Unlock()
 	return status, nil
 }
@@ -1429,6 +1441,43 @@ func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), 
 	b.controlOps.Add(1)
 	f.mu.Unlock()
 	return b, func() {
+		b.controlOps.Done()
+		b.opMu.Unlock()
+	}, nil
+}
+
+// beginPausedManagementControl acquires the branch operation lock and opens a
+// management-only execution window in a paused branch. Existing guest tasks
+// remain stopped. The caller must retain the returned completion function
+// until the management process has exited.
+func (f *SandboxFamily) beginPausedManagementControl(id string) (*sandboxBranch, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
+	if b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("branch %q is %s, not paused", id, state)
+	}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	restorePause, err := b.k.BeginPausedManagementExecution()
+	if err != nil {
+		b.controlOps.Done()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("opening paused management execution in branch %q: %w", id, err)
+	}
+	return b, func() {
+		restorePause()
 		b.controlOps.Done()
 		b.opMu.Unlock()
 	}, nil

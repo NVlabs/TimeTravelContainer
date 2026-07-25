@@ -98,6 +98,12 @@ type ExecArgs struct {
 	// empty value selects the default branch.
 	BranchID string `json:"branch_id,omitempty"`
 
+	// PausedManagement allows this process to run while the selected branch's
+	// pre-existing guest tasks remain paused. It is reserved for trusted TTC
+	// management helpers and serializes against branch lifecycle operations
+	// until the process exits.
+	PausedManagement bool `json:"paused_management,omitempty"`
+
 	// Filename is the filename to load.
 	//
 	// If this is provided as "", then the file will be guessed via Argv[0].

@@ -1764,6 +1764,47 @@ func (k *Kernel) IsPaused() bool {
 	return k.tasks.isExternallyStopped()
 }
 
+// BeginPausedManagementExecution keeps every task that existed at entry
+// stopped while temporarily removing the TaskSet-wide external stop so that a
+// newly created management process can run. The returned function restores the
+// TaskSet-wide stop and must be called only after the management process and
+// all of its threads have exited.
+//
+// This is intentionally narrower than Unpause: it neither makes existing guest
+// tasks runnable nor resumes time that was frozen by StartPaused.
+//
+// Preconditions:
+//   - k has exactly one TaskSet-wide external stop.
+//   - The caller serializes process creation and retains the corresponding
+//     lifecycle lock until the returned function has completed.
+func (k *Kernel) BeginPausedManagementExecution() (func(), error) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if !k.tasks.isFinalExternalStop() {
+		return nil, fmt.Errorf("kernel is not singly paused")
+	}
+	var existing []*Task
+	if k.tasks.Root != nil {
+		existing = k.tasks.Root.Tasks()
+	}
+	// The existing tasks are already quiescent under the TaskSet-wide stop.
+	// Give each one an individual stop before removing the common stop, so
+	// there is no instant at which guest application code can run.
+	for _, t := range existing {
+		t.BeginExternalStop()
+	}
+	k.tasks.EndExternalStop()
+	return func() {
+		// Re-establish the common stop for every task, including management
+		// threads created during the window, and wait for asynchronous work to
+		// quiesce before releasing the existing tasks' redundant stops.
+		k.Pause()
+		for _, t := range existing {
+			t.EndExternalStop()
+		}
+	}, nil
+}
+
 // ReceiveTaskStates receives full states for all tasks.
 //
 // Precondition: The kernel must be paused.
