@@ -84,9 +84,7 @@ and does not require a Docker or containerd daemon.
 - Select image tags, digests, and multi-architecture variants.
 - Use Docker configuration files and credential helpers for authenticated
   registries.
-- See live, per-layer download and extraction progress. TTC refreshes stable
-  layer rows in a terminal and uses ordinary line-oriented output when
-  redirected.
+- See human-readable download, reuse, and extraction progress.
 - Run images containing arbitrary users without subordinate UID/GID ranges or
   `newuidmap`/`newgidmap`.
 - Use image workflows that rely on `sudo`, `su`, or SUID/SGID programs; their
