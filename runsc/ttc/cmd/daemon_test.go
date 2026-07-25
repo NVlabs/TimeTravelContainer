@@ -49,6 +49,19 @@ func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	}
 }
 
+func TestReportDaemonStartupFailureIncludesDaemonDiagnostic(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ttcd.log")
+	if err := os.WriteFile(logPath, []byte("ttcd: volume backing filesystem does not support FICLONE\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	reportDaemonStartupFailure(&stderr, logPath, errors.New("exit status 1"))
+	got := stderr.String()
+	if !strings.Contains(got, logPath) || !strings.Contains(got, "exit status 1") || !strings.Contains(got, "does not support FICLONE") {
+		t.Fatalf("startup diagnostic=%q, want log path, process status, and daemon error", got)
+	}
+}
+
 func TestStopDaemonContainersStopsDescendantsBeforeMain(t *testing.T) {
 	b := &fakeBackend{
 		families: []Family{{

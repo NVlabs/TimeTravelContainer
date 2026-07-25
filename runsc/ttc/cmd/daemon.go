@@ -1095,13 +1095,17 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 	}
 }
 
-func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlowVolumeCopy bool) error {
+func daemonLogPath(socket string) string {
+	return filepath.Join(filepath.Dir(socket), "ttcd.log")
+}
+
+func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlowVolumeCopy bool) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
-		return fmt.Errorf("creating daemon directory: %w", err)
+		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("finding ttc executable: %w", err)
+		return "", nil, fmt.Errorf("finding ttc executable: %w", err)
 	}
 	commandName := executable
 	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot}
@@ -1119,18 +1123,44 @@ func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlo
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	defer devNull.Close()
+	logPath := daemonLogPath(socket)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", nil, fmt.Errorf("opening ttcd log %q: %w", logPath, err)
+	}
+	defer logFile.Close()
 	command := exec.Command(commandName, commandArgs...)
 	command.Stdin = devNull
-	command.Stdout = devNull
-	command.Stderr = devNull
+	command.Stdout = logFile
+	command.Stderr = logFile
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
-		return fmt.Errorf("starting ttcd: %w", err)
+		return logPath, nil, fmt.Errorf("starting ttcd: %w", err)
 	}
-	return command.Process.Release()
+	done := make(chan error, 1)
+	go func() {
+		done <- command.Wait()
+		close(done)
+	}()
+	return logPath, done, nil
+}
+
+func reportDaemonStartupFailure(stderr io.Writer, logPath string, processErr error) {
+	fmt.Fprintf(stderr, "ttc: ttcd did not become ready; startup log: %s\n", logPath)
+	if processErr != nil {
+		fmt.Fprintf(stderr, "ttc: ttcd exited: %v\n", processErr)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttc: reading startup log: %v\n", err)
+		return
+	}
+	if diagnostic := strings.TrimSpace(string(log)); diagnostic != "" {
+		fmt.Fprintln(stderr, diagnostic)
+	}
 }
 
 func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int {
@@ -1184,7 +1214,8 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
-		if err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy); err != nil {
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy)
+		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
@@ -1195,9 +1226,14 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 				fmt.Fprintln(stdout, "ttcd started")
 				return 0
 			}
-			time.Sleep(25 * time.Millisecond)
+			select {
+			case processErr := <-processDone:
+				reportDaemonStartupFailure(stderr, logPath, processErr)
+				return 1
+			case <-time.After(25 * time.Millisecond):
+			}
 		}
-		fmt.Fprintln(stderr, "ttc: ttcd did not become ready")
+		reportDaemonStartupFailure(stderr, logPath, nil)
 		return 1
 	case "status", "stop":
 		conn, err := connectDaemon(opts.daemonSocket)
