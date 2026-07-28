@@ -1,0 +1,9 @@
+{
+  "all_children_ready_ms": 798.67878,
+  "forks_returned_ms": 635.554576,
+  "max_single_fork_ms": 36.006608,
+  "n": 10,
+  "sentry_pss_before_kib": 58919,
+  "sentry_pss_with_children_kib": 73576,
+  "sum_source_downtime_ms": 331.678907
+}

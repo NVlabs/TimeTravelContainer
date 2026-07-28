@@ -1,0 +1,7 @@
+{
+  "forkd_fresh_source_trials": 15,
+  "forkd_repeated_source_trials": 6,
+  "started_at_unix": 1785228281.7234476,
+  "ttc_trials": 30,
+  "workload": "Python 3.12, anonymous 512 MiB mmap, every 4 KiB page touched"
+}

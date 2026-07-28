@@ -1,0 +1,6 @@
+{"branch_return_ms": 15.124599, "snapshot_ready_ms": 1260.376923, "source_alive": true, "source_pause_ms": 3, "trial": 0, "warning": null}
+{"branch_return_ms": 27.505855, "snapshot_ready_ms": 1265.804153, "source_alive": true, "source_pause_ms": 3, "trial": 1, "warning": null}
+{"branch_return_ms": 28.531506, "snapshot_ready_ms": 1286.85752, "source_alive": true, "source_pause_ms": 2, "trial": 2, "warning": null}
+{"branch_return_ms": 28.963885, "snapshot_ready_ms": 1306.904082, "source_alive": true, "source_pause_ms": 2, "trial": 3, "warning": null}
+{"branch_return_ms": 29.211844, "snapshot_ready_ms": 1285.258225, "source_alive": true, "source_pause_ms": 3, "trial": 4, "warning": null}
+{"branch_return_ms": 29.699387, "snapshot_ready_ms": 1288.52729, "source_alive": true, "source_pause_ms": 3, "trial": 5, "warning": null}

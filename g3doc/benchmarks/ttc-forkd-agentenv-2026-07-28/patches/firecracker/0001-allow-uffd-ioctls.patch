@@ -1,0 +1,37 @@
+diff --git a/resources/seccomp/x86_64-unknown-linux-musl.json b/resources/seccomp/x86_64-unknown-linux-musl.json
+index a3ddd489c..5cc68bdb0 100644
+--- a/resources/seccomp/x86_64-unknown-linux-musl.json
++++ b/resources/seccomp/x86_64-unknown-linux-musl.json
+@@ -357,6 +357,32 @@
+                     }
+                 ]
+             },
++            {
++                "syscall": "ioctl",
++                "comment": "Negotiate the userfaultfd API for snapshot-side write protection",
++                "args": [
++                    {
++                        "index": 1,
++                        "type": "dword",
++                        "op": "eq",
++                        "val": 3222841919,
++                        "comment": "UFFDIO_API"
++                    }
++                ]
++            },
++            {
++                "syscall": "ioctl",
++                "comment": "Register guest memory for snapshot-side userfaultfd write protection",
++                "args": [
++                    {
++                        "index": 1,
++                        "type": "dword",
++                        "op": "eq",
++                        "val": 3223366144,
++                        "comment": "UFFDIO_REGISTER"
++                    }
++                ]
++            },
+             {
+                 "syscall": "ioctl",
+                 "comment": "Triggered on shutdown, to restore the initial terminal settings.",

@@ -1,0 +1,10 @@
+{
+  "all_children_ready_ms": 130.728596,
+  "branch_return_ms": 16.673166,
+  "children_pss_sum_kib": 527860,
+  "forks_returned_ms": 60.188381,
+  "n": 10,
+  "snapshot_ready_ms": 1294.691659,
+  "source_pause_ms": 2,
+  "spawn_stdout": "\u2713 sb-6a686cc2-0024  guest=10.42.0.2:8888  netns=forkd-child-1\n  \u2713 sb-6a686cc2-0025  guest=10.42.0.2:8888  netns=forkd-child-2\n  \u2713 sb-6a686cc2-0026  guest=10.42.0.2:8888  netns=forkd-child-3\n  \u2713 sb-6a686cc2-0027  guest=10.42.0.2:8888  netns=forkd-child-4\n  \u2713 sb-6a686cc2-0028  guest=10.42.0.2:8888  netns=forkd-child-5\n  \u2713 sb-6a686cc2-0029  guest=10.42.0.2:8888  netns=forkd-child-6\n  \u2713 sb-6a686cc2-002a  guest=10.42.0.2:8888  netns=forkd-child-7\n  \u2713 sb-6a686cc2-002b  guest=10.42.0.2:8888  netns=forkd-child-8\n  \u2713 sb-6a686cc2-002c  guest=10.42.0.2:8888  netns=forkd-child-9\n  \u2713 sb-6a686cc2-002d  guest=10.42.0.2:8888  netns=forkd-child-10"
+}
