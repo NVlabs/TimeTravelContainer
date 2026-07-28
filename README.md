@@ -1,8 +1,6 @@
 # TimeTravelContainer
 
-<p align="center">
-  <img src="assets/ttc-logo.png" alt="TimeTravelContainer logo" width="180">
-</p>
+<img src="assets/ttc-logo.png" alt="TimeTravelContainer logo" width="180">
 
 TimeTravelContainer (TTC) is a lightweight, rootless Linux container manager
 that can **fork an entire running container** into independent branches.
@@ -23,6 +21,12 @@ demo@main
 └── demo@test-b
 ```
 
+Install the latest static release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gzz2000/TimeTravelOS/master/install.sh | sh
+```
+
 ## Why TimeTravelContainer?
 
 Containers are usually treated as disposable machines: when a workload needs
@@ -40,24 +44,16 @@ minutes cloning a repository, installing dependencies, indexing source,
 starting databases, and building a project before it can attempt a change.
 With TTC, that warmed environment can become the root of a branch tree:
 
-- **Parallel coding agents:** give multiple agents the same live workspace and
-  let each try a different implementation without repeating setup or sharing
-  writes.
-- **Speculative tool use:** fork immediately before an uncertain shell command,
-  package upgrade, migration, or configuration change; retain the successful
-  future and discard destructive attempts.
-- **Search and planning:** map tree-search nodes to container branches so an
-  agent can explore several action sequences from an identical process and
-  filesystem state.
-- **Fast rollback:** preserve useful milestones during a long-running task and
-  return to them without reconstructing the environment or replaying every
-  preceding action.
-- **Agent evaluation:** start candidate agents or policies from the same exact
-  prepared state, reducing setup variance and making trajectories easier to
-  compare.
-- **Reusable warm environments:** branch initialized browsers, language
-  servers, databases, test fixtures, and model-serving processes instead of
-  paying their startup cost for every attempt.
+- **Parallel exploration:** give coding agents, planners, or tree-search nodes
+  the same live starting state, then explore different implementations or
+  action sequences in independent branches.
+- **Speculation and rollback:** preserve warm milestones and fork before risky
+  tool calls, upgrades, or migrations; keep promising outcomes and discard the
+  rest without replaying the task from the beginning.
+- **Evaluation and training:** run candidate agents or policies from an
+  identical prepared state. Branching training rollouts from a shared prefix
+  reduces environment variance, enables direct counterfactual comparison, and
+  can support more stable credit assignment.
 
 The same primitive accelerates integration testing, state-space exploration,
 fault injection, fuzzing, interactive debugging, and any workflow that needs
@@ -274,19 +270,6 @@ TTC reports an error rather than silently ignoring an unavailable hard limit.
 Container process-count limits do not require host cgroup delegation.
 
 ## Build and install
-
-### Install the latest release
-
-On x86-64 or ARM64 Linux:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/gzz2000/TimeTravelOS/master/install.sh | sh
-```
-
-This installs the static `ttc` and `ttcd` binaries in `~/.local/bin`, creates
-the per-user data and runtime directories, and adds `~/.local/bin` to
-`~/.profile` when needed. Restart the shell after the first installation, or
-run `export PATH="$HOME/.local/bin:$PATH"` once in the current shell.
 
 ### Docker-based build
 
