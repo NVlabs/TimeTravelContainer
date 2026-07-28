@@ -474,6 +474,23 @@ func TestForkGeneratesDestination(t *testing.T) {
 	}
 }
 
+func TestForkCreatesSiblingBatch(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"fork", "--paused", "web@main", "a", "web@b", "c"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.forkDestinations, []string{"a", "b", "c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fork destinations=%q, want %q", got, want)
+	}
+	if !b.forkPaused {
+		t.Fatal("batch fork did not preserve --paused")
+	}
+	if got, want := stdout.String(), "web@a\nweb@b\nweb@c\n"; got != want {
+		t.Errorf("fork output=%q, want %q", got, want)
+	}
+}
+
 func TestForkRejectsCrossFamilyDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -3058,6 +3075,7 @@ type fakeBackend struct {
 	killErr            error
 	forkSource         selector
 	forkDestination    string
+	forkDestinations   []string
 	forkPaused         bool
 	publishedTarget    selector
 	publishedBinding   ttcbundle.PortBinding
@@ -3230,13 +3248,29 @@ func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
+	branches, err := b.forkMany(source, []string{destination}, paused)
+	if err != nil {
+		return Branch{}, err
+	}
+	return branches[0], nil
+}
+
+func (b *fakeBackend) forkMany(source selector, destinations []string, paused bool) ([]Branch, error) {
 	b.forkSource = source
-	b.forkDestination = destination
+	b.forkDestinations = append([]string(nil), destinations...)
+	b.forkDestination = ""
+	if len(destinations) != 0 {
+		b.forkDestination = destinations[len(destinations)-1]
+	}
 	b.forkPaused = paused
 	if b.err != nil {
-		return Branch{}, b.err
+		return nil, b.err
 	}
-	return Branch{ID: destination, ParentID: source.branch, State: "paused"}, nil
+	branches := make([]Branch, len(destinations))
+	for i, destination := range destinations {
+		branches[i] = Branch{ID: destination, ParentID: source.branch, State: "paused"}
+	}
+	return branches, nil
 }
 
 func (b *fakeBackend) publishPort(target selector, binding ttcbundle.PortBinding) error {

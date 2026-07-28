@@ -27,6 +27,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+type liveForkContextID int
+
+const (
+	// CtxLiveForkPMASnapshots maps live-fork state keys to in-memory PMA
+	// metadata. It is present only while reconstructing in-process clones.
+	CtxLiveForkPMASnapshots liveForkContextID = iota
+)
+
 // LiveForkMappingIssue describes one VMA that cannot be cloned safely.
 type LiveForkMappingIssue struct {
 	AddrRange hostarch.AddrRange
@@ -104,6 +112,37 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 		}
 		mm.as = as
 	}
+}
+
+// savePmas is invoked by stateify. Live fork keeps PMA metadata in an
+// in-memory snapshot rather than reflecting every resident range through the
+// generic wire encoder. Durable checkpoints retain the normal representation.
+func (mm *MemoryManager) savePmas() pmaSet {
+	if mm.liveForkPMAKey != 0 {
+		return pmaSet{}
+	}
+	return mm.pmas
+}
+
+// loadPmas is invoked by stateify.
+func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved pmaSet) {
+	if mm.liveForkPMAKey == 0 {
+		mm.pmas = saved
+		return
+	}
+	snapshots, ok := ctx.Value(CtxLiveForkPMASnapshots).(LiveForkPMASnapshots)
+	if !ok {
+		panic("live-fork PMA snapshots were not provided")
+	}
+	snapshot := snapshots[mm.liveForkPMAKey]
+	if snapshot == nil {
+		panic(fmt.Sprintf("live-fork PMA snapshot %d was not provided", mm.liveForkPMAKey))
+	}
+	pgap := mm.pmas.FirstGap()
+	for _, entry := range snapshot.entries {
+		pgap = mm.pmas.Insert(pgap, entry.ar, entry.pma).NextGap()
+	}
+	mm.liveForkPMAKey = 0
 }
 
 // afterLoad is invoked by stateify.

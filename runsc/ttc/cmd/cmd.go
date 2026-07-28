@@ -312,7 +312,7 @@ Commands:
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
-  fork [--paused] SOURCE [DEST]   Fork SOURCE into a new live branch
+  fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   pause TARGET...                 Pause one or more branches
@@ -3863,26 +3863,34 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 || fs.NArg() > 2 {
-		return errors.New("usage: ttc fork [--paused] SOURCE [DEST]")
+	if fs.NArg() < 1 {
+		return errors.New("usage: ttc fork [--paused] SOURCE [DEST...]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return fmt.Errorf("invalid source: %w", err)
 	}
-	destinationValue := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-	if fs.NArg() == 2 {
-		destinationValue = fs.Arg(1)
+	destinationValues := fs.Args()[1:]
+	if len(destinationValues) == 0 {
+		destinationValues = []string{"fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")}
 	}
-	destination, err := parseDestination(source.container, destinationValue)
+	destinations := make([]selector, len(destinationValues))
+	destinationBranches := make([]string, len(destinationValues))
+	for i, value := range destinationValues {
+		destination, err := parseDestination(source.container, value)
+		if err != nil {
+			return fmt.Errorf("invalid destination %q: %w", value, err)
+		}
+		destinations[i] = destination
+		destinationBranches[i] = destination.branch
+	}
+	branches, err := backend.forkMany(source, destinationBranches, *paused)
 	if err != nil {
-		return fmt.Errorf("invalid destination: %w", err)
+		return fmt.Errorf("forking %s as %s: %w", source, strings.Join(destinationValues, ", "), err)
 	}
-	branch, err := backend.fork(source, destination.branch, *paused)
-	if err != nil {
-		return fmt.Errorf("forking %s as %s: %w", source, destination, err)
+	for i, branch := range branches {
+		fmt.Fprintf(stdout, "%s@%s\n", destinations[i].container, branch.ID)
 	}
-	fmt.Fprintf(stdout, "%s@%s\n", source.container, branch.ID)
 	return nil
 }
 
@@ -4580,6 +4588,7 @@ type backend interface {
 	processes(target selector) ([]ProcessInfo, error)
 	rootfsSize(target selector) (uint64, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
+	forkMany(source selector, destinations []string, paused bool) ([]Branch, error)
 	publishPort(target selector, binding ttcbundle.PortBinding) error
 	listPorts(container string) ([]ttcbundle.PortBinding, error)
 	unpublishPort(target selector, binding ttcbundle.PortBinding) error
@@ -7735,73 +7744,102 @@ func branchView(info runscBranchInfo) Branch {
 }
 
 func (b *runtimeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
-	resolved, containerInfo, err := b.resolveSelector(source)
+	branches, err := b.forkMany(source, []string{destination}, paused)
 	if err != nil {
 		return Branch{}, err
 	}
+	return branches[0], nil
+}
+
+func (b *runtimeBackend) forkMany(source selector, destinations []string, paused bool) ([]Branch, error) {
+	if len(destinations) == 0 {
+		return nil, errors.New("at least one fork destination is required")
+	}
+	resolved, containerInfo, err := b.resolveSelector(source)
+	if err != nil {
+		return nil, err
+	}
 	source = resolved
-	for _, historical := range containerInfo.Branches {
-		if historical.ID == destination {
-			return Branch{}, fmt.Errorf("branch name %q is retained by immutable lineage", destination)
+	seen := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		if _, ok := seen[destination]; ok {
+			return nil, fmt.Errorf("branch name %q is repeated", destination)
+		}
+		seen[destination] = struct{}{}
+		for _, historical := range containerInfo.Branches {
+			if historical.ID == destination {
+				return nil, fmt.Errorf("branch name %q is retained by immutable lineage", destination)
+			}
 		}
 	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
 	}
-	args = append(args, source.container, "fork", destination)
+	args = append(args, source.container, "fork")
+	args = append(args, destinations...)
 	output, err := b.command(args...)
 	if err != nil {
-		return Branch{}, err
+		return nil, err
 	}
-	var info runscBranchInfo
-	if err := json.Unmarshal(output, &info); err != nil {
-		return Branch{}, fmt.Errorf("decoding runsc fork result: %w", err)
+	infos := make([]runscBranchInfo, 0, len(destinations))
+	if len(destinations) == 1 {
+		var info runscBranchInfo
+		if err := json.Unmarshal(output, &info); err != nil {
+			return nil, fmt.Errorf("decoding runsc fork result: %w", err)
+		}
+		infos = append(infos, info)
+	} else if err := json.Unmarshal(output, &infos); err != nil {
+		return nil, fmt.Errorf("decoding runsc batch-fork result: %w", err)
 	}
-	branch := branchView(info)
+	branches := make([]Branch, len(infos))
+	for i, info := range infos {
+		branches[i] = branchView(info)
+	}
 	if b.dataRoot != "" {
-		record := ttcbundle.BranchInfo{
-			ID: branch.ID, ParentID: branch.ParentID, State: branch.State, CreatedAt: branch.CreatedAt,
-			ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
-		}
-		if err := b.containerStore().RecordBranch(source.container, record); err != nil {
-			_, cleanupErr := b.command("timetravel", source.container, "destroy", destination)
-			if cleanupErr != nil {
-				return Branch{}, fmt.Errorf("persisting fork lineage: %w (cleanup also failed: %v)", err, cleanupErr)
+		records := make([]ttcbundle.BranchInfo, len(branches))
+		for i, branch := range branches {
+			records[i] = ttcbundle.BranchInfo{
+				ID: branch.ID, ParentID: branch.ParentID, State: branch.State, CreatedAt: branch.CreatedAt,
+				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 			}
-			return Branch{}, fmt.Errorf("persisting fork lineage: %w; forked branch was destroyed", err)
 		}
-	}
-	target := selector{container: source.container, branch: destination}
-	if _, err := b.ensureConsoleDrain(target, true); err != nil {
-		cleanupErr := b.destroy(target)
-		if cleanupErr != nil {
-			return Branch{}, fmt.Errorf("starting console drain after fork: %w (cleanup also failed: %v)", err, cleanupErr)
-		}
-		return Branch{}, fmt.Errorf("starting console drain after fork: %w; forked branch was destroyed", err)
-	}
-	sessions, err := b.execSessions(target)
-	if err != nil {
-		cleanupErr := b.destroy(target)
-		if cleanupErr != nil {
-			return Branch{}, fmt.Errorf("listing cloned exec sessions after fork: %w (cleanup also failed: %v)", err, cleanupErr)
-		}
-		return Branch{}, fmt.Errorf("listing cloned exec sessions after fork: %w; forked branch was destroyed", err)
-	}
-	for _, session := range sessions {
-		if session.State != "running" {
-			continue
-		}
-		if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, true); err != nil {
-			cleanupErr := b.destroy(target)
-			if cleanupErr != nil {
-				return Branch{}, fmt.Errorf("starting cloned exec console drain %q: %w (cleanup also failed: %v)", session.ID, err, cleanupErr)
+		if err := b.containerStore().RecordBranches(source.container, records); err != nil {
+			for _, cleanupDestination := range destinations {
+				_, _ = b.command("timetravel", source.container, "destroy", cleanupDestination)
 			}
-			return Branch{}, fmt.Errorf("starting cloned exec console drain %q: %w; forked branch was destroyed", session.ID, err)
+			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
+		}
+	}
+	for _, destination := range destinations {
+		target := selector{container: source.container, branch: destination}
+		if _, err := b.ensureConsoleDrain(target, true); err != nil {
+			for _, cleanupDestination := range destinations {
+				_ = b.destroy(selector{container: source.container, branch: cleanupDestination})
+			}
+			return nil, fmt.Errorf("starting console drain after batch fork: %w; batch branches were destroyed", err)
+		}
+		sessions, err := b.execSessions(target)
+		if err != nil {
+			for _, cleanupDestination := range destinations {
+				_ = b.destroy(selector{container: source.container, branch: cleanupDestination})
+			}
+			return nil, fmt.Errorf("listing cloned exec sessions after batch fork: %w; batch branches were destroyed", err)
+		}
+		for _, session := range sessions {
+			if session.State != "running" {
+				continue
+			}
+			if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, true); err != nil {
+				for _, cleanupDestination := range destinations {
+					_ = b.destroy(selector{container: source.container, branch: cleanupDestination})
+				}
+				return nil, fmt.Errorf("starting cloned exec console drain %q: %w; batch branches were destroyed", session.ID, err)
+			}
 		}
 	}
 
-	return branch, nil
+	return branches, nil
 }
 
 func (b *runtimeBackend) pause(target selector) error {

@@ -1029,11 +1029,11 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	childCreated := time.Now().UTC()
 	child := BranchInfo{ID: "child", ParentID: "main", State: "running", CreatedAt: childCreated, ForkTotalNS: 123}
-	if err := store.RecordBranch("demo", child); err != nil {
-		t.Fatalf("RecordBranch: %v", err)
-	}
-	if err := store.RecordBranch("demo", BranchInfo{ID: "grandchild", ParentID: "child", State: "paused", CreatedAt: childCreated.Add(time.Second)}); err != nil {
-		t.Fatalf("RecordBranch grandchild: %v", err)
+	if err := store.RecordBranches("demo", []BranchInfo{
+		child,
+		{ID: "grandchild", ParentID: "child", State: "paused", CreatedAt: childCreated.Add(time.Second)},
+	}); err != nil {
+		t.Fatalf("RecordBranches: %v", err)
 	}
 	if err := store.MarkBranchDeleted("demo", "child"); err != nil {
 		t.Fatalf("MarkBranchDeleted: %v", err)

@@ -82,20 +82,22 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			if _, ok := resources[fs.diskVolume.ResourceID]; ok {
 				return fmt.Errorf("live-fork resource for TTC volume %q already exists", fs.diskVolume.ResourceID)
 			}
-			childBranch := vfs.LiveForkChildBranchIDFromContext(ctx)
-			if childBranch == "" {
+			childBranches := vfs.LiveForkChildBranchIDsFromContext(ctx)
+			if len(childBranches) == 0 {
 				return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
 			}
 			transactions := vfs.LiveForkTransactionsFromContext(ctx)
 			if transactions == nil {
 				return fmt.Errorf("CtxLiveForkTransactions was not provided for TTC volume")
 			}
-			tx, err := fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
-			if err != nil {
-				return fmt.Errorf("forking TTC volume %q: %w", fs.diskVolume.ResourceID, err)
+			for _, childBranch := range childBranches {
+				tx, err := fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+				if err != nil {
+					return fmt.Errorf("forking TTC volume %q as branch %q: %w", fs.diskVolume.ResourceID, childBranch, err)
+				}
+				transactions.Add(tx)
 			}
 			resources[fs.diskVolume.ResourceID] = fs.diskVolume.Repository
-			transactions.Add(tx)
 		}
 	}
 	resourceID := fs.mf.ResourceID()

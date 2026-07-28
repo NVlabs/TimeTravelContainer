@@ -57,14 +57,21 @@ func (mm *MemoryManager) realUsageAS() uint64 {
 }
 
 func cloneMemoryManagerMetadata(ctx context.Context, src *MemoryManager) (*MemoryManager, error) {
-	src.PrepareLiveFork()
+	const snapshotKey = 1
+	snapshots := LiveForkPMASnapshots{
+		snapshotKey: src.PrepareLiveForkSnapshot(snapshotKey),
+	}
+	defer src.ClearLiveForkPMASnapshot()
 	src.mf.MarkSavable()
 
 	var metadata bytes.Buffer
 	if _, err := state.Save(ctx, &metadata, src); err != nil {
 		return nil, fmt.Errorf("state.Save: %w", err)
 	}
-	loadCtx := context.WithValue(ctx, pgalloc.CtxLiveForkClone, true)
+	loadCtx := context.WithValues(ctx, map[any]any{
+		pgalloc.CtxLiveForkClone: true,
+		CtxLiveForkPMASnapshots:  snapshots,
+	})
 	dst := &MemoryManager{}
 	if _, err := state.Load(loadCtx, &metadata, dst); err != nil {
 		return nil, fmt.Errorf("state.Load: %w", err)

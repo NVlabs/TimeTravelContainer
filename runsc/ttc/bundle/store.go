@@ -1908,27 +1908,44 @@ func (s Store) RemovePortBindingsForBranch(name, branchID string) error {
 
 // RecordBranch appends one immutable branch identity or refreshes its lifecycle data.
 func (s Store) RecordBranch(name string, branch BranchInfo) error {
-	if err := validateObjectName("branch", branch.ID); err != nil {
-		return err
-	}
-	if branch.ID == branch.ParentID {
-		return fmt.Errorf("branch %q cannot be its own parent", branch.ID)
+	return s.RecordBranches(name, []BranchInfo{branch})
+}
+
+// RecordBranches atomically appends or refreshes multiple branch identities.
+func (s Store) RecordBranches(name string, branches []BranchInfo) error {
+	if len(branches) == 0 {
+		return errors.New("at least one branch is required")
 	}
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
 	}
+	index := make(map[string]int, len(info.Branches))
 	for i := range info.Branches {
-		if info.Branches[i].ID != branch.ID {
+		index[info.Branches[i].ID] = i
+	}
+	seen := make(map[string]struct{}, len(branches))
+	for _, branch := range branches {
+		if err := validateObjectName("branch", branch.ID); err != nil {
+			return err
+		}
+		if branch.ID == branch.ParentID {
+			return fmt.Errorf("branch %q cannot be its own parent", branch.ID)
+		}
+		if _, ok := seen[branch.ID]; ok {
+			return fmt.Errorf("branch %q is repeated", branch.ID)
+		}
+		seen[branch.ID] = struct{}{}
+		if i, ok := index[branch.ID]; ok {
+			if info.Branches[i].ParentID != branch.ParentID {
+				return fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
+			}
+			info.Branches[i] = branch
 			continue
 		}
-		if info.Branches[i].ParentID != branch.ParentID {
-			return fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
-		}
-		info.Branches[i] = branch
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		index[branch.ID] = len(info.Branches)
+		info.Branches = append(info.Branches, branch)
 	}
-	info.Branches = append(info.Branches, branch)
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 

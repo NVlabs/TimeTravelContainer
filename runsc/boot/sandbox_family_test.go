@@ -534,6 +534,60 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	parent.Release()
 }
 
+func TestSandboxFamilyForkMany(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+
+	infos, err := family.ForkMany(&ForkBranchesArgs{
+		IDs:    []string{"sibling-a", "sibling-b", "sibling-c"},
+		Paused: true,
+	})
+	if err != nil {
+		t.Fatalf("ForkMany: %v", err)
+	}
+	if len(infos) != 3 {
+		t.Fatalf("ForkMany returned %d branches, want 3", len(infos))
+	}
+	wantIDs := []string{"sibling-a", "sibling-b", "sibling-c"}
+	for i, info := range infos {
+		if info.ID != wantIDs[i] {
+			t.Errorf("branch %d ID=%q, want %q", i, info.ID, wantIDs[i])
+		}
+		if info.ParentID != DefaultBranchID || info.State != BranchPaused {
+			t.Errorf("branch %d = %+v", i, info)
+		}
+		if info.ForkMetrics.Kernel.MetadataStream <= 0 {
+			t.Errorf("branch %d has no metadata timing: %+v", i, info.ForkMetrics)
+		}
+		if i != 0 && (info.ForkMetrics.Kernel.Validation != 0 || info.ForkMetrics.Kernel.ParentPreparation != 0) {
+			t.Errorf("sibling %d repeated source work: %+v", i, info.ForkMetrics.Kernel)
+		}
+		if info.ForkMetrics.SourceDowntime != infos[0].ForkMetrics.SourceDowntime {
+			t.Errorf("sibling %d downtime=%v, primary=%v", i, info.ForkMetrics.SourceDowntime, infos[0].ForkMetrics.SourceDowntime)
+		}
+	}
+	if parent.IsPaused() {
+		t.Fatal("ForkMany left the running source paused")
+	}
+	for _, info := range infos {
+		if err := family.Destroy(info.ID); err != nil {
+			t.Fatalf("Destroy(%q): %v", info.ID, err)
+		}
+	}
+	parent.Pause()
+	parent.Release()
+}
+
 func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

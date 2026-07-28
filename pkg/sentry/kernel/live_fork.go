@@ -16,9 +16,11 @@ package kernel
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -60,6 +62,15 @@ type LiveForkOptions struct {
 
 	// Metrics, when non-nil, receives a timing breakdown for this attempt.
 	Metrics *LiveForkMetrics
+
+	// batchChildBranchIDs, metadataCapture, and batchFilesystemResources are
+	// used by LiveForkMany to prepare all sibling filesystem branches and
+	// retain the primary child's metadata stream. They are deliberately not
+	// exported: callers should use LiveForkMany.
+	batchChildBranchIDs      []string
+	metadataCapture          io.Writer
+	batchFilesystemResources vfs.LiveForkFilesystemResources
+	batchPMASnapshots        *mm.LiveForkPMASnapshots
 }
 
 // LiveForkValidationOptions controls live-fork resource validation.
@@ -78,6 +89,7 @@ type LiveForkMetrics struct {
 	Validation        time.Duration
 	ParentPreparation time.Duration
 	MetadataStream    time.Duration
+	MetadataBytes     int64
 	ChildRestore      time.Duration
 	Total             time.Duration
 }
@@ -252,8 +264,8 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
-		var fsResources vfs.LiveForkFilesystemResources
-		if opts.AllowSharedFilesystemResources {
+		fsResources := opts.batchFilesystemResources
+		if fsResources == nil && opts.AllowSharedFilesystemResources {
 			fsResources = make(vfs.LiveForkFilesystemResources)
 		}
 		fsTransactions := &vfs.LiveForkTransactions{}
@@ -276,6 +288,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
+			vfs.CtxLiveForkChildBranchIDs:      opts.batchChildBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
@@ -289,7 +302,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return fmt.Errorf("live fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
-		k.prepareMemoryManagersForLiveFork()
+		pmaSnapshots, clearPMASnapshots := k.prepareMemoryManagersForLiveFork()
+		defer clearPMASnapshots()
+		if opts.batchPMASnapshots != nil {
+			*opts.batchPMASnapshots = pmaSnapshots
+		}
 		k.mf.MarkSavable()
 		if opts.Metrics != nil {
 			opts.Metrics.ParentPreparation = time.Since(preparationStarted)
@@ -328,13 +345,14 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
+			mm.CtxLiveForkPMASnapshots:         pmaSnapshots,
 		})
 		metadataStarted := time.Now()
 		k.filteringLiveForkDanglingEndpoints = true
 		defer func() {
 			k.filteringLiveForkDanglingEndpoints = false
 		}()
-		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
+		if err := streamLiveForkState(saveCtx, loadCtx, k, child, opts.metadataCapture); err != nil {
 			return err
 		}
 		if opts.Metrics != nil {
@@ -394,6 +412,212 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	})
 	if err != nil {
 		return nil, err
+	}
+	return child, nil
+}
+
+// LiveForkMany creates multiple sibling Kernels from one paused source
+// snapshot. The source is validated, prepared, and serialized once. The first
+// child is loaded while the source is paused, which pins all shared MemoryFile
+// ranges; sourceReady is then called before the remaining children are loaded
+// concurrently from the captured in-memory metadata.
+//
+// All options must name distinct non-empty ChildBranchIDs and use compatible
+// resource-policy settings. The returned children correspond to opts by index.
+// sourceReady may be nil. If it succeeds, callers must assume that the source
+// may be running when this method subsequently returns an error.
+func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourceReady func() error) ([]*Kernel, error) {
+	if len(opts) == 0 {
+		return nil, fmt.Errorf("live fork batch requires at least one child")
+	}
+	ids := make([]string, len(opts))
+	seen := make(map[string]struct{}, len(opts))
+	for i := range opts {
+		if opts[i].ChildBranchID == "" {
+			return nil, fmt.Errorf("live fork batch child %d has an empty branch ID", i)
+		}
+		if _, ok := seen[opts[i].ChildBranchID]; ok {
+			return nil, fmt.Errorf("live fork batch repeats child branch ID %q", opts[i].ChildBranchID)
+		}
+		seen[opts[i].ChildBranchID] = struct{}{}
+		ids[i] = opts[i].ChildBranchID
+		if i != 0 && (opts[i].AllowNetworkStack != opts[0].AllowNetworkStack ||
+			opts[i].AllowSharedFilesystemResources != opts[0].AllowSharedFilesystemResources) {
+			return nil, fmt.Errorf("live fork batch child %q uses incompatible resource policy", opts[i].ChildBranchID)
+		}
+	}
+
+	var metadata bytes.Buffer
+	// Avoid repeated buffer growth while the source is paused. Typical
+	// container metadata streams are a few MiB; unused capacity is released
+	// when the batch operation returns.
+	metadata.Grow(16 << 20)
+	fsResources := make(vfs.LiveForkFilesystemResources)
+	var pmaSnapshots mm.LiveForkPMASnapshots
+	primaryOpts := opts[0]
+	primaryOpts.batchChildBranchIDs = ids
+	primaryOpts.metadataCapture = &metadata
+	primaryOpts.batchFilesystemResources = fsResources
+	primaryOpts.batchPMASnapshots = &pmaSnapshots
+	primary, err := k.LiveFork(ctx, primaryOpts)
+	if err != nil {
+		return nil, err
+	}
+	if opts[0].Metrics != nil {
+		opts[0].Metrics.MetadataBytes = int64(metadata.Len())
+	}
+	children := make([]*Kernel, len(opts))
+	children[0] = primary
+	cleanup := func() {
+		for _, child := range children {
+			if child != nil {
+				child.Release()
+			}
+		}
+		// LiveFork committed all sibling filesystem transactions before
+		// returning the primary child. No child has been started yet, so it is
+		// safe to discard their published branch pointers on batch failure.
+		for _, resource := range fsResources {
+			remover, ok := resource.(interface{ RemoveBranch(string) error })
+			if !ok {
+				continue
+			}
+			for _, id := range ids {
+				_ = remover.RemoveBranch(id)
+			}
+		}
+	}
+	if sourceReady != nil {
+		if err := sourceReady(); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("making live-fork source ready: %w", err)
+		}
+	}
+	if len(opts) == 1 {
+		return children, nil
+	}
+
+	var networkConfigSource inet.Stack
+	if rootNS := primary.rootNetworkNamespace; rootNS != nil {
+		networkConfigSource = rootNS.Stack()
+	}
+	serialized := metadata.Bytes()
+	errs := make([]error, len(opts))
+	var wg sync.WaitGroup
+	for i := 1; i < len(opts); i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			child, err := k.loadCapturedLiveForkChild(
+				ctx,
+				serialized,
+				fsResources,
+				pmaSnapshots,
+				networkConfigSource,
+				opts[i],
+			)
+			children[i] = child
+			errs[i] = err
+		}()
+	}
+	wg.Wait()
+	for i := 1; i < len(errs); i++ {
+		if errs[i] != nil {
+			cleanup()
+			return nil, fmt.Errorf("loading live-fork batch child %q: %w", opts[i].ChildBranchID, errs[i])
+		}
+	}
+	return children, nil
+}
+
+// loadCapturedLiveForkChild reconstructs one sibling from metadata captured by
+// LiveForkMany. The primary child remains paused and owns references to every
+// shared MemoryFile range, so the source may run concurrently with this load.
+func (k *Kernel) loadCapturedLiveForkChild(
+	ctx context.Context,
+	metadata []byte,
+	fsResources vfs.LiveForkFilesystemResources,
+	pmaSnapshots mm.LiveForkPMASnapshots,
+	networkConfigSource inet.Stack,
+	opts LiveForkOptions,
+) (*Kernel, error) {
+	started := time.Now()
+	if opts.Metrics != nil {
+		*opts.Metrics = LiveForkMetrics{}
+		defer func() {
+			opts.Metrics.Total = time.Since(started)
+		}()
+	}
+	if opts.Clocks == nil {
+		return nil, fmt.Errorf("live fork requires a clock source")
+	}
+
+	k.mf.IncOwner()
+	childLoaded := false
+	child := &Kernel{Platform: k.Platform}
+	child.SetMemoryFile(k.mf)
+	child.initRuntimeFields()
+	defer func() {
+		if childLoaded {
+			return
+		}
+		k.mf.Destroy()
+	}()
+	mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
+		pgalloc.CtxMemoryFile:              k.mf,
+		pgalloc.CtxMemoryFileMap:           mfs,
+		pgalloc.CtxLiveForkClone:           true,
+		vfs.CtxLiveForkFilesystemResources: fsResources,
+		vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
+		mm.CtxLiveForkPMASnapshots:         pmaSnapshots,
+	})
+	metadataStarted := time.Now()
+	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(metadata), 64<<10), child); err != nil {
+		return nil, fmt.Errorf("loading live-fork metadata: %w", err)
+	}
+	childLoaded = true
+	if opts.Metrics != nil {
+		opts.Metrics.MetadataStream = time.Since(metadataStarted)
+		opts.Metrics.MetadataBytes = int64(len(metadata))
+	}
+
+	restoreStarted := time.Now()
+	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
+		child.Release()
+		return nil, err
+	}
+	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if networkConfigSource == nil {
+			child.Release()
+			return nil, fmt.Errorf("live fork network configuration source is unavailable")
+		}
+		cloner, ok := networkConfigSource.(inet.LiveForkStackConfigCloner)
+		if !ok {
+			child.Release()
+			return nil, fmt.Errorf("live fork network stack %T cannot clone unsaved configuration", networkConfigSource)
+		}
+		if err := cloner.CloneLiveForkConfig(rootNS.Stack()); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("cloning live-fork network configuration: %w", err)
+		}
+		rootNS.Stack().Restore()
+		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				child.Release()
+				return nil, fmt.Errorf("resetting child external network state: %w", err)
+			}
+		}
+	}
+	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
+		child.Release()
+		return nil, vfs.PrependErrMsg("VFS live-fork restore failed", err)
+	}
+	child.Pause()
+	if opts.Metrics != nil {
+		opts.Metrics.ChildRestore = time.Since(restoreStarted)
 	}
 	return child, nil
 }
@@ -642,8 +866,10 @@ func (k *Kernel) privatizeLiveForkVDSOParamPage() error {
 
 // prepareMemoryManagersForLiveFork transitions all private PMAs to COW.
 // Tasks are paused, so Task.image and runState may be read without Task.mu.
-func (k *Kernel) prepareMemoryManagersForLiveFork() {
+func (k *Kernel) prepareMemoryManagersForLiveFork() (mm.LiveForkPMASnapshots, func()) {
 	prepared := make(map[*mm.MemoryManager]struct{})
+	snapshots := make(mm.LiveForkPMASnapshots)
+	nextKey := uint64(1)
 	prepare := func(memMgr *mm.MemoryManager) {
 		if memMgr == nil {
 			return
@@ -651,7 +877,8 @@ func (k *Kernel) prepareMemoryManagersForLiveFork() {
 		if _, ok := prepared[memMgr]; ok {
 			return
 		}
-		memMgr.PrepareLiveFork()
+		snapshots[nextKey] = memMgr.PrepareLiveForkSnapshot(nextKey)
+		nextKey++
 		prepared[memMgr] = struct{}{}
 	}
 
@@ -663,15 +890,26 @@ func (k *Kernel) prepareMemoryManagersForLiveFork() {
 			prepare(r.image.MemoryManager)
 		}
 	}
+	return snapshots, func() {
+		for memMgr := range prepared {
+			memMgr.ClearLiveForkPMASnapshot()
+		}
+	}
 }
 
 // streamLiveForkState connects state.Save directly to state.Load. The pipe
 // bounds temporary memory use and ensures that no checkpoint file is created.
-func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel) error {
+// If capture is non-nil, it receives an exact in-memory copy of the metadata
+// stream for sibling loads.
+func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel, capture io.Writer) error {
 	reader, writer := io.Pipe()
 	saveErrCh := make(chan error, 1)
 	go func() {
-		bufferedWriter := bufio.NewWriterSize(writer, 64<<10)
+		var output io.Writer = writer
+		if capture != nil {
+			output = io.MultiWriter(writer, capture)
+		}
+		bufferedWriter := bufio.NewWriterSize(output, 64<<10)
 		_, err := state.Save(saveCtx, bufferedWriter, parent)
 		if err == nil {
 			err = bufferedWriter.Flush()

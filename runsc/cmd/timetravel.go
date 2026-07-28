@@ -84,7 +84,7 @@ func (*TimeTravel) Synopsis() string {
 // Usage implements subcommands.Command.Usage.
 func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
-		"timetravel [flags] <container-id> fork <new-branch-id>\n" +
+		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
@@ -178,7 +178,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	if action == "branches" {
 		wantArgs = 2
 	}
-	if f.NArg() != wantArgs {
+	if (action == "fork" && f.NArg() < wantArgs) || (action != "fork" && f.NArg() != wantArgs) {
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
@@ -194,11 +194,20 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "branches":
 		output, err = cont.Sandbox.ListBranches()
 	case "fork":
-		output, err = cont.Sandbox.ForkBranch(&boot.ForkBranchArgs{
-			Source: t.source,
-			ID:     f.Arg(2),
-			Paused: t.paused,
-		})
+		destinations := f.Args()[2:]
+		if len(destinations) == 1 {
+			output, err = cont.Sandbox.ForkBranch(&boot.ForkBranchArgs{
+				Source: t.source,
+				ID:     destinations[0],
+				Paused: t.paused,
+			})
+		} else {
+			output, err = cont.Sandbox.ForkBranches(&boot.ForkBranchesArgs{
+				Source: t.source,
+				IDs:    destinations,
+				Paused: t.paused,
+			})
+		}
 	case "pause":
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":

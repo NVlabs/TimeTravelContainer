@@ -101,6 +101,9 @@ const (
 	// ContMgrForkBranch creates an in-memory branch of a paused instant.
 	ContMgrForkBranch = "containerManager.ForkBranch"
 
+	// ContMgrForkBranches creates sibling branches from one paused instant.
+	ContMgrForkBranches = "containerManager.ForkBranches"
+
 	// ContMgrListBranches lists all in-memory branches in the sandbox family.
 	ContMgrListBranches = "containerManager.ListBranches"
 
@@ -998,6 +1001,16 @@ func (cm *containerManager) ForkBranch(args *ForkBranchArgs, out *BranchInfo) er
 		return err
 	}
 	*out = *info
+	return nil
+}
+
+// ForkBranches creates in-memory sibling branches.
+func (cm *containerManager) ForkBranches(args *ForkBranchesArgs, out *[]BranchInfo) error {
+	infos, err := cm.l.family.ForkMany(args)
+	if err != nil {
+		return err
+	}
+	*out = infos
 	return nil
 }
 

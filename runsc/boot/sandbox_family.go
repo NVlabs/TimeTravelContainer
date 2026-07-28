@@ -80,6 +80,17 @@ type ForkBranchArgs struct {
 	Paused bool
 }
 
+// ForkBranchesArgs selects one source and multiple sibling destinations for a
+// single coordinated in-memory fork.
+type ForkBranchesArgs struct {
+	// Source defaults to DefaultBranchID.
+	Source string
+	// IDs are the new, distinct branch identifiers.
+	IDs []string
+	// Paused leaves every new branch stopped after creation.
+	Paused bool
+}
+
 // BranchArgs selects an existing branch. An empty ID selects the default.
 type BranchArgs struct {
 	ID string
@@ -655,16 +666,33 @@ func branchInitStatus(b *sandboxBranch) (kernel.ThreadID, string) {
 	return 0, "not-started"
 }
 
-// Fork creates a child from args.Source. Both branches remain paused unless
-// their requested/prior state says otherwise.
+// Fork creates one child from args.Source.
 func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
-	forkStarted := time.Now()
-	var metrics SandboxForkMetrics
 	if args == nil {
 		return nil, fmt.Errorf("missing live-fork arguments")
 	}
-	if args.ID == "" {
-		return nil, fmt.Errorf("branch ID must not be empty")
+	infos, err := f.ForkMany(&ForkBranchesArgs{
+		Source: args.Source,
+		IDs:    []string{args.ID},
+		Paused: args.Paused,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &infos[0], nil
+}
+
+// ForkMany creates sibling children from one source snapshot. The source is
+// paused once and becomes runnable again as soon as the primary child has
+// pinned the captured MemoryFile ranges. Remaining siblings are reconstructed
+// concurrently without extending source downtime.
+func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
+	forkStarted := time.Now()
+	if args == nil {
+		return nil, fmt.Errorf("missing live-fork arguments")
+	}
+	if len(args.IDs) == 0 {
+		return nil, fmt.Errorf("at least one branch ID is required")
 	}
 	sourceID := args.Source
 	if sourceID == "" {
@@ -677,24 +705,41 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		f.mu.Unlock()
 		return nil, fmt.Errorf("source branch %q does not exist", sourceID)
 	}
-	if _, ok := f.branches[args.ID]; ok {
-		f.mu.Unlock()
-		return nil, fmt.Errorf("branch %q already exists", args.ID)
+	seen := make(map[string]struct{}, len(args.IDs))
+	childBranches := make([]*sandboxBranch, len(args.IDs))
+	for i, id := range args.IDs {
+		if id == "" {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("branch ID must not be empty")
+		}
+		if _, ok := seen[id]; ok {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("branch %q is repeated", id)
+		}
+		seen[id] = struct{}{}
+		if _, ok := f.branches[id]; ok {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("branch %q already exists", id)
+		}
+		childBranches[i] = &sandboxBranch{
+			id:           id,
+			parentID:     sourceID,
+			state:        BranchCreating,
+			createdAt:    time.Now().UTC(),
+			execSessions: make(map[string]*execSession),
+		}
 	}
-	childBranch := &sandboxBranch{
-		id:           args.ID,
-		parentID:     sourceID,
-		state:        BranchCreating,
-		createdAt:    time.Now().UTC(),
-		execSessions: make(map[string]*execSession),
+	for _, childBranch := range childBranches {
+		f.branches[childBranch.id] = childBranch
 	}
-	f.branches[args.ID] = childBranch
 	f.mu.Unlock()
 
-	fail := func(err error) (*BranchInfo, error) {
+	fail := func(err error) ([]BranchInfo, error) {
 		f.mu.Lock()
-		childBranch.state = BranchFailed
-		delete(f.branches, args.ID)
+		for _, childBranch := range childBranches {
+			childBranch.state = BranchFailed
+			delete(f.branches, childBranch.id)
+		}
 		f.mu.Unlock()
 		return nil, err
 	}
@@ -717,21 +762,31 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 	// waiters before cloning so no control callback is inherited by the child.
 	f.cancelConsoleWaits(source)
 
+	metrics := make([]SandboxForkMetrics, len(childBranches))
 	if !sourceWasPaused {
 		pauseStarted := time.Now()
 		source.k.Pause()
-		metrics.SourcePause = time.Since(pauseStarted)
+		pauseDuration := time.Since(pauseStarted)
+		for i := range metrics {
+			metrics[i].SourcePause = pauseDuration
+		}
 	}
 	sourcePausedAt := time.Now()
+	sourceResumed := false
 	resumeSource := func() error {
-		if sourceWasPaused {
+		if sourceWasPaused || sourceResumed {
 			return nil
 		}
 		resumeStarted := time.Now()
 		source.k.Unpause()
 		err := control.PostResume(source.k, nil)
-		metrics.SourceResume += time.Since(resumeStarted)
-		metrics.SourceDowntime = time.Since(sourcePausedAt)
+		sourceResumed = true
+		resumeDuration := time.Since(resumeStarted)
+		downtime := time.Since(sourcePausedAt)
+		for i := range metrics {
+			metrics[i].SourceResume += resumeDuration
+			metrics[i].SourceDowntime = downtime
+		}
 		return err
 	}
 	if err := f.injectForkFailure(SandboxForkStageSourcePaused); err != nil {
@@ -742,131 +797,144 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return fail(err)
 	}
 
-	child, err := source.k.LiveFork(source.k.SupervisorContext(), kernel.LiveForkOptions{
-		Clocks:                         sentrytime.NewCalibratedClocks(),
-		ChildBranchID:                  f.volumeBranchID(args.ID),
-		AllowNetworkStack:              f.allowNetworkStack,
-		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
-		Metrics:                        &metrics.Kernel,
-	})
+	kernelOpts := make([]kernel.LiveForkOptions, len(childBranches))
+	for i, childBranch := range childBranches {
+		kernelOpts[i] = kernel.LiveForkOptions{
+			Clocks:                         sentrytime.NewCalibratedClocks(),
+			ChildBranchID:                  f.volumeBranchID(childBranch.id),
+			AllowNetworkStack:              f.allowNetworkStack,
+			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+			Metrics:                        &metrics[i].Kernel,
+		}
+	}
+	children, err := source.k.LiveForkMany(source.k.SupervisorContext(), kernelOpts, resumeSource)
 	if err != nil {
 		resumeErr := resumeSource()
 		if resumeErr != nil {
 			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
 		}
-		return fail(fmt.Errorf("forking branch %q from %q: %w", args.ID, sourceID, err))
+		return fail(fmt.Errorf("forking %d branches from %q: %w", len(args.IDs), sourceID, err))
 	}
 	if err := f.injectForkFailure(SandboxForkStageKernelCloned); err != nil {
-		child.Release()
-		resumeErr := resumeSource()
-		if resumeErr != nil {
-			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		for _, child := range children {
+			child.Release()
 		}
 		return fail(err)
 	}
-	childStartStarted := time.Now()
-	if err := child.StartPaused(); err != nil {
-		// StartPaused failure is an invariant violation, but ensure ownership of
-		// the child's shared MemoryFile is still released.
-		child.Release()
-		_ = resumeSource()
-		return fail(fmt.Errorf("starting branch %q paused: %w", args.ID, err))
-	}
-	metrics.ChildStart = time.Since(childStartStarted)
 
 	// The child Kernel contains the same virtual PIDs. Clone only sessions whose
 	// thread groups were present in the memory snapshot; an exit racing the
 	// watcher may leave source metadata briefly marked running.
-	clonedExecSessions := make(map[string]*execSession)
-	f.mu.Lock()
-	for id, sourceSession := range source.execSessions {
-		if sourceSession.info.State != ExecSessionRunning {
-			continue
+	clonedExecSessions := make([]map[string]*execSession, len(children))
+	for i, child := range children {
+		childStartStarted := time.Now()
+		if err := child.StartPaused(); err != nil {
+			for j, startedChild := range children {
+				if j < i {
+					startedChild.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+					startedChild.Unpause()
+					startedChild.WaitExited()
+				}
+				startedChild.Release()
+			}
+			return fail(fmt.Errorf("starting branch %q paused: %w", childBranches[i].id, err))
 		}
-		childTG := child.RootPIDNamespace().ThreadGroupWithID(sourceSession.info.PID)
-		if childTG == nil {
-			continue
-		}
-		info := cloneExecSessionInfo(sourceSession.info)
-		info.State = ExecSessionRunning
-		info.ExitStatus = nil
-		clonedExecSessions[id] = &execSession{info: info, tg: childTG}
-	}
-	f.mu.Unlock()
-	cleanupStartedChild := func(dog *watchdog.Watchdog) {
-		if dog != nil {
-			dog.Stop()
-		}
-		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
-		if child.IsPaused() {
-			child.Unpause()
-		}
-		child.WaitExited()
-		child.Release()
-	}
-	if err := f.injectForkFailure(SandboxForkStageChildStarted); err != nil {
-		cleanupStartedChild(nil)
-		resumeErr := resumeSource()
-		if resumeErr != nil {
-			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
-		}
-		return fail(err)
-	}
-	var childWatchdog *watchdog.Watchdog
-	if f.watchdogOpts != nil {
-		childWatchdog = watchdog.New(child, *f.watchdogOpts)
-		childWatchdog.Start()
-	}
-
-	f.mu.Lock()
-	childBranch.k = child
-	childBranch.watchdog = childWatchdog
-	childBranch.state = BranchPaused
-	childBranch.execSessions = clonedExecSessions
-	f.mu.Unlock()
-	if err := f.injectForkFailure(SandboxForkStageBranchReady); err != nil {
-		cleanupStartedChild(childWatchdog)
-		resumeErr := resumeSource()
-		if resumeErr != nil {
-			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
-		}
-		return fail(err)
-	}
-	for id, session := range clonedExecSessions {
-		f.watchExecSession(childBranch.id, id, session)
-	}
-	if !args.Paused {
-		childResumeStarted := time.Now()
-		child.Unpause()
-		if err := control.PostResume(child, nil); err != nil {
-			child.Pause()
-			cleanupStartedChild(childWatchdog)
-			_ = resumeSource()
-			return fail(fmt.Errorf("resuming branch %q: %w", args.ID, err))
-		}
-		metrics.ChildResume = time.Since(childResumeStarted)
+		metrics[i].ChildStart = time.Since(childStartStarted)
+		clonedExecSessions[i] = make(map[string]*execSession)
 		f.mu.Lock()
-		childBranch.state = kernelBranchState(child)
+		for id, sourceSession := range source.execSessions {
+			if sourceSession.info.State != ExecSessionRunning {
+				continue
+			}
+			childTG := child.RootPIDNamespace().ThreadGroupWithID(sourceSession.info.PID)
+			if childTG == nil {
+				continue
+			}
+			info := cloneExecSessionInfo(sourceSession.info)
+			info.State = ExecSessionRunning
+			info.ExitStatus = nil
+			clonedExecSessions[i][id] = &execSession{info: info, tg: childTG}
+		}
 		f.mu.Unlock()
 	}
+	cleanupStartedChildren := func(dogs []*watchdog.Watchdog) {
+		for i, child := range children {
+			if dogs != nil && dogs[i] != nil {
+				dogs[i].Stop()
+			}
+			child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			if child.IsPaused() {
+				child.Unpause()
+			}
+			child.WaitExited()
+			child.Release()
+		}
+	}
+	if err := f.injectForkFailure(SandboxForkStageChildStarted); err != nil {
+		cleanupStartedChildren(nil)
+		return fail(err)
+	}
+	childWatchdogs := make([]*watchdog.Watchdog, len(children))
+	if f.watchdogOpts != nil {
+		for i := range children {
+			childWatchdogs[i] = watchdog.New(children[i], *f.watchdogOpts)
+			childWatchdogs[i].Start()
+		}
+	}
+	f.mu.Lock()
+	for i, childBranch := range childBranches {
+		childBranch.k = children[i]
+		childBranch.watchdog = childWatchdogs[i]
+		childBranch.state = BranchPaused
+		childBranch.execSessions = clonedExecSessions[i]
+	}
+	f.mu.Unlock()
+	if err := f.injectForkFailure(SandboxForkStageBranchReady); err != nil {
+		cleanupStartedChildren(childWatchdogs)
+		return fail(err)
+	}
+	for i, sessions := range clonedExecSessions {
+		for id, session := range sessions {
+			f.watchExecSession(childBranches[i].id, id, session)
+		}
+	}
+	if !args.Paused {
+		for i, child := range children {
+			childResumeStarted := time.Now()
+			child.Unpause()
+			if err := control.PostResume(child, nil); err != nil {
+				child.Pause()
+				cleanupStartedChildren(childWatchdogs)
+				return fail(fmt.Errorf("resuming branch %q: %w", childBranches[i].id, err))
+			}
+			metrics[i].ChildResume = time.Since(childResumeStarted)
+			f.mu.Lock()
+			childBranches[i].state = kernelBranchState(child)
+			f.mu.Unlock()
+		}
+	}
 	if err := resumeSource(); err != nil {
-		cleanupStartedChild(childWatchdog)
+		cleanupStartedChildren(childWatchdogs)
 		return fail(fmt.Errorf("resuming source branch %q: %w", sourceID, err))
 	}
 
 	f.mu.Lock()
 	source.state = kernelBranchState(source.k)
-	metrics.Total = time.Since(forkStarted)
-	childBranch.metrics = metrics
-	info := BranchInfo{
-		ID:          childBranch.id,
-		ParentID:    childBranch.parentID,
-		State:       childBranch.state,
-		CreatedAt:   childBranch.createdAt,
-		ForkMetrics: metrics,
+	infos := make([]BranchInfo, len(childBranches))
+	total := time.Since(forkStarted)
+	for i, childBranch := range childBranches {
+		metrics[i].Total = total
+		childBranch.metrics = metrics[i]
+		infos[i] = BranchInfo{
+			ID:          childBranch.id,
+			ParentID:    childBranch.parentID,
+			State:       childBranch.state,
+			CreatedAt:   childBranch.createdAt,
+			ForkMetrics: metrics[i],
+		}
 	}
 	f.mu.Unlock()
-	return &info, nil
+	return infos, nil
 }
 
 // Pause pauses a branch.

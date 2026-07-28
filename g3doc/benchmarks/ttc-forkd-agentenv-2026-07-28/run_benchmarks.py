@@ -375,16 +375,20 @@ def bench_forkd_repeated(n: int = 6) -> None:
             pass
 
 
-def bench_ttc_fanout(n: int = 10) -> None:
-    out = OUT / "ttc-fanout.json"
-    tags = [f"bench-fanout-{i:02d}" for i in range(n)]
+def bench_ttc_fanout(n: int = 10, *, batch: bool = False) -> None:
+    out = OUT / ("ttc-batch-fanout.json" if batch else "ttc-fanout.json")
+    prefix = "bench-batch" if batch else "bench-fanout"
+    tags = [f"{prefix}-{i:02d}" for i in range(n)]
     info = ttc_inspect()
     sentry = int(info["State"]["Pid"])
     pss_before = pss_kib(sentry)
     start = time.perf_counter_ns()
     try:
-        for tag in tags:
-            run(TTC + ["fork", "ttc-bench", tag], env=TTC_ENV, timeout=30)
+        if batch:
+            run(TTC + ["fork", "ttc-bench", *tags], env=TTC_ENV, timeout=30)
+        else:
+            for tag in tags:
+                run(TTC + ["fork", "ttc-bench", tag], env=TTC_ENV, timeout=30)
         forked_ms = ms_since(start)
         for tag in tags:
             run(
@@ -398,9 +402,14 @@ def bench_ttc_fanout(n: int = 10) -> None:
             json.dumps(
                 {
                     "n": n,
+                    "batch": batch,
                     "forks_returned_ms": forked_ms,
                     "all_children_ready_ms": ready_ms,
                     "sum_source_downtime_ms": sum(
+                        m["source_downtime_ns"] for m in metas
+                    )
+                    / 1_000_000,
+                    "coordinated_source_downtime_ms": max(
                         m["source_downtime_ns"] for m in metas
                     )
                     / 1_000_000,

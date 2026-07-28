@@ -121,6 +121,14 @@ func (t *Task) SyscallTable() *SyscallTable {
 	return t.image.st
 }
 
+// TestOnlySetArchAndSyscallTable completes the minimal TaskImage constructed
+// by filesystem test helpers so that it can pass through state serialization.
+// Production task images are initialized by LoadTaskImage.
+func (t *Task) TestOnlySetArchAndSyscallTable(ac *arch.Context64, st *SyscallTable) {
+	t.image.Arch = ac
+	t.image.st = st
+}
+
 // Stack returns the userspace stack.
 //
 // Preconditions: The caller must be running on the task goroutine, or t.mu

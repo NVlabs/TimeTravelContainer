@@ -2116,6 +2116,16 @@ func (s *Sandbox) ForkBranch(args *boot.ForkBranchArgs) (boot.BranchInfo, error)
 	return info, nil
 }
 
+// ForkBranches creates sibling in-memory branches in one sandbox-family
+// operation.
+func (s *Sandbox) ForkBranches(args *boot.ForkBranchesArgs) ([]boot.BranchInfo, error) {
+	var infos []boot.BranchInfo
+	if err := s.call(boot.ContMgrForkBranches, args, &infos); err != nil {
+		return nil, fmt.Errorf("forking %d live branches: %w", len(args.IDs), err)
+	}
+	return infos, nil
+}
+
 // ListBranches lists all in-memory branches in the sandbox family.
 func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
 	var branches []boot.BranchInfo

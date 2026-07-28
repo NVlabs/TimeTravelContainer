@@ -48,6 +48,12 @@ const (
 	// live fork.
 	CtxLiveForkChildBranchID
 
+	// CtxLiveForkChildBranchIDs contains all destination branch IDs when a
+	// single metadata capture is used to create multiple sibling branches.
+	// Restore contexts continue to use CtxLiveForkChildBranchID to select the
+	// branch assigned to one child.
+	CtxLiveForkChildBranchIDs
+
 	// CtxLiveForkTransactions collects filesystem-side transactions that must
 	// commit only after the child kernel has been restored successfully.
 	CtxLiveForkTransactions
@@ -95,6 +101,19 @@ func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFiles
 func LiveForkChildBranchIDFromContext(ctx goContext.Context) string {
 	id, _ := ctx.Value(CtxLiveForkChildBranchID).(string)
 	return id
+}
+
+// LiveForkChildBranchIDsFromContext returns all destination live-fork
+// branches. A singular destination is returned as a one-element slice for
+// compatibility with callers that do not use the batch API.
+func LiveForkChildBranchIDsFromContext(ctx goContext.Context) []string {
+	if ids, ok := ctx.Value(CtxLiveForkChildBranchIDs).([]string); ok {
+		return ids
+	}
+	if id := LiveForkChildBranchIDFromContext(ctx); id != "" {
+		return []string{id}
+	}
+	return nil
 }
 
 // LiveForkTransaction is a filesystem-side mutation coupled to Kernel.LiveFork.

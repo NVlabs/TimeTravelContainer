@@ -18,9 +18,14 @@ import (
 	"errors"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
@@ -148,7 +153,25 @@ func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	}
 	parent.PipeMount().IncRef()
 	parent.SetHostMount(parent.PipeMount())
+	ctx := parent.SupervisorContext()
+	creds := auth.CredentialsFromContext(ctx)
+	mntns, err := parent.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{}, parent)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	root := mntns.Root(ctx)
+	if _, err := testutil.CreateTask(ctx, "init", parent.GlobalInit(), mntns, root, root); err != nil {
+		root.DecRef(ctx)
+		mntns.DecRef(ctx)
+		t.Fatalf("CreateTask: %v", err)
+	}
+	root.DecRef(ctx)
 	parentTask := parent.GlobalInit().Leader()
+	tables := kernel.SyscallTables()
+	if len(tables) == 0 {
+		t.Fatal("no syscall tables are registered")
+	}
+	parentTask.TestOnlySetArchAndSyscallTable(arch.New(tables[0].Arch), tables[0])
 	parentTID := parent.RootPIDNamespace().IDOfTask(parentTask)
 	pidfd, err := parentTask.PIDFDOpen(parentTID, false /* isThread */, false /* nonBlock */)
 	if err != nil {
@@ -161,7 +184,6 @@ func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	}
 	pidfd.DecRef(parentTask)
 	parent.Pause()
-
 	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
 		Clocks: sentrytime.NewCalibratedClocks(),
 	})

@@ -471,7 +471,9 @@ go_test(
     srcs = ["live_fork_test.go"],
     library = ":kernel",
     deps = [
+        "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
     ],
 )
@@ -486,8 +488,10 @@ go_test(
     args = ["--platform=systrap"],
     library = ":kernel",
     deps = [
+        "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/platform/systrap",
+        "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
     ],
 )

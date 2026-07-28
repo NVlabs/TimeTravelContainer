@@ -127,6 +127,11 @@ type MemoryManager struct {
 	// mm_struct::page_table_lock.
 	activeMu activeRWMutex `state:"nosave"`
 
+	// liveForkPMAKey identifies an in-memory PMA metadata snapshot while a live
+	// fork is being serialized. It is zero for durable checkpoint/restore.
+	// Placing it before pmas ensures it is available to loadPmas.
+	liveForkPMAKey uint64
+
 	// pmas stores platform mapping areas used to implement vmas. Since pmas
 	// are stored by value, clients should usually use pmaIterator.ValuePtr()
 	// instead of pmaIterator.Value() to get a pointer to the pma rather than
@@ -139,7 +144,7 @@ type MemoryManager struct {
 	// address, a vma must also exist for that address.
 	//
 	// pmas is protected by activeMu.
-	pmas pmaSet
+	pmas pmaSet `state:".(pmaSet)"`
 
 	// curRSS is pmas.Span(), cached to accelerate updates to maxRSS. It is
 	// reported as the MemoryManager's RSS.

@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -64,35 +65,81 @@ func (mm *MemoryManager) SetMmapLayout(ac *arch.Context64, r *limits.LimitSet) (
 //
 // Preconditions: Tasks using mm are externally stopped.
 func (mm *MemoryManager) PrepareLiveFork() {
+	mm.prepareLiveFork(0)
+}
+
+// LiveForkPMASnapshot is an immutable, in-memory representation of PMA
+// metadata. It excludes cached host mappings and retains no additional page
+// references; the primary child must be loaded before the source resumes.
+type LiveForkPMASnapshot struct {
+	entries []liveForkPMAEntry
+}
+
+type liveForkPMAEntry struct {
+	ar  hostarch.AddrRange
+	pma pma
+}
+
+// LiveForkPMASnapshots maps state-stream keys to PMA metadata snapshots.
+type LiveForkPMASnapshots map[uint64]*LiveForkPMASnapshot
+
+// PrepareLiveForkSnapshot establishes CoW and captures PMA metadata without
+// encoding every resident range through the generic state stream.
+func (mm *MemoryManager) PrepareLiveForkSnapshot(key uint64) *LiveForkPMASnapshot {
+	if key == 0 {
+		panic("live-fork PMA snapshot key must be nonzero")
+	}
+	return mm.prepareLiveFork(key)
+}
+
+func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
 	mm.AddressSpace().PreFork()
 	defer mm.AddressSpace().PostFork()
 
 	mm.activeMu.Lock()
 	defer mm.activeMu.Unlock()
 
+	var snapshot *LiveForkPMASnapshot
+	if key != 0 {
+		snapshot = &LiveForkPMASnapshot{}
+	}
 	var unmapAR hostarch.AddrRange
 	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
 		pma := pseg.ValuePtr()
-		if !pma.private || pma.needCOW {
-			continue
-		}
-		pma.needCOW = true
-		if pma.effectivePerms.Write {
-			if unmapAR.End == pseg.Start() {
-				unmapAR.End = pseg.End()
-			} else {
-				if unmapAR.Length() != 0 {
-					mm.unmapASLocked(unmapAR)
+		if pma.private && !pma.needCOW {
+			pma.needCOW = true
+			if pma.effectivePerms.Write {
+				if unmapAR.End == pseg.Start() {
+					unmapAR.End = pseg.End()
+				} else {
+					if unmapAR.Length() != 0 {
+						mm.unmapASLocked(unmapAR)
+					}
+					unmapAR = pseg.Range()
 				}
-				unmapAR = pseg.Range()
+				pma.effectivePerms.Write = false
 			}
-			pma.effectivePerms.Write = false
+			pma.maxPerms.Write = false
 		}
-		pma.maxPerms.Write = false
+		if snapshot != nil {
+			pmaCopy := *pma
+			pmaCopy.internalMappings = safemem.BlockSeq{}
+			snapshot.entries = append(snapshot.entries, liveForkPMAEntry{ar: pseg.Range(), pma: pmaCopy})
+		}
 	}
 	if unmapAR.Length() != 0 {
 		mm.unmapASLocked(unmapAR)
 	}
+	mm.liveForkPMAKey = key
+	return snapshot
+}
+
+// ClearLiveForkPMASnapshot restores normal state serialization after a live
+// fork metadata capture.
+func (mm *MemoryManager) ClearLiveForkPMASnapshot() {
+	mm.activeMu.Lock()
+	mm.liveForkPMAKey = 0
+	mm.activeMu.Unlock()
 }
 
 // Fork creates a copy of mm with 1 user, as for Linux syscalls fork() or
