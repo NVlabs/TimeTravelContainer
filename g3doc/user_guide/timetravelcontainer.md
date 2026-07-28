@@ -1,7 +1,7 @@
 # TimeTravelContainer user guide
 
-TimeTravelContainer (TTC) is an experimental, rootless container manager built on a
-modified gVisor `runsc`. In addition to Docker-like image and container
+TimeTravelContainer (TTC) is an experimental, rootless container manager built
+on a modified gVisor userspace kernel. In addition to Docker-like image and container
 commands, TTC can pause, resume, and live-fork a running container into
 multiple branches inside one Sentry process.
 
@@ -15,11 +15,11 @@ before depending on live-fork or credential-isolation behavior.
 
 ## What is installed
 
-TTC consists of three binaries:
+TTC consists of two binaries:
 
-* `runsc`, containing the TimeTravelContainer Sentry and live-fork implementation;
 * `ttc`, the user-facing command-line client; and
-* `ttcd`, the per-user manager service.
+* `ttcd`, the per-user manager service, userspace container runtime, Sentry,
+  and live-fork implementation.
 
 Start `ttcd` explicitly with `ttc daemon start` before ordinary commands.
 Docker, containerd, CRIU, KVM, and a containerd snapshotter are not required.
@@ -32,7 +32,7 @@ TTC builds and runs on Linux x86-64 and ARM64. Build with the Bazel version in
 the repository's `.bazelversion` file (currently 8.3.1).
 
 For a direct Debian or Ubuntu Bazel build, install the native and cross-build
-dependencies used by gVisor's canonical build image. In particular, `runsc`
+dependencies used by gVisor's canonical build image. In particular, `ttcd`
 requires Clang and the libbpf headers, while the generated VDSO and systrap
 objects require both amd64 and arm64 compiler components:
 
@@ -102,12 +102,12 @@ ttc --direct --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
 
 ## Compile
 
-The repository's Docker-based build wrapper can copy all three binaries in one
+The repository's Docker-based build wrapper can copy both binaries in one
 command:
 
 ```shell
 mkdir -p bin
-make copy TARGETS="runsc runsc/ttc runsc/ttcd" DESTINATION="$PWD/bin"
+make copy TARGETS="runsc/ttc runsc/ttcd" DESTINATION="$PWD/bin"
 ```
 
 This build path requires Docker only while compiling; Docker is not needed to
@@ -115,13 +115,12 @@ run TTC. To build directly on the host with Bazel, from the gVisor repository
 root run:
 
 ```shell
-bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 ```
 
 The binaries are written to:
 
 ```text
-bazel-bin/runsc/runsc_/runsc
 bazel-bin/runsc/ttc/ttc_/ttc
 bazel-bin/runsc/ttcd/ttcd_/ttcd
 ```
@@ -130,28 +129,20 @@ You can use them directly without installation:
 
 ```shell
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc"
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc"
-
-"$TTC" --runsc "$RUNSC" --help
+"$TTC" --help
 ```
-
-When `runsc` is not installed beside `ttc`, pass `--runsc` or set
-`TTC_RUNSC`.
 
 ## Optional per-user installation
 
-Keeping all three binaries together lets `ttc` find `runsc` and `ttcd`
-automatically:
+Keep `ttc` and `ttcd` together so the client can locate its service and
+embedded runtime automatically:
 
 ```shell
-mkdir -p "$HOME/.local/libexec/ttc" "$HOME/.local/bin"
-install -m 0755 bazel-bin/runsc/runsc_/runsc \
-  "$HOME/.local/libexec/ttc/runsc"
+mkdir -p "$HOME/.local/bin"
 install -m 0755 bazel-bin/runsc/ttc/ttc_/ttc \
-  "$HOME/.local/libexec/ttc/ttc"
+  "$HOME/.local/bin/ttc"
 install -m 0755 bazel-bin/runsc/ttcd/ttcd_/ttcd \
-  "$HOME/.local/libexec/ttc/ttcd"
-ln -sfn "$HOME/.local/libexec/ttc/ttc" "$HOME/.local/bin/ttc"
+  "$HOME/.local/bin/ttcd"
 ```
 
 Add `$HOME/.local/bin` to `PATH` if necessary, then verify the installation:
@@ -164,8 +155,7 @@ ttc daemon stop
 ```
 
 No privileged installation step is required. A system-wide installation may
-place the same three files together under `/usr/local/libexec/ttc` and link
-`ttc` into `/usr/local/bin`.
+place both files together under `/usr/local/bin`.
 
 ## State and runtime paths
 
@@ -181,7 +171,9 @@ $HOME/.local/share/ttc
 The first defined location wins. The native OCI content store is the
 `image-store` subdirectory of that data root.
 
-The default `runsc` root is `$XDG_RUNTIME_DIR/runsc`. Without
+`TTC_RUNTIME_DIR` may set one private base directory containing both the
+runtime state and daemon socket. Otherwise, the default runtime root is
+`$XDG_RUNTIME_DIR/runsc`. Without
 `XDG_RUNTIME_DIR`, TTC uses `/tmp/ttc-$UID/runsc`, alongside its per-user
 daemon socket. Both locations are writable only by the invoking user. Explicit
 paths remain available for independent installations or test runs:
@@ -200,7 +192,7 @@ each independent TTC installation or test run:
 
 ```shell
 export TTC_DATA_ROOT="$HOME/.local/share/ttc"
-export TTC_RUNSC="$HOME/.local/libexec/ttc/runsc"
+export TTC_RUNTIME_DIR="$HOME/.local/state/ttc/runtime"
 ```
 
 Do not point two incompatible TTC versions at the same live runtime root.
@@ -727,11 +719,11 @@ reuse, exec, logs, mounts, volumes, pause/resume, recursive fork, and daemon
 restart:
 
 ```shell
-bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 

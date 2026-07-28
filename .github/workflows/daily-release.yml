@@ -1,0 +1,109 @@
+name: Daily TTC release
+
+"on":
+  schedule:
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.detect.outputs.build }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: detect
+        name: Detect code changes made today
+        shell: bash
+        run: |
+          set -euo pipefail
+          day=$(date -u +%Y%m%d)
+          short=$(git rev-parse --short=10 HEAD)
+          tag="daily-${day}-${short}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="manual-${day}-${short}-${GITHUB_RUN_NUMBER}"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          changed=$(
+            git log --since="$(date -u +%Y-%m-%dT00:00:00Z)" \
+              --name-only --pretty=format: |
+              grep -E '(^|/)(BUILD|BUILD\.bazel)$|(^|/)(Makefile|MODULE\.bazel|WORKSPACE)$|\.(go|s|S|c|cc|h|proto|bzl)$' ||
+              true
+          )
+          if [[ -n "$changed" ]] && ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            bazel_options: ""
+            file_pattern: "x86-64"
+          - arch: arm64
+            bazel_options: "--config=aarch64"
+            file_pattern: "ARM aarch64"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file make
+      - name: Build linux/${{ matrix.arch }}
+        run: |
+          set -eux
+          mkdir -p "out/${{ matrix.arch }}"
+          make copy \
+            BAZEL_OPTIONS="${{ matrix.bazel_options }}" \
+            TARGETS="runsc/ttc runsc/ttcd" \
+            DESTINATION="$PWD/out/${{ matrix.arch }}"
+          file "out/${{ matrix.arch }}/ttc" "out/${{ matrix.arch }}/ttcd"
+          file "out/${{ matrix.arch }}/ttc" | grep -q "${{ matrix.file_pattern }}"
+          file "out/${{ matrix.arch }}/ttcd" | grep -q "statically linked"
+          mv "out/${{ matrix.arch }}/ttc" "out/ttc-linux-${{ matrix.arch }}"
+          mv "out/${{ matrix.arch }}/ttcd" "out/ttcd-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: out/*-linux-${{ matrix.arch }}
+
+  release:
+    needs: [changes, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+      - name: Publish latest release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd release
+          sha256sum ttc-linux-* ttcd-linux-* > SHA256SUMS
+          gh release create "${{ needs.changes.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --latest \
+            --title "TimeTravelContainer ${{ needs.changes.outputs.tag }}" \
+            --notes "Automated static Linux binaries for the latest TTC code changed on this UTC day." \
+            SHA256SUMS ttc-linux-* ttcd-linux-*
+        env:
+          GH_TOKEN: ${{ github.token }}

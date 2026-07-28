@@ -1,4 +1,4 @@
-name: CI
+name: TTC build
 
 "on":
   push:
@@ -23,13 +23,18 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v5
 
-    - name: build
+    - name: Build static TTC binaries
       run: |
-          mkdir -p bin
-          make copy TARGETS=runsc DESTINATION=bin/
+        mkdir -p bin
+        make copy TARGETS="runsc/ttc runsc/ttcd" DESTINATION="$PWD/bin"
+        file bin/ttc bin/ttcd
+        file bin/ttc | grep -q "statically linked"
+        file bin/ttcd | grep -q "statically linked"
 
-    - name: Upload runsc
+    - name: Upload TTC binaries
       uses: actions/upload-artifact@v4
       with:
-          name: runsc
-          path: bin/runsc
+        name: ttc-linux-amd64
+        path: |
+          bin/ttc
+          bin/ttcd

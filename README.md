@@ -248,6 +248,19 @@ Container process-count limits do not require host cgroup delegation.
 
 ## Build and install
 
+### Install the latest release
+
+On x86-64 or ARM64 Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gzz2000/TimeTravelOS/master/install.sh | sh
+```
+
+This installs the static `ttc` and `ttcd` binaries in `~/.local/bin`, creates
+the per-user data and runtime directories, and adds `~/.local/bin` to
+`~/.profile` when needed. Restart the shell after the first installation, or
+run `export PATH="$HOME/.local/bin:$PATH"` once in the current shell.
+
 ### Docker-based build
 
 Docker is needed only for this build method. It is not needed to run TTC.
@@ -256,25 +269,24 @@ From the repository root:
 
 ```sh
 mkdir -p bin
-make copy TARGETS="runsc runsc/ttc runsc/ttcd" \
+make copy TARGETS="runsc/ttc runsc/ttcd" \
   DESTINATION="$PWD/bin"
 ```
 
 This produces:
 
 ```text
-bin/runsc
 bin/ttc
 bin/ttcd
 ```
 
-Keep the three binaries together so `ttc` can find `runsc` and `ttcd`.
-You can run them directly from `bin`, add that directory to `PATH`, or install
-all three in a per-user directory:
+Keep the two binaries together. `ttcd` contains both the TTC control service
+and the userspace container runtime. You can run them directly from `bin`, add
+that directory to `PATH`, or install both in a per-user directory:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-install -m 0755 bin/runsc bin/ttc bin/ttcd "$HOME/.local/bin/"
+install -m 0755 bin/ttc bin/ttcd "$HOME/.local/bin/"
 ```
 
 ### Direct Bazel build
@@ -284,19 +296,18 @@ Install the native dependencies listed in
 from [`.bazelversion`](.bazelversion), and run:
 
 ```sh
-bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd
+bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 ```
 
 The binaries are written beneath `bazel-bin/runsc/`.
 
-No privileged system-wide installation is required. `TTC_RUNSC` can point to
-`runsc` when the binaries are installed in different locations. See the
-[complete user guide](g3doc/user_guide/timetravelcontainer.md) for native
-build dependencies and installation layouts.
+No privileged system-wide installation is required. See the [complete user
+guide](g3doc/user_guide/timetravelcontainer.md) for native build dependencies
+and installation layouts.
 
 ## Quick start
 
-The following examples assume the three binaries are available in `PATH`.
+The following examples assume `ttc` and `ttcd` are available in `PATH`.
 Prefix commands with `./bin/` if you are running directly from a build.
 
 Start the per-user daemon:
