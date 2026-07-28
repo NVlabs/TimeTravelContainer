@@ -39,6 +39,7 @@ func TestConnectionStatScopesVirtualOwnership(t *testing.T) {
 	manifest := ownership.NewManifest()
 	manifest.Entries["."] = ownership.Owner{}
 	manifest.Entries["file"] = ownership.Owner{UID: 1234, GID: 5678}
+	manifest.Xattrs["file"] = map[string][]byte{"security.capability": []byte("virtual-cap")}
 	virtual := &connectionImpl{config: &Config{VirtualOwners: manifest}}
 	got, err := virtual.stat(hostFD, "file")
 	if err != nil {
@@ -64,5 +65,14 @@ func TestConnectionStatScopesVirtualOwnership(t *testing.T) {
 	}
 	if unscoped.UID != raw.UID || unscoped.GID != raw.GID {
 		t.Fatalf("host-bind owner=%d:%d, want host %d:%d", unscoped.UID, unscoped.GID, raw.UID, raw.GID)
+	}
+	if value, ok := virtual.virtualXattr("file", "security.capability"); !ok || string(value) != "virtual-cap" {
+		t.Fatalf("virtual xattr=%q, ok=%t", value, ok)
+	}
+	if names := virtual.virtualXattrNames("file"); len(names) != 1 || names[0] != "security.capability" {
+		t.Fatalf("virtual xattr names=%v", names)
+	}
+	if _, ok := hostBind.virtualXattr("file", "security.capability"); ok {
+		t.Fatal("host bind unexpectedly received image virtual xattr")
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -127,6 +128,20 @@ func (i *connectionImpl) stat(hostFD int, virtualPath string) (lisafs.Statx, err
 		stat.GID = owner.GID
 	}
 	return stat, nil
+}
+
+func (i *connectionImpl) virtualXattr(virtualPath, name string) ([]byte, bool) {
+	if i == nil || i.config == nil {
+		return nil, false
+	}
+	return i.config.VirtualOwners.LookupXattr(virtualPath, name)
+}
+
+func (i *connectionImpl) virtualXattrNames(virtualPath string) []string {
+	if i == nil || i.config == nil {
+		return nil
+	}
+	return i.config.VirtualOwners.ListXattrs(virtualPath)
 }
 
 // Mount implements lisafs.ConnectionImpl.Mount.
@@ -1050,6 +1065,18 @@ func (fd *controlFDLisa) Renamed() {
 
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
+	impl := fd.Conn().Impl().(*connectionImpl)
+	if value, ok := impl.virtualXattr(fd.virtualPath, name); ok {
+		if len(value) > linux.XATTR_SIZE_MAX || len(value) > math.MaxUint16 {
+			return 0, unix.E2BIG
+		}
+		if size != 0 && uint32(len(value)) > size {
+			return 0, unix.ERANGE
+		}
+		data := getValueBuf(uint32(len(value)))
+		copy(data, value)
+		return uint16(len(value)), nil
+	}
 	// getxattr(2) called with size 0 should return the attribute size. As a
 	// result, we need to return the entire attribute here so that the sentry
 	// can return the correct value.
@@ -1095,15 +1122,18 @@ var listXattrBufPool = sync.Pool{
 
 // ListXattr implements lisafs.ControlFDImpl.ListXattr.
 func (fd *controlFDLisa) ListXattr(size uint64) (lisafs.StringArray, error) {
+	impl := fd.Conn().Impl().(*connectionImpl)
+	virtualNames := impl.virtualXattrNames(fd.virtualPath)
 	// listxattr(2) called with size 0 should return the list size. As a result,
 	// we need to return the entire list here so that the sentry can return the
 	// correct value.
-	if size > linux.XATTR_LIST_MAX || size == 0 {
-		size = linux.XATTR_LIST_MAX
+	hostSize := size
+	if hostSize > linux.XATTR_LIST_MAX || hostSize == 0 || len(virtualNames) != 0 {
+		hostSize = linux.XATTR_LIST_MAX
 	}
 	bPtr := listXattrBufPool.Get().(*[]byte)
 	defer listXattrBufPool.Put(bPtr)
-	data := (*bPtr)[:size]
+	data := (*bPtr)[:hostSize]
 	sz, err := fd.listXattr(data)
 	if err != nil {
 		return nil, err
@@ -1117,6 +1147,30 @@ func (fd *controlFDLisa) ListXattr(size uint64) (lisafs.StringArray, error) {
 		}
 		names = append(names, string(data[:i]))
 		data = data[i+1:]
+	}
+	if len(virtualNames) != 0 {
+		seen := make(map[string]struct{}, len(names)+len(virtualNames))
+		for _, name := range names {
+			seen[name] = struct{}{}
+		}
+		for _, name := range virtualNames {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		var required uint64
+		for _, name := range names {
+			required += uint64(len(name) + 1)
+		}
+		if required > linux.XATTR_LIST_MAX {
+			return nil, unix.E2BIG
+		}
+		if size != 0 && required > size {
+			return nil, unix.ERANGE
+		}
 	}
 	return names, nil
 }

@@ -1126,7 +1126,7 @@ func seedManagedVolume(repository *ttcvolume.Repository, rootfs, destination str
 	root.AtimeNsec = rootInfo.ModTime().UnixNano()
 	root.MtimeNsec = rootInfo.ModTime().UnixNano()
 	root.CtimeNsec = rootInfo.ModTime().UnixNano()
-	root.Xattrs, err = readImageXattrs(sourceRoot)
+	root.Xattrs, err = readImageXattrs(sourceRoot, manifest, filepath.ToSlash(relativeDestination))
 	if err != nil {
 		return err
 	}
@@ -1220,7 +1220,7 @@ func seedManagedVolume(repository *ttcvolume.Repository, rootfs, destination str
 		inode.AtimeNsec = info.ModTime().UnixNano()
 		inode.MtimeNsec = info.ModTime().UnixNano()
 		inode.CtimeNsec = info.ModTime().UnixNano()
-		inode.Xattrs, err = readImageXattrs(hostPath)
+		inode.Xattrs, err = readImageXattrs(hostPath, manifest, filepath.ToSlash(imageRelative))
 		if err != nil {
 			return err
 		}
@@ -1232,37 +1232,45 @@ func seedManagedVolume(repository *ttcvolume.Repository, rootfs, destination str
 	return repository.SyncMetadata()
 }
 
-func readImageXattrs(name string) (map[string]string, error) {
+func readImageXattrs(name string, manifest *ownership.Manifest, virtualPath string) (map[string]string, error) {
 	size, err := unix.Llistxattr(name, nil)
 	if err != nil {
-		if errors.Is(err, unix.ENOTSUP) {
-			return nil, nil
+		if !errors.Is(err, unix.ENOTSUP) {
+			return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
 		}
-		return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
-	}
-	if size == 0 {
-		return nil, nil
-	}
-	names := make([]byte, size)
-	size, err = unix.Llistxattr(name, names)
-	if err != nil {
-		return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
+		size = 0
 	}
 	result := make(map[string]string)
-	for _, attribute := range strings.Split(string(names[:size]), "\x00") {
-		if attribute == "" {
-			continue
-		}
-		valueSize, err := unix.Lgetxattr(name, attribute, nil)
+	if size != 0 {
+		names := make([]byte, size)
+		size, err = unix.Llistxattr(name, names)
 		if err != nil {
-			return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+			return nil, fmt.Errorf("listing xattrs for %q: %w", name, err)
 		}
-		value := make([]byte, valueSize)
-		valueSize, err = unix.Lgetxattr(name, attribute, value)
-		if err != nil {
-			return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+		for _, attribute := range strings.Split(string(names[:size]), "\x00") {
+			if attribute == "" {
+				continue
+			}
+			valueSize, err := unix.Lgetxattr(name, attribute, nil)
+			if err != nil {
+				return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+			}
+			value := make([]byte, valueSize)
+			valueSize, err = unix.Lgetxattr(name, attribute, value)
+			if err != nil {
+				return nil, fmt.Errorf("reading xattr %q for %q: %w", attribute, name, err)
+			}
+			result[attribute] = string(value[:valueSize])
 		}
-		result[attribute] = string(value[:valueSize])
+	}
+	for _, attribute := range manifest.ListXattrs(virtualPath) {
+		value, ok := manifest.LookupXattr(virtualPath, attribute)
+		if ok {
+			result[attribute] = string(value)
+		}
+	}
+	if len(result) == 0 {
+		return nil, nil
 	}
 	return result, nil
 }
@@ -1803,7 +1811,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 			continue
 		}
 		path := filepath.Join(imagesDir, entry.Name())
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeImageRoot(path); err != nil {
 			return removed, fmt.Errorf("removing image root %q: %w", path, err)
 		}
 		removed++
@@ -1976,7 +1984,7 @@ func selectStoredImage(stored []images.Info, reference, platform string) (images
 	return images.Info{}, false, nil
 }
 
-func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (images.RootFSInfo, string, error) {
+func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (_ images.RootFSInfo, _ string, retErr error) {
 	imagesDir := filepath.Join(s.Root, "images")
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating image cache: %w", err)
@@ -1987,6 +1995,9 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	}
 	key := imageRootKey(pulled.Digest, selectedPlatform)
 	finalDir := filepath.Join(imagesDir, key)
+	if err := removeStaleImageRootTemps(imagesDir, key); err != nil {
+		return images.RootFSInfo{}, "", fmt.Errorf("cleaning stale image roots: %w", err)
+	}
 	if info, err := loadImageRoot(finalDir); err == nil {
 		return info, filepath.Join(finalDir, "rootfs"), nil
 	}
@@ -1994,7 +2005,15 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 	if err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating temporary image root: %w", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := removeImageRoot(tempDir); err != nil {
+			if retErr == nil {
+				retErr = fmt.Errorf("cleaning temporary image root: %w", err)
+			} else {
+				retErr = fmt.Errorf("%w (also cleaning temporary image root: %v)", retErr, err)
+			}
+		}
+	}()
 	rootfs := filepath.Join(tempDir, "rootfs")
 	info, err := images.MaterializeRootFS(ctx, images.RootFSOptions{
 		StoreRoot: s.Root,
@@ -2019,6 +2038,46 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 		return images.RootFSInfo{}, "", fmt.Errorf("publishing image root: %w", err)
 	}
 	return info, filepath.Join(finalDir, "rootfs"), nil
+}
+
+func removeStaleImageRootTemps(imagesDir, key string) error {
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		return err
+	}
+	prefix := key + ".tmp-"
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		if err := removeImageRoot(filepath.Join(imagesDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeImageRoot(root string) error {
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		return os.Chmod(path, info.Mode()|0700)
+	})
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(root)
 }
 
 // EnsureImageRoot materializes the selected immutable image root if it is not

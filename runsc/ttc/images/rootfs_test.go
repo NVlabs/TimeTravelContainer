@@ -19,11 +19,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
@@ -35,6 +37,7 @@ type tarEntry struct {
 	gid      int
 	typeflag byte
 	linkname string
+	xattrs   map[string]string
 }
 
 func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
@@ -63,6 +66,89 @@ func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "etc/remove")); !os.IsNotExist(err) {
 		t.Errorf("whiteouted file stat error=%v, want not-exist", err)
+	}
+}
+
+func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
+	root := t.TempDir()
+	t.Cleanup(func() {
+		// testing.TempDir cleanup is intentionally unprivileged too.
+		_ = os.Chmod(filepath.Join(root, "root"), 0700)
+		_ = os.Chmod(filepath.Join(root, "lower"), 0700)
+	})
+	base := makeLayer(t, false, []tarEntry{
+		{name: "root/", mode: 0550},
+		{name: "root/.bash_logout", body: "logout", mode: 0644},
+		{name: "lower/", mode: 0500},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(base)); err != nil {
+		t.Fatalf("applying restrictive base layer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "root", ".bash_logout")); err != nil || string(got) != "logout" {
+		t.Fatalf("reading file created after restrictive directory: got %q, err %v", got, err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "root")); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Mode().Perm(), os.FileMode(0550); got != want {
+		t.Fatalf("root mode=%#o, want %#o", got, want)
+	}
+
+	upper := makeLayer(t, false, []tarEntry{
+		{name: "lower/from-upper", body: "upper", mode: 0644},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(upper)); err != nil {
+		t.Fatalf("applying into restrictive directory from an earlier layer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "lower", "from-upper")); err != nil || string(got) != "upper" {
+		t.Fatalf("reading upper-layer file: got %q, err %v", got, err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "lower")); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Mode().Perm(), os.FileMode(0500); got != want {
+		t.Fatalf("lower mode=%#o, want %#o", got, want)
+	}
+}
+
+func TestApplyLayerVirtualizesPrivilegedXattrs(t *testing.T) {
+	root := t.TempDir()
+	owners := newOwnershipState()
+	layer := makeLayer(t, false, []tarEntry{
+		{
+			name:   "usr/bin/newgidmap",
+			body:   "binary",
+			mode:   0755,
+			xattrs: map[string]string{"security.capability": "capability-data"},
+		},
+		{
+			name:   "replace",
+			body:   "file",
+			mode:   0644,
+			xattrs: map[string]string{"security.capability": "removed-capability"},
+		},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(layer), owners); err != nil {
+		t.Fatalf("applying layer with privileged xattr: %v", err)
+	}
+	replacement := makeLayer(t, false, []tarEntry{
+		{name: "replace/", mode: 0755},
+		{name: "replace/child", body: "child", mode: 0644},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(replacement), owners); err != nil {
+		t.Fatalf("replacing capable file with a directory: %v", err)
+	}
+	manifest, err := owners.finalize(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, ok := manifest.LookupXattr("usr/bin/newgidmap", "security.capability")
+	if !ok || string(value) != "capability-data" {
+		t.Fatalf("virtual capability=%q, ok=%t", value, ok)
+	}
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !errors.Is(err, unix.ENODATA) {
+		t.Fatalf("physical security.capability unexpectedly exists: %v", err)
+	}
+	if _, ok := manifest.LookupXattr("replace", "security.capability"); ok {
+		t.Fatal("replacement directory retained the replaced file's capability")
 	}
 }
 
@@ -177,6 +263,12 @@ func makeLayer(t *testing.T, compressed bool, entries []tarEntry) []byte {
 			size = int64(len(entry.body))
 		}
 		header := &tar.Header{Name: entry.name, Mode: entry.mode, Size: size, Typeflag: typeflag, Uid: entry.uid, Gid: entry.gid, Linkname: entry.linkname}
+		if len(entry.xattrs) != 0 {
+			header.PAXRecords = make(map[string]string, len(entry.xattrs))
+			for name, value := range entry.xattrs {
+				header.PAXRecords["SCHILY.xattr."+name] = value
+			}
+		}
 		if err := writer.WriteHeader(header); err != nil {
 			t.Fatal(err)
 		}

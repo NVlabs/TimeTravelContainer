@@ -62,6 +62,8 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	manifest.Entries["var/lib/app/nested/payload"] = ownership.Owner{UID: 12, GID: 22}
 	manifest.Entries["var/lib/app/hardlink"] = ownership.Owner{UID: 12, GID: 22}
 	manifest.Entries["var/lib/app/symlink"] = ownership.Owner{UID: 13, GID: 23}
+	manifest.Xattrs["var/lib/app/nested/payload"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
+	manifest.Xattrs["var/lib/app/hardlink"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
 
 	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
 	if err != nil {
@@ -114,6 +116,9 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	}
 	if value, ok := inode.Xattrs["user.ttc-seed"]; ok && value != "xattr-data" {
 		t.Fatalf("payload xattr = %q, want xattr-data", value)
+	}
+	if value := inode.Xattrs["security.capability"]; value != "virtual-capability" {
+		t.Fatalf("payload virtual capability = %q, want virtual-capability", value)
 	}
 	link, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "symlink")
 	if err != nil {
@@ -1193,6 +1198,35 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	legacyManifest.Entries["."] = ownership.Owner{}
 	if err := ownership.Write(ownership.ManifestPath(filepath.Join(legacy, "rootfs")), legacyManifest); err != nil {
 		t.Fatal(err)
+	}
+	for _, dir := range []string{amd64, arm64, legacy} {
+		restricted := filepath.Join(dir, "rootfs", "restricted")
+		if err := os.Mkdir(restricted, 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(restricted, "payload"), []byte("x"), 0440); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(restricted, 0550); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stale := filepath.Join(root, "images", imageRootKey(digest, "linux/amd64")+".tmp-stale")
+	staleRestricted := filepath.Join(stale, "rootfs", "restricted")
+	if err := os.MkdirAll(staleRestricted, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staleRestricted, "payload"), []byte("x"), 0440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(staleRestricted, 0550); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStaleImageRootTemps(filepath.Join(root, "images"), imageRootKey(digest, "linux/amd64")); err != nil {
+		t.Fatalf("removeStaleImageRootTemps: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale restrictive image root still exists: %v", err)
 	}
 
 	for _, platform := range []string{"linux/amd64", "linux/arm64/v8"} {

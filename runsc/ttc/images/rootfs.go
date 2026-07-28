@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -199,19 +200,131 @@ func applyLayerWithOwnership(ctx context.Context, root string, compressed io.Rea
 		return fmt.Errorf("decompressing layer: %w", err)
 	}
 	defer stream.Close()
-	options := []archive.ApplyOpt{archive.WithNoSameOwner()}
-	if owners != nil {
-		options = append(options, archive.WithFilter(owners.record))
+
+	// OCI directory modes describe the completed layer, not permissions that
+	// should prevent extraction of later entries. A privileged extractor can
+	// traverse and write through modes such as 0550 using CAP_DAC_OVERRIDE,
+	// but TTC's rootless extractor cannot. Temporarily grant the invoking user
+	// access to existing and newly declared directories, then restore the
+	// image's exact modes after the complete layer has been applied.
+	directoryModes := make(layerDirectoryModes)
+	if err := directoryModes.relaxExisting(root); err != nil {
+		return fmt.Errorf("preparing layer directories: %w", err)
 	}
-	if _, err := archive.Apply(ctx, root, stream, options...); err != nil {
-		return fmt.Errorf("extracting layer: %w", err)
+	filter := func(header *tar.Header) (bool, error) {
+		if owners != nil {
+			accepted, err := owners.record(header)
+			if err != nil || !accepted {
+				return accepted, err
+			}
+		}
+		return directoryModes.record(header)
+	}
+	_, applyErr := archive.Apply(ctx, root, stream, archive.WithNoSameOwner(), archive.WithFilter(filter))
+	restoreErr := directoryModes.restore(root)
+	if applyErr != nil {
+		if restoreErr != nil {
+			return fmt.Errorf("extracting layer: %w (also restoring directory modes: %v)", applyErr, restoreErr)
+		}
+		return fmt.Errorf("extracting layer: %w", applyErr)
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("restoring layer directory modes: %w", restoreErr)
+	}
+	return nil
+}
+
+type layerDirectoryModes map[string]os.FileMode
+
+func (m layerDirectoryModes) relaxExisting(root string) (retErr error) {
+	err := filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		m[relative] = info.Mode()
+		if info.Mode().Perm()&0700 == 0700 {
+			return nil
+		}
+		return os.Chmod(current, info.Mode()|0700)
+	})
+	if err == nil {
+		return nil
+	}
+	if restoreErr := m.restore(root); restoreErr != nil {
+		return fmt.Errorf("%w (also rolling back directory modes: %v)", err, restoreErr)
+	}
+	return err
+}
+
+func (m layerDirectoryModes) record(header *tar.Header) (bool, error) {
+	if header.Typeflag != tar.TypeDir {
+		return true, nil
+	}
+	relative, err := ownership.CleanPath(header.Name)
+	if err != nil {
+		return false, err
+	}
+	m[relative] = header.FileInfo().Mode()
+	header.Mode |= 0700
+	return true, nil
+}
+
+func (m layerDirectoryModes) restore(root string) error {
+	paths := make([]string, 0, len(m))
+	for relative := range m {
+		paths = append(paths, relative)
+	}
+	// Restore children before parents so a final non-searchable parent cannot
+	// prevent restoration of entries beneath it.
+	depth := func(relative string) int {
+		if relative == "." {
+			return 0
+		}
+		return strings.Count(relative, "/") + 1
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		iDepth := depth(paths[i])
+		jDepth := depth(paths[j])
+		if iDepth != jDepth {
+			return iDepth > jDepth
+		}
+		return paths[i] < paths[j]
+	})
+	for _, relative := range paths {
+		current := filepath.Join(root, filepath.FromSlash(relative))
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			continue
+		}
+		if err := os.Chmod(current, m[relative]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 type ownershipRecord struct {
-	owner    ownership.Owner
-	sequence uint64
+	owner         ownership.Owner
+	virtualXattrs map[string][]byte
+	sequence      uint64
 }
 
 type ownershipState struct {
@@ -255,15 +368,21 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 	if header.Uid < 0 || uint64(header.Uid) > math.MaxUint32 || header.Gid < 0 || uint64(header.Gid) > math.MaxUint32 {
 		return false, fmt.Errorf("image path %q has invalid owner %d:%d", header.Name, header.Uid, header.Gid)
 	}
+	virtualXattrs := takeVirtualXattrs(header)
 	s.sequence++
 	record := ownershipRecord{
-		owner:    ownership.Owner{UID: uint32(header.Uid), GID: uint32(header.Gid)},
-		sequence: s.sequence,
+		owner:         ownership.Owner{UID: uint32(header.Uid), GID: uint32(header.Gid)},
+		virtualXattrs: virtualXattrs,
+		sequence:      s.sequence,
 	}
 	switch header.Typeflag {
 	case tar.TypeDir:
 		// A directory header merges with an existing directory, but replaces a
 		// non-directory at the same path. Either way it is not a hardlink.
+		_, replacesNonDirectory := s.groups[rel]
+		if previous, ok := s.entries[rel]; ok && !replacesNonDirectory {
+			record.virtualXattrs = mergeVirtualXattrs(previous.virtualXattrs, virtualXattrs)
+		}
 		delete(s.groups, rel)
 		s.entries[rel] = record
 	case tar.TypeLink:
@@ -271,6 +390,9 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 		target, err := ownership.CleanPath(header.Linkname)
 		if err != nil {
 			return false, fmt.Errorf("invalid hardlink target for %q: %w", header.Name, err)
+		}
+		if targetRecord, ok := s.entries[target]; ok {
+			record.virtualXattrs = mergeVirtualXattrs(targetRecord.virtualXattrs, virtualXattrs)
 		}
 		group, ok := s.groups[target]
 		if !ok {
@@ -294,6 +416,41 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 		s.entries[rel] = record
 	}
 	return true, nil
+}
+
+func takeVirtualXattrs(header *tar.Header) map[string][]byte {
+	var virtual map[string][]byte
+	for key, value := range header.PAXRecords {
+		if !strings.HasPrefix(key, "SCHILY.xattr.") {
+			continue
+		}
+		attribute := strings.TrimPrefix(key, "SCHILY.xattr.")
+		if !strings.HasPrefix(attribute, "security.") && !strings.HasPrefix(attribute, "trusted.") {
+			continue
+		}
+		if virtual == nil {
+			virtual = make(map[string][]byte)
+		}
+		virtual[attribute] = []byte(value)
+		// These namespaces require host privileges. The immutable-image gofer
+		// serves the value from TTC's metadata manifest instead.
+		delete(header.PAXRecords, key)
+	}
+	return virtual
+}
+
+func mergeVirtualXattrs(base, updates map[string][]byte) map[string][]byte {
+	if len(base) == 0 && len(updates) == 0 {
+		return nil
+	}
+	merged := make(map[string][]byte, len(base)+len(updates))
+	for name, value := range base {
+		merged[name] = append([]byte(nil), value...)
+	}
+	for name, value := range updates {
+		merged[name] = append([]byte(nil), value...)
+	}
+	return merged
 }
 
 func (s *ownershipState) deleteSubtree(rel string) {
@@ -350,6 +507,9 @@ func (s *ownershipState) finalize(root string) (*ownership.Manifest, error) {
 			record = ownershipRecord{owner: ownership.Owner{}}
 		}
 		manifest.Entries[rel] = record.owner
+		if len(record.virtualXattrs) != 0 {
+			manifest.Xattrs[rel] = mergeVirtualXattrs(nil, record.virtualXattrs)
+		}
 
 		info, err := entry.Info()
 		if err != nil {
@@ -378,6 +538,11 @@ func (s *ownershipState) finalize(root string) (*ownership.Manifest, error) {
 	for _, group := range inodes {
 		for _, rel := range group.paths {
 			manifest.Entries[rel] = group.winner.owner
+			if len(group.winner.virtualXattrs) != 0 {
+				manifest.Xattrs[rel] = mergeVirtualXattrs(nil, group.winner.virtualXattrs)
+			} else {
+				delete(manifest.Xattrs, rel)
+			}
 		}
 	}
 	return manifest, nil

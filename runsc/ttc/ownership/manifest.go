@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -53,16 +54,22 @@ type Owner struct {
 	GID uint32 `json:"gid"`
 }
 
-// Manifest maps clean root-relative paths to guest-visible owners. The root
-// directory is represented by ".".
+// Manifest maps clean root-relative paths to guest-visible metadata that an
+// unprivileged host cannot represent directly. The root directory is
+// represented by ".".
 type Manifest struct {
-	Version int              `json:"version"`
-	Entries map[string]Owner `json:"entries"`
+	Version int                          `json:"version"`
+	Entries map[string]Owner             `json:"entries"`
+	Xattrs  map[string]map[string][]byte `json:"xattrs,omitempty"`
 }
 
 // NewManifest returns an empty manifest using the current format version.
 func NewManifest() *Manifest {
-	return &Manifest{Version: currentVersion, Entries: make(map[string]Owner)}
+	return &Manifest{
+		Version: currentVersion,
+		Entries: make(map[string]Owner),
+		Xattrs:  make(map[string]map[string][]byte),
+	}
 }
 
 // ManifestPath returns the metadata path associated with rootfs.
@@ -95,6 +102,41 @@ func (m *Manifest) Lookup(name string) (Owner, bool) {
 	}
 	owner, ok := m.Entries[clean]
 	return owner, ok
+}
+
+// LookupXattr returns a copy of a virtual extended attribute.
+func (m *Manifest) LookupXattr(name, attribute string) ([]byte, bool) {
+	if m == nil {
+		return nil, false
+	}
+	clean, err := CleanPath(name)
+	if err != nil {
+		return nil, false
+	}
+	attributes := m.Xattrs[clean]
+	value, ok := attributes[attribute]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), value...), true
+}
+
+// ListXattrs returns the virtual extended-attribute names for name.
+func (m *Manifest) ListXattrs(name string) []string {
+	if m == nil {
+		return nil
+	}
+	clean, err := CleanPath(name)
+	if err != nil {
+		return nil
+	}
+	attributes := m.Xattrs[clean]
+	result := make([]string, 0, len(attributes))
+	for attribute := range attributes {
+		result = append(result, attribute)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // Read loads and validates a manifest.
@@ -131,6 +173,23 @@ func ReadFrom(name string, r io.Reader) (*Manifest, error) {
 		}
 		if clean != entry {
 			return nil, fmt.Errorf("ownership manifest %q contains non-canonical path %q", name, entry)
+		}
+	}
+	for entry, attributes := range manifest.Xattrs {
+		clean, err := CleanPath(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ownership manifest %q xattrs: %w", name, err)
+		}
+		if clean != entry {
+			return nil, fmt.Errorf("ownership manifest %q contains non-canonical xattr path %q", name, entry)
+		}
+		if _, ok := manifest.Entries[entry]; !ok {
+			return nil, fmt.Errorf("ownership manifest %q contains xattrs for unknown path %q", name, entry)
+		}
+		for attribute := range attributes {
+			if attribute == "" || len(attribute) > 255 || strings.ContainsRune(attribute, 0) {
+				return nil, fmt.Errorf("ownership manifest %q contains invalid xattr name %q", name, attribute)
+			}
 		}
 	}
 	if _, ok := manifest.Entries["."]; !ok {

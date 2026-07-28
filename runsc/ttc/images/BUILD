@@ -41,5 +41,6 @@ go_test(
     deps = [
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
