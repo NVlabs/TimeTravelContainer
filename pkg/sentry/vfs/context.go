@@ -57,6 +57,12 @@ const (
 	// CtxLiveForkTransactions collects filesystem-side transactions that must
 	// commit only after the child kernel has been restored successfully.
 	CtxLiveForkTransactions
+
+	// CtxLiveForkBranchesPrepared indicates that persistent destination
+	// branches were created by an earlier stage of the same batch fork.
+	// Filesystems must still prepare their in-memory state for CoW, but must
+	// not create the branches again.
+	CtxLiveForkBranchesPrepared
 )
 
 // RestoreFilesystemResource associates an implementation-specific resource
@@ -158,6 +164,13 @@ func (ts *LiveForkTransactions) Abort() error {
 func LiveForkTransactionsFromContext(ctx goContext.Context) *LiveForkTransactions {
 	transactions, _ := ctx.Value(CtxLiveForkTransactions).(*LiveForkTransactions)
 	return transactions
+}
+
+// LiveForkBranchesPreparedFromContext reports whether persistent destination
+// branches have already been created for this batch fork.
+func LiveForkBranchesPreparedFromContext(ctx goContext.Context) bool {
+	prepared, _ := ctx.Value(CtxLiveForkBranchesPrepared).(bool)
+	return prepared
 }
 
 // RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used

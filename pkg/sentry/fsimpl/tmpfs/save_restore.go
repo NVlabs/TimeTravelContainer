@@ -74,7 +74,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			file.prepareLiveFork()
 		}
 		fs.liveForkMu.Unlock()
-		if fs.diskVolume != nil {
+		if fs.diskVolume != nil && !vfs.LiveForkBranchesPreparedFromContext(ctx) {
 			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
 			if resources == nil {
 				return fmt.Errorf("CtxLiveForkFilesystemResources was not provided for TTC volume")
