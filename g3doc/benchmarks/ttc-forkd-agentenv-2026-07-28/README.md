@@ -180,3 +180,21 @@ from the headline comparison. TTC keeps guest pages in gVisor-managed shmem
 and forkd shares file/memfd pages among Firecracker and the controller, so
 per-process PSS does not attribute the same underlying memory in comparable
 ways.
+
+## Cleanup issue found after measurement
+
+The post-benchmark `ttc rm -f ttc-bench` stopped both the runsc sandbox and
+gofer processes, but then waited for 120 seconds and failed with:
+
+```text
+waiting sandbox "...": sandbox is still running: exit status 128
+```
+
+The durable mutation record completed with status 1 and retained the container
+metadata. After the daemon exited, documented recovery mode
+`ttc --direct rm -f ttc-bench` removed that stale family immediately. This did
+not affect benchmark samples because it happened after all measurements, but
+it is a real lifecycle/reconciliation bug. TTC should treat confirmed sandbox
+process death as authoritative during forced removal and clear stale runsc
+state without waiting for the full stop timeout. The raw durable request is in
+`ttc-cleanup-failure.json`.
