@@ -64,8 +64,9 @@ type LiveForkOptions struct {
 	Metrics *LiveForkMetrics
 
 	// batchChildBranchIDs and batchFilesystemResources are used by
-	// LiveForkMany to prepare all sibling filesystem branches. They are
-	// deliberately not exported: callers should use LiveForkMany.
+	// LiveForkMany to prepare its primary filesystem branch and retain the
+	// resources needed for post-resume sibling branching. They are deliberately
+	// not exported: callers should use LiveForkMany.
 	batchChildBranchIDs      []string
 	batchFilesystemResources vfs.LiveForkFilesystemResources
 }
@@ -472,9 +473,8 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 				child.Release()
 			}
 		}
-		// LiveFork committed all sibling filesystem transactions before
-		// returning the primary child. No child has been started yet, so it is
-		// safe to discard their published branch pointers on batch failure.
+		// No child has been started yet, so it is safe to discard all
+		// filesystem branch pointers published by either batch phase.
 		for _, resource := range fsResources {
 			remover, ok := resource.(interface{ RemoveBranch(string) error })
 			if !ok {
@@ -556,8 +556,8 @@ func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, p
 
 // captureLiveForkMetadata prepares paused child k as an additional live-fork
 // source and serializes its metadata in memory. Persistent filesystem branches
-// were transactionally created by the original source fork, so this pass only
-// establishes CoW for in-memory filesystem data.
+// were created before this pass, so it only establishes CoW for in-memory
+// filesystem data.
 func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResources) ([]byte, mm.LiveForkPMASnapshots, error) {
 	if !k.IsPaused() {
 		return nil, nil, fmt.Errorf("capturing live-fork metadata requires a paused kernel")
