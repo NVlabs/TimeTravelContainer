@@ -18,6 +18,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gvisor.dev/gvisor/runsc/cli/maincli"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
@@ -25,7 +26,7 @@ import (
 )
 
 func main() {
-	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || filepath.Base(os.Args[0]) == "runsc"
+	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true
 		os.Args = append([]string{"ttcd-runsc"}, os.Args[2:]...)
@@ -48,4 +49,11 @@ func main() {
 		return
 	}
 	os.Exit(cmd.RunDaemon(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func embeddedRuntimeArgv0(argv0 string) bool {
+	base := filepath.Base(argv0)
+	return base == "runsc" ||
+		strings.HasPrefix(base, "runsc-") ||
+		strings.HasPrefix(base, "ttc-sentry[")
 }
