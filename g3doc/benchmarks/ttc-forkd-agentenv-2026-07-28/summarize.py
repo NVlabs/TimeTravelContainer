@@ -38,6 +38,8 @@ def stats(data: list[dict], field: str) -> dict:
 
 def main() -> None:
     ttc = rows("ttc-single.jsonl")
+    ttc_optimized = rows("ttc-optimized-single.jsonl")
+    ttc_batch = rows("ttc-optimized-batch-fanout.jsonl")
     forkd = rows("forkd-single.jsonl")
     repeated = rows("forkd-repeated-source.jsonl")
     summary = {
@@ -50,6 +52,25 @@ def main() -> None:
                 "source_downtime_ms",
                 "kernel_fork_ms",
                 "rootfs_alloc_delta_bytes",
+            )
+        },
+        "ttc_optimized_single": {
+            field: stats(ttc_optimized, field)
+            for field in (
+                "fork_return_ms",
+                "child_ready_ms",
+                "fork_total_ms_internal",
+                "source_downtime_ms",
+                "kernel_fork_ms",
+                "rootfs_alloc_delta_bytes",
+            )
+        },
+        "ttc_optimized_batch_fanout": {
+            field: stats(ttc_batch, field)
+            for field in (
+                "forks_returned_ms",
+                "all_children_ready_ms",
+                "coordinated_source_downtime_ms",
             )
         },
         "forkd_single": {

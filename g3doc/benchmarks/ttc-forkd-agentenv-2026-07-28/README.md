@@ -40,22 +40,48 @@ Thus:
 
 ## Ten-child fan-out
 
-| Measurement | TTC | forkd |
-|---|---:|---:|
-| Children | 10 | 10 |
-| Fork/spawn calls returned | 635.55 ms | 60.19 ms |
-| All children probed | 798.68 ms | 130.73 ms |
-| Preparation included | No separate snapshot | No; used a previously completed snapshot |
+TTC was subsequently extended with `ttc fork SOURCE CHILD1 CHILD2 ...`.
+It freezes the source once, creates a paused primary child, resumes the source,
+and then captures reusable metadata and creates the remaining persistent
+rootfs branches from that frozen primary.
+
+| Measurement | TTC, sequential baseline | TTC, coordinated batch | forkd |
+|---|---:|---:|---:|
+| Children | 10 | 10 | 10 |
+| Source downtime | 331.68 ms summed over 10 freezes | 31.26 ms, one freeze | 2 ms during prior snapshot |
+| Fork/spawn calls returned | 635.55 ms | 255.49 ms | 60.19 ms |
+| All children probed | 798.68 ms | 445.12 ms | 130.73 ms |
+| Preparation included | No separate snapshot | No separate snapshot | No; used a previously completed snapshot |
+| Trials | 1 | 5 | 1 |
 
 These are deliberately reported separately from the single live-fork result.
-TTC performed ten sequential live forks through ten CLI/daemon requests.
-forkd restored ten microVMs in parallel from one already-materialized memory
-snapshot. Producing that forkd snapshot took another 1,294.69 ms and paused
-its source for 2 ms.
+The coordinated TTC path reduced API return time by 59.8%, child-probe time by
+44.3%, and application downtime by 90.6% relative to the original sequential
+TTC fan-out. The five TTC batch figures above are medians. Its children include
+independent persistent reflink-CoW rootfs branches.
 
-forkd therefore has a strong prepared-template fan-out path. TTC has the
-stronger one-shot live-branch path, but currently lacks a batch API that can
-amortize CLI/RPC overhead and coordinate sibling creation.
+forkd restored ten microVMs in parallel from one already-materialized memory
+snapshot. Producing that snapshot took another 1,294.69 ms and paused its
+source for 2 ms. forkd therefore remains substantially faster once a template
+has been prepared, but that preparation and its 1 GiB memory artifact are not
+included in its fan-out timing.
+
+## Follow-up memory-metadata result
+
+The TTC follow-up also replaced generic per-PMA state encoding with immutable
+in-memory PMA snapshots and direct range-reference acquisition by children.
+This is the intended lazy/refcounted metadata path: application pages remain
+in the shared MemoryFile and are never copied or written to a checkpoint.
+
+For this workload, however, ordinary single-fork source downtime was
+32.41 ms p50 after the change versus 32.30 ms in the baseline. The difference
+is noise, not an improvement. A densely populated 512 MiB anonymous mapping is
+represented by compact PMA extents rather than one metadata object per 4 KiB
+page, so the baseline inference that populated-page metadata dominated the
+32 ms pause was incorrect. The remaining single-fork cost is in validation,
+filesystem preparation, whole-kernel metadata save/load, and child restore;
+the next profiling pass should expose those existing `LiveForkMetrics`
+components through the benchmark output before optimizing further.
 
 ## AgentENV result
 
@@ -108,8 +134,11 @@ It could not reach its template-ready state on this kernel.
   `noatime`. The loop image itself resided on the outer Docker overlay.
 * KSM: disabled.
 * Huge pages: none reserved.
-* TTC: source commit `dc14e0885920ebd54b05b56d628c3561c8e49052`,
-  rootless isolated daemon, reflink volume mode.
+* TTC baseline: source commit
+  `dc14e0885920ebd54b05b56d628c3561c8e49052`, rootless isolated daemon,
+  reflink volume mode.
+* TTC optimized follow-up: source commit
+  `32a872c5f`, using the same daemon, image, workload, and storage.
 * forkd: release v0.5.3; source comparison commit
   `b5c2d7c1f8f8f00b2c5c2e693d30137c427e4147`.
 * AgentENV: release v0.1.0; source comparison commit
@@ -139,19 +168,20 @@ operations. The benchmark binary adds only:
 The patches are included beside the raw results. They restore the branch's
 documented live-fork path; they do not optimize its measured implementation.
 
-## TTC priorities suggested by the data
+## TTC conclusions and next priorities
 
 1. Preserve the product message around semantics: TTC creates a runnable,
    in-memory, rootless whole-container branch with a forked filesystem. Compare
    `request -> runnable isolated child`, not just API acknowledgement.
-2. Reduce source downtime. The 512 MiB result strongly suggests that current
-   memory-manager cloning still performs work proportional to populated
-   mappings/pages while the source is stopped. Hierarchical, refcounted,
-   lazily cloned mapping metadata is the most important performance direction.
-3. Add a batch sibling interface, for example
-   `ttc fork SOURCE CHILD1 CHILD2 ...` or `--count N`. One daemon request and
-   one coordinated freeze would remove repeated client/RPC costs and make the
-   prepared fan-out comparison much stronger.
+2. The coordinated sibling interface is now implemented as
+   `ttc fork SOURCE CHILD1 CHILD2 ...`. It amortizes CLI/RPC and source-freeze
+   work and moves reusable metadata capture plus sibling rootfs branching
+   after source resume.
+3. The PMA snapshot fast path is now implemented, but it did not reduce the
+   single-fork median for this compact-mapping workload. Measure validation,
+   filesystem preparation, metadata save/load, and child restore separately
+   across VMA- and FD-heavy cases before choosing the next critical-path
+   optimization.
 4. Keep the internal `fork_total_ns`, `source_downtime_ns`, and
    `kernel_fork_ns` metrics. Expose them in a machine-readable benchmark mode
    so results do not require `ttc inspect`.
@@ -165,6 +195,8 @@ Raw samples and scripts are in this directory:
 * `run_benchmarks.py` runs the matched workload;
 * `summarize.py` computes interpolated p50/p90/p95 values;
 * `ttc-single.jsonl` and `forkd-single.jsonl` contain every trial;
+* `ttc-optimized-single.jsonl` contains the 20 post-change single-fork trials;
+* `ttc-optimized-batch-fanout.jsonl` contains five coordinated fan-out trials;
 * `forkd-repeated-source.jsonl` records six branches from one source;
 * `ttc-fanout.json` and `forkd-fanout.json` contain the fan-out trials; and
 * `patches/firecracker/` contains the Firecracker build repairs.
@@ -198,3 +230,10 @@ it is a real lifecycle/reconciliation bug. TTC should treat confirmed sandbox
 process death as authoritative during forced removal and clear stale runsc
 state without waiting for the full stop timeout. The raw durable request is in
 `ttc-cleanup-failure.json`.
+
+The optimized follow-up reproduced a second form after a clean daemon
+shutdown: direct forced removal blocked in `runsc delete --force` despite no
+live sandbox or gofer processes. The hung cleanup commands were terminated and
+the four confirmed benchmark-only container directories were removed
+manually. Installed tools, pulled image data, and raw benchmark results were
+retained.
