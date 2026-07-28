@@ -1,5 +1,9 @@
 # TimeTravelContainer
 
+<p align="center">
+  <img src="assets/ttc-logo.png" alt="TimeTravelContainer logo" width="180">
+</p>
+
 TimeTravelContainer (TTC) is a lightweight, rootless Linux container manager
 that can **fork an entire running container** into independent branches.
 
@@ -21,20 +25,43 @@ demo@main
 
 ## Why TimeTravelContainer?
 
-Many tests begin with the same expensive setup: boot an application, load its
-data, establish internal services, and wait until everything is ready.
-Ordinary container tools repeat that setup for every test. TTC can perform it
-once and branch the initialized container:
+Containers are usually treated as disposable machines: when a workload needs
+another possible future, it starts another container and repeats everything
+that led to the present. TTC makes the present itself forkable.
 
 1. Start an unmodified Docker or OCI image.
-2. Initialize the application and its data.
-3. Fork the running container.
-4. Run a different test or mutation in each branch.
-5. Inspect or discard the branches independently.
+2. Initialize its applications, tools, services, and data once.
+3. Fork the whole running environment at the decision point.
+4. Explore a different action, test, or mutation in each branch.
+5. Keep the useful outcomes and discard the rest.
 
-This is useful for integration testing, state-space exploration, fault
-injection, interactive debugging, and workloads that need many variations of
-the same live starting state.
+This model is particularly useful for agentic AI. A coding agent may spend
+minutes cloning a repository, installing dependencies, indexing source,
+starting databases, and building a project before it can attempt a change.
+With TTC, that warmed environment can become the root of a branch tree:
+
+- **Parallel coding agents:** give multiple agents the same live workspace and
+  let each try a different implementation without repeating setup or sharing
+  writes.
+- **Speculative tool use:** fork immediately before an uncertain shell command,
+  package upgrade, migration, or configuration change; retain the successful
+  future and discard destructive attempts.
+- **Search and planning:** map tree-search nodes to container branches so an
+  agent can explore several action sequences from an identical process and
+  filesystem state.
+- **Fast rollback:** preserve useful milestones during a long-running task and
+  return to them without reconstructing the environment or replaying every
+  preceding action.
+- **Agent evaluation:** start candidate agents or policies from the same exact
+  prepared state, reducing setup variance and making trajectories easier to
+  compare.
+- **Reusable warm environments:** branch initialized browsers, language
+  servers, databases, test fixtures, and model-serving processes instead of
+  paying their startup cost for every attempt.
+
+The same primitive accelerates integration testing, state-space exploration,
+fault injection, fuzzing, interactive debugging, and any workflow that needs
+many independent variations of one live starting state.
 
 At the instant of a fork, guest-visible details such as process IDs, threads,
 open-file offsets, clocks, signals, and internal connections are preserved in
