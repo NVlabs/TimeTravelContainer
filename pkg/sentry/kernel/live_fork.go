@@ -458,7 +458,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 
 	fsResources := make(vfs.LiveForkFilesystemResources)
 	primaryOpts := opts[0]
-	primaryOpts.batchChildBranchIDs = ids
+	primaryOpts.batchChildBranchIDs = ids[:1]
 	primaryOpts.batchFilesystemResources = fsResources
 	primary, err := k.LiveFork(ctx, primaryOpts)
 	if err != nil {
@@ -490,6 +490,10 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 			cleanup()
 			return nil, fmt.Errorf("making live-fork source ready: %w", err)
 		}
+	}
+	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:]); err != nil {
+		cleanup()
+		return nil, err
 	}
 	serialized, pmaSnapshots, err := primary.captureLiveForkMetadata(fsResources)
 	if err != nil {
@@ -530,6 +534,24 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 		}
 	}
 	return children, nil
+}
+
+// forkPreparedFilesystemBranches creates remaining persistent siblings from
+// the paused primary child. Its metadata root is the exact root captured from
+// the original source, but this work no longer contributes to source downtime.
+func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, primary string, siblings []string) error {
+	for resourceID, resource := range resources {
+		brancher, ok := resource.(vfs.LiveForkBranchingResource)
+		if !ok {
+			continue
+		}
+		for _, sibling := range siblings {
+			if err := brancher.Fork(primary, sibling); err != nil {
+				return fmt.Errorf("forking prepared filesystem resource %q from %q as %q: %w", resourceID, primary, sibling, err)
+			}
+		}
+	}
+	return nil
 }
 
 // captureLiveForkMetadata prepares paused child k as an additional live-fork

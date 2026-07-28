@@ -97,6 +97,14 @@ func MountNamespaceFromContext(ctx goContext.Context) *MountNamespace {
 // specific resources borrowed by an in-process clone.
 type LiveForkFilesystemResources map[checkpoint.ResourceID]any
 
+// LiveForkBranchingResource is a persistent filesystem resource whose
+// immutable metadata root can be forked after the original source resumes.
+// The new source branch belongs to a paused primary child.
+type LiveForkBranchingResource interface {
+	Fork(source, child string) error
+	RemoveBranch(branch string) error
+}
+
 // LiveForkFilesystemResourcesFromContext returns live-fork resources, or nil.
 func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFilesystemResources {
 	resources, _ := ctx.Value(CtxLiveForkFilesystemResources).(LiveForkFilesystemResources)
