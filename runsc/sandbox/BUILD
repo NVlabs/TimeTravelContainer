@@ -11,6 +11,7 @@ go_library(
         "network.go",
         "network_unsafe.go",
         "no_xdp.go",
+        "process_state.go",
         "sandbox.go",
         "xdp.go",
     ],
@@ -72,11 +73,14 @@ go_test(
     size = "small",
     srcs = [
         "network_test.go",
+        "process_state_test.go",
     ],
     library = ":sandbox",
     deps = [
         "//runsc/boot",
         "//runsc/config",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],

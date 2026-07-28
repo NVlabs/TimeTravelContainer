@@ -17,10 +17,35 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 
+	"gvisor.dev/gvisor/runsc/cli/maincli"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
 func main() {
+	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || filepath.Base(os.Args[0]) == "runsc"
+	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
+		runscMode = true
+		os.Args = append([]string{"ttcd-runsc"}, os.Args[2:]...)
+	}
+	if runscMode {
+		// runsc re-executes /proc/self/exe for sandbox helpers. The marker makes
+		// those children return to the embedded runtime instead of starting the
+		// TTC control daemon.
+		_ = os.Setenv("TTC_EMBEDDED_RUNTIME", "1")
+		if filepath.Base(os.Args[0]) != "ttcd-runsc" {
+			os.Args[0] = "ttcd-runsc"
+		}
+		maincli.Main()
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		// Keep this useful for both users and the historical //runsc:version_test
+		// alias. The embedded runtime reports the same linked version.
+		os.Stdout.WriteString("ttcd version " + version.Version() + "\n")
+		return
+	}
 	os.Exit(cmd.RunDaemon(os.Args[1:], os.Stdout, os.Stderr))
 }

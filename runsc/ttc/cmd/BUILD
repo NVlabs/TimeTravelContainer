@@ -7,7 +7,7 @@ package(
 
 go_library(
     name = "cmd",
-    srcs = ["checkpoint.go", "cmd.go", "completion.go", "cp.go", "daemon.go", "daemon_requests.go", "daemon_stdin_lease.go", "daemon_terminal.go", "events.go", "idempotency.go"],
+    srcs = ["checkpoint.go", "cmd.go", "completion.go", "cp.go", "daemon.go", "daemon_requests.go", "daemon_stdin_lease.go", "daemon_terminal.go", "events.go", "idempotency.go", "runtime_command.go"],
     visibility = ["//runsc/ttc:__subpackages__", "//runsc/ttcd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
@@ -29,7 +29,7 @@ go_library(
 go_test(
     name = "cmd_test",
     size = "small",
-    srcs = ["cmd_test.go", "cp_test.go", "daemon_test.go", "daemon_terminal_test.go", "events_test.go", "idempotency_test.go"],
+    srcs = ["cmd_test.go", "cp_test.go", "daemon_test.go", "daemon_terminal_test.go", "events_test.go", "idempotency_test.go", "runtime_command_test.go"],
     library = ":cmd",
     deps = [
         "//pkg/ttcvolume",

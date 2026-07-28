@@ -340,6 +340,9 @@ func TestBuildSpecCombinesImageAndOverrides(t *testing.T) {
 	if got, want := spec.Annotations[ImmutableHostMountsAnnotation], `["/mnt/fixture"]`; got != want {
 		t.Errorf("immutable host mounts annotation=%q, want %q", got, want)
 	}
+	if got, want := spec.Annotations[specutils.ContainerdContainerNameAnnotation], "demo"; got != want {
+		t.Errorf("container name annotation=%q, want %q", got, want)
+	}
 
 	if !spec.Root.Readonly {
 		t.Error("root filesystem is writable")

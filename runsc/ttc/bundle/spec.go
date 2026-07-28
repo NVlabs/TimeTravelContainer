@@ -644,11 +644,12 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	}
 	annotations := map[string]string{
-		"dev.gvisor.spec.rootfs.source":            rootfs,
-		"dev.gvisor.spec.rootfs.type":              "bind",
-		"dev.gvisor.spec.rootfs.overlay":           "memory",
-		"dev.timetravelcontainer.internal-console": "init",
-		"dev.timetravelcontainer.config.network":   networkMode,
+		"dev.gvisor.spec.rootfs.source":             rootfs,
+		"dev.gvisor.spec.rootfs.type":               "bind",
+		"dev.gvisor.spec.rootfs.overlay":            "memory",
+		"dev.timetravelcontainer.internal-console":  "init",
+		"dev.timetravelcontainer.config.network":    networkMode,
+		specutils.ContainerdContainerNameAnnotation: opts.Name,
 	}
 	var resources *specs.LinuxResources
 	if opts.PidsLimit != nil && *opts.PidsLimit > 0 {

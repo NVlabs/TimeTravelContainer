@@ -1336,7 +1336,7 @@ func (c *Container) waitForStopped() error {
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
-		if err := unix.Kill(goferPid, 0); err == nil {
+		if sandbox.IsProcessRunning(goferPid) {
 			return fmt.Errorf("gofer is still running")
 		}
 		c.GoferPid.Store(0)

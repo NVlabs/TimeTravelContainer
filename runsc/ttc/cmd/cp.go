@@ -362,7 +362,7 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 	}
 	args = append(args, resolved.container, "ttc", copyHelperArg)
 	args = append(args, helperArgs...)
-	command := exec.Command(b.runsc, args...)
+	command := runscCommand(b.runsc, args...)
 	command.ExtraFiles = []*os.File{helper}
 	command.Stdout = output
 	command.Stderr = b.stderr
@@ -514,7 +514,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	defer helper.Close()
 	args := b.configuredRunscArgsForNetwork("none")
 	args = append(args, "run", "--bundle", bundleDir, "--exec-fd", "3", runtimeID)
-	command := exec.Command(b.runsc, args...)
+	command := runscCommand(b.runsc, args...)
 	command.ExtraFiles = []*os.File{helper}
 	command.Stdout = output
 	command.Stderr = b.stderr

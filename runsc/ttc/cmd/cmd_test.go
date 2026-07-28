@@ -2438,6 +2438,11 @@ func TestVerifyCgroupV2Resources(t *testing.T) {
 }
 
 func TestRuntimeRootIsWritableByDefault(t *testing.T) {
+	t.Setenv("TTC_RUNTIME_DIR", "/var/run/ttc-test")
+	if got, want := runtimeRoot(), "/var/run/ttc-test/runsc"; got != want {
+		t.Fatalf("runtimeRoot with TTC_RUNTIME_DIR=%q, want %q", got, want)
+	}
+	t.Setenv("TTC_RUNTIME_DIR", "")
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/test")
 	if got, want := runtimeRoot(), "/run/user/test/runsc"; got != want {
 		t.Fatalf("runtimeRoot with XDG_RUNTIME_DIR=%q, want %q", got, want)

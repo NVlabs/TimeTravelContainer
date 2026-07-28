@@ -13,6 +13,7 @@ go_library(
     visibility = [
         "//:__pkg__",
         "//runsc:__pkg__",
+        "//runsc/ttcd:__pkg__",
     ],
     deps = [
         "//runsc/cli",

@@ -230,6 +230,9 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 }
 
 func runtimeRoot() string {
+	if dir := os.Getenv("TTC_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "runsc")
+	}
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "runsc")
 	}
@@ -245,12 +248,12 @@ func runscPath() string {
 		return path
 	}
 	if executable, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(executable), "runsc")
+		sibling := filepath.Join(filepath.Dir(executable), "ttcd")
 		if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
 			return sibling
 		}
 	}
-	return "runsc"
+	return "ttcd"
 }
 
 func currentExecutable() string {
@@ -5252,7 +5255,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	if request.processPath == "" {
 		args = append(args, request.args...)
 	}
-	command := exec.Command(b.runsc, args...)
+	command := runscCommand(b.runsc, args...)
 	var closeCommandStdin func()
 	if !request.detach && (request.interactive || request.terminal) {
 		closeCommandStdin, err = setCommandStdin(command, b.stdin)
@@ -6154,7 +6157,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		commandArgs = append(commandArgs, "--exec-id", execID)
 	}
 	commandArgs = append(commandArgs, target.container, "console-follow", target.branch)
-	command := exec.Command(b.runsc, commandArgs...)
+	command := runscCommand(b.runsc, commandArgs...)
 	command.Stderr = errorFile
 	// The inherited duplicate keeps the advisory lock held for exactly the
 	// lifetime of the drainer, preventing multiple consumers of one pipe.
@@ -6880,7 +6883,7 @@ func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args 
 	defer os.Remove(stderrName)
 	defer stderr.Close()
 
-	command := exec.Command(b.runsc, args...)
+	command := runscCommand(b.runsc, args...)
 	// Use real files rather than the caller streams. The sandbox may inherit
 	// these descriptors after runsc exits; an os/exec copy pipe would keep
 	// `ttc run --detach` command substitutions and redirected callers open.
@@ -7140,7 +7143,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
 	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	args = append(args, "port-forward", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
-	command := exec.Command(b.runsc, args...)
+	command := runscCommand(b.runsc, args...)
 	command.Stdout = errorFile
 	command.Stderr = errorFile
 	command.ExtraFiles = []*os.File{lockFile, readyWriter}
@@ -7420,7 +7423,7 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 	global := []string{"--root", b.root}
-	command := exec.Command(b.runsc, append(global, args...)...)
+	command := runscCommand(b.runsc, append(global, args...)...)
 	var stderr strings.Builder
 	command.Stderr = &stderr
 	output, err := command.Output()

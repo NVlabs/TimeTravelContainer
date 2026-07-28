@@ -459,3 +459,10 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		t.Fatal("daemon did not stop")
 	}
 }
+
+func TestDefaultDaemonSocketHonorsTTCRuntimeDir(t *testing.T) {
+	t.Setenv("TTC_RUNTIME_DIR", "/var/run/ttc-test")
+	if got, want := defaultDaemonSocket(), "/var/run/ttc-test/ttcd.sock"; got != want {
+		t.Fatalf("defaultDaemonSocket() = %q, want %q", got, want)
+	}
+}

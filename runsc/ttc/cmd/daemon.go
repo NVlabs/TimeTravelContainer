@@ -201,6 +201,9 @@ func (w daemonFrameWriter) Write(data []byte) (int, error) {
 }
 
 func defaultDaemonSocket() string {
+	if dir := os.Getenv("TTC_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "ttcd.sock")
+	}
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "ttc", "ttcd.sock")
 	}

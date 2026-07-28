@@ -950,9 +950,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		Setsid: true,
 	}
 
-	// Set Args[0] to make easier to spot the sandbox process. Otherwise it's
-	// shown as `exe`.
-	cmd.Args[0] = "runsc-sandbox"
+	// A Sentry hosts the entire TTC sandbox family, not one host process per
+	// guest PID. Give its host-visible command line the stable family name.
+	cmd.Args[0] = sandboxProcessArgv0(args.Spec, s.ID)
 
 	// Transfer FDs that need to be present before the "boot" command.
 	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
@@ -2365,9 +2365,7 @@ func (s *Sandbox) IsRunning() bool {
 	if pid == 0 {
 		return false
 	}
-	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
-	// process is running.
-	return unix.Kill(pid, 0) == nil
+	return IsProcessRunning(pid)
 }
 
 // Stacks collects and returns all stacks for the sandbox.
