@@ -162,7 +162,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 
@@ -171,7 +171,7 @@ No-userns example:
 ```shell
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 Use `TTC_E2E_ROOT` to retain the generated TTC state for inspection. Image
@@ -196,7 +196,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_cp
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_cp.sh"
 ```
 
@@ -238,7 +238,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
 
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
@@ -257,7 +257,7 @@ unmodified image. It never changes the host daemon configuration.
 ```shell
 bazel build //runsc:runsc //runsc/ttc/test:e2e_docker_main
 
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_docker_main.sh"
 ```
 
@@ -286,7 +286,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc \
   //runsc/ttc/test:e2e_local_registry
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/runsc_/runsc" \
+RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/registry_fixture_/registry_fixture" \
 FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_/guest" \
   "$PWD/runsc/ttc/test/e2e_local_registry.sh"

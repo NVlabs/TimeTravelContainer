@@ -116,7 +116,7 @@ else
 RUNTIME     ?= $(BRANCH_NAME)
 endif
 RUNTIME_DIR     ?= $(shell dirname $(shell mktemp -u))/$(RUNTIME)
-RUNSC_TARGET    ?= //runsc
+RUNSC_TARGET    ?= //runsc/ttcd
 RUNTIME_BIN     ?= $(RUNTIME_DIR)/runsc
 RUNTIME_LOG_DIR ?= $(RUNTIME_DIR)/logs
 RUNTIME_LOGS    ?= $(RUNTIME_LOG_DIR)/runsc.log.%TEST%.%TIMESTAMP%.%COMMAND%
@@ -203,25 +203,9 @@ PARTITION        ?= 1
 TOTAL_PARTITIONS ?= 1
 PARTITIONS       := --test_env=PARTITION=$(PARTITION) --test_env=TOTAL_PARTITIONS=$(TOTAL_PARTITIONS)
 
-runsc: ## Builds the runsc binary.
-	@$(call build,-c opt //runsc)
-.PHONY: runsc
-
 ttc: ## Builds the TimeTravelContainer client and service/runtime binaries.
 	@$(call build,-c opt //runsc/ttc //runsc/ttcd)
 .PHONY: ttc
-
-runsc-plugin-stack:
-	@$(call build,-c opt $(PLUGIN_STACK_FLAGS) //runsc:runsc-plugin-stack)
-.PHONY: runsc-plugin-stack
-
-smoke-tests: ## Runs a simple smoke test after building runsc.
-	@$(call run,//runsc,--alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true)
-.PHONY: smoke-tests
-
-smoke-race-tests: ## Runs a smoke test after build building runsc in race configuration.
-	@$(call run,$(RACE_FLAGS) //runsc:runsc-race,--alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true)
-.PHONY: smoke-race-tests
 
 nogo-tests:
 	@$(call test,--test_tag_filters=nogo //:all pkg/... tools/...)
@@ -398,12 +382,6 @@ docker-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME)-cgroupv2,--mount-cgroup-v2) # Used by TestSystemd*.
 	@$(call test_runtime_cached,$(RUNTIME),$(INTEGRATION_TARGETS) --test_env=TEST_SAVE_RESTORE_NETSTACK=true //test/e2e:integration_runtime_test //test/e2e:runtime_in_docker_test)
 .PHONY: docker-tests
-
-plugin-network-tests: integration-test-images $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME)-dpdk,--network=plugin)
-	@$(call test_runtime_cached,$(RUNTIME)-dpdk, --test_arg=-test.run=ConnectToSelf $(INTEGRATION_TARGETS))
-
-plugin-network-tests: RUNSC_TARGET=--config plugin-tldk //runsc:runsc-plugin-stack
 
 overlay-tests: integration-test-images $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME)-overlay,--overlay2=all:dir=/tmp)
