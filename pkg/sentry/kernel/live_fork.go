@@ -441,7 +441,9 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 		}
 	}
 	if len(opts) == 1 {
-		child, err := k.LiveFork(ctx, opts[0])
+		singleOpts := opts[0]
+		singleOpts.batchChildBranchIDs = ids
+		child, err := k.LiveFork(ctx, singleOpts)
 		if err != nil {
 			return nil, err
 		}
