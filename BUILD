@@ -2,7 +2,6 @@ load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
-load("//website:defs.bzl", "doc")
 
 package(
     default_applicable_licenses = [":license"],
@@ -11,14 +10,13 @@ package(
 
 license(
     name = "license",
-    package_name = "gvisor",
+    package_name = "TimeTravelContainer",
 )
 
 exports_files([
     "LICENSE",
     "README.md",
     "SECURITY.md",
-    "GOVERNANCE.md",
 ])
 
 nogo_config(
@@ -27,44 +25,6 @@ nogo_config(
     visibility = [
         "//visibility:public",
     ],
-)
-
-doc(
-    name = "contributing",
-    src = "CONTRIBUTING.md",
-    category = "Project",
-    permalink = "/contributing/",
-    visibility = ["//website:__pkg__"],
-    weight = "20",
-)
-
-doc(
-    name = "security",
-    src = "SECURITY.md",
-    category = "Project",
-    permalink = "/security/",
-    visibility = ["//website:__pkg__"],
-    weight = "30",
-)
-
-doc(
-    name = "governance",
-    src = "GOVERNANCE.md",
-    category = "Project",
-    permalink = "/community/governance/",
-    subcategory = "Community",
-    visibility = ["//website:__pkg__"],
-    weight = "20",
-)
-
-doc(
-    name = "code_of_conduct",
-    src = "CODE_OF_CONDUCT.md",
-    category = "Project",
-    permalink = "/community/code_of_conduct/",
-    subcategory = "Community",
-    visibility = ["//website:__pkg__"],
-    weight = "99",
 )
 
 yaml_test(
@@ -77,18 +37,6 @@ yaml_test(
     name = "github_workflows_test",
     srcs = glob([".github/workflows/*.yml"]),
     schema = "@github_workflow_schema//file",
-)
-
-filegroup(
-    name = "buildkite_pipelines",
-    srcs = glob([".buildkite/*.yaml"]),
-    visibility = ["//:sandbox"],
-)
-
-yaml_test(
-    name = "buildkite_pipelines_test",
-    srcs = glob([".buildkite/*.yaml"]),
-    schema = "@buildkite_pipeline_schema//file",
 )
 
 # The sandbox filegroup is used for sandbox-internal dependencies.
@@ -139,8 +87,6 @@ go_path(
         # binaries have been factored into a cli package, which is
         # a good practice in any case.
         "//runsc/cli/maincli",
-        "//shim/v1/cli",
-        "//webhook/pkg/cli",
         "//tools/checklocks",
 
         # Packages that are not dependencies of the above.

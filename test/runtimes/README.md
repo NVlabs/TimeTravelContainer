@@ -88,13 +88,12 @@ To bump the version of an existing runtime test:
 2.  Update [`runtime_test`](BUILD) target. The `name` field must be the
     directory name for the `Dockerfile` created in Step 1.
 
-3.  Update [Buildkite pipeline](../../.buildkite/pipeline.yaml).
 
-4.  Run the tests, and triage any failures. Some language tests are flaky (or
+3.  Run the tests, and triage any failures. Some language tests are flaky (or
     never pass at all), other failures may indicate a gVisor bug or divergence
     from Linux behavior.
 
-5.  Update the [exclude](exclude) file by renaming it with the right version and
+4.  Update the [exclude](exclude) file by renaming it with the right version and
     adding any failing tests to it with a reason.
 
 ### Cleaning up exclude files
