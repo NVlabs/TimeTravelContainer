@@ -1014,11 +1014,12 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 	for _, value := range volumeSpecs {
 		parts := strings.Split(value, ":")
 		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
-			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER:ro", value)
+			return nil, fmt.Errorf("invalid volume specification %q; want HOST:CONTAINER[:ro|rw|copy]", value)
 		}
 		readonly := false
 		immutableSource := false
 		managedCoW := false
+		copySource := false
 		if len(parts) == 3 {
 			for _, option := range strings.Split(parts[2], ",") {
 				switch option {
@@ -1030,13 +1031,15 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 					immutableSource = true
 				case "cow", "managed-cow":
 					managedCoW = true
+				case "copy":
+					copySource = true
 				case "":
 				default:
 					return nil, fmt.Errorf("unsupported volume option %q in %q", option, value)
 				}
 			}
 		}
-		mount, err := normalizeHostMount(parts[0], parts[1], readonly, immutableSource, managedCoW)
+		mount, err := normalizeHostMount(parts[0], parts[1], readonly, immutableSource, managedCoW, copySource)
 		if err != nil {
 			return nil, err
 		}
@@ -1049,6 +1052,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 		readonly := false
 		immutableSource := false
 		managedCoW := false
+		copySource := false
 		seen := make(map[string]struct{})
 		for _, field := range strings.Split(value, ",") {
 			key, raw, found := strings.Cut(field, "=")
@@ -1063,6 +1067,9 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 					continue
 				case "cow", "managed-cow":
 					managedCoW = true
+					continue
+				case "copy":
+					copySource = true
 					continue
 				default:
 					return nil, fmt.Errorf("invalid --mount field %q in %q", field, value)
@@ -1107,6 +1114,12 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 					return nil, fmt.Errorf("invalid managed-cow value %q in %q", raw, value)
 				}
 				managedCoW = parsed
+			case "copy":
+				parsed, err := strconv.ParseBool(raw)
+				if err != nil {
+					return nil, fmt.Errorf("invalid copy value %q in %q", raw, value)
+				}
+				copySource = parsed
 			default:
 				return nil, fmt.Errorf("unsupported --mount field %q in %q", key, value)
 			}
@@ -1117,7 +1130,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 			}
 			return nil, fmt.Errorf("--mount %q must specify type=bind", value)
 		}
-		mount, err := normalizeHostMount(source, destination, readonly, immutableSource, managedCoW)
+		mount, err := normalizeHostMount(source, destination, readonly, immutableSource, managedCoW, copySource)
 		if err != nil {
 			return nil, err
 		}
@@ -1126,7 +1139,7 @@ func parseHostMounts(volumeSpecs, mountSpecs []string) ([]ttcbundle.HostMount, e
 	return mounts, nil
 }
 
-func normalizeHostMount(source, destination string, readonly, immutableSource, managedCoW bool) (ttcbundle.HostMount, error) {
+func normalizeHostMount(source, destination string, readonly, immutableSource, managedCoW, copySource bool) (ttcbundle.HostMount, error) {
 	if source == "" || destination == "" {
 		return ttcbundle.HostMount{}, errors.New("host bind mount requires both source and destination")
 	}
@@ -1143,16 +1156,19 @@ func normalizeHostMount(source, destination string, readonly, immutableSource, m
 	if !filepath.IsAbs(destination) || filepath.Clean(destination) == "/" {
 		return ttcbundle.HostMount{}, fmt.Errorf("host mount destination %q must be an absolute non-root path", destination)
 	}
-	if readonly && managedCoW {
-		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot be both read-only and managed CoW", source, destination)
+	if readonly && (managedCoW || copySource) {
+		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine read-only with cow or copy", source, destination)
 	}
-	if managedCoW && !immutableSource {
-		return ttcbundle.HostMount{}, fmt.Errorf("managed CoW host bind %q:%q requires immutable-source", source, destination)
+	if managedCoW && copySource {
+		return ttcbundle.HostMount{}, fmt.Errorf("host bind %q:%q cannot combine cow and copy", source, destination)
 	}
-	if !readonly && !managedCoW {
-		return ttcbundle.HostMount{}, fmt.Errorf("writable host bind %q:%q requires :cow,immutable-source; add :ro for a shared read-only view", source, destination)
+	if !readonly && !copySource {
+		managedCoW = true
 	}
-	return ttcbundle.HostMount{Source: filepath.Clean(source), Destination: filepath.Clean(destination), Readonly: readonly, ImmutableSource: immutableSource, ManagedCoW: managedCoW}, nil
+	return ttcbundle.HostMount{
+		Source: filepath.Clean(source), Destination: filepath.Clean(destination),
+		Readonly: readonly, ImmutableSource: immutableSource, ManagedCoW: managedCoW, Copy: copySource,
+	}, nil
 }
 
 func parseNetworkMode(value string) (string, error) {
@@ -1493,8 +1509,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
-	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -1757,8 +1773,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&labels, "l", "set container metadata KEY[=VALUE]")
 	fs.Var(&labelFiles, "label-file", "read container labels from a file")
 	var volumes, mounts, tmpfsMounts stringSlice
-	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
-	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or a read-only HOST:CONTAINER:ro bind")
+	fs.Var(&volumes, "volume", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
+	fs.Var(&volumes, "v", "attach VOLUME:CONTAINER[:ro] or HOST:CONTAINER[:ro|rw|copy]")
 	fs.Var(&mounts, "mount", "attach type=bind|tmpfs|proc|sysfs,target=CONTAINER[,OPTIONS]")
 	fs.Var(&tmpfsMounts, "tmpfs", "mount tmpfs at CONTAINER[:OPTIONS]")
 	var logOptions, ulimitValues, groupAddValues, capAddValues, capDropValues stringSlice
@@ -6384,6 +6400,17 @@ func managedCoWHostMountDestinations(spec *specs.Spec) map[string]struct{} {
 	return result
 }
 
+func copiedHostMountSources(spec *specs.Spec) map[string]string {
+	result := make(map[string]string)
+	if spec == nil || spec.Annotations == nil {
+		return result
+	}
+	if json.Unmarshal([]byte(ttcbundle.AnnotationValue(spec.Annotations, ttcbundle.CopiedHostMountsAnnotation)), &result) != nil {
+		return make(map[string]string)
+	}
+	return result
+}
+
 func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struct{}, map[string]string) {
 	mounts := []InspectMount{}
 	binds := []string{}
@@ -6394,6 +6421,7 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 	}
 	dockerTmpfs := make(map[string]string)
 	managedCoWHostMounts := managedCoWHostMountDestinations(spec)
+	copiedHostMounts := copiedHostMountSources(spec)
 	if encoded := ttcbundle.AnnotationValue(spec.Annotations, ttcbundle.TmpfsConfigAnnotation); encoded != "" {
 		_ = json.Unmarshal([]byte(encoded), &dockerTmpfs)
 	}
@@ -6431,6 +6459,15 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 				Mode: mode, RW: !readonly, Propagation: "rprivate",
 			})
 		case mount.Type == "ttcvol":
+			if original, copied := copiedHostMounts[filepath.Clean(mount.Destination)]; copied {
+				mode = "rw,copy"
+				binds = append(binds, original+":"+mount.Destination+":"+mode)
+				mounts = append(mounts, InspectMount{
+					Type: "bind", Source: original, Destination: mount.Destination,
+					Mode: mode, RW: true, Propagation: "rprivate",
+				})
+				continue
+			}
 			name := filepath.Base(mount.Source)
 			volumes[mount.Destination] = struct{}{}
 			mounts = append(mounts, InspectMount{
@@ -6518,8 +6555,12 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 	externalViews := make([]InspectExternalView, 0)
 	immutableHostMounts := immutableHostMountDestinations(spec)
 	managedCoWHostMounts := managedCoWHostMountDestinations(spec)
+	copiedHostMounts := copiedHostMountSources(spec)
 	for _, mount := range mounts {
 		if mount.Type == "bind" {
+			if _, copied := copiedHostMounts[filepath.Clean(mount.Destination)]; copied {
+				continue
+			}
 			_, immutableSource := immutableHostMounts[filepath.Clean(mount.Destination)]
 			_, managedCoW := managedCoWHostMounts[filepath.Clean(mount.Destination)]
 			semantics := "shared-external-view"
@@ -6527,7 +6568,10 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 				semantics = "user-asserted-immutable-external-view"
 			}
 			if managedCoW {
-				semantics = "branch-local-cow-over-user-asserted-immutable-host-lower"
+				semantics = "branch-local-persistent-cow-over-live-host-lower"
+				if immutableSource {
+					semantics = "branch-local-persistent-cow-over-user-asserted-immutable-host-lower"
+				}
 			}
 			externalViews = append(externalViews, InspectExternalView{Source: mount.Source, Destination: mount.Destination, Readonly: !mount.RW, ImmutableSourceAsserted: immutableSource, ManagedCoW: managedCoW, Semantics: semantics})
 		}

@@ -511,7 +511,7 @@ One named volume may have one writable container family at a time. TTC rejects
 a second writable attachment because separate Sentry namespace caches are not
 yet coherent; additional read-only attachments are allowed.
 
-A host bind must be read-only:
+Use `:ro` for a live read-only view of a host path:
 
 ```shell
 ttc run --rm \
@@ -520,15 +520,36 @@ ttc run --rm \
 ```
 
 Such a bind is a shared external view, not a snapshot; later host changes may
-become visible in every branch. `immutable-source` records the user's promise
-that the host path will not change, but TTC cannot enforce it. A branch-local
-memory overlay can be placed above an asserted immutable lower:
+become visible in every branch.
+
+An ordinary writable bind creates a persistent, branch-local writable layer
+over the live host path:
 
 ```shell
 ttc run -d --name edit \
-  --mount type=bind,source=/host/base,target=/work,cow,immutable-source \
+  -v /host/base:/work \
   alpine:3.20 sleep 600
 ```
+
+The host path is always read-only from the guest's perspective. A first write
+to a lower file copies that complete file into TTC-managed storage; later
+writes and live forks use reflink-backed copy-on-write there. Host changes to
+paths that have not been copied up may still become visible. Container
+stop/start preserves the private layer, and each live-fork branch receives its
+own persistent view.
+
+Use `:copy` for a detached import:
+
+```shell
+ttc run -d --name edit \
+  -v /host/base:/work:copy \
+  alpine:3.20 sleep 600
+```
+
+TTC copies the source during container creation, opportunistically using
+reflinks when the source and TTC data root permit it and otherwise streaming
+the file contents. The source can then change or disappear without affecting
+the container. Both files and directories are supported.
 
 ## Networking and resource limits
 

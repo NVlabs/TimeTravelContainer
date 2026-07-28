@@ -681,9 +681,9 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		return nil, nil, fmt.Errorf("lower layer's root has unsupported file type %v", rootType)
 	}
 
-	// Upper is normally tmpfs. TTC root filesystems instead donate a private
-	// ttcvol repository so every namespace and data mutation is persistent as
-	// it occurs; no exit-time archive is involved.
+	// Upper is normally tmpfs. TTC may instead donate a private ttcvol
+	// repository for the rootfs or a writable host mount so every namespace and
+	// data mutation is persistent as it occurs.
 	tmpfsOpts := tmpfs.FilesystemOpts{
 		RootFileType: uint16(rootType),
 		// If a mount is being overlaid, it should not be limited by the default
@@ -691,16 +691,25 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		DisableDefaultSizeLimit: true,
 	}
 	upperFSName := tmpfs.Name
+	var persistentUpper *ttcVolumeRepository
 	if repository, ok := c.l.ttcVolumeRepositories[specutils.TTCRootfsUpperSource]; ok && dst == "/" {
-		if rootType != linux.S_IFDIR {
-			return nil, nil, fmt.Errorf("persistent TTC rootfs upper requires a directory root")
+		persistentUpper = &repository
+	} else if dst != "/" {
+		for _, repository := range c.l.ttcVolumeRepositories {
+			if repository.config.OverlayDestination == dst {
+				repository := repository
+				persistentUpper = &repository
+				break
+			}
 		}
+	}
+	if persistentUpper != nil {
 		if filestoreFD != nil || rootfsUpperTarFD != nil {
-			return nil, nil, fmt.Errorf("persistent TTC rootfs upper is mutually exclusive with filestore and tar-backed uppers")
+			return nil, nil, fmt.Errorf("persistent TTC upper at %q is mutually exclusive with filestore and tar-backed uppers", dst)
 		}
 		tmpfsOpts.DiskVolume = &tmpfs.DiskVolumeOptions{
-			Repository: repository.repository,
-			Branch:     repository.config.Branch,
+			Repository: persistentUpper.repository,
+			Branch:     persistentUpper.config.Branch,
 		}
 		upperFSName = tmpfs.DiskVolumeName
 	}

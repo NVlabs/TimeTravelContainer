@@ -33,11 +33,11 @@ devpts instance with `/dev/ptmx`. Docker-compatible `--shm-size` configures the
 mode, size, and access options; TTC extensions
 `--mount type=proc|procfs|sysfs` add alternate Sentry virtual-filesystem
 views. Existing host paths can be attached read-only with Docker-style `-v`
-or `--mount` syntax. An explicit `:cow,immutable-source` or
-`--mount type=bind,...,cow,immutable-source` TTC extension instead places a
-branch-local Sentry-memory OverlayFS upper over the user-attested immutable host
-lower; ordinary writable Docker binds remain rejected to avoid silently changing
-their host-write semantics.
+or `--mount` syntax. An ordinary writable host mount places a persistent,
+branch-local `ttcvol` upper over the live read-only host lower; guest writes
+never reach the host. The `:copy` extension imports the source into a detached
+private repository during creation, using reflinks opportunistically and
+falling back to streamed copies.
 Named and anonymous disk-backed managed volumes can be attached through
 Docker-compatible syntax, initialized from image contents, and fork their
 immutable metadata root plus regular-file backing objects CoW with each live
@@ -254,10 +254,13 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       and finish time into persistent inspect metadata.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
-- [x] Support explicit managed host CoW binds through
-      `-v HOST:CONTAINER:cow,immutable-source` and
-      `--mount type=bind,...,cow,immutable-source`; ordinary writable binds
-      remain rejected because their Docker host-write semantics are incompatible.
+- [x] Support persistent isolated writable host views through
+      `-v HOST:CONTAINER[:rw]` and `--mount type=bind,...`; use the host path
+      only as a live read-only lower and store all guest changes in a private
+      branch-local `ttcvol` repository.
+- [x] Support detached imports through `-v HOST:CONTAINER:copy` and
+      `--mount type=bind,...,copy`; opportunistically reflink during creation
+      and always permit streamed-copy fallback for this explicit import mode.
 - [x] Support Docker-compatible `--shm-size` byte units with Docker's 64 MiB
       default, persistent `HostConfig.ShmSize` inspect output, and retention
       across create/start/restart/live fork.
@@ -632,7 +635,7 @@ and reason.
       read-only volume aliases, host-bind remounts, and recursive-fork retention;
       proc mount rendering also preserves `nodev` and the leading `rw`/`ro` option.
 
-### Read-only host paths
+### Host paths
 
 - [x] Admit a LISAFS/gofer bind only when the OCI mount and server connection
       are both read-only and directfs is disabled.
@@ -649,9 +652,14 @@ and reason.
 - [x] Document and expose read-only host binds as shared external views, not
       snapshots: TTC inspect metadata and fork-check warnings state that
       host-side mutations may become visible to every branch.
-- [x] Add the `immutable-source` bind option as a persisted user attestation.
-      Inspect and fork diagnostics distinguish it from ordinary shared views and
-      explicitly state that TTC cannot prevent an independent host writer.
+- [x] Add persistent container-private `ttcvol` uppers for writable host-mount
+      syntax. Keep the host gofer read-only, preserve changes across
+      stop/start, and fork the private repository with the branch.
+- [x] Add `:copy` imports for directories and regular files, including
+      opportunistic reflinks, unconditional streamed-copy fallback, hard links,
+      symlinks, ownership, modes, and xattrs.
+- [x] Include private host repositories in checkpoint/restore and support
+      running, paused, and stopped `ttc cp` through mounted subtrees.
 
 ### Managed volumes
 

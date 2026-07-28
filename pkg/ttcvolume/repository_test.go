@@ -106,6 +106,40 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	}
 }
 
+func TestRegularFileRepositoryRootForks(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("regular-root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.InitializeRootRegular(0640, 1000, 1001); err != nil {
+		t.Fatal(err)
+	}
+	root, err := repo.Inode(MainBranch, RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Type != "regular" || root.Mode != 0640 || root.UID != 1000 || root.GID != 1001 {
+		t.Fatalf("regular root=%+v", root)
+	}
+	if cloned := write(t, repo, MainBranch, RootInode, "base", 0); cloned {
+		t.Fatal("initial root write unexpectedly cloned")
+	}
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if cloned := write(t, repo, "child", RootInode, "CH", 0); !cloned {
+		t.Fatal("child regular-root write did not clone")
+	}
+	if got := readAll(t, repo, MainBranch, RootInode); got != "base" {
+		t.Fatalf("parent root=%q", got)
+	}
+	if got := readAll(t, repo, "child", RootInode); got != "CHse" {
+		t.Fatalf("child root=%q", got)
+	}
+}
+
 func TestActualReflinkPathSucceedsOrFailsClosed(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("actual-reflink")

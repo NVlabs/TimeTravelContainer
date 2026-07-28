@@ -470,6 +470,67 @@ func (r *Repository) Info() VolumeInfo {
 	return r.info
 }
 
+// InitializeRootRegular converts a newly-created, empty repository root into a
+// regular file. It is used for private TTC mounts whose source is a single
+// host file. The operation is rejected once the repository has acquired any
+// namespace entries or branches.
+func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
+	return r.withLock(func() error {
+		branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		names, readErr := branchDir.Readdirnames(-1)
+		closeErr := branchDir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if len(names) != 1 || names[0] != mainBranch+".json" {
+			return errors.New("regular repository root requires a pristine main branch")
+		}
+		branch, err := r.readBranch(mainBranch)
+		if err != nil {
+			return err
+		}
+		root, err := r.getInode(branch.Root, rootInode)
+		if err != nil {
+			return err
+		}
+		if root.Type != "directory" {
+			if root.Type == "regular" {
+				return nil
+			}
+			return fmt.Errorf("repository root has unsupported type %q", root.Type)
+		}
+		entries, err := r.treePrefix(branch.Root, entryPrefix(rootInode))
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return errors.New("regular repository root requires an empty namespace")
+		}
+		object, err := r.createObject("")
+		if err != nil {
+			return err
+		}
+		now := time.Now().UnixNano()
+		root = Inode{
+			Number: rootInode, Type: "regular", Mode: mode & 07777,
+			UID: uid, GID: gid, Nlink: 1, Object: object,
+			DataGeneration: branch.Generation,
+			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
+		}
+		branch.Root, err = r.setInode(branch.Root, root)
+		if err != nil {
+			return err
+		}
+		return r.writeBranch(branch)
+	})
+}
+
 // HostPath returns the manager-side repository directory. Donated Sentry
 // repositories intentionally return an empty path.
 func (r *Repository) HostPath() string {

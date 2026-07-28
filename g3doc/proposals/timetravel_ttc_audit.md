@@ -212,9 +212,12 @@ systrap directfs and shared-filesystem variants.
   affected only v2.1.0 and was fixed in v2.1.1. TTC's virtual ownership
   manifest paths are canonicalized and image roots are served read-only below
   a private, Sentry-managed disk-backed `ttcvol` overlay upper.
-- Writable host binds are rejected. Ordinary host binds are read-only shared
-  external views, while managed CoW binds require an explicit immutable-source
-  attestation. Directfs remains disabled in TTC's normal runsc arguments.
+- Host paths are never writable through the gofer. Read-only binds are shared
+  external views. Writable bind syntax uses the host path only as a read-only
+  lower and directs guest changes to a container-private persistent `ttcvol`
+  upper. `:copy` imports into a private repository and removes the runtime
+  dependency on the host source. Directfs remains disabled in TTC's normal
+  runsc arguments.
 - SUID/SGID transitions occur in Sentry credentials and do not grant host
   credentials. They are intentional compatibility behavior; the effective
   default-capability defect above is separate and unintended.
@@ -424,9 +427,11 @@ It does **not** include an ordinary read-only host bind in the same category.
 Read-only binds use a LISAFS gofer client with a stable resource identity;
 `directfs=false` lets the child borrow that read-only client explicitly.
 
-Read-only host binds are shared external views. `immutable-source` is only an
-attestation; it does not stop an independent host writer. Managed bind CoW also
-assumes its external lower remains immutable for stable snapshot semantics.
+Read-only host binds are shared external views. The lower of an ordinary
+writable host mount is also live: an independent host writer can change paths
+that a branch has not copied up. Guest writes are confined to the private
+upper, so they cannot modify the host source. `:copy` is the mode for a fixed,
+fully detached initial tree.
 
 Directfs bypasses gofer RPCs by exposing host file descriptions more directly
 to the Sentry. Duplicating such an FD normally shares the host open-file

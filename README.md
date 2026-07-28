@@ -107,8 +107,9 @@ TTC also supports:
 - Container-local tmpfs mounts
 - `/proc`, restricted read-only `/sys`, `/dev`, `/dev/shm`, and private
   terminal mounts
-- Read-only host-directory binds
-- Branch-local writable views over explicitly immutable host directories
+- Read-only views of host files and directories
+- Persistent, branch-local writable views over host paths
+- Detached copies of host files and directories
 - File copying to or from running, paused, and fully stopped containers
 
 ```sh
@@ -117,6 +118,26 @@ ttc run -d --name app -v cache:/var/cache/app \
   alpine:3.20 sleep 600
 ttc volume inspect cache
 ```
+
+Host paths use familiar Docker-style syntax with TTC isolation semantics:
+
+```sh
+# A live, read-only view of the host path.
+ttc run --rm -v /host/input:/input:ro alpine:3.20 cat /input/file
+
+# A persistent private writable view. Guest writes never modify /host/work.
+ttc run -d --name work -v /host/work:/work alpine:3.20 sleep 600
+
+# Copy once, then run without any dependency on /host/template.
+ttc run -d --name imported -v /host/template:/work:copy \
+  alpine:3.20 sleep 600
+```
+
+For an ordinary writable bind, the host path remains a live read-only lower
+layer: host changes to files that the container has not copied up may become
+visible. Use `:copy` when the container must see a fixed, fully private initial
+copy. In both writable forms, stop/start preserves changes and live fork gives
+each branch an independent copy-on-write view.
 
 ### Rootless virtual networking
 
@@ -433,8 +454,11 @@ container family with no ancestry or mutable storage shared with the source.
 - A stopped child branch retains its filesystem for `ttc cp`, but its former
   live process and memory state cannot be started again. Restarting a container
   starts its main branch from its persistent configuration and filesystem.
-- Read-only host binds remain shared views during live fork. Durable
-  checkpoints include a private snapshot of their contents.
+- Read-only host binds remain shared live views during a fork. Ordinary
+  writable host mounts also retain a live read-only host lower, while each
+  branch has an independent persistent upper. A `:copy` mount is fully detached
+  from its source after creation. Durable checkpoints capture host-backed
+  content into the checkpoint.
 - A managed volume cannot be attached writable to unrelated container families
   at the same time.
 - TTC does not yet implement the Docker Engine API, Compose, Swarm, general

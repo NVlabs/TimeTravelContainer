@@ -47,6 +47,7 @@ const (
 	imageRootFormatVersion   = "v3"
 	containerIDBytes         = 32
 	rootfsUpperRepositoryDir = "rootfs-upper"
+	hostMountRepositoryDir   = "host-mounts"
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
 )
@@ -578,6 +579,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			return Prepared{}, fmt.Errorf("closing persistent rootfs upper: %w", err)
 		}
 	}
+	if err := s.resolveWritableHostMounts(containerDir, &opts); err != nil {
+		return Prepared{}, err
+	}
 	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
@@ -767,6 +771,24 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			}
 			info := imported.Info()
 			rootfsUpperID = info.ID
+			repository.Path = imported.HostPath()
+			repository.Branch = ttcvolume.MainBranch
+			repository.CopyMode = string(copyMode)
+			repository.RestoreID = snapshot.RepositoryID
+			if err := imported.Close(); err != nil {
+				return Prepared{}, err
+			}
+			continue
+		}
+		if repository.Private {
+			path := filepath.Join(containerDir, hostMountRepositoryDir, strconv.Itoa(index))
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				return Prepared{}, fmt.Errorf("creating restored private repository root: %w", err)
+			}
+			imported, snapshot, err := manager.ImportPrivateSnapshot(path, fmt.Sprintf("host-%d", index), snapshotPath)
+			if err != nil {
+				return Prepared{}, fmt.Errorf("importing private host-mount repository %q: %w", repository.Source, err)
+			}
 			repository.Path = imported.HostPath()
 			repository.Branch = ttcvolume.MainBranch
 			repository.CopyMode = string(copyMode)
@@ -1078,6 +1100,225 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	return volumes, nil
 }
 
+func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptions) error {
+	if opts == nil {
+		return errors.New("missing host mount options")
+	}
+	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	if err != nil {
+		return err
+	}
+	if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
+		return fmt.Errorf("volume backing capability changed while preparing host mounts: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
+	}
+	hostMountRootCreated := false
+	for index := range opts.HostMounts {
+		mount := &opts.HostMounts[index]
+		if mount.Readonly || mount.Internal {
+			continue
+		}
+		if !mount.ManagedCoW && !mount.Copy {
+			return fmt.Errorf("writable host mount %q at %q has no TTC isolation mode", mount.Source, mount.Destination)
+		}
+		resolved, err := filepath.EvalSymlinks(mount.Source)
+		if err != nil {
+			return fmt.Errorf("resolving host mount source %q: %w", mount.Source, err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return fmt.Errorf("stating host mount source %q: %w", mount.Source, err)
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("host mount source %q has unsupported type %s", mount.Source, info.Mode().Type())
+		}
+		if !hostMountRootCreated {
+			if err := os.Mkdir(filepath.Join(containerDir, hostMountRepositoryDir), 0700); err != nil && !os.IsExist(err) {
+				return fmt.Errorf("creating private host-mount repository root: %w", err)
+			}
+			hostMountRootCreated = true
+		}
+		repositoryPath := filepath.Join(containerDir, hostMountRepositoryDir, strconv.Itoa(index))
+		repository, err := manager.CreatePrivate(repositoryPath, fmt.Sprintf("host-%d", index))
+		if err != nil {
+			return fmt.Errorf("creating persistent upper for host mount %q: %w", mount.Destination, err)
+		}
+		uid, gid := hostFileOwner(info)
+		if info.Mode().IsRegular() {
+			err = repository.InitializeRootRegular(uint32(info.Mode().Perm()), uid, gid)
+		}
+		if err == nil && mount.Copy {
+			err = seedCopiedHostMount(repository, resolved, info)
+		}
+		mount.RepositoryID = repository.Info().ID
+		mount.RepositoryPath = repository.HostPath()
+		mount.CopyMode = string(manager.Capability().Mode)
+		closeErr := repository.Close()
+		if err != nil {
+			return fmt.Errorf("preparing host mount %q at %q: %w", mount.Source, mount.Destination, err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing host-mount repository %q: %w", mount.Destination, closeErr)
+		}
+	}
+	return nil
+}
+
+func hostFileOwner(info os.FileInfo) (uint32, uint32) {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return stat.Uid, stat.Gid
+	}
+	return 0, 0
+}
+
+func seedCopiedHostMount(repository *ttcvolume.Repository, sourceRoot string, rootInfo os.FileInfo) error {
+	if rootInfo.Mode().IsRegular() {
+		return copyHostRegularIntoRepository(repository, ttcvolume.RootInode, sourceRoot, rootInfo)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("copy source has unsupported type %s", rootInfo.Mode().Type())
+	}
+	root, err := repository.Inode(ttcvolume.MainBranch, ttcvolume.RootInode)
+	if err != nil {
+		return err
+	}
+	root.UID, root.GID = hostFileOwner(rootInfo)
+	root.Mode = uint32(rootInfo.Mode().Perm())
+	root.AtimeNsec = rootInfo.ModTime().UnixNano()
+	root.MtimeNsec = rootInfo.ModTime().UnixNano()
+	root.CtimeNsec = rootInfo.ModTime().UnixNano()
+	root.Xattrs, err = readHostXattrs(sourceRoot)
+	if err != nil {
+		return err
+	}
+	if err := repository.UpdateMetadata(ttcvolume.MainBranch, root); err != nil {
+		return err
+	}
+
+	directories := map[string]uint64{".": ttcvolume.RootInode}
+	hardlinks := make(map[hostFileIdentity]uint64)
+	err = filepath.Walk(sourceRoot, func(hostPath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(sourceRoot, hostPath)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		parent := directories[filepath.Dir(relative)]
+		if parent == 0 {
+			return fmt.Errorf("missing imported parent for %q", relative)
+		}
+		name := filepath.Base(relative)
+		uid, gid := hostFileOwner(info)
+		mode := uint32(info.Mode().Perm())
+		var ino uint64
+		switch {
+		case info.IsDir():
+			ino, err = repository.CreateDirectory(ttcvolume.MainBranch, parent, name, mode, uid, gid)
+			if err == nil {
+				directories[relative] = ino
+			}
+		case info.Mode().IsRegular():
+			var identity hostFileIdentity
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+				identity = hostFileIdentity{dev: uint64(stat.Dev), ino: stat.Ino}
+				if existing := hardlinks[identity]; existing != 0 {
+					return repository.Link(ttcvolume.MainBranch, parent, name, existing)
+				}
+			}
+			ino, err = repository.CreateRegular(ttcvolume.MainBranch, parent, name, mode, uid, gid)
+			if err == nil {
+				err = copyHostRegularIntoRepository(repository, ino, hostPath, info)
+			}
+			if err == nil && identity != (hostFileIdentity{}) {
+				hardlinks[identity] = ino
+			}
+		case info.Mode()&os.ModeSymlink != 0:
+			var target string
+			target, err = os.Readlink(hostPath)
+			if err == nil {
+				ino, err = repository.CreateSymlink(ttcvolume.MainBranch, parent, name, target, uid, gid)
+			}
+		default:
+			return fmt.Errorf("copy source path %q has unsupported type %s", hostPath, info.Mode().Type())
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			return nil
+		}
+		inode, err := repository.Inode(ttcvolume.MainBranch, ino)
+		if err != nil {
+			return err
+		}
+		inode.AtimeNsec = info.ModTime().UnixNano()
+		inode.MtimeNsec = info.ModTime().UnixNano()
+		inode.CtimeNsec = info.ModTime().UnixNano()
+		inode.Xattrs, err = readHostXattrs(hostPath)
+		if err != nil {
+			return err
+		}
+		return repository.UpdateMetadata(ttcvolume.MainBranch, inode)
+	})
+	if err != nil {
+		return err
+	}
+	return repository.SyncMetadata()
+}
+
+func copyHostRegularIntoRepository(repository *ttcvolume.Repository, ino uint64, sourcePath string, info os.FileInfo) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, inode, _, err := repository.OpenDataFile(ttcvolume.MainBranch, ino, true)
+	if err != nil {
+		return err
+	}
+	cloneErr := unix.IoctlFileClone(int(destination.Fd()), int(source.Fd()))
+	if cloneErr != nil {
+		if err := destination.Truncate(0); err != nil {
+			destination.Close()
+			return err
+		}
+		if _, err := destination.Seek(0, io.SeekStart); err != nil {
+			destination.Close()
+			return err
+		}
+		if _, err := source.Seek(0, io.SeekStart); err != nil {
+			destination.Close()
+			return err
+		}
+		if _, err := io.CopyBuffer(destination, source, make([]byte, 256*1024)); err != nil {
+			destination.Close()
+			return err
+		}
+	}
+	if err := destination.Close(); err != nil {
+		return err
+	}
+	inode.Size = info.Size()
+	inode.UID, inode.GID = hostFileOwner(info)
+	inode.Mode = uint32(info.Mode().Perm())
+	inode.AtimeNsec = info.ModTime().UnixNano()
+	inode.MtimeNsec = info.ModTime().UnixNano()
+	inode.CtimeNsec = info.ModTime().UnixNano()
+	inode.Xattrs, err = readHostXattrs(sourcePath)
+	if err != nil {
+		return err
+	}
+	return repository.UpdateAfterWrite(ttcvolume.MainBranch, inode)
+}
+
+func readHostXattrs(name string) (map[string]string, error) {
+	return readImageXattrs(name, nil, "")
+}
+
 func validateManagedVolumeAttachment(volumeID string, requested ManagedVolume, containers []ContainerInfo) error {
 	if requested.Readonly {
 		return nil
@@ -1263,10 +1504,12 @@ func readImageXattrs(name string, manifest *ownership.Manifest, virtualPath stri
 			result[attribute] = string(value[:valueSize])
 		}
 	}
-	for _, attribute := range manifest.ListXattrs(virtualPath) {
-		value, ok := manifest.LookupXattr(virtualPath, attribute)
-		if ok {
-			result[attribute] = string(value)
+	if manifest != nil {
+		for _, attribute := range manifest.ListXattrs(virtualPath) {
+			value, ok := manifest.LookupXattr(virtualPath, attribute)
+			if ok {
+				result[attribute] = string(value)
+			}
 		}
 	}
 	if len(result) == 0 {

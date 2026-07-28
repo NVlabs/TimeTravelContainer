@@ -990,6 +990,14 @@ type TTCVolumeRepository struct {
 	Path     string `json:"path"`
 	Branch   string `json:"branch"`
 	CopyMode string `json:"copy_mode"`
+	// Private marks a container-family-owned repository. Unlike a named or
+	// anonymous managed volume, it is restored beneath the new container's
+	// private state directory and is removed with that container.
+	Private bool `json:"private,omitempty"`
+	// OverlayDestination selects this repository as the persistent upper for
+	// the gofer bind mounted at the given guest destination. Empty means that
+	// the repository is mounted directly as a ttcvol filesystem.
+	OverlayDestination string `json:"overlay_destination,omitempty"`
 	// RestoreID is the repository identity serialized in a TTC checkpoint.
 	// Empty during ordinary creation and live fork.
 	RestoreID string `json:"restore_id,omitempty"`
@@ -1006,6 +1014,7 @@ func TTCVolumeRepositories(spec *specs.Spec) ([]TTCVolumeRepository, error) {
 		return nil, fmt.Errorf("decoding %s: %w", AnnotationTTCVolumeRepositories, err)
 	}
 	seen := make(map[string]bool, len(repositories))
+	seenOverlayDestinations := make(map[string]bool, len(repositories))
 	for _, repository := range repositories {
 		if repository.Source == "" || repository.Path == "" || repository.Branch == "" {
 			return nil, fmt.Errorf("%s contains an empty source, path, or branch", AnnotationTTCVolumeRepositories)
@@ -1021,6 +1030,19 @@ func TTCVolumeRepositories(spec *specs.Spec) ([]TTCVolumeRepository, error) {
 		case "reflink", "full-copy":
 		default:
 			return nil, fmt.Errorf("%s source %q has invalid copy mode %q", AnnotationTTCVolumeRepositories, repository.Source, repository.CopyMode)
+		}
+		if repository.OverlayDestination != "" {
+			destination := filepath.Clean(repository.OverlayDestination)
+			if !filepath.IsAbs(destination) || destination == "/" || destination != repository.OverlayDestination {
+				return nil, fmt.Errorf("%s source %q has invalid overlay destination %q", AnnotationTTCVolumeRepositories, repository.Source, repository.OverlayDestination)
+			}
+			if !repository.Private {
+				return nil, fmt.Errorf("%s source %q has a non-private overlay repository", AnnotationTTCVolumeRepositories, repository.Source)
+			}
+			if seenOverlayDestinations[destination] {
+				return nil, fmt.Errorf("%s contains duplicate overlay destination %q", AnnotationTTCVolumeRepositories, destination)
+			}
+			seenOverlayDestinations[destination] = true
 		}
 		if repository.RestoreID != "" {
 			if len(repository.RestoreID) != 32 {

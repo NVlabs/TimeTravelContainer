@@ -495,10 +495,6 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	var root *dentry
 	if fs.diskVolume != nil {
-		if rootFileType != linux.S_IFDIR {
-			fs.vfsfs.DecRef(ctx)
-			return nil, nil, errors.New("ttcvol root must be a directory")
-		}
 		root, err = fs.loadDiskVolume(ctx)
 		if err != nil {
 			fs.vfsfs.DecRef(ctx)

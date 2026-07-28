@@ -511,7 +511,7 @@ LIFECYCLE_ID=$(ttc run --name "$LIFECYCLE" --detach --read-only \
   --tmpfs /state:mode=0755 \
   --volume "$HOST_FIXTURE:/host-fixture:ro" \
   --mount "type=bind,source=$HOST_FIXTURE_TWO,target=/host-fixture-two,readonly,immutable-source" \
-  --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host,cow,immutable-source" \
+  --mount "type=bind,source=$HOST_COW_FIXTURE,target=/cow-host" \
   --tmpfs /scratch:mode=0700,size=1m \
   --mount type=proc,target=/alt-proc,readonly \
   --mount type=proc,target=/repeat-proc,readonly \
@@ -614,7 +614,7 @@ fi
 [ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent state tmpfs was not initialized"
 [ "$(ttc exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
 [ "$(ttc exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "managed overlay did not retain the parent copy-up"
-[ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "managed overlay modified its immutable host lower"
+[ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "managed overlay modified its host lower"
 [ "$(ttc exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-readonly-two" ] || fail "second read-only host bind was not readable"
 [ "$(ttc exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
 ttc exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
@@ -681,7 +681,7 @@ grep -q "\"Source\":\"$HOST_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted 
 grep -q "\"Source\":\"$HOST_FIXTURE_TWO\"" "$INSPECT_JSON" || fail "inspect omitted the second read-only host bind"
 grep -q "\"Source\":\"$HOST_COW_FIXTURE\"" "$INSPECT_JSON" || fail "inspect omitted the managed CoW host lower"
 grep -q '"managed_cow":true' "$INSPECT_JSON" || fail "TTC inspect omitted managed CoW metadata"
-grep -q '"semantics":"branch-local-cow-over-user-asserted-immutable-host-lower"' "$INSPECT_JSON" || fail "TTC inspect omitted managed-overlay semantics"
+grep -q '"semantics":"branch-local-persistent-cow-over-live-host-lower"' "$INSPECT_JSON" || fail "TTC inspect omitted managed-overlay semantics"
 grep -q '"semantics":"shared-external-view"' "$INSPECT_JSON" || fail "TTC inspect omitted shared external-view semantics"
 grep -q '"semantics":"user-asserted-immutable-external-view"' "$INSPECT_JSON" || fail "TTC inspect omitted immutable-source attestation"
 grep -q '"immutable_source_asserted":true' "$INSPECT_JSON" || fail "TTC inspect omitted immutable-source assertion flag"

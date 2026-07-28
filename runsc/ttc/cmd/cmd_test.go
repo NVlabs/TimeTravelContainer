@@ -1203,18 +1203,20 @@ func TestParseImmutableHostMountAssertion(t *testing.T) {
 	}
 }
 
-func TestRunRejectsUnmanagedWritableMounts(t *testing.T) {
-	for _, args := range [][]string{
-		{"run", "-v", "/host:/data", "busybox"},
-		{"run", "--mount", "type=bind,source=/host,target=/data", "busybox"},
+func TestWritableHostMountsDefaultToManagedCoW(t *testing.T) {
+	for _, input := range []struct {
+		volumes []string
+		mounts  []string
+	}{
+		{volumes: []string{"/host:/data"}},
+		{mounts: []string{"type=bind,source=/host,target=/data"}},
 	} {
-		b := &fakeBackend{}
-		var stdout, stderr bytes.Buffer
-		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
-			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		mounts, err := parseHostMounts(input.volumes, input.mounts)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if b.runRequest.reference != "" {
-			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		if len(mounts) != 1 || !mounts[0].ManagedCoW || mounts[0].Readonly || mounts[0].Copy {
+			t.Errorf("writable host mounts=%+v", mounts)
 		}
 	}
 }
@@ -3556,10 +3558,23 @@ func TestParseManagedCoWHostMount(t *testing.T) {
 	if len(mounts) != 2 || !mounts[0].ManagedCoW || !mounts[1].ManagedCoW || mounts[0].Readonly || mounts[1].Readonly || !mounts[0].ImmutableSource || !mounts[1].ImmutableSource {
 		t.Errorf("managed CoW host mounts=%+v", mounts)
 	}
-	for _, value := range []string{"/host:/data:cow", "/host:/data:ro,cow,immutable-source"} {
+	for _, value := range []string{"/host:/data:ro,cow,immutable-source", "/host:/data:cow,copy"} {
 		if _, err := parseHostMounts([]string{value}, nil); err == nil {
 			t.Errorf("parseHostMounts accepted invalid managed CoW mount %q", value)
 		}
+	}
+}
+
+func TestParseCopiedHostMount(t *testing.T) {
+	mounts, err := parseHostMounts(
+		[]string{"/host/a:/data:copy"},
+		[]string{"type=bind,source=/host/b,target=/config,copy=true"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 2 || !mounts[0].Copy || !mounts[1].Copy || mounts[0].ManagedCoW || mounts[1].ManagedCoW {
+		t.Errorf("copied host mounts=%+v", mounts)
 	}
 }
 
@@ -3579,7 +3594,29 @@ func TestInspectManagedCoWHostMount(t *testing.T) {
 	if got, want := info.HostConfig.Binds, []string{"/host/lower:/data:rw,cow"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("managed CoW binds=%q, want %q", got, want)
 	}
-	if got := info.TTC.ExternalViews; len(got) != 1 || !got[0].ManagedCoW || !got[0].ImmutableSourceAsserted || got[0].Readonly || got[0].Semantics != "branch-local-cow-over-user-asserted-immutable-host-lower" {
+	if got := info.TTC.ExternalViews; len(got) != 1 || !got[0].ManagedCoW || !got[0].ImmutableSourceAsserted || got[0].Readonly || got[0].Semantics != "branch-local-persistent-cow-over-user-asserted-immutable-host-lower" {
 		t.Errorf("managed CoW external view=%+v", got)
+	}
+}
+
+func TestInspectCopiedHostMount(t *testing.T) {
+	spec := &specs.Spec{
+		Process: &specs.Process{},
+		Mounts: []specs.Mount{{
+			Type: "ttcvol", Source: "/run/ttc/host-mounts/id", Destination: "/data", Options: []string{"rw"},
+		}},
+		Annotations: map[string]string{
+			ttcbundle.CopiedHostMountsAnnotation: `{"/data":"/host/source"}`,
+		},
+	}
+	info := buildInspectInfo(ttcbundle.ContainerInfo{Name: "demo"}, spec, nil, "")
+	if len(info.Mounts) != 1 || info.Mounts[0].Type != "bind" || info.Mounts[0].Source != "/host/source" || info.Mounts[0].Mode != "rw,copy" {
+		t.Errorf("copied inspect mounts=%+v", info.Mounts)
+	}
+	if got, want := info.HostConfig.Binds, []string{"/host/source:/data:rw,copy"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("copied binds=%q, want %q", got, want)
+	}
+	if len(info.TTC.ExternalViews) != 0 {
+		t.Errorf("copied mount reported as external view: %+v", info.TTC.ExternalViews)
 	}
 }

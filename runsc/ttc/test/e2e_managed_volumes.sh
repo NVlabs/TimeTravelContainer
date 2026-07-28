@@ -50,6 +50,10 @@ SEEDED_VOLUME="$PREFIX-seeded"
 EMPTY_VOLUME="$PREFIX-empty"
 ROOTFS_CONTAINER="$PREFIX-rootfs"
 CREATED_CONTAINER="$PREFIX-created"
+HOST_COW_CONTAINER="$PREFIX-host-cow"
+HOST_COPY_CONTAINER="$PREFIX-host-copy"
+HOST_COW_RESTORED="$PREFIX-host-cow-restored"
+HOST_COPY_RESTORED="$PREFIX-host-copy-restored"
 
 ttc() {
   "$TTC" \
@@ -121,6 +125,112 @@ ttc start "$CREATED_CONTAINER" >/dev/null
 ttc exec "$CREATED_CONTAINER" test -f /created-import
 ttc stop "$CREATED_CONTAINER" >/dev/null
 ttc rm "$CREATED_CONTAINER" >/dev/null
+
+# A writable host path is a live read-only lower with a private persistent
+# ttcvol upper. Guest writes never reach the host, survive restart, and split
+# with the rest of the family during live fork.
+HOST_COW_SOURCE="$TTC_E2E_ROOT/host-cow-source"
+mkdir -p "$HOST_COW_SOURCE"
+printf 'host-lower\n' >"$HOST_COW_SOURCE/value"
+ttc run -d --name "$HOST_COW_CONTAINER" -v "$HOST_COW_SOURCE:/data" "$BUSYBOX_IMAGE" \
+  sh -c 'while :; do sleep 60; done' >/dev/null
+[ "$(ttc exec "$HOST_COW_CONTAINER" cat /data/value)" = host-lower ] ||
+  fail "writable host mount did not expose its lower"
+ttc exec "$HOST_COW_CONTAINER" sh -c 'echo parent >/data/value; echo parent-created >/data/created'
+[ "$(cat "$HOST_COW_SOURCE/value")" = host-lower ] ||
+  fail "writable host mount modified its host lower"
+test ! -e "$HOST_COW_SOURCE/created" ||
+  fail "writable host mount created a host file"
+HOST_COW_ID=$(ttc inspect -f '{{.Id}}' "$HOST_COW_CONTAINER")
+find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
+  fail "writable host mount did not write directly to a private repository"
+ttc fork "$HOST_COW_CONTAINER" child >/dev/null
+ttc exec "$HOST_COW_CONTAINER@child" sh -c 'test "$(cat /data/value)" = parent; echo child >/data/value; echo child >/data/child'
+ttc exec "$HOST_COW_CONTAINER@main" sh -c 'test "$(cat /data/value)" = parent; test ! -e /data/child'
+printf 'host-added\n' >"$HOST_COW_SOURCE/added"
+for branch in main child; do
+  ttc exec "$HOST_COW_CONTAINER@$branch" sh -c 'test "$(cat /data/added)" = host-added'
+done
+HOST_COW_CHECKPOINT="$TTC_E2E_ROOT/host-cow-checkpoint.ttc"
+ttc checkpoint "$HOST_COW_CONTAINER" "$HOST_COW_CHECKPOINT" >/dev/null
+printf 'host-after-checkpoint\n' >"$HOST_COW_SOURCE/added"
+ttc restore --name "$HOST_COW_RESTORED" "$HOST_COW_CHECKPOINT" >/dev/null
+ttc exec "$HOST_COW_RESTORED" sh -c '
+  test "$(cat /data/value)" = parent
+  test "$(cat /data/added)" = host-added
+  echo restored >/data/added
+'
+[ "$(cat "$HOST_COW_SOURCE/added")" = host-after-checkpoint ] ||
+  fail "restored writable host mount wrote through to the original host"
+ttc stop "$HOST_COW_RESTORED" >/dev/null
+ttc rm "$HOST_COW_RESTORED" >/dev/null
+ttc stop "$HOST_COW_CONTAINER@child" >/dev/null
+ttc stop "$HOST_COW_CONTAINER" >/dev/null
+HOST_COW_EXPORT="$TTC_E2E_ROOT/host-cow-export"
+HOST_COW_IMPORT="$TTC_E2E_ROOT/host-cow-import"
+printf 'offline-host-mount\n' >"$HOST_COW_IMPORT"
+ttc cp "$HOST_COW_CONTAINER:/data/value" "$HOST_COW_EXPORT"
+[ "$(cat "$HOST_COW_EXPORT")" = parent ] ||
+  fail "stopped-container cp did not read the writable host mount upper"
+ttc cp "$HOST_COW_IMPORT" "$HOST_COW_CONTAINER:/data/offline"
+ttc start "$HOST_COW_CONTAINER" >/dev/null
+ttc exec "$HOST_COW_CONTAINER" sh -c '
+  test "$(cat /data/value)" = parent
+  test "$(cat /data/created)" = parent-created
+  test "$(cat /data/offline)" = offline-host-mount
+'
+ttc stop "$HOST_COW_CONTAINER" >/dev/null
+ttc rm "$HOST_COW_CONTAINER" >/dev/null
+
+# :copy explicitly imports the complete source and then severs the runtime
+# dependency on it. Directory and single-file roots are both supported.
+HOST_COPY_SOURCE="$TTC_E2E_ROOT/host-copy-source"
+HOST_COPY_FILE="$TTC_E2E_ROOT/host-copy-file"
+mkdir -p "$HOST_COPY_SOURCE/sub"
+printf 'copied-directory\n' >"$HOST_COPY_SOURCE/sub/value"
+printf 'copied-file\n' >"$HOST_COPY_FILE"
+ttc run -d --name "$HOST_COPY_CONTAINER" \
+  -v "$HOST_COPY_SOURCE:/copied:copy" \
+  -v "$HOST_COPY_FILE:/single:copy" \
+  "$BUSYBOX_IMAGE" sh -c 'while :; do sleep 60; done' >/dev/null
+printf 'host-mutated\n' >"$HOST_COPY_SOURCE/sub/value"
+printf 'host-mutated\n' >"$HOST_COPY_FILE"
+ttc exec "$HOST_COPY_CONTAINER" sh -c '
+  test "$(cat /copied/sub/value)" = copied-directory
+  test "$(cat /single)" = copied-file
+  echo container >/copied/sub/value
+  echo container-file >/single
+'
+[ "$(cat "$HOST_COPY_SOURCE/sub/value")" = host-mutated ] ||
+  fail ":copy directory wrote through to the host"
+[ "$(cat "$HOST_COPY_FILE")" = host-mutated ] ||
+  fail ":copy file wrote through to the host"
+HOST_COPY_CHECKPOINT="$TTC_E2E_ROOT/host-copy-checkpoint.ttc"
+ttc checkpoint "$HOST_COPY_CONTAINER" "$HOST_COPY_CHECKPOINT" >/dev/null
+rm -rf "$HOST_COPY_SOURCE"
+rm -f "$HOST_COPY_FILE"
+ttc restore --name "$HOST_COPY_RESTORED" "$HOST_COPY_CHECKPOINT" >/dev/null
+ttc exec "$HOST_COPY_RESTORED" sh -c '
+  test "$(cat /copied/sub/value)" = container
+  test "$(cat /single)" = container-file
+'
+ttc stop "$HOST_COPY_RESTORED" >/dev/null
+ttc rm "$HOST_COPY_RESTORED" >/dev/null
+ttc fork "$HOST_COPY_CONTAINER" child >/dev/null
+ttc exec "$HOST_COPY_CONTAINER@child" sh -c 'echo child >/copied/sub/value; echo child-file >/single'
+ttc exec "$HOST_COPY_CONTAINER@main" sh -c '
+  test "$(cat /copied/sub/value)" = container
+  test "$(cat /single)" = container-file
+'
+[ "$(ttc inspect -f '{{(index .Mounts 0).Mode}}|{{(index .Mounts 1).Mode}}|{{len .TTC.ExternalViews}}' "$HOST_COPY_CONTAINER")" = \
+  "rw,copy|rw,copy|0" ] || fail ":copy inspection did not report detached mounts"
+ttc stop "$HOST_COPY_CONTAINER@child" >/dev/null
+ttc stop "$HOST_COPY_CONTAINER" >/dev/null
+HOST_COPY_EXPORT="$TTC_E2E_ROOT/host-copy-export"
+ttc cp "$HOST_COPY_CONTAINER:/single" "$HOST_COPY_EXPORT"
+[ "$(cat "$HOST_COPY_EXPORT")" = container-file ] ||
+  fail "stopped-container cp did not read a copied single-file mount"
+ttc rm "$HOST_COPY_CONTAINER" >/dev/null
 
 # A new volume copies the image destination directly into its repository once;
 # nocopy creates the same mount with an empty root.

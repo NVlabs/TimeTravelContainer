@@ -48,8 +48,12 @@ const (
 	InternalMountsAnnotation = "dev.timetravelcontainer.config.internal-mounts"
 	// ImmutableHostMountsAnnotation records user-attested immutable host sources.
 	ImmutableHostMountsAnnotation = "dev.timetravelcontainer.config.immutable-host-mounts"
-	// ManagedCoWHostMountsAnnotation records host binds with branch-local memory uppers.
+	// ManagedCoWHostMountsAnnotation records host binds with branch-local
+	// persistent ttcvol uppers.
 	ManagedCoWHostMountsAnnotation = "dev.timetravelcontainer.config.managed-cow-host-mounts"
+	// CopiedHostMountsAnnotation maps detached TTC-volume mount destinations to
+	// the host paths from which they were imported.
+	CopiedHostMountsAnnotation = "dev.timetravelcontainer.config.copied-host-mounts"
 
 	// DefaultStopSignal matches Docker's default graceful-termination signal.
 	DefaultStopSignal = "SIGTERM"
@@ -147,9 +151,8 @@ type ManagedVolume struct {
 	CopyMode       string `json:"-"`
 }
 
-// HostMount describes a host path exposed through a gofer bind. Writable
-// mounts require ManagedCoW, which keeps the gofer lower read-only and places a
-// branch-local Sentry-memory OverlayFS upper above it.
+// HostMount describes a host path exposed through a read-only gofer bind, a
+// persistent CoW overlay, or a detached copy in a private ttcvol repository.
 type HostMount struct {
 	Source          string
 	Destination     string
@@ -157,6 +160,10 @@ type HostMount struct {
 	Internal        bool
 	ImmutableSource bool
 	ManagedCoW      bool
+	Copy            bool
+	RepositoryID    string
+	RepositoryPath  string
+	CopyMode        string
 }
 
 // FilesystemMount describes a Sentry-implemented tmpfs, procfs, or sysfs mount.
@@ -774,7 +781,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		}
 		annotations[TmpfsConfigAnnotation] = string(encoded)
 	}
-	volumeRepositories := make([]specutils.TTCVolumeRepository, 0, len(opts.ManagedVolumes)+1)
+	volumeRepositories := make([]specutils.TTCVolumeRepository, 0, len(opts.ManagedVolumes)+len(opts.HostMounts)+1)
 	if opts.RootfsUpperRepositoryPath != "" || opts.RootfsUpperCopyMode != "" {
 		if opts.ReadonlyRootfs {
 			return nil, fmt.Errorf("read-only rootfs cannot have a writable upper repository")
@@ -816,27 +823,26 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Source: source, Path: volume.RepositoryPath, Branch: "main", CopyMode: volume.CopyMode,
 		})
 	}
-	if len(volumeRepositories) != 0 {
-		encoded, err := json.Marshal(volumeRepositories)
-		if err != nil {
-			return nil, fmt.Errorf("encoding TTC volume repositories: %w", err)
-		}
-		annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-	}
+	copiedHostMounts := make(map[string]string)
 	for _, mount := range opts.HostMounts {
-		if !mount.Readonly && !mount.ManagedCoW {
-			return nil, fmt.Errorf("host mount %q at %q is writable; use an explicit managed CoW mount", mount.Source, mount.Destination)
+		if !mount.Readonly && !mount.ManagedCoW && !mount.Copy {
+			return nil, fmt.Errorf("host mount %q at %q is writable without TTC isolation", mount.Source, mount.Destination)
 		}
-		if mount.ManagedCoW && (mount.Readonly || !mount.ImmutableSource) {
-			return nil, fmt.Errorf("managed CoW host mount %q at %q requires a writable mount and immutable-source", mount.Source, mount.Destination)
+		if mount.Readonly && (mount.ManagedCoW || mount.Copy) {
+			return nil, fmt.Errorf("read-only host mount %q at %q cannot have a writable TTC layer", mount.Source, mount.Destination)
+		}
+		if mount.ManagedCoW && mount.Copy {
+			return nil, fmt.Errorf("host mount %q at %q cannot be both CoW and copied", mount.Source, mount.Destination)
 		}
 		if !filepath.IsAbs(mount.Source) {
 			return nil, fmt.Errorf("host mount source %q is not absolute", mount.Source)
 		}
-		if info, err := os.Stat(mount.Source); err != nil {
-			return nil, fmt.Errorf("stating host mount source %q: %w", mount.Source, err)
-		} else if info.Mode()&os.ModeSocket != 0 || info.Mode()&os.ModeNamedPipe != 0 || info.Mode()&os.ModeDevice != 0 {
-			return nil, fmt.Errorf("host mount source %q is not a regular file or directory", mount.Source)
+		if !mount.Copy {
+			if info, err := os.Stat(mount.Source); err != nil {
+				return nil, fmt.Errorf("stating host mount source %q: %w", mount.Source, err)
+			} else if info.Mode()&os.ModeSocket != 0 || info.Mode()&os.ModeNamedPipe != 0 || info.Mode()&os.ModeDevice != 0 {
+				return nil, fmt.Errorf("host mount source %q is not a regular file or directory", mount.Source)
+			}
 		}
 		destination := filepath.Clean(mount.Destination)
 		if !filepath.IsAbs(destination) || destination == "/" {
@@ -846,16 +852,55 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("duplicate mount destination %q", destination)
 		}
 		seenDestinations[destination] = struct{}{}
-		options := []string{"rbind", "rw"}
-		if mount.Readonly {
-			options[1] = "ro"
+		if !mount.Readonly {
+			if mount.RepositoryID == "" || mount.RepositoryPath == "" || mount.CopyMode == "" {
+				return nil, fmt.Errorf("writable host mount %q at %q is missing resolved repository metadata", mount.Source, mount.Destination)
+			}
+			repositorySource := filepath.Join("/run/ttc/host-mounts", mount.RepositoryID)
+			repository := specutils.TTCVolumeRepository{
+				Source: repositorySource, Path: mount.RepositoryPath, Branch: "main",
+				CopyMode: mount.CopyMode, Private: true,
+			}
+			if mount.Copy {
+				mounts = append(mounts, specs.Mount{
+					Destination: destination,
+					Type:        "ttcvol",
+					Source:      repositorySource,
+					Options:     []string{"rw"},
+				})
+				copiedHostMounts[destination] = filepath.Clean(mount.Source)
+			} else {
+				repository.OverlayDestination = destination
+				mounts = append(mounts, specs.Mount{
+					Destination: destination,
+					Type:        "bind",
+					Source:      filepath.Clean(mount.Source),
+					Options:     []string{"rbind", "rw"},
+				})
+			}
+			volumeRepositories = append(volumeRepositories, repository)
+			continue
 		}
 		mounts = append(mounts, specs.Mount{
 			Destination: destination,
 			Type:        "bind",
 			Source:      filepath.Clean(mount.Source),
-			Options:     options,
+			Options:     []string{"rbind", "ro"},
 		})
+	}
+	if len(volumeRepositories) != 0 {
+		encoded, err := json.Marshal(volumeRepositories)
+		if err != nil {
+			return nil, fmt.Errorf("encoding TTC volume repositories: %w", err)
+		}
+		annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+	}
+	if len(copiedHostMounts) != 0 {
+		encoded, err := json.Marshal(copiedHostMounts)
+		if err != nil {
+			return nil, fmt.Errorf("encoding copied host mounts: %w", err)
+		}
+		annotations[CopiedHostMountsAnnotation] = string(encoded)
 	}
 	internalMounts := make([]string, 0)
 	immutableHostMounts := make([]string, 0)

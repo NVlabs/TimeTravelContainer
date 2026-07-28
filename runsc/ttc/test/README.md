@@ -107,12 +107,14 @@ covers:
   Chromium exercises;
 - exact validation of systrap's `mov $sysno,%eax; syscall` fast-path pattern,
   preventing false-positive rewriting of unrelated Chromium/V8 JIT code;
-- simultaneous read-only host binds, write rejection, shared-view fork warnings,
-  host-side mutation visibility in parent and child, and an explicitly unenforced
-  `immutable-source` attestation;
-- explicit managed OverlayFS host submounts, immutable-lower protection, inspect
-  and fork diagnostics, parent/child/grandchild CoW divergence, and continued
-  operation after deletion of the source branch;
+- simultaneous read-only host binds, write rejection, shared-view fork
+  warnings, and host-side mutation visibility in parent and child;
+- persistent isolated writable host views, protection of the host lower,
+  visibility of uncopied live-lower changes, stop/start persistence, stopped
+  `ttc cp`, checkpoint/restore, inspect output, and parent/child CoW divergence;
+- detached `:copy` imports for directories and individual files, source
+  deletion independence, fork divergence, inspect output, and
+  checkpoint/restore;
 - graceful stop, branch removal, and container removal.
 
 The dedicated disk-volume suite additionally covers the ordinary rootfs upper:

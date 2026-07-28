@@ -38,11 +38,10 @@ func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 	if err != nil {
 		return nil, err
 	}
-	rootDir, ok := rootInode.impl.(*directory)
-	if !ok {
-		return nil, fmt.Errorf("volume root inode %d is not a directory", ttcvolume.RootInode)
+	if rootDir, ok := rootInode.impl.(*directory); ok {
+		return &rootDir.dentry, nil
 	}
-	return &rootDir.dentry, nil
+	return fs.newDentry(rootInode), nil
 }
 
 func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[uint64]*inode, visiting map[uint64]bool) (*inode, error) {

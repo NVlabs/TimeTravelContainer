@@ -133,6 +133,93 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	}
 }
 
+func TestSeedCopiedHostMountDirectoryAndFile(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := t.TempDir()
+	if err := os.Mkdir(filepath.Join(source, "nested"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	payloadPath := filepath.Join(source, "nested", "payload")
+	if err := os.WriteFile(payloadPath, []byte("host-data"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(payloadPath, filepath.Join(source, "hardlink")); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("copied-directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedCopiedHostMount(repository, source, info); err != nil {
+		t.Fatal(err)
+	}
+	nested, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := repository.Lookup(ttcvolume.MainBranch, nested, "payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hardlink, err := repository.Lookup(ttcvolume.MainBranch, ttcvolume.RootInode, "hardlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload != hardlink {
+		t.Fatalf("hardlink inode=%d, want %d", hardlink, payload)
+	}
+	got := make([]byte, len("host-data"))
+	if _, err := repository.ReadAt(ttcvolume.MainBranch, payload, got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "host-data" {
+		t.Fatalf("copied payload=%q", got)
+	}
+
+	fileSource := filepath.Join(t.TempDir(), "single")
+	if err := os.WriteFile(fileSource, []byte("single-file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileRepository, err := manager.Create("copied-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fileRepository.Close()
+	fileInfo, err := os.Stat(fileSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := hostFileOwner(fileInfo)
+	if err := fileRepository.InitializeRootRegular(uint32(fileInfo.Mode().Perm()), uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedCopiedHostMount(fileRepository, fileSource, fileInfo); err != nil {
+		t.Fatal(err)
+	}
+	root, err := fileRepository.Inode(ttcvolume.MainBranch, ttcvolume.RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Type != "regular" || root.Mode != 0600 || root.Size != int64(len("single-file")) {
+		t.Fatalf("copied file root=%+v", root)
+	}
+	got = make([]byte, len("single-file"))
+	if _, err := fileRepository.ReadAt(ttcvolume.MainBranch, ttcvolume.RootInode, got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "single-file" {
+		t.Fatalf("copied file=%q", got)
+	}
+}
+
 func TestBuildSpecDonatesPersistentRootfsUpper(t *testing.T) {
 	rootfs := t.TempDir()
 	repository := filepath.Join(t.TempDir(), "rootfs-upper")
@@ -1265,6 +1352,8 @@ func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 		RootFS: t.TempDir(),
 		HostMounts: []HostMount{{
 			Source: host, Destination: "/data", ImmutableSource: true, ManagedCoW: true,
+			RepositoryID:   "0123456789abcdef0123456789abcdef",
+			RepositoryPath: "/repository", CopyMode: "reflink",
 		}},
 	})
 	if err != nil {
@@ -1282,11 +1371,44 @@ func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	}
 	for _, invalid := range []HostMount{
 		{Source: host, Destination: "/data", ManagedCoW: true},
-		{Source: host, Destination: "/data", Readonly: true, ImmutableSource: true, ManagedCoW: true},
+		{
+			Source: host, Destination: "/data", Readonly: true, ManagedCoW: true,
+			RepositoryID:   "0123456789abcdef0123456789abcdef",
+			RepositoryPath: "/repository", CopyMode: "reflink",
+		},
 	} {
 		if _, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), HostMounts: []HostMount{invalid}}); err == nil {
 			t.Errorf("BuildSpec accepted invalid managed CoW mount %+v", invalid)
 		}
+	}
+}
+
+func TestBuildSpecCopiedHostMount(t *testing.T) {
+	host := t.TempDir()
+	spec, err := BuildSpec(ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}, SpecOptions{
+		RootFS: t.TempDir(),
+		HostMounts: []HostMount{{
+			Source: host, Destination: "/data", Copy: true,
+			RepositoryID:   "0123456789abcdef0123456789abcdef",
+			RepositoryPath: "/repository", CopyMode: "reflink",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := spec.Mounts[len(spec.Mounts)-1]
+	if mount.Type != "ttcvol" || mount.Destination != "/data" || !reflect.DeepEqual(mount.Options, []string{"rw"}) {
+		t.Fatalf("copied mount=%+v", mount)
+	}
+	if got, want := spec.Annotations[CopiedHostMountsAnnotation], `{"`+"/data"+`":"`+host+`"}`; got != want {
+		t.Errorf("copied annotation=%q, want %q", got, want)
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositories) != 1 || !repositories[0].Private || repositories[0].OverlayDestination != "" {
+		t.Errorf("copied repositories=%+v", repositories)
 	}
 }
 
