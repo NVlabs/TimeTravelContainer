@@ -40,6 +40,59 @@ func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
 	}
 }
 
+func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
+	server := &daemonServer{
+		root:                  "/run/ttc/runsc",
+		runsc:                 "/opt/ttc/bin/ttcd",
+		dataRoot:              "/var/lib/ttc",
+		clientExecutable:      "/opt/ttc/bin/ttc",
+		unsafeNoHostIsolation: true,
+	}
+	opts := server.optionsFromRequest(daemonWireOptions{})
+	if got, want := opts.root, server.root; got != want {
+		t.Errorf("root=%q, want %q", got, want)
+	}
+	if got, want := opts.runsc, server.runsc; got != want {
+		t.Errorf("runsc=%q, want %q", got, want)
+	}
+	if got, want := opts.dataRoot, server.dataRoot; got != want {
+		t.Errorf("data root=%q, want %q", got, want)
+	}
+	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
+		t.Errorf("client executable=%q, want %q", got, want)
+	}
+	if !opts.unsafeNoHostIsolation {
+		t.Error("unsafe-no-host-isolation daemon mode was not applied")
+	}
+}
+
+func TestDaemonRequestOptionsPreserveClientRuntimeOverrides(t *testing.T) {
+	server := &daemonServer{
+		root:             "/default/root",
+		runsc:            "/default/ttcd",
+		dataRoot:         "/daemon/data",
+		clientExecutable: "/default/ttc",
+	}
+	opts := server.optionsFromRequest(daemonWireOptions{
+		Root:             "/custom/root",
+		Runsc:            "/custom/ttcd",
+		DataRoot:         "/ignored/client/data",
+		ClientExecutable: "/custom/ttc",
+	})
+	if got, want := opts.root, "/custom/root"; got != want {
+		t.Errorf("root=%q, want %q", got, want)
+	}
+	if got, want := opts.runsc, "/custom/ttcd"; got != want {
+		t.Errorf("runsc=%q, want %q", got, want)
+	}
+	if got, want := opts.dataRoot, server.dataRoot; got != want {
+		t.Errorf("data root=%q, want daemon-owned %q", got, want)
+	}
+	if got, want := opts.clientExecutable, "/custom/ttc"; got != want {
+		t.Errorf("client executable=%q, want %q", got, want)
+	}
+}
+
 func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
 	var stdout, stderr bytes.Buffer

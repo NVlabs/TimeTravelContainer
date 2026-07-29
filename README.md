@@ -407,6 +407,22 @@ Stop the daemon when it is no longer needed:
 ttc daemon stop
 ```
 
+## SDKs and agent integration
+
+Applications can connect directly to `ttcd` without invoking the `ttc` CLI.
+The `ttcx` bindings expose TTC commands as structured results with separate
+stdout, stderr, and exit status:
+
+- [Python SDK](sdk/python/README.md)
+- [TypeScript SDK](sdk/typescript/README.md)
+- [Rust SDK](sdk/rust/README.md)
+- [MCP server for coding agents and MCP clients](sdk/mcp/README.md)
+
+All bindings include lifecycle conveniences such as run, exec, fork, pause,
+resume, stop, and remove, plus a raw command method covering the complete
+non-interactive TTC interface. See the [local API protocol](sdk/PROTOCOL.md)
+when implementing another language binding.
+
 ## Networking example
 
 Start nginx with outbound access, a chosen virtual address, and a published

@@ -1,0 +1,13 @@
+[package]
+name = "ttcx"
+version = "0.1.0"
+edition = "2021"
+description = "Rust SDK for TimeTravelContainer"
+license = "Apache-2.0"
+repository = "https://github.com/gzz2000/TimeTravelOS"
+keywords = ["container", "gvisor", "sandbox"]
+categories = ["api-bindings"]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"

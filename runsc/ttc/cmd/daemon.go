@@ -78,6 +78,9 @@ type daemonServer struct {
 	listener              net.Listener
 	unsafeNoHostIsolation bool
 	dataRoot              string
+	root                  string
+	runsc                 string
+	clientExecutable      string
 	volumeCapability      ttcvolume.Capability
 
 	stopOnce sync.Once
@@ -317,6 +320,41 @@ func optionsFromWire(w daemonWireOptions) options {
 	}
 }
 
+// optionsFromRequest applies daemon-owned defaults to fields omitted by direct
+// API clients. The CLI still sends these fields for compatibility, but SDKs
+// should not need to know how ttcd was installed or where it keeps runtime
+// state.
+func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
+	opts := optionsFromWire(w)
+	if opts.root == "" {
+		opts.root = s.root
+	}
+	if opts.runsc == "" {
+		opts.runsc = s.runsc
+	}
+	if opts.clientExecutable == "" {
+		opts.clientExecutable = s.clientExecutable
+	}
+	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+	opts.dataRoot = s.dataRoot
+	return opts
+}
+
+func siblingTTCExecutable() string {
+	executable, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if filepath.Base(executable) == "ttc" {
+		return executable
+	}
+	sibling := filepath.Join(filepath.Dir(executable), "ttc")
+	if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+		return sibling
+	}
+	return ""
+}
+
 // RunDaemon serves the versioned TTC local API. It is used by the standalone
 // ttcd binary and by ttc's private daemon entry point.
 func RunDaemon(args []string, stdout, stderr io.Writer) int {
@@ -468,6 +506,9 @@ func serveDaemon(socket string, unsafeNoHostIsolation bool, dataRoot string, vol
 		listener:              listener,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
 		dataRoot:              dataRoot,
+		root:                  runtimeRoot(),
+		runsc:                 runscPath(),
+		clientExecutable:      siblingTTCExecutable(),
 		volumeCapability:      volumeCapability,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
@@ -558,9 +599,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	case "stop":
 		if request.Options != (daemonWireOptions{}) {
-			opts := optionsFromWire(request.Options)
-			opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
-			opts.dataRoot = s.dataRoot
+			opts := s.optionsFromRequest(request.Options)
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			s.configureVolumeBackend(backend)
@@ -597,9 +636,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	terminalInput := newDaemonTerminalInput(stdinReader, conn, &writeMu)
 	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
-	opts := optionsFromWire(request.Options)
-	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
-	opts.dataRoot = s.dataRoot
+	opts := s.optionsFromRequest(request.Options)
 	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
 	if err != nil {
 		stdinReader.Close()

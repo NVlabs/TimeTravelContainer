@@ -1,0 +1,195 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { McpServer } from "@modelcontextprotocol/server";
+import * as z from "zod/v4";
+import { Client, type Result } from "ttcx";
+
+type ToolResponse = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+};
+
+function commandResponse(result: Result): ToolResponse {
+  const parts: string[] = [];
+  if (result.stdout.length) parts.push(result.stdoutText());
+  if (result.stderr.length) parts.push(result.stderrText());
+  if (!parts.length) parts.push(`TTC command completed with status ${result.status}.`);
+  return {
+    content: [{ type: "text", text: parts.join("") }],
+    ...(result.ok ? {} : { isError: true }),
+  };
+}
+
+function jsonResponse(value: unknown): ToolResponse {
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+  };
+}
+
+export function createServer(client = new Client()): McpServer {
+  const server = new McpServer(
+    { name: "ttcx-mcp", version: "0.1.0" },
+    {
+      instructions:
+        "Manage TimeTravelContainer through ttcd. Tools are non-interactive; use ttc directly for a TTY.",
+    },
+  );
+
+  server.registerTool(
+    "ttc_status",
+    {
+      description: "Show ttcd status and capabilities.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async () => jsonResponse(await client.ping()),
+  );
+
+  server.registerTool(
+    "ttc_list",
+    {
+      description: "List TTC container families and their live-fork branches.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async () => jsonResponse(await client.list()),
+  );
+
+  server.registerTool(
+    "ttc_inspect",
+    {
+      description: "Inspect a TTC container or branch.",
+      inputSchema: { target: z.string().describe("Container or container@branch") },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ target }) => jsonResponse(await client.inspect(target)),
+  );
+
+  server.registerTool(
+    "ttc_pull",
+    {
+      description: "Pull an OCI image into TTC.",
+      inputSchema: { image: z.string() },
+      annotations: { idempotentHint: true, openWorldHint: true },
+    },
+    async ({ image }) => commandResponse(await client.pull(image)),
+  );
+
+  server.registerTool(
+    "ttc_run",
+    {
+      description: "Start a non-interactive container from an OCI image.",
+      inputSchema: {
+        image: z.string(),
+        name: z.string().optional(),
+        command: z.array(z.string()).default([]),
+        detach: z.boolean().default(true),
+        options: z
+          .array(z.string())
+          .default([])
+          .describe("Additional ttc run options placed before the image"),
+      },
+      annotations: { destructiveHint: true, openWorldHint: true },
+    },
+    async ({ image, name, command, detach, options }) => {
+      const runOptions = [...options];
+      if (detach) runOptions.push("-d");
+      if (name) runOptions.push("--name", name);
+      return commandResponse(await client.run(image, command, runOptions));
+    },
+  );
+
+  server.registerTool(
+    "ttc_exec",
+    {
+      description: "Run a non-interactive command in an existing TTC branch.",
+      inputSchema: {
+        target: z.string().describe("Container or container@branch"),
+        command: z.array(z.string()).min(1),
+        stdin: z.string().optional(),
+      },
+      annotations: { destructiveHint: true, openWorldHint: true },
+    },
+    async ({ target, command, stdin }) =>
+      commandResponse(await client.exec(target, command, { input: stdin })),
+  );
+
+  server.registerTool(
+    "ttc_fork",
+    {
+      description: "Live-fork a running TTC container branch.",
+      inputSchema: {
+        source: z.string().describe("Source container or container@branch"),
+        destination: z.string().describe("New container@branch name"),
+        paused: z.boolean().default(false),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ source, destination, paused }) =>
+      commandResponse(await client.fork(source, destination, paused)),
+  );
+
+  for (const [name, description] of [
+    ["pause", "Pause a running TTC branch."],
+    ["resume", "Resume a paused TTC branch."],
+    ["stop", "Stop a TTC container branch."],
+  ] as const) {
+    server.registerTool(
+      `ttc_${name}`,
+      {
+        description,
+        inputSchema: { target: z.string() },
+        annotations: { destructiveHint: true, idempotentHint: true },
+      },
+      async ({ target }) => commandResponse(await client[name](target)),
+    );
+  }
+
+  server.registerTool(
+    "ttc_remove",
+    {
+      description: "Remove a TTC container or branch.",
+      inputSchema: {
+        target: z.string(),
+        force: z.boolean().default(false),
+      },
+      annotations: { destructiveHint: true, idempotentHint: true },
+    },
+    async ({ target, force }) => commandResponse(await client.remove(target, force)),
+  );
+
+  server.registerTool(
+    "ttc_command",
+    {
+      description:
+        "Run any non-interactive TTC command not covered by another tool. Arguments exclude the ttc executable name.",
+      inputSchema: {
+        args: z.array(z.string()).min(1),
+        stdin: z.string().optional(),
+        requestId: z
+          .string()
+          .optional()
+          .describe("Reuse only to retry the exact same mutating request"),
+      },
+      annotations: { destructiveHint: true, openWorldHint: true },
+    },
+    async ({ args, stdin, requestId }) =>
+      commandResponse(
+        await client.command(args, { input: stdin, requestId }),
+      ),
+  );
+
+  return server;
+}
