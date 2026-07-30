@@ -11,8 +11,16 @@ shared through copy-on-write until either branch modifies them, so a fork does
 not copy all container RAM or create a checkpoint image.
 
 TTC is forked from [Google's gVisor](https://github.com/google/gvisor) and
-builds on its userspace Linux runtime. It does not require KVM, CRIU, Docker,
-containerd, or root privileges at runtime.
+builds on its userspace Linux runtime.
+
+Compared with microVM-based solutions such as
+[forkd](https://github.com/deeplethe/forkd) and
+[AgentENV](https://github.com/kvcache-ai/AgentENV), TTC does not require
+hardware virtualization support such as KVM, root privileges, or special
+kernel modules. It supports Linux 4.14.77+ and can run nested inside Docker
+containers and other virtual machines. TTC is distributed as just two static
+Linux binaries, `ttc` and `ttcd`, with no Docker or containerd daemon,
+system-wide installation, or CRIU setup required.
 
 ```text
 demo@main
