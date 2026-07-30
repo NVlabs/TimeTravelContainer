@@ -1204,26 +1204,44 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			cmd.Args = append(cmd.Args, "--setup-root")
 
 			const nobody = 65534
+			sandboxID := uint32(nobody)
+			legacyUserNamespaceRoot := false
 			if rootlessEUID || conf.Rootless {
-				log.Infof("Rootless mode: sandbox will run as nobody inside user namespace, mapped to the current user, uid: %d, gid: %d", os.Getuid(), os.Getgid())
+				kernelVersion, err := hostos.KernelVersion()
+				if err != nil {
+					return fmt.Errorf("checking host kernel version for rootless sandbox credentials: %w", err)
+				}
+				if kernelVersion.LessThan(4, 3) {
+					// Ambient capabilities were added in Linux 4.3. On older
+					// kernels, execute as root inside the new user namespace
+					// so that the sandbox retains the capabilities it needs
+					// across exec. UID 0 remains mapped only to the caller's
+					// unprivileged host UID.
+					sandboxID = 0
+					legacyUserNamespaceRoot = true
+					log.Warningf("Host kernel %s predates ambient capabilities; starting the sandbox as root inside its private user namespace", kernelVersion)
+				}
+			}
+			if rootlessEUID || conf.Rootless {
+				log.Infof("Rootless mode: sandbox will run as uid %d inside user namespace, mapped to the current user, uid: %d, gid: %d", sandboxID, os.Getuid(), os.Getgid())
 			} else {
 				// Map nobody in the new namespace to nobody in the parent namespace.
 				s.UID = nobody
 				s.GID = nobody
 			}
 
-			// Set credentials to run as user and group nobody.
-			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: nobody, Gid: nobody}
+			// Set credentials inside the new user namespace.
+			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: sandboxID, Gid: sandboxID}
 			cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
 				{
-					ContainerID: nobody,
+					ContainerID: int(sandboxID),
 					HostID:      s.UID,
 					Size:        1,
 				},
 			}
 			cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
 				{
-					ContainerID: nobody,
+					ContainerID: int(sandboxID),
 					HostID:      s.GID,
 					Size:        1,
 				},
@@ -1231,15 +1249,17 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 			// A sandbox process will construct an empty root for itself, so it has
 			// to have CAP_SYS_ADMIN and CAP_SYS_CHROOT capabilities.
-			cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
-				uintptr(capability.CAP_SYS_ADMIN),
-				uintptr(capability.CAP_SYS_CHROOT),
-				// CAP_SETPCAP is required to clear the bounding set.
-				uintptr(capability.CAP_SETPCAP),
-			)
-			if gPlatform.Requirements().RequiresCapSysPtrace {
+			if !legacyUserNamespaceRoot {
 				cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
-					uintptr(capability.CAP_SYS_PTRACE))
+					uintptr(capability.CAP_SYS_ADMIN),
+					uintptr(capability.CAP_SYS_CHROOT),
+					// CAP_SETPCAP is required to clear the bounding set.
+					uintptr(capability.CAP_SETPCAP),
+				)
+				if gPlatform.Requirements().RequiresCapSysPtrace {
+					cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
+						uintptr(capability.CAP_SYS_PTRACE))
+				}
 			}
 		} else {
 			return fmt.Errorf("can't run sandbox process as user nobody since we don't have CAP_SETUID or CAP_SETGID")

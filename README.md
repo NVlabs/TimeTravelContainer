@@ -22,9 +22,6 @@ containers and other virtual machines. TTC is distributed as just two static
 Linux binaries, `ttc` and `ttcd`, with no Docker or containerd daemon,
 system-wide installation, or CRIU setup required.
 
-On Linux 3.17 through 4.14.76, `ttcd` automatically disables host GSO at
-startup and warns that large-payload network performance will be reduced.
-
 ```text
 demo@main
 ├── demo@test-a
@@ -487,6 +484,8 @@ container family with no ancestry or mutable storage shared with the source.
 ## Current limitations
 
 - TTC is not yet a production security boundary for hostile workloads.
+- On Linux 3.17 through 4.14.76, `ttcd` automatically disables host GSO.
+  Network performance, especially for large payloads, will be reduced.
 - Branches in one family share a runtime process, so a runtime failure can
   affect the whole family.
 - Fork duration depends on the number of processes, mappings, and resources.

@@ -1401,6 +1401,39 @@ func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 func fstatTo(hostFD int) (lisafs.Statx, error) {
 	var stat unix.Statx_t
 	if err := unix.Statx(hostFD, "", unix.AT_EMPTY_PATH, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat); err != nil {
+		if err == unix.ENOSYS {
+			var legacy unix.Stat_t
+			if err := unix.Fstat(hostFD, &legacy); err != nil {
+				return lisafs.Statx{}, err
+			}
+			return lisafs.Statx{
+				Mask:      unix.STATX_BASIC_STATS,
+				Mode:      uint16(legacy.Mode),
+				DevMinor:  uint32(unix.Minor(legacy.Dev)),
+				DevMajor:  uint32(unix.Major(legacy.Dev)),
+				Ino:       legacy.Ino,
+				Nlink:     uint32(legacy.Nlink),
+				UID:       legacy.Uid,
+				GID:       legacy.Gid,
+				RdevMinor: uint32(unix.Minor(legacy.Rdev)),
+				RdevMajor: uint32(unix.Major(legacy.Rdev)),
+				Size:      uint64(legacy.Size),
+				Blksize:   uint32(legacy.Blksize),
+				Blocks:    uint64(legacy.Blocks),
+				Atime: lisafs.StatxTimestamp{
+					Sec:  legacy.Atim.Sec,
+					Nsec: uint32(legacy.Atim.Nsec),
+				},
+				Mtime: lisafs.StatxTimestamp{
+					Sec:  legacy.Mtim.Sec,
+					Nsec: uint32(legacy.Mtim.Nsec),
+				},
+				Ctime: lisafs.StatxTimestamp{
+					Sec:  legacy.Ctim.Sec,
+					Nsec: uint32(legacy.Ctim.Nsec),
+				},
+			}, nil
+		}
 		return lisafs.Statx{}, err
 	}
 	return lisafs.Statx{
