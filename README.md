@@ -17,10 +17,13 @@ Compared with microVM-based solutions such as
 [forkd](https://github.com/deeplethe/forkd) and
 [AgentENV](https://github.com/kvcache-ai/AgentENV), TTC does not require
 hardware virtualization support such as KVM, root privileges, or special
-kernel modules. It supports Linux 4.14.77+ and can run nested inside Docker
+kernel modules. It supports Linux 3.17+ and can run nested inside Docker
 containers and other virtual machines. TTC is distributed as just two static
 Linux binaries, `ttc` and `ttcd`, with no Docker or containerd daemon,
 system-wide installation, or CRIU setup required.
+
+On Linux 3.17 through 4.14.76, `ttcd` automatically disables host GSO at
+startup and warns that large-payload network performance will be reduced.
 
 ```text
 demo@main

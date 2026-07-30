@@ -2487,6 +2487,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
 	}
+	wantOldKernel := append(append([]string(nil), wantHardened...), "--gso=false")
+	if got := (&runtimeBackend{root: "/runtime", disableHostGSO: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantOldKernel) {
+		t.Errorf("old-kernel runsc args=%q, want %q", got, wantOldKernel)
+	}
 }
 
 func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {

@@ -47,6 +47,7 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 		dataRoot:              "/var/lib/ttc",
 		clientExecutable:      "/opt/ttc/bin/ttc",
 		unsafeNoHostIsolation: true,
+		disableHostGSO:        true,
 	}
 	opts := server.optionsFromRequest(daemonWireOptions{})
 	if got, want := opts.root, server.root; got != want {
@@ -63,6 +64,9 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 	if !opts.unsafeNoHostIsolation {
 		t.Error("unsafe-no-host-isolation daemon mode was not applied")
+	}
+	if !opts.disableHostGSO {
+		t.Error("daemon host-GSO compatibility mode was not applied")
 	}
 }
 
@@ -93,6 +97,97 @@ func TestDaemonRequestOptionsPreserveClientRuntimeOverrides(t *testing.T) {
 	}
 }
 
+func TestHostKernelCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		release        string
+		version        hostKernelVersion
+		disableHostGSO bool
+		wantError      bool
+	}{
+		{release: "3.16.99", wantError: true},
+		{release: "3.17", version: hostKernelVersion{major: 3, minor: 17}, disableHostGSO: true},
+		{release: "3.17.0-custom", version: hostKernelVersion{major: 3, minor: 17}, disableHostGSO: true},
+		{release: "4.14-legacy", version: hostKernelVersion{major: 4, minor: 14}, disableHostGSO: true},
+		{release: "4.14.76-generic", version: hostKernelVersion{major: 4, minor: 14, patch: 76}, disableHostGSO: true},
+		{release: "4.14.77-generic", version: hostKernelVersion{major: 4, minor: 14, patch: 77}},
+		{release: "4.15.0", version: hostKernelVersion{major: 4, minor: 15}},
+		{release: "6.8.0-60-generic", version: hostKernelVersion{major: 6, minor: 8}},
+		{release: "", wantError: true},
+		{release: "not-a-kernel", wantError: true},
+		{release: "4", wantError: true},
+		{release: "4.x", wantError: true},
+	} {
+		t.Run(test.release, func(t *testing.T) {
+			compatibility, err := evaluateHostKernelCompatibility(test.release)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("evaluateHostKernelCompatibility(%q) succeeded: %+v", test.release, compatibility)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("evaluateHostKernelCompatibility(%q): %v", test.release, err)
+			}
+			if compatibility.version != test.version || compatibility.release != test.release || compatibility.disableHostGSO != test.disableHostGSO {
+				t.Errorf("evaluateHostKernelCompatibility(%q)=%+v, want version=%+v disableHostGSO=%t", test.release, compatibility, test.version, test.disableHostGSO)
+			}
+		})
+	}
+}
+
+func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
+	original := daemonKernelRelease
+	defer func() {
+		daemonKernelRelease = original
+	}()
+	daemonKernelRelease = func() (string, error) {
+		return "3.16.99-legacy", nil
+	}
+
+	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{
+		"--socket", socket,
+		"--data-root", t.TempDir(),
+		"--unsafe-no-host-isolation",
+		"--allow-slow-volume-copy",
+	}, &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires Linux 3.17 or newer") {
+		t.Fatalf("unsupported kernel: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("unsupported kernel created daemon socket: %v", err)
+	}
+}
+
+func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
+	original := daemonKernelRelease
+	defer func() {
+		daemonKernelRelease = original
+	}()
+	daemonKernelRelease = func() (string, error) {
+		return "4.14.76-legacy", nil
+	}
+
+	dataRoot := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(dataRoot, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{
+		"--socket", filepath.Join(t.TempDir(), "runtime", "ttcd.sock"),
+		"--data-root", dataRoot,
+		"--unsafe-no-host-isolation",
+		"--allow-slow-volume-copy",
+	}, &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 {
+		t.Fatalf("old kernel startup fixture: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if diagnostic := stderr.String(); !strings.Contains(diagnostic, "disabling host GSO") || !strings.Contains(diagnostic, "large payloads") {
+		t.Fatalf("old kernel startup diagnostic=%q", diagnostic)
+	}
+}
+
 func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
 	var stdout, stderr bytes.Buffer
@@ -112,6 +207,21 @@ func TestReportDaemonStartupFailureIncludesDaemonDiagnostic(t *testing.T) {
 	got := stderr.String()
 	if !strings.Contains(got, logPath) || !strings.Contains(got, "exit status 1") || !strings.Contains(got, "does not support FICLONE") {
 		t.Fatalf("startup diagnostic=%q, want log path, process status, and daemon error", got)
+	}
+}
+
+func TestReportDaemonStartupWarningsSurfacesHostGSOFallback(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ttcd.log")
+	log := "ttcd: warning: unrelated warning\n" +
+		"ttcd: warning: host Linux kernel 4.14.76 predates 4.14.77; disabling host GSO for compatibility; network performance will be reduced\n" +
+		"ttcd listening\n"
+	if err := os.WriteFile(logPath, []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	reportDaemonStartupWarnings(&stderr, logPath)
+	if diagnostic := stderr.String(); !strings.Contains(diagnostic, "disabling host GSO") || strings.Contains(diagnostic, "unrelated warning") {
+		t.Fatalf("surfaced startup warnings=%q", diagnostic)
 	}
 }
 
@@ -420,7 +530,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	dataRoot := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, true, dataRoot, ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
+		done <- serveDaemon(socket, true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -464,6 +574,8 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	if status != 0 ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
+		!strings.Contains(stdout, `"host_kernel_release":"6.8.0"`) ||
+		!strings.Contains(stdout, `"host_gso_enabled":true`) ||
 		!strings.Contains(stdout, `"data_root":"`+dataRoot+`"`) ||
 		!strings.Contains(stdout, `"volume_copy_mode":"full-copy"`) ||
 		stderr != "" {

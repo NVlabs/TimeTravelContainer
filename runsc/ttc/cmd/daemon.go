@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
@@ -53,6 +54,7 @@ const (
 var (
 	createDaemonRootlessProbe = createRootlessProbe
 	daemonEffectiveUID        = os.Geteuid
+	daemonKernelRelease       = currentHostKernelRelease
 )
 
 type daemonWireOptions struct {
@@ -77,6 +79,8 @@ type daemonRequest struct {
 type daemonServer struct {
 	listener              net.Listener
 	unsafeNoHostIsolation bool
+	disableHostGSO        bool
+	hostKernelRelease     string
 	dataRoot              string
 	root                  string
 	runsc                 string
@@ -227,6 +231,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		runsc:                 opts.runsc,
 		dataRoot:              opts.dataRoot,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
+		disableHostGSO:        opts.disableHostGSO,
 		allowSlowVolumeCopy:   opts.allowSlowVolumeCopy,
 		clientExecutable:      opts.clientExecutable,
 		clientTERM:            os.Getenv("TERM"),
@@ -336,8 +341,102 @@ func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 		opts.clientExecutable = s.clientExecutable
 	}
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+	opts.disableHostGSO = s.disableHostGSO
 	opts.dataRoot = s.dataRoot
 	return opts
+}
+
+type hostKernelVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func (v hostKernelVersion) lessThan(other hostKernelVersion) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}
+
+type hostKernelCompatibility struct {
+	release        string
+	version        hostKernelVersion
+	disableHostGSO bool
+}
+
+func parseHostKernelVersion(release string) (hostKernelVersion, error) {
+	if release == "" || release[0] < '0' || release[0] > '9' {
+		return hostKernelVersion{}, fmt.Errorf("invalid host kernel release %q", release)
+	}
+	parseComponent := func(value string) (int, string, error) {
+		end := 0
+		for end < len(value) && value[end] >= '0' && value[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return 0, value, fmt.Errorf("invalid host kernel release %q", release)
+		}
+		component, err := strconv.Atoi(value[:end])
+		if err != nil {
+			return 0, value, fmt.Errorf("invalid host kernel release %q: %w", release, err)
+		}
+		return component, value[end:], nil
+	}
+	major, remaining, err := parseComponent(release)
+	if err != nil || len(remaining) == 0 || remaining[0] != '.' {
+		return hostKernelVersion{}, fmt.Errorf("invalid host kernel release %q", release)
+	}
+	minor, remaining, err := parseComponent(remaining[1:])
+	if err != nil {
+		return hostKernelVersion{}, err
+	}
+	patch := 0
+	if len(remaining) != 0 && remaining[0] == '.' {
+		patch, _, err = parseComponent(remaining[1:])
+		if err != nil {
+			return hostKernelVersion{}, err
+		}
+	}
+	return hostKernelVersion{major: major, minor: minor, patch: patch}, nil
+}
+
+func evaluateHostKernelCompatibility(release string) (hostKernelCompatibility, error) {
+	version, err := parseHostKernelVersion(release)
+	if err != nil {
+		return hostKernelCompatibility{}, err
+	}
+	minimum := hostKernelVersion{major: 3, minor: 17}
+	if version.lessThan(minimum) {
+		return hostKernelCompatibility{}, fmt.Errorf("host Linux kernel %s is unsupported; TTC requires Linux 3.17 or newer", release)
+	}
+	hostGSOMinimum := hostKernelVersion{major: 4, minor: 14, patch: 77}
+	return hostKernelCompatibility{
+		release:        release,
+		version:        version,
+		disableHostGSO: version.lessThan(hostGSOMinimum),
+	}, nil
+}
+
+func currentHostKernelRelease() (string, error) {
+	var name unix.Utsname
+	if err := unix.Uname(&name); err != nil {
+		return "", err
+	}
+	var release strings.Builder
+	for _, value := range name.Release {
+		if value == 0 {
+			break
+		}
+		release.WriteByte(byte(value))
+	}
+	if release.Len() == 0 {
+		return "", errors.New("uname returned an empty host kernel release")
+	}
+	return release.String(), nil
 }
 
 func siblingTTCExecutable() string {
@@ -398,6 +497,19 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd: data root must not be empty")
 		return 2
 	}
+	kernelRelease, err := daemonKernelRelease()
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: detecting host Linux kernel release: %v\n", err)
+		return 1
+	}
+	kernelCompatibility, err := evaluateHostKernelCompatibility(kernelRelease)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: %v\n", err)
+		return 1
+	}
+	if kernelCompatibility.disableHostGSO {
+		fmt.Fprintf(stderr, "ttcd: warning: host Linux kernel %s predates 4.14.77; disabling host GSO for compatibility; network performance, especially for large payloads, will be reduced\n", kernelRelease)
+	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
 	} else if err := preflightDaemonIsolation(false); err != nil {
@@ -409,7 +521,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
 	}
-	if err := serveDaemon(socket, unsafeNoHostIsolation, daemonDataRoot, manager.Capability(), stdout, stderr); err != nil {
+	if err := serveDaemon(socket, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, manager.Capability(), stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
@@ -470,7 +582,7 @@ func secureDaemonDirectory(dir string) error {
 	return nil
 }
 
-func serveDaemon(socket string, unsafeNoHostIsolation bool, dataRoot string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
+func serveDaemon(socket string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -505,6 +617,8 @@ func serveDaemon(socket string, unsafeNoHostIsolation bool, dataRoot string, vol
 	server := &daemonServer{
 		listener:              listener,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
+		disableHostGSO:        kernelCompatibility.disableHostGSO,
+		hostKernelRelease:     kernelCompatibility.release,
 		dataRoot:              dataRoot,
 		root:                  runtimeRoot(),
 		runsc:                 runscPath(),
@@ -589,6 +703,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"pid":                      os.Getpid(),
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
 			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
+			"host_kernel_release":      s.hostKernelRelease,
+			"host_gso_enabled":         !s.disableHostGSO,
 			"data_root":                s.dataRoot,
 			"volume_copy_mode":         s.volumeCapability.Mode,
 			"volume_filesystem_type":   s.volumeCapability.FilesystemType,
@@ -1225,6 +1341,18 @@ func reportDaemonStartupFailure(stderr io.Writer, logPath string, processErr err
 	}
 }
 
+func reportDaemonStartupWarnings(stderr io.Writer, logPath string) {
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(log), "\n") {
+		if strings.Contains(line, "disabling host GSO") {
+			fmt.Fprintln(stderr, line)
+		}
+	}
+}
+
 func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int {
 	if opts.unsafeNoHostIsolation && (len(args) == 0 || args[0] != "start") {
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is valid with 'daemon start' only")
@@ -1285,6 +1413,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		for time.Now().Before(deadline) {
 			if conn, err := connectDaemon(opts.daemonSocket); err == nil {
 				conn.Close()
+				reportDaemonStartupWarnings(stderr, logPath)
 				fmt.Fprintln(stdout, "ttcd started")
 				return 0
 			}

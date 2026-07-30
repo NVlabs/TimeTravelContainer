@@ -72,6 +72,7 @@ type options struct {
 	runsc                 string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	disableHostGSO        bool
 	allowSlowVolumeCopy   bool
 	daemonSocket          string
 	direct                bool
@@ -4613,6 +4614,7 @@ type runtimeBackend struct {
 	runsc                 string
 	dataRoot              string
 	unsafeNoHostIsolation bool
+	disableHostGSO        bool
 	allowSlowVolumeCopy   bool
 	volumeCopyMode        ttcvolume.CopyMode
 	clientExecutable      string
@@ -6844,6 +6846,9 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// compatibility with Docker images that use helpers such as sudo.
 		"--allow-suid=true",
 		"--overlay2=all:memory")
+	if b.disableHostGSO {
+		args = append(args, "--gso=false")
+	}
 	if networkMode == "ttc" {
 		args = append(args, "--ttc-network-nat="+strconv.FormatBool(networkNAT))
 		if networkIP != "" {
