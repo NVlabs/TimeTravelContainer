@@ -17,6 +17,7 @@ package kernel
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -29,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -72,6 +74,12 @@ type LiveForkOptions struct {
 	// cross-process orchestration supplies the same page-loader protocol through
 	// a network reader.
 	RemoteMemoryFile *pgalloc.MemoryFile
+
+	// RemotePageReaderFactory optionally replaces the in-process loopback page
+	// reader when RemoteMemoryFile is set. It takes ownership of snapshot if it
+	// returns a non-nil reader. This permits TCP transport testing without
+	// coupling Kernel to a particular distributed transport.
+	RemotePageReaderFactory func(snapshot *pgalloc.RemoteSnapshot) (stateio.AsyncReader, error)
 
 	// batchChildBranchIDs and batchFilesystemResources are used by
 	// LiveForkMany to prepare its primary filesystem branch and retain the
@@ -328,7 +336,22 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				childMemoryFile.Destroy()
 				return fmt.Errorf("creating remote memory snapshot: %w", err)
 			}
-			reader := pgalloc.NewLoopbackRemoteReader(snapshot, 256<<10, 16, 4)
+			var reader stateio.AsyncReader
+			if opts.RemotePageReaderFactory != nil {
+				reader, err = opts.RemotePageReaderFactory(snapshot)
+				if err != nil {
+					_ = snapshot.Close()
+					childMemoryFile.Destroy()
+					return fmt.Errorf("creating remote page reader: %w", err)
+				}
+				if reader == nil {
+					_ = snapshot.Close()
+					childMemoryFile.Destroy()
+					return errors.New("remote page reader factory returned nil")
+				}
+			} else {
+				reader = pgalloc.NewLoopbackRemoteReader(snapshot, 256<<10, 16, 4)
+			}
 			remotePageLoad, err = pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
 			if err != nil {
 				childMemoryFile.Destroy()

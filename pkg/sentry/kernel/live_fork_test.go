@@ -16,8 +16,10 @@ package kernel_test
 
 import (
 	"errors"
+	"net"
 	"os"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -25,10 +27,31 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+type ownedKernelTCPReader struct {
+	stateio.AsyncReader
+	server    *ttcremote.TCPPageServer
+	serveDone <-chan error
+}
+
+func (r *ownedKernelTCPReader) Close() error {
+	readerErr := r.AsyncReader.Close()
+	serverErr := r.server.Close()
+	serveErr := <-r.serveDone
+	if readerErr != nil {
+		return readerErr
+	}
+	if serverErr != nil {
+		return serverErr
+	}
+	return serveErr
+}
 
 func newRemoteKernelMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 	t.Helper()
@@ -209,6 +232,62 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	}
 	if err := child.StartPaused(); err != nil {
 		t.Fatalf("child.StartPaused: %v", err)
+	}
+	parent.Unpause()
+	child.Unpause()
+	parent.Pause()
+	child.Pause()
+	child.Release()
+	parent.Release()
+}
+
+func TestLiveForkRemoteMemoryFileTCP(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	targetMF := newRemoteKernelMemoryFile(t)
+	readerFactory := func(snapshot *pgalloc.RemoteSnapshot) (stateio.AsyncReader, error) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		token := ttcremote.SnapshotToken{0x54, 0x54, 0x43, 2}
+		server, err := ttcremote.NewTCPPageServer(listener, token, snapshot, 256<<10)
+		if err != nil {
+			listener.Close()
+			return nil, err
+		}
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve() }()
+		reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, 256<<10, 16, 4, 5*time.Second)
+		if err != nil {
+			server.Close()
+			<-serveDone
+			return nil, err
+		}
+		return &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}, nil
+	}
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks:                  sentrytime.NewCalibratedClocks(),
+		RemoteMemoryFile:        targetMF,
+		RemotePageReaderFactory: readerFactory,
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("TCP remote LiveFork: %v", err)
+	}
+	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatalf("draining TCP-backed child: %v", err)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.StartPaused(); err != nil {
+		t.Fatal(err)
 	}
 	parent.Unpause()
 	child.Unpause()
