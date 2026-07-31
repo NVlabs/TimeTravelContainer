@@ -297,6 +297,67 @@ func TestLiveForkRemoteMemoryFileTCP(t *testing.T) {
 	parent.Release()
 }
 
+func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "remote"})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := ttcremote.SnapshotToken{0x54, 0x54, 0x43, 3}
+	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, 256<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture.Snapshot = nil // ownership transferred to server
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, 256<<10, 16, 4, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedReader := &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}
+	targetMF := newRemoteKernelMemoryFile(t)
+	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, ownedReader,
+		kernel.DistributedForkLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "remote",
+			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
+		})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LoadDistributedFork: %v", err)
+	}
+	if child.MemoryFile() == parent.MemoryFile() {
+		t.Fatal("portable distributed child shares source MemoryFile")
+	}
+	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatalf("draining distributed child: %v", err)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	parent.Unpause()
+	child.Unpause()
+	parent.Pause()
+	child.Pause()
+	child.Release()
+	parent.Release()
+}
+
 func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

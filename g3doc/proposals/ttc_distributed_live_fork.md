@@ -361,6 +361,10 @@ after a full drain and branch destruction.
 * A subprocess target test reconstructs its own MemoryFile from the envelope
   and fetches exactly one demanded 4 KiB page over TCP while leaving the rest
   remote.
+* Portable whole-Kernel capture/load APIs now serialize ordinary PMAs, rebuild
+  them against a separate target allocator, attach TCP demand paging, complete
+  VFS restore, and start the reconstructed Kernel without process-local PMA
+  snapshot pointers.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.
