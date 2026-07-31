@@ -63,6 +63,16 @@ type LiveForkOptions struct {
 	// Metrics, when non-nil, receives a timing breakdown for this attempt.
 	Metrics *LiveForkMetrics
 
+	// RemoteMemoryFile, when non-nil, receives a metadata-only clone of the
+	// source allocator and is populated on demand through an in-process remote
+	// snapshot provider. Ownership transfers to the returned Kernel on success
+	// and is consumed on failure. It must be newly created and empty.
+	//
+	// This is the local transport integration point for distributed live fork;
+	// cross-process orchestration supplies the same page-loader protocol through
+	// a network reader.
+	RemoteMemoryFile *pgalloc.MemoryFile
+
 	// batchChildBranchIDs and batchFilesystemResources are used by
 	// LiveForkMany to prepare its primary filesystem branch and retain the
 	// resources needed for post-resume sibling branching. They are deliberately
@@ -303,6 +313,29 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		pmaSnapshots, clearPMASnapshots := k.prepareMemoryManagersForLiveFork()
 		defer clearPMASnapshots()
 		k.mf.MarkSavable()
+		childMemoryFile := k.mf
+		var remotePageLoad *pgalloc.AsyncPagesFileLoad
+		var remoteLoadRanges []pgalloc.RemoteLoadRange
+		if opts.RemoteMemoryFile != nil {
+			childMemoryFile = opts.RemoteMemoryFile
+			regions, loads, err := pgalloc.CloneMemoryFileMetadataForRemote(ctx, k.mf, childMemoryFile)
+			if err != nil {
+				childMemoryFile.Destroy()
+				return fmt.Errorf("cloning remote MemoryFile metadata: %w", err)
+			}
+			snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+			if err != nil {
+				childMemoryFile.Destroy()
+				return fmt.Errorf("creating remote memory snapshot: %w", err)
+			}
+			reader := pgalloc.NewLoopbackRemoteReader(snapshot, 256<<10, 16, 4)
+			remotePageLoad, err = pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+			if err != nil {
+				childMemoryFile.Destroy()
+				return fmt.Errorf("starting remote page loader: %w", err)
+			}
+			remoteLoadRanges = loads
+		}
 		if opts.Metrics != nil {
 			opts.Metrics.ParentPreparation = time.Since(preparationStarted)
 		}
@@ -310,7 +343,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 
-		k.mf.IncOwner()
+		if opts.RemoteMemoryFile == nil {
+			k.mf.IncOwner()
+		}
 		ownerTransferred := false
 		childLoaded := false
 		defer func() {
@@ -320,7 +355,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			if childLoaded {
 				child.Release()
 			} else {
-				k.mf.Destroy()
+				if remotePageLoad != nil {
+					remotePageLoad.Cancel()
+					_ = remotePageLoad.Wait()
+				}
+				childMemoryFile.Destroy()
 			}
 		}()
 		if err := injectLiveForkFailure(opts, LiveForkStageOwnerAcquired); err != nil {
@@ -328,19 +367,20 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		}
 
 		child = &Kernel{Platform: k.Platform}
-		child.SetMemoryFile(k.mf)
+		child.SetMemoryFile(childMemoryFile)
 		child.initRuntimeFields()
 		if err := injectLiveForkFailure(opts, LiveForkStageChildInitialized); err != nil {
 			return err
 		}
 		loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
-			pgalloc.CtxMemoryFile:              k.mf,
-			pgalloc.CtxMemoryFileMap:           mfs,
-			pgalloc.CtxLiveForkClone:           true,
-			vfs.CtxLiveForkFilesystemResources: fsResources,
-			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
-			vfs.CtxLiveForkTransactions:        fsTransactions,
-			mm.CtxLiveForkPMASnapshots:         pmaSnapshots,
+			pgalloc.CtxMemoryFile:                childMemoryFile,
+			pgalloc.CtxMemoryFileMap:             mfs,
+			pgalloc.CtxLiveForkClone:             true,
+			pgalloc.CtxLiveForkRemoteMemoryClone: opts.RemoteMemoryFile != nil,
+			vfs.CtxLiveForkFilesystemResources:   fsResources,
+			vfs.CtxLiveForkChildBranchID:         opts.ChildBranchID,
+			vfs.CtxLiveForkTransactions:          fsTransactions,
+			mm.CtxLiveForkPMASnapshots:           pmaSnapshots,
 		})
 		metadataStarted := time.Now()
 		k.filteringLiveForkDanglingEndpoints = true
@@ -349,6 +389,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		}()
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
+		}
+		if remotePageLoad != nil {
+			if err := childMemoryFile.AttachRemotePageLoad(remotePageLoad, remoteLoadRanges, nil, nil); err != nil {
+				return fmt.Errorf("attaching remote page loader: %w", err)
+			}
+			remotePageLoad.MemoryFilesDone()
+			child.remotePageLoad = remotePageLoad
 		}
 		if opts.Metrics != nil {
 			opts.Metrics.MetadataStream = time.Since(metadataStarted)

@@ -175,6 +175,11 @@ type Kernel struct {
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
+	// remotePageLoad supplies a distinct MemoryFile created by a remote live
+	// fork. It is canceled during Release, after users of mf have dropped their
+	// references and before mf itself is destroyed.
+	remotePageLoad *pgalloc.AsyncPagesFileLoad `state:"nosave"`
+
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
 	timekeeper           *Timekeeper
@@ -2356,6 +2361,11 @@ func (k *Kernel) Release() {
 	k.rootIPCNamespace.DecRef(ctx)
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
+	if k.remotePageLoad != nil {
+		k.remotePageLoad.Cancel()
+		_ = k.remotePageLoad.Wait()
+		k.remotePageLoad = nil
+	}
 	k.mf.Destroy()
 	k.RootPIDNamespace().DecRef(ctx)
 	k.rootUserNamespace.DecRef(ctx)

@@ -337,8 +337,9 @@ transaction.
   are implemented in `pgalloc`.
 * The asynchronous restore/page-loader path now supports demand-only loading,
   explicit drain, cancellation, and both loopback and TCP readers.
-* Run source and target Kernels in one process but force all target page access
-  through an asynchronous loopback transport.
+* A full `Kernel.LiveFork` can now use a distinct metadata-cloned target
+  `MemoryFile`; target page access is forced through the asynchronous loopback
+  transport, and Kernel release cancels the remaining remote dependency.
 * Implement pull and batched ACK only; use demand-only policy.
 
 Exit criteria: recursive memory tests, process-heavy containers, and randomized

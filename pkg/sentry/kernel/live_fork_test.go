@@ -16,6 +16,7 @@ package kernel_test
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -23,10 +24,33 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+func newRemoteKernelMemoryFile(t *testing.T) *pgalloc.MemoryFile {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-remote-kernel-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	return mf
+}
 
 var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
 
@@ -144,6 +168,54 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	child.Pause()
 	parent.Release()
 	child.Release()
+}
+
+func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	targetMF := newRemoteKernelMemoryFile(t)
+
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks:           sentrytime.NewCalibratedClocks(),
+		RemoteMemoryFile: targetMF,
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("remote LiveFork: %v", err)
+	}
+	if child.MemoryFile() == parent.MemoryFile() {
+		t.Fatal("remote child shares the source MemoryFile")
+	}
+	if child.MemoryFile() != targetMF {
+		t.Fatal("remote child did not adopt the provided target MemoryFile")
+	}
+	if !child.MemoryFile().IsAsyncLoading() {
+		t.Fatal("remote child is not backed by asynchronous page loading")
+	}
+	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatalf("draining remote child memory: %v", err)
+	}
+	if child.MemoryFile().IsAsyncLoading() {
+		t.Fatal("remote child MemoryFile remained loading after AwaitLoadAll")
+	}
+
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("parent.StartPaused: %v", err)
+	}
+	if err := child.StartPaused(); err != nil {
+		t.Fatalf("child.StartPaused: %v", err)
+	}
+	parent.Unpause()
+	child.Unpause()
+	parent.Pause()
+	child.Pause()
+	child.Release()
+	parent.Release()
 }
 
 func TestLiveForkClonesPIDFDTarget(t *testing.T) {
