@@ -534,6 +534,7 @@ the [audit](g3doc/proposals/timetravel_ttc_audit.md).
 - [End-user guide](g3doc/user_guide/timetravelcontainer.md)
 - [Performance and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
+- [Distributed live-fork development and test plan](g3doc/proposals/ttc_distributed_live_fork.md)
 - [Disk-backed storage design](g3doc/proposals/ttc_disk_backed_volumes.md)
 - [Product and CLI roadmap](g3doc/proposals/timetravel_ttc_cli.md)
 - [End-to-end test guide](runsc/ttc/test/README.md)
