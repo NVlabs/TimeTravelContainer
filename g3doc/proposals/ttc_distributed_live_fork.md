@@ -1,6 +1,6 @@
 # Distributed live fork with remote copy-on-read memory
 
-Status: design and implementation plan; not yet implemented.
+Status: design and implementation plan; implementation in progress.
 
 Implementation progress:
 
@@ -388,6 +388,10 @@ execution or a cleanly failed target, never silent corruption.
   same state transition to network transport-side push workers. A reverse TCP
   push channel now implements `PUSH_OK` (installed, source may release) and
   `PUSH_SKIP` (pull owns the range, source must retain it).
+* An adversarial transport test now holds a pull after it claims a page, races
+  a reverse-channel push for the same page, and verifies that `PUSH_SKIP`
+  retains the source reference until the pull installs and acknowledges it
+  exactly once.
 * Implement sharded bounded queues, range coalescing, dirty-orphan push, and
   batched installation acknowledgements.
 * Release old source pages individually and validate the unique-page write

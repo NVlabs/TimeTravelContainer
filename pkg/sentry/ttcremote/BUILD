@@ -9,7 +9,7 @@ go_library(
     name = "ttcremote",
     srcs = [
         "metadata.go",
-		"push.go",
+        "push.go",
         "tcp.go",
     ],
     visibility = ["//visibility:public"],
@@ -33,9 +33,10 @@ go_test(
     deps = [
         "//pkg/hostarch",
         "//pkg/safemem",
-		"//pkg/sentry/contexttest",
+        "//pkg/sentry/contexttest",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
         "@org_golang_x_sys//unix:go_default_library",
     ],

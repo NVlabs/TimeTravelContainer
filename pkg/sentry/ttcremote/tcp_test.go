@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,8 +33,28 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
+
+type blockingSnapshotReaderAt struct {
+	snapshot *pgalloc.RemoteSnapshot
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (r *blockingSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	n, err := r.snapshot.CopyStreamAt(dst, off)
+	if err == nil {
+		err = r.snapshot.AcknowledgeStreamRange(uint64(off), uint64(len(dst)))
+	}
+	return n, err
+}
+
+func (r *blockingSnapshotReaderAt) Close() error { return r.snapshot.Close() }
 
 func newTCPTestMemoryFile(t *testing.T, pages uint64) (*pgalloc.MemoryFile, memmap.FileRange, []byte) {
 	t.Helper()
@@ -624,6 +645,99 @@ func TestTCPProactivePushInstallAndAcknowledge(t *testing.T) {
 	}
 	if !bytes.Equal(got, want[:hostarch.PageSize]) {
 		t.Fatal("TCP pushed page differs")
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+	if err := sender.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	receiver.Close()
+	if err := <-receiverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPPushSkipsRangeOwnedByConcurrentPull(t *testing.T) {
+	source, sourceFR, _ := newTCPTestMemoryFile(t, 1)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyTCPTestMemoryFile(t)
+	if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, allocator); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		target.DecRef(sourceFR)
+		target.Destroy()
+	}()
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingSnapshotReaderAt{snapshot: snapshot, started: make(chan struct{}), release: make(chan struct{})}
+	reader := stateio.NewIOReader(blocked, hostarch.PageSize, 1, 1)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	pullDone := make(chan error, 1)
+	go func() {
+		_, err := target.MapInternal(sourceFR, hostarch.Read)
+		pullDone <- err
+	}()
+	select {
+	case <-blocked.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pull did not start")
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	receiver, err := NewTCPPushReceiver(listener, token, pages, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiver.Serve() }()
+	sender, err := StartTCPPushSender(listener.Addr().String(), token, snapshot, hostarch.PageSize, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.NotifyRemoteCOW(sourceFR)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, skipped := receiver.Stats()
+		if skipped == hostarch.PageSize || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	installed, skipped := receiver.Stats()
+	if installed != 0 || skipped != hostarch.PageSize || sender.BytesPushed() != 0 {
+		t.Fatalf("pull/push race installed=%d skipped=%d acknowledged=%d", installed, skipped, sender.BytesPushed())
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 1 {
+		t.Fatalf("PUSH_SKIP released pull-owned page: %+v", stats)
+	}
+	close(blocked.release)
+	select {
+	case err := <-pullDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pull did not complete")
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 {
+		t.Fatalf("pull ACK did not release page: %+v", stats)
 	}
 	pages.Cancel()
 	_ = pages.Wait()
