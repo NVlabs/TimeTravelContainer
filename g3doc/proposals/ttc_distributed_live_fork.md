@@ -2,6 +2,12 @@
 
 Status: design and implementation plan; not yet implemented.
 
+Implementation progress:
+
+* Phase 0 protocol model, trace replay, invariant tests, randomized schedules,
+  policy validation, and analytical pull simulator: implemented.
+* Phases 1 through 6: pending.
+
 ## Summary
 
 This proposal extends TimeTravelContainer (TTC) so that a branch running on
