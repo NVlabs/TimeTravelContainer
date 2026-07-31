@@ -368,6 +368,9 @@ after a full drain and branch destruction.
 * A whole-Kernel subprocess target now fetches the portable envelope from the
   source process, creates its own platform context and MemoryFile, restores and
   starts the Kernel, drains remote pages, and tears down cleanly.
+* Portable capture now validates and serializes contained netstack state. The
+  target load API requires ttcd to recreate target-local virtual-link/NAT
+  plumbing, then restores netstack and resets inherited external connections.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.

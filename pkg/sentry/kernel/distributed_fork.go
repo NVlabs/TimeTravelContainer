@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
@@ -72,12 +73,17 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	}
 	k.tasks.waitForExternalStop()
 	k.ReceiveTaskStates()
-	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-		return nil, fmt.Errorf("distributed fork network reconstruction is not yet configured")
-	}
-
 	var capture *DistributedForkCapture
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
+		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			stack := rootNS.Stack()
+			stack.SetRemoveConf(false)
+			stack.Pause()
+			defer stack.Resume()
+			if err := k.validateLiveForkNetwork(stack); err != nil {
+				return err
+			}
+		}
 		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
 			return err
 		}
@@ -137,6 +143,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
+		k.filteringLiveForkDanglingEndpoints = true
+		defer func() { k.filteringLiveForkDanglingEndpoints = false }()
 		if _, err := state.Save(saveCtx, buffered, k); err != nil {
 			return fmt.Errorf("saving distributed Kernel metadata: %w", err)
 		}
@@ -167,6 +175,10 @@ type DistributedForkLoadOptions struct {
 	RestoreOptions      vfs.CompleteRestoreOptions
 	FilesystemResources vfs.LiveForkFilesystemResources
 	DemandOnly          bool
+
+	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
+	// Kernel state. It is required when the captured Kernel has a netstack.
+	ConfigureNetwork func(inet.Stack) error
 }
 
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a
@@ -228,6 +240,23 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if opts.ConfigureNetwork == nil {
+			child.Release()
+			return nil, fmt.Errorf("distributed target network configurator was not provided")
+		}
+		if err := opts.ConfigureNetwork(rootNS.Stack()); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("configuring distributed target network: %w", err)
+		}
+		rootNS.Stack().Restore()
+		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				child.Release()
+				return nil, fmt.Errorf("resetting distributed child external network state: %w", err)
+			}
+		}
+	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
 		return nil, vfs.PrependErrMsg("VFS distributed-fork restore failed", err)
