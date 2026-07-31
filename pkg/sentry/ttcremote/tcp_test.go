@@ -558,3 +558,80 @@ func TestTCPRemoteReaderRejectsCorruptData(t *testing.T) {
 		}
 	}
 }
+
+func TestTCPProactivePushInstallAndAcknowledge(t *testing.T) {
+	source, sourceFR, want := newTCPTestMemoryFile(t, 4)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyTCPTestMemoryFile(t)
+	if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, allocator); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		target.DecRef(sourceFR)
+		target.Destroy()
+	}()
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	receiver, err := NewTCPPushReceiver(listener, token, pages, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiver.Serve() }()
+	sender, err := StartTCPPushSender(listener.Addr().String(), token, snapshot, hostarch.PageSize, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.NotifyRemoteCOW(memmap.FileRange{sourceFR.Start, sourceFR.Start + hostarch.PageSize})
+	deadline := time.Now().Add(5 * time.Second)
+	for sender.BytesPushed() != hostarch.PageSize && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sender.BytesPushed() != hostarch.PageSize {
+		t.Fatalf("sender pushed %d bytes", sender.BytesPushed())
+	}
+	installed, skipped := receiver.Stats()
+	if installed != hostarch.PageSize || skipped != 0 {
+		t.Fatalf("receiver installed=%d skipped=%d", installed, skipped)
+	}
+	first := memmap.FileRange{sourceFR.Start, sourceFR.Start + hostarch.PageSize}
+	mapped, err := target.MapInternal(first, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != hostarch.PageSize {
+		t.Fatalf("copy pushed target: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want[:hostarch.PageSize]) {
+		t.Fatal("TCP pushed page differs")
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+	if err := sender.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	receiver.Close()
+	if err := <-receiverDone; err != nil {
+		t.Fatal(err)
+	}
+}

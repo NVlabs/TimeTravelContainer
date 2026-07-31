@@ -9,6 +9,7 @@ go_library(
     name = "ttcremote",
     srcs = [
         "metadata.go",
+		"push.go",
         "tcp.go",
     ],
     visibility = ["//visibility:public"],
