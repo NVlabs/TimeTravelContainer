@@ -324,6 +324,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		childMemoryFile := k.mf
 		var remotePageLoad *pgalloc.AsyncPagesFileLoad
 		var remoteLoadRanges []pgalloc.RemoteLoadRange
+		var remoteSnapshot *pgalloc.RemoteSnapshot
 		if opts.RemoteMemoryFile != nil {
 			childMemoryFile = opts.RemoteMemoryFile
 			regions, loads, err := pgalloc.CloneMemoryFileMetadataForRemote(ctx, k.mf, childMemoryFile)
@@ -358,6 +359,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				return fmt.Errorf("starting remote page loader: %w", err)
 			}
 			remoteLoadRanges = loads
+			remoteSnapshot = snapshot
 		}
 		if opts.Metrics != nil {
 			opts.Metrics.ParentPreparation = time.Since(preparationStarted)
@@ -419,6 +421,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			}
 			remotePageLoad.MemoryFilesDone()
 			child.remotePageLoad = remotePageLoad
+			if opts.RemotePageReaderFactory == nil {
+				pgalloc.StartLoopbackRemotePush(remoteSnapshot, remotePageLoad, 256<<10)
+			}
 		}
 		if opts.Metrics != nil {
 			opts.Metrics.MetadataStream = time.Since(metadataStarted)

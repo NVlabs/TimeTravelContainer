@@ -372,6 +372,53 @@ func TestCancelDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestLoopbackProactivePushWinsBeforePull(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 2)
+	target, targetFR := newRemoteTestMemoryFile(t, 2)
+	want := bytes.Repeat([]byte{0x6d}, int(sourceFR.Length()))
+	fillRemoteTestRange(t, source, sourceFR, want)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	done := StartLoopbackRemotePush(snapshot, pages, hostarch.PageSize)
+	source.NotifyRemoteCOW(memmap.FileRange{sourceFR.Start, sourceFR.Start + hostarch.PageSize})
+	deadline := time.Now().Add(5 * time.Second)
+	for snapshot.Stats().PagesReleased != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := snapshot.Stats(); stats.PagesReleased != 1 || stats.PagesOutstanding != 1 {
+		t.Fatalf("push did not install and acknowledge one page: %+v", stats)
+	}
+	loaded, err := target.MapInternal(memmap.FileRange{targetFR.Start, targetFR.Start + hostarch.PageSize}, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), loaded); err != nil || n != hostarch.PageSize {
+		t.Fatalf("copy pushed page: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want[:hostarch.PageSize]) {
+		t.Fatal("proactively pushed bytes differ")
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("push pump did not stop with snapshot")
+	}
+}
+
 func TestCloneMemoryFileMetadataForRemote(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 4)
 	want := make([]byte, sourceFR.Length())

@@ -365,7 +365,9 @@ execution or a cleanly failed target, never silent corruption.
 
 * A non-blocking post-CoW notification now identifies old snapshot ranges only
   after MM locks are released and feeds a bounded per-snapshot push-hint queue.
-  Connect this queue to transport-side push workers.
+  A loopback push pump installs not-yet-pulled ranges and ACKs only after
+  installation; ranges whose pull has started remain pull-owned. Connect this
+  same state transition to network transport-side push workers.
 * Implement sharded bounded queues, range coalescing, dirty-orphan push, and
   batched installation acknowledgements.
 * Release old source pages individually and validate the unique-page write

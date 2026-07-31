@@ -1395,6 +1395,88 @@ func (apfl *AsyncPagesFileLoad) Wait() error {
 	return apfl.err()
 }
 
+// TryInstallRemotePages installs an unsolicited pushed range if none of its
+// pages has started a pull. It returns false without changing state when pull
+// already owns the range or the stream range is not pending. The caller may
+// acknowledge the source only when installed is true.
+func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data []byte) (installed bool, err error) {
+	length := uint64(len(data))
+	if length == 0 || !hostarch.IsPageAligned(streamOffset) || !hostarch.IsPageAligned(length) {
+		return false, fmt.Errorf("pushed remote range must be non-empty and page-aligned: off=%d len=%d", streamOffset, length)
+	}
+	var wakeups []*aplWaiter
+	apfl.amflsMu.Lock()
+	defer func() {
+		apfl.amflsMu.Unlock()
+		for _, waiter := range wakeups {
+			waiter.wakeup.Notify(1)
+		}
+	}()
+	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+		amfl.f.mu.Lock()
+		apfl.mu.Lock()
+		for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
+			ul := ulseg.ValuePtr()
+			if streamOffset < ul.off || streamOffset-ul.off > ulseg.Range().Length() ||
+				length > ulseg.Range().Length()-(streamOffset-ul.off) {
+				continue
+			}
+			if ul.started {
+				apfl.mu.Unlock()
+				amfl.f.mu.Unlock()
+				return false, nil
+			}
+			targetStart := ulseg.Start() + (streamOffset - ul.off)
+			ulseg = amfl.unloaded.SplitBefore(ulseg, targetStart)
+			ulseg = amfl.unloaded.SplitAfter(ulseg, targetStart+length)
+			copied := 0
+			amfl.f.forEachMappingSlice(ulseg.Range(), func(dst []byte) {
+				copied += copy(dst, data[copied:])
+			})
+			if uint64(copied) != length {
+				apfl.mu.Unlock()
+				amfl.f.mu.Unlock()
+				return false, fmt.Errorf("pushed remote range copied %d bytes, want %d", copied, length)
+			}
+			for _, waiter := range ul.waiters {
+				waiter.pending -= length
+				if waiter.pending == 0 {
+					wakeups = append(wakeups, waiter)
+					now := gohacks.Nanotime()
+					apfl.durWaitedTotal += time.Duration(now - waiter.timeStart)
+					apfl.numWaiters--
+					if apfl.numWaiters == 0 {
+						apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
+						apfl.timeStartWaiters = math.MaxInt64
+					}
+				}
+			}
+			amfl.unloaded.Remove(ulseg)
+			apfl.bytesLoaded += length
+			if amfl.lfDone {
+				if amfl.unloaded.IsEmpty() {
+					amfl.minUnloaded.Store(math.MaxUint64)
+					apfl.amfls.Remove(amfl)
+					amfl.f.asyncPageLoad.Store(nil)
+					amfl.timeline.End()
+					if amfl.doneCallback != nil {
+						amfl.doneCallback(nil)
+						amfl.doneCallback = nil
+					}
+				} else {
+					amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
+				}
+			}
+			apfl.mu.Unlock()
+			amfl.f.mu.Unlock()
+			return true, nil
+		}
+		apfl.mu.Unlock()
+		amfl.f.mu.Unlock()
+	}
+	return false, nil
+}
+
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
 // loading from apfl. MemoryFilesDone may be called multiple times; subsequent
 // calls have no effect.

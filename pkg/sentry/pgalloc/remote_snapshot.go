@@ -88,6 +88,35 @@ type RemotePushHint struct {
 	Length       uint64
 }
 
+// StartLoopbackRemotePush starts a non-blocking proactive-push pump for local
+// distributed-fork testing. Pull owns any range that has already started;
+// otherwise the pump installs bytes and only then acknowledges the source.
+// The returned channel closes when snapshot is closed.
+func StartLoopbackRemotePush(snapshot *RemoteSnapshot, pages *AsyncPagesFileLoad, maxChunk uint64) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for hint := range snapshot.PushHints() {
+			for off, remaining := hint.StreamOffset, hint.Length; remaining != 0; {
+				length := min(remaining, maxChunk)
+				length = hostarch.PageRoundDown(length)
+				if length == 0 {
+					length = hostarch.PageSize
+				}
+				data := make([]byte, length)
+				if n, err := snapshot.CopyStreamAt(data, int64(off)); err == nil && uint64(n) == length {
+					if installed, err := pages.TryInstallRemotePages(off, data); err == nil && installed {
+						_ = snapshot.AcknowledgeStreamRange(off, length)
+					}
+				}
+				off += length
+				remaining -= length
+			}
+		}
+	}()
+	return done
+}
+
 // RemoteSnapshotStats is a point-in-time snapshot of page ownership.
 type RemoteSnapshotStats struct {
 	PagesTotal       uint64
