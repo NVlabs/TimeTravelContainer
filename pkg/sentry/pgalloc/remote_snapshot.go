@@ -192,29 +192,13 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 	return s, nil
 }
 
-// CloneMemoryFileMetadataForRemote makes target's allocator metadata describe
-// the same object graph and file offsets as source, without reading or copying
-// page contents. It returns source regions in packed-stream order and matching
-// target load ranges. The caller can pass the regions to NewRemoteSnapshot and
-// attach the ranges to target with AttachRemotePageLoad.
-//
-// target must be a newly created, empty MemoryFile. Users of source must be
-// externally stopped so its page-reference graph cannot change during the
-// clone. Work is proportional to allocator metadata, not resident bytes.
-func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *MemoryFile) ([]RemoteSnapshotRegion, []RemoteLoadRange, error) {
-	if source == nil || target == nil {
-		return nil, nil, errors.New("source and target MemoryFiles must be non-nil")
+// ExportMemoryFileMetadataForRemote captures allocator metadata and the packed
+// page-stream layout without reading page contents. The returned bytes contain
+// no process-local pointers and may be sent to another Sentry process.
+func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) ([]byte, []RemoteSnapshotRegion, []RemoteLoadRange, error) {
+	if source == nil {
+		return nil, nil, nil, errors.New("source MemoryFile is nil")
 	}
-	if source == target {
-		return nil, nil, errors.New("remote MemoryFile clone requires distinct source and target")
-	}
-	target.mu.Lock()
-	targetEmpty := len(target.chunksLoad()) == 0
-	target.mu.Unlock()
-	if !targetEmpty {
-		return nil, nil, errors.New("remote target MemoryFile is not empty")
-	}
-
 	var metadata bytes.Buffer
 	var used []memmap.FileRange
 	source.mu.Lock()
@@ -225,7 +209,7 @@ func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *Memor
 	}
 	if len(source.evictable) != 0 {
 		source.mu.Unlock()
-		return nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
+		return nil, nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
 	}
 	collectUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
@@ -246,7 +230,7 @@ func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *Memor
 		chunks:       source.chunksLoad(),
 	}); err != nil {
 		source.mu.Unlock()
-		return nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
+		return nil, nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
 	}
 	source.mu.Unlock()
 
@@ -259,20 +243,44 @@ func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *Memor
 		}
 		last := &merged[len(merged)-1]
 		if fr.Start < last.End {
-			return nil, nil, fmt.Errorf("source MemoryFile used ranges overlap: %v and %v", *last, fr)
+			return nil, nil, nil, fmt.Errorf("source MemoryFile used ranges overlap: %v and %v", *last, fr)
 		}
 		last.End = fr.End
 	}
 	used = merged
+	regions := make([]RemoteSnapshotRegion, len(used))
+	loads := make([]RemoteLoadRange, len(used))
+	var streamOffset uint64
+	for i, fr := range used {
+		regions[i] = RemoteSnapshotRegion{ID: RemoteRegionID(i + 1), File: source, Range: fr}
+		loads[i] = RemoteLoadRange{Target: fr, StreamOffset: streamOffset}
+		streamOffset += fr.Length()
+	}
+	return metadata.Bytes(), regions, loads, nil
+}
+
+// ImportMemoryFileMetadataForRemote reconstructs allocator metadata exported
+// by ExportMemoryFileMetadataForRemote in a newly created empty MemoryFile.
+// Page contents remain absent until a remote page loader is attached.
+func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, metadata []byte) error {
+	if target == nil {
+		return errors.New("target MemoryFile is nil")
+	}
+	target.mu.Lock()
+	targetEmpty := len(target.chunksLoad()) == 0
+	target.mu.Unlock()
+	if !targetEmpty {
+		return errors.New("remote target MemoryFile is not empty")
+	}
 
 	var saved memoryFileSaved
-	if _, err := state.Load(ctx, bytes.NewReader(metadata.Bytes()), &saved); err != nil {
-		return nil, nil, fmt.Errorf("loading remote MemoryFile metadata: %w", err)
+	if _, err := state.Load(ctx, bytes.NewReader(metadata), &saved); err != nil {
+		return fmt.Errorf("loading remote MemoryFile metadata: %w", err)
 	}
 	chunks := saved.chunks
 	fileSize := uint64(len(chunks)) * chunkSize
 	if err := target.file.Truncate(int64(fileSize)); err != nil {
-		return nil, nil, fmt.Errorf("sizing remote target MemoryFile: %w", err)
+		return fmt.Errorf("sizing remote target MemoryFile: %w", err)
 	}
 	if len(chunks) != 0 {
 		mapping, _, errno := unix.Syscall6(
@@ -284,7 +292,7 @@ func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *Memor
 			target.file.Fd(),
 			0)
 		if errno != 0 {
-			return nil, nil, fmt.Errorf("mapping remote target MemoryFile: %w", errno)
+			return fmt.Errorf("mapping remote target MemoryFile: %w", errno)
 		}
 		for i := range chunks {
 			chunks[i].mapping = mapping + uintptr(i)*chunkSize
@@ -316,13 +324,22 @@ func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *Memor
 		}
 	}
 
-	regions := make([]RemoteSnapshotRegion, len(used))
-	loads := make([]RemoteLoadRange, len(used))
-	var streamOffset uint64
-	for i, fr := range used {
-		regions[i] = RemoteSnapshotRegion{ID: RemoteRegionID(i + 1), File: source, Range: fr}
-		loads[i] = RemoteLoadRange{Target: fr, StreamOffset: streamOffset}
-		streamOffset += fr.Length()
+	return nil
+}
+
+// CloneMemoryFileMetadataForRemote is the same-process composition of Export
+// and Import. target must be newly created and empty, and source users must be
+// externally stopped while its reference graph is captured.
+func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *MemoryFile) ([]RemoteSnapshotRegion, []RemoteLoadRange, error) {
+	if source == target {
+		return nil, nil, errors.New("remote MemoryFile clone requires distinct source and target")
+	}
+	metadata, regions, loads, err := ExportMemoryFileMetadataForRemote(ctx, source)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ImportMemoryFileMetadataForRemote(ctx, target, metadata); err != nil {
+		return nil, nil, err
 	}
 	return regions, loads, nil
 }

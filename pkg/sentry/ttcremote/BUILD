@@ -7,7 +7,10 @@ package(
 
 go_library(
     name = "ttcremote",
-    srcs = ["tcp.go"],
+    srcs = [
+        "metadata.go",
+        "tcp.go",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/hostarch",
@@ -21,7 +24,10 @@ go_library(
 go_test(
     name = "ttcremote_test",
     size = "small",
-    srcs = ["tcp_test.go"],
+    srcs = [
+        "metadata_test.go",
+        "tcp_test.go",
+    ],
     library = ":ttcremote",
     deps = [
         "//pkg/hostarch",

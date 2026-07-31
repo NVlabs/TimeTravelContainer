@@ -327,10 +327,14 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		var remoteSnapshot *pgalloc.RemoteSnapshot
 		if opts.RemoteMemoryFile != nil {
 			childMemoryFile = opts.RemoteMemoryFile
-			regions, loads, err := pgalloc.CloneMemoryFileMetadataForRemote(ctx, k.mf, childMemoryFile)
+			allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
 			if err != nil {
 				childMemoryFile.Destroy()
-				return fmt.Errorf("cloning remote MemoryFile metadata: %w", err)
+				return fmt.Errorf("exporting remote MemoryFile metadata: %w", err)
+			}
+			if err := pgalloc.ImportMemoryFileMetadataForRemote(ctx, childMemoryFile, allocatorMetadata); err != nil {
+				childMemoryFile.Destroy()
+				return fmt.Errorf("importing remote MemoryFile metadata: %w", err)
 			}
 			snapshot, err := pgalloc.NewRemoteSnapshot(regions)
 			if err != nil {

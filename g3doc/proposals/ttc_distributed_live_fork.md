@@ -354,6 +354,10 @@ after a full drain and branch destruction.
   transaction handshake, flow control, and target dependency handling.
 * A token-authenticated session hello and bounded, checksummed metadata stream
   now transfer Kernel metadata separately from memory page data.
+* MemoryFile allocator metadata now has explicit pointer-free export/import
+  APIs. A versioned, allocation-bounded, SHA-256-protected session envelope
+  carries Kernel metadata, allocator metadata, page-stream mappings, and branch
+  identity between independent Sentry processes.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.
