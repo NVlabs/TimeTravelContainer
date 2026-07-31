@@ -1,0 +1,260 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ttcremote
+
+import (
+	"bytes"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
+)
+
+func newTCPTestMemoryFile(t *testing.T, pages uint64) (*pgalloc.MemoryFile, memmap.FileRange, []byte) {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-tcp-pages-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	fr, err := mf.Allocate(pages*hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.Anonymous,
+		Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		mf.Destroy()
+		t.Fatal(err)
+	}
+	data := make([]byte, fr.Length())
+	for i := range data {
+		data[i] = byte((i*29 + i/int(hostarch.PageSize)) & 0xff)
+	}
+	dst, err := mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := safemem.CopySeq(dst, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data))); err != nil || n != fr.Length() {
+		t.Fatalf("fill source: n=%d err=%v", n, err)
+	}
+	t.Cleanup(func() {
+		mf.DecRef(fr)
+		mf.Destroy()
+	})
+	return mf, fr, data
+}
+
+func startTCPTestServer(t *testing.T, snapshot *pgalloc.RemoteSnapshot, token SnapshotToken, maxRead uint64) (*TCPPageServer, <-chan error) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewTCPPageServer(listener, token, snapshot, maxRead)
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	return server, done
+}
+
+func testSnapshotToken() SnapshotToken {
+	return SnapshotToken{0x54, 0x54, 0x43, 0x01, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+}
+
+func TestTCPRemoteReaderConcurrentPulls(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 64)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, 64<<10)
+	reader, err := NewTCPRemoteReader(server.Addr().String(), token, 64<<10, 4, 4, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := make([]byte, len(want))
+	const transfer = 64 << 10
+	for i, off := 0, 0; off < len(got); i, off = i+1, off+transfer {
+		reader.AddRead(i, int64(off), nil, memmap.FileRange{}, got[off:off+transfer])
+	}
+	completions, err := reader.Wait(nil, len(got)/transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, completion := range completions {
+		if completion.Err != nil || completion.N != transfer {
+			t.Fatalf("completion %+v", completion)
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("TCP reader returned incorrect memory contents")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	if stats := server.Stats(); stats.PullRequests != 4 || stats.AckRequests != 4 || stats.BytesSent != uint64(len(want)) {
+		t.Fatalf("server stats: %+v", stats)
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 || !stats.Closed {
+		t.Fatalf("snapshot stats: %+v", stats)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("source pages did not become unique after TCP acknowledgements")
+	}
+}
+
+func TestTCPAckAfterInstallation(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 1)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, hostarch.PageSize)
+	conn, err := net.DialTimeout("tcp", server.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	pull := tcpHeader{type_: tcpPull, token: token, requestID: 7, length: uint32(hostarch.PageSize)}
+	if err := writeTCPMessage(conn, pull, nil); err != nil {
+		t.Fatal(err)
+	}
+	response, payload, err := readTCPResponse(conn, token, 7, hostarch.PageSize)
+	if err != nil || response.type_ != tcpData {
+		t.Fatalf("data response=%+v err=%v", response, err)
+	}
+	if !bytes.Equal(payload, want) {
+		t.Fatal("manual pull returned incorrect data")
+	}
+	if mf.HasUniqueRef(fr) {
+		t.Fatal("source snapshot reference was released before target ACK")
+	}
+	installed := append([]byte(nil), payload...)
+	if !bytes.Equal(installed, want) {
+		t.Fatal("target installation failed")
+	}
+	ack := tcpHeader{type_: tcpAck, token: token, requestID: 7, length: uint32(hostarch.PageSize)}
+	if err := writeTCPMessage(conn, ack, nil); err != nil {
+		t.Fatal(err)
+	}
+	ackResponse, _, err := readTCPResponse(conn, token, 7, hostarch.PageSize)
+	if err != nil || ackResponse.type_ != tcpAckOK {
+		t.Fatalf("ACK response=%+v err=%v", ackResponse, err)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("source page did not become unique after confirmed ACK")
+	}
+	conn.Close()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPRemoteReaderReadv(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 2)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, fr.Length())
+	reader, err := NewTCPRemoteReader(server.Addr().String(), token, fr.Length(), 2, 1, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make([]byte, hostarch.PageSize)
+	second := make([]byte, hostarch.PageSize)
+	iovecs := []unix.Iovec{
+		{Base: &first[0], Len: uint64(len(first))},
+		{Base: &second[0], Len: uint64(len(second))},
+	}
+	reader.AddReadv(0, 0, fr.Length(), nil, nil, iovecs)
+	completions, err := reader.Wait(nil, 1)
+	if err != nil || len(completions) != 1 || completions[0].Err != nil {
+		t.Fatalf("completions=%+v err=%v", completions, err)
+	}
+	if !bytes.Equal(append(first, second...), want) {
+		t.Fatal("TCP readv returned incorrect data")
+	}
+	reader.Close()
+	server.Close()
+	<-serveDone
+}
+
+func TestTCPRemoteReaderRejectsWrongToken(t *testing.T) {
+	mf, fr, _ := newTCPTestMemoryFile(t, 1)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, serveDone := startTCPTestServer(t, snapshot, testSnapshotToken(), hostarch.PageSize)
+	wrong := testSnapshotToken()
+	wrong[0]++
+	reader, err := NewTCPRemoteReader(server.Addr().String(), wrong, hostarch.PageSize, 1, 1, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, hostarch.PageSize)
+	reader.AddRead(0, 0, nil, memmap.FileRange{}, dst)
+	completions, err := reader.Wait(nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completions[0].Err == nil || completions[0].N != 0 {
+		t.Fatalf("wrong-token completion: %+v", completions[0])
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 1 {
+		t.Fatalf("wrong token released source page: %+v", stats)
+	}
+	reader.Close()
+	server.Close()
+	<-serveDone
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("server cancellation did not release wrong-token snapshot")
+	}
+}

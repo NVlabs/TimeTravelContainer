@@ -563,6 +563,20 @@ func (r *remoteSnapshotReaderAt) Close() error {
 }
 
 func (r *remoteSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
+	written, err := r.snapshot.CopyStreamAt(dst, off)
+	if err != nil {
+		return written, err
+	}
+	if err := r.snapshot.AcknowledgeStreamRange(uint64(off), uint64(len(dst))); err != nil {
+		return written, err
+	}
+	return written, nil
+}
+
+// CopyStreamAt copies an aligned packed-stream range while holding temporary
+// sender references. It does not release the snapshot references; the caller
+// must call AcknowledgeStreamRange only after the target installs the bytes.
+func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
 	}
@@ -570,24 +584,24 @@ func (r *remoteSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("remote read must be page-aligned: off=%d len=%d", off, len(dst))
 	}
 	streamOff := uint64(off)
-	if streamOff >= r.snapshot.streamBytes || uint64(len(dst)) > r.snapshot.streamBytes-streamOff {
+	if streamOff >= s.streamBytes || uint64(len(dst)) > s.streamBytes-streamOff {
 		return 0, io.EOF
 	}
 
 	written := 0
 	for written < len(dst) {
-		regionIndex := sort.Search(len(r.snapshot.regions), func(i int) bool {
-			region := &r.snapshot.regions[i]
+		regionIndex := sort.Search(len(s.regions), func(i int) bool {
+			region := &s.regions[i]
 			return region.streamStart+region.Range.Length() > streamOff
 		})
-		if regionIndex == len(r.snapshot.regions) {
+		if regionIndex == len(s.regions) {
 			return written, io.ErrUnexpectedEOF
 		}
-		region := &r.snapshot.regions[regionIndex]
+		region := &s.regions[regionIndex]
 		relativeStart := streamOff - region.streamStart
 		length := min(uint64(len(dst)-written), region.Range.Length()-relativeStart)
 		relative := memmap.FileRange{relativeStart, relativeStart + length}
-		lease, err := r.snapshot.AcquireRegion(region.ID, relative)
+		lease, err := s.AcquireRegion(region.ID, relative)
 		if err != nil {
 			return written, err
 		}
@@ -601,9 +615,6 @@ func (r *remoteSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 		if copyErr == nil && copied != length {
 			copyErr = io.ErrUnexpectedEOF
 		}
-		if copyErr == nil {
-			copyErr = r.snapshot.ReleaseRegion(region.ID, relative)
-		}
 		lease.Close()
 		written += int(copied)
 		if copyErr != nil {
@@ -612,4 +623,33 @@ func (r *remoteSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 		streamOff += length
 	}
 	return written, nil
+}
+
+// AcknowledgeStreamRange releases source snapshot references for an aligned
+// packed-stream range after the target has installed it. Duplicate and
+// overlapping acknowledgements are idempotent.
+func (s *RemoteSnapshot) AcknowledgeStreamRange(streamOff, length uint64) error {
+	if length == 0 || !hostarch.IsPageAligned(streamOff) || !hostarch.IsPageAligned(length) ||
+		streamOff >= s.streamBytes || length > s.streamBytes-streamOff {
+		return fmt.Errorf("invalid remote acknowledgement: off=%#x len=%#x stream=%#x", streamOff, length, s.streamBytes)
+	}
+	remaining := length
+	for remaining != 0 {
+		regionIndex := sort.Search(len(s.regions), func(i int) bool {
+			region := &s.regions[i]
+			return region.streamStart+region.Range.Length() > streamOff
+		})
+		if regionIndex == len(s.regions) {
+			return io.ErrUnexpectedEOF
+		}
+		region := &s.regions[regionIndex]
+		relativeStart := streamOff - region.streamStart
+		part := min(remaining, region.Range.Length()-relativeStart)
+		if err := s.ReleaseRegion(region.ID, memmap.FileRange{relativeStart, relativeStart + part}); err != nil {
+			return err
+		}
+		streamOff += part
+		remaining -= part
+	}
+	return nil
 }
