@@ -358,6 +358,9 @@ after a full drain and branch destruction.
   APIs. A versioned, allocation-bounded, SHA-256-protected session envelope
   carries Kernel metadata, allocator metadata, page-stream mappings, and branch
   identity between independent Sentry processes.
+* A subprocess target test reconstructs its own MemoryFile from the envelope
+  and fetches exactly one demanded 4 KiB page over TCP while leaving the rest
+  remote.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.

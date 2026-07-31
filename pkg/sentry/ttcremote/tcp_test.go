@@ -22,12 +22,14 @@ import (
 	"hash/crc32"
 	"net"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -76,6 +78,27 @@ func newTCPTestMemoryFile(t *testing.T, pages uint64) (*pgalloc.MemoryFile, memm
 		mf.Destroy()
 	})
 	return mf, fr, data
+}
+
+func newEmptyTCPTestMemoryFile(t *testing.T) *pgalloc.MemoryFile {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-tcp-target-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction: pgalloc.DelayedEvictionDisabled, DisableIMAWorkAround: true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	return mf
 }
 
 func startTCPTestServer(t *testing.T, snapshot *pgalloc.RemoteSnapshot, token SnapshotToken, maxRead uint64) (*TCPPageServer, <-chan error) {
@@ -172,6 +195,91 @@ func TestTCPMetadataHandshakeAndChunkStream(t *testing.T) {
 	}
 	if stats := server.Stats(); stats.MetadataBytesSent != uint64(len(metadata)) || stats.PullRequests != 0 {
 		t.Fatalf("metadata transport stats: %+v", stats)
+	}
+	server.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPRemoteTargetSubprocess(t *testing.T) {
+	if os.Getenv("TTC_REMOTE_TARGET_HELPER") == "1" {
+		address := os.Getenv("TTC_REMOTE_TARGET_ADDRESS")
+		encoded, err := FetchTCPMetadata(context.Background(), address, testSnapshotToken(), 64<<10, 4<<20, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimits{
+			MaxTotalBytes: 4 << 20, MaxKernelBytes: 1, MaxAllocatorBytes: 2 << 20, MaxLoadRanges: 1024,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := newEmptyTCPTestMemoryFile(t)
+		defer target.Destroy()
+		if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, session.AllocatorMetadata); err != nil {
+			t.Fatal(err)
+		}
+		reader, err := NewTCPRemoteReader(address, testSnapshotToken(), 64<<10, 16, 2, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := target.AttachRemotePageLoad(pages, session.LoadRanges, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		pages.MemoryFilesDone()
+		first := session.LoadRanges[0].Target
+		first.End = first.Start + hostarch.PageSize
+		mapped, err := target.MapInternal(first, hostarch.Read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, hostarch.PageSize)
+		if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != hostarch.PageSize {
+			t.Fatalf("copy target page: n=%d err=%v", n, err)
+		}
+		for i, value := range got {
+			want := byte((i*29 + i/int(hostarch.PageSize)) & 0xff)
+			if value != want {
+				t.Fatalf("target byte %d=%d, want %d", i, value, want)
+			}
+		}
+		pages.Cancel()
+		_ = pages.Wait()
+		return
+	}
+
+	mf, _, _ := newTCPTestMemoryFile(t, 16)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), mf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := (&SessionMetadata{
+		FamilyID: "subprocess", SourceBranchID: "a", TargetBranchID: "b",
+		AllocatorMetadata: allocator, LoadRanges: loads,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, serveDone := startTCPTestServer(t, snapshot, testSnapshotToken(), 64<<10)
+	if err := server.SetMetadata(session); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestTCPRemoteTargetSubprocess$")
+	cmd.Env = append(os.Environ(), "TTC_REMOTE_TARGET_HELPER=1", "TTC_REMOTE_TARGET_ADDRESS="+server.Addr().String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("remote target subprocess: %v\n%s", err, output)
+	}
+	if stats := server.Stats(); stats.BytesSent != hostarch.PageSize {
+		t.Fatalf("target fetched %d page bytes before exit, want one page", stats.BytesSent)
 	}
 	server.Close()
 	if err := <-serveDone; err != nil {

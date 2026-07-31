@@ -32,6 +32,7 @@ go_test(
     deps = [
         "//pkg/hostarch",
         "//pkg/safemem",
+		"//pkg/sentry/contexttest",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
