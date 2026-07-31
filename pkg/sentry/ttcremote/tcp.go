@@ -258,7 +258,8 @@ func (s *TCPPageServer) serveConn(conn net.Conn) {
 			}
 
 		case tcpAck:
-			if header.checksum != 0 || header.length == 0 || !hostarch.IsPageAligned(uint64(header.length)) || !hostarch.IsPageAligned(header.offset) {
+			if header.checksum != 0 || header.length == 0 || uint64(header.length) > s.maxRead ||
+				!hostarch.IsPageAligned(uint64(header.length)) || !hostarch.IsPageAligned(header.offset) {
 				s.writeError(conn, header, errors.New("invalid acknowledgement range"))
 				return
 			}
@@ -346,6 +347,8 @@ type TCPRemoteReader struct {
 	maxReadBytes uint64
 	maxRanges    int
 	timeout      time.Duration
+	retryLimit   int
+	retryBackoff time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -357,36 +360,63 @@ type TCPRemoteReader struct {
 	conns  map[net.Conn]struct{}
 }
 
+// TCPRemoteReaderOpts configures remote page reads.
+type TCPRemoteReaderOpts struct {
+	MaxReadBytes uint64
+	MaxRanges    int
+	MaxParallel  int
+	Timeout      time.Duration
+	RetryLimit   int
+	RetryBackoff time.Duration
+}
+
 // NewTCPRemoteReader constructs a TCP page reader. timeout applies to dialing
 // and every request/response pair.
 func NewTCPRemoteReader(address string, token SnapshotToken, maxReadBytes uint64, maxRanges, maxParallel int, timeout time.Duration) (*TCPRemoteReader, error) {
+	return NewTCPRemoteReaderWithOpts(address, token, TCPRemoteReaderOpts{
+		MaxReadBytes: maxReadBytes,
+		MaxRanges:    maxRanges,
+		MaxParallel:  maxParallel,
+		Timeout:      timeout,
+		RetryLimit:   3,
+		RetryBackoff: 10 * time.Millisecond,
+	})
+}
+
+// NewTCPRemoteReaderWithOpts constructs a configurable TCP page reader.
+func NewTCPRemoteReaderWithOpts(address string, token SnapshotToken, opts TCPRemoteReaderOpts) (*TCPRemoteReader, error) {
 	if address == "" {
 		return nil, errors.New("TCP remote reader address is empty")
 	}
-	if maxReadBytes < hostarch.PageSize || !hostarch.IsPageAligned(maxReadBytes) || maxReadBytes > 2<<20 {
-		return nil, fmt.Errorf("invalid maximum TCP read size %d", maxReadBytes)
+	if opts.MaxReadBytes < hostarch.PageSize || !hostarch.IsPageAligned(opts.MaxReadBytes) || opts.MaxReadBytes > 2<<20 {
+		return nil, fmt.Errorf("invalid maximum TCP read size %d", opts.MaxReadBytes)
 	}
-	if maxRanges <= 0 || maxParallel <= 0 {
+	if opts.MaxRanges <= 0 || opts.MaxParallel <= 0 {
 		return nil, fmt.Errorf("max ranges and parallelism must be positive")
 	}
-	if timeout <= 0 {
+	if opts.Timeout <= 0 {
 		return nil, fmt.Errorf("TCP page timeout must be positive")
+	}
+	if opts.RetryLimit < 0 || opts.RetryBackoff < 0 {
+		return nil, errors.New("TCP retry limit and backoff must be non-negative")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &TCPRemoteReader{
 		address:      address,
 		token:        token,
-		maxReadBytes: maxReadBytes,
-		maxRanges:    maxRanges,
-		timeout:      timeout,
+		maxReadBytes: opts.MaxReadBytes,
+		maxRanges:    opts.MaxRanges,
+		timeout:      opts.Timeout,
+		retryLimit:   opts.RetryLimit,
+		retryBackoff: opts.RetryBackoff,
 		ctx:          ctx,
 		cancel:       cancel,
-		subs:         make(chan tcpReadSubmission, maxParallel),
-		cmps:         make(chan stateio.Completion, maxParallel),
+		subs:         make(chan tcpReadSubmission, opts.MaxParallel),
+		cmps:         make(chan stateio.Completion, opts.MaxParallel),
 		conns:        make(map[net.Conn]struct{}),
 	}
-	r.wg.Add(maxParallel)
-	for range maxParallel {
+	r.wg.Add(opts.MaxParallel)
+	for range opts.MaxParallel {
 		go r.worker()
 	}
 	return r, nil
@@ -437,20 +467,8 @@ func (r *TCPRemoteReader) worker() {
 		case <-r.ctx.Done():
 			return
 		case sub := <-r.subs:
-			if conn == nil {
-				var err error
-				dialer := net.Dialer{Timeout: r.timeout}
-				conn, err = dialer.DialContext(r.ctx, "tcp", r.address)
-				if err != nil {
-					r.cmps <- stateio.Completion{ID: sub.id, Err: err}
-					continue
-				}
-				r.mu.Lock()
-				r.conns[conn] = struct{}{}
-				r.mu.Unlock()
-			}
-			n, err := r.performRead(conn, sub)
-			if err != nil {
+			n, err := r.performReadWithRetry(&conn, sub)
+			if conn != nil && err != nil {
 				r.mu.Lock()
 				delete(r.conns, conn)
 				r.mu.Unlock()
@@ -462,45 +480,95 @@ func (r *TCPRemoteReader) worker() {
 	}
 }
 
-func (r *TCPRemoteReader) performRead(conn net.Conn, sub tcpReadSubmission) (uint64, error) {
+func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmission) (uint64, error) {
 	if sub.offset < 0 || sub.total == 0 || sub.total > r.maxReadBytes || sub.total > uint64(^uint32(0)) ||
 		!hostarch.IsPageAligned(uint64(sub.offset)) || !hostarch.IsPageAligned(sub.total) {
 		return 0, fmt.Errorf("invalid TCP remote read: off=%d len=%d", sub.offset, sub.total)
 	}
+	installed := false
+	var lastErr error
+	for attempt := 0; attempt <= r.retryLimit; attempt++ {
+		if *conn == nil {
+			dialer := net.Dialer{Timeout: r.timeout}
+			var err error
+			*conn, err = dialer.DialContext(r.ctx, "tcp", r.address)
+			if err != nil {
+				lastErr = err
+			} else {
+				r.mu.Lock()
+				r.conns[*conn] = struct{}{}
+				r.mu.Unlock()
+			}
+		}
+		if *conn != nil {
+			var retryable bool
+			installed, retryable, lastErr = r.performReadAttempt(*conn, sub, installed)
+			if lastErr == nil {
+				return sub.total, nil
+			}
+			r.mu.Lock()
+			delete(r.conns, *conn)
+			r.mu.Unlock()
+			(*conn).Close()
+			*conn = nil
+			if !retryable {
+				return 0, lastErr
+			}
+		}
+		if attempt != r.retryLimit && r.retryBackoff != 0 {
+			timer := time.NewTimer(r.retryBackoff)
+			select {
+			case <-r.ctx.Done():
+				timer.Stop()
+				return 0, r.ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return 0, fmt.Errorf("TCP remote read failed after %d attempts: %w", r.retryLimit+1, lastErr)
+}
+
+// performReadAttempt performs either pull+install+ACK or, if installed is
+// true, an ACK-only recovery. Retrying ACK rather than PULL is essential: the
+// server may have released the source page before its ACKOK was lost.
+func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmission, installed bool) (bool, bool, error) {
 	deadline := time.Now().Add(r.timeout)
 	if err := conn.SetDeadline(deadline); err != nil {
-		return 0, err
+		return installed, true, err
 	}
 	requestID := uint32(sub.id)
-	pull := tcpHeader{
-		type_:     tcpPull,
-		token:     r.token,
-		requestID: requestID,
-		offset:    uint64(sub.offset),
-		length:    uint32(sub.total),
-	}
-	if err := writeTCPMessage(conn, pull, nil); err != nil {
-		return 0, err
-	}
-	response, payload, err := readTCPResponse(conn, r.token, requestID, r.maxReadBytes)
-	if err != nil {
-		return 0, err
-	}
-	if response.type_ == tcpError {
-		return 0, fmt.Errorf("remote page server: %s", payload)
-	}
-	if response.type_ != tcpData || response.offset != uint64(sub.offset) || uint64(response.length) != sub.total {
-		return 0, fmt.Errorf("mismatched TCP page response: type=%d off=%d len=%d", response.type_, response.offset, response.length)
-	}
+	if !installed {
+		pull := tcpHeader{
+			type_:     tcpPull,
+			token:     r.token,
+			requestID: requestID,
+			offset:    uint64(sub.offset),
+			length:    uint32(sub.total),
+		}
+		if err := writeTCPMessage(conn, pull, nil); err != nil {
+			return false, true, err
+		}
+		response, payload, err := readTCPResponse(conn, r.token, requestID, r.maxReadBytes)
+		if err != nil {
+			return false, true, err
+		}
+		if response.type_ == tcpError {
+			return false, false, fmt.Errorf("remote page server: %s", payload)
+		}
+		if response.type_ != tcpData || response.offset != uint64(sub.offset) || uint64(response.length) != sub.total {
+			return false, false, fmt.Errorf("mismatched TCP page response: type=%d off=%d len=%d", response.type_, response.offset, response.length)
+		}
 
-	var copied uint64
-	sub.dst.Mappings(func(_ int, dst []byte) bool {
-		n := copy(dst, payload[copied:])
-		copied += uint64(n)
-		return copied < sub.total
-	})
-	if copied != sub.total {
-		return copied, fmt.Errorf("destination mappings contain %d bytes, want %d", copied, sub.total)
+		var copied uint64
+		sub.dst.Mappings(func(_ int, dst []byte) bool {
+			n := copy(dst, payload[copied:])
+			copied += uint64(n)
+			return copied < sub.total
+		})
+		if copied != sub.total {
+			return false, false, fmt.Errorf("destination mappings contain %d bytes, want %d", copied, sub.total)
+		}
+		installed = true
 	}
 	if err := writeTCPMessage(conn, tcpHeader{
 		type_:     tcpAck,
@@ -509,19 +577,19 @@ func (r *TCPRemoteReader) performRead(conn net.Conn, sub tcpReadSubmission) (uin
 		offset:    uint64(sub.offset),
 		length:    uint32(sub.total),
 	}, nil); err != nil {
-		return 0, err
+		return installed, true, err
 	}
 	ack, ackPayload, err := readTCPResponse(conn, r.token, requestID, r.maxReadBytes)
 	if err != nil {
-		return 0, err
+		return installed, true, err
 	}
 	if ack.type_ == tcpError {
-		return 0, fmt.Errorf("remote page acknowledgement: %s", ackPayload)
+		return installed, false, fmt.Errorf("remote page acknowledgement: %s", ackPayload)
 	}
 	if ack.type_ != tcpAckOK || ack.offset != uint64(sub.offset) || uint64(ack.length) != sub.total {
-		return 0, errors.New("mismatched TCP page acknowledgement")
+		return installed, false, errors.New("mismatched TCP page acknowledgement")
 	}
-	return copied, nil
+	return installed, false, nil
 }
 
 func readTCPResponse(r io.Reader, token SnapshotToken, requestID uint32, maxPayload uint64) (tcpHeader, []byte, error) {

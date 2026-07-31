@@ -347,10 +347,10 @@ after a full drain and branch destruction.
 
 ### Phase 2: network pull between two Sentries
 
-* The initial bounded TCP pull/data/ACK transport and checksums are implemented.
-  It releases source references only after destination installation and an
-  acknowledged ACK. Complete the transaction handshake, retries, flow control,
-  and target dependency handling.
+* The bounded TCP pull/data/ACK transport, checksums, bounded reconnect retry,
+  and ACK-only recovery are implemented. It releases source references only
+  after destination installation and an acknowledged ACK. Complete the
+  transaction handshake, flow control, and target dependency handling.
 * Stream kernel metadata separately from memory page data.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.

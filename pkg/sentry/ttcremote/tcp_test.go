@@ -16,6 +16,9 @@ package ttcremote
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"hash/crc32"
 	"net"
 	"os"
 	"testing"
@@ -256,5 +259,162 @@ func TestTCPRemoteReaderRejectsWrongToken(t *testing.T) {
 	<-serveDone
 	if !mf.HasUniqueRef(fr) {
 		t.Fatal("server cancellation did not release wrong-token snapshot")
+	}
+}
+
+func TestTCPRemoteReaderRecoversLostAckOK(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 1)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		pull, err := readTCPHeader(conn)
+		if err == nil && pull.type_ != tcpPull {
+			err = errors.New("first request is not PULL")
+		}
+		if err == nil {
+			err = writeTCPMessage(conn, tcpHeader{
+				type_: tcpData, token: token, requestID: pull.requestID,
+				offset: pull.offset, length: pull.length, checksum: crc32.ChecksumIEEE(want),
+			}, want)
+		}
+		var ack tcpHeader
+		if err == nil {
+			ack, err = readTCPHeader(conn)
+		}
+		if err == nil && ack.type_ != tcpAck {
+			err = errors.New("second request is not ACK")
+		}
+		if err == nil {
+			err = snapshot.AcknowledgeStreamRange(ack.offset, uint64(ack.length))
+		}
+		// Simulate ACKOK loss after the source has already released the page.
+		conn.Close()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		conn, err = listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		retry, err := readTCPHeader(conn)
+		if err == nil && retry.type_ != tcpAck {
+			err = fmt.Errorf("retry type=%d, want ACK", retry.type_)
+		}
+		if err == nil {
+			err = snapshot.AcknowledgeStreamRange(retry.offset, uint64(retry.length))
+		}
+		if err == nil {
+			err = writeTCPMessage(conn, tcpHeader{
+				type_: tcpAckOK, token: token, requestID: retry.requestID,
+				offset: retry.offset, length: retry.length,
+			}, nil)
+		}
+		serverDone <- err
+	}()
+
+	reader, err := NewTCPRemoteReaderWithOpts(listener.Addr().String(), token, TCPRemoteReaderOpts{
+		MaxReadBytes: hostarch.PageSize,
+		MaxRanges:    1,
+		MaxParallel:  1,
+		Timeout:      time.Second,
+		RetryLimit:   2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	reader.AddRead(19, 0, nil, memmap.FileRange{}, got)
+	completions, err := reader.Wait(nil, 1)
+	if err != nil || completions[0].Err != nil || completions[0].N != hostarch.PageSize {
+		t.Fatalf("completion=%+v Wait err=%v", completions, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("retry changed installed page data")
+	}
+	reader.Close()
+	listener.Close()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("lost ACKOK recovery retained source snapshot reference")
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPRemoteReaderRejectsCorruptData(t *testing.T) {
+	token := testSnapshotToken()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverDone := make(chan error, 1)
+	go func() {
+		defer close(serverDone)
+		for range 2 {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			header, err := readTCPHeader(conn)
+			if err == nil {
+				payload := make([]byte, hostarch.PageSize)
+				err = writeTCPMessage(conn, tcpHeader{
+					type_: tcpData, token: token, requestID: header.requestID,
+					offset: header.offset, length: uint32(len(payload)), checksum: 1,
+				}, payload)
+			}
+			conn.Close()
+			if err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+	reader, err := NewTCPRemoteReaderWithOpts(listener.Addr().String(), token, TCPRemoteReaderOpts{
+		MaxReadBytes: hostarch.PageSize,
+		MaxRanges:    1,
+		MaxParallel:  1,
+		Timeout:      time.Second,
+		RetryLimit:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, hostarch.PageSize)
+	reader.AddRead(1, 0, nil, memmap.FileRange{}, dst)
+	completions, err := reader.Wait(nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completions[0].Err == nil || completions[0].N != 0 {
+		t.Fatalf("corrupt completion: %+v", completions[0])
+	}
+	reader.Close()
+	listener.Close()
+	for err := range serverDone {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
