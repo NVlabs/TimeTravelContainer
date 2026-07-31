@@ -15,9 +15,11 @@
 package kernel_test
 
 import (
+	stdcontext "context"
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -355,6 +357,105 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	parent.Pause()
 	child.Pause()
 	child.Release()
+	parent.Release()
+}
+
+func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
+	token := ttcremote.SnapshotToken{0x54, 0x54, 0x43, 4}
+	if os.Getenv("TTC_KERNEL_TARGET_HELPER") == "1" {
+		address := os.Getenv("TTC_KERNEL_TARGET_ADDRESS")
+		encoded, err := ttcremote.FetchTCPMetadata(stdcontext.Background(), address, token, 256<<10, 32<<20, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
+			MaxTotalBytes: 32 << 20, MaxKernelBytes: 24 << 20, MaxAllocatorBytes: 8 << 20, MaxLoadRanges: 1 << 16,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		platformOwner, err := testutil.Boot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		platformOwner.PipeMount().IncRef()
+		platformOwner.SetHostMount(platformOwner.PipeMount())
+		targetMF := newRemoteKernelMemoryFile(t)
+		reader, err := ttcremote.NewTCPRemoteReader(address, token, 256<<10, 16, 4, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child, err := kernel.LoadDistributedFork(platformOwner.SupervisorContext(), platformOwner.Platform, targetMF,
+			session.KernelMetadata, session.AllocatorMetadata, session.LoadRanges, reader,
+			kernel.DistributedForkLoadOptions{
+				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: session.TargetBranchID,
+				FilesystemResources: make(vfs.LiveForkFilesystemResources), DemandOnly: true,
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+			t.Fatal(err)
+		}
+		if err := child.StartPaused(); err != nil {
+			t.Fatal(err)
+		}
+		child.Unpause()
+		child.Pause()
+		child.Release()
+		platformOwner.Release()
+		return
+	}
+
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "subprocess"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := (&ttcremote.SessionMetadata{
+		FamilyID: "kernel-subprocess", SourceBranchID: "main", TargetBranchID: "subprocess",
+		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, 256<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamBytes := capture.Snapshot.StreamBytes()
+	capture.Snapshot = nil
+	if err := server.SetMetadata(envelope); err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPortableDistributedForkKernelSubprocess$")
+	cmd.Env = append(os.Environ(), "TTC_KERNEL_TARGET_HELPER=1", "TTC_KERNEL_TARGET_ADDRESS="+listener.Addr().String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("distributed Kernel target subprocess: %v\n%s", err, output)
+	}
+	stats := server.Stats()
+	if stats.BytesSent == 0 {
+		t.Fatal("target started without demanding any remote memory")
+	}
+	if stats.BytesSent >= streamBytes {
+		t.Logf("small test Kernel demanded its full %d-byte memory stream during startup", streamBytes)
+	}
+	server.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
 	parent.Release()
 }
 

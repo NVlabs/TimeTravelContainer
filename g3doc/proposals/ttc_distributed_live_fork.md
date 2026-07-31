@@ -365,6 +365,9 @@ after a full drain and branch destruction.
   them against a separate target allocator, attach TCP demand paging, complete
   VFS restore, and start the reconstructed Kernel without process-local PMA
   snapshot pointers.
+* A whole-Kernel subprocess target now fetches the portable envelope from the
+  source process, creates its own platform context and MemoryFile, restores and
+  starts the Kernel, drains remote pages, and tears down cleanly.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.
