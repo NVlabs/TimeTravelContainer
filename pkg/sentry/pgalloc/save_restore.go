@@ -1129,6 +1129,14 @@ type AsyncPagesFileLoad struct {
 	// immutable. errVal is stored with mu locked.
 	errVal atomic.Value
 
+	// demandOnly is true while unawaited pages must not be loaded. It may
+	// transition from true to false exactly once when Drain is called.
+	demandOnly atomic.Bool
+
+	// done is closed after the loader goroutine has stopped and ar has been
+	// closed.
+	done chan struct{}
+
 	// priority contains possibly-unstarted ranges with at least one waiter.
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
@@ -1206,6 +1214,7 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	aplLFCancel
 )
 
 type aplFileRange struct {
@@ -1316,9 +1325,22 @@ func (op *aplOp) off() int64 {
 	return int64(op.end - op.total)
 }
 
+// AsyncPagesFileLoadOpts controls asynchronous page loading.
+type AsyncPagesFileLoadOpts struct {
+	// DemandOnly prevents speculative background loading. Only ranges needed
+	// by a current waiter are read until Drain is called.
+	DemandOnly bool
+}
+
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
 func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {
+	return StartAsyncPagesFileLoadWithOpts(ar, doneCallback, timeline, AsyncPagesFileLoadOpts{})
+}
+
+// StartAsyncPagesFileLoadWithOpts is equivalent to StartAsyncPagesFileLoad
+// with the given options.
+func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline, opts AsyncPagesFileLoadOpts) (*AsyncPagesFileLoad, error) {
 	maxReadBytes := hostarch.PageRoundDown(ar.MaxReadBytes())
 	if maxReadBytes <= 0 {
 		ar.Close()
@@ -1335,7 +1357,9 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
+		done:             make(chan struct{}),
 	}
+	apfl.demandOnly.Store(opts.DemandOnly)
 	// Mark ops in opsBusy that don't actually exist as permanently busy.
 	for i, n := maxParallel, apfl.opsBusy.Size(); i < n; i++ {
 		apfl.opsBusy.Add(uint32(i))
@@ -1350,6 +1374,25 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+// Drain enables background loading of every remaining page. It is idempotent.
+func (apfl *AsyncPagesFileLoad) Drain() {
+	if apfl.demandOnly.Swap(false) {
+		apfl.lfStatus.Notify(aplLFPending)
+	}
+}
+
+// Cancel stops page loading and closes the underlying reader. Any remaining
+// waiters fail with context.Canceled. It is safe to call multiple times.
+func (apfl *AsyncPagesFileLoad) Cancel() {
+	apfl.lfStatus.Notify(aplLFCancel)
+}
+
+// Wait waits for the loader to stop and returns its terminal error.
+func (apfl *AsyncPagesFileLoad) Wait() error {
+	<-apfl.done
+	return apfl.err()
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
@@ -1433,6 +1476,7 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	}
 	apfl.mu.Unlock()
 	if pending {
+		apfl.lfStatus.Notify(aplLFPending)
 		if logAwaitedLoads {
 			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
 		}
@@ -1626,6 +1670,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
+		close(apfl.done)
 	}()
 
 	maxParallel := apfl.ar.MaxParallel()
@@ -1691,7 +1736,19 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}()
 	}
 
+	memoryFilesDone := false
 	for {
+		ev := apfl.lfStatus.Pending()
+		if ev&aplLFCancel != 0 {
+			apfl.mu.Lock()
+			apfl.errVal.Store(context.Canceled)
+			apfl.mu.Unlock()
+			return
+		}
+		if ev&aplLFDone != 0 {
+			memoryFilesDone = true
+			apfl.lfStatus.Ack(aplLFDone)
+		}
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
@@ -1741,7 +1798,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		if apfl.canEnqueue() && !apfl.demandOnly.Load() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -1799,7 +1856,18 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 		if apfl.qavail == maxParallel {
 			// We are out of work to do.
+			if memoryFilesDone && !apfl.demandOnly.Load() {
+				// Successfully completed all loading for all MemoryFiles.
+				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
+				apfl.mu.Lock()
+				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited)
+				apfl.mu.Unlock()
+				return
+			}
 			ev := apfl.lfStatus.Wait()
+			if ev&aplLFCancel != 0 {
+				continue
+			}
 			if ev&aplLFPending != 0 {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
 				// asyncMemoryFileLoad.unloaded.
@@ -1807,12 +1875,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				continue
 			}
 			if ev&aplLFDone != 0 {
-				// Successfully completed all loading for all MemoryFiles.
-				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
-				apfl.mu.Lock()
-				log.Infof("Async page loading completed in %s (%d bytes, %.3f MB/s); %d waiters waited %v~%v for %d bytes", durTotal.Round(time.Millisecond), apfl.bytesLoaded, float64(apfl.bytesLoaded)*1e-6/durTotal.Seconds(), apfl.totalWaiters, apfl.durWaitedOne.Round(time.Millisecond), apfl.durWaitedTotal.Round(time.Millisecond), apfl.bytesWaited)
-				apfl.mu.Unlock()
-				return
+				continue
 			}
 			panic(fmt.Sprintf("unknown events in lfStatus: %#x", ev))
 		}

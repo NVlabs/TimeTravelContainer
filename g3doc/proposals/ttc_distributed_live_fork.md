@@ -333,9 +333,10 @@ transaction.
 
 ### Phase 1: local asynchronous remote-page provider
 
-* Introduce `RemoteSnapshot` reference ownership in `pgalloc`.
-* Adapt the existing asynchronous restore/page-loader path to a pluggable
-  `RemotePageProvider`.
+* `RemoteSnapshot` reference ownership and metadata-only `MemoryFile` cloning
+  are implemented in `pgalloc`.
+* The asynchronous restore/page-loader path now supports demand-only loading,
+  explicit drain, cancellation, and both loopback and TCP readers.
 * Run source and target Kernels in one process but force all target page access
   through an asynchronous loopback transport.
 * Implement pull and batched ACK only; use demand-only policy.

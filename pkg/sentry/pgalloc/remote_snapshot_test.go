@@ -18,6 +18,7 @@ package pgalloc
 
 import (
 	"bytes"
+	stdcontext "context"
 	"os"
 	"sync"
 	"testing"
@@ -282,6 +283,92 @@ func TestAttachRemotePageLoad(t *testing.T) {
 	}
 	if !source.HasUniqueRef(sourceFR) {
 		t.Fatal("source pages did not become unique after target installation")
+	}
+}
+
+func TestDemandOnlyRemotePageLoad(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	target, targetFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*13 + 11)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	// MemoryFilesDone must not turn a demand-only load into an eager drain.
+	time.Sleep(25 * time.Millisecond)
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 8 {
+		t.Fatalf("demand-only loader fetched untouched pages: %+v", stats)
+	}
+
+	page := uint64(3)
+	pageFR := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
+	loaded, err := target.MapInternal(pageFR, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), loaded); err != nil || n != hostarch.PageSize {
+		t.Fatalf("copy demanded page: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want[page*hostarch.PageSize:(page+1)*hostarch.PageSize]) {
+		t.Fatal("demand-loaded page differs from source")
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 7 || stats.PagesReleased != 1 {
+		t.Fatalf("demand load did not release exactly one page: %+v", stats)
+	}
+
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := snapshot.Stats(); !stats.Closed || stats.PagesOutstanding != 0 {
+		t.Fatalf("drained snapshot: %+v", stats)
+	}
+	if !source.HasUniqueRef(sourceFR) {
+		t.Fatal("drain did not release all source references")
+	}
+}
+
+func TestCancelDemandOnlyRemotePageLoad(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 4)
+	target, targetFR := newRemoteTestMemoryFile(t, 4)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	pages.Cancel()
+	if err := pages.Wait(); err != stdcontext.Canceled {
+		t.Fatalf("Wait after Cancel: got %v, want context.Canceled", err)
+	}
+	if stats := snapshot.Stats(); !stats.Closed || stats.PagesOutstanding != 0 {
+		t.Fatalf("canceled snapshot: %+v", stats)
+	}
+	if !source.HasUniqueRef(sourceFR) {
+		t.Fatal("cancel did not release source references")
 	}
 }
 
