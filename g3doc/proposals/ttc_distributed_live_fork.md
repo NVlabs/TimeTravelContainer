@@ -6,7 +6,10 @@ Implementation progress:
 
 * Phase 0 protocol model, trace replay, invariant tests, randomized schedules,
   policy validation, and analytical pull simulator: implemented.
-* Phases 1 through 6: pending.
+* Phase 1 `MemoryFile` snapshot ownership, page-granular acknowledgement,
+  sender leases, loopback `AsyncReader`, and asynchronous target-page loading:
+  implemented and tested; Kernel metadata-clone integration is pending.
+* Phases 2 through 6: pending.
 
 ## Summary
 

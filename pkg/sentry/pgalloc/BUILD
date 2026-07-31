@@ -167,6 +167,7 @@ go_library(
         "memory_file_mutex.go",
         "pgalloc.go",
         "pgalloc_unsafe.go",
+        "remote_snapshot.go",
         "save_restore.go",
         "unfree_set.go",
         "unwaste_set.go",
@@ -207,10 +208,14 @@ go_test(
     srcs = [
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
+        "remote_snapshot_test.go",
     ],
     library = ":pgalloc",
     deps = [
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/usage",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
