@@ -103,6 +103,11 @@ type MemoryFile struct {
 
 	mu memoryFileMutex
 
+	// remoteCOWMu protects remoteCOWSnapshots. It is independent of mu so COW
+	// notifications can be emitted only after MemoryManager locks are dropped.
+	remoteCOWMu        sync.RWMutex
+	remoteCOWSnapshots map[*RemoteSnapshot]struct{}
+
 	// unwasteSmall and unwasteHuge track waste ranges backed by small/huge pages
 	// respectively. Both sets are "inverted"; segments exist for all ranges that
 	// are *not* waste, allowing use of segment.Set gap-tracking to efficiently
@@ -216,6 +221,36 @@ type MemoryFile struct {
 	//
 	// chunks is protected by mu. chunks slices are immutable.
 	chunks atomic.Pointer[[]chunkInfo]
+}
+
+// NotifyRemoteCOW reports that a source mapping has stopped owning the given
+// fork-time range after a copy-on-write break. Notification is non-blocking;
+// transports consume it as a proactive-push hint.
+func (f *MemoryFile) NotifyRemoteCOW(fr memmap.FileRange) {
+	f.remoteCOWMu.RLock()
+	snapshots := make([]*RemoteSnapshot, 0, len(f.remoteCOWSnapshots))
+	for snapshot := range f.remoteCOWSnapshots {
+		snapshots = append(snapshots, snapshot)
+	}
+	f.remoteCOWMu.RUnlock()
+	for _, snapshot := range snapshots {
+		snapshot.notifySourceCOW(f, fr)
+	}
+}
+
+func (f *MemoryFile) registerRemoteSnapshot(snapshot *RemoteSnapshot) {
+	f.remoteCOWMu.Lock()
+	if f.remoteCOWSnapshots == nil {
+		f.remoteCOWSnapshots = make(map[*RemoteSnapshot]struct{})
+	}
+	f.remoteCOWSnapshots[snapshot] = struct{}{}
+	f.remoteCOWMu.Unlock()
+}
+
+func (f *MemoryFile) unregisterRemoteSnapshot(snapshot *RemoteSnapshot) {
+	f.remoteCOWMu.Lock()
+	delete(f.remoteCOWSnapshots, snapshot)
+	f.remoteCOWMu.Unlock()
 }
 
 const (

@@ -489,7 +489,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					oldpma = pseg.ValuePtr()
 					unmapAR = joinAddrRanges(unmapAR, copyAR)
-					pfdrs = appendPendingFileDecRef(pfdrs, oldpma.file, pseg.fileRange())
+					pfdrs = appendPendingCOWFileDecRef(pfdrs, oldpma.file, pseg.fileRange())
 					oldpma.file = mm.mf
 					oldpma.off = fr.Start
 					oldpma.translatePerms = hostarch.AnyAccess
@@ -1103,6 +1103,7 @@ type pendingFileDecRefs struct {
 type pendingFileDecRef struct {
 	file memmap.File
 	fr   memmap.FileRange
+	cow  bool
 }
 
 var pendingFileDecRefsPool = sync.Pool{
@@ -1115,7 +1116,13 @@ func appendPendingFileDecRef(pfdrs *pendingFileDecRefs, file memmap.File, fr mem
 	if pfdrs == nil {
 		pfdrs = pendingFileDecRefsPool.Get().(*pendingFileDecRefs)
 	}
-	pfdrs.slice = append(pfdrs.slice, pendingFileDecRef{file, fr})
+	pfdrs.slice = append(pfdrs.slice, pendingFileDecRef{file: file, fr: fr})
+	return pfdrs
+}
+
+func appendPendingCOWFileDecRef(pfdrs *pendingFileDecRefs, file memmap.File, fr memmap.FileRange) *pendingFileDecRefs {
+	pfdrs = appendPendingFileDecRef(pfdrs, file, fr)
+	pfdrs.slice[len(pfdrs.slice)-1].cow = true
 	return pfdrs
 }
 
@@ -1130,8 +1137,14 @@ func (pfdrs *pendingFileDecRefs) Cleanup() {
 	}
 	for i := range pfdrs.slice {
 		pfdr := &pfdrs.slice[i]
+		if pfdr.cow {
+			if mf, ok := pfdr.file.(*pgalloc.MemoryFile); ok {
+				mf.NotifyRemoteCOW(pfdr.fr)
+			}
+		}
 		pfdr.file.DecRef(pfdr.fr)
 		pfdr.file = nil // allow GC
+		pfdr.cow = false
 	}
 	pfdrs.slice = pfdrs.slice[:0]
 	pendingFileDecRefsPool.Put(pfdrs)

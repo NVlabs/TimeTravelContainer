@@ -198,6 +198,45 @@ func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	}
 }
 
+func TestLiveForkSourceCOWEmitsRemotePushHint(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length: hostarch.PageSize, Private: true,
+		Perms: hostarch.ReadWrite, MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parent.CopyOut(ctx, addr, []byte{1}, usermem.IOOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	parent.PrepareLiveForkSnapshot(1)
+	defer parent.ClearLiveForkPMASnapshot()
+	pseg := parent.pmas.FindSegment(addr)
+	if !pseg.Ok() {
+		t.Fatal("parent PMA missing")
+	}
+	fr := pseg.fileRange()
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: parent.mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	if _, err := parent.CopyOut(ctx, addr, []byte{2}, usermem.IOOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case hint := <-snapshot.PushHints():
+		if hint.StreamOffset != 0 || hint.Length != hostarch.PageSize {
+			t.Fatalf("push hint=%+v", hint)
+		}
+	default:
+		t.Fatal("source COW emitted no remote push hint")
+	}
+}
+
 func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)

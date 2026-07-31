@@ -75,6 +75,17 @@ type RemoteSnapshot struct {
 
 	pagesTotal    uint64
 	pagesReleased uint64
+	pushHints     chan RemotePushHint
+	pushEnqueued  uint64
+	pushDropped   uint64
+}
+
+// RemotePushHint identifies fork-time bytes that became especially valuable
+// to transfer because the source just broke COW on the corresponding range.
+// Hints are advisory and may be coalesced, reordered, or dropped.
+type RemotePushHint struct {
+	StreamOffset uint64
+	Length       uint64
 }
 
 // RemoteSnapshotStats is a point-in-time snapshot of page ownership.
@@ -84,6 +95,8 @@ type RemoteSnapshotStats struct {
 	PagesOutstanding uint64
 	ActiveLeases     uint64
 	Closed           bool
+	PushEnqueued     uint64
+	PushDropped      uint64
 }
 
 // NewRemoteSnapshot creates a snapshot and acquires one page reference for
@@ -98,6 +111,7 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 		regionByID: make(map[RemoteRegionID]int, len(regions)),
 		regions:    make([]remoteSnapshotRegion, len(regions)),
 		closeDone:  make(chan struct{}),
+		pushHints:  make(chan RemotePushHint, 1024),
 	}
 	ownerSet := make(map[*MemoryFile]struct{})
 	for i, region := range regions {
@@ -142,6 +156,9 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 	for i := range s.regions {
 		region := &s.regions[i]
 		region.File.IncRef(region.Range, region.MemCgID)
+	}
+	for _, file := range s.owners {
+		file.registerRemoteSnapshot(s)
 	}
 	return s, nil
 }
@@ -296,6 +313,42 @@ func (s *RemoteSnapshot) Stats() RemoteSnapshotStats {
 		PagesOutstanding: s.pagesTotal - s.pagesReleased,
 		ActiveLeases:     s.activeLeases,
 		Closed:           s.closed,
+		PushEnqueued:     s.pushEnqueued,
+		PushDropped:      s.pushDropped,
+	}
+}
+
+// PushHints returns a bounded stream of advisory proactive-push candidates.
+func (s *RemoteSnapshot) PushHints() <-chan RemotePushHint { return s.pushHints }
+
+func (s *RemoteSnapshot) notifySourceCOW(file *MemoryFile, fr memmap.FileRange) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	for i := range s.regions {
+		region := &s.regions[i]
+		if region.File != file || fr.Start >= region.Range.End || region.Range.Start >= fr.End {
+			continue
+		}
+		intersection := fr.Intersect(region.Range)
+		relative := memmap.FileRange{intersection.Start - region.Range.Start, intersection.End - region.Range.Start}
+		if region.anyReleased(relative) {
+			// Released subranges do not need another transfer. Splitting around
+			// them is left to the consumer's idempotent ACK bitmap.
+			continue
+		}
+		hint := RemotePushHint{
+			StreamOffset: region.streamStart + relative.Start,
+			Length:       relative.Length(),
+		}
+		select {
+		case s.pushHints <- hint:
+			s.pushEnqueued++
+		default:
+			s.pushDropped++
+		}
 	}
 }
 
@@ -396,6 +449,7 @@ func (s *RemoteSnapshot) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.pushHints)
 	type pendingRelease struct {
 		file   *MemoryFile
 		range_ memmap.FileRange
@@ -416,6 +470,9 @@ func (s *RemoteSnapshot) Close() error {
 		}
 	}
 	s.mu.Unlock()
+	for _, file := range s.owners {
+		file.unregisterRemoteSnapshot(s)
+	}
 
 	for _, release := range pending {
 		release.file.DecRef(release.range_)
