@@ -212,6 +212,7 @@ go_test(
     ],
     library = ":pgalloc",
     deps = [
+        "//pkg/context",
         "//pkg/hostarch",
         "//pkg/safemem",
         "//pkg/sentry/memmap",

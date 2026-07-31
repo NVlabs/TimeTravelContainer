@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -63,6 +64,28 @@ func newRemoteTestMemoryFile(t *testing.T, pages uint64) (*MemoryFile, memmap.Fi
 		mf.Destroy()
 	})
 	return mf, fr
+}
+
+func newEmptyRemoteTestMemoryFile(t *testing.T) *MemoryFile {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-remote-target-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := NewMemoryFile(file, MemoryFileOpts{
+		DelayedEviction:         DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	return mf
 }
 
 func fillRemoteTestRange(t *testing.T, mf *MemoryFile, fr memmap.FileRange, data []byte) {
@@ -259,6 +282,75 @@ func TestAttachRemotePageLoad(t *testing.T) {
 	}
 	if !source.HasUniqueRef(sourceFR) {
 		t.Fatal("source pages did not become unique after target installation")
+	}
+}
+
+func TestCloneMemoryFileMetadataForRemote(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 4)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*17 + 3)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+	target := newEmptyRemoteTestMemoryFile(t)
+	targetHasRefs := false
+	t.Cleanup(func() {
+		if targetHasRefs {
+			target.DecRef(sourceFR)
+		}
+		target.Destroy()
+	})
+
+	regions, loads, err := CloneMemoryFileMetadataForRemote(context.Background(), source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHasRefs = true
+	if len(regions) != 1 || regions[0].Range != sourceFR {
+		t.Fatalf("snapshot regions: %+v, want one region %v", regions, sourceFR)
+	}
+	if len(loads) != 1 || loads[0].Target != sourceFR || loads[0].StreamOffset != 0 {
+		t.Fatalf("target load ranges: %+v", loads)
+	}
+	if !target.HasUniqueRef(sourceFR) {
+		t.Fatal("remote allocator metadata did not preserve source refcounts")
+	}
+
+	snapshot, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, 2*hostarch.PageSize, 4, 2)
+	loaderDone := make(chan error, 1)
+	pages, err := StartAsyncPagesFileLoad(reader, func(err error) { loaderDone <- err }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	loaded, err := target.MapInternal(sourceFR, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), loaded); err != nil || n != sourceFR.Length() {
+		t.Fatalf("copy from metadata clone: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("metadata-cloned MemoryFile loaded incorrect contents")
+	}
+	select {
+	case err := <-loaderDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote metadata clone load timed out")
+	}
+	if !source.HasUniqueRef(sourceFR) {
+		t.Fatal("source did not reclaim snapshot references after clone load")
 	}
 }
 

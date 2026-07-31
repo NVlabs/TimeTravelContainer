@@ -98,7 +98,7 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 		panic("MemoryManager restore context has no platform")
 	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
-	if pgalloc.IsLiveForkClone(ctx) {
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
 			pseg.ValuePtr().file.IncRef(pseg.fileRange(), memCgID)
@@ -140,7 +140,13 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved pmaSet) {
 	}
 	pgap := mm.pmas.FirstGap()
 	for _, entry := range snapshot.entries {
-		pgap = mm.pmas.Insert(pgap, entry.ar, entry.pma).NextGap()
+		pma := entry.pma
+		if pgalloc.IsLiveForkRemoteMemoryClone(ctx) {
+			if _, ok := pma.file.(*pgalloc.MemoryFile); ok {
+				pma.file = pgalloc.MemoryFileFromContext(ctx)
+			}
+		}
+		pgap = mm.pmas.Insert(pgap, entry.ar, pma).NextGap()
 	}
 	mm.liveForkPMAKey = 0
 }
@@ -148,7 +154,7 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved pmaSet) {
 // afterLoad is invoked by stateify.
 func (m *SpecialMappable) afterLoad(ctx goContext.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
-	if pgalloc.IsLiveForkClone(ctx) {
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		m.mf.IncRef(m.fr, 0)
 	}
 }

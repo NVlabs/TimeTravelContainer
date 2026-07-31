@@ -8,7 +8,9 @@ Implementation progress:
   policy validation, and analytical pull simulator: implemented.
 * Phase 1 `MemoryFile` snapshot ownership, page-granular acknowledgement,
   sender leases, loopback `AsyncReader`, and asynchronous target-page loading:
-  implemented and tested; Kernel metadata-clone integration is pending.
+  implemented and tested. Metadata-only allocator cloning and MemoryManager PMA
+  rebinding to a distinct target `MemoryFile` are also implemented; full Kernel
+  object-graph orchestration is pending.
 * Phases 2 through 6: pending.
 
 ## Summary

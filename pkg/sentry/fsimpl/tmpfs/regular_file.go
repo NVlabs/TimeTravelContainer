@@ -152,7 +152,7 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 		rf.diskMmap.SetFD(-1)
 		rf.diskObject = ""
 	}
-	if !pgalloc.IsLiveForkClone(ctx) {
+	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		return
 	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)

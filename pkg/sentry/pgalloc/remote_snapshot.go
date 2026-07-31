@@ -15,16 +15,22 @@
 package pgalloc
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sort"
 	"sync"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/timing"
 )
 
@@ -138,6 +144,141 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 		region.File.IncRef(region.Range, region.MemCgID)
 	}
 	return s, nil
+}
+
+// CloneMemoryFileMetadataForRemote makes target's allocator metadata describe
+// the same object graph and file offsets as source, without reading or copying
+// page contents. It returns source regions in packed-stream order and matching
+// target load ranges. The caller can pass the regions to NewRemoteSnapshot and
+// attach the ranges to target with AttachRemotePageLoad.
+//
+// target must be a newly created, empty MemoryFile. Users of source must be
+// externally stopped so its page-reference graph cannot change during the
+// clone. Work is proportional to allocator metadata, not resident bytes.
+func CloneMemoryFileMetadataForRemote(ctx context.Context, source, target *MemoryFile) ([]RemoteSnapshotRegion, []RemoteLoadRange, error) {
+	if source == nil || target == nil {
+		return nil, nil, errors.New("source and target MemoryFiles must be non-nil")
+	}
+	if source == target {
+		return nil, nil, errors.New("remote MemoryFile clone requires distinct source and target")
+	}
+	target.mu.Lock()
+	targetEmpty := len(target.chunksLoad()) == 0
+	target.mu.Unlock()
+	if !targetEmpty {
+		return nil, nil, errors.New("remote target MemoryFile is not empty")
+	}
+
+	var metadata bytes.Buffer
+	var used []memmap.FileRange
+	source.mu.Lock()
+	for source.haveWaste {
+		source.mu.Unlock()
+		runtime.Gosched()
+		source.mu.Lock()
+	}
+	if len(source.evictable) != 0 {
+		source.mu.Unlock()
+		return nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
+	}
+	collectUsed := func(set *unfreeSet) {
+		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if seg.ValuePtr().refs != 0 {
+				used = append(used, seg.Range())
+			}
+		}
+	}
+	collectUsed(&source.unfreeSmall)
+	collectUsed(&source.unfreeHuge)
+	if _, err := state.Save(ctx, &metadata, &memoryFileSaved{
+		unwasteSmall: &source.unwasteSmall,
+		unwasteHuge:  &source.unwasteHuge,
+		unfreeSmall:  &source.unfreeSmall,
+		unfreeHuge:   &source.unfreeHuge,
+		subreleased:  source.subreleased,
+		memAcct:      &source.memAcct,
+		chunks:       source.chunksLoad(),
+	}); err != nil {
+		source.mu.Unlock()
+		return nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
+	}
+	source.mu.Unlock()
+
+	sort.Slice(used, func(i, j int) bool { return used[i].Start < used[j].Start })
+	merged := used[:0]
+	for _, fr := range used {
+		if len(merged) == 0 || merged[len(merged)-1].End < fr.Start {
+			merged = append(merged, fr)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if fr.Start < last.End {
+			return nil, nil, fmt.Errorf("source MemoryFile used ranges overlap: %v and %v", *last, fr)
+		}
+		last.End = fr.End
+	}
+	used = merged
+
+	var saved memoryFileSaved
+	if _, err := state.Load(ctx, bytes.NewReader(metadata.Bytes()), &saved); err != nil {
+		return nil, nil, fmt.Errorf("loading remote MemoryFile metadata: %w", err)
+	}
+	chunks := saved.chunks
+	fileSize := uint64(len(chunks)) * chunkSize
+	if err := target.file.Truncate(int64(fileSize)); err != nil {
+		return nil, nil, fmt.Errorf("sizing remote target MemoryFile: %w", err)
+	}
+	if len(chunks) != 0 {
+		mapping, _, errno := unix.Syscall6(
+			unix.SYS_MMAP,
+			0,
+			uintptr(fileSize),
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED,
+			target.file.Fd(),
+			0)
+		if errno != 0 {
+			return nil, nil, fmt.Errorf("mapping remote target MemoryFile: %w", errno)
+		}
+		for i := range chunks {
+			chunks[i].mapping = mapping + uintptr(i)*chunkSize
+			target.madviseChunkMapping(chunks[i].mapping, chunkSize, chunks[i].huge)
+		}
+	}
+
+	var knownCommitted uint64
+	for seg := saved.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		if seg.ValuePtr().knownCommitted {
+			knownCommitted += seg.Range().Length()
+		}
+	}
+	target.mu.Lock()
+	target.unwasteSmall.MoveFrom(saved.unwasteSmall)
+	target.unwasteHuge.MoveFrom(saved.unwasteHuge)
+	target.unfreeSmall.MoveFrom(saved.unfreeSmall)
+	target.unfreeHuge.MoveFrom(saved.unfreeHuge)
+	target.subreleased = saved.subreleased
+	target.memAcct.MoveFrom(saved.memAcct)
+	target.knownCommittedBytes = knownCommitted
+	target.chunks.Store(&chunks)
+	target.mu.Unlock()
+	if !target.opts.DisableMemoryAccounting {
+		for seg := target.memAcct.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if seg.ValuePtr().knownCommitted {
+				usage.MemoryAccounting.Inc(seg.Range().Length(), seg.ValuePtr().kind, seg.ValuePtr().memCgID)
+			}
+		}
+	}
+
+	regions := make([]RemoteSnapshotRegion, len(used))
+	loads := make([]RemoteLoadRange, len(used))
+	var streamOffset uint64
+	for i, fr := range used {
+		regions[i] = RemoteSnapshotRegion{ID: RemoteRegionID(i + 1), File: source, Range: fr}
+		loads[i] = RemoteLoadRange{Target: fr, StreamOffset: streamOffset}
+		streamOffset += fr.Length()
+	}
+	return regions, loads, nil
 }
 
 // StreamBytes returns the size of the packed page stream.

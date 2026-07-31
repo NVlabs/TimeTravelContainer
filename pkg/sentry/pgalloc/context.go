@@ -43,6 +43,12 @@ const (
 	// live fork. Mutable filesystem objects must establish CoW before metadata
 	// serialization begins.
 	CtxLiveForkSource
+
+	// CtxLiveForkRemoteMemoryClone indicates that a live-fork child uses a
+	// separately cloned MemoryFile whose allocator metadata already contains
+	// the complete target object graph's page references. Live-fork restore
+	// hooks must still run, but must not increment page references again.
+	CtxLiveForkRemoteMemoryClone
 )
 
 // IsLiveForkClone returns true if ctx is loading an in-memory live fork.
@@ -51,6 +57,22 @@ func IsLiveForkClone(ctx context.Context) bool {
 		return v.(bool)
 	}
 	return false
+}
+
+// IsLiveForkRemoteMemoryClone returns true if the live-fork target has a
+// distinct, metadata-cloned MemoryFile.
+func IsLiveForkRemoteMemoryClone(ctx context.Context) bool {
+	if v := ctx.Value(CtxLiveForkRemoteMemoryClone); v != nil {
+		return v.(bool)
+	}
+	return false
+}
+
+// LiveForkCloneNeedsPageRefs returns true when restore hooks must acquire
+// references in a shared source MemoryFile. Remote-memory clones inherit the
+// graph's reference counts in their cloned allocator metadata instead.
+func LiveForkCloneNeedsPageRefs(ctx context.Context) bool {
+	return IsLiveForkClone(ctx) && !IsLiveForkRemoteMemoryClone(ctx)
 }
 
 // IsLiveForkSource returns true if ctx is preparing an in-memory live fork.

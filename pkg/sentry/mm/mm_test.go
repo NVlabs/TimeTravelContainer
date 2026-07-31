@@ -17,6 +17,7 @@ package mm
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -77,6 +78,124 @@ func cloneMemoryManagerMetadata(ctx context.Context, src *MemoryManager) (*Memor
 		return nil, fmt.Errorf("state.Load: %w", err)
 	}
 	return dst, nil
+}
+
+func newRemoteCloneMemoryFile(t *testing.T) *pgalloc.MemoryFile {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-mm-remote-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	return mf
+}
+
+func TestLiveForkRemoteMemoryClone(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+
+	addr, err := parent.MMap(ctx, memmap.MMapOpts{
+		Length:   4 * hostarch.PageSize,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	want := bytes.Repeat([]byte("remote-memory-"), 300)
+	if n, err := parent.CopyOut(ctx, addr+hostarch.PageSize-100, want, usermem.IOOpts{}); err != nil || n != len(want) {
+		t.Fatalf("parent.CopyOut: n=%d err=%v", n, err)
+	}
+
+	const snapshotKey = 1
+	pmaSnapshots := LiveForkPMASnapshots{snapshotKey: parent.PrepareLiveForkSnapshot(snapshotKey)}
+	defer parent.ClearLiveForkPMASnapshot()
+	parent.mf.MarkSavable()
+	var metadata bytes.Buffer
+	if _, err := state.Save(ctx, &metadata, parent); err != nil {
+		t.Fatalf("state.Save: %v", err)
+	}
+
+	targetMF := newRemoteCloneMemoryFile(t)
+	defer targetMF.Destroy()
+	regions, loads, err := pgalloc.CloneMemoryFileMetadataForRemote(ctx, parent.mf, targetMF)
+	if err != nil {
+		t.Fatalf("CloneMemoryFileMetadataForRemote: %v", err)
+	}
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatalf("NewRemoteSnapshot: %v", err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, 64<<10, 16, 4)
+	loaderDone := make(chan error, 1)
+	pages, err := pgalloc.StartAsyncPagesFileLoad(reader, func(err error) { loaderDone <- err }, nil)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	if err := targetMF.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatalf("AttachRemotePageLoad: %v", err)
+	}
+	pages.MemoryFilesDone()
+
+	loadCtx := context.WithValues(ctx, map[any]any{
+		pgalloc.CtxMemoryFile:                targetMF,
+		pgalloc.CtxLiveForkClone:             true,
+		pgalloc.CtxLiveForkRemoteMemoryClone: true,
+		CtxLiveForkPMASnapshots:              pmaSnapshots,
+	})
+	child := &MemoryManager{}
+	if _, err := state.Load(loadCtx, bytes.NewReader(metadata.Bytes()), child); err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	defer child.DecUsers(ctx)
+	for pseg := child.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		if got, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && got != targetMF {
+			t.Fatalf("child PMA retained source MemoryFile %p, want target %p", got, targetMF)
+		}
+	}
+
+	got := make([]byte, len(want))
+	if n, err := child.CopyIn(ctx, addr+hostarch.PageSize-100, got, usermem.IOOpts{}); err != nil || n != len(got) {
+		t.Fatalf("child.CopyIn: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("remote-memory child observed incorrect fork-time contents")
+	}
+	if err := targetMF.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	if err := <-loaderDone; err != nil {
+		t.Fatalf("remote loader: %v", err)
+	}
+	if stats := snapshot.Stats(); !stats.Closed || stats.PagesOutstanding != 0 {
+		t.Fatalf("snapshot was not drained: %+v", stats)
+	}
+
+	childBytes := []byte("child-private")
+	if n, err := child.CopyOut(ctx, addr, childBytes, usermem.IOOpts{}); err != nil || n != len(childBytes) {
+		t.Fatalf("child.CopyOut: n=%d err=%v", n, err)
+	}
+	parentBytes := make([]byte, len(childBytes))
+	if n, err := parent.CopyIn(ctx, addr, parentBytes, usermem.IOOpts{}); err != nil || n != len(parentBytes) {
+		t.Fatalf("parent.CopyIn: n=%d err=%v", n, err)
+	}
+	if bytes.Equal(parentBytes, childBytes) {
+		t.Fatal("remote child write changed source memory")
+	}
 }
 
 func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {

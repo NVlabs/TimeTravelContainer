@@ -420,7 +420,7 @@ type Shm struct {
 // afterLoad is invoked by stateify.
 func (s *Shm) afterLoad(ctx goContext.Context) {
 	s.mf = pgalloc.MemoryFileFromContext(ctx)
-	if !pgalloc.IsLiveForkClone(ctx) {
+	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		return
 	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
