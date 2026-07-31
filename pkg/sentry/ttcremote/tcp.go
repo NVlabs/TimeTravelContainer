@@ -53,6 +53,10 @@ const (
 	tcpAck
 	tcpAckOK
 	tcpError
+	tcpHello
+	tcpHelloOK
+	tcpMetadataPull
+	tcpMetadataData
 )
 
 type tcpHeader struct {
@@ -143,16 +147,19 @@ type TCPPageServer struct {
 	closeDone chan struct{}
 	wg        sync.WaitGroup
 
-	requests atomic.Uint64
-	acks     atomic.Uint64
-	bytes    atomic.Uint64
+	requests      atomic.Uint64
+	acks          atomic.Uint64
+	bytes         atomic.Uint64
+	metadata      []byte
+	metadataBytes atomic.Uint64
 }
 
 // TCPPageServerStats reports completed protocol operations.
 type TCPPageServerStats struct {
-	PullRequests uint64
-	AckRequests  uint64
-	BytesSent    uint64
+	PullRequests      uint64
+	AckRequests       uint64
+	BytesSent         uint64
+	MetadataBytesSent uint64
 }
 
 // NewTCPPageServer constructs a server. Serve must be called to accept peers.
@@ -179,10 +186,26 @@ func (s *TCPPageServer) Addr() net.Addr { return s.listener.Addr() }
 // Stats returns server counters.
 func (s *TCPPageServer) Stats() TCPPageServerStats {
 	return TCPPageServerStats{
-		PullRequests: s.requests.Load(),
-		AckRequests:  s.acks.Load(),
-		BytesSent:    s.bytes.Load(),
+		PullRequests:      s.requests.Load(),
+		AckRequests:       s.acks.Load(),
+		BytesSent:         s.bytes.Load(),
+		MetadataBytesSent: s.metadataBytes.Load(),
 	}
+}
+
+// SetMetadata configures the immutable Kernel metadata stream advertised by
+// the session. It must be called before Serve.
+func (s *TCPPageServer) SetMetadata(metadata []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.conns) != 0 || s.closed {
+		return errors.New("cannot change TCP page metadata after serving starts")
+	}
+	if uint64(len(metadata)) > uint64(^uint32(0)) {
+		return errors.New("TCP page metadata exceeds 4 GiB protocol limit")
+	}
+	s.metadata = append([]byte(nil), metadata...)
+	return nil
 }
 
 // Serve accepts connections until Close is called or the listener fails.
@@ -229,6 +252,33 @@ func (s *TCPPageServer) serveConn(conn net.Conn) {
 			return
 		}
 		switch header.type_ {
+		case tcpHello:
+			if header.offset != 0 || header.length != 0 || header.checksum != 0 {
+				s.writeError(conn, header, errors.New("invalid session hello"))
+				return
+			}
+			if err := writeTCPMessage(conn, tcpHeader{
+				type_: tcpHelloOK, token: s.token, requestID: header.requestID,
+				length: uint32(len(s.metadata)),
+			}, nil); err != nil {
+				return
+			}
+
+		case tcpMetadataPull:
+			if header.checksum != 0 || header.length == 0 || uint64(header.length) > s.maxRead ||
+				header.offset > uint64(len(s.metadata)) || uint64(header.length) > uint64(len(s.metadata))-header.offset {
+				s.writeError(conn, header, errors.New("invalid metadata range"))
+				return
+			}
+			payload := s.metadata[header.offset : header.offset+uint64(header.length)]
+			s.metadataBytes.Add(uint64(len(payload)))
+			if err := writeTCPMessage(conn, tcpHeader{
+				type_: tcpMetadataData, token: s.token, requestID: header.requestID,
+				offset: header.offset, length: header.length, checksum: crc32.ChecksumIEEE(payload),
+			}, payload); err != nil {
+				return
+			}
+
 		case tcpPull:
 			if header.checksum != 0 || header.length == 0 || uint64(header.length) > s.maxRead ||
 				!hostarch.IsPageAligned(uint64(header.length)) || !hostarch.IsPageAligned(header.offset) {
@@ -283,6 +333,56 @@ func (s *TCPPageServer) serveConn(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// FetchTCPMetadata performs the session handshake and downloads the bounded,
+// checksummed Kernel metadata stream separately from memory pages.
+func FetchTCPMetadata(ctx context.Context, address string, token SnapshotToken, maxChunk, maxMetadata uint64, timeout time.Duration) ([]byte, error) {
+	if maxChunk == 0 || maxChunk > 2<<20 || maxMetadata == 0 || timeout <= 0 {
+		return nil, errors.New("invalid TCP metadata fetch limits")
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	if err := writeTCPMessage(conn, tcpHeader{type_: tcpHello, token: token, requestID: 1}, nil); err != nil {
+		return nil, err
+	}
+	hello, payload, err := readTCPResponse(conn, token, 1, maxMetadata)
+	if err != nil {
+		return nil, err
+	}
+	if hello.type_ == tcpError {
+		return nil, fmt.Errorf("remote session hello: %s", payload)
+	}
+	if hello.type_ != tcpHelloOK || uint64(hello.length) > maxMetadata {
+		return nil, fmt.Errorf("invalid remote metadata size %d", hello.length)
+	}
+	metadata := make([]byte, hello.length)
+	for offset, requestID := uint64(0), uint32(2); offset < uint64(len(metadata)); requestID++ {
+		length := min(maxChunk, uint64(len(metadata))-offset)
+		if err := writeTCPMessage(conn, tcpHeader{
+			type_: tcpMetadataPull, token: token, requestID: requestID,
+			offset: offset, length: uint32(length),
+		}, nil); err != nil {
+			return nil, err
+		}
+		response, chunk, err := readTCPResponse(conn, token, requestID, maxChunk)
+		if err != nil {
+			return nil, err
+		}
+		if response.type_ != tcpMetadataData || response.offset != offset || uint64(response.length) != length {
+			return nil, errors.New("mismatched TCP metadata response")
+		}
+		copy(metadata[offset:], chunk)
+		offset += length
+	}
+	return metadata, nil
 }
 
 func (s *TCPPageServer) writeError(conn net.Conn, request tcpHeader, err error) {
@@ -604,7 +704,7 @@ func readTCPResponse(r io.Reader, token SnapshotToken, requestID uint32, maxPayl
 		return tcpHeader{}, nil, fmt.Errorf("TCP page response length %d exceeds limit %d", header.length, maxPayload)
 	}
 	var payload []byte
-	if header.type_ == tcpData || header.type_ == tcpError {
+	if header.type_ == tcpData || header.type_ == tcpMetadataData || header.type_ == tcpError {
 		payload = make([]byte, header.length)
 		if _, err := io.ReadFull(r, payload); err != nil {
 			return tcpHeader{}, nil, err

@@ -352,7 +352,8 @@ after a full drain and branch destruction.
   and ACK-only recovery are implemented. It releases source references only
   after destination installation and an acknowledged ACK. Complete the
   transaction handshake, flow control, and target dependency handling.
-* Stream kernel metadata separately from memory page data.
+* A token-authenticated session hello and bounded, checksummed metadata stream
+  now transfer Kernel metadata separately from memory page data.
 * Add configurable range sizes, request concurrency, ACK batching, and
   sequential/fixed-window prefetch.
 * Expose metrics and a debug transaction dump.

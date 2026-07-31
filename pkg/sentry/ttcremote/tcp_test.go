@@ -16,6 +16,7 @@ package ttcremote
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -144,6 +145,37 @@ func TestTCPRemoteReaderConcurrentPulls(t *testing.T) {
 	}
 	if !mf.HasUniqueRef(fr) {
 		t.Fatal("source pages did not become unique after TCP acknowledgements")
+	}
+}
+
+func TestTCPMetadataHandshakeAndChunkStream(t *testing.T) {
+	mf, fr, _ := newTCPTestMemoryFile(t, 1)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, 64<<10)
+	metadata := make([]byte, 700<<10)
+	for i := range metadata {
+		metadata[i] = byte(i*37 + 5)
+	}
+	if err := server.SetMetadata(metadata); err != nil {
+		t.Fatal(err)
+	}
+	got, err := FetchTCPMetadata(context.Background(), server.Addr().String(), token, 64<<10, 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, metadata) {
+		t.Fatal("fetched Kernel metadata differs")
+	}
+	if stats := server.Stats(); stats.MetadataBytesSent != uint64(len(metadata)) || stats.PullRequests != 0 {
+		t.Fatalf("metadata transport stats: %+v", stats)
+	}
+	server.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
