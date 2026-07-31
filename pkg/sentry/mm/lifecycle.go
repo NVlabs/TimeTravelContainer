@@ -92,6 +92,13 @@ func (mm *MemoryManager) PrepareLiveForkSnapshot(key uint64) *LiveForkPMASnapsho
 	return mm.prepareLiveFork(key)
 }
 
+// PrepareDistributedForkCOW establishes fork-time CoW without installing an
+// in-process PMA snapshot key. PMAs therefore remain in the normal state
+// stream and can be reconstructed by another Sentry process.
+func (mm *MemoryManager) PrepareDistributedForkCOW() {
+	mm.prepareLiveFork(0)
+}
+
 func (mm *MemoryManager) prepareLiveFork(key uint64) *LiveForkPMASnapshot {
 	mm.AddressSpace().PreFork()
 	defer mm.AddressSpace().PostFork()

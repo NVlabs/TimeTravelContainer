@@ -1052,6 +1052,31 @@ func (k *Kernel) prepareMemoryManagersForLiveFork() (mm.LiveForkPMASnapshots, fu
 	}
 }
 
+// prepareMemoryManagersForDistributedFork establishes CoW while leaving PMAs
+// in the ordinary state stream, which is required when the loader cannot share
+// in-process LiveForkPMASnapshot pointers.
+func (k *Kernel) prepareMemoryManagersForDistributedFork() {
+	prepared := make(map[*mm.MemoryManager]struct{})
+	prepare := func(memMgr *mm.MemoryManager) {
+		if memMgr == nil {
+			return
+		}
+		if _, ok := prepared[memMgr]; ok {
+			return
+		}
+		memMgr.PrepareDistributedForkCOW()
+		prepared[memMgr] = struct{}{}
+	}
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+	for t := range k.tasks.Root.tids {
+		prepare(t.image.MemoryManager)
+		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
+			prepare(r.image.MemoryManager)
+		}
+	}
+}
+
 // streamLiveForkState connects state.Save directly to state.Load. The pipe
 // bounds temporary memory use and ensures that no checkpoint file is created.
 func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel) error {
