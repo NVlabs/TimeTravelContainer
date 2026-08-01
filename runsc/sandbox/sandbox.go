@@ -2156,6 +2156,16 @@ func (s *Sandbox) CaptureDistributedFork(args *boot.DistributedForkCaptureArgs) 
 	return info, nil
 }
 
+// CaptureDistributedForkMany starts sibling remote-memory snapshots in one
+// Sentry pause.
+func (s *Sandbox) CaptureDistributedForkMany(args *boot.DistributedForkCaptureManyArgs) ([]boot.DistributedForkSessionInfo, error) {
+	var infos []boot.DistributedForkSessionInfo
+	if err := s.call(boot.ContMgrCaptureDistributedForkMany, args, &infos); err != nil {
+		return nil, fmt.Errorf("capturing %d distributed forks: %w", len(args.Children), err)
+	}
+	return infos, nil
+}
+
 // ServeDistributedForkConnection donates one host-accepted TCP stream.
 func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServeArgs) error {
 	if err := s.call(boot.ContMgrServeDistributedForkConnection, args, nil); err != nil {

@@ -108,6 +108,9 @@ const (
 	// ContMgrCaptureDistributedFork starts a remote page snapshot session.
 	ContMgrCaptureDistributedFork = "containerManager.CaptureDistributedFork"
 
+	// ContMgrCaptureDistributedForkMany starts sibling sessions from one capture.
+	ContMgrCaptureDistributedForkMany = "containerManager.CaptureDistributedForkMany"
+
 	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
 	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
 
@@ -1060,6 +1063,16 @@ func (cm *containerManager) CaptureDistributedFork(args *DistributedForkCaptureA
 		return err
 	}
 	*out = *info
+	return nil
+}
+
+// CaptureDistributedForkMany starts remotely readable sibling snapshots.
+func (cm *containerManager) CaptureDistributedForkMany(args *DistributedForkCaptureManyArgs, out *[]DistributedForkSessionInfo) error {
+	infos, err := cm.l.family.CaptureDistributedForkMany(args)
+	if err != nil {
+		return err
+	}
+	*out = infos
 	return nil
 }
 

@@ -115,6 +115,25 @@ type DistributedForkCaptureArgs struct {
 	PushHighWater    uint64
 }
 
+// DistributedForkCaptureChildArgs identifies one target in a coordinated
+// sibling capture. ttcd owns the advertised listener for every child.
+type DistributedForkCaptureChildArgs struct {
+	SessionID        string
+	TargetBranchID   string
+	AdvertiseAddress string
+}
+
+// DistributedForkCaptureManyArgs starts independent page sessions backed by
+// one paused Kernel capture and one set of source page references.
+type DistributedForkCaptureManyArgs struct {
+	Source           string
+	FamilyID         string
+	Children         []DistributedForkCaptureChildArgs
+	MaxTransferBytes uint64
+	PushPolicy       ttcremote.TCPPushPolicy
+	PushHighWater    uint64
+}
+
 // DistributedForkSessionInfo is safe to return through the runsc control
 // socket. Token is a bearer capability and must never appear in status or log
 // output after initial creation.
@@ -450,28 +469,8 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 	if len(args.FilePayload.Files) > 1 {
 		return nil, fmt.Errorf("distributed fork capture received %d listener files, want at most one", len(args.FilePayload.Files))
 	}
-	if args.MaxTransferBytes == 0 {
-		return nil, errors.New("distributed fork maximum transfer size is zero")
-	}
-	f.mu.Lock()
-	if f.distributedSessions == nil {
-		f.distributedSessions = make(map[string]*distributedForkSession)
-	}
-	if _, ok := f.distributedSessions[args.SessionID]; ok {
-		f.mu.Unlock()
-		return nil, fmt.Errorf("distributed fork session %q already exists", args.SessionID)
-	}
-	f.mu.Unlock()
-
-	sourceID := args.Source
-	if sourceID == "" {
-		sourceID = DefaultBranchID
-	}
-	source, err := f.branch(sourceID)
-	if err != nil {
-		return nil, err
-	}
 	var listener net.Listener
+	var err error
 	if !args.ExternalListener {
 		if len(args.FilePayload.Files) == 1 {
 			listener, err = net.FileListener(args.FilePayload.Files[0])
@@ -486,13 +485,69 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 			return nil, fmt.Errorf("distributed page listener is %T, want TCP", listener)
 		}
 	}
-	keepListener := false
-	defer func() {
-		if listener != nil && !keepListener {
+	children := []DistributedForkCaptureChildArgs{{
+		SessionID: args.SessionID, TargetBranchID: args.TargetBranchID,
+		AdvertiseAddress: args.AdvertiseAddress,
+	}}
+	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener)
+	if err != nil {
+		if listener != nil {
 			listener.Close()
 		}
-	}()
+		return nil, err
+	}
+	return &infos[0], nil
+}
 
+// CaptureDistributedForkMany creates independent remote page sessions and
+// filesystem branches from one source pause and one Kernel metadata stream.
+func (f *SandboxFamily) CaptureDistributedForkMany(args *DistributedForkCaptureManyArgs) ([]DistributedForkSessionInfo, error) {
+	if args == nil {
+		return nil, errors.New("missing distributed fork batch arguments")
+	}
+	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil)
+}
+
+func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener) ([]DistributedForkSessionInfo, error) {
+	if familyID == "" || len(children) == 0 || maxTransferBytes == 0 {
+		return nil, errors.New("distributed fork capture is missing family, children, or transfer limit")
+	}
+	if len(children) != 1 && listener != nil {
+		return nil, errors.New("a shared listener is valid only for a singular distributed capture")
+	}
+	seenSessions := make(map[string]struct{}, len(children))
+	seenBranches := make(map[string]struct{}, len(children))
+	for i, child := range children {
+		if child.SessionID == "" || child.TargetBranchID == "" || (listener == nil && child.AdvertiseAddress == "") {
+			return nil, fmt.Errorf("distributed fork child %d is missing session, branch, or advertise identity", i)
+		}
+		if _, ok := seenSessions[child.SessionID]; ok {
+			return nil, fmt.Errorf("distributed fork batch repeats session %q", child.SessionID)
+		}
+		if _, ok := seenBranches[child.TargetBranchID]; ok {
+			return nil, fmt.Errorf("distributed fork batch repeats target branch %q", child.TargetBranchID)
+		}
+		seenSessions[child.SessionID] = struct{}{}
+		seenBranches[child.TargetBranchID] = struct{}{}
+	}
+	f.mu.Lock()
+	if f.distributedSessions == nil {
+		f.distributedSessions = make(map[string]*distributedForkSession)
+	}
+	for _, child := range children {
+		if _, ok := f.distributedSessions[child.SessionID]; ok {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("distributed fork session %q already exists", child.SessionID)
+		}
+	}
+	f.mu.Unlock()
+	if sourceID == "" {
+		sourceID = DefaultBranchID
+	}
+	source, err := f.branch(sourceID)
+	if err != nil {
+		return nil, err
+	}
 	source.opMu.Lock()
 	defer source.opMu.Unlock()
 	f.mu.Lock()
@@ -514,8 +569,12 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		source.k.Unpause()
 		return control.PostResume(source.k, nil)
 	}
+	volumeBranches := make([]string, len(children))
+	for i := range children {
+		volumeBranches[i] = f.volumeBranchID(children[i].TargetBranchID)
+	}
 	capture, err := source.k.CaptureDistributedFork(source.k.SupervisorContext(), kernel.DistributedForkCaptureOptions{
-		ChildBranchID:                  f.volumeBranchID(args.TargetBranchID),
+		ChildBranchIDs:                 volumeBranches,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 	})
 	if err != nil {
@@ -524,75 +583,107 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		}
 		return nil, err
 	}
-	rollbackCapture := func() error {
-		return errors.Join(capture.Close(), removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID)))
+	rollbackFilesystem := func() error {
+		var result error
+		for _, branch := range volumeBranches {
+			result = errors.Join(result, removeDistributedFilesystemBranch(capture.FilesystemResources, branch))
+		}
+		return result
 	}
-	metadata, err := (&ttcremote.SessionMetadata{
-		FamilyID: args.FamilyID, SourceBranchID: sourceID, TargetBranchID: args.TargetBranchID,
-		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
-		LoadRanges: capture.LoadRanges,
-	}).MarshalBinary()
-	if err != nil {
-		_ = rollbackCapture()
-		_ = resume()
-		return nil, fmt.Errorf("encoding distributed fork metadata: %w", err)
-	}
-	var token ttcremote.SnapshotToken
-	if _, err := rand.Read(token[:]); err != nil {
-		_ = rollbackCapture()
-		_ = resume()
-		return nil, fmt.Errorf("generating distributed snapshot token: %w", err)
-	}
-	var server *ttcremote.TCPPageServer
-	if args.ExternalListener {
-		server, err = ttcremote.NewTCPPageSession(token, capture.Snapshot, args.MaxTransferBytes)
-	} else {
-		server, err = ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, args.MaxTransferBytes)
-	}
-	if err != nil {
-		_ = rollbackCapture()
-		_ = resume()
-		return nil, err
-	}
-	capture.Snapshot = nil // server owns it from this point onward.
-	if err := server.SetMetadata(metadata); err != nil {
-		_ = server.Close()
-		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
-		_ = resume()
-		return nil, err
-	}
-	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
-		if err := server.ConfigurePush(ttcremote.TCPPushSenderOpts{
-			MaxPush: args.MaxTransferBytes, Timeout: 30 * time.Second, RetryLimit: 2,
-			RetryBackoff: 10 * time.Millisecond, Policy: args.PushPolicy,
-			RetainedHighWater: args.PushHighWater, ScanInterval: 10 * time.Millisecond,
-		}); err != nil {
+	committed := false
+	var servers []*ttcremote.TCPPageServer
+	defer func() {
+		if committed {
+			return
+		}
+		for _, server := range servers {
 			_ = server.Close()
-			_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
+		}
+		_ = capture.Close()
+		_ = rollbackFilesystem()
+	}()
+	snapshots := capture.Snapshots
+	if capture.Snapshot != nil {
+		snapshots = []*pgalloc.RemoteSnapshot{capture.Snapshot}
+	}
+	if len(snapshots) != len(children) {
+		_ = resume()
+		return nil, fmt.Errorf("distributed capture returned %d snapshots for %d children", len(snapshots), len(children))
+	}
+	infos := make([]DistributedForkSessionInfo, len(children))
+	sessions := make([]*distributedForkSession, len(children))
+	for i, child := range children {
+		metadata, err := (&ttcremote.SessionMetadata{
+			FamilyID: familyID, SourceBranchID: sourceID, TargetBranchID: child.TargetBranchID,
+			KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
+			LoadRanges: capture.LoadRanges,
+		}).MarshalBinary()
+		if err != nil {
 			_ = resume()
-			return nil, fmt.Errorf("configuring distributed reverse push: %w", err)
+			return nil, fmt.Errorf("encoding distributed fork child %q metadata: %w", child.TargetBranchID, err)
+		}
+		var token ttcremote.SnapshotToken
+		if _, err := rand.Read(token[:]); err != nil {
+			_ = resume()
+			return nil, fmt.Errorf("generating distributed snapshot token: %w", err)
+		}
+		var server *ttcremote.TCPPageServer
+		if listener != nil {
+			server, err = ttcremote.NewTCPPageServer(listener, token, snapshots[i], maxTransferBytes)
+		} else {
+			server, err = ttcremote.NewTCPPageSession(token, snapshots[i], maxTransferBytes)
+		}
+		if err != nil {
+			_ = resume()
+			return nil, err
+		}
+		servers = append(servers, server)
+		if capture.Snapshot != nil {
+			capture.Snapshot = nil
+		} else {
+			capture.Snapshots[i] = nil
+		}
+		if err := server.SetMetadata(metadata); err != nil {
+			_ = resume()
+			return nil, err
+		}
+		if pushPolicy != "" && pushPolicy != ttcremote.TCPPushDemandOnly {
+			if err := server.ConfigurePush(ttcremote.TCPPushSenderOpts{
+				MaxPush: maxTransferBytes, Timeout: 30 * time.Second, RetryLimit: 2,
+				RetryBackoff: 10 * time.Millisecond, Policy: pushPolicy,
+				RetainedHighWater: pushHighWater, ScanInterval: 10 * time.Millisecond,
+			}); err != nil {
+				_ = resume()
+				return nil, fmt.Errorf("configuring distributed reverse push: %w", err)
+			}
+		}
+		address := child.AdvertiseAddress
+		if listener != nil {
+			address = listener.Addr().String()
+		}
+		sessions[i] = &distributedForkSession{
+			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
+			resources: capture.FilesystemResources, server: server,
+		}
+		infos[i] = DistributedForkSessionInfo{
+			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
+			MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
 		}
 	}
-	address := args.AdvertiseAddress
-	if address == "" {
-		address = listener.Addr().String()
-	}
-	session := &distributedForkSession{
-		source: sourceID, address: address, filesystemBranch: f.volumeBranchID(args.TargetBranchID),
-		resources: capture.FilesystemResources, server: server,
-	}
 	f.mu.Lock()
-	if _, ok := f.distributedSessions[args.SessionID]; ok {
-		f.mu.Unlock()
-		_ = server.Close()
-		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
-		_ = resume()
-		return nil, fmt.Errorf("distributed fork session %q was created concurrently", args.SessionID)
+	for _, child := range children {
+		if _, ok := f.distributedSessions[child.SessionID]; ok {
+			f.mu.Unlock()
+			_ = resume()
+			return nil, fmt.Errorf("distributed fork session %q was created concurrently", child.SessionID)
+		}
 	}
-	f.distributedSessions[args.SessionID] = session
+	for i, child := range children {
+		f.distributedSessions[child.SessionID] = sessions[i]
+	}
 	f.mu.Unlock()
 	if listener != nil {
-		keepListener = true
+		server := servers[0]
 		go func() {
 			if err := server.Serve(); err != nil {
 				_ = server.Close()
@@ -601,19 +692,17 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 	}
 	if err := resume(); err != nil {
 		f.mu.Lock()
-		delete(f.distributedSessions, args.SessionID)
+		for _, child := range children {
+			delete(f.distributedSessions, child.SessionID)
+		}
 		f.mu.Unlock()
-		_ = server.Close()
-		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
 		return nil, fmt.Errorf("resuming source branch %q: %w", sourceID, err)
 	}
 	f.mu.Lock()
 	source.state = kernelBranchState(source.k)
 	f.mu.Unlock()
-	return &DistributedForkSessionInfo{
-		SessionID: args.SessionID, Source: sourceID, Address: address, Token: token,
-		MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
-	}, nil
+	committed = true
+	return infos, nil
 }
 
 // ServeDistributedForkConnection handles one connection accepted by ttcd.

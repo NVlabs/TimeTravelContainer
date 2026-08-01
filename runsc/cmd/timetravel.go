@@ -102,6 +102,7 @@ func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-capture-many <batch-id>\n" +
 		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
@@ -292,6 +293,29 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		})
 		listenerFile.Close()
 		listener.Close()
+	case "distributed-capture-many":
+		if t.distributedConfigFD < 0 {
+			util.Fatalf("--distributed-config-fd is required")
+		}
+		configFile := os.NewFile(uintptr(t.distributedConfigFD), "distributed-fork-batch-config")
+		if configFile == nil {
+			util.Fatalf("invalid distributed fork batch config FD")
+		}
+		decoder := json.NewDecoder(io.LimitReader(configFile, 1<<20))
+		decoder.DisallowUnknownFields()
+		var captureArgs boot.DistributedForkCaptureManyArgs
+		if err := decoder.Decode(&captureArgs); err != nil {
+			configFile.Close()
+			util.Fatalf("decoding distributed fork batch config: %v", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			configFile.Close()
+			util.Fatalf("distributed fork batch config contains trailing data")
+		}
+		if err := configFile.Close(); err != nil {
+			util.Fatalf("closing distributed fork batch config: %v", err)
+		}
+		output, err = cont.Sandbox.CaptureDistributedForkMany(&captureArgs)
 	case "distributed-serve":
 		if t.distributedConnectionFD < 0 {
 			util.Fatalf("--distributed-connection-fd is required")

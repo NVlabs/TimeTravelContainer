@@ -84,6 +84,8 @@ and kernel objects rather than the amount of resident application memory.
 - Preserve process trees, threads, memory, credentials, timers, signals,
   internal pipes, internal sockets, and supported IPC resources.
 - Share memory page-by-page until one branch writes.
+- Fork one or more live siblings onto another configured TTC cluster node;
+  remote memory is fetched on demand instead of copied through shared storage.
 - Share disk-backed files through filesystem copy-on-write.
 - Show ancestry and branch state with `ttc ls --tree`.
 - Validate a fork while the source is paused. If a resource cannot be copied
@@ -512,8 +514,10 @@ container family with no ancestry or mutable storage shared with the source.
   device or accelerator passthrough, or Docker named networks.
 - One image reference currently records one selected platform. Image signature,
   attestation, and content-trust policy are not yet implemented.
-- Live branches require a durable checkpoint to move to another runtime
-  process or host.
+- Cross-node live fork currently requires mutually authenticated `ttcd` peers,
+  a common TTC repository and image content, and a reachable page-transfer
+  network. A durable checkpoint remains the portable option for unrelated TTC
+  installations or offline transfer.
 - Checkpoint restore requires the exact recorded image digest to be available
   in the destination TTC image store and currently requires a compatible TTC
   build.

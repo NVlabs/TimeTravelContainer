@@ -33,6 +33,18 @@
       "netem_device": "lo",
       "delay_ms": 5,
       "rate_mbit": 1000
+    },
+    {
+      "name": "wan-adaptive-four-siblings",
+      "fanout": 4,
+      "memory_mib": 16,
+      "workload": "sequential",
+      "transfer_bytes": 65536,
+      "prefetch": "adaptive",
+      "push": "dirty-orphan",
+      "netem_device": "lo",
+      "delay_ms": 5,
+      "rate_mbit": 1000
     }
   ]
 }

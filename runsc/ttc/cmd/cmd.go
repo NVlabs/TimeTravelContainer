@@ -3885,18 +3885,17 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		destinationValues = []string{"fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")}
 	}
 	if *targetNode != "" {
-		if len(destinationValues) != 1 {
-			return errors.New("a distributed fork currently requires exactly one destination container")
-		}
 		distributed, ok := backend.(distributedForkBackend)
 		if !ok {
 			return errors.New("this backend does not support distributed forks")
 		}
-		target, err := distributed.forkRemote(source, *targetNode, destinationValues[0], *paused)
+		targets, err := distributed.forkRemoteMany(source, *targetNode, destinationValues, *paused)
 		if err != nil {
-			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, destinationValues[0], err)
+			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, strings.Join(destinationValues, ", "), err)
 		}
-		fmt.Fprintln(stdout, target)
+		for _, target := range targets {
+			fmt.Fprintln(stdout, target)
+		}
 		return nil
 	}
 	destinations := make([]selector, len(destinationValues))

@@ -17,6 +17,7 @@ package kernel
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -33,7 +34,11 @@ import (
 
 // DistributedForkCaptureOptions controls portable source capture.
 type DistributedForkCaptureOptions struct {
-	ChildBranchID                  string
+	ChildBranchID string
+	// ChildBranchIDs requests sibling filesystem and memory snapshots from
+	// one paused instant. When non-empty, ChildBranchID must be empty or equal
+	// the first element. A singular caller may continue using ChildBranchID.
+	ChildBranchIDs                 []string
 	AllowSharedFilesystemResources bool
 }
 
@@ -45,6 +50,7 @@ type DistributedForkCapture struct {
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
 	Snapshot          *pgalloc.RemoteSnapshot
+	Snapshots         []*pgalloc.RemoteSnapshot
 
 	// FilesystemResources contains process-local handles. A same-process target
 	// may use them directly; a remote ttcd reopens equivalent handles from its
@@ -54,12 +60,21 @@ type DistributedForkCapture struct {
 
 // Close cancels all outstanding remote pages.
 func (c *DistributedForkCapture) Close() error {
-	if c == nil || c.Snapshot == nil {
+	if c == nil {
 		return nil
 	}
-	err := c.Snapshot.Close()
-	c.Snapshot = nil
-	return err
+	var result error
+	if c.Snapshot != nil {
+		result = errors.Join(result, c.Snapshot.Close())
+		c.Snapshot = nil
+	}
+	for i, snapshot := range c.Snapshots {
+		if snapshot != nil {
+			result = errors.Join(result, snapshot.Close())
+			c.Snapshots[i] = nil
+		}
+	}
+	return result
 }
 
 // CaptureDistributedFork captures portable Kernel and allocator metadata while
@@ -69,8 +84,21 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	if !k.IsPaused() {
 		return nil, fmt.Errorf("distributed fork capture requires a paused kernel")
 	}
-	if opts.ChildBranchID == "" {
-		return nil, fmt.Errorf("distributed fork capture requires a child branch ID")
+	childBranchIDs := opts.ChildBranchIDs
+	if len(childBranchIDs) == 0 {
+		childBranchIDs = []string{opts.ChildBranchID}
+	} else if opts.ChildBranchID != "" && opts.ChildBranchID != childBranchIDs[0] {
+		return nil, fmt.Errorf("distributed fork primary branch %q differs from first sibling %q", opts.ChildBranchID, childBranchIDs[0])
+	}
+	seenBranchIDs := make(map[string]struct{}, len(childBranchIDs))
+	for i, id := range childBranchIDs {
+		if id == "" {
+			return nil, fmt.Errorf("distributed fork capture child %d has an empty branch ID", i)
+		}
+		if _, ok := seenBranchIDs[id]; ok {
+			return nil, fmt.Errorf("distributed fork capture repeats child branch ID %q", id)
+		}
+		seenBranchIDs[id] = struct{}{}
 	}
 	k.tasks.waitForExternalStop()
 	k.ReceiveTaskStates()
@@ -113,8 +141,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			pgalloc.CtxMemoryFileMap:           mfs,
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
-			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
-			vfs.CtxLiveForkChildBranchIDs:      []string{opts.ChildBranchID},
+			vfs.CtxLiveForkChildBranchID:       childBranchIDs[0],
+			vfs.CtxLiveForkChildBranchIDs:      childBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
@@ -131,14 +159,16 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		if err != nil {
 			return err
 		}
-		snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+		snapshots, err := pgalloc.NewRemoteSnapshots(regions, len(childBranchIDs))
 		if err != nil {
 			return err
 		}
-		keepSnapshot := false
+		keepSnapshots := false
 		defer func() {
-			if !keepSnapshot {
-				_ = snapshot.Close()
+			if !keepSnapshots {
+				for _, snapshot := range snapshots {
+					_ = snapshot.Close()
+				}
 			}
 		}()
 		var kernelMetadata bytes.Buffer
@@ -165,9 +195,14 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		committed = true
 		capture = &DistributedForkCapture{
 			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
-			LoadRanges: loads, Snapshot: snapshot, FilesystemResources: fsResources,
+			LoadRanges: loads, FilesystemResources: fsResources,
 		}
-		keepSnapshot = true
+		if len(snapshots) == 1 {
+			capture.Snapshot = snapshots[0]
+		} else {
+			capture.Snapshots = snapshots
+		}
+		keepSnapshots = true
 		return nil
 	})
 	if err != nil {
@@ -267,6 +302,15 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	child.remotePageLoad = pages
 	loaded = true
+	// The restored VVAR mapping still refers to its fork-time remote page, but
+	// privatizeLiveForkVDSOParamPage replaces that mapping with a new local
+	// allocation. Materialize the old page first so its pull is acknowledged;
+	// otherwise a target that never faults VVAR retains exactly one source page
+	// forever and cannot complete a drain.
+	if _, err := child.vdsoParams.access(); err != nil {
+		child.Release()
+		return nil, fmt.Errorf("materializing distributed-fork VDSO parameter page: %w", err)
+	}
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
 		child.Release()
 		return nil, err

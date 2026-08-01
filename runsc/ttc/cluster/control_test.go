@@ -276,6 +276,32 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	}
 }
 
+func TestControlPlaneTransactionLocksAreIndependent(t *testing.T) {
+	control := &ControlPlane{}
+	unlockA := control.lockTransaction("fork-a")
+	defer unlockA()
+	acquiredB := make(chan func(), 1)
+	go func() {
+		acquiredB <- control.lockTransaction("fork-b")
+	}()
+	select {
+	case unlockB := <-acquiredB:
+		unlockB()
+	case <-time.After(time.Second):
+		t.Fatal("unrelated transaction lock was serialized")
+	}
+	acquiredA := make(chan func(), 1)
+	go func() {
+		acquiredA <- control.lockTransaction("fork-a")
+	}()
+	select {
+	case unlock := <-acquiredA:
+		unlock()
+		t.Fatal("same transaction lock was acquired concurrently")
+	case <-time.After(10 * time.Millisecond):
+	}
+}
+
 func TestPrepareRejectsChangedSessionAfterLostResponse(t *testing.T) {
 	files := newTestTLSFiles(t)
 	serverTLS, _ := LoadServerTLSConfig(files.serverCert, files.serverKey, files.ca)

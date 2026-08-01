@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -47,6 +48,7 @@ type distributedSourceRuntime struct {
 
 type distributedForkBackend interface {
 	forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error)
+	forkRemoteMany(source selector, targetNode string, targetContainers []string, paused bool) ([]selector, error)
 }
 
 type distributedPageRelay struct {
@@ -317,6 +319,252 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	monitorBackend.stderr = io.Discard
 	go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
+}
+
+// forkRemoteMany reserves multiple targets before pausing the source, then
+// captures all sibling memory/filesystem branches in one Sentry operation.
+// Each child retains an independent transaction and page session after the
+// shared capture.
+func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targetContainers []string, paused bool) ([]selector, error) {
+	if len(targetContainers) == 0 {
+		return nil, errors.New("distributed fork requires at least one destination")
+	}
+	if len(targetContainers) == 1 {
+		target, err := b.forkRemote(source, targetNode, targetContainers[0], paused)
+		if err != nil {
+			return nil, err
+		}
+		return []selector{target}, nil
+	}
+	if b.distributedSource == nil {
+		return nil, errors.New("ttcd is not configured for distributed forks")
+	}
+	peer := b.distributedSource.peers[targetNode]
+	if peer == nil {
+		return nil, fmt.Errorf("cluster target node %q is not configured", targetNode)
+	}
+	seenTargets := make(map[string]struct{}, len(targetContainers))
+	for _, targetContainer := range targetContainers {
+		targetSelector, err := parseSelector(targetContainer)
+		if err != nil {
+			return nil, fmt.Errorf("target container %q: %w", targetContainer, err)
+		}
+		if targetSelector.container != targetContainer || targetSelector.branch != defaultBranchID {
+			return nil, fmt.Errorf("target container %q must not include a branch", targetContainer)
+		}
+		if _, ok := seenTargets[targetContainer]; ok {
+			return nil, fmt.Errorf("distributed fork repeats target container %q", targetContainer)
+		}
+		seenTargets[targetContainer] = struct{}{}
+	}
+	resolved, sourceInfo, err := b.resolveSelector(source)
+	if err != nil {
+		return nil, err
+	}
+	source = resolved
+	rootfsDigest, err := distributedRootfsDigest(sourceInfo, source.branch, b.distributedSource.capabilities.RepositoryID)
+	if err != nil {
+		return nil, err
+	}
+	type childState struct {
+		target       string
+		transaction  string
+		tx           *cluster.Transaction
+		relay        *distributedPageRelay
+		advertise    string
+		dataPlaneMax uint64
+		captured     bool
+	}
+	children := make([]childState, len(targetContainers))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cleanup := true
+	defer func() {
+		if !cleanup {
+			return
+		}
+		for i := range children {
+			child := &children[i]
+			child.relay.Close()
+			if child.transaction == "" {
+				continue
+			}
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if status, statusErr := peer.Status(cleanupCtx, child.transaction); statusErr == nil {
+				_, _ = peer.Cancel(cleanupCtx, child.transaction, status.Revision)
+			} else if child.tx != nil {
+				_, _ = peer.Cancel(cleanupCtx, child.transaction, child.tx.Revision)
+			}
+			cleanupCancel()
+			if child.captured {
+				_, _ = b.command("timetravel", source.container, "distributed-cancel", child.transaction)
+			}
+		}
+	}()
+
+	var commonPolicy *ttcpolicy.Policy
+	var commonDataPlaneMax uint64
+	for i, targetContainer := range targetContainers {
+		transactionID, err := newDistributedTransactionID()
+		if err != nil {
+			return nil, fmt.Errorf("generating distributed transaction ID: %w", err)
+		}
+		identity := cluster.ForkIdentity{
+			TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
+			TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
+			TargetContainer: targetContainer, TargetBranch: transactionID,
+			ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
+			RepositoryID: b.distributedSource.capabilities.RepositoryID,
+		}
+		tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+		if err != nil {
+			return nil, fmt.Errorf("reserving target %s on node %s: %w", targetContainer, targetNode, err)
+		}
+		dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
+		if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+			dataPlaneMax = tx.Negotiated.MaxTransferSize
+		}
+		if commonPolicy == nil {
+			policy := tx.Negotiated.PagingPolicy
+			commonPolicy = &policy
+			commonDataPlaneMax = dataPlaneMax
+		} else if *commonPolicy != tx.Negotiated.PagingPolicy || commonDataPlaneMax != dataPlaneMax {
+			return nil, fmt.Errorf("target %s negotiated a different paging policy within one sibling batch", targetContainer)
+		}
+		listener, err := net.Listen("tcp", b.distributedSource.pageListen)
+		if err != nil {
+			return nil, fmt.Errorf("opening distributed page listener for %s: %w", targetContainer, err)
+		}
+		advertise, err := resolveDistributedAdvertiseAddress(b.distributedSource.pageAdvertise, listener.Addr().String())
+		if err != nil {
+			listener.Close()
+			return nil, err
+		}
+		relayBackend := *b
+		relayBackend.stdin = strings.NewReader("")
+		relayBackend.stdout = io.Discard
+		relayBackend.stderr = io.Discard
+		children[i] = childState{
+			target: targetContainer, transaction: transactionID, tx: tx,
+			relay:     newDistributedPageRelay(listener, &relayBackend, source.container, transactionID),
+			advertise: advertise, dataPlaneMax: dataPlaneMax,
+		}
+	}
+	captureArgs := boot.DistributedForkCaptureManyArgs{
+		Source: source.branch, FamilyID: source.container,
+		MaxTransferBytes: commonDataPlaneMax, PushPolicy: sentryremote.TCPPushPolicy(commonPolicy.Push),
+		PushHighWater: commonPolicy.MaxOutstandingBytes,
+		Children:      make([]boot.DistributedForkCaptureChildArgs, len(children)),
+	}
+	for i := range children {
+		captureArgs.Children[i] = boot.DistributedForkCaptureChildArgs{
+			SessionID: children[i].transaction, TargetBranchID: children[i].transaction,
+			AdvertiseAddress: children[i].advertise,
+		}
+	}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("creating distributed batch config pipe: %w", err)
+	}
+	encodedConfig, err := json.Marshal(&captureArgs)
+	if err == nil {
+		_, err = configWriter.Write(encodedConfig)
+	}
+	closeErr := configWriter.Close()
+	if err != nil {
+		configReader.Close()
+		return nil, fmt.Errorf("writing distributed batch config: %w", err)
+	}
+	if closeErr != nil {
+		configReader.Close()
+		return nil, fmt.Errorf("closing distributed batch config: %w", closeErr)
+	}
+	output, err := b.commandWithFiles([]*os.File{configReader}, "timetravel", "--distributed-config-fd=3",
+		source.container, "distributed-capture-many", children[0].transaction)
+	configReader.Close()
+	if err != nil {
+		return nil, fmt.Errorf("capturing %d distributed siblings: %w", len(children), err)
+	}
+	var sessions []boot.DistributedForkSessionInfo
+	if err := json.Unmarshal(output, &sessions); err != nil {
+		return nil, fmt.Errorf("decoding distributed sibling capture: %w", err)
+	}
+	if len(sessions) != len(children) {
+		return nil, fmt.Errorf("source returned %d sessions for %d siblings", len(sessions), len(children))
+	}
+	for i := range children {
+		children[i].captured = true
+	}
+	sessionByID := make(map[string]boot.DistributedForkSessionInfo, len(sessions))
+	for _, session := range sessions {
+		sessionByID[session.SessionID] = session
+	}
+	descriptors := make([]cluster.RemoteSessionDescriptor, len(children))
+	for i := range children {
+		child := &children[i]
+		session, ok := sessionByID[child.transaction]
+		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
+			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
+		}
+		descriptors[i] = cluster.RemoteSessionDescriptor{
+			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
+			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
+			MaxTransferBytes: child.dataPlaneMax,
+		}
+	}
+	prepareErrors := make([]error, len(children))
+	var prepareWG sync.WaitGroup
+	for i := range children {
+		i := i
+		prepareWG.Add(1)
+		go func() {
+			defer prepareWG.Done()
+			child := &children[i]
+			child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+		}()
+	}
+	prepareWG.Wait()
+	for i, prepareErr := range prepareErrors {
+		if prepareErr != nil {
+			return nil, fmt.Errorf("restoring target %s on node %s: %w", children[i].target, targetNode, prepareErr)
+		}
+	}
+	publishErrors := make([]error, len(children))
+	var publishWG sync.WaitGroup
+	for i := range children {
+		i := i
+		publishWG.Add(1)
+		go func() {
+			defer publishWG.Done()
+			child := &children[i]
+			child.tx, publishErrors[i] = peer.Publish(ctx, child.transaction, child.tx.Revision, paused)
+			if publishErrors[i] != nil {
+				status, statusErr := peer.Status(ctx, child.transaction)
+				if statusErr == nil && (status.State == cluster.TransactionPublished || status.State == cluster.TransactionIndependent) {
+					child.tx = status
+					publishErrors[i] = nil
+				}
+			}
+		}()
+	}
+	publishWG.Wait()
+	for i, publishErr := range publishErrors {
+		if publishErr != nil {
+			return nil, fmt.Errorf("publishing target %s on node %s: %w", children[i].target, targetNode, publishErr)
+		}
+	}
+	results := make([]selector, len(children))
+	for i := range children {
+		child := &children[i]
+		monitorBackend := *b
+		monitorBackend.stdin = strings.NewReader("")
+		monitorBackend.stdout = io.Discard
+		monitorBackend.stderr = io.Discard
+		go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+		results[i] = selector{container: child.target, branch: defaultBranchID}
+	}
+	cleanup = false
+	return results, nil
 }
 
 func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {

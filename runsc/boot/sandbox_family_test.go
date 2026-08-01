@@ -117,6 +117,62 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyDistributedForkCaptureMany(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	infos, err := family.CaptureDistributedForkMany(&DistributedForkCaptureManyArgs{
+		FamilyID: "family-many", MaxTransferBytes: 64 << 10,
+		Children: []DistributedForkCaptureChildArgs{
+			{SessionID: "tx-a", TargetBranchID: "remote-a", AdvertiseAddress: "127.0.0.1:10001"},
+			{SessionID: "tx-b", TargetBranchID: "remote-b", AdvertiseAddress: "127.0.0.1:10002"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CaptureDistributedForkMany: %v", err)
+	}
+	if len(infos) != 2 || infos[0].SessionID != "tx-a" || infos[1].SessionID != "tx-b" || infos[0].StreamBytes == 0 {
+		t.Fatalf("session infos: %+v", infos)
+	}
+	if parent.IsPaused() {
+		t.Fatal("source remained paused after sibling capture")
+	}
+	first, err := family.DistributedForkSessionStatus("tx-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := family.DistributedForkSessionStatus("tx-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Snapshot.PagesOutstanding == 0 || first.Snapshot.PagesOutstanding != second.Snapshot.PagesOutstanding {
+		t.Fatalf("sibling snapshot status: first=%+v second=%+v", first.Snapshot, second.Snapshot)
+	}
+	if err := family.CancelDistributedForkSession("tx-a"); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := family.DistributedForkSessionStatus("tx-b"); err != nil || status.Snapshot.PagesOutstanding == 0 {
+		t.Fatalf("second sibling after first cancellation: status=%+v err=%v", status, err)
+	}
+	if err := family.CancelDistributedForkSession("tx-b"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	first := &SandboxFamily{volumeBranchScope: "sandbox-a"}
 	second := &SandboxFamily{volumeBranchScope: "sandbox-b"}

@@ -185,7 +185,15 @@ type ControlPlane struct {
 	MaxTransactions int
 	Now             func() time.Time
 	TargetRuntime   TargetRuntime
-	operationMu     sync.Mutex
+	operationMu     sync.Mutex // serializes reservation/quota accounting
+	transactionMu   sync.Map   // transaction ID -> *sync.Mutex
+}
+
+func (c *ControlPlane) lockTransaction(id string) func() {
+	value, _ := c.transactionMu.LoadOrStore(id, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // ServeHTTP serves the versioned reservation/status/cancel API. The HTTP
@@ -332,8 +340,8 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 }
 
 func (c *ControlPlane) prepare(w http.ResponseWriter, r *http.Request, id, peer string) {
-	c.operationMu.Lock()
-	defer c.operationMu.Unlock()
+	unlock := c.lockTransaction(id)
+	defer unlock()
 	if c.TargetRuntime == nil {
 		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
 		return
@@ -403,8 +411,8 @@ func (c *ControlPlane) prepare(w http.ResponseWriter, r *http.Request, id, peer 
 }
 
 func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer string) {
-	c.operationMu.Lock()
-	defer c.operationMu.Unlock()
+	unlock := c.lockTransaction(id)
+	defer unlock()
 	if c.TargetRuntime == nil {
 		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
 		return
@@ -460,8 +468,8 @@ func (c *ControlPlane) drain(w http.ResponseWriter, r *http.Request, id, peer st
 }
 
 func (c *ControlPlane) advanceRuntime(w http.ResponseWriter, r *http.Request, id, peer string, required, next TransactionState, operation func(context.Context, *Transaction) error) {
-	c.operationMu.Lock()
-	defer c.operationMu.Unlock()
+	unlock := c.lockTransaction(id)
+	defer unlock()
 	if c.TargetRuntime == nil {
 		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
 		return
@@ -525,8 +533,8 @@ func (c *ControlPlane) status(w http.ResponseWriter, id, peer string) {
 }
 
 func (c *ControlPlane) cancel(w http.ResponseWriter, r *http.Request, id, peer string) {
-	c.operationMu.Lock()
-	defer c.operationMu.Unlock()
+	unlock := c.lockTransaction(id)
+	defer unlock()
 	tx, err := c.Store.Load(id)
 	if err != nil {
 		writeControlError(w, http.StatusNotFound, err.Error())

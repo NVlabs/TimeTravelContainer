@@ -23,11 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
@@ -358,6 +360,46 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	child.Pause()
 	child.Release()
 	parent.Release()
+}
+
+func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	defer parent.Release()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{
+		ChildBranchIDs: []string{"remote-a", "remote-b"},
+	})
+	if err != nil {
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	defer capture.Close()
+	if capture.Snapshot != nil || len(capture.Snapshots) != 2 {
+		t.Fatalf("capture snapshots: singular=%p siblings=%d", capture.Snapshot, len(capture.Snapshots))
+	}
+	if len(capture.LoadRanges) == 0 || capture.LoadRanges[0].Target.Length() < hostarch.PageSize {
+		t.Fatal("capture has no remotely loadable page")
+	}
+	firstPage := memmap.FileRange{
+		Start: capture.LoadRanges[0].Target.Start,
+		End:   capture.LoadRanges[0].Target.Start + hostarch.PageSize,
+	}
+	if err := capture.Snapshots[0].AcknowledgeStreamRange(0, hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	if parent.MemoryFile().HasUniqueRef(firstPage) {
+		t.Fatal("one sibling acknowledgement prematurely released the source page")
+	}
+	if err := capture.Snapshots[1].AcknowledgeStreamRange(0, hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	if !parent.MemoryFile().HasUniqueRef(firstPage) {
+		t.Fatal("last sibling acknowledgement did not release the source page")
+	}
 }
 
 func TestPortableDistributedForkKernelSubprocess(t *testing.T) {

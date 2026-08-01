@@ -51,6 +51,16 @@ pass to a sparse prefix of the sequential or pseudo-random access stream. This
 makes it possible to measure prefetch waste without changing the fork-time
 resident set.
 
+`fanout` defaults to one. Values greater than one exercise the coordinated
+sibling API: all target containers are captured from one source pause, then
+run and verify the same workload concurrently. The JSON record contains one
+transaction and loader status per target.
+
+`capture_mode` defaults to `batch`. Set it to `sequential` with `fanout` greater
+than one to issue one ordinary fork command per target. This provides a direct
+comparison for batch fan-out's single source pause, shared capture, and
+parallel target preparation.
+
 The harness compiles `page_worker.c` once into the work directory and imports
 it through a TTC `:copy` mount. The worker prefaults one byte per 4 KiB page,
 stops itself before the fork, and resumes only on `SIGCONT`. Thus readiness

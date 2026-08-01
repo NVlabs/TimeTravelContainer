@@ -295,6 +295,59 @@ ttc branch rm web@test-a
 `ttc rm web` removes the whole family and requires all live branches to be
 stopped unless `--force` is used.
 
+## Distributed live fork
+
+Configured TTC nodes can place a live child on another host without first
+copying all container memory or creating a checkpoint. The target begins with
+remote memory and fetches configurable page ranges directly from the source;
+each installed page releases the corresponding source dependency.
+
+The nodes must use the same shared TTC data root and repository ID, have the
+same image content available, and be able to reach each other's control and
+page-transfer listeners. Give every daemon a certificate issued by one cluster
+CA whose identity matches its node ID. For example, start node A with:
+
+```shell
+ttc daemon start \
+  --cluster-node-id node-a \
+  --cluster-repository-id team-repository \
+  --cluster-listen 0.0.0.0:7443 \
+  --cluster-page-listen 0.0.0.0:0 \
+  --cluster-page-advertise node-a.example:0 \
+  --cluster-cert /shared/cluster/node-a.pem \
+  --cluster-key /shared/cluster/node-a.key \
+  --cluster-ca /shared/cluster/ca.pem \
+  --cluster-peer node-b=https://node-b.example:7443,node-b
+```
+
+Start node B with the node names and peer address reversed. `TTC_DATA_ROOT`
+should name the shared repository path on both hosts; `TTC_RUNTIME_DIR` should
+remain a fast, node-local path. `ttc daemon status` reports the active cluster
+identity and negotiated capabilities.
+
+From node A, create one child on node B:
+
+```shell
+ttc fork --target node-b web remote-web
+```
+
+Create several siblings from one source pause and one metadata capture by
+listing all destinations in a single command:
+
+```shell
+ttc fork --target node-b web candidate-a candidate-b candidate-c
+```
+
+Each child has an independent filesystem branch and memory dependency. A
+child becomes fully independent when it has installed every required page;
+`ttc inspect` reports its distributed transaction state and final transfer
+metrics. If the source daemon is stopped while children still depend on it,
+TTC asks the children to drain their remaining pages before shutdown.
+
+Distributed live fork currently targets one remote node per command. Use a
+durable checkpoint for offline transfer or for TTC installations that do not
+share a repository and trust configuration.
+
 ## Durable checkpoint and restore
 
 `ttc fork` is the fast, in-memory operation for creating another branch in the

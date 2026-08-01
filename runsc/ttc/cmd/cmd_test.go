@@ -493,10 +493,11 @@ func TestForkCreatesSiblingBatch(t *testing.T) {
 
 type fakeDistributedBackend struct {
 	*fakeBackend
-	source          selector
-	targetNode      string
-	targetContainer string
-	targetPaused    bool
+	source           selector
+	targetNode       string
+	targetContainer  string
+	targetContainers []string
+	targetPaused     bool
 }
 
 func (b *fakeDistributedBackend) forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error) {
@@ -505,6 +506,21 @@ func (b *fakeDistributedBackend) forkRemote(source selector, targetNode, targetC
 	b.targetContainer = targetContainer
 	b.targetPaused = paused
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
+}
+
+func (b *fakeDistributedBackend) forkRemoteMany(source selector, targetNode string, targetContainers []string, paused bool) ([]selector, error) {
+	b.source = source
+	b.targetNode = targetNode
+	b.targetContainers = append([]string(nil), targetContainers...)
+	b.targetPaused = paused
+	results := make([]selector, len(targetContainers))
+	for i, target := range targetContainers {
+		results[i] = selector{container: target, branch: defaultBranchID}
+	}
+	if len(targetContainers) == 1 {
+		b.targetContainer = targetContainers[0]
+	}
+	return results, nil
 }
 
 func TestForkTargetsRemoteNode(t *testing.T) {
@@ -517,6 +533,20 @@ func TestForkTargetsRemoteNode(t *testing.T) {
 		t.Fatalf("distributed fork call source=%+v node=%q container=%q paused=%t", b.source, b.targetNode, b.targetContainer, b.targetPaused)
 	}
 	if got, want := stdout.String(), "remote@main\n"; got != want {
+		t.Fatalf("fork output=%q, want %q", got, want)
+	}
+}
+
+func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
+	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"fork", "--target", "node-b", "web", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.targetContainers, []string{"remote-a", "remote-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("distributed targets=%q, want %q", got, want)
+	}
+	if got, want := stdout.String(), "remote-a@main\nremote-b@main\n"; got != want {
 		t.Fatalf("fork output=%q, want %q", got, want)
 	}
 }

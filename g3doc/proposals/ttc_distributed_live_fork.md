@@ -22,7 +22,10 @@ Implementation progress:
   stop: implemented and tested in a two-daemon same-host cluster.
 * Phase 5 policy controls, durable metrics, real-container benchmark harness,
   PMA-aware demand granularity, and adaptive locality selection: implemented
-  and tested. Phase 6: pending.
+  and tested.
+* Phase 6 coordinated sibling capture, shared source-page ownership,
+  per-child transactions, parallel target reconstruction, and advanced
+  transport evaluation: implemented and tested.
 
 ## Summary
 
@@ -45,11 +48,12 @@ The initial implementation assumes:
 * a common image store and TTC filesystem repository visible on all nodes,
   initially through a shared filesystem;
 * a reliable, high-speed IP network between nodes; and
-* one remote child per distributed-fork operation.
+* one target node per distributed-fork operation, with one or more sibling
+  children on that node.
 
-RDMA, multiple remote consumers of one memory snapshot, source-independent
-failover, and distributed filesystem CoW are later extensions. The memory
-protocol must not depend on NFS and must not route page contents through it.
+Cross-target-node fan-out, source-independent failover, and distributed
+filesystem CoW are later extensions. The memory protocol does not depend on
+NFS and does not route page contents through it.
 
 ## Goals
 
@@ -524,14 +528,63 @@ experimental target, not a correctness requirement.
 
 ### Phase 6: multiple children and advanced transports
 
-* Generalize page need state to multiple remote consumers or a delegated page
-  server.
-* Evaluate RDMA reads/writes, io_uring, compression, deduplication, and target
-  page eviction back to a snapshot owner.
-* Add replication if target survival after source failure becomes a product
-  requirement.
+`ttc fork --target NODE SOURCE CHILD...` now creates all requested siblings
+from one atomic source pause and one kernel-metadata capture. The allocator
+adds one physical snapshot reference per source page, not one per child. Each
+child has its own release bitmap, leases, metrics, page session, filesystem
+branch, and durable transaction. A source page becomes reclaimable only after
+every live child has acknowledged or cancelled it. This preserves independent
+failure and cleanup while avoiding reference-count and metadata work that
+scales with sibling count.
 
-This phase starts only after the single-target protocol is stable.
+Target reservations are still quota-serialized, but preparation and
+publication use per-transaction locks and run concurrently. Failure before
+publication rolls back every sibling; failure after publication remains an
+independent durable transaction outcome. Unit tests cover staggered ACKs,
+cancel/ACK races, sibling close, shared page lifetime, batch rollback, and
+control-plane lock independence. A real four-child test verifies all guest
+workloads, source and target liveness, independent terminal state, and exact
+release of every source snapshot page.
+
+On an unshaped same-host two-daemon setup with an 8 MiB prefaulted BusyBox
+workload, three runs produced these median wall times:
+
+| Capture | Fork command | All children independent |
+|---|---:|---:|
+| One child | 262 ms | 532 ms |
+| Four siblings, one batch capture | **668 ms** | **1,985 ms** |
+| Four siblings, four sequential captures | 1,063 ms | 2,397 ms |
+
+Batch capture reduced four-child fork-command latency by 37% and time to full
+independence by 17%. Every transaction in all runs released
+`pages_released == pages_total`; all source and target health probes passed.
+These are development-machine measurements, not general performance claims.
+
+The current bounded multi-stream TCP transport remains the default after the
+advanced transport evaluation:
+
+* **RDMA** can reduce CPU use and tail latency on specialized clusters, but
+  memory registration/pinning, hardware and module requirements, and a more
+  complex revocation protocol conflict with TTC's portable rootless baseline.
+  The page-provider boundary remains suitable for a future negotiated RDMA
+  backend.
+* **io_uring** can reduce host syscall and scheduling overhead, but it does not
+  remove remote-fault RTT. With donated streams and concurrent range requests,
+  it is an incremental transport optimization rather than an architectural
+  prerequisite.
+* **Compression** can help on bandwidth-limited links but adds latency and CPU
+  cost, especially for already-compressed or high-entropy pages. It should be
+  negotiated per session and selected from measured compressibility.
+* **Content deduplication** requires hashing every candidate page and provides
+  little benefit when branches already share one immutable source snapshot.
+  It is better suited to optional background replication.
+* **Target eviction and source-independent replication** change ownership and
+  failure semantics. They remain future protocol extensions rather than being
+  hidden behind the current ACK contract.
+
+Cross-node siblings therefore share source memory efficiently today, while
+specialized transports and failover remain additive extensions with explicit
+negotiation and tests.
 
 ## Test plan
 

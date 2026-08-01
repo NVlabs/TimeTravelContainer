@@ -2,6 +2,7 @@
 """Reproducible two-node TTC distributed-fork workload benchmark."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 import pathlib
@@ -70,10 +71,10 @@ class Experiment:
         self.data = root / "data"
         unique = f"{os.getpid()}-{repetition}-{time.time_ns()}"
         self.source = f"bench-source-{unique}"
-        self.target = f"bench-target-{unique}"
+        self.targets = [f"bench-target-{unique}-{i}" for i in range(int(case.get("fanout", 1)))]
         self.source_id = ""
-        self.target_id = ""
-        self.txid = ""
+        self.target_ids = []
+        self.txids = []
         self.netem_active = False
 
     def env(self, node):
@@ -155,23 +156,23 @@ class Experiment:
             raise RuntimeError(f"inspect returned {len(records)} records")
         return records[0]
 
-    def source_status(self):
-        if not self.source_id or not self.txid:
+    def source_status(self, transaction):
+        if not self.source_id or not transaction:
             return None
         result = run([
             self.args.ttcd, "runsc", "--root", self.runtime_a / "runsc",
-            "timetravel", self.source_id, "distributed-status", self.txid,
+            "timetravel", self.source_id, "distributed-status", transaction,
         ], check=False, timeout=15)
         if result.returncode:
             return None
         return json.loads(result.stdout)
 
-    def target_status(self):
-        if not self.target_id:
+    def target_status(self, target_id):
+        if not target_id:
             return None
         result = run([
             self.args.ttcd, "runsc", "--root", self.runtime_b / "runsc",
-            "timetravel", self.target_id, "distributed-dependency", "main",
+            "timetravel", target_id, "distributed-dependency", "main",
         ], check=False, timeout=15)
         if result.returncode:
             return None
@@ -195,33 +196,41 @@ class Experiment:
                        "while [ ! -f /tmp/ttc-bench-ready ]; do sleep 0.05; done", 120)
         self.shape_network()
         fork_start = time.monotonic_ns()
-        self.ttc("a", "fork", "--target", "node-b", self.source, self.target, timeout=300)
+        if self.case["capture_mode"] == "batch":
+            self.ttc("a", "fork", "--target", "node-b", self.source, *self.targets, timeout=300)
+        elif self.case["capture_mode"] == "sequential":
+            for target in self.targets:
+                self.ttc("a", "fork", "--target", "node-b", self.source, target, timeout=300)
+        else:
+            raise ValueError(f"unknown capture_mode {self.case['capture_mode']!r}")
         fork_end = time.monotonic_ns()
-        target = self.inspect("b", self.target)
-        self.target_id = target["TTC"]["container"]["id"]
-        distributed = target["TTC"]["distributed_fork"]
-        self.txid = distributed["identity"]["transaction_id"]
+        inspected = [self.inspect("b", target) for target in self.targets]
+        self.target_ids = [target["TTC"]["container"]["id"] for target in inspected]
+        self.txids = [target["TTC"]["distributed_fork"]["identity"]["transaction_id"] for target in inspected]
         work_start = time.monotonic_ns()
-        self.ttc("b", "kill", "--signal", "CONT", self.target)
-        self.wait_exec("b", self.target,
-                       "while [ ! -f /tmp/ttc-bench-done ]; do sleep 0.01; done",
-                       300)
+        def run_target(target):
+            self.ttc("b", "kill", "--signal", "CONT", target)
+            self.wait_exec("b", target,
+                           "while [ ! -f /tmp/ttc-bench-done ]; do sleep 0.01; done",
+                           300)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.targets)) as executor:
+            list(executor.map(run_target, self.targets))
         work_end = time.monotonic_ns()
         independent_ms = None
         deadline = time.monotonic() + self.args.independence_timeout
-        final = target
+        final = inspected
         while time.monotonic() < deadline:
-            final = self.inspect("b", self.target)
-            if final["TTC"]["distributed_fork"]["state"] == "independent":
+            final = [self.inspect("b", target) for target in self.targets]
+            if all(target["TTC"]["distributed_fork"]["state"] == "independent" for target in final):
                 independent_ms = (time.monotonic_ns() - fork_start) / 1e6
                 break
             time.sleep(0.05)
-        status = self.source_status()
-        target_status = self.target_status()
+        statuses = [self.source_status(txid) for txid in self.txids]
+        target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
         source_ok = self.ttc("a", "exec", self.source, "true", check=False).returncode == 0
-        target_ok = self.ttc("b", "exec", self.target, "true", check=False).returncode == 0
+        target_ok = [self.ttc("b", "exec", target, "true", check=False).returncode == 0 for target in self.targets]
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "case": self.case,
             "repetition": self.repetition,
             "image": self.args.image,
@@ -230,21 +239,45 @@ class Experiment:
             "independent_ms": independent_ms,
             "source_ok": source_ok,
             "target_ok": target_ok,
-            "transaction": final["TTC"]["distributed_fork"],
-            "source_live_status": status,
-            "target_loader_status": target_status,
+            "transactions": [target["TTC"]["distributed_fork"] for target in final],
+            "source_live_statuses": statuses,
+            "target_loader_statuses": target_statuses,
             "wall_ms": (time.time_ns() - started) / 1e6,
         }
 
     def cleanup(self):
-        self.clear_network()
+        try:
+            self.clear_network()
+        except Exception:
+            self.netem_active = False
+        def safe_ttc(node, *argv, timeout=30):
+            try:
+                return self.ttc(node, *argv, check=False, timeout=timeout).returncode == 0
+            except Exception:
+                return False
         # Stop the source first while its peer is reachable. This lets ttcd
         # request a complete target drain for demand-only runs; stopping the
         # target first can intentionally make source shutdown refuse to lose
         # remotely-owned pages.
-        stopped_a = self.ttc("a", "daemon", "stop", check=False, timeout=120).returncode == 0
-        self.ttc("b", "rm", "-f", self.target, check=False, timeout=30)
-        stopped_b = self.ttc("b", "daemon", "stop", check=False, timeout=60).returncode == 0
+        stopped_a = safe_ttc("a", "daemon", "stop", timeout=120)
+        if not stopped_a and self.source_id:
+            # Preserve teardown even when the experiment exposed a dependency
+            # bug: explicitly cancel each source snapshot while its Sentry is
+            # still reachable, then retry daemon shutdown after target removal.
+            for transaction in self.txids:
+                try:
+                    run([
+                        self.args.ttcd, "runsc", "--root", self.runtime_a / "runsc",
+                        "timetravel", self.source_id, "distributed-cancel", transaction,
+                    ], check=False, timeout=15)
+                except Exception:
+                    pass
+        for target in self.targets:
+            safe_ttc("b", "rm", "-f", target)
+        stopped_b = safe_ttc("b", "daemon", "stop", timeout=60)
+        if not stopped_a:
+            safe_ttc("a", "rm", "-f", self.source)
+            stopped_a = safe_ttc("a", "daemon", "stop", timeout=60)
         if stopped_a:
             shutil.rmtree(self.runtime_a, ignore_errors=True)
         if stopped_b:
@@ -264,6 +297,8 @@ DEFAULT_CASE = {
     "memory_mib": 64,
     "rounds": 2,
     "touch_fraction": 1.0,
+    "fanout": 1,
+    "capture_mode": "batch",
     "netem_device": "",
     "delay_ms": 0,
     "rate_mbit": 0,
@@ -309,11 +344,14 @@ def main():
                     record = experiment.run()
                 except Exception as error:
                     record = {
-                        "schema_version": 1, "case": case,
+                        "schema_version": 2, "case": case,
                         "repetition": repetition, "error": str(error),
                     }
                 finally:
-                    experiment.cleanup()
+                    try:
+                        experiment.cleanup()
+                    except Exception as cleanup_error:
+                        record["cleanup_error"] = str(cleanup_error)
                 line = json.dumps(record, sort_keys=True)
                 print(line, flush=True)
                 if output:

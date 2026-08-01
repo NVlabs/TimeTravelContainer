@@ -149,6 +149,40 @@ func TestRemoteSnapshotPageRelease(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotSiblingsShareSourceReferences(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 2)
+	snapshots, err := NewRemoteSnapshots([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPage := memmap.FileRange{0, hostarch.PageSize}
+	absoluteFirstPage := memmap.FileRange{fr.Start, fr.Start + hostarch.PageSize}
+	if err := snapshots[0].ReleaseRegion(1, firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if mf.HasUniqueRef(absoluteFirstPage) {
+		t.Fatal("first sibling prematurely released the shared source page")
+	}
+	if err := snapshots[1].ReleaseRegion(1, firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if !mf.HasUniqueRef(absoluteFirstPage) {
+		t.Fatal("last sibling acknowledgement did not release the shared page")
+	}
+	if err := snapshots[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if mf.HasUniqueRef(memmap.FileRange{fr.Start + hostarch.PageSize, fr.End}) {
+		t.Fatal("closing one sibling prematurely released another sibling's page")
+	}
+	if err := snapshots[1].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !mf.HasUniqueRef(fr) {
+		t.Fatal("closing every sibling did not restore source uniqueness")
+	}
+}
+
 func TestLoopbackRemoteReader(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 4)
 	want := make([]byte, fr.Length())

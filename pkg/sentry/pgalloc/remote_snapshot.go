@@ -62,7 +62,10 @@ type remoteSnapshotRegion struct {
 // and Close. Close prevents new acquisitions, releases unacknowledged pages,
 // waits for active readers, and drops MemoryFile ownership.
 type RemoteSnapshot struct {
-	mu sync.Mutex
+	// mu is shared by sibling snapshots captured from one instant. Sharing the
+	// lock lets the last consumer of a page release one common source reference
+	// without a per-page consumer counter or cross-snapshot lock ordering.
+	mu *sync.Mutex
 
 	regions      []remoteSnapshotRegion
 	regionByID   map[RemoteRegionID]int
@@ -78,6 +81,17 @@ type RemoteSnapshot struct {
 	pushHints     chan RemotePushHint
 	pushEnqueued  uint64
 	pushDropped   uint64
+	shared        *remoteSnapshotShared
+}
+
+// remoteSnapshotShared owns the single set of MemoryFile references retained
+// for one capture instant. Each target has its own RemoteSnapshot release
+// bitmap and transport state, but source pages are released only after every
+// still-live target has acknowledged or canceled them.
+type remoteSnapshotShared struct {
+	views  map[*RemoteSnapshot]struct{}
+	owners []*MemoryFile
+	active sync.WaitGroup
 }
 
 // RemotePushHint identifies fork-time bytes that became especially valuable
@@ -133,15 +147,26 @@ type RemoteSnapshotStats struct {
 // NewLoopbackRemoteReader. It must not be called while the source may change
 // its PMA ownership.
 func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) {
+	snapshots, err := NewRemoteSnapshots(regions, 1)
+	if err != nil {
+		return nil, err
+	}
+	return snapshots[0], nil
+}
+
+// NewRemoteSnapshots creates count independently readable views of one
+// fork-time snapshot. It acquires one source page reference, rather than one
+// reference per destination. This makes sibling fan-out add only release
+// bitmaps and transport state to the source pause path.
+func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSnapshot, error) {
 	if len(regions) == 0 {
-		return nil, errors.New("remote snapshot requires at least one region")
+		return nil, errors.New("remote snapshots require at least one region")
 	}
-	s := &RemoteSnapshot{
-		regionByID: make(map[RemoteRegionID]int, len(regions)),
-		regions:    make([]remoteSnapshotRegion, len(regions)),
-		closeDone:  make(chan struct{}),
-		pushHints:  make(chan RemotePushHint, 1024),
+	if count <= 0 {
+		return nil, fmt.Errorf("remote snapshot count must be positive, got %d", count)
 	}
+	var streamBytes, pagesTotal uint64
+	regionByID := make(map[RemoteRegionID]int, len(regions))
 	ownerSet := make(map[*MemoryFile]struct{})
 	for i, region := range regions {
 		if region.File == nil {
@@ -151,45 +176,69 @@ func NewRemoteSnapshot(regions []RemoteSnapshotRegion) (*RemoteSnapshot, error) 
 			!hostarch.IsPageAligned(region.Range.Start) || !hostarch.IsPageAligned(region.Range.End) {
 			return nil, fmt.Errorf("region %d has invalid range %v", region.ID, region.Range)
 		}
-		if _, ok := s.regionByID[region.ID]; ok {
+		if _, ok := regionByID[region.ID]; ok {
 			return nil, fmt.Errorf("duplicate remote region ID %d", region.ID)
 		}
-		if s.streamBytes > ^uint64(0)-region.Range.Length() {
+		if streamBytes > ^uint64(0)-region.Range.Length() {
 			return nil, errors.New("remote snapshot stream size overflows uint64")
 		}
-		pages := region.Range.Length() / hostarch.PageSize
-		s.regionByID[region.ID] = i
-		s.regions[i] = remoteSnapshotRegion{
-			RemoteSnapshotRegion: region,
-			streamStart:          s.streamBytes,
-			released:             make([]uint64, (pages+63)/64),
-		}
-		s.streamBytes += region.Range.Length()
-		s.pagesTotal += pages
+		regionByID[region.ID] = i
+		streamBytes += region.Range.Length()
+		pagesTotal += region.Range.Length() / hostarch.PageSize
 		ownerSet[region.File] = struct{}{}
 	}
-	for i := range s.regions {
+	for i := range regions {
 		for j := 0; j < i; j++ {
-			left, right := &s.regions[i], &s.regions[j]
+			left, right := &regions[i], &regions[j]
 			if left.File == right.File && left.Range.Start < right.Range.End && right.Range.Start < left.Range.End {
 				return nil, fmt.Errorf("remote regions %d and %d overlap in one MemoryFile: %v and %v", left.ID, right.ID, left.Range, right.Range)
 			}
 		}
 	}
+	shared := &remoteSnapshotShared{views: make(map[*RemoteSnapshot]struct{}, count)}
+	mu := &sync.Mutex{}
+	snapshots := make([]*RemoteSnapshot, count)
+	for snapshotIndex := range snapshots {
+		s := &RemoteSnapshot{
+			mu:          mu,
+			regionByID:  regionByID,
+			regions:     make([]remoteSnapshotRegion, len(regions)),
+			streamBytes: streamBytes,
+			closeDone:   make(chan struct{}),
+			pagesTotal:  pagesTotal,
+			pushHints:   make(chan RemotePushHint, 1024),
+			shared:      shared,
+		}
+		var streamStart uint64
+		for i, region := range regions {
+			pages := region.Range.Length() / hostarch.PageSize
+			s.regions[i] = remoteSnapshotRegion{
+				RemoteSnapshotRegion: region,
+				streamStart:          streamStart,
+				released:             make([]uint64, (pages+63)/64),
+			}
+			streamStart += region.Range.Length()
+		}
+		snapshots[snapshotIndex] = s
+		shared.views[s] = struct{}{}
+	}
 
 	// Keep allocator mappings alive independently from the source Kernel.
 	for file := range ownerSet {
 		file.IncOwner()
-		s.owners = append(s.owners, file)
+		shared.owners = append(shared.owners, file)
 	}
-	for i := range s.regions {
-		region := &s.regions[i]
+	for i := range regions {
+		region := &regions[i]
 		region.File.IncRef(region.Range, region.MemCgID)
 	}
-	for _, file := range s.owners {
-		file.registerRemoteSnapshot(s)
+	for _, s := range snapshots {
+		s.owners = shared.owners
+		for _, file := range shared.owners {
+			file.registerRemoteSnapshot(s)
+		}
 	}
-	return s, nil
+	return snapshots, nil
 }
 
 // ExportMemoryFileMetadataForRemote captures allocator metadata and the packed
@@ -456,6 +505,7 @@ func (l *RemotePageLease) Close() error {
 		l.snapshot.activeLeases--
 		l.snapshot.mu.Unlock()
 		l.snapshot.active.Done()
+		l.snapshot.shared.active.Done()
 	})
 	return nil
 }
@@ -484,6 +534,7 @@ func (s *RemoteSnapshot) AcquireRegion(id RemoteRegionID, relative memmap.FileRa
 	abs := memmap.FileRange{Start: region.Range.Start + relative.Start, End: region.Range.Start + relative.End}
 	region.File.IncRef(abs, region.MemCgID)
 	s.active.Add(1)
+	s.shared.active.Add(1)
 	s.activeLeases++
 	return &RemotePageLease{snapshot: s, file: region.File, range_: abs}, nil
 }
@@ -508,15 +559,63 @@ func (s *RemoteSnapshot) ReleaseRegion(id RemoteRegionID, relative memmap.FileRa
 	for _, fr := range released {
 		s.pagesReleased += fr.Length() / hostarch.PageSize
 	}
+	pending := s.sharedReleasesLocked(index, released)
 	s.mu.Unlock()
 
-	for _, relativeFR := range released {
-		region.File.DecRef(memmap.FileRange{
-			Start: region.Range.Start + relativeFR.Start,
-			End:   region.Range.Start + relativeFR.End,
-		})
+	for _, release := range pending {
+		release.file.DecRef(release.range_)
 	}
 	return nil
+}
+
+type remoteSnapshotRelease struct {
+	file   *MemoryFile
+	range_ memmap.FileRange
+}
+
+// sharedReleasesLocked returns source ranges for which this update satisfied
+// the last sibling. All sibling release bitmaps are protected by their common
+// mutex, so no per-page destination counter is needed.
+func (s *RemoteSnapshot) sharedReleasesLocked(regionIndex int, newlyReleased []memmap.FileRange) []remoteSnapshotRelease {
+	region := &s.regions[regionIndex]
+	var releases []remoteSnapshotRelease
+	for _, relative := range newlyReleased {
+		start := relative.Start / hostarch.PageSize
+		end := relative.End / hostarch.PageSize
+		runStart := ^uint64(0)
+		for page := start; page < end; page++ {
+			allReleased := true
+			for view := range s.shared.views {
+				other := &view.regions[regionIndex]
+				if other.released[page/64]&(uint64(1)<<(page%64)) == 0 {
+					allReleased = false
+					break
+				}
+			}
+			if allReleased {
+				if runStart == ^uint64(0) {
+					runStart = page
+				}
+				continue
+			}
+			if runStart != ^uint64(0) {
+				releases = append(releases, remoteSnapshotRelease{
+					file: region.File,
+					range_: memmap.FileRange{Start: region.Range.Start + runStart*hostarch.PageSize,
+						End: region.Range.Start + page*hostarch.PageSize},
+				})
+				runStart = ^uint64(0)
+			}
+		}
+		if runStart != ^uint64(0) {
+			releases = append(releases, remoteSnapshotRelease{
+				file: region.File,
+				range_: memmap.FileRange{Start: region.Range.Start + runStart*hostarch.PageSize,
+					End: region.Range.Start + end*hostarch.PageSize},
+			})
+		}
+	}
+	return releases
 }
 
 // Close cancels all pages not yet acknowledged and releases snapshot
@@ -531,25 +630,18 @@ func (s *RemoteSnapshot) Close() error {
 	}
 	s.closed = true
 	close(s.pushHints)
-	type pendingRelease struct {
-		file   *MemoryFile
-		range_ memmap.FileRange
-	}
-	var pending []pendingRelease
+	var pending []remoteSnapshotRelease
 	for i := range s.regions {
 		region := &s.regions[i]
 		all := memmap.FileRange{0, region.Range.Length()}
-		for _, relativeFR := range region.markReleased(all) {
+		newlyReleased := region.markReleased(all)
+		for _, relativeFR := range newlyReleased {
 			s.pagesReleased += relativeFR.Length() / hostarch.PageSize
-			pending = append(pending, pendingRelease{
-				file: region.File,
-				range_: memmap.FileRange{
-					Start: region.Range.Start + relativeFR.Start,
-					End:   region.Range.Start + relativeFR.End,
-				},
-			})
 		}
+		pending = append(pending, s.sharedReleasesLocked(i, newlyReleased)...)
 	}
+	delete(s.shared.views, s)
+	lastView := len(s.shared.views) == 0
 	s.mu.Unlock()
 	for _, file := range s.owners {
 		file.unregisterRemoteSnapshot(s)
@@ -559,8 +651,11 @@ func (s *RemoteSnapshot) Close() error {
 		release.file.DecRef(release.range_)
 	}
 	s.active.Wait()
-	for _, file := range s.owners {
-		file.Destroy()
+	if lastView {
+		s.shared.active.Wait()
+		for _, file := range s.owners {
+			file.Destroy()
+		}
 	}
 	close(s.closeDone)
 	return nil
