@@ -306,6 +306,20 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		peerStatus, statusErr := peer.Status(ctx, transactionID)
+		cancel()
+		if statusErr == nil {
+			revision = peerStatus.Revision
+			switch peerStatus.State {
+			case cluster.TransactionIndependent:
+				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+				return
+			case cluster.TransactionCanceled, cluster.TransactionFailed:
+				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				return
+			}
+		}
 		output, err := b.command("timetravel", sourceContainer, "distributed-status", transactionID)
 		if err != nil {
 			return
@@ -317,7 +331,7 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 		if status.Snapshot.PagesOutstanding != 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 		tx, err := peer.MarkIndependent(ctx, transactionID, revision)
 		if err != nil {
 			if current, statusErr := peer.Status(ctx, transactionID); statusErr == nil && current.State == cluster.TransactionIndependent {
@@ -331,5 +345,41 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 		}
 		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 		return
+	}
+}
+
+func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *runtimeBackend, runtime *daemonClusterRuntime) {
+	if targetRuntime == nil || backend == nil || runtime == nil || runtime.controlPlane == nil || runtime.controlPlane.Store == nil {
+		return
+	}
+	transactions, err := runtime.controlPlane.Store.List()
+	if err != nil {
+		return
+	}
+	localNode := runtime.controlPlane.Capabilities.NodeID
+	for i := range transactions {
+		tx := transactions[i]
+		if tx.Terminal() {
+			continue
+		}
+		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
+			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
+				targetRuntime.monitorDependency(tx.Identity.TransactionID, info.ID)
+			}
+		}
+		if tx.Identity.SourceNodeID != localNode || !tx.SourceNeeded ||
+			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+			continue
+		}
+		peer := runtime.source.peers[tx.Identity.TargetNodeID]
+		if peer == nil {
+			continue
+		}
+		monitorBackend := *backend
+		monitorBackend.stdin = strings.NewReader("")
+		monitorBackend.stdout = io.Discard
+		monitorBackend.stderr = io.Discard
+		go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
+			tx.Identity.TransactionID, tx.Revision, nil)
 	}
 }

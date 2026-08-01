@@ -314,6 +314,9 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	if stats := snapshot.Stats(); stats.PagesOutstanding != 8 {
 		t.Fatalf("demand-only loader fetched untouched pages: %+v", stats)
 	}
+	if stats := pages.Stats(); stats.Done || !stats.DemandOnly || stats.BytesOutstanding != sourceFR.Length() || stats.BytesLoaded != 0 {
+		t.Fatalf("initial demand-only loader stats: %+v", stats)
+	}
 
 	page := uint64(3)
 	pageFR := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
@@ -331,6 +334,9 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	if stats := snapshot.Stats(); stats.PagesOutstanding != 7 || stats.PagesReleased != 1 {
 		t.Fatalf("demand load did not release exactly one page: %+v", stats)
 	}
+	if stats := pages.Stats(); stats.Done || stats.BytesOutstanding != sourceFR.Length()-hostarch.PageSize || stats.BytesLoaded != hostarch.PageSize {
+		t.Fatalf("post-demand loader stats: %+v", stats)
+	}
 
 	pages.Drain()
 	if err := pages.Wait(); err != nil {
@@ -338,6 +344,9 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 	if stats := snapshot.Stats(); !stats.Closed || stats.PagesOutstanding != 0 {
 		t.Fatalf("drained snapshot: %+v", stats)
+	}
+	if stats := pages.Stats(); !stats.Done || stats.BytesOutstanding != 0 || stats.BytesLoaded != sourceFR.Length() || stats.Error != "" {
+		t.Fatalf("drained loader stats: %+v", stats)
 	}
 	if !source.HasUniqueRef(sourceFR) {
 		t.Fatal("drain did not release all source references")

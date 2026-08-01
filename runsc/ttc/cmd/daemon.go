@@ -40,6 +40,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -100,6 +101,7 @@ type daemonServer struct {
 	clusterCapabilities   *cluster.Capabilities
 	clusterListen         string
 	distributedSource     *distributedSourceRuntime
+	clusterStore          *cluster.Store
 
 	stopOnce sync.Once
 
@@ -143,6 +145,9 @@ type daemonClusterRuntime struct {
 type daemonTargetRuntime struct {
 	backend *runtimeBackend
 	nodeID  string
+	store   *cluster.Store
+	done    <-chan struct{}
+	watch   sync.Map
 }
 
 func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction) error {
@@ -306,7 +311,17 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: defaultBranchID}, true); err != nil {
 		return fmt.Errorf("starting distributed target console drain: %w", err)
 	}
+	r.monitorDependency(tx.Identity.TransactionID, info.ID)
 	return nil
+}
+
+func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) error {
+	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	_, err = r.backend.command("timetravel", info.ID, "distributed-drain", defaultBranchID)
+	return err
 }
 
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
@@ -318,6 +333,63 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 }
 
 func (*daemonTargetRuntime) MarkIndependent(context.Context, *cluster.Transaction) error { return nil }
+
+func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID string) {
+	if r == nil || r.store == nil || transactionID == "" || containerID == "" {
+		return
+	}
+	if _, loaded := r.watch.LoadOrStore(transactionID, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer r.watch.Delete(transactionID)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		failedPolls := 0
+		for {
+			select {
+			case <-r.done:
+				return
+			case <-ticker.C:
+			}
+			tx, err := r.store.Load(transactionID)
+			if err != nil || tx.Terminal() {
+				return
+			}
+			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining {
+				continue
+			}
+			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", defaultBranchID)
+			if statusErr != nil {
+				failedPolls++
+				if failedPolls < 3 {
+					continue
+				}
+				if _, stateErr := r.backend.command("state", containerID); stateErr == nil {
+					continue
+				}
+				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
+					"dependent target exited before remote memory drain completed", time.Now())
+				return
+			}
+			failedPolls = 0
+			var status pgalloc.AsyncPagesFileLoadStats
+			if err := json.Unmarshal(output, &status); err != nil {
+				continue
+			}
+			if !status.Done {
+				continue
+			}
+			if status.Error != "" {
+				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
+					"remote memory loader failed: "+status.Error, time.Now())
+				return
+			}
+			_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+			return
+		}
+	}()
+}
 
 type daemonFrameWriter struct {
 	conn net.Conn
@@ -523,6 +595,66 @@ func stopDaemonContainers(backend backend) error {
 		}
 	}
 	return errors.Join(stopErrors...)
+}
+
+func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID string) error {
+	if backend == nil || source == nil || store == nil || nodeID == "" {
+		return nil
+	}
+	transactions, err := store.List()
+	if err != nil {
+		return fmt.Errorf("listing distributed dependencies: %w", err)
+	}
+	for i := range transactions {
+		tx := transactions[i]
+		if tx.Identity.SourceNodeID != nodeID || !tx.SourceNeeded ||
+			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+			continue
+		}
+		peer := source.peers[tx.Identity.TargetNodeID]
+		if peer == nil {
+			return fmt.Errorf("distributed target node %q for transaction %q is not configured", tx.Identity.TargetNodeID, tx.Identity.TransactionID)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		if tx.State == cluster.TransactionPublished {
+			draining, err := peer.Drain(ctx, tx.Identity.TransactionID, tx.Revision)
+			if err != nil {
+				if current, statusErr := peer.Status(ctx, tx.Identity.TransactionID); statusErr != nil ||
+					(current.State != cluster.TransactionDraining && current.State != cluster.TransactionIndependent) {
+					cancel()
+					return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, err)
+				} else {
+					tx = *current
+				}
+			} else {
+				tx = *draining
+			}
+		}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		for tx.State != cluster.TransactionIndependent {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				cancel()
+				return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, ctx.Err())
+			case <-ticker.C:
+			}
+			current, err := peer.Status(ctx, tx.Identity.TransactionID)
+			if err != nil {
+				continue
+			}
+			tx = *current
+			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+				ticker.Stop()
+				cancel()
+				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+			}
+		}
+		ticker.Stop()
+		cancel()
+		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+	}
+	return nil
 }
 
 func wireOptions(opts options) daemonWireOptions {
@@ -1012,6 +1144,8 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	clusterDone := make(chan struct{})
+	defer close(clusterDone)
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
@@ -1023,15 +1157,18 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 		server.configureVolumeBackend(targetBackend)
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
-		clusterRuntime.controlPlane.TargetRuntime = &daemonTargetRuntime{
+		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
+			store: clusterRuntime.controlPlane.Store, done: clusterDone,
 		}
+		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterListener, err := net.Listen("tcp", clusterRuntime.listen)
 		if err != nil {
 			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)
 		}
 		clusterRuntime.listen = clusterListener.Addr().String()
 		server.clusterCapabilities = &clusterRuntime.controlPlane.Capabilities
+		server.clusterStore = clusterRuntime.controlPlane.Store
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
 		clusterServer = &http.Server{
@@ -1048,6 +1185,7 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 			listener.Close()
 		}()
 		defer clusterServer.Close()
+		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "ttcd listening on %s (API v%d, isolation=%s, volume-copy=%s)\n", socket, daemonAPIVersion, daemonIsolationMode(unsafeNoHostIsolation), volumeCapability.Mode)
@@ -1164,7 +1302,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				backend.nodeID = s.clusterCapabilities.NodeID
 			}
 			unlock := s.lockDataRoot(opts.dataRoot)
-			err := stopDaemonContainers(backend)
+			var err error
+			if s.clusterCapabilities != nil {
+				err = drainSourceDependencies(backend, s.distributedSource, s.clusterStore, s.clusterCapabilities.NodeID)
+			}
+			if err == nil {
+				err = stopDaemonContainers(backend)
+			}
 			unlock()
 			if err != nil {
 				writeError(fmt.Errorf("stopping managed containers: %w", err))

@@ -51,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
@@ -2159,6 +2160,24 @@ func (s *Sandbox) CaptureDistributedFork(args *boot.DistributedForkCaptureArgs) 
 func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServeArgs) error {
 	if err := s.call(boot.ContMgrServeDistributedForkConnection, args, nil); err != nil {
 		return fmt.Errorf("serving distributed fork session %q: %w", args.SessionID, err)
+	}
+	return nil
+}
+
+// DistributedForkDependencyStatus reports target-side remote-memory progress.
+func (s *Sandbox) DistributedForkDependencyStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	var status pgalloc.AsyncPagesFileLoadStats
+	err := s.call(boot.ContMgrDistributedForkDependencyStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID}, &status)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("reading distributed fork dependency for branch %q: %w", branchID, err)
+	}
+	return status, nil
+}
+
+// DrainDistributedForkMemory eagerly loads all remote pages for one branch.
+func (s *Sandbox) DrainDistributedForkMemory(branchID string) error {
+	if err := s.call(boot.ContMgrDrainDistributedForkMemory, &boot.DistributedForkDependencyArgs{BranchID: branchID}, nil); err != nil {
+		return fmt.Errorf("draining distributed fork memory for branch %q: %w", branchID, err)
 	}
 	return nil
 }

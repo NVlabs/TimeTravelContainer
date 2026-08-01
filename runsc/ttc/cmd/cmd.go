@@ -51,6 +51,7 @@ import (
 
 	"gvisor.dev/gvisor/runsc/flag"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 	"gvisor.dev/gvisor/runsc/version"
@@ -2608,11 +2609,12 @@ type InspectBranch struct {
 
 // TTCInspectInfo contains state with no direct Docker analogue.
 type TTCInspectInfo struct {
-	Container     ttcbundle.ContainerInfo `json:"container"`
-	Runtime       *Family                 `json:"runtime,omitempty"`
-	Branches      []InspectBranch         `json:"branches"`
-	ExternalViews []InspectExternalView   `json:"external_views,omitempty"`
-	RuntimeError  string                  `json:"runtime_error,omitempty"`
+	Container       ttcbundle.ContainerInfo `json:"container"`
+	Runtime         *Family                 `json:"runtime,omitempty"`
+	Branches        []InspectBranch         `json:"branches"`
+	ExternalViews   []InspectExternalView   `json:"external_views,omitempty"`
+	DistributedFork *cluster.Transaction    `json:"distributed_fork,omitempty"`
+	RuntimeError    string                  `json:"runtime_error,omitempty"`
 }
 
 // InspectInfo combines a Docker-compatible main-container view with TTC lineage.
@@ -6772,6 +6774,13 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		}
 	}
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
+	if transactionID := containerInfo.DistributedForkTransactionID; transactionID != "" {
+		if store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions")); err == nil {
+			if transaction, err := store.Load(transactionID); err == nil {
+				result.TTC.DistributedFork = transaction
+			}
+		}
+	}
 	for i := range result.TTC.Branches {
 		branch := &result.TTC.Branches[i]
 		paths, retentionErr := store.BranchConsolePaths(containerInfo.ID, branch.Metadata.ID)

@@ -305,3 +305,19 @@ func (k *Kernel) SetDistributedForkPrefetchWindow(behind, ahead uint64) error {
 	}
 	return k.remotePageLoad.SetPrefetchWindow(behind, ahead)
 }
+
+// DistributedForkDependencyStatus reports whether this Kernel still depends
+// on a remote memory source.
+func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {
+	if k.remotePageLoad == nil {
+		return pgalloc.AsyncPagesFileLoadStats{Done: true}
+	}
+	return k.remotePageLoad.Stats()
+}
+
+// DrainDistributedForkMemory eagerly materializes all remaining remote pages.
+func (k *Kernel) DrainDistributedForkMemory() {
+	if k.remotePageLoad != nil {
+		k.remotePageLoad.Drain()
+	}
+}

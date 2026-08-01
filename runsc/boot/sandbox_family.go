@@ -145,6 +145,11 @@ type DistributedForkSessionStatus struct {
 	Snapshot  pgalloc.RemoteSnapshotStats
 }
 
+// DistributedForkDependencyArgs selects a target branch's remote loader.
+type DistributedForkDependencyArgs struct {
+	BranchID string
+}
+
 // BranchArgs selects an existing branch. An empty ID selects the default.
 type BranchArgs struct {
 	ID string
@@ -675,6 +680,27 @@ func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 		return nil
 	}
 	return session.server.Close()
+}
+
+// DistributedForkDependencyStatus reports target-side remote-memory progress.
+func (f *SandboxFamily) DistributedForkDependencyStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, err
+	}
+	defer release()
+	return b.k.DistributedForkDependencyStatus(), nil
+}
+
+// DrainDistributedForkMemory eagerly materializes a target branch's pages.
+func (f *SandboxFamily) DrainDistributedForkMemory(branchID string) error {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	b.k.DrainDistributedForkMemory()
+	return nil
 }
 
 // CloseDistributedForkSessions releases all remote dependencies during Sentry

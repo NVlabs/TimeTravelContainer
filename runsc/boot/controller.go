@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -109,6 +110,12 @@ const (
 
 	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
 	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
+
+	// ContMgrDistributedForkDependencyStatus reports target loader progress.
+	ContMgrDistributedForkDependencyStatus = "containerManager.DistributedForkDependencyStatus"
+
+	// ContMgrDrainDistributedForkMemory makes a target source-independent.
+	ContMgrDrainDistributedForkMemory = "containerManager.DrainDistributedForkMemory"
 
 	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
 	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
@@ -1056,6 +1063,21 @@ func (cm *containerManager) CaptureDistributedFork(args *DistributedForkCaptureA
 // ServeDistributedForkConnection handles one stream donated by ttcd.
 func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
 	return cm.l.family.ServeDistributedForkConnection(args)
+}
+
+// DistributedForkDependencyStatus reports target-side remote-memory progress.
+func (cm *containerManager) DistributedForkDependencyStatus(args *DistributedForkDependencyArgs, out *pgalloc.AsyncPagesFileLoadStats) error {
+	status, err := cm.l.family.DistributedForkDependencyStatus(args.BranchID)
+	if err != nil {
+		return err
+	}
+	*out = status
+	return nil
+}
+
+// DrainDistributedForkMemory eagerly loads all remote pages for one branch.
+func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDependencyArgs, _ *struct{}) error {
+	return cm.l.family.DrainDistributedForkMemory(args.BranchID)
 }
 
 // DistributedForkSessionStatus returns token-free transfer progress.

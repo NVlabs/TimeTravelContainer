@@ -1354,6 +1354,47 @@ type AsyncPagesFileLoadOpts struct {
 	PrefetchBehindBytes uint64
 }
 
+// AsyncPagesFileLoadStats is a point-in-time view of a remote or checkpoint
+// page loader. It contains no transport credentials or process-local state.
+type AsyncPagesFileLoadStats struct {
+	Done             bool   `json:"done"`
+	DemandOnly       bool   `json:"demand_only"`
+	BytesLoaded      uint64 `json:"bytes_loaded"`
+	BytesOutstanding uint64 `json:"bytes_outstanding"`
+	Waiters          int    `json:"waiters"`
+	TotalWaiters     int    `json:"total_waiters"`
+	Error            string `json:"error,omitempty"`
+}
+
+// Stats returns loader progress without waiting for outstanding I/O.
+func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
+	if apfl == nil {
+		return AsyncPagesFileLoadStats{Done: true}
+	}
+	stats := AsyncPagesFileLoadStats{DemandOnly: apfl.demandOnly.Load()}
+	select {
+	case <-apfl.done:
+		stats.Done = true
+	default:
+	}
+	apfl.amflsMu.Lock()
+	apfl.mu.Lock()
+	stats.BytesLoaded = apfl.bytesLoaded
+	stats.Waiters = apfl.numWaiters
+	stats.TotalWaiters = apfl.totalWaiters
+	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+		for seg := amfl.unloaded.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			stats.BytesOutstanding += seg.Range().Length()
+		}
+	}
+	apfl.mu.Unlock()
+	apfl.amflsMu.Unlock()
+	if err := apfl.err(); err != nil {
+		stats.Error = err.Error()
+	}
+	return stats
+}
+
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
 // file ar. It takes ownership of ar, even if it returns a non-nil error.
 func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), timeline *timing.Timeline) (*AsyncPagesFileLoad, error) {

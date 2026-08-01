@@ -98,6 +98,8 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
+		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
@@ -292,6 +294,10 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		connection.Close()
 	case "distributed-status":
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
+	case "distributed-dependency":
+		output, err = cont.Sandbox.DistributedForkDependencyStatus(f.Arg(2))
+	case "distributed-drain":
+		err = cont.Sandbox.DrainDistributedForkMemory(f.Arg(2))
 	case "distributed-cancel":
 		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
 	case "distributed-complete":

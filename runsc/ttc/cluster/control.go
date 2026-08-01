@@ -168,6 +168,7 @@ type TargetRuntime interface {
 	Reserve(context.Context, *Transaction) error
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
 	Publish(context.Context, *Transaction, bool) error
+	Drain(context.Context, *Transaction) error
 	Cancel(context.Context, *Transaction) error
 	MarkIndependent(context.Context, *Transaction) error
 }
@@ -231,6 +232,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "independent" && r.Method == http.MethodPost {
 		c.independent(w, r, id, peer)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "drain" && r.Method == http.MethodPost {
+		c.drain(w, r, id, peer)
 		return
 	}
 	writeControlError(w, http.StatusNotFound, "unknown cluster endpoint")
@@ -445,6 +450,14 @@ func (c *ControlPlane) independent(w http.ResponseWriter, r *http.Request, id, p
 	c.advanceRuntime(w, r, id, peer, TransactionPublished, TransactionIndependent, operation)
 }
 
+func (c *ControlPlane) drain(w http.ResponseWriter, r *http.Request, id, peer string) {
+	var operation func(context.Context, *Transaction) error
+	if c.TargetRuntime != nil {
+		operation = c.TargetRuntime.Drain
+	}
+	c.advanceRuntime(w, r, id, peer, TransactionPublished, TransactionDraining, operation)
+}
+
 func (c *ControlPlane) advanceRuntime(w http.ResponseWriter, r *http.Request, id, peer string, required, next TransactionState, operation func(context.Context, *Transaction) error) {
 	c.operationMu.Lock()
 	defer c.operationMu.Unlock()
@@ -470,7 +483,8 @@ func (c *ControlPlane) advanceRuntime(w http.ResponseWriter, r *http.Request, id
 		writeControlJSON(w, http.StatusOK, tx)
 		return
 	}
-	if tx.State != required || tx.Revision != request.Revision {
+	stateMatches := tx.State == required || (next == TransactionIndependent && tx.State == TransactionDraining)
+	if !stateMatches || tx.Revision != request.Revision {
 		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, required, request.Revision))
 		return
 	}
@@ -653,6 +667,11 @@ func (c *Client) Publish(ctx context.Context, id string, revision uint64, paused
 // be stopped without affecting the target.
 func (c *Client) MarkIndependent(ctx context.Context, id string, revision uint64) (*Transaction, error) {
 	return c.advance(ctx, id, "independent", revision)
+}
+
+// Drain requests eager target materialization so the source may stop safely.
+func (c *Client) Drain(ctx context.Context, id string, revision uint64) (*Transaction, error) {
+	return c.advance(ctx, id, "drain", revision)
 }
 
 func (c *Client) advance(ctx context.Context, id, operation string, revision uint64) (*Transaction, error) {

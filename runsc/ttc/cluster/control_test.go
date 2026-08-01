@@ -36,6 +36,7 @@ type testTargetRuntime struct {
 	mu          sync.Mutex
 	prepared    int
 	published   int
+	drained     int
 	canceled    int
 	independent int
 }
@@ -53,6 +54,13 @@ func (r *testTargetRuntime) Publish(context.Context, *Transaction, bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.published++
+	return nil
+}
+
+func (r *testTargetRuntime) Drain(context.Context, *Transaction) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drained++
 	return nil
 }
 
@@ -249,13 +257,17 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil || published.State != TransactionPublished {
 		t.Fatalf("publish=%+v err=%v", published, err)
 	}
-	independent, err := client.MarkIndependent(context.Background(), tx.Identity.TransactionID, published.Revision)
+	draining, err := client.Drain(context.Background(), tx.Identity.TransactionID, published.Revision)
+	if err != nil || draining.State != TransactionDraining || !draining.SourceNeeded {
+		t.Fatalf("draining=%+v err=%v", draining, err)
+	}
+	independent, err := client.MarkIndependent(context.Background(), tx.Identity.TransactionID, draining.Revision)
 	if err != nil || independent.State != TransactionIndependent || independent.SourceNeeded {
 		t.Fatalf("independent=%+v err=%v", independent, err)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.prepared != 1 || runtime.published != 1 || runtime.independent != 1 {
+	if runtime.prepared != 1 || runtime.published != 1 || runtime.drained != 1 || runtime.independent != 1 {
 		t.Fatalf("runtime calls: %+v", runtime)
 	}
 }
