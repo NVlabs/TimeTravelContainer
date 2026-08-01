@@ -40,6 +40,8 @@ type testTargetRuntime struct {
 	independent int
 }
 
+func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error { return nil }
+
 func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

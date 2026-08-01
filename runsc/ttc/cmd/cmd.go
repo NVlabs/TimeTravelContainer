@@ -7430,8 +7430,13 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {
+	return b.commandWithFiles(nil, args...)
+}
+
+func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]byte, error) {
 	global := []string{"--root", b.root}
 	command := runscCommand(b.runsc, append(global, args...)...)
+	command.ExtraFiles = files
 	var stderr strings.Builder
 	command.Stderr = &stderr
 	output, err := command.Output()

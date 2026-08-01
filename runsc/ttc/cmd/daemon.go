@@ -17,8 +17,10 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +40,10 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/boot"
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -129,6 +134,109 @@ type daemonClusterRuntime struct {
 	tlsConfig    *tls.Config
 	controlPlane *cluster.ControlPlane
 }
+
+type daemonTargetRuntime struct {
+	backend *runtimeBackend
+	nodeID  string
+}
+
+func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction) error {
+	if r == nil || r.backend == nil || tx == nil {
+		return errors.New("distributed target runtime is unavailable")
+	}
+	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
+		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
+		TargetBranch: tx.Identity.TargetBranch, TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
+	})
+	return err
+}
+
+func (r *daemonTargetRuntime) Prepare(_ context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
+	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	tokenBytes, err := hex.DecodeString(session.SnapshotToken)
+	if err != nil || len(tokenBytes) != 16 {
+		return errors.New("invalid distributed snapshot token")
+	}
+	var token ttcremote.SnapshotToken
+	copy(token[:], tokenBytes)
+	restoreArgs := boot.DistributedForkRestoreArgs{
+		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
+		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
+		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
+		MaxParallel: 16, Timeout: 30 * time.Second, RetryLimit: 3, PrefetchBytes: 64 << 10,
+	}
+	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	var runtimeState struct {
+		Status string `json:"status"`
+	}
+	stateOutput, stateErr := r.backend.command("state", info.ID)
+	if stateErr == nil {
+		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
+			return fmt.Errorf("decoding target runtime state: %w", err)
+		}
+	} else {
+		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", info.BundleDir, info.ID)
+		if err != nil {
+			return fmt.Errorf("creating distributed target runtime: %w", err)
+		}
+		if status != 0 {
+			return fmt.Errorf("creating distributed target runtime exited with status %d", status)
+		}
+		runtimeState.Status = "created"
+	}
+	if runtimeState.Status == "created" {
+		encoded, err := json.Marshal(&restoreArgs)
+		if err != nil {
+			return err
+		}
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(encoded); err != nil {
+			reader.Close()
+			writer.Close()
+			return err
+		}
+		if err := writer.Close(); err != nil {
+			reader.Close()
+			return err
+		}
+		_, err = r.backend.commandWithFiles([]*os.File{reader}, "timetravel", "--distributed-config-fd=3", info.ID, "distributed-restore", tx.Identity.TransactionID)
+		reader.Close()
+		if err != nil {
+			return err
+		}
+		status, err := r.backend.runConfiguredCommandWithArgs(configured, "start", info.ID)
+		if err != nil {
+			return fmt.Errorf("starting paused distributed target: %w", err)
+		}
+		if status != 0 {
+			return fmt.Errorf("starting paused distributed target exited with status %d", status)
+		}
+	} else if runtimeState.Status != "running" {
+		return fmt.Errorf("distributed target runtime is unexpectedly %q", runtimeState.Status)
+	}
+	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "paused")
+}
+
+func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction) error {
+	_, err := r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+	return err
+}
+
+func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
+	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	if err == nil {
+		_, _ = r.backend.command("delete", "--force", info.ID)
+	}
+	return r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TransactionID)
+}
+
+func (*daemonTargetRuntime) MarkIndependent(context.Context, *cluster.Transaction) error { return nil }
 
 type daemonFrameWriter struct {
 	conn net.Conn
@@ -764,6 +872,16 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
+		targetBackend := directBackend(options{
+			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot,
+			unsafeNoHostIsolation: server.unsafeNoHostIsolation,
+			disableHostGSO:        server.disableHostGSO,
+		}, strings.NewReader(""), io.Discard, io.Discard)
+		server.configureVolumeBackend(targetBackend)
+		targetBackend.consoleSidecars = server
+		clusterRuntime.controlPlane.TargetRuntime = &daemonTargetRuntime{
+			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
+		}
 		clusterListener, err := net.Listen("tcp", clusterRuntime.listen)
 		if err != nil {
 			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)

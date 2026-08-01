@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -123,6 +124,8 @@ type DistributedForkOptions struct {
 	SourceContainer string
 	TargetName      string
 	TargetBranch    string
+	TransactionID   string
+	NodeID          string
 }
 
 // BranchInfo is immutable branch lineage plus its last known lifecycle state.
@@ -157,54 +160,57 @@ func (p PortBinding) Branch() string {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	ID                  string            `json:"id"`
-	Name                string            `json:"name"`
-	Reference           string            `json:"reference"`
-	Digest              string            `json:"digest"`
-	ImageSize           int64             `json:"image_size,omitempty"`
-	LeaseID             string            `json:"lease_id,omitempty"`
-	Platform            string            `json:"platform"`
-	BundleDir           string            `json:"bundle_dir"`
-	RootFS              string            `json:"rootfs"`
-	Branches            []BranchInfo      `json:"branches,omitempty"`
-	NetworkMode         string            `json:"network_mode,omitempty"`
-	NetworkNAT          bool              `json:"network_nat,omitempty"`
-	NetworkIP           string            `json:"network_ip,omitempty"`
-	NetworkMAC          string            `json:"network_mac,omitempty"`
-	PublishedPorts      []PortBinding     `json:"published_ports,omitempty"`
-	LogDriver           string            `json:"log_driver,omitempty"`
-	LogOptions          map[string]string `json:"log_options,omitempty"`
-	LogAttributes       map[string]string `json:"log_attributes,omitempty"`
-	ConsoleLogMaxBytes  int64             `json:"console_log_max_bytes,omitempty"`
-	ConsoleLogMaxFiles  int               `json:"console_log_max_files,omitempty"`
-	Terminal            bool              `json:"terminal,omitempty"`
-	OpenStdin           bool              `json:"open_stdin,omitempty"`
-	AutoRemove          bool              `json:"auto_remove,omitempty"`
-	StopSignal          string            `json:"stop_signal,omitempty"`
-	StopTimeout         *int              `json:"stop_timeout,omitempty"`
-	PidsLimit           *int64            `json:"pids_limit,omitempty"`
-	MemoryLimit         *int64            `json:"memory_limit,omitempty"`
-	NanoCPUs            *int64            `json:"nano_cpus,omitempty"`
-	CPUShares           *uint64           `json:"cpu_shares,omitempty"`
-	CPUPeriod           *uint64           `json:"cpu_period,omitempty"`
-	CPUQuota            *int64            `json:"cpu_quota,omitempty"`
-	ShmSize             *int64            `json:"shm_size,omitempty"`
-	GroupAdd            []string          `json:"group_add,omitempty"`
-	CapAdd              []string          `json:"cap_add,omitempty"`
-	CapDrop             []string          `json:"cap_drop,omitempty"`
-	Ulimits             []Ulimit          `json:"ulimits,omitempty"`
-	ExtraHosts          []string          `json:"extra_hosts,omitempty"`
-	DNS                 []string          `json:"dns,omitempty"`
-	DNSSearch           []string          `json:"dns_search,omitempty"`
-	DNSOptions          []string          `json:"dns_options,omitempty"`
-	Volumes             []ManagedVolume   `json:"volumes,omitempty"`
-	RootfsUpperID       string            `json:"rootfs_upper_id,omitempty"`
-	RootfsUpperCopyMode string            `json:"rootfs_upper_copy_mode,omitempty"`
-	State               string            `json:"state"`
-	ExitStatus          *int              `json:"exit_status,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	StartedAt           *time.Time        `json:"started_at,omitempty"`
-	ExitedAt            *time.Time        `json:"exited_at,omitempty"`
+	ID                           string            `json:"id"`
+	Name                         string            `json:"name"`
+	Reference                    string            `json:"reference"`
+	Digest                       string            `json:"digest"`
+	ImageSize                    int64             `json:"image_size,omitempty"`
+	LeaseID                      string            `json:"lease_id,omitempty"`
+	Platform                     string            `json:"platform"`
+	BundleDir                    string            `json:"bundle_dir"`
+	RootFS                       string            `json:"rootfs"`
+	Branches                     []BranchInfo      `json:"branches,omitempty"`
+	NetworkMode                  string            `json:"network_mode,omitempty"`
+	NetworkNAT                   bool              `json:"network_nat,omitempty"`
+	NetworkIP                    string            `json:"network_ip,omitempty"`
+	NetworkMAC                   string            `json:"network_mac,omitempty"`
+	PublishedPorts               []PortBinding     `json:"published_ports,omitempty"`
+	LogDriver                    string            `json:"log_driver,omitempty"`
+	LogOptions                   map[string]string `json:"log_options,omitempty"`
+	LogAttributes                map[string]string `json:"log_attributes,omitempty"`
+	ConsoleLogMaxBytes           int64             `json:"console_log_max_bytes,omitempty"`
+	ConsoleLogMaxFiles           int               `json:"console_log_max_files,omitempty"`
+	Terminal                     bool              `json:"terminal,omitempty"`
+	OpenStdin                    bool              `json:"open_stdin,omitempty"`
+	AutoRemove                   bool              `json:"auto_remove,omitempty"`
+	StopSignal                   string            `json:"stop_signal,omitempty"`
+	StopTimeout                  *int              `json:"stop_timeout,omitempty"`
+	PidsLimit                    *int64            `json:"pids_limit,omitempty"`
+	MemoryLimit                  *int64            `json:"memory_limit,omitempty"`
+	NanoCPUs                     *int64            `json:"nano_cpus,omitempty"`
+	CPUShares                    *uint64           `json:"cpu_shares,omitempty"`
+	CPUPeriod                    *uint64           `json:"cpu_period,omitempty"`
+	CPUQuota                     *int64            `json:"cpu_quota,omitempty"`
+	ShmSize                      *int64            `json:"shm_size,omitempty"`
+	GroupAdd                     []string          `json:"group_add,omitempty"`
+	CapAdd                       []string          `json:"cap_add,omitempty"`
+	CapDrop                      []string          `json:"cap_drop,omitempty"`
+	Ulimits                      []Ulimit          `json:"ulimits,omitempty"`
+	ExtraHosts                   []string          `json:"extra_hosts,omitempty"`
+	DNS                          []string          `json:"dns,omitempty"`
+	DNSSearch                    []string          `json:"dns_search,omitempty"`
+	DNSOptions                   []string          `json:"dns_options,omitempty"`
+	Volumes                      []ManagedVolume   `json:"volumes,omitempty"`
+	RootfsUpperID                string            `json:"rootfs_upper_id,omitempty"`
+	RootfsUpperCopyMode          string            `json:"rootfs_upper_copy_mode,omitempty"`
+	State                        string            `json:"state"`
+	ExitStatus                   *int              `json:"exit_status,omitempty"`
+	CreatedAt                    time.Time         `json:"created_at"`
+	StartedAt                    *time.Time        `json:"started_at,omitempty"`
+	ExitedAt                     *time.Time        `json:"exited_at,omitempty"`
+	DistributedForkTransactionID string            `json:"distributed_fork_transaction_id,omitempty"`
+	DistributedForkNodeID        string            `json:"distributed_fork_node_id,omitempty"`
+	DistributedForkHidden        bool              `json:"distributed_fork_hidden,omitempty"`
 }
 
 func cloneIntPointer(value *int) *int {
@@ -531,7 +537,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
-	containers, err := s.ListContainers()
+	containers, err := s.listContainers(true)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -690,7 +696,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
-	containers, err := s.ListContainers()
+	containers, err := s.listContainers(true)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -944,11 +950,25 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err := validateObjectName("target branch", opts.TargetBranch); err != nil {
 		return Prepared{}, err
 	}
+	if err := validateObjectName("distributed fork transaction", opts.TransactionID); err != nil {
+		return Prepared{}, err
+	}
+	if opts.NodeID == "" {
+		return Prepared{}, errors.New("distributed fork target node ID is empty")
+	}
+	if existing, err := s.LoadDistributedForkTarget(opts.TransactionID); err == nil {
+		if existing.Name != opts.TargetName || existing.DistributedForkNodeID != opts.NodeID {
+			return Prepared{}, fmt.Errorf("distributed fork transaction %q is bound to another target", opts.TransactionID)
+		}
+		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return Prepared{}, err
+	}
 	source, err := s.LoadContainer(opts.SourceContainer)
 	if err != nil {
 		return Prepared{}, err
 	}
-	containers, err := s.ListContainers()
+	containers, err := s.listContainers(true)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1036,6 +1056,9 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.StartedAt = nil
 	target.ExitedAt = nil
 	target.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	target.DistributedForkTransactionID = opts.TransactionID
+	target.DistributedForkNodeID = opts.NodeID
+	target.DistributedForkHidden = true
 	for i := range target.Volumes {
 		target.Volumes[i].Anonymous = false
 	}
@@ -1713,7 +1736,9 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 		return ContainerInfo{}, err
 	}
 	if info, err := s.loadContainerKey(identifier); err == nil {
-		return info, nil
+		if !info.DistributedForkHidden {
+			return info, nil
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ContainerInfo{}, err
 	}
@@ -1744,6 +1769,33 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
 	}
 	return ContainerInfo{}, fmt.Errorf("container %q does not exist", identifier)
+}
+
+// LoadDistributedForkTarget resolves a hidden or published target by its
+// immutable transaction marker. It is intended only for ttcd reconciliation.
+func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, error) {
+	if err := validateObjectName("distributed fork transaction", transactionID); err != nil {
+		return ContainerInfo{}, err
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
+	var found *ContainerInfo
+	for i := range containers {
+		if containers[i].DistributedForkTransactionID != transactionID {
+			continue
+		}
+		if found != nil {
+			return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q has multiple target containers", transactionID)
+		}
+		copy := containers[i]
+		found = &copy
+	}
+	if found == nil {
+		return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q target: %w", transactionID, fs.ErrNotExist)
+	}
+	return *found, nil
 }
 
 func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
@@ -1863,6 +1915,10 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
+	return s.listContainers(false)
+}
+
+func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
@@ -1880,7 +1936,9 @@ func (s Store) ListContainers() ([]ContainerInfo, error) {
 		if err != nil {
 			return nil, err
 		}
-		containers = append(containers, info)
+		if includeHidden || !info.DistributedForkHidden {
+			containers = append(containers, info)
+		}
 	}
 	sort.Slice(containers, func(i, j int) bool {
 		if containers[i].Name != containers[j].Name {
@@ -1889,6 +1947,58 @@ func (s Store) ListContainers() ([]ContainerInfo, error) {
 		return containers[i].ID < containers[j].ID
 	})
 	return containers, nil
+}
+
+// PublishDistributedForkTarget atomically makes a prepared target visible to
+// ordinary TTC listing and lookup.
+func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo, error) {
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
+	if !info.DistributedForkHidden {
+		return info, nil
+	}
+	info.DistributedForkHidden = false
+	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		return ContainerInfo{}, err
+	}
+	return info, nil
+}
+
+// UpdateDistributedForkTargetState records hidden-target lifecycle without
+// making the target visible.
+func (s Store) UpdateDistributedForkTargetState(transactionID, state string) error {
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return err
+	}
+	info.State = state
+	for i := range info.Branches {
+		if info.Branches[i].ID == "main" {
+			info.Branches[i].State = state
+		}
+	}
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// RemoveDistributedForkTarget removes a transaction target and its image
+// lease. Borrowed source-family repositories live outside the target directory
+// and are deliberately retained.
+func (s Store) RemoveDistributedForkTarget(transactionID string) error {
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.LeaseID != "" {
+		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
+			return err
+		}
+	}
+	return os.RemoveAll(filepath.Join(s.Root, "containers", info.ID))
 }
 
 // UpdateState records the last known base-container lifecycle state.

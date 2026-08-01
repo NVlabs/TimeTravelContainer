@@ -21,12 +21,38 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+type testDistributedBranchResource struct {
+	removed []string
+}
+
+func (*testDistributedBranchResource) Fork(string, string) error { return nil }
+
+func (r *testDistributedBranchResource) RemoveBranch(branch string) error {
+	r.removed = append(r.removed, branch)
+	return nil
+}
+
+func TestRemoveDistributedFilesystemBranchDeduplicatesResources(t *testing.T) {
+	resource := &testDistributedBranchResource{}
+	resources := vfs.LiveForkFilesystemResources{
+		checkpoint.ResourceID{Path: "one"}: resource,
+		checkpoint.ResourceID{Path: "two"}: resource,
+	}
+	if err := removeDistributedFilesystemBranch(resources, "remote"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(resource.removed), "[remote]"; got != want {
+		t.Fatalf("removed branches=%s, want %s", got, want)
+	}
+}
 
 func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	parent, err := testutil.Boot()

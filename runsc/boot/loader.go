@@ -243,7 +243,9 @@ type Loader struct {
 	// distributedRestore distinguishes a remote live-fork restore, whose page
 	// loading remains active after the target is published, from checkpoint
 	// restore's background completion lifecycle.
-	distributedRestore bool
+	distributedRestore          bool
+	distributedRestoreSessionID string
+	distributedRestoreInfo      DistributedForkRestoreInfo
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string

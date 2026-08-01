@@ -12,7 +12,9 @@ go_library(
     deps = [
         "//pkg/abi/linux",
 		"//pkg/hostarch",
+		"//pkg/sentry/ttcremote",
         "//pkg/ttcvolume",
+		"//runsc/boot",
         "//runsc/flag",
         "//runsc/specutils",
         "//runsc/ttc/bundle",

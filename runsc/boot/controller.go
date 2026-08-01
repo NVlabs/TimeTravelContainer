@@ -113,6 +113,9 @@ const (
 	// ContMgrCancelDistributedForkSession releases a remote snapshot session.
 	ContMgrCancelDistributedForkSession = "containerManager.CancelDistributedForkSession"
 
+	// ContMgrCompleteDistributedForkSession releases a drained snapshot.
+	ContMgrCompleteDistributedForkSession = "containerManager.CompleteDistributedForkSession"
+
 	// ContMgrRestoreDistributedFork installs a remotely paged target Kernel.
 	ContMgrRestoreDistributedFork = "containerManager.RestoreDistributedFork"
 
@@ -1066,6 +1069,15 @@ func (cm *containerManager) CancelDistributedForkSession(args *DistributedForkSe
 		return errors.New("missing distributed fork session arguments")
 	}
 	return cm.l.family.CancelDistributedForkSession(args.SessionID)
+}
+
+// CompleteDistributedForkSession releases drained memory but preserves the
+// target's persistent filesystem branches.
+func (cm *containerManager) CompleteDistributedForkSession(args *DistributedForkSessionArgs, _ *struct{}) error {
+	if args == nil {
+		return errors.New("missing distributed fork session arguments")
+	}
+	return cm.l.family.CompleteDistributedForkSession(args.SessionID)
 }
 
 // ListBranches returns the sandbox branch family.

@@ -67,6 +67,10 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.distributedRestore && l.distributedRestoreSessionID == args.SessionID {
+		info := l.distributedRestoreInfo
+		return &info, nil
+	}
 	if l.state != created || l.distributedRestore {
 		return nil, fmt.Errorf("sandbox is %s, not an unstarted distributed target", l.state)
 	}
@@ -196,6 +200,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	l.watchdog = newWatchdog
 	l.restoreDone = sync.NewCond(&l.mu)
 	l.distributedRestore = true
+	l.distributedRestoreSessionID = args.SessionID
 	l.state = restoringUnstarted
 	old.Release()
 	childOwned = false
@@ -203,8 +208,10 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	for _, load := range metadata.LoadRanges {
 		remoteBytes += load.Target.Length()
 	}
-	return &DistributedForkRestoreInfo{
+	info := DistributedForkRestoreInfo{
 		SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID,
 		RemotePages: remoteBytes / hostarch.PageSize, RemoteBytes: remoteBytes,
-	}, nil
+	}
+	l.distributedRestoreInfo = info
+	return &info, nil
 }

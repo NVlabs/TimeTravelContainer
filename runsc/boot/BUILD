@@ -236,6 +236,7 @@ go_test(
     args = ["--platform=systrap"],
     library = ":boot",
     deps = [
+        "//pkg/sentry/checkpoint",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/vfs",

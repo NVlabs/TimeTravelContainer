@@ -2172,6 +2172,14 @@ func (s *Sandbox) CancelDistributedForkSession(id string) error {
 	return nil
 }
 
+// CompleteDistributedForkSession releases drained source memory ownership.
+func (s *Sandbox) CompleteDistributedForkSession(id string) error {
+	if err := s.call(boot.ContMgrCompleteDistributedForkSession, &boot.DistributedForkSessionArgs{SessionID: id}, nil); err != nil {
+		return fmt.Errorf("completing distributed fork session %q: %w", id, err)
+	}
+	return nil
+}
+
 // RestoreDistributedFork installs a hidden, paused remote target Kernel.
 func (s *Sandbox) RestoreDistributedFork(args *boot.DistributedForkRestoreArgs) (boot.DistributedForkRestoreInfo, error) {
 	var info boot.DistributedForkRestoreInfo

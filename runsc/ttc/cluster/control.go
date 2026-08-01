@@ -159,6 +159,7 @@ type RevisionRequest struct {
 // method is keyed by tx.Identity.TransactionID and may be called again after a
 // lost response or daemon restart.
 type TargetRuntime interface {
+	Reserve(context.Context, *Transaction) error
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
 	Publish(context.Context, *Transaction) error
 	Cancel(context.Context, *Transaction) error
@@ -257,6 +258,14 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 	if existing, err := c.Store.Load(request.Identity.TransactionID); err == nil {
 		if reflect.DeepEqual(existing.Identity, request.Identity) && reflect.DeepEqual(existing.Negotiated, negotiated) {
 			if existing.State == TransactionPreparing {
+				if c.TargetRuntime == nil {
+					writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
+					return
+				}
+				if err := c.TargetRuntime.Reserve(r.Context(), existing); err != nil {
+					writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
+					return
+				}
 				existing, err = c.Store.Advance(existing.Identity.TransactionID, existing.Revision, TransactionTargetReserved, "", c.Now())
 				if err != nil {
 					writeControlError(w, http.StatusInternalServerError, err.Error())
@@ -291,6 +300,15 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 	}
 	if err := c.Store.Create(tx); err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if c.TargetRuntime == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
+		return
+	}
+	if err := c.TargetRuntime.Reserve(r.Context(), tx); err != nil {
+		_, _ = c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionFailed, err.Error(), c.Now())
+		writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
 		return
 	}
 	tx, err = c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionTargetReserved, "", c.Now())

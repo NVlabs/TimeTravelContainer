@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -348,9 +350,11 @@ type SandboxFamily struct {
 }
 
 type distributedForkSession struct {
-	source  string
-	address string
-	server  *ttcremote.TCPPageServer
+	source           string
+	address          string
+	filesystemBranch string
+	resources        vfs.LiveForkFilesystemResources
+	server           *ttcremote.TCPPageServer
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -486,31 +490,35 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		}
 		return nil, err
 	}
+	rollbackCapture := func() error {
+		return errors.Join(capture.Close(), removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID)))
+	}
 	metadata, err := (&ttcremote.SessionMetadata{
 		FamilyID: args.FamilyID, SourceBranchID: sourceID, TargetBranchID: args.TargetBranchID,
 		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
 		LoadRanges: capture.LoadRanges,
 	}).MarshalBinary()
 	if err != nil {
-		_ = capture.Close()
+		_ = rollbackCapture()
 		_ = resume()
 		return nil, fmt.Errorf("encoding distributed fork metadata: %w", err)
 	}
 	var token ttcremote.SnapshotToken
 	if _, err := rand.Read(token[:]); err != nil {
-		_ = capture.Close()
+		_ = rollbackCapture()
 		_ = resume()
 		return nil, fmt.Errorf("generating distributed snapshot token: %w", err)
 	}
 	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, args.MaxTransferBytes)
 	if err != nil {
-		_ = capture.Close()
+		_ = rollbackCapture()
 		_ = resume()
 		return nil, err
 	}
 	capture.Snapshot = nil // server owns it from this point onward.
 	if err := server.SetMetadata(metadata); err != nil {
 		_ = server.Close()
+		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
 		_ = resume()
 		return nil, err
 	}
@@ -518,11 +526,15 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 	if address == "" {
 		address = listener.Addr().String()
 	}
-	session := &distributedForkSession{source: sourceID, address: address, server: server}
+	session := &distributedForkSession{
+		source: sourceID, address: address, filesystemBranch: f.volumeBranchID(args.TargetBranchID),
+		resources: capture.FilesystemResources, server: server,
+	}
 	f.mu.Lock()
 	if _, ok := f.distributedSessions[args.SessionID]; ok {
 		f.mu.Unlock()
 		_ = server.Close()
+		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
 		_ = resume()
 		return nil, fmt.Errorf("distributed fork session %q was created concurrently", args.SessionID)
 	}
@@ -539,6 +551,7 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		delete(f.distributedSessions, args.SessionID)
 		f.mu.Unlock()
 		_ = server.Close()
+		_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
 		return nil, fmt.Errorf("resuming source branch %q: %w", sourceID, err)
 	}
 	f.mu.Lock()
@@ -569,6 +582,43 @@ func (f *SandboxFamily) DistributedForkSessionStatus(id string) (*DistributedFor
 // still retained for the target. It is idempotent for a session that already
 // completed cancellation in this process.
 func (f *SandboxFamily) CancelDistributedForkSession(id string) error {
+	f.mu.Lock()
+	session := f.distributedSessions[id]
+	if session != nil {
+		delete(f.distributedSessions, id)
+	}
+	f.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	return errors.Join(session.server.Close(), removeDistributedFilesystemBranch(session.resources, session.filesystemBranch))
+}
+
+func removeDistributedFilesystemBranch(resources vfs.LiveForkFilesystemResources, branch string) error {
+	var result error
+	seen := make(map[vfs.LiveForkBranchingResource]struct{})
+	for _, resource := range resources {
+		branching, ok := resource.(vfs.LiveForkBranchingResource)
+		if !ok {
+			continue
+		}
+		comparable := reflect.TypeOf(branching).Comparable()
+		if comparable {
+			if _, ok := seen[branching]; ok {
+				continue
+			}
+			seen[branching] = struct{}{}
+		}
+		if err := branching.RemoveBranch(branch); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+// CompleteDistributedForkSession releases memory ownership after a target has
+// drained while preserving the filesystem branches now owned by that target.
+func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 	f.mu.Lock()
 	session := f.distributedSessions[id]
 	if session != nil {
