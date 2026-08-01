@@ -429,8 +429,17 @@ budget selected below.
 
 ### Phase 4: cross-node `ttcd` orchestration
 
-* Add peer configuration, capability negotiation, image/rootfs identity checks,
-  transaction lifecycle, authorization, quotas, and observability.
+* A versioned capability contract now validates architecture, base page size,
+  maximum transfer size, shared-repository identity, and required feature
+  intersection before capture. Fork identities bind the request to image and
+  rootfs SHA-256 digests.
+* An explicit transaction state machine now keeps target reservation,
+  source capture, restore, paused readiness, publication, draining, and
+  independence separate. A private per-daemon store atomically persists each
+  revision, rejects stale writers, reloads after restart, and permits deletion
+  only after a terminal state.
+* Add peer configuration, mutually authenticated transport, quotas, and
+  daemon-wide observability.
 * Add `ttc fork --target` and equivalent SDK operations.
 * Keep filesystem publication transactional on the common repository and make
   target cleanup idempotent.
