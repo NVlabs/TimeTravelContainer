@@ -44,33 +44,38 @@ import (
 // TimeTravel controls experimental in-memory sandbox branches.
 type TimeTravel struct {
 	containerLoader
-	source                string
-	paused                bool
-	pid                   int
-	execID                string
-	signal                int
-	all                   bool
-	consoleID             string
-	consoleStream         string
-	consoleMaxBytes       int
-	consoleData           string
-	consoleWaitStdout     bool
-	consoleWaitStderr     bool
-	consoleWaitStdin      bool
-	consoleWaitTimeout    time.Duration
-	consoleRows           int
-	consoleCols           int
-	consoleXPixels        int
-	consoleYPixels        int
-	consoleLog            string
-	consoleReadyFD        int
-	consoleWaitStatus     string
-	consoleRetentionStats string
-	consolePIDFile        string
-	consoleLogMax         int64
-	consoleLogFiles       int
-	checkpointImagePath   string
-	checkpointCompression CheckpointCompression
+	source                 string
+	paused                 bool
+	pid                    int
+	execID                 string
+	signal                 int
+	all                    bool
+	consoleID              string
+	consoleStream          string
+	consoleMaxBytes        int
+	consoleData            string
+	consoleWaitStdout      bool
+	consoleWaitStderr      bool
+	consoleWaitStdin       bool
+	consoleWaitTimeout     time.Duration
+	consoleRows            int
+	consoleCols            int
+	consoleXPixels         int
+	consoleYPixels         int
+	consoleLog             string
+	consoleReadyFD         int
+	consoleWaitStatus      string
+	consoleRetentionStats  string
+	consolePIDFile         string
+	consoleLogMax          int64
+	consoleLogFiles        int
+	checkpointImagePath    string
+	checkpointCompression  CheckpointCompression
+	distributedSessionID   string
+	distributedFamilyID    string
+	distributedListen      string
+	distributedAdvertise   string
+	distributedMaxTransfer uint64
 }
 
 // Name implements subcommands.Command.Name.
@@ -85,6 +90,8 @@ func (*TimeTravel) Synopsis() string {
 func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
+		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-status|distributed-cancel <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
@@ -121,6 +128,11 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
 	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
+	f.StringVar(&t.distributedSessionID, "distributed-session", "", "distributed fork transaction/session ID")
+	f.StringVar(&t.distributedFamilyID, "distributed-family", "", "portable distributed fork family identity")
+	f.StringVar(&t.distributedListen, "distributed-listen", "", "host TCP address for the source page server")
+	f.StringVar(&t.distributedAdvertise, "distributed-advertise", "", "page server address advertised to the target")
+	f.Uint64Var(&t.distributedMaxTransfer, "distributed-max-transfer", 0, "maximum bytes in one remote page transfer")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -208,6 +220,19 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				Paused: t.paused,
 			})
 		}
+	case "distributed-capture":
+		if t.distributedSessionID == "" || t.distributedFamilyID == "" || t.distributedListen == "" || t.distributedMaxTransfer == 0 {
+			util.Fatalf("--distributed-session, --distributed-family, --distributed-listen, and --distributed-max-transfer are required")
+		}
+		output, err = cont.Sandbox.CaptureDistributedFork(&boot.DistributedForkCaptureArgs{
+			SessionID: t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
+			TargetBranchID: f.Arg(2), ListenAddress: t.distributedListen,
+			AdvertiseAddress: t.distributedAdvertise, MaxTransferBytes: t.distributedMaxTransfer,
+		})
+	case "distributed-status":
+		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
+	case "distributed-cancel":
+		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
 	case "pause":
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":
