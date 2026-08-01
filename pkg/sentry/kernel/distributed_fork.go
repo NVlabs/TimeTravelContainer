@@ -175,6 +175,7 @@ type DistributedForkLoadOptions struct {
 	RestoreOptions      vfs.CompleteRestoreOptions
 	FilesystemResources vfs.LiveForkFilesystemResources
 	DemandOnly          bool
+	PrefetchBytes       uint64
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
@@ -199,7 +200,9 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		targetMF.Destroy()
 		return nil, err
 	}
-	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: opts.DemandOnly})
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{
+		DemandOnly: opts.DemandOnly, PrefetchBytes: opts.PrefetchBytes,
+	})
 	if err != nil {
 		targetMF.Destroy()
 		return nil, err

@@ -344,6 +344,67 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	target, targetFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*17 + 3)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, 4*hostarch.PageSize, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, PrefetchBytes: 3 * hostarch.PageSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	page := uint64(2)
+	pageFR := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
+	if _, err := target.MapInternal(pageFR, hostarch.Read); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for snapshot.Stats().PagesReleased != 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := snapshot.Stats(); stats.PagesReleased != 4 || stats.PagesOutstanding != 4 {
+		t.Fatalf("forward prefetch loaded wrong range: %+v", stats)
+	}
+	prefetchedFR := memmap.FileRange{pageFR.End, pageFR.End + 3*hostarch.PageSize}
+	mapped, err := target.MapInternal(prefetchedFR, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, prefetchedFR.Length())
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != prefetchedFR.Length() {
+		t.Fatalf("copy prefetched pages: n=%d err=%v", n, err)
+	}
+	wantStart := (page + 1) * hostarch.PageSize
+	if !bytes.Equal(got, want[wantStart:wantStart+uint64(len(got))]) {
+		t.Fatal("prefetched pages differ from source")
+	}
+	// Accessing the already-prefetched pages must not request more data.
+	time.Sleep(25 * time.Millisecond)
+	if stats := snapshot.Stats(); stats.PagesReleased != 4 {
+		t.Fatalf("prefetched access caused another pull: %+v", stats)
+	}
+	pages.Cancel()
+	if err := pages.Wait(); err == nil {
+		t.Fatal("canceled loader unexpectedly completed without cancellation")
+	}
+}
+
 func TestCancelDemandOnlyRemotePageLoad(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 4)
 	target, targetFR := newRemoteTestMemoryFile(t, 4)

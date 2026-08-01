@@ -1141,6 +1141,15 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// prefetch contains advisory ranges following awaited ranges. Unlike
+	// priority, these ranges hold temporary references while I/O is in flight.
+	// prefetch is protected by mu and bounded to avoid untrusted fault patterns
+	// growing metadata without limit.
+	prefetch ringdeque.Deque[aplFileRange]
+
+	// prefetchBytes is the maximum forward window queued after a fault.
+	prefetchBytes uint64
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1330,6 +1339,11 @@ type AsyncPagesFileLoadOpts struct {
 	// DemandOnly prevents speculative background loading. Only ranges needed
 	// by a current waiter are read until Drain is called.
 	DemandOnly bool
+
+	// PrefetchBytes speculatively loads up to this many page-aligned bytes
+	// immediately following a demanded range. It is effective only while
+	// DemandOnly is true; Drain already loads every remaining page.
+	PrefetchBytes uint64
 }
 
 // StartAsyncPagesFileLoad constructs asynchronous loading state for the pages
@@ -1346,6 +1360,10 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		ar.Close()
 		return nil, fmt.Errorf("stateio.AsyncReader.MaxReadBytes() (%d) must be at least one page)", ar.MaxReadBytes())
 	}
+	if !hostarch.IsPageAligned(opts.PrefetchBytes) {
+		ar.Close()
+		return nil, fmt.Errorf("async page prefetch size %d is not page-aligned", opts.PrefetchBytes)
+	}
 	// Cap maxParallel due to the uint32 range of bitmap.Bitmap.
 	maxParallel := min(ar.MaxParallel(), 1<<30)
 	apfl := &AsyncPagesFileLoad{
@@ -1354,6 +1372,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		doneCallback:     doneCallback,
 		ar:               ar,
 		maxReadBytes:     maxReadBytes,
+		prefetchBytes:    opts.PrefetchBytes,
 		qavail:           maxParallel,
 		opsBusy:          bitmap.New(uint32(maxParallel)),
 		ops:              make([]aplOp, maxParallel),
@@ -1538,6 +1557,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			apfl.bytesWaited += ullen
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+				if apfl.demandOnly.Load() && apfl.prefetchBytes != 0 && apfl.prefetch.Len() < 4096 {
+					end := ulFR.End + min(apfl.prefetchBytes, ^uint64(0)-ulFR.End)
+					if end != ulFR.End {
+						apfl.prefetch.PushBack(aplFileRange{amfl, memmap.FileRange{Start: ulFR.End, End: end}})
+					}
+				}
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1879,6 +1904,47 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 		}
 		apfl.mu.Unlock()
+		// Use spare queue slots for forward prefetches created by faults. The
+		// lock order matches background loading: amflsMu -> MemoryFile.mu ->
+		// apfl.mu. Awaited reads above remain strictly higher priority.
+		if apfl.canEnqueue() && apfl.demandOnly.Load() && apfl.prefetchBytes != 0 {
+			apfl.amflsMu.Lock()
+			for apfl.canEnqueue() {
+				apfl.mu.Lock()
+				if apfl.prefetch.Empty() {
+					apfl.mu.Unlock()
+					break
+				}
+				prefetch := apfl.prefetch.PopFront()
+				apfl.mu.Unlock()
+				amfl := prefetch.amfl
+				amfl.f.mu.Lock()
+				apfl.mu.Lock()
+				for ulseg := amfl.unloaded.LowerBoundSegment(prefetch.Start); ulseg.Ok() && ulseg.Start() < prefetch.End && apfl.canEnqueue(); {
+					ul := ulseg.ValuePtr()
+					ulFR := ulseg.Range()
+					if ul.started || len(ul.waiters) != 0 {
+						ulseg = ulseg.NextSegment()
+						continue
+					}
+					loadFR := ulFR.Intersect(prefetch.FileRange)
+					ulseg = amfl.unloaded.SplitBefore(ulseg, loadFR.Start)
+					ul = ulseg.ValuePtr()
+					n := apfl.enqueueRange(amfl, loadFR, ul.off, true /* tempRef */)
+					if n == 0 {
+						break
+					}
+					loadFR.End = loadFR.Start + n
+					ulseg = amfl.unloaded.SplitAfter(ulseg, loadFR.End)
+					ulseg.ValuePtr().started = true
+					amfl.f.incRefLocked(loadFR)
+					ulseg = ulseg.NextSegment()
+				}
+				apfl.mu.Unlock()
+				amfl.f.mu.Unlock()
+			}
+			apfl.amflsMu.Unlock()
+		}
 		// Fill remaining queue with reads for pages with no waiters.
 		if apfl.canEnqueue() && !apfl.demandOnly.Load() {
 			apfl.amflsMu.Lock()

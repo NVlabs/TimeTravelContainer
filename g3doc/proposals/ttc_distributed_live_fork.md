@@ -371,8 +371,11 @@ after a full drain and branch destruction.
 * Portable capture now validates and serializes contained netstack state. The
   target load API requires ttcd to recreate target-local virtual-link/NAT
   plumbing, then restores netstack and resets inherited external connections.
-* Add configurable range sizes, request concurrency, ACK batching, and
-  sequential/fixed-window prefetch.
+* Configurable TCP range sizes and request concurrency are implemented. The
+  demand loader now also supports a bounded, page-aligned forward sequential
+  prefetch window: waiter-owned reads keep priority while spare asynchronous
+  slots fetch adjacent pages in multi-page requests. Fixed-window/adaptive
+  prefetch and ACK batching remain to be added.
 * Expose metrics and a debug transaction dump.
 
 Exit criteria: B starts and runs before full transfer; induced duplication,
