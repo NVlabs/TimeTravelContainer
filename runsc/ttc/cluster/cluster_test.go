@@ -151,6 +151,13 @@ func TestTransactionStoreLifecycleAndRevisionChecks(t *testing.T) {
 	if stored.State != TransactionTargetReserved || stored.Revision != 2 {
 		t.Fatalf("advanced transaction=%+v", stored)
 	}
+	bound, err := store.BindSession(stored.Identity.TransactionID, stored.Revision, "sha256:"+strings.Repeat("a", 64), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.State != TransactionSourceCaptured || bound.SessionDigest == "" {
+		t.Fatalf("bound transaction=%+v", bound)
+	}
 	// Reopening the store must observe the atomically replaced record.
 	reopened, err := OpenStore(store.dir)
 	if err != nil {
@@ -160,8 +167,8 @@ func TestTransactionStoreLifecycleAndRevisionChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.State != stored.State || loaded.Revision != stored.Revision {
-		t.Fatalf("reloaded=%+v, want %+v", loaded, stored)
+	if loaded.State != bound.State || loaded.Revision != bound.Revision {
+		t.Fatalf("reloaded=%+v, want %+v", loaded, bound)
 	}
 	if err := reopened.Delete(loaded.Identity.TransactionID, loaded.Revision); err == nil {
 		t.Fatal("deleted a nonterminal transaction")

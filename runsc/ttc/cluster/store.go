@@ -139,6 +139,59 @@ func (s *Store) Advance(id string, revision uint64, next TransactionState, failu
 	return tx, nil
 }
 
+// BindSession atomically records the data-plane descriptor digest and advances
+// a reserved target to source-captured. The secret descriptor itself is never
+// written to the transaction store.
+func (s *Store) BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error) {
+	if err := validateSHA256Digest(digest); err != nil {
+		return nil, fmt.Errorf("session digest: %w", err)
+	}
+	path, err := s.path(id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := loadTransaction(path, id)
+	if err != nil {
+		return nil, err
+	}
+	if tx.SessionDigest != "" {
+		if tx.SessionDigest != digest {
+			return nil, fmt.Errorf("transaction %q is bound to another data-plane session", id)
+		}
+		if tx.State == TransactionSourceCaptured {
+			return tx, nil
+		}
+		return nil, fmt.Errorf("transaction %q already passed session binding in state %s", id, tx.State)
+	}
+	switch tx.State {
+	case TransactionSourceCaptured, TransactionTargetRestoring, TransactionTargetPaused,
+		TransactionPublished, TransactionDraining, TransactionIndependent:
+		if tx.SessionDigest == "" {
+			return nil, fmt.Errorf("transaction %q in state %s has no session digest", id, tx.State)
+		}
+	}
+	if tx.Revision != revision {
+		return nil, fmt.Errorf("transaction %q revision is %d, not %d", id, tx.Revision, revision)
+	}
+	if tx.State != TransactionTargetReserved {
+		return nil, fmt.Errorf("transaction %q is %s, not target-reserved", id, tx.State)
+	}
+	tx.SessionDigest = digest
+	if err := tx.Advance(TransactionSourceCaptured, "", now); err != nil {
+		return nil, err
+	}
+	data, err := marshalTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.replace(path, data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
 // List returns all valid records ordered by transaction ID.
 func (s *Store) List() ([]Transaction, error) {
 	s.mu.Lock()
@@ -266,6 +319,11 @@ func loadTransaction(path, id string) (*Transaction, error) {
 	}
 	if err := tx.Identity.Validate(); err != nil {
 		return nil, fmt.Errorf("transaction %q identity: %w", id, err)
+	}
+	if tx.SessionDigest != "" {
+		if err := validateSHA256Digest(tx.SessionDigest); err != nil {
+			return nil, fmt.Errorf("transaction %q session digest: %w", id, err)
+		}
 	}
 	if _, known := transactionTransitions[tx.State]; !known && !tx.Terminal() {
 		return nil, fmt.Errorf("transaction %q has unknown state %q", id, tx.State)

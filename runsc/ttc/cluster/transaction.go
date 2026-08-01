@@ -97,6 +97,9 @@ type Transaction struct {
 	UpdatedAt    time.Time              `json:"updated_at"`
 	Failure      string                 `json:"failure,omitempty"`
 	SourceNeeded bool                   `json:"source_needed"`
+	// SessionDigest binds retries to the same bearer-token-bearing data-plane
+	// descriptor without persisting or exposing that descriptor itself.
+	SessionDigest string `json:"session_digest,omitempty"`
 }
 
 var transactionTransitions = map[TransactionState]map[TransactionState]bool{
