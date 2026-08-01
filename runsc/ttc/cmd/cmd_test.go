@@ -3071,6 +3071,16 @@ exit 2
 	if err := store.UpdateState("demo", "running", nil); err != nil {
 		t.Fatalf("marking container running: %v", err)
 	}
+	consolePaths, err := store.BranchConsolePaths("demo", defaultBranchID)
+	if err != nil {
+		t.Fatalf("BranchConsolePaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(consolePaths.WaitStatus), 0700); err != nil {
+		t.Fatalf("creating console directory: %v", err)
+	}
+	if err := os.WriteFile(consolePaths.WaitStatus, []byte("11\n"), 0600); err != nil {
+		t.Fatalf("writing crash wait status: %v", err)
+	}
 	families, err = b.listFamilies()
 	if err != nil {
 		t.Fatalf("reconciling listFamilies: %v", err)
@@ -3085,8 +3095,15 @@ exit 2
 	if err != nil {
 		t.Fatalf("loading reconciled metadata: %v", err)
 	}
-	if info.State != "exited" || info.ExitedAt == nil {
-		t.Errorf("reconciled metadata = %+v, want exited with timestamp", info)
+	if info.State != "exited" || info.ExitedAt == nil || info.ExitStatus == nil || *info.ExitStatus != 139 {
+		t.Errorf("reconciled metadata = %+v, want exited with status 139 and timestamp", info)
+	}
+	inspected, err := b.inspect("demo")
+	if err != nil {
+		t.Fatalf("inspect after reconciliation: %v", err)
+	}
+	if inspected.State.Status != "exited" || inspected.State.ExitCode != 139 {
+		t.Errorf("inspect after reconciliation = %+v, want exited with status 139", inspected.State)
 	}
 }
 

@@ -6759,6 +6759,11 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return buildInspectInfo(containerInfo, spec, nil, err.Error()), nil
 	}
+	// listFamilies may reconcile persistent state after an asynchronous sandbox
+	// exit. Reload so this inspect response reflects that update immediately.
+	if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
+		containerInfo = refreshed
+	}
 	var runtimeFamily *Family
 	for i := range families {
 		if families[i].ID == containerInfo.ID {
@@ -7544,7 +7549,14 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				if _, ok := runtimeIDs[container.ID]; ok {
 					continue
 				}
-				_ = store.UpdateState(container.ID, "exited", nil)
+				var exitStatus *int
+				if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
+					if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
+						code := waitStatusExitCode(status)
+						exitStatus = &code
+					}
+				}
+				_ = store.UpdateState(container.ID, "exited", exitStatus)
 				family := byID[container.ID]
 				family.State = "exited"
 				for i := range family.Branches {
