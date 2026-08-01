@@ -111,6 +111,8 @@ type DistributedForkCaptureArgs struct {
 	AdvertiseAddress string
 	MaxTransferBytes uint64
 	ExternalListener bool
+	PushPolicy       ttcremote.TCPPushPolicy
+	PushHighWater    uint64
 }
 
 // DistributedForkSessionInfo is safe to return through the runsc control
@@ -559,6 +561,18 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		_ = resume()
 		return nil, err
 	}
+	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+		if err := server.ConfigurePush(ttcremote.TCPPushSenderOpts{
+			MaxPush: args.MaxTransferBytes, Timeout: 30 * time.Second, RetryLimit: 2,
+			RetryBackoff: 10 * time.Millisecond, Policy: args.PushPolicy,
+			RetainedHighWater: args.PushHighWater, ScanInterval: 10 * time.Millisecond,
+		}); err != nil {
+			_ = server.Close()
+			_ = removeDistributedFilesystemBranch(capture.FilesystemResources, f.volumeBranchID(args.TargetBranchID))
+			_ = resume()
+			return nil, fmt.Errorf("configuring distributed reverse push: %w", err)
+		}
+	}
 	address := args.AdvertiseAddress
 	if address == "" {
 		address = listener.Addr().String()
@@ -613,7 +627,11 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	if session == nil {
 		return fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
 	}
-	return session.server.ServeStream(args.FilePayload.Files[0])
+	conn, err := ttcremote.NewDonatedTCPConn(args.FilePayload.Files[0])
+	if err != nil {
+		return err
+	}
+	return session.server.ServeStream(conn)
 }
 
 // DistributedForkSessionStatus returns progress without disclosing the bearer

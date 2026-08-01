@@ -52,6 +52,7 @@ type DistributedForkRestoreArgs struct {
 	PrefetchBehindBytes uint64
 	AckBatchPages       int
 	AckInterval         time.Duration
+	PushPolicy          ttcremote.TCPPushPolicy
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -100,6 +101,19 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			}
 		}
 	}()
+	var pushConn net.Conn
+	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+		if !donatedMode || len(donated) < 2 {
+			return nil, errors.New("distributed reverse push requires a dedicated donated stream")
+		}
+		pushConn = donated[len(donated)-1]
+		donated = donated[:len(donated)-1]
+		defer func() {
+			if pushConn != nil {
+				pushConn.Close()
+			}
+		}()
+	}
 	var encoded []byte
 	var err error
 	if donatedMode {
@@ -209,6 +223,13 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err != nil {
 		return nil, err
 	}
+	var pushReceiver *ttcremote.TCPPushReceiver
+	if pushConn != nil {
+		pushReceiver, err = ttcremote.NewTCPPushSession(args.SnapshotToken, child.TryInstallRemotePages, args.MaxTransferBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
 	childOwned := true
 	defer func() {
 		if childOwned {
@@ -244,6 +265,12 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	l.distributedRestore = true
 	l.distributedRestoreSessionID = args.SessionID
 	l.state = restoringUnstarted
+	if pushReceiver != nil {
+		l.distributedPushReceiver = pushReceiver
+		conn := pushConn
+		pushConn = nil // receiver owns it.
+		go func() { _ = pushReceiver.ServeStream(conn) }()
+	}
 	old.Release()
 	childOwned = false
 	var remoteBytes uint64

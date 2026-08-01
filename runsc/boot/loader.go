@@ -60,6 +60,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -246,6 +247,7 @@ type Loader struct {
 	distributedRestore          bool
 	distributedRestoreSessionID string
 	distributedRestoreInfo      DistributedForkRestoreInfo
+	distributedPushReceiver     *ttcremote.TCPPushReceiver
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -1073,6 +1075,9 @@ func (l *Loader) Destroy() {
 	}
 	l.family.DestroyChildren()
 	l.family.CloseDistributedForkSessions()
+	if l.distributedPushReceiver != nil {
+		_ = l.distributedPushReceiver.Close()
+	}
 	l.k.Release()
 
 	// Release any dangling tcp connections.

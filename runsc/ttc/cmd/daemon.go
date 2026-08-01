@@ -187,6 +187,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
+		PushPolicy: ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
 	}
 	switch tx.Negotiated.PagingPolicy.Prefetch {
 	case ttcpolicy.PrefetchSequential, ttcpolicy.PrefetchAdaptive:
@@ -234,6 +235,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return err
 		}
 		connectionCount := 1 + (restoreArgs.MaxParallel+1)*(restoreArgs.RetryLimit+1)
+		if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
+			connectionCount++
+		}
 		connectionFiles := make([]*os.File, 0, connectionCount)
 		for i := 0; i < connectionCount; i++ {
 			conn, err := (&net.Dialer{Timeout: restoreArgs.Timeout}).DialContext(ctx, "tcp", session.Address)

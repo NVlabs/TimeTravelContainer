@@ -104,6 +104,7 @@ go_library(
         "//pkg/sentry/hostmm",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/ttcremote",
         "//pkg/sentry/platform",
         "//pkg/sentry/socket/plugin",
         "//pkg/sentry/syscalls/linux",

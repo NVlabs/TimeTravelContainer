@@ -149,6 +149,7 @@ type TCPPageServer struct {
 	conns     map[io.ReadWriteCloser]struct{}
 	closeErr  error
 	closeDone chan struct{}
+	stop      chan struct{}
 	wg        sync.WaitGroup
 
 	requests      atomic.Uint64
@@ -157,6 +158,10 @@ type TCPPageServer struct {
 	bytes         atomic.Uint64
 	metadata      []byte
 	metadataBytes atomic.Uint64
+	pushOpts      *TCPPushSenderOpts
+	pushBytes     atomic.Uint64
+	pushRetries   atomic.Uint64
+	pushSenders   map[*TCPPushSender]struct{}
 }
 
 // TCPPageServerStats reports completed protocol operations.
@@ -166,6 +171,8 @@ type TCPPageServerStats struct {
 	AckBatches        uint64
 	BytesSent         uint64
 	MetadataBytesSent uint64
+	PushBytesSent     uint64
+	PushRetries       uint64
 }
 
 // NewTCPPageServer constructs a server. Serve must be called to accept peers.
@@ -192,11 +199,13 @@ func NewTCPPageSession(token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, ma
 		return nil, fmt.Errorf("invalid maximum TCP page read size %d", maxRead)
 	}
 	return &TCPPageServer{
-		token:     token,
-		snapshot:  snapshot,
-		maxRead:   maxRead,
-		conns:     make(map[io.ReadWriteCloser]struct{}),
-		closeDone: make(chan struct{}),
+		token:       token,
+		snapshot:    snapshot,
+		maxRead:     maxRead,
+		conns:       make(map[io.ReadWriteCloser]struct{}),
+		closeDone:   make(chan struct{}),
+		stop:        make(chan struct{}),
+		pushSenders: make(map[*TCPPushSender]struct{}),
 	}, nil
 }
 
@@ -210,13 +219,23 @@ func (s *TCPPageServer) Addr() net.Addr {
 
 // Stats returns server counters.
 func (s *TCPPageServer) Stats() TCPPageServerStats {
-	return TCPPageServerStats{
+	stats := TCPPageServerStats{
 		PullRequests:      s.requests.Load(),
 		AckRequests:       s.acks.Load(),
 		AckBatches:        s.ackBatches.Load(),
 		BytesSent:         s.bytes.Load(),
 		MetadataBytesSent: s.metadataBytes.Load(),
+		PushBytesSent:     s.pushBytes.Load(),
+		PushRetries:       s.pushRetries.Load(),
 	}
+	s.mu.Lock()
+	for sender := range s.pushSenders {
+		active := sender.Stats()
+		stats.PushBytesSent += active.BytesPushed
+		stats.PushRetries += active.Retries
+	}
+	s.mu.Unlock()
+	return stats
 }
 
 // SnapshotStats returns the current page-ownership state. It intentionally
@@ -240,6 +259,21 @@ func (s *TCPPageServer) SetMetadata(metadata []byte) error {
 		return errors.New("TCP page metadata exceeds 4 GiB protocol limit")
 	}
 	s.metadata = append([]byte(nil), metadata...)
+	return nil
+}
+
+// ConfigurePush enables target-registered reverse push lanes. It must be
+// called before any stream is served.
+func (s *TCPPageServer) ConfigurePush(opts TCPPushSenderOpts) error {
+	if err := validateTCPPushSenderOpts(&opts); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.conns) != 0 || s.closed {
+		return errors.New("cannot configure TCP push after serving starts")
+	}
+	s.pushOpts = &opts
 	return nil
 }
 
@@ -414,6 +448,34 @@ func (s *TCPPageServer) serveConn(conn io.ReadWriteCloser) {
 				return
 			}
 
+		case tcpPushRegister:
+			if header.offset != 0 || header.length != 0 || header.checksum != 0 || s.pushOpts == nil {
+				s.writeError(conn, header, errors.New("reverse push is not enabled"))
+				return
+			}
+			if err := writeTCPMessage(conn, tcpHeader{
+				type_: tcpPushRegisterOK, token: s.token, requestID: header.requestID,
+			}, nil); err != nil {
+				return
+			}
+			netConn, ok := conn.(net.Conn)
+			if !ok {
+				s.writeError(conn, header, errors.New("reverse push stream does not support deadlines"))
+				return
+			}
+			sender := &TCPPushSender{done: make(chan struct{})}
+			s.mu.Lock()
+			s.pushSenders[sender] = struct{}{}
+			s.mu.Unlock()
+			sender.run("", s.token, s.snapshot, *s.pushOpts, netConn, false, s.stop)
+			stats := sender.Stats()
+			s.mu.Lock()
+			delete(s.pushSenders, sender)
+			s.mu.Unlock()
+			s.pushBytes.Add(stats.BytesPushed)
+			s.pushRetries.Add(stats.Retries)
+			return
+
 		default:
 			s.writeError(conn, header, fmt.Errorf("unexpected message type %d", header.type_))
 			return
@@ -513,6 +575,7 @@ func (s *TCPPageServer) Close() error {
 		return err
 	}
 	s.closed = true
+	close(s.stop)
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()

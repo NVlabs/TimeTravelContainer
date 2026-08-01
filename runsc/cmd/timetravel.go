@@ -31,6 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -84,6 +85,8 @@ type TimeTravel struct {
 	distributedConnectionsCount   int
 	distributedPrefetchBytes      uint64
 	distributedPrefetchBehind     uint64
+	distributedPushPolicy         string
+	distributedPushHighWater      uint64
 }
 
 // Name implements subcommands.Command.Name.
@@ -153,6 +156,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.distributedConnectionsCount, "distributed-connections-count", 0, "number of inherited target page streams")
 	f.Uint64Var(&t.distributedPrefetchBytes, "distributed-prefetch-bytes", 0, "remote-memory bytes to prefetch after a fault")
 	f.Uint64Var(&t.distributedPrefetchBehind, "distributed-prefetch-behind-bytes", 0, "remote-memory bytes to prefetch before a fault")
+	f.StringVar(&t.distributedPushPolicy, "distributed-push-policy", "demand-only", "reverse push policy")
+	f.Uint64Var(&t.distributedPushHighWater, "distributed-push-high-water", 0, "retained source bytes that trigger pressure push")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -252,6 +257,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				SessionID: t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
 				TargetBranchID: f.Arg(2), AdvertiseAddress: t.distributedAdvertise,
 				MaxTransferBytes: t.distributedMaxTransfer, ExternalListener: true,
+				PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
 			})
 			break
 		}
@@ -282,6 +288,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			FilePayload: urpc.FilePayload{Files: []*os.File{listenerFile}},
 			SessionID:   t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
 			TargetBranchID: f.Arg(2), AdvertiseAddress: advertise, MaxTransferBytes: t.distributedMaxTransfer,
+			PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
 		})
 		listenerFile.Close()
 		listener.Close()

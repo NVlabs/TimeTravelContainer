@@ -30,7 +30,9 @@ import (
 )
 
 const (
-	tcpPush tcpMessageType = 32 + iota
+	tcpPushRegister tcpMessageType = 32 + iota
+	tcpPushRegisterOK
+	tcpPush
 	tcpPushOK
 	tcpPushSkip
 	tcpPushCommit
@@ -47,12 +49,12 @@ type pushReceiptKey struct {
 type TCPPushReceiver struct {
 	listener net.Listener
 	token    SnapshotToken
-	pages    *pgalloc.AsyncPagesFileLoad
+	install  func(uint64, []byte) (bool, error)
 	maxPush  uint64
 
 	mu        sync.Mutex
 	closed    bool
-	conns     map[net.Conn]struct{}
+	conns     map[io.ReadWriteCloser]struct{}
 	receipts  map[pushReceiptKey]uint32
 	wg        sync.WaitGroup
 	installed atomic.Uint64
@@ -61,24 +63,46 @@ type TCPPushReceiver struct {
 
 // NewTCPPushReceiver constructs a target-side push receiver.
 func NewTCPPushReceiver(listener net.Listener, token SnapshotToken, pages *pgalloc.AsyncPagesFileLoad, maxPush uint64) (*TCPPushReceiver, error) {
-	if listener == nil || pages == nil || maxPush < hostarch.PageSize || !hostarch.IsPageAligned(maxPush) || maxPush > 2<<20 {
+	if listener == nil || pages == nil {
+		return nil, errors.New("invalid TCP push receiver configuration")
+	}
+	return newTCPPushReceiver(listener, token, pages.TryInstallRemotePages, maxPush)
+}
+
+// NewTCPPushSession constructs a receiver whose connected stream is supplied
+// by ServeStream. install atomically arbitrates each push against concurrent
+// pull completion.
+func NewTCPPushSession(token SnapshotToken, install func(uint64, []byte) (bool, error), maxPush uint64) (*TCPPushReceiver, error) {
+	return newTCPPushReceiver(nil, token, install, maxPush)
+}
+
+func newTCPPushReceiver(listener net.Listener, token SnapshotToken, install func(uint64, []byte) (bool, error), maxPush uint64) (*TCPPushReceiver, error) {
+	if install == nil || maxPush < hostarch.PageSize || !hostarch.IsPageAligned(maxPush) || maxPush > 2<<20 {
 		return nil, errors.New("invalid TCP push receiver configuration")
 	}
 	return &TCPPushReceiver{
 		listener: listener,
 		token:    token,
-		pages:    pages,
+		install:  install,
 		maxPush:  maxPush,
-		conns:    make(map[net.Conn]struct{}),
+		conns:    make(map[io.ReadWriteCloser]struct{}),
 		receipts: make(map[pushReceiptKey]uint32),
 	}, nil
 }
 
 // Addr returns the reverse-channel listen address.
-func (r *TCPPushReceiver) Addr() net.Addr { return r.listener.Addr() }
+func (r *TCPPushReceiver) Addr() net.Addr {
+	if r.listener == nil {
+		return nil
+	}
+	return r.listener.Addr()
+}
 
 // Serve accepts push connections until Close.
 func (r *TCPPushReceiver) Serve() error {
+	if r.listener == nil {
+		return errors.New("TCP push session has no listener")
+	}
 	for {
 		conn, err := r.listener.Accept()
 		if err != nil {
@@ -103,13 +127,48 @@ func (r *TCPPushReceiver) Serve() error {
 	}
 }
 
-func (r *TCPPushReceiver) serveConn(conn net.Conn) {
-	defer func() {
-		conn.Close()
-		r.mu.Lock()
-		delete(r.conns, conn)
+// ServeStream registers a reverse push lane on an already-connected page
+// stream, then receives pushes until the source closes it.
+func (r *TCPPushReceiver) ServeStream(conn io.ReadWriteCloser) error {
+	if conn == nil {
+		return errors.New("nil TCP push connection")
+	}
+	r.mu.Lock()
+	if r.closed {
 		r.mu.Unlock()
-		r.wg.Done()
+		conn.Close()
+		return net.ErrClosed
+	}
+	r.conns[conn] = struct{}{}
+	r.wg.Add(1)
+	r.mu.Unlock()
+	if err := writeTCPMessage(conn, tcpHeader{type_: tcpPushRegister, token: r.token, requestID: 1}, nil); err != nil {
+		r.finishConn(conn)
+		return err
+	}
+	response, err := readTCPHeader(conn)
+	if err != nil || response.type_ != tcpPushRegisterOK || response.token != r.token || response.requestID != 1 || response.offset != 0 || response.length != 0 || response.checksum != 0 {
+		r.finishConn(conn)
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid TCP push registration response")
+	}
+	r.serveConn(conn)
+	return nil
+}
+
+func (r *TCPPushReceiver) finishConn(conn io.ReadWriteCloser) {
+	conn.Close()
+	r.mu.Lock()
+	delete(r.conns, conn)
+	r.mu.Unlock()
+	r.wg.Done()
+}
+
+func (r *TCPPushReceiver) serveConn(conn io.ReadWriteCloser) {
+	defer func() {
+		r.finishConn(conn)
 	}()
 	for {
 		header, err := readTCPHeader(conn)
@@ -160,7 +219,7 @@ func (r *TCPPushReceiver) serveConn(conn net.Conn) {
 			}
 			continue
 		}
-		installed, err := r.pages.TryInstallRemotePages(header.offset, payload)
+		installed, err := r.install(header.offset, payload)
 		if err != nil {
 			return
 		}
@@ -191,7 +250,10 @@ func (r *TCPPushReceiver) Close() error {
 		return nil
 	}
 	r.closed = true
-	err := r.listener.Close()
+	var err error
+	if r.listener != nil {
+		err = r.listener.Close()
+	}
 	for conn := range r.conns {
 		conn.Close()
 	}
@@ -276,30 +338,44 @@ func StartTCPPushSenderWithOpts(address string, token SnapshotToken, snapshot *p
 	if opts.Policy == "" {
 		opts.Policy = TCPPushDirtyOrphan
 	}
-	if address == "" || snapshot == nil || opts.MaxPush < hostarch.PageSize || !hostarch.IsPageAligned(opts.MaxPush) ||
-		opts.MaxPush > 2<<20 || opts.Timeout <= 0 || opts.RetryLimit < 0 || opts.RetryBackoff < 0 {
+	if address == "" || snapshot == nil {
 		return nil, errors.New("invalid TCP push sender configuration")
 	}
+	if err := validateTCPPushSenderOpts(&opts); err != nil {
+		return nil, err
+	}
+	s := &TCPPushSender{done: make(chan struct{})}
+	go s.run(address, token, snapshot, opts, nil, true, nil)
+	return s, nil
+}
+
+func validateTCPPushSenderOpts(opts *TCPPushSenderOpts) error {
+	if opts.MaxPush < hostarch.PageSize || !hostarch.IsPageAligned(opts.MaxPush) ||
+		opts.MaxPush > 2<<20 || opts.Timeout <= 0 || opts.RetryLimit < 0 || opts.RetryBackoff < 0 {
+		return errors.New("invalid TCP push sender configuration")
+	}
 	switch opts.Policy {
-	case TCPPushDemandOnly, TCPPushDirtyOrphan, TCPPushEagerDrain:
+	case TCPPushDemandOnly, TCPPushDirtyOrphan:
+	case TCPPushEagerDrain:
+		if opts.ScanInterval <= 0 {
+			opts.ScanInterval = 10 * time.Millisecond
+		}
 	case TCPPushMemoryPressure:
 		if opts.RetainedHighWater < hostarch.PageSize {
-			return nil, errors.New("memory-pressure push requires a retained high-water mark of at least one page")
+			return errors.New("memory-pressure push requires a retained high-water mark of at least one page")
 		}
 		if opts.ScanInterval <= 0 {
 			opts.ScanInterval = 10 * time.Millisecond
 		}
 	default:
-		return nil, fmt.Errorf("unknown TCP push policy %q", opts.Policy)
+		return fmt.Errorf("unknown TCP push policy %q", opts.Policy)
 	}
-	s := &TCPPushSender{done: make(chan struct{})}
-	go s.run(address, token, snapshot, opts)
-	return s, nil
+	return nil
 }
 
-func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts) {
+func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, initial net.Conn, allowDial bool, stop <-chan struct{}) {
 	defer close(s.done)
-	var conn net.Conn
+	conn := initial
 	defer func() {
 		if conn != nil {
 			conn.Close()
@@ -320,27 +396,32 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 			return
 		}
 		s.scans.Add(1)
-		if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID); err != nil {
+		if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID, allowDial); err != nil {
 			s.err.Store(err)
+			return
+		}
+		if snapshot.Stats().PagesOutstanding == 0 {
 			return
 		}
 	}
 	var ticker *time.Ticker
 	var tickerC <-chan time.Time
-	if opts.Policy == TCPPushMemoryPressure {
+	if opts.Policy == TCPPushMemoryPressure || opts.Policy == TCPPushEagerDrain {
 		ticker = time.NewTicker(opts.ScanInterval)
 		defer ticker.Stop()
 		tickerC = ticker.C
 	}
 	for {
 		select {
+		case <-stop:
+			return
 		case hint, ok := <-hints:
 			if !ok {
 				return
 			}
 			merged, consumed, closed := collectCoalescedPushHints(hint, hints)
 			s.hints.Add(uint64(consumed))
-			if err := s.sendRanges(&conn, address, token, snapshot, opts, merged, &requestID); err != nil {
+			if err := s.sendRanges(&conn, address, token, snapshot, opts, merged, &requestID, allowDial); err != nil {
 				s.err.Store(err)
 				return
 			}
@@ -349,7 +430,10 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 			}
 		case <-tickerC:
 			stats := snapshot.Stats()
-			if stats.PagesOutstanding*hostarch.PageSize < opts.RetainedHighWater {
+			if opts.Policy == TCPPushEagerDrain && stats.PagesOutstanding == 0 {
+				return
+			}
+			if opts.Policy == TCPPushMemoryPressure && stats.PagesOutstanding*hostarch.PageSize < opts.RetainedHighWater {
 				continue
 			}
 			outstanding, err := snapshot.OutstandingStreamRanges(opts.MaxPush)
@@ -358,7 +442,7 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 				return
 			}
 			s.scans.Add(1)
-			if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID); err != nil {
+			if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID, allowDial); err != nil {
 				s.err.Store(err)
 				return
 			}
@@ -366,7 +450,7 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 	}
 }
 
-func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, ranges []pgalloc.RemotePushHint, requestID *uint32) error {
+func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, ranges []pgalloc.RemotePushHint, requestID *uint32, allowDial bool) error {
 	for _, candidate := range ranges {
 		for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; (*requestID)++ {
 			length := min(remaining, opts.MaxPush)
@@ -375,7 +459,7 @@ func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token Snapsho
 				break
 			}
 			header := tcpHeader{type_: tcpPush, token: token, requestID: *requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
-			response, err := s.pushWithRetry(conn, address, token, header, payload, opts)
+			response, err := s.pushWithRetry(conn, address, token, header, payload, opts, allowDial)
 			if err != nil {
 				return err
 			}
@@ -387,7 +471,7 @@ func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token Snapsho
 				commit := header
 				commit.type_ = tcpPushCommit
 				commit.checksum = 0
-				response, err = s.pushWithRetry(conn, address, token, commit, nil, opts)
+				response, err = s.pushWithRetry(conn, address, token, commit, nil, opts, allowDial)
 				if err != nil {
 					return err
 				}
@@ -445,10 +529,10 @@ collect:
 	return merged, consumed, closed
 }
 
-func (s *TCPPushSender) pushWithRetry(conn *net.Conn, address string, token SnapshotToken, header tcpHeader, payload []byte, opts TCPPushSenderOpts) (tcpHeader, error) {
+func (s *TCPPushSender) pushWithRetry(conn *net.Conn, address string, token SnapshotToken, header tcpHeader, payload []byte, opts TCPPushSenderOpts, allowDial bool) (tcpHeader, error) {
 	var lastErr error
 	for attempt := 0; attempt <= opts.RetryLimit; attempt++ {
-		if *conn == nil {
+		if *conn == nil && allowDial {
 			var err error
 			*conn, err = net.DialTimeout("tcp", address, opts.Timeout)
 			if err != nil {
@@ -468,6 +552,9 @@ func (s *TCPPushSender) pushWithRetry(conn *net.Conn, address string, token Snap
 			}
 			(*conn).Close()
 			*conn = nil
+		}
+		if !allowDial {
+			break
 		}
 		if attempt != opts.RetryLimit {
 			s.retries.Add(1)

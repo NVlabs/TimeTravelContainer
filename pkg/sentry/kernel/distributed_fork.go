@@ -306,6 +306,15 @@ func (k *Kernel) SetDistributedForkPrefetchWindow(behind, ahead uint64) error {
 	return k.remotePageLoad.SetPrefetchWindow(behind, ahead)
 }
 
+// TryInstallRemotePages atomically installs a proactive push unless a pull or
+// another push already owns the range.
+func (k *Kernel) TryInstallRemotePages(offset uint64, data []byte) (bool, error) {
+	if k.remotePageLoad == nil {
+		return false, fmt.Errorf("kernel has no active distributed remote-memory load")
+	}
+	return k.remotePageLoad.TryInstallRemotePages(offset, data)
+}
+
 // DistributedForkDependencyStatus reports whether this Kernel still depends
 // on a remote memory source.
 func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {

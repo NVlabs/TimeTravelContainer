@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -89,6 +90,13 @@ func (r *distributedPageRelay) serve() {
 
 func (r *distributedPageRelay) serveFile(file *os.File) {
 	defer file.Close()
+	timeout := unix.NsecToTimeval((30 * time.Second).Nanoseconds())
+	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
+		return
+	}
+	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
+		return
+	}
 	command := runscCommand(r.backend.runsc,
 		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
 		r.source, "distributed-serve", r.session)
@@ -259,6 +267,8 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		"--distributed-external-listener",
 		"--distributed-advertise", advertise,
 		"--distributed-max-transfer", fmt.Sprint(tx.Negotiated.PagingPolicy.TransferBytes),
+		"--distributed-push-policy", string(tx.Negotiated.PagingPolicy.Push),
+		"--distributed-push-high-water", fmt.Sprint(tx.Negotiated.PagingPolicy.MaxOutstandingBytes),
 	}
 	args = append(args, source.container, "distributed-capture", transactionID)
 	output, err := b.command(args...)
