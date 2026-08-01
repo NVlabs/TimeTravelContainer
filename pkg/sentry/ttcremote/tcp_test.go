@@ -896,6 +896,54 @@ func TestTCPDonatedReversePushLane(t *testing.T) {
 	}
 }
 
+func TestTCPReversePushReleasesTargetResolvedPage(t *testing.T) {
+	_, _, snapshot, pages := newTCPPushPolicyTestSession(t, 1)
+	defer pages.Cancel()
+	token := SnapshotToken{7, 6, 5, 4}
+	server, err := NewTCPPageSession(token, snapshot, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.ConfigurePush(TCPPushSenderOpts{
+		MaxPush: hostarch.PageSize, Timeout: time.Second, RetryLimit: 0,
+		Policy: TCPPushEagerDrain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := newTCPPushReceiver(nil, token, func(uint64, []byte) (pgalloc.RemotePageInstallResult, error) {
+		return pgalloc.RemotePageInstallResolved, nil
+	}, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sourceConn, targetConn := net.Pipe()
+	go func() { _ = server.ServeConn(sourceConn) }()
+	done := make(chan error, 1)
+	go func() { done <- receiver.ServeStream(targetConn) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for server.SnapshotStats().PagesOutstanding != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := server.SnapshotStats().PagesOutstanding; got != 0 {
+		t.Fatalf("source retains %d target-resolved pages", got)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.Stats().PushBytesSent; got != 0 {
+		t.Fatalf("resolved page counted as transferred: %d", got)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reverse receiver did not stop")
+	}
+}
+
 func TestCoalesceAdjacentAndOverlappingPushHints(t *testing.T) {
 	hints := make(chan pgalloc.RemotePushHint, 4)
 	hints <- pgalloc.RemotePushHint{StreamOffset: 3 * hostarch.PageSize, Length: hostarch.PageSize}

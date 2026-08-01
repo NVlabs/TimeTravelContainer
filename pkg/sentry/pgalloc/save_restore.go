@@ -1490,16 +1490,46 @@ func (apfl *AsyncPagesFileLoad) Wait() error {
 	return apfl.err()
 }
 
+// RemotePageInstallResult describes the outcome of an unsolicited page push.
+type RemotePageInstallResult uint8
+
+const (
+	// RemotePageInstallBusy means that at least part of the range is still
+	// pending, but the whole range cannot be installed atomically. A concurrent
+	// pull may own it, or the request may span loaded and unloaded subranges.
+	RemotePageInstallBusy RemotePageInstallResult = iota
+	// RemotePageInstallInstalled means that data was installed atomically.
+	RemotePageInstallInstalled
+	// RemotePageInstallResolved means that no part of the range remains pending.
+	// The target therefore no longer depends on the source copy.
+	RemotePageInstallResolved
+)
+
 // TryInstallRemotePages installs an unsolicited pushed range if none of its
 // pages has started a pull. It returns false without changing state when pull
-// already owns the range or the stream range is not pending. The caller may
-// acknowledge the source only when installed is true.
+// already owns the range or the stream range is already resolved. Callers that
+// need to distinguish those cases should use TryInstallRemotePagesState.
 func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data []byte) (installed bool, err error) {
+	result, err := apfl.TryInstallRemotePagesState(streamOffset, data)
+	return result == RemotePageInstallInstalled, err
+}
+
+// TryInstallRemotePagesState is TryInstallRemotePages with a tri-state result.
+// Resolved is reported only while holding the loader locks and after proving
+// that no unloaded range overlaps the requested stream interval. This lets a
+// push transport release source ownership without confusing an already-loaded
+// range with a pull/push race.
+func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, data []byte) (result RemotePageInstallResult, err error) {
 	length := uint64(len(data))
 	if length == 0 || !hostarch.IsPageAligned(streamOffset) || !hostarch.IsPageAligned(length) {
-		return false, fmt.Errorf("pushed remote range must be non-empty and page-aligned: off=%d len=%d", streamOffset, length)
+		return RemotePageInstallBusy, fmt.Errorf("pushed remote range must be non-empty and page-aligned: off=%d len=%d", streamOffset, length)
+	}
+	streamEnd := streamOffset + length
+	if streamEnd < streamOffset {
+		return RemotePageInstallBusy, fmt.Errorf("pushed remote range overflows: off=%d len=%d", streamOffset, length)
 	}
 	var wakeups []*aplWaiter
+	anyPending := false
 	apfl.amflsMu.Lock()
 	defer func() {
 		apfl.amflsMu.Unlock()
@@ -1512,6 +1542,10 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data 
 		apfl.mu.Lock()
 		for ulseg := amfl.unloaded.FirstSegment(); ulseg.Ok(); ulseg = ulseg.NextSegment() {
 			ul := ulseg.ValuePtr()
+			unloadedEnd := ul.off + ulseg.Range().Length()
+			if streamOffset < unloadedEnd && ul.off < streamEnd {
+				anyPending = true
+			}
 			if streamOffset < ul.off || streamOffset-ul.off > ulseg.Range().Length() ||
 				length > ulseg.Range().Length()-(streamOffset-ul.off) {
 				continue
@@ -1519,7 +1553,7 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data 
 			if ul.started {
 				apfl.mu.Unlock()
 				amfl.f.mu.Unlock()
-				return false, nil
+				return RemotePageInstallBusy, nil
 			}
 			targetStart := ulseg.Start() + (streamOffset - ul.off)
 			ulseg = amfl.unloaded.SplitBefore(ulseg, targetStart)
@@ -1531,7 +1565,7 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data 
 			if uint64(copied) != length {
 				apfl.mu.Unlock()
 				amfl.f.mu.Unlock()
-				return false, fmt.Errorf("pushed remote range copied %d bytes, want %d", copied, length)
+				return RemotePageInstallBusy, fmt.Errorf("pushed remote range copied %d bytes, want %d", copied, length)
 			}
 			for _, waiter := range ul.waiters {
 				waiter.pending -= length
@@ -1564,12 +1598,15 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePages(streamOffset uint64, data 
 			}
 			apfl.mu.Unlock()
 			amfl.f.mu.Unlock()
-			return true, nil
+			return RemotePageInstallInstalled, nil
 		}
 		apfl.mu.Unlock()
 		amfl.f.mu.Unlock()
 	}
-	return false, nil
+	if anyPending {
+		return RemotePageInstallBusy, nil
+	}
+	return RemotePageInstallResolved, nil
 }
 
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles

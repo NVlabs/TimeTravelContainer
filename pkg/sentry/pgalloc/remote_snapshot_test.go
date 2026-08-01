@@ -518,6 +518,47 @@ func TestCancelDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestTryInstallRemotePagesDistinguishesResolvedAndMixedRanges(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 2)
+	target, targetFR := newRemoteTestMemoryFile(t, 2)
+	want := bytes.Repeat([]byte{0x4a}, int(sourceFR.Length()))
+	fillRemoteTestRange(t, source, sourceFR, want)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		pages.Cancel()
+		_ = pages.Wait()
+	}()
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	loaded, err := target.MapInternal(memmap.FileRange{targetFR.Start, targetFR.Start + hostarch.PageSize}, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), loaded); err != nil || n != hostarch.PageSize {
+		t.Fatalf("faulting first page: n=%d err=%v", n, err)
+	}
+	if result, err := pages.TryInstallRemotePagesState(0, want); err != nil || result != RemotePageInstallBusy {
+		t.Fatalf("mixed range result=%v err=%v, want busy", result, err)
+	}
+	if result, err := pages.TryInstallRemotePagesState(0, want[:hostarch.PageSize]); err != nil || result != RemotePageInstallResolved {
+		t.Fatalf("loaded range result=%v err=%v, want resolved", result, err)
+	}
+	if result, err := pages.TryInstallRemotePagesState(hostarch.PageSize, want[hostarch.PageSize:]); err != nil || result != RemotePageInstallInstalled {
+		t.Fatalf("pending range result=%v err=%v, want installed", result, err)
+	}
+}
+
 func TestLoopbackProactivePushWinsBeforePull(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 2)
 	target, targetFR := newRemoteTestMemoryFile(t, 2)

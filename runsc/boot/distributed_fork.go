@@ -225,7 +225,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	var pushReceiver *ttcremote.TCPPushReceiver
 	if pushConn != nil {
-		pushReceiver, err = ttcremote.NewTCPPushSession(args.SnapshotToken, child.TryInstallRemotePages, args.MaxTransferBytes)
+		pushReceiver, err = ttcremote.NewTCPPushStateSession(args.SnapshotToken, child.TryInstallRemotePagesState, args.MaxTransferBytes)
 		if err != nil {
 			return nil, err
 		}

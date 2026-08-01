@@ -37,6 +37,7 @@ const (
 	tcpPushSkip
 	tcpPushCommit
 	tcpPushCommitOK
+	tcpPushResolved
 )
 
 type pushReceiptKey struct {
@@ -49,7 +50,7 @@ type pushReceiptKey struct {
 type TCPPushReceiver struct {
 	listener net.Listener
 	token    SnapshotToken
-	install  func(uint64, []byte) (bool, error)
+	install  func(uint64, []byte) (pgalloc.RemotePageInstallResult, error)
 	maxPush  uint64
 
 	mu        sync.Mutex
@@ -66,17 +67,34 @@ func NewTCPPushReceiver(listener net.Listener, token SnapshotToken, pages *pgall
 	if listener == nil || pages == nil {
 		return nil, errors.New("invalid TCP push receiver configuration")
 	}
-	return newTCPPushReceiver(listener, token, pages.TryInstallRemotePages, maxPush)
+	return newTCPPushReceiver(listener, token, pages.TryInstallRemotePagesState, maxPush)
 }
 
 // NewTCPPushSession constructs a receiver whose connected stream is supplied
 // by ServeStream. install atomically arbitrates each push against concurrent
 // pull completion.
 func NewTCPPushSession(token SnapshotToken, install func(uint64, []byte) (bool, error), maxPush uint64) (*TCPPushReceiver, error) {
+	if install == nil {
+		return nil, errors.New("invalid TCP push receiver configuration")
+	}
+	return newTCPPushReceiver(nil, token, func(offset uint64, data []byte) (pgalloc.RemotePageInstallResult, error) {
+		installed, err := install(offset, data)
+		if installed {
+			return pgalloc.RemotePageInstallInstalled, err
+		}
+		return pgalloc.RemotePageInstallBusy, err
+	}, maxPush)
+}
+
+// NewTCPPushStateSession constructs a receiver that preserves the distinction
+// between a pull-owned range and one the target has already resolved. Runtime
+// restore should use this form so the source can release pages materialized by
+// restore itself without weakening pull/push arbitration.
+func NewTCPPushStateSession(token SnapshotToken, install func(uint64, []byte) (pgalloc.RemotePageInstallResult, error), maxPush uint64) (*TCPPushReceiver, error) {
 	return newTCPPushReceiver(nil, token, install, maxPush)
 }
 
-func newTCPPushReceiver(listener net.Listener, token SnapshotToken, install func(uint64, []byte) (bool, error), maxPush uint64) (*TCPPushReceiver, error) {
+func newTCPPushReceiver(listener net.Listener, token SnapshotToken, install func(uint64, []byte) (pgalloc.RemotePageInstallResult, error), maxPush uint64) (*TCPPushReceiver, error) {
 	if install == nil || maxPush < hostarch.PageSize || !hostarch.IsPageAligned(maxPush) || maxPush > 2<<20 {
 		return nil, errors.New("invalid TCP push receiver configuration")
 	}
@@ -219,17 +237,19 @@ func (r *TCPPushReceiver) serveConn(conn io.ReadWriteCloser) {
 			}
 			continue
 		}
-		installed, err := r.install(header.offset, payload)
+		result, err := r.install(header.offset, payload)
 		if err != nil {
 			return
 		}
 		responseType := tcpPushSkip
-		if installed {
+		if result == pgalloc.RemotePageInstallInstalled {
 			responseType = tcpPushOK
 			r.mu.Lock()
 			r.receipts[key] = header.checksum
 			r.mu.Unlock()
 			r.installed.Add(uint64(header.length))
+		} else if result == pgalloc.RemotePageInstallResolved {
+			responseType = tcpPushResolved
 		} else {
 			r.skipped.Add(uint64(header.length))
 		}
@@ -452,13 +472,15 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 
 func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, ranges []pgalloc.RemotePushHint, requestID *uint32, allowDial bool) error {
 	for _, candidate := range ranges {
-		for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; (*requestID)++ {
+		for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; {
 			length := min(remaining, opts.MaxPush)
 			payload := make([]byte, length)
 			if n, err := snapshot.CopyStreamAt(payload, int64(off)); err != nil || uint64(n) != length {
 				break
 			}
-			header := tcpHeader{type_: tcpPush, token: token, requestID: *requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
+			id := *requestID
+			*requestID = *requestID + 1
+			header := tcpHeader{type_: tcpPush, token: token, requestID: id, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
 			response, err := s.pushWithRetry(conn, address, token, header, payload, opts, allowDial)
 			if err != nil {
 				return err
@@ -484,6 +506,27 @@ func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token Snapsho
 				s.bytes.Add(length)
 				s.chunks.Add(1)
 			case tcpPushSkip:
+				// A large push may straddle a range already materialized by
+				// restore and a range owned by a concurrent pull. Refine it to
+				// page granularity so resolved pages can be acknowledged while
+				// genuinely busy pages remain conservatively pinned.
+				if length > hostarch.PageSize {
+					left := hostarch.PageRoundDown(length / 2)
+					if left == 0 {
+						left = hostarch.PageSize
+					}
+					parts := []pgalloc.RemotePushHint{
+						{StreamOffset: off, Length: left},
+						{StreamOffset: off + left, Length: length - left},
+					}
+					if err := s.sendRanges(conn, address, token, snapshot, opts, parts, requestID, allowDial); err != nil {
+						return err
+					}
+				}
+			case tcpPushResolved:
+				if err := snapshot.AcknowledgeStreamRange(off, length); err != nil {
+					return err
+				}
 			default:
 				return fmt.Errorf("unexpected TCP push response %d", response.type_)
 			}

@@ -315,6 +315,16 @@ func (k *Kernel) TryInstallRemotePages(offset uint64, data []byte) (bool, error)
 	return k.remotePageLoad.TryInstallRemotePages(offset, data)
 }
 
+// TryInstallRemotePagesState is TryInstallRemotePages with enough state for a
+// transport to distinguish a pull race from a range already materialized by
+// restore.
+func (k *Kernel) TryInstallRemotePagesState(offset uint64, data []byte) (pgalloc.RemotePageInstallResult, error) {
+	if k.remotePageLoad == nil {
+		return pgalloc.RemotePageInstallBusy, fmt.Errorf("kernel has no active distributed remote-memory load")
+	}
+	return k.remotePageLoad.TryInstallRemotePagesState(offset, data)
+}
+
 // DistributedForkDependencyStatus reports whether this Kernel still depends
 // on a remote memory source.
 func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {
