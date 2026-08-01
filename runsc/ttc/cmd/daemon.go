@@ -156,7 +156,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	return err
 }
 
-func (r *daemonTargetRuntime) Prepare(_ context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
+func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
 	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
 	if err != nil {
 		return err
@@ -171,7 +171,7 @@ func (r *daemonTargetRuntime) Prepare(_ context.Context, tx *cluster.Transaction
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
-		MaxParallel: 16, Timeout: 30 * time.Second, RetryLimit: 3, PrefetchBytes: 64 << 10,
+		MaxParallel: 4, Timeout: 30 * time.Second, RetryLimit: 2, PrefetchBytes: 64 << 10,
 	}
 	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	var runtimeState struct {
@@ -210,8 +210,66 @@ func (r *daemonTargetRuntime) Prepare(_ context.Context, tx *cluster.Transaction
 			reader.Close()
 			return err
 		}
-		_, err = r.backend.commandWithFiles([]*os.File{reader}, "timetravel", "--distributed-config-fd=3", info.ID, "distributed-restore", tx.Identity.TransactionID)
+		connectionCount := 1 + (restoreArgs.MaxParallel+1)*(restoreArgs.RetryLimit+1)
+		connectionFiles := make([]*os.File, 0, connectionCount)
+		for i := 0; i < connectionCount; i++ {
+			conn, err := (&net.Dialer{Timeout: restoreArgs.Timeout}).DialContext(ctx, "tcp", session.Address)
+			if err != nil {
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				reader.Close()
+				return fmt.Errorf("connecting donated distributed page stream %d/%d: %w", i+1, connectionCount, err)
+			}
+			tcp, ok := conn.(*net.TCPConn)
+			if !ok {
+				conn.Close()
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				reader.Close()
+				return fmt.Errorf("distributed page connection is %T, want TCP", conn)
+			}
+			file, err := tcp.File()
+			conn.Close()
+			if err != nil {
+				for _, opened := range connectionFiles {
+					opened.Close()
+				}
+				reader.Close()
+				return err
+			}
+			// The isolated Sentry intentionally treats donated streams as plain
+			// byte FDs and performs no host socket control operations. Install
+			// kernel-enforced per-I/O timeouts before donating the descriptor so
+			// an unreachable source cannot block a guest page fault forever.
+			timeout := unix.NsecToTimeval(restoreArgs.Timeout.Nanoseconds())
+			if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
+				file.Close()
+				for _, opened := range connectionFiles {
+					opened.Close()
+				}
+				reader.Close()
+				return fmt.Errorf("setting donated page stream receive timeout: %w", err)
+			}
+			if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
+				file.Close()
+				for _, opened := range connectionFiles {
+					opened.Close()
+				}
+				reader.Close()
+				return fmt.Errorf("setting donated page stream send timeout: %w", err)
+			}
+			connectionFiles = append(connectionFiles, file)
+		}
+		files := append([]*os.File{reader}, connectionFiles...)
+		_, err = r.backend.commandWithFiles(files, "timetravel", "--distributed-config-fd=3",
+			"--distributed-connections-start-fd=4", "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
+			info.ID, "distributed-restore", tx.Identity.TransactionID)
 		reader.Close()
+		for _, file := range connectionFiles {
+			file.Close()
+		}
 		if err != nil {
 			return err
 		}

@@ -144,7 +144,7 @@ type MemoryManager struct {
 	// address, a vma must also exist for that address.
 	//
 	// pmas is protected by activeMu.
-	pmas pmaSet `state:".(pmaSet)"`
+	pmas pmaSet `state:".([]pmaFlatSegment)"`
 
 	// curRSS is pmas.Span(), cached to accelerate updates to maxRSS. It is
 	// reported as the MemoryManager's RSS.

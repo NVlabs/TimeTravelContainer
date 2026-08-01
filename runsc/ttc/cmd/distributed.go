@@ -23,7 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -40,6 +45,107 @@ type distributedSourceRuntime struct {
 
 type distributedForkBackend interface {
 	forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error)
+}
+
+type distributedPageRelay struct {
+	listener net.Listener
+	backend  *runtimeBackend
+	source   string
+	session  string
+	close    sync.Once
+	mu       sync.Mutex
+	closed   bool
+	commands map[*exec.Cmd]struct{}
+}
+
+func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
+	relay := &distributedPageRelay{
+		listener: listener, backend: backend, source: source, session: session,
+		commands: make(map[*exec.Cmd]struct{}),
+	}
+	go relay.serve()
+	return relay
+}
+
+func (r *distributedPageRelay) serve() {
+	for {
+		conn, err := r.listener.Accept()
+		if err != nil {
+			return
+		}
+		tcp, ok := conn.(*net.TCPConn)
+		if !ok {
+			conn.Close()
+			continue
+		}
+		file, err := tcp.File()
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		go r.serveFile(file)
+	}
+}
+
+func (r *distributedPageRelay) serveFile(file *os.File) {
+	defer file.Close()
+	command := runscCommand(r.backend.runsc,
+		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
+		r.source, "distributed-serve", r.session)
+	command.ExtraFiles = []*os.File{file}
+	command.Stdin = strings.NewReader("")
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	if err := command.Start(); err != nil {
+		r.mu.Unlock()
+		return
+	}
+	r.commands[command] = struct{}{}
+	r.mu.Unlock()
+	_ = command.Wait()
+	r.mu.Lock()
+	delete(r.commands, command)
+	r.mu.Unlock()
+}
+
+func (r *distributedPageRelay) Close() {
+	if r != nil {
+		r.close.Do(func() {
+			_ = r.listener.Close()
+			r.mu.Lock()
+			r.closed = true
+			commands := make([]*exec.Cmd, 0, len(r.commands))
+			for command := range r.commands {
+				commands = append(commands, command)
+			}
+			r.mu.Unlock()
+			for _, command := range commands {
+				if command.Process != nil {
+					_ = command.Process.Kill()
+				}
+			}
+		})
+	}
+}
+
+func resolveDistributedAdvertiseAddress(configured, bound string) (string, error) {
+	host, port, err := net.SplitHostPort(configured)
+	if err != nil || host == "" {
+		return "", fmt.Errorf("invalid cluster page advertise address %q", configured)
+	}
+	if port == "0" {
+		_, port, err = net.SplitHostPort(bound)
+		if err != nil {
+			return "", err
+		}
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func newDistributedTransactionID() (string, error) {
@@ -111,32 +217,48 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
 	}
+	var relay *distributedPageRelay
 	captured := false
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
-		status, statusErr := peer.Status(context.Background(), transactionID)
+		relay.Close()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		status, statusErr := peer.Status(cleanupCtx, transactionID)
 		if statusErr == nil {
-			_, _ = peer.Cancel(context.Background(), transactionID, status.Revision)
+			_, _ = peer.Cancel(cleanupCtx, transactionID, status.Revision)
 		} else if tx != nil {
-			_, _ = peer.Cancel(context.Background(), transactionID, tx.Revision)
+			_, _ = peer.Cancel(cleanupCtx, transactionID, tx.Revision)
 		}
 		if captured {
 			_, _ = b.command("timetravel", source.container, "distributed-cancel", transactionID)
 		}
 	}()
+	listener, err := net.Listen("tcp", b.distributedSource.pageListen)
+	if err != nil {
+		return selector{}, fmt.Errorf("opening distributed page listener: %w", err)
+	}
+	advertise, err := resolveDistributedAdvertiseAddress(b.distributedSource.pageAdvertise, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		return selector{}, err
+	}
+	relayBackend := *b
+	relayBackend.stdin = strings.NewReader("")
+	relayBackend.stdout = io.Discard
+	relayBackend.stderr = io.Discard
+	relay = newDistributedPageRelay(listener, &relayBackend, source.container, transactionID)
 
 	args := []string{
 		"timetravel", "--source", source.branch,
 		"--distributed-session", transactionID,
 		"--distributed-family", source.container,
-		"--distributed-listen", b.distributedSource.pageListen,
+		"--distributed-external-listener",
+		"--distributed-advertise", advertise,
 		"--distributed-max-transfer", fmt.Sprint(tx.Negotiated.MaxTransferSize),
-	}
-	if b.distributedSource.pageAdvertise != "" {
-		args = append(args, "--distributed-advertise", b.distributedSource.pageAdvertise)
 	}
 	args = append(args, source.container, "distributed-capture", transactionID)
 	output, err := b.command(args...)
@@ -175,11 +297,12 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	monitorBackend.stdin = strings.NewReader("")
 	monitorBackend.stdout = io.Discard
 	monitorBackend.stderr = io.Discard
-	go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision)
+	go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
 }
 
-func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64) {
+func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	defer relay.Close()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {

@@ -141,7 +141,6 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				_ = snapshot.Close()
 			}
 		}()
-
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		k.filteringLiveForkDanglingEndpoints = true
@@ -151,6 +150,14 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 		if err := buffered.Flush(); err != nil {
 			return err
+		}
+		// The state stream and remote snapshot refer to the fork-time VVAR
+		// page. resumeTimeLocked updates the source Timekeeper after this
+		// callback returns, so first move the source onto a new parameter page.
+		// Otherwise the source overwrites the supposedly immutable page before
+		// the remote target can read it.
+		if err := k.privatizeLiveForkVDSOParamPage(); err != nil {
+			return fmt.Errorf("privatizing distributed-fork source VDSO parameter page: %w", err)
 		}
 		if err := fsTransactions.Commit(); err != nil {
 			return fmt.Errorf("committing distributed-fork filesystem transactions: %w", err)
@@ -215,6 +222,18 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	child := &Kernel{Platform: p}
 	child.SetMemoryFile(targetMF)
 	child.initRuntimeFields()
+	// Attach the remote loader before restoring Kernel metadata. Restoring
+	// address spaces calls MemoryFile.DataFD while installing application
+	// mappings into the platform. If the loader is attached afterwards, those
+	// mappings can observe the newly allocated MemoryFile's zero-filled pages
+	// without ever passing through the remote-load interlock.
+	if err := targetMF.AttachRemotePageLoad(pages, loadRanges, nil, nil); err != nil {
+		pages.Cancel()
+		_ = pages.Wait()
+		targetMF.Destroy()
+		return nil, err
+	}
+	pages.MemoryFilesDone()
 	loaded := false
 	defer func() {
 		if loaded {
@@ -248,11 +267,6 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	child.remotePageLoad = pages
 	loaded = true
-	if err := targetMF.AttachRemotePageLoad(pages, loadRanges, nil, nil); err != nil {
-		child.Release()
-		return nil, err
-	}
-	pages.MemoryFilesDone()
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
 		child.Release()
 		return nil, err

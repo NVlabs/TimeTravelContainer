@@ -2155,6 +2155,14 @@ func (s *Sandbox) CaptureDistributedFork(args *boot.DistributedForkCaptureArgs) 
 	return info, nil
 }
 
+// ServeDistributedForkConnection donates one host-accepted TCP stream.
+func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServeArgs) error {
+	if err := s.call(boot.ContMgrServeDistributedForkConnection, args, nil); err != nil {
+		return fmt.Errorf("serving distributed fork session %q: %w", args.SessionID, err)
+	}
+	return nil
+}
+
 // DistributedForkSessionStatus returns remote-memory transfer progress.
 func (s *Sandbox) DistributedForkSessionStatus(id string) (boot.DistributedForkSessionStatus, error) {
 	var status boot.DistributedForkSessionStatus

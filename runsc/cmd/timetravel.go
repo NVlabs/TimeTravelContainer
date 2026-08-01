@@ -45,39 +45,43 @@ import (
 // TimeTravel controls experimental in-memory sandbox branches.
 type TimeTravel struct {
 	containerLoader
-	source                 string
-	paused                 bool
-	pid                    int
-	execID                 string
-	signal                 int
-	all                    bool
-	consoleID              string
-	consoleStream          string
-	consoleMaxBytes        int
-	consoleData            string
-	consoleWaitStdout      bool
-	consoleWaitStderr      bool
-	consoleWaitStdin       bool
-	consoleWaitTimeout     time.Duration
-	consoleRows            int
-	consoleCols            int
-	consoleXPixels         int
-	consoleYPixels         int
-	consoleLog             string
-	consoleReadyFD         int
-	consoleWaitStatus      string
-	consoleRetentionStats  string
-	consolePIDFile         string
-	consoleLogMax          int64
-	consoleLogFiles        int
-	checkpointImagePath    string
-	checkpointCompression  CheckpointCompression
-	distributedSessionID   string
-	distributedFamilyID    string
-	distributedListen      string
-	distributedAdvertise   string
-	distributedMaxTransfer uint64
-	distributedConfigFD    int
+	source                        string
+	paused                        bool
+	pid                           int
+	execID                        string
+	signal                        int
+	all                           bool
+	consoleID                     string
+	consoleStream                 string
+	consoleMaxBytes               int
+	consoleData                   string
+	consoleWaitStdout             bool
+	consoleWaitStderr             bool
+	consoleWaitStdin              bool
+	consoleWaitTimeout            time.Duration
+	consoleRows                   int
+	consoleCols                   int
+	consoleXPixels                int
+	consoleYPixels                int
+	consoleLog                    string
+	consoleReadyFD                int
+	consoleWaitStatus             string
+	consoleRetentionStats         string
+	consolePIDFile                string
+	consoleLogMax                 int64
+	consoleLogFiles               int
+	checkpointImagePath           string
+	checkpointCompression         CheckpointCompression
+	distributedSessionID          string
+	distributedFamilyID           string
+	distributedListen             string
+	distributedAdvertise          string
+	distributedMaxTransfer        uint64
+	distributedConfigFD           int
+	distributedExternal           bool
+	distributedConnectionFD       int
+	distributedConnectionsStartFD int
+	distributedConnectionsCount   int
 }
 
 // Name implements subcommands.Command.Name.
@@ -93,6 +97,7 @@ func (*TimeTravel) Usage() string {
 	return "timetravel [flags] <container-id> branches\n" +
 		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
@@ -137,6 +142,10 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.distributedAdvertise, "distributed-advertise", "", "page server address advertised to the target")
 	f.Uint64Var(&t.distributedMaxTransfer, "distributed-max-transfer", 0, "maximum bytes in one remote page transfer")
 	f.IntVar(&t.distributedConfigFD, "distributed-config-fd", -1, "inherited FD containing a secret distributed restore request")
+	f.BoolVar(&t.distributedExternal, "distributed-external-listener", false, "ttcd owns and relays the page listener")
+	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
+	f.IntVar(&t.distributedConnectionsStartFD, "distributed-connections-start-fd", -1, "first inherited target page stream")
+	f.IntVar(&t.distributedConnectionsCount, "distributed-connections-count", 0, "number of inherited target page streams")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -225,8 +234,22 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			})
 		}
 	case "distributed-capture":
-		if t.distributedSessionID == "" || t.distributedFamilyID == "" || t.distributedListen == "" || t.distributedMaxTransfer == 0 {
-			util.Fatalf("--distributed-session, --distributed-family, --distributed-listen, and --distributed-max-transfer are required")
+		if t.distributedSessionID == "" || t.distributedFamilyID == "" || t.distributedMaxTransfer == 0 {
+			util.Fatalf("--distributed-session, --distributed-family, and --distributed-max-transfer are required")
+		}
+		if t.distributedExternal {
+			if t.distributedAdvertise == "" {
+				util.Fatalf("--distributed-advertise is required with --distributed-external-listener")
+			}
+			output, err = cont.Sandbox.CaptureDistributedFork(&boot.DistributedForkCaptureArgs{
+				SessionID: t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
+				TargetBranchID: f.Arg(2), AdvertiseAddress: t.distributedAdvertise,
+				MaxTransferBytes: t.distributedMaxTransfer, ExternalListener: true,
+			})
+			break
+		}
+		if t.distributedListen == "" {
+			util.Fatalf("--distributed-listen is required")
 		}
 		listener, listenErr := net.Listen("tcp", t.distributedListen)
 		if listenErr != nil {
@@ -255,6 +278,18 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		})
 		listenerFile.Close()
 		listener.Close()
+	case "distributed-serve":
+		if t.distributedConnectionFD < 0 {
+			util.Fatalf("--distributed-connection-fd is required")
+		}
+		connection := os.NewFile(uintptr(t.distributedConnectionFD), "distributed-page-connection")
+		if connection == nil {
+			util.Fatalf("invalid distributed page connection FD")
+		}
+		err = cont.Sandbox.ServeDistributedForkConnection(&boot.DistributedForkServeArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{connection}}, SessionID: f.Arg(2),
+		})
+		connection.Close()
 	case "distributed-status":
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-cancel":
@@ -285,6 +320,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		if restoreArgs.SessionID != f.Arg(2) {
 			util.Fatalf("distributed restore session identity mismatch")
+		}
+		if t.distributedConnectionsCount < 0 || (t.distributedConnectionsCount != 0 && t.distributedConnectionsStartFD < 0) {
+			util.Fatalf("invalid inherited distributed connection range")
+		}
+		for i := 0; i < t.distributedConnectionsCount; i++ {
+			file := os.NewFile(uintptr(t.distributedConnectionsStartFD+i), "distributed-target-connection")
+			if file == nil {
+				util.Fatalf("invalid inherited distributed connection FD %d", t.distributedConnectionsStartFD+i)
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
+			defer file.Close()
 		}
 		output, err = cont.Sandbox.RestoreDistributedFork(&restoreArgs)
 	case "pause":

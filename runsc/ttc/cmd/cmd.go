@@ -7537,6 +7537,9 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			byID[family.ID] = family
 		}
 		for _, container := range containers {
+			if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
+				continue
+			}
 			if container.State == "running" || container.State == "paused" {
 				if _, ok := runtimeIDs[container.ID]; ok {
 					continue
@@ -7620,6 +7623,9 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
 	families := make([]Family, 0, len(states))
 	for _, state := range states {
+		if state.ID == "" {
+			continue
+		}
 		family := Family{ID: state.ID, State: state.Status, SandboxPID: state.PID, Branches: []Branch{}}
 		if state.Status == "stopped" {
 			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: "exited"})

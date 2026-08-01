@@ -110,6 +110,7 @@ type DistributedForkCaptureArgs struct {
 	ListenAddress    string
 	AdvertiseAddress string
 	MaxTransferBytes uint64
+	ExternalListener bool
 }
 
 // DistributedForkSessionInfo is safe to return through the runsc control
@@ -126,6 +127,12 @@ type DistributedForkSessionInfo struct {
 
 // DistributedForkSessionArgs identifies an existing source snapshot.
 type DistributedForkSessionArgs struct {
+	SessionID string
+}
+
+// DistributedForkServeArgs donates one host-accepted TCP connection.
+type DistributedForkServeArgs struct {
+	urpc.FilePayload
 	SessionID string
 }
 
@@ -425,8 +432,11 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 // it through a bounded TCP page server. The source is restored to its original
 // pause state before this method returns.
 func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs) (*DistributedForkSessionInfo, error) {
-	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || (args.ListenAddress == "" && len(args.FilePayload.Files) == 0) {
+	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || (!args.ExternalListener && args.ListenAddress == "" && len(args.FilePayload.Files) == 0) {
 		return nil, errors.New("distributed fork capture is missing session, family, branch, or listen identity")
+	}
+	if args.ExternalListener && (args.AdvertiseAddress == "" || args.ListenAddress != "" || len(args.FilePayload.Files) != 0) {
+		return nil, errors.New("external distributed listener requires only an advertise address")
 	}
 	if len(args.FilePayload.Files) > 1 {
 		return nil, fmt.Errorf("distributed fork capture received %d listener files, want at most one", len(args.FilePayload.Files))
@@ -453,21 +463,23 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		return nil, err
 	}
 	var listener net.Listener
-	if len(args.FilePayload.Files) == 1 {
-		listener, err = net.FileListener(args.FilePayload.Files[0])
-	} else {
-		listener, err = net.Listen("tcp", args.ListenAddress)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("listening for distributed pages: %w", err)
-	}
-	if _, ok := listener.(*net.TCPListener); !ok {
-		listener.Close()
-		return nil, fmt.Errorf("distributed page listener is %T, want TCP", listener)
+	if !args.ExternalListener {
+		if len(args.FilePayload.Files) == 1 {
+			listener, err = net.FileListener(args.FilePayload.Files[0])
+		} else {
+			listener, err = net.Listen("tcp", args.ListenAddress)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("listening for distributed pages: %w", err)
+		}
+		if _, ok := listener.(*net.TCPListener); !ok {
+			listener.Close()
+			return nil, fmt.Errorf("distributed page listener is %T, want TCP", listener)
+		}
 	}
 	keepListener := false
 	defer func() {
-		if !keepListener {
+		if listener != nil && !keepListener {
 			listener.Close()
 		}
 	}()
@@ -522,7 +534,12 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		_ = resume()
 		return nil, fmt.Errorf("generating distributed snapshot token: %w", err)
 	}
-	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, args.MaxTransferBytes)
+	var server *ttcremote.TCPPageServer
+	if args.ExternalListener {
+		server, err = ttcremote.NewTCPPageSession(token, capture.Snapshot, args.MaxTransferBytes)
+	} else {
+		server, err = ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, args.MaxTransferBytes)
+	}
 	if err != nil {
 		_ = rollbackCapture()
 		_ = resume()
@@ -553,12 +570,14 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 	}
 	f.distributedSessions[args.SessionID] = session
 	f.mu.Unlock()
-	keepListener = true
-	go func() {
-		if err := server.Serve(); err != nil {
-			_ = server.Close()
-		}
-	}()
+	if listener != nil {
+		keepListener = true
+		go func() {
+			if err := server.Serve(); err != nil {
+				_ = server.Close()
+			}
+		}()
+	}
 	if err := resume(); err != nil {
 		f.mu.Lock()
 		delete(f.distributedSessions, args.SessionID)
@@ -574,6 +593,20 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		SessionID: args.SessionID, Source: sourceID, Address: address, Token: token,
 		MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
 	}, nil
+}
+
+// ServeDistributedForkConnection handles one connection accepted by ttcd.
+func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServeArgs) error {
+	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
+		return errors.New("distributed page serving requires a session and one connected socket")
+	}
+	f.mu.Lock()
+	session := f.distributedSessions[args.SessionID]
+	f.mu.Unlock()
+	if session == nil {
+		return fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
+	}
+	return session.server.ServeStream(args.FilePayload.Files[0])
 }
 
 // DistributedForkSessionStatus returns progress without disclosing the bearer

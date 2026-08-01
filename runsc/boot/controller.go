@@ -107,6 +107,9 @@ const (
 	// ContMgrCaptureDistributedFork starts a remote page snapshot session.
 	ContMgrCaptureDistributedFork = "containerManager.CaptureDistributedFork"
 
+	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
+	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
+
 	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
 	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
 
@@ -1048,6 +1051,11 @@ func (cm *containerManager) CaptureDistributedFork(args *DistributedForkCaptureA
 	}
 	*out = *info
 	return nil
+}
+
+// ServeDistributedForkConnection handles one stream donated by ttcd.
+func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
+	return cm.l.family.ServeDistributedForkConnection(args)
 }
 
 // DistributedForkSessionStatus returns token-free transfer progress.

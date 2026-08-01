@@ -117,17 +117,22 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 // savePmas is invoked by stateify. Live fork keeps PMA metadata in an
 // in-memory snapshot rather than reflecting every resident range through the
 // generic wire encoder. Durable checkpoints retain the normal representation.
-func (mm *MemoryManager) savePmas() pmaSet {
+func (mm *MemoryManager) savePmas() []pmaFlatSegment {
 	if mm.liveForkPMAKey != 0 {
-		return pmaSet{}
+		return nil
 	}
-	return mm.pmas
+	saved := mm.pmas.ExportSlice()
+	// State serialization preserves slice capacity. Prevent unused capacity
+	// from being encoded as zero-valued PMA segments.
+	return saved[:len(saved):len(saved)]
 }
 
 // loadPmas is invoked by stateify.
-func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved pmaSet) {
+func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment) {
 	if mm.liveForkPMAKey == 0 {
-		mm.pmas = saved
+		if err := mm.pmas.ImportSlice(saved); err != nil {
+			panic(err)
+		}
 		return
 	}
 	snapshots, ok := ctx.Value(CtxLiveForkPMASnapshots).(LiveForkPMASnapshots)

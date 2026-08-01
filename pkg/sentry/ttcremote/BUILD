@@ -8,6 +8,7 @@ package(
 go_library(
     name = "ttcremote",
     srcs = [
+		"donated_conn.go",
         "metadata.go",
         "push.go",
         "tcp.go",

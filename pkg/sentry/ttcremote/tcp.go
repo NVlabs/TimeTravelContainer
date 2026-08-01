@@ -146,7 +146,7 @@ type TCPPageServer struct {
 
 	mu        sync.Mutex
 	closed    bool
-	conns     map[net.Conn]struct{}
+	conns     map[io.ReadWriteCloser]struct{}
 	closeErr  error
 	closeDone chan struct{}
 	wg        sync.WaitGroup
@@ -170,24 +170,43 @@ type TCPPageServerStats struct {
 
 // NewTCPPageServer constructs a server. Serve must be called to accept peers.
 func NewTCPPageServer(listener net.Listener, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, maxRead uint64) (*TCPPageServer, error) {
-	if listener == nil || snapshot == nil {
-		return nil, errors.New("TCP page server requires a listener and snapshot")
+	if listener == nil {
+		return nil, errors.New("TCP page server requires a listener")
+	}
+	server, err := NewTCPPageSession(token, snapshot, maxRead)
+	if err != nil {
+		return nil, err
+	}
+	server.listener = listener
+	return server, nil
+}
+
+// NewTCPPageSession constructs a page protocol session whose connected TCP
+// streams are supplied by ServeConn. This permits a less-privileged Sentry to
+// serve memory while a host-side ttcd owns the listening socket.
+func NewTCPPageSession(token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, maxRead uint64) (*TCPPageServer, error) {
+	if snapshot == nil {
+		return nil, errors.New("TCP page session requires a snapshot")
 	}
 	if maxRead < hostarch.PageSize || !hostarch.IsPageAligned(maxRead) || maxRead > 2<<20 {
 		return nil, fmt.Errorf("invalid maximum TCP page read size %d", maxRead)
 	}
 	return &TCPPageServer{
-		listener:  listener,
 		token:     token,
 		snapshot:  snapshot,
 		maxRead:   maxRead,
-		conns:     make(map[net.Conn]struct{}),
+		conns:     make(map[io.ReadWriteCloser]struct{}),
 		closeDone: make(chan struct{}),
 	}, nil
 }
 
 // Addr returns the server's listening address.
-func (s *TCPPageServer) Addr() net.Addr { return s.listener.Addr() }
+func (s *TCPPageServer) Addr() net.Addr {
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
 
 // Stats returns server counters.
 func (s *TCPPageServer) Stats() TCPPageServerStats {
@@ -226,6 +245,9 @@ func (s *TCPPageServer) SetMetadata(metadata []byte) error {
 
 // Serve accepts connections until Close is called or the listener fails.
 func (s *TCPPageServer) Serve() error {
+	if s.listener == nil {
+		return errors.New("TCP page session has no listener")
+	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -237,20 +259,35 @@ func (s *TCPPageServer) Serve() error {
 			}
 			return err
 		}
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			conn.Close()
-			return nil
-		}
-		s.conns[conn] = struct{}{}
-		s.wg.Add(1)
-		s.mu.Unlock()
-		go s.serveConn(conn)
+		go func() { _ = s.ServeStream(conn) }()
 	}
 }
 
-func (s *TCPPageServer) serveConn(conn net.Conn) {
+// ServeConn handles one already-connected page protocol stream. It blocks
+// until the peer disconnects or Close cancels the session.
+func (s *TCPPageServer) ServeConn(conn net.Conn) error {
+	return s.ServeStream(conn)
+}
+
+// ServeStream is ServeConn without requiring host socket introspection.
+func (s *TCPPageServer) ServeStream(conn io.ReadWriteCloser) error {
+	if conn == nil {
+		return errors.New("nil TCP page connection")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		conn.Close()
+		return net.ErrClosed
+	}
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	s.serveConn(conn)
+	return nil
+}
+
+func (s *TCPPageServer) serveConn(conn io.ReadWriteCloser) {
 	defer func() {
 		conn.Close()
 		s.mu.Lock()
@@ -396,6 +433,19 @@ func FetchTCPMetadata(ctx context.Context, address string, token SnapshotToken, 
 		return nil, err
 	}
 	defer conn.Close()
+	return FetchTCPMetadataConn(ctx, conn, token, maxChunk, maxMetadata, timeout)
+}
+
+// FetchTCPMetadataConn fetches metadata over a host-connected donated stream.
+func FetchTCPMetadataConn(ctx context.Context, conn net.Conn, token SnapshotToken, maxChunk, maxMetadata uint64, timeout time.Duration) ([]byte, error) {
+	if conn == nil || maxChunk == 0 || maxChunk > 2<<20 || maxMetadata == 0 || timeout <= 0 {
+		return nil, errors.New("invalid TCP metadata connection or fetch limits")
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
@@ -434,7 +484,7 @@ func FetchTCPMetadata(ctx context.Context, address string, token SnapshotToken, 
 	return metadata, nil
 }
 
-func (s *TCPPageServer) writeError(conn net.Conn, request tcpHeader, err error) {
+func (s *TCPPageServer) writeError(conn io.Writer, request tcpHeader, err error) {
 	payload := []byte(err.Error())
 	if len(payload) > maxProtocolError {
 		payload = payload[:maxProtocolError]
@@ -463,7 +513,10 @@ func (s *TCPPageServer) Close() error {
 		return err
 	}
 	s.closed = true
-	err := s.listener.Close()
+	var err error
+	if s.listener != nil {
+		err = s.listener.Close()
+	}
 	for conn := range s.conns {
 		conn.Close()
 	}
@@ -509,15 +562,16 @@ type TCPRemoteReader struct {
 	ackInterval   time.Duration
 	maxAckEntries int
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	subs    chan tcpReadSubmission
-	cmps    chan stateio.Completion
-	ackSubs chan tcpAckSubmission
-	wg      sync.WaitGroup
-	once    sync.Once
-	mu      sync.Mutex
-	conns   map[net.Conn]struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	subs       chan tcpReadSubmission
+	cmps       chan stateio.Completion
+	ackSubs    chan tcpAckSubmission
+	wg         sync.WaitGroup
+	once       sync.Once
+	mu         sync.Mutex
+	conns      map[net.Conn]struct{}
+	spareConns chan net.Conn
 
 	submitted      atomic.Uint64
 	completed      atomic.Uint64
@@ -580,6 +634,19 @@ func NewTCPRemoteReader(address string, token SnapshotToken, maxReadBytes uint64
 
 // NewTCPRemoteReaderWithOpts constructs a configurable TCP page reader.
 func NewTCPRemoteReaderWithOpts(address string, token SnapshotToken, opts TCPRemoteReaderOpts) (*TCPRemoteReader, error) {
+	return newTCPRemoteReader(address, token, opts, nil)
+}
+
+// NewTCPRemoteReaderWithConns uses host-connected streams donated to an
+// isolated target. No host network syscall is required by the reader.
+func NewTCPRemoteReaderWithConns(address string, token SnapshotToken, opts TCPRemoteReaderOpts, conns []net.Conn) (*TCPRemoteReader, error) {
+	if len(conns) == 0 {
+		return nil, errors.New("TCP remote reader connection pool is empty")
+	}
+	return newTCPRemoteReader(address, token, opts, conns)
+}
+
+func newTCPRemoteReader(address string, token SnapshotToken, opts TCPRemoteReaderOpts, donated []net.Conn) (*TCPRemoteReader, error) {
 	if address == "" {
 		return nil, errors.New("TCP remote reader address is empty")
 	}
@@ -618,6 +685,15 @@ func NewTCPRemoteReaderWithOpts(address string, token SnapshotToken, opts TCPRem
 		subs:          make(chan tcpReadSubmission, opts.MaxParallel),
 		cmps:          make(chan stateio.Completion, opts.MaxParallel),
 		conns:         make(map[net.Conn]struct{}),
+	}
+	if len(donated) != 0 {
+		r.spareConns = make(chan net.Conn, len(donated))
+		for _, conn := range donated {
+			if conn == nil {
+				continue
+			}
+			r.spareConns <- conn
+		}
 	}
 	if opts.AckBatchPages > 1 {
 		r.ackSubs = make(chan tcpAckSubmission, opts.MaxParallel)
@@ -677,9 +753,32 @@ func (r *TCPRemoteReader) Close() error {
 			conn.Close()
 		}
 		r.mu.Unlock()
+		if r.spareConns != nil {
+			for {
+				select {
+				case conn := <-r.spareConns:
+					conn.Close()
+				default:
+					return
+				}
+			}
+		}
 	})
 	r.wg.Wait()
 	return nil
+}
+
+func (r *TCPRemoteReader) connect() (net.Conn, error) {
+	if r.spareConns != nil {
+		select {
+		case conn := <-r.spareConns:
+			return conn, nil
+		default:
+			return nil, errors.New("donated TCP connection pool is exhausted")
+		}
+	}
+	dialer := net.Dialer{Timeout: r.timeout}
+	return dialer.DialContext(r.ctx, "tcp", r.address)
 }
 
 func (r *TCPRemoteReader) worker() {
@@ -737,9 +836,8 @@ func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmis
 			}
 		}
 		if *conn == nil {
-			dialer := net.Dialer{Timeout: r.timeout}
 			var err error
-			*conn, err = dialer.DialContext(r.ctx, "tcp", r.address)
+			*conn, err = r.connect()
 			if err != nil {
 				lastErr = err
 			} else {
@@ -784,6 +882,7 @@ func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmissio
 	if err := conn.SetDeadline(deadline); err != nil {
 		return installed, true, err
 	}
+	defer conn.SetDeadline(time.Time{})
 	requestID := uint32(sub.id)
 	if !installed {
 		pull := tcpHeader{
@@ -953,9 +1052,8 @@ func (r *TCPRemoteReader) sendAckBatchWithRetry(conn *net.Conn, batchID uint32, 
 			r.ackOnlyRetries.Add(1)
 		}
 		if *conn == nil {
-			dialer := net.Dialer{Timeout: r.timeout}
 			var err error
-			*conn, err = dialer.DialContext(r.ctx, "tcp", r.address)
+			*conn, err = r.connect()
 			if err != nil {
 				lastErr = err
 			} else {
@@ -965,9 +1063,11 @@ func (r *TCPRemoteReader) sendAckBatchWithRetry(conn *net.Conn, batchID uint32, 
 			}
 		}
 		if *conn != nil {
-			_ = (*conn).SetDeadline(time.Now().Add(r.timeout))
-			if err := writeTCPMessage(*conn, header, payload); err == nil {
+			if err := (*conn).SetDeadline(time.Now().Add(r.timeout)); err != nil {
+				lastErr = err
+			} else if err := writeTCPMessage(*conn, header, payload); err == nil {
 				response, responsePayload, err := readTCPResponse(*conn, r.token, batchID, r.maxReadBytes)
+				_ = (*conn).SetDeadline(time.Time{})
 				if err == nil {
 					if response.type_ == tcpError {
 						return fmt.Errorf("remote page acknowledgement batch: %s", responsePayload)
@@ -979,6 +1079,7 @@ func (r *TCPRemoteReader) sendAckBatchWithRetry(conn *net.Conn, batchID uint32, 
 				}
 				lastErr = err
 			} else {
+				_ = (*conn).SetDeadline(time.Time{})
 				lastErr = err
 			}
 			r.mu.Lock()

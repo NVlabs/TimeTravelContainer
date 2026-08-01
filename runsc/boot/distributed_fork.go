@@ -17,6 +17,7 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -29,12 +30,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/urpc"
 )
 
 // DistributedForkRestoreArgs is delivered through a private inherited FD by
 // runsc's internal control command. SnapshotToken must not be placed in argv,
 // logs, or persistent container metadata.
 type DistributedForkRestoreArgs struct {
+	urpc.FilePayload
 	SessionID           string
 	FamilyID            string
 	TargetBranchID      string
@@ -75,7 +78,35 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		return nil, fmt.Errorf("sandbox is %s, not an unstarted distributed target", l.state)
 	}
 
-	encoded, err := ttcremote.FetchTCPMetadata(l.k.SupervisorContext(), args.Address, args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
+	var donated []net.Conn
+	donatedMode := len(args.FilePayload.Files) != 0
+	for _, file := range args.FilePayload.Files {
+		conn, err := ttcremote.NewDonatedTCPConn(file)
+		if err != nil {
+			for _, opened := range donated {
+				opened.Close()
+			}
+			return nil, fmt.Errorf("opening donated distributed page connection: %w", err)
+		}
+		donated = append(donated, conn)
+	}
+	donatedOwned := true
+	defer func() {
+		if donatedOwned {
+			for _, conn := range donated {
+				conn.Close()
+			}
+		}
+	}()
+	var encoded []byte
+	var err error
+	if donatedMode {
+		encoded, err = ttcremote.FetchTCPMetadataConn(l.k.SupervisorContext(), donated[0], args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
+		donated[0].Close()
+		donated = donated[1:]
+	} else {
+		encoded, err = ttcremote.FetchTCPMetadata(l.k.SupervisorContext(), args.Address, args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetching distributed metadata: %w", err)
 	}
@@ -92,11 +123,20 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
 		return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
 	}
-	reader, err := ttcremote.NewTCPRemoteReaderWithOpts(args.Address, args.SnapshotToken, ttcremote.TCPRemoteReaderOpts{
+	readerOpts := ttcremote.TCPRemoteReaderOpts{
 		MaxReadBytes: args.MaxTransferBytes, MaxRanges: 64, MaxParallel: args.MaxParallel,
 		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
 		AckBatchPages: 256, AckInterval: time.Millisecond,
-	})
+	}
+	var reader *ttcremote.TCPRemoteReader
+	if donatedMode {
+		reader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
+		if err == nil {
+			donatedOwned = false
+		}
+	} else {
+		reader, err = ttcremote.NewTCPRemoteReaderWithOpts(args.Address, args.SnapshotToken, readerOpts)
+	}
 	if err != nil {
 		return nil, err
 	}
