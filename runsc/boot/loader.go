@@ -1062,6 +1062,7 @@ func (l *Loader) Destroy() {
 		l.finalMountNamespace = nil
 	}
 	l.family.DestroyChildren()
+	l.family.CloseDistributedForkSessions()
 	l.k.Release()
 
 	// Release any dangling tcp connections.

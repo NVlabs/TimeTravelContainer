@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -22,9 +23,73 @@ import (
 
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	info, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
+		SessionID: "tx-1", FamilyID: "family-1", TargetBranchID: "remote-1",
+		ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	if info.Address == "" || info.MetadataBytes == 0 || info.StreamBytes == 0 {
+		t.Fatalf("incomplete session info: %+v", info)
+	}
+	if parent.IsPaused() {
+		t.Fatal("source remained paused after distributed capture")
+	}
+	encoded, err := ttcremote.FetchTCPMetadata(context.Background(), info.Address, info.Token, 64<<10, 64<<20, 5*time.Second)
+	if err != nil {
+		t.Fatalf("FetchTCPMetadata: %v", err)
+	}
+	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
+		MaxTotalBytes: 64 << 20, MaxKernelBytes: 60 << 20,
+		MaxAllocatorBytes: 4 << 20, MaxLoadRanges: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("UnmarshalSessionMetadata: %v", err)
+	}
+	if metadata.FamilyID != "family-1" || metadata.SourceBranchID != DefaultBranchID || metadata.TargetBranchID != "remote-1" {
+		t.Fatalf("metadata identity: %+v", metadata)
+	}
+	status, err := family.DistributedForkSessionStatus("tx-1")
+	if err != nil {
+		t.Fatalf("DistributedForkSessionStatus: %v", err)
+	}
+	if status.Snapshot.PagesOutstanding == 0 || status.Transport.MetadataBytesSent != uint64(len(encoded)) {
+		t.Fatalf("unexpected session status: %+v", status)
+	}
+	if err := family.CancelDistributedForkSession("tx-1"); err != nil {
+		t.Fatalf("CancelDistributedForkSession: %v", err)
+	}
+	if err := family.CancelDistributedForkSession("tx-1"); err != nil {
+		t.Fatalf("idempotent CancelDistributedForkSession: %v", err)
+	}
+	if _, err := family.DistributedForkSessionStatus("tx-1"); err == nil {
+		t.Fatal("canceled session remained visible")
+	}
+}
 
 func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	first := &SandboxFamily{volumeBranchScope: "sandbox-a"}

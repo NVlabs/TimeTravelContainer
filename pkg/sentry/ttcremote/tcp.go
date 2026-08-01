@@ -200,6 +200,15 @@ func (s *TCPPageServer) Stats() TCPPageServerStats {
 	}
 }
 
+// SnapshotStats returns the current page-ownership state. It intentionally
+// excludes the session token so callers can expose it through diagnostics.
+func (s *TCPPageServer) SnapshotStats() pgalloc.RemoteSnapshotStats {
+	return s.snapshot.Stats()
+}
+
+// StreamBytes returns the size of the immutable packed memory stream.
+func (s *TCPPageServer) StreamBytes() uint64 { return s.snapshot.StreamBytes() }
+
 // SetMetadata configures the immutable Kernel metadata stream advertised by
 // the session. It must be called before Serve.
 func (s *TCPPageServer) SetMetadata(metadata []byte) error {

@@ -104,6 +104,15 @@ const (
 	// ContMgrForkBranches creates sibling branches from one paused instant.
 	ContMgrForkBranches = "containerManager.ForkBranches"
 
+	// ContMgrCaptureDistributedFork starts a remote page snapshot session.
+	ContMgrCaptureDistributedFork = "containerManager.CaptureDistributedFork"
+
+	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
+	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
+
+	// ContMgrCancelDistributedForkSession releases a remote snapshot session.
+	ContMgrCancelDistributedForkSession = "containerManager.CancelDistributedForkSession"
+
 	// ContMgrListBranches lists all in-memory branches in the sandbox family.
 	ContMgrListBranches = "containerManager.ListBranches"
 
@@ -1012,6 +1021,37 @@ func (cm *containerManager) ForkBranches(args *ForkBranchesArgs, out *[]BranchIn
 	}
 	*out = infos
 	return nil
+}
+
+// CaptureDistributedFork starts a remotely readable, metadata-only fork.
+func (cm *containerManager) CaptureDistributedFork(args *DistributedForkCaptureArgs, out *DistributedForkSessionInfo) error {
+	info, err := cm.l.family.CaptureDistributedFork(args)
+	if err != nil {
+		return err
+	}
+	*out = *info
+	return nil
+}
+
+// DistributedForkSessionStatus returns token-free transfer progress.
+func (cm *containerManager) DistributedForkSessionStatus(args *DistributedForkSessionArgs, out *DistributedForkSessionStatus) error {
+	if args == nil {
+		return errors.New("missing distributed fork session arguments")
+	}
+	status, err := cm.l.family.DistributedForkSessionStatus(args.SessionID)
+	if err != nil {
+		return err
+	}
+	*out = *status
+	return nil
+}
+
+// CancelDistributedForkSession releases pages retained for a remote target.
+func (cm *containerManager) CancelDistributedForkSession(args *DistributedForkSessionArgs, _ *struct{}) error {
+	if args == nil {
+		return errors.New("missing distributed fork session arguments")
+	}
+	return cm.l.family.CancelDistributedForkSession(args.SessionID)
 }
 
 // ListBranches returns the sandbox branch family.

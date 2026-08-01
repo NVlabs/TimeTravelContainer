@@ -2146,6 +2146,32 @@ func (s *Sandbox) ForkBranches(args *boot.ForkBranchesArgs) ([]boot.BranchInfo, 
 	return infos, nil
 }
 
+// CaptureDistributedFork starts a remote-memory snapshot in the Sentry.
+func (s *Sandbox) CaptureDistributedFork(args *boot.DistributedForkCaptureArgs) (boot.DistributedForkSessionInfo, error) {
+	var info boot.DistributedForkSessionInfo
+	if err := s.call(boot.ContMgrCaptureDistributedFork, args, &info); err != nil {
+		return boot.DistributedForkSessionInfo{}, fmt.Errorf("capturing distributed fork %q: %w", args.SessionID, err)
+	}
+	return info, nil
+}
+
+// DistributedForkSessionStatus returns remote-memory transfer progress.
+func (s *Sandbox) DistributedForkSessionStatus(id string) (boot.DistributedForkSessionStatus, error) {
+	var status boot.DistributedForkSessionStatus
+	if err := s.call(boot.ContMgrDistributedForkSessionStatus, &boot.DistributedForkSessionArgs{SessionID: id}, &status); err != nil {
+		return boot.DistributedForkSessionStatus{}, fmt.Errorf("reading distributed fork session %q: %w", id, err)
+	}
+	return status, nil
+}
+
+// CancelDistributedForkSession releases a remote-memory snapshot.
+func (s *Sandbox) CancelDistributedForkSession(id string) error {
+	if err := s.call(boot.ContMgrCancelDistributedForkSession, &boot.DistributedForkSessionArgs{SessionID: id}, nil); err != nil {
+		return fmt.Errorf("canceling distributed fork session %q: %w", id, err)
+	}
+	return nil
+}
+
 // ListBranches lists all in-memory branches in the sandbox family.
 func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
 	var branches []boot.BranchInfo

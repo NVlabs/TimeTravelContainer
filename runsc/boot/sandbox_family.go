@@ -15,10 +15,12 @@
 package boot
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -26,7 +28,9 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -89,6 +93,46 @@ type ForkBranchesArgs struct {
 	IDs []string
 	// Paused leaves every new branch stopped after creation.
 	Paused bool
+}
+
+// DistributedForkCaptureArgs starts a remotely readable snapshot session.
+// ListenAddress is a host TCP address accepted by net.Listen. AdvertiseAddress
+// is returned to the peer and may differ when the listener is behind a routed
+// or translated address; if empty, the listener's address is advertised.
+type DistributedForkCaptureArgs struct {
+	SessionID        string
+	Source           string
+	FamilyID         string
+	TargetBranchID   string
+	ListenAddress    string
+	AdvertiseAddress string
+	MaxTransferBytes uint64
+}
+
+// DistributedForkSessionInfo is safe to return through the runsc control
+// socket. Token is a bearer capability and must never appear in status or log
+// output after initial creation.
+type DistributedForkSessionInfo struct {
+	SessionID     string
+	Source        string
+	Address       string
+	Token         ttcremote.SnapshotToken
+	MetadataBytes uint64
+	StreamBytes   uint64
+}
+
+// DistributedForkSessionArgs identifies an existing source snapshot.
+type DistributedForkSessionArgs struct {
+	SessionID string
+}
+
+// DistributedForkSessionStatus reports token-free session progress.
+type DistributedForkSessionStatus struct {
+	SessionID string
+	Source    string
+	Address   string
+	Transport ttcremote.TCPPageServerStats
+	Snapshot  pgalloc.RemoteSnapshotStats
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -300,6 +344,13 @@ type SandboxFamily struct {
 	testOnlyForkFailureInjector    func(SandboxForkStage) error
 	testOnlyExecFailureInjector    func(SandboxExecStage) error
 	volumeBranchScope              string
+	distributedSessions            map[string]*distributedForkSession
+}
+
+type distributedForkSession struct {
+	source  string
+	address string
+	server  *ttcremote.TCPPageServer
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -352,6 +403,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		testOnlyExecFailureInjector:    opts.TestOnlyExecFailureInjector,
 		volumeBranchScope:              opts.VolumeBranchScope,
 		defaultStarted:                 make(chan struct{}),
+		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
 				id:           DefaultBranchID,
@@ -361,6 +413,183 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 				execSessions: make(map[string]*execSession),
 			},
 		},
+	}
+}
+
+// CaptureDistributedFork atomically captures a paused instant and publishes
+// it through a bounded TCP page server. The source is restored to its original
+// pause state before this method returns.
+func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs) (*DistributedForkSessionInfo, error) {
+	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || args.ListenAddress == "" {
+		return nil, errors.New("distributed fork capture is missing session, family, branch, or listen identity")
+	}
+	if args.MaxTransferBytes == 0 {
+		return nil, errors.New("distributed fork maximum transfer size is zero")
+	}
+	f.mu.Lock()
+	if f.distributedSessions == nil {
+		f.distributedSessions = make(map[string]*distributedForkSession)
+	}
+	if _, ok := f.distributedSessions[args.SessionID]; ok {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("distributed fork session %q already exists", args.SessionID)
+	}
+	f.mu.Unlock()
+
+	sourceID := args.Source
+	if sourceID == "" {
+		sourceID = DefaultBranchID
+	}
+	source, err := f.branch(sourceID)
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", args.ListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("listening for distributed pages: %w", err)
+	}
+	keepListener := false
+	defer func() {
+		if !keepListener {
+			listener.Close()
+		}
+	}()
+
+	source.opMu.Lock()
+	defer source.opMu.Unlock()
+	f.mu.Lock()
+	if source.state != BranchRunning && source.state != BranchPaused {
+		state := source.state
+		f.mu.Unlock()
+		return nil, fmt.Errorf("source branch %q is %s", sourceID, state)
+	}
+	sourceWasPaused := source.k.IsPaused()
+	f.mu.Unlock()
+	f.cancelConsoleWaits(source)
+	if !sourceWasPaused {
+		source.k.Pause()
+	}
+	resume := func() error {
+		if sourceWasPaused {
+			return nil
+		}
+		source.k.Unpause()
+		return control.PostResume(source.k, nil)
+	}
+	capture, err := source.k.CaptureDistributedFork(source.k.SupervisorContext(), kernel.DistributedForkCaptureOptions{
+		ChildBranchID:                  f.volumeBranchID(args.TargetBranchID),
+		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+	})
+	if err != nil {
+		if resumeErr := resume(); resumeErr != nil {
+			err = fmt.Errorf("%w; resuming source: %v", err, resumeErr)
+		}
+		return nil, err
+	}
+	metadata, err := (&ttcremote.SessionMetadata{
+		FamilyID: args.FamilyID, SourceBranchID: sourceID, TargetBranchID: args.TargetBranchID,
+		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
+		LoadRanges: capture.LoadRanges,
+	}).MarshalBinary()
+	if err != nil {
+		_ = capture.Close()
+		_ = resume()
+		return nil, fmt.Errorf("encoding distributed fork metadata: %w", err)
+	}
+	var token ttcremote.SnapshotToken
+	if _, err := rand.Read(token[:]); err != nil {
+		_ = capture.Close()
+		_ = resume()
+		return nil, fmt.Errorf("generating distributed snapshot token: %w", err)
+	}
+	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, args.MaxTransferBytes)
+	if err != nil {
+		_ = capture.Close()
+		_ = resume()
+		return nil, err
+	}
+	capture.Snapshot = nil // server owns it from this point onward.
+	if err := server.SetMetadata(metadata); err != nil {
+		_ = server.Close()
+		_ = resume()
+		return nil, err
+	}
+	address := args.AdvertiseAddress
+	if address == "" {
+		address = listener.Addr().String()
+	}
+	session := &distributedForkSession{source: sourceID, address: address, server: server}
+	f.mu.Lock()
+	if _, ok := f.distributedSessions[args.SessionID]; ok {
+		f.mu.Unlock()
+		_ = server.Close()
+		_ = resume()
+		return nil, fmt.Errorf("distributed fork session %q was created concurrently", args.SessionID)
+	}
+	f.distributedSessions[args.SessionID] = session
+	f.mu.Unlock()
+	keepListener = true
+	go func() {
+		if err := server.Serve(); err != nil {
+			_ = server.Close()
+		}
+	}()
+	if err := resume(); err != nil {
+		f.mu.Lock()
+		delete(f.distributedSessions, args.SessionID)
+		f.mu.Unlock()
+		_ = server.Close()
+		return nil, fmt.Errorf("resuming source branch %q: %w", sourceID, err)
+	}
+	f.mu.Lock()
+	source.state = kernelBranchState(source.k)
+	f.mu.Unlock()
+	return &DistributedForkSessionInfo{
+		SessionID: args.SessionID, Source: sourceID, Address: address, Token: token,
+		MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
+	}, nil
+}
+
+// DistributedForkSessionStatus returns progress without disclosing the bearer
+// token required to read the snapshot.
+func (f *SandboxFamily) DistributedForkSessionStatus(id string) (*DistributedForkSessionStatus, error) {
+	f.mu.Lock()
+	session := f.distributedSessions[id]
+	f.mu.Unlock()
+	if session == nil {
+		return nil, fmt.Errorf("distributed fork session %q does not exist", id)
+	}
+	return &DistributedForkSessionStatus{
+		SessionID: id, Source: session.source, Address: session.address,
+		Transport: session.server.Stats(), Snapshot: session.server.SnapshotStats(),
+	}, nil
+}
+
+// CancelDistributedForkSession closes the transport and releases every page
+// still retained for the target. It is idempotent for a session that already
+// completed cancellation in this process.
+func (f *SandboxFamily) CancelDistributedForkSession(id string) error {
+	f.mu.Lock()
+	session := f.distributedSessions[id]
+	if session != nil {
+		delete(f.distributedSessions, id)
+	}
+	f.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	return session.server.Close()
+}
+
+// CloseDistributedForkSessions releases all remote dependencies during Sentry
+// teardown.
+func (f *SandboxFamily) CloseDistributedForkSessions() {
+	f.mu.Lock()
+	sessions := f.distributedSessions
+	f.distributedSessions = make(map[string]*distributedForkSession)
+	f.mu.Unlock()
+	for _, session := range sessions {
+		_ = session.server.Close()
 	}
 }
 
