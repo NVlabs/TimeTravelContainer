@@ -20,6 +20,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -229,6 +230,8 @@ type TCPPushSender struct {
 	err     atomic.Value
 	bytes   atomic.Uint64
 	retries atomic.Uint64
+	hints   atomic.Uint64
+	chunks  atomic.Uint64
 }
 
 // TCPPushSenderOpts configures proactive push transport and retry behavior.
@@ -267,51 +270,99 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 		}
 	}()
 	requestID := uint32(1)
-	for hint := range snapshot.PushHints() {
-		for off, remaining := hint.StreamOffset, hint.Length; remaining != 0; requestID++ {
-			length := min(remaining, opts.MaxPush)
-			payload := make([]byte, length)
-			if n, err := snapshot.CopyStreamAt(payload, int64(off)); err != nil || uint64(n) != length {
-				break
-			}
-			header := tcpHeader{type_: tcpPush, token: token, requestID: requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
-			response, err := s.pushWithRetry(&conn, address, token, header, payload, opts)
-			if err != nil {
-				s.err.Store(err)
-				return
-			}
-			if response.offset != off || uint64(response.length) != length {
-				s.err.Store(fmt.Errorf("mismatched TCP push response"))
-				return
-			}
-			switch response.type_ {
-			case tcpPushOK:
-				commit := header
-				commit.type_ = tcpPushCommit
-				commit.checksum = 0
-				response, err = s.pushWithRetry(&conn, address, token, commit, nil, opts)
+	hints := snapshot.PushHints()
+	for {
+		hint, ok := <-hints
+		if !ok {
+			return
+		}
+		merged, consumed, closed := collectCoalescedPushHints(hint, hints)
+		s.hints.Add(uint64(consumed))
+		for _, candidate := range merged {
+			for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; requestID++ {
+				length := min(remaining, opts.MaxPush)
+				payload := make([]byte, length)
+				if n, err := snapshot.CopyStreamAt(payload, int64(off)); err != nil || uint64(n) != length {
+					break
+				}
+				header := tcpHeader{type_: tcpPush, token: token, requestID: requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
+				response, err := s.pushWithRetry(&conn, address, token, header, payload, opts)
 				if err != nil {
 					s.err.Store(err)
 					return
 				}
-				if response.type_ != tcpPushCommitOK {
-					s.err.Store(fmt.Errorf("unexpected TCP push commit response %d", response.type_))
+				if response.offset != off || uint64(response.length) != length {
+					s.err.Store(fmt.Errorf("mismatched TCP push response"))
 					return
 				}
-				if err := snapshot.AcknowledgeStreamRange(off, length); err != nil {
-					s.err.Store(err)
+				switch response.type_ {
+				case tcpPushOK:
+					commit := header
+					commit.type_ = tcpPushCommit
+					commit.checksum = 0
+					response, err = s.pushWithRetry(&conn, address, token, commit, nil, opts)
+					if err != nil {
+						s.err.Store(err)
+						return
+					}
+					if response.type_ != tcpPushCommitOK {
+						s.err.Store(fmt.Errorf("unexpected TCP push commit response %d", response.type_))
+						return
+					}
+					if err := snapshot.AcknowledgeStreamRange(off, length); err != nil {
+						s.err.Store(err)
+						return
+					}
+					s.bytes.Add(length)
+					s.chunks.Add(1)
+				case tcpPushSkip:
+				default:
+					s.err.Store(fmt.Errorf("unexpected TCP push response %d", response.type_))
 					return
 				}
-				s.bytes.Add(length)
-			case tcpPushSkip:
-			default:
-				s.err.Store(fmt.Errorf("unexpected TCP push response %d", response.type_))
-				return
+				off += length
+				remaining -= length
 			}
-			off += length
-			remaining -= length
+		}
+		if closed {
+			return
 		}
 	}
+}
+
+func collectCoalescedPushHints(first pgalloc.RemotePushHint, hints <-chan pgalloc.RemotePushHint) ([]pgalloc.RemotePushHint, int, bool) {
+	batch := []pgalloc.RemotePushHint{first}
+	closed := false
+collect:
+	for len(batch) < 256 {
+		select {
+		case hint, ok := <-hints:
+			if !ok {
+				closed = true
+				break collect
+			}
+			batch = append(batch, hint)
+		default:
+			break collect
+		}
+	}
+	consumed := len(batch)
+	sort.Slice(batch, func(i, j int) bool { return batch[i].StreamOffset < batch[j].StreamOffset })
+	merged := batch[:0]
+	for _, candidate := range batch {
+		if len(merged) == 0 {
+			merged = append(merged, candidate)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if candidate.StreamOffset <= last.StreamOffset+last.Length {
+			end := max(last.StreamOffset+last.Length, candidate.StreamOffset+candidate.Length)
+			last.Length = end - last.StreamOffset
+			continue
+		}
+		merged = append(merged, candidate)
+	}
+	return merged, consumed, closed
 }
 
 func (s *TCPPushSender) pushWithRetry(conn *net.Conn, address string, token SnapshotToken, header tcpHeader, payload []byte, opts TCPPushSenderOpts) (tcpHeader, error) {
@@ -367,9 +418,13 @@ func (s *TCPPushSender) Retries() uint64 { return s.retries.Load() }
 type TCPPushSenderStats struct {
 	BytesPushed uint64
 	Retries     uint64
+	Hints       uint64
+	Chunks      uint64
 }
 
 // Stats returns source-side proactive push counters.
 func (s *TCPPushSender) Stats() TCPPushSenderStats {
-	return TCPPushSenderStats{BytesPushed: s.bytes.Load(), Retries: s.retries.Load()}
+	return TCPPushSenderStats{
+		BytesPushed: s.bytes.Load(), Retries: s.retries.Load(), Hints: s.hints.Load(), Chunks: s.chunks.Load(),
+	}
 }

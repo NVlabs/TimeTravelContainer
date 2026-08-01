@@ -701,6 +701,31 @@ func TestTCPProactivePushInstallAndAcknowledge(t *testing.T) {
 	}
 }
 
+func TestCoalesceAdjacentAndOverlappingPushHints(t *testing.T) {
+	hints := make(chan pgalloc.RemotePushHint, 4)
+	hints <- pgalloc.RemotePushHint{StreamOffset: 3 * hostarch.PageSize, Length: hostarch.PageSize}
+	hints <- pgalloc.RemotePushHint{StreamOffset: 2 * hostarch.PageSize, Length: 2 * hostarch.PageSize}
+	hints <- pgalloc.RemotePushHint{StreamOffset: 8 * hostarch.PageSize, Length: hostarch.PageSize}
+	close(hints)
+	merged, consumed, closed := collectCoalescedPushHints(
+		pgalloc.RemotePushHint{StreamOffset: hostarch.PageSize, Length: hostarch.PageSize}, hints)
+	if consumed != 4 || !closed {
+		t.Fatalf("consumed=%d closed=%t", consumed, closed)
+	}
+	want := []pgalloc.RemotePushHint{
+		{StreamOffset: hostarch.PageSize, Length: 3 * hostarch.PageSize},
+		{StreamOffset: 8 * hostarch.PageSize, Length: hostarch.PageSize},
+	}
+	if len(merged) != len(want) {
+		t.Fatalf("merged=%+v, want %+v", merged, want)
+	}
+	for i := range want {
+		if merged[i] != want[i] {
+			t.Fatalf("merged[%d]=%+v, want %+v", i, merged[i], want[i])
+		}
+	}
+}
+
 func TestTCPProactivePushRecoversLostPushOK(t *testing.T) {
 	source, sourceFR, _ := newTCPTestMemoryFile(t, 1)
 	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)

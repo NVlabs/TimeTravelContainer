@@ -406,8 +406,10 @@ execution or a cleanly failed target, never silent corruption.
   until commit, so loss of `PUSH_OK` replays success instead of misclassifying
   an already installed page as pull-owned. Fault-injection and race-detector
   tests cover this response-loss path.
-* Implement sharded bounded queues, range coalescing, dirty-orphan push, and
-  batched installation acknowledgements.
+* The sender now drains bounded batches of queued COW hints, sorts them, and
+  coalesces adjacent or overlapping ranges before applying the configured
+  network chunk size. Sharded queues and batched installation
+  acknowledgements remain to be added.
 * Release old source pages individually and validate the unique-page write
   fast path without eager PMA splitting or TLB work on ACK.
 * Add memory-pressure and explicit eager-drain policies.
