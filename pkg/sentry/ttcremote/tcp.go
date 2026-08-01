@@ -57,7 +57,11 @@ const (
 	tcpHelloOK
 	tcpMetadataPull
 	tcpMetadataData
+	tcpAckBatch
+	tcpAckBatchOK
 )
+
+const tcpAckRangeSize = 16
 
 type tcpHeader struct {
 	type_     tcpMessageType
@@ -149,6 +153,7 @@ type TCPPageServer struct {
 
 	requests      atomic.Uint64
 	acks          atomic.Uint64
+	ackBatches    atomic.Uint64
 	bytes         atomic.Uint64
 	metadata      []byte
 	metadataBytes atomic.Uint64
@@ -158,6 +163,7 @@ type TCPPageServer struct {
 type TCPPageServerStats struct {
 	PullRequests      uint64
 	AckRequests       uint64
+	AckBatches        uint64
 	BytesSent         uint64
 	MetadataBytesSent uint64
 }
@@ -188,6 +194,7 @@ func (s *TCPPageServer) Stats() TCPPageServerStats {
 	return TCPPageServerStats{
 		PullRequests:      s.requests.Load(),
 		AckRequests:       s.acks.Load(),
+		AckBatches:        s.ackBatches.Load(),
 		BytesSent:         s.bytes.Load(),
 		MetadataBytesSent: s.metadataBytes.Load(),
 	}
@@ -328,6 +335,39 @@ func (s *TCPPageServer) serveConn(conn net.Conn) {
 				return
 			}
 
+		case tcpAckBatch:
+			if header.offset != 0 || header.length == 0 || uint64(header.length) > s.maxRead ||
+				int(header.length)%tcpAckRangeSize != 0 {
+				s.writeError(conn, header, errors.New("invalid acknowledgement batch"))
+				return
+			}
+			payload := make([]byte, header.length)
+			if _, err := io.ReadFull(conn, payload); err != nil || crc32.ChecksumIEEE(payload) != header.checksum {
+				return
+			}
+			entries := len(payload) / tcpAckRangeSize
+			for i := 0; i < entries; i++ {
+				entry := payload[i*tcpAckRangeSize : (i+1)*tcpAckRangeSize]
+				offset := binary.BigEndian.Uint64(entry[4:12])
+				length := uint64(binary.BigEndian.Uint32(entry[12:16]))
+				if length == 0 || length > s.maxRead || !hostarch.IsPageAligned(offset) || !hostarch.IsPageAligned(length) {
+					s.writeError(conn, header, errors.New("invalid range in acknowledgement batch"))
+					return
+				}
+				if err := s.snapshot.AcknowledgeStreamRange(offset, length); err != nil {
+					s.writeError(conn, header, err)
+					return
+				}
+			}
+			s.acks.Add(uint64(entries))
+			s.ackBatches.Add(1)
+			if err := writeTCPMessage(conn, tcpHeader{
+				type_: tcpAckBatchOK, token: s.token, requestID: header.requestID,
+				offset: uint64(entries),
+			}, nil); err != nil {
+				return
+			}
+
 		default:
 			s.writeError(conn, header, fmt.Errorf("unexpected message type %d", header.type_))
 			return
@@ -437,27 +477,38 @@ type tcpReadSubmission struct {
 	dst    stateio.LocalClientRanges
 }
 
+type tcpAckSubmission struct {
+	requestID uint32
+	offset    uint64
+	length    uint64
+	done      chan error
+}
+
 // TCPRemoteReader implements stateio.AsyncReader over TCP. Each worker uses a
 // separate ordered connection, allowing MaxParallel independent page pulls.
 type TCPRemoteReader struct {
 	stateio.NoRegisterClientFD
 
-	address      string
-	token        SnapshotToken
-	maxReadBytes uint64
-	maxRanges    int
-	timeout      time.Duration
-	retryLimit   int
-	retryBackoff time.Duration
+	address       string
+	token         SnapshotToken
+	maxReadBytes  uint64
+	maxRanges     int
+	timeout       time.Duration
+	retryLimit    int
+	retryBackoff  time.Duration
+	ackBatchPages int
+	ackInterval   time.Duration
+	maxAckEntries int
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	subs   chan tcpReadSubmission
-	cmps   chan stateio.Completion
-	wg     sync.WaitGroup
-	once   sync.Once
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
+	ctx     context.Context
+	cancel  context.CancelFunc
+	subs    chan tcpReadSubmission
+	cmps    chan stateio.Completion
+	ackSubs chan tcpAckSubmission
+	wg      sync.WaitGroup
+	once    sync.Once
+	mu      sync.Mutex
+	conns   map[net.Conn]struct{}
 
 	submitted      atomic.Uint64
 	completed      atomic.Uint64
@@ -469,12 +520,14 @@ type TCPRemoteReader struct {
 
 // TCPRemoteReaderOpts configures remote page reads.
 type TCPRemoteReaderOpts struct {
-	MaxReadBytes uint64
-	MaxRanges    int
-	MaxParallel  int
-	Timeout      time.Duration
-	RetryLimit   int
-	RetryBackoff time.Duration
+	MaxReadBytes  uint64
+	MaxRanges     int
+	MaxParallel   int
+	Timeout       time.Duration
+	RetryLimit    int
+	RetryBackoff  time.Duration
+	AckBatchPages int
+	AckInterval   time.Duration
 }
 
 // TCPRemoteReaderStats reports target-side demand paging activity.
@@ -490,26 +543,29 @@ type TCPRemoteReaderStats struct {
 // TCPRemoteReaderDebugState is a token-free transaction snapshot suitable for
 // logs, diagnostics, and experiment result capture.
 type TCPRemoteReaderDebugState struct {
-	Address      string
-	MaxReadBytes uint64
-	MaxRanges    int
-	MaxParallel  int
-	Timeout      time.Duration
-	RetryLimit   int
-	RetryBackoff time.Duration
-	Stats        TCPRemoteReaderStats
+	Address       string
+	MaxReadBytes  uint64
+	MaxRanges     int
+	MaxParallel   int
+	Timeout       time.Duration
+	RetryLimit    int
+	RetryBackoff  time.Duration
+	AckBatchPages int
+	AckInterval   time.Duration
+	Stats         TCPRemoteReaderStats
 }
 
 // NewTCPRemoteReader constructs a TCP page reader. timeout applies to dialing
 // and every request/response pair.
 func NewTCPRemoteReader(address string, token SnapshotToken, maxReadBytes uint64, maxRanges, maxParallel int, timeout time.Duration) (*TCPRemoteReader, error) {
 	return NewTCPRemoteReaderWithOpts(address, token, TCPRemoteReaderOpts{
-		MaxReadBytes: maxReadBytes,
-		MaxRanges:    maxRanges,
-		MaxParallel:  maxParallel,
-		Timeout:      timeout,
-		RetryLimit:   3,
-		RetryBackoff: 10 * time.Millisecond,
+		MaxReadBytes:  maxReadBytes,
+		MaxRanges:     maxRanges,
+		MaxParallel:   maxParallel,
+		Timeout:       timeout,
+		RetryLimit:    3,
+		RetryBackoff:  10 * time.Millisecond,
+		AckBatchPages: 1,
 	})
 }
 
@@ -530,20 +586,34 @@ func NewTCPRemoteReaderWithOpts(address string, token SnapshotToken, opts TCPRem
 	if opts.RetryLimit < 0 || opts.RetryBackoff < 0 {
 		return nil, errors.New("TCP retry limit and backoff must be non-negative")
 	}
+	if opts.AckBatchPages == 0 {
+		opts.AckBatchPages = 1
+	}
+	if opts.AckBatchPages < 0 || opts.AckInterval < 0 {
+		return nil, errors.New("TCP acknowledgement batch size and interval must be non-negative")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &TCPRemoteReader{
-		address:      address,
-		token:        token,
-		maxReadBytes: opts.MaxReadBytes,
-		maxRanges:    opts.MaxRanges,
-		timeout:      opts.Timeout,
-		retryLimit:   opts.RetryLimit,
-		retryBackoff: opts.RetryBackoff,
-		ctx:          ctx,
-		cancel:       cancel,
-		subs:         make(chan tcpReadSubmission, opts.MaxParallel),
-		cmps:         make(chan stateio.Completion, opts.MaxParallel),
-		conns:        make(map[net.Conn]struct{}),
+		address:       address,
+		token:         token,
+		maxReadBytes:  opts.MaxReadBytes,
+		maxRanges:     opts.MaxRanges,
+		timeout:       opts.Timeout,
+		retryLimit:    opts.RetryLimit,
+		retryBackoff:  opts.RetryBackoff,
+		ackBatchPages: opts.AckBatchPages,
+		ackInterval:   opts.AckInterval,
+		maxAckEntries: max(1, int(opts.MaxReadBytes/tcpAckRangeSize)),
+		ctx:           ctx,
+		cancel:        cancel,
+		subs:          make(chan tcpReadSubmission, opts.MaxParallel),
+		cmps:          make(chan stateio.Completion, opts.MaxParallel),
+		conns:         make(map[net.Conn]struct{}),
+	}
+	if opts.AckBatchPages > 1 {
+		r.ackSubs = make(chan tcpAckSubmission, opts.MaxParallel)
+		r.wg.Add(1)
+		go r.ackWorker()
 	}
 	r.wg.Add(opts.MaxParallel)
 	for range opts.MaxParallel {
@@ -572,6 +642,7 @@ func (r *TCPRemoteReader) DebugState() TCPRemoteReaderDebugState {
 		Address: r.address, MaxReadBytes: r.maxReadBytes, MaxRanges: r.maxRanges,
 		MaxParallel: cap(r.subs), Timeout: r.timeout, RetryLimit: r.retryLimit,
 		RetryBackoff: r.retryBackoff, Stats: r.Stats(),
+		AckBatchPages: r.ackBatchPages, AckInterval: r.ackInterval,
 	}
 }
 
@@ -618,7 +689,13 @@ func (r *TCPRemoteReader) worker() {
 		case <-r.ctx.Done():
 			return
 		case sub := <-r.subs:
-			n, err := r.performReadWithRetry(&conn, sub)
+			n, err := r.performReadWithRetry(&conn, sub, r.ackSubs == nil)
+			if err == nil && r.ackSubs != nil {
+				err = r.batchAcknowledge(sub)
+				if err != nil {
+					n = 0
+				}
+			}
 			if err != nil {
 				r.failed.Add(1)
 			} else {
@@ -636,7 +713,7 @@ func (r *TCPRemoteReader) worker() {
 	}
 }
 
-func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmission) (uint64, error) {
+func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmission, acknowledge bool) (uint64, error) {
 	if sub.offset < 0 || sub.total == 0 || sub.total > r.maxReadBytes || sub.total > uint64(^uint32(0)) ||
 		!hostarch.IsPageAligned(uint64(sub.offset)) || !hostarch.IsPageAligned(sub.total) {
 		return 0, fmt.Errorf("invalid TCP remote read: off=%d len=%d", sub.offset, sub.total)
@@ -664,7 +741,7 @@ func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmis
 		}
 		if *conn != nil {
 			var retryable bool
-			installed, retryable, lastErr = r.performReadAttempt(*conn, sub, installed)
+			installed, retryable, lastErr = r.performReadAttempt(*conn, sub, installed, acknowledge)
 			if lastErr == nil {
 				return sub.total, nil
 			}
@@ -693,7 +770,7 @@ func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmis
 // performReadAttempt performs either pull+install+ACK or, if installed is
 // true, an ACK-only recovery. Retrying ACK rather than PULL is essential: the
 // server may have released the source page before its ACKOK was lost.
-func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmission, installed bool) (bool, bool, error) {
+func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmission, installed, acknowledge bool) (bool, bool, error) {
 	deadline := time.Now().Add(r.timeout)
 	if err := conn.SetDeadline(deadline); err != nil {
 		return installed, true, err
@@ -733,6 +810,9 @@ func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmissio
 		installed = true
 		r.bytesInstalled.Add(sub.total)
 	}
+	if !acknowledge {
+		return installed, false, nil
+	}
 	if err := writeTCPMessage(conn, tcpHeader{
 		type_:     tcpAck,
 		token:     r.token,
@@ -753,6 +833,162 @@ func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmissio
 		return installed, false, errors.New("mismatched TCP page acknowledgement")
 	}
 	return installed, false, nil
+}
+
+func (r *TCPRemoteReader) batchAcknowledge(sub tcpReadSubmission) error {
+	ack := tcpAckSubmission{
+		requestID: uint32(sub.id), offset: uint64(sub.offset), length: sub.total, done: make(chan error, 1),
+	}
+	select {
+	case r.ackSubs <- ack:
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+	select {
+	case err := <-ack.done:
+		return err
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+}
+
+func (r *TCPRemoteReader) ackWorker() {
+	defer r.wg.Done()
+	var conn net.Conn
+	defer func() {
+		if conn != nil {
+			r.mu.Lock()
+			delete(r.conns, conn)
+			r.mu.Unlock()
+			conn.Close()
+		}
+	}()
+	batchID := uint32(1)
+	for {
+		var first tcpAckSubmission
+		select {
+		case <-r.ctx.Done():
+			return
+		case first = <-r.ackSubs:
+		}
+		batch := []tcpAckSubmission{first}
+		pages := int((first.length + hostarch.PageSize - 1) / hostarch.PageSize)
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if r.ackInterval != 0 {
+			timer = time.NewTimer(r.ackInterval)
+			timerC = timer.C
+		}
+		canceled := false
+	collect:
+		for pages < r.ackBatchPages && len(batch) < r.maxAckEntries {
+			if timerC == nil {
+				select {
+				case ack := <-r.ackSubs:
+					batch = append(batch, ack)
+					pages += int((ack.length + hostarch.PageSize - 1) / hostarch.PageSize)
+				default:
+					break collect
+				}
+				continue
+			}
+			select {
+			case ack := <-r.ackSubs:
+				batch = append(batch, ack)
+				pages += int((ack.length + hostarch.PageSize - 1) / hostarch.PageSize)
+			case <-timerC:
+				break collect
+			case <-r.ctx.Done():
+				canceled = true
+				break collect
+			}
+		}
+		if timer != nil && !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		var err error
+		if canceled {
+			err = r.ctx.Err()
+		} else {
+			err = r.sendAckBatchWithRetry(&conn, batchID, batch)
+			batchID++
+		}
+		for _, ack := range batch {
+			ack.done <- err
+		}
+		if canceled {
+			return
+		}
+	}
+}
+
+func (r *TCPRemoteReader) sendAckBatchWithRetry(conn *net.Conn, batchID uint32, batch []tcpAckSubmission) error {
+	payload := make([]byte, len(batch)*tcpAckRangeSize)
+	for i, ack := range batch {
+		entry := payload[i*tcpAckRangeSize : (i+1)*tcpAckRangeSize]
+		binary.BigEndian.PutUint32(entry[0:4], ack.requestID)
+		binary.BigEndian.PutUint64(entry[4:12], ack.offset)
+		binary.BigEndian.PutUint32(entry[12:16], uint32(ack.length))
+	}
+	header := tcpHeader{
+		type_: tcpAckBatch, token: r.token, requestID: batchID,
+		length: uint32(len(payload)), checksum: crc32.ChecksumIEEE(payload),
+	}
+	var lastErr error
+	for attempt := 0; attempt <= r.retryLimit; attempt++ {
+		if attempt != 0 {
+			r.retries.Add(1)
+			r.ackOnlyRetries.Add(1)
+		}
+		if *conn == nil {
+			dialer := net.Dialer{Timeout: r.timeout}
+			var err error
+			*conn, err = dialer.DialContext(r.ctx, "tcp", r.address)
+			if err != nil {
+				lastErr = err
+			} else {
+				r.mu.Lock()
+				r.conns[*conn] = struct{}{}
+				r.mu.Unlock()
+			}
+		}
+		if *conn != nil {
+			_ = (*conn).SetDeadline(time.Now().Add(r.timeout))
+			if err := writeTCPMessage(*conn, header, payload); err == nil {
+				response, responsePayload, err := readTCPResponse(*conn, r.token, batchID, r.maxReadBytes)
+				if err == nil {
+					if response.type_ == tcpError {
+						return fmt.Errorf("remote page acknowledgement batch: %s", responsePayload)
+					}
+					if response.type_ == tcpAckBatchOK && response.offset == uint64(len(batch)) && response.length == 0 {
+						return nil
+					}
+					return errors.New("mismatched TCP page acknowledgement batch response")
+				}
+				lastErr = err
+			} else {
+				lastErr = err
+			}
+			r.mu.Lock()
+			delete(r.conns, *conn)
+			r.mu.Unlock()
+			(*conn).Close()
+			*conn = nil
+		}
+		if attempt != r.retryLimit && r.retryBackoff != 0 {
+			timer := time.NewTimer(r.retryBackoff)
+			select {
+			case <-r.ctx.Done():
+				timer.Stop()
+				return r.ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return fmt.Errorf("TCP acknowledgement batch failed after %d attempts: %w", r.retryLimit+1, lastErr)
 }
 
 func readTCPResponse(r io.Reader, token SnapshotToken, requestID uint32, maxPayload uint64) (tcpHeader, []byte, error) {

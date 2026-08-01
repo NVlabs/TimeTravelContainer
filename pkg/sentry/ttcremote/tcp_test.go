@@ -56,26 +56,27 @@ func (r *blockingSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 
 func (r *blockingSnapshotReaderAt) Close() error { return r.snapshot.Close() }
 
-type dropFirstPushOKListener struct {
+type dropFirstControlListener struct {
 	net.Listener
-	once sync.Once
+	message tcpMessageType
+	once    sync.Once
 }
 
-func (l *dropFirstPushOKListener) Accept() (net.Conn, error) {
+func (l *dropFirstControlListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	return &dropFirstPushOKConn{Conn: conn, listener: l}, nil
+	return &dropFirstControlConn{Conn: conn, listener: l}, nil
 }
 
-type dropFirstPushOKConn struct {
+type dropFirstControlConn struct {
 	net.Conn
-	listener *dropFirstPushOKListener
+	listener *dropFirstControlListener
 }
 
-func (c *dropFirstPushOKConn) Write(data []byte) (int, error) {
-	if len(data) == tcpHeaderSize && string(data[:4]) == string(tcpMagic[:]) && tcpMessageType(data[5]) == tcpPushOK {
+func (c *dropFirstControlConn) Write(data []byte) (int, error) {
+	if len(data) == tcpHeaderSize && string(data[:4]) == string(tcpMagic[:]) && tcpMessageType(data[5]) == c.listener.message {
 		drop := false
 		c.listener.once.Do(func() { drop = true })
 		if drop {
@@ -229,6 +230,110 @@ func TestTCPRemoteReaderConcurrentPulls(t *testing.T) {
 	}
 	if !mf.HasUniqueRef(fr) {
 		t.Fatal("source pages did not become unique after TCP acknowledgements")
+	}
+}
+
+func TestTCPRemoteReaderBatchesAcknowledgements(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 4)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	server, serveDone := startTCPTestServer(t, snapshot, token, hostarch.PageSize)
+	reader, err := NewTCPRemoteReaderWithOpts(server.Addr().String(), token, TCPRemoteReaderOpts{
+		MaxReadBytes: hostarch.PageSize, MaxRanges: 1, MaxParallel: 4,
+		Timeout: 5 * time.Second, RetryLimit: 2, AckBatchPages: 4, AckInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	for page := range 4 {
+		off := page * int(hostarch.PageSize)
+		reader.AddRead(page, int64(off), nil, memmap.FileRange{}, got[off:off+int(hostarch.PageSize)])
+	}
+	completions, err := reader.Wait(nil, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, completion := range completions {
+		if completion.Err != nil || completion.N != hostarch.PageSize {
+			t.Fatalf("completion %+v", completion)
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("ACK-batched pulls returned incorrect data")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	if stats := server.Stats(); stats.PullRequests != 4 || stats.AckRequests != 4 || stats.AckBatches != 1 {
+		t.Fatalf("ACK batch server stats: %+v", stats)
+	}
+	if stats := reader.Stats(); stats.CompletedReads != 4 || stats.BytesInstalled != fr.Length() {
+		t.Fatalf("ACK batch reader stats: %+v", stats)
+	}
+}
+
+func TestTCPRemoteReaderRecoversLostAckBatchOK(t *testing.T) {
+	mf, fr, want := newTCPTestMemoryFile(t, 2)
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &dropFirstControlListener{Listener: base, message: tcpAckBatchOK}
+	token := testSnapshotToken()
+	server, err := NewTCPPageServer(listener, token, snapshot, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+	reader, err := NewTCPRemoteReaderWithOpts(listener.Addr().String(), token, TCPRemoteReaderOpts{
+		MaxReadBytes: hostarch.PageSize, MaxRanges: 1, MaxParallel: 2,
+		Timeout: time.Second, RetryLimit: 2, AckBatchPages: 2, AckInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	for page := range 2 {
+		off := page * int(hostarch.PageSize)
+		reader.AddRead(page, int64(off), nil, memmap.FileRange{}, got[off:off+int(hostarch.PageSize)])
+	}
+	completions, err := reader.Wait(nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, completion := range completions {
+		if completion.Err != nil || completion.N != hostarch.PageSize {
+			t.Fatalf("completion %+v", completion)
+		}
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("retried ACK batch changed installed data")
+	}
+	if stats := reader.Stats(); stats.Retries != 1 || stats.AckOnlyRetries != 1 || stats.CompletedReads != 2 {
+		t.Fatalf("lost ACK batch reader stats: %+v", stats)
+	}
+	reader.Close()
+	server.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatal(err)
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 {
+		t.Fatalf("lost ACK batch retained source pages: %+v", stats)
 	}
 }
 
@@ -757,7 +862,7 @@ func TestTCPProactivePushRecoversLostPushOK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listener := &dropFirstPushOKListener{Listener: base}
+	listener := &dropFirstControlListener{Listener: base, message: tcpPushOK}
 	token := testSnapshotToken()
 	receiver, err := NewTCPPushReceiver(listener, token, pages, hostarch.PageSize)
 	if err != nil {

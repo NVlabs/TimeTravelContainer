@@ -377,7 +377,12 @@ after a full drain and branch destruction.
   spare asynchronous slots fetch adjacent pages in multi-page requests. The
   active window can be changed at runtime without reconstructing the target,
   providing the switch point for an adaptive controller. Automated policy
-  selection and ACK batching remain to be added.
+  selection remains to be added.
+* Installed pull ranges may be acknowledged individually or through a bounded
+  coordinator that batches ranges by page count and timer. Batch confirmation
+  gates target completion, and loss of `ACK_BATCH_OK` retries the same
+  idempotent ranges. Normal, response-loss, and race-detector tests cover this
+  path.
 * Reader, page-server, push-sender, and push-receiver counters are exposed,
   including installed bytes, failures, retries, ACK-only recovery, skipped
   pushes, and pending push receipts. Token-free reader configuration/state can
