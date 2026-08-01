@@ -176,6 +176,7 @@ type DistributedForkLoadOptions struct {
 	FilesystemResources vfs.LiveForkFilesystemResources
 	DemandOnly          bool
 	PrefetchBytes       uint64
+	PrefetchBehindBytes uint64
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
@@ -202,6 +203,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{
 		DemandOnly: opts.DemandOnly, PrefetchBytes: opts.PrefetchBytes,
+		PrefetchBehindBytes: opts.PrefetchBehindBytes,
 	})
 	if err != nil {
 		targetMF.Destroy()
@@ -266,4 +268,13 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	child.Pause()
 	return child, nil
+}
+
+// SetDistributedForkPrefetchWindow changes the active remote-memory prefetch
+// window for a distributed child. It affects future faults only.
+func (k *Kernel) SetDistributedForkPrefetchWindow(behind, ahead uint64) error {
+	if k.remotePageLoad == nil {
+		return fmt.Errorf("kernel has no active distributed remote-memory load")
+	}
+	return k.remotePageLoad.SetPrefetchWindow(behind, ahead)
 }

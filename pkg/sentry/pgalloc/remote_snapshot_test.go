@@ -405,6 +405,50 @@ func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
 	}
 }
 
+func TestDemandOnlyRemotePageLoadFixedWindowAndPolicySwitch(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	target, targetFR := newRemoteTestMemoryFile(t, 8)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, 4*hostarch.PageSize, 1, 3)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, PrefetchBehindBytes: hostarch.PageSize, PrefetchBytes: 2 * hostarch.PageSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	fault := func(page uint64) {
+		t.Helper()
+		fr := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
+		if _, err := target.MapInternal(fr, hostarch.Read); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fault(3)
+	deadline := time.Now().Add(5 * time.Second)
+	for snapshot.Stats().PagesReleased != 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stats := snapshot.Stats(); stats.PagesReleased != 4 {
+		t.Fatalf("fixed prefetch window did not load four pages: %+v", stats)
+	}
+	if err := pages.SetPrefetchWindow(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	fault(7)
+	if stats := snapshot.Stats(); stats.PagesReleased != 5 {
+		t.Fatalf("disabled prefetch loaded more than demanded page: %+v", stats)
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+}
+
 func TestCancelDemandOnlyRemotePageLoad(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 4)
 	target, targetFR := newRemoteTestMemoryFile(t, 4)

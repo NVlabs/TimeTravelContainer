@@ -373,9 +373,11 @@ after a full drain and branch destruction.
   plumbing, then restores netstack and resets inherited external connections.
 * Configurable TCP range sizes and request concurrency are implemented. The
   demand loader now also supports a bounded, page-aligned forward sequential
-  prefetch window: waiter-owned reads keep priority while spare asynchronous
-  slots fetch adjacent pages in multi-page requests. Fixed-window/adaptive
-  prefetch and ACK batching remain to be added.
+  or two-sided fixed prefetch window: waiter-owned reads keep priority while
+  spare asynchronous slots fetch adjacent pages in multi-page requests. The
+  active window can be changed at runtime without reconstructing the target,
+  providing the switch point for an adaptive controller. Automated policy
+  selection and ACK batching remain to be added.
 * Reader, page-server, push-sender, and push-receiver counters are exposed,
   including installed bytes, failures, retries, ACK-only recovery, skipped
   pushes, and pending push receipts. Token-free reader configuration/state can
