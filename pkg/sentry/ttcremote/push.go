@@ -232,7 +232,22 @@ type TCPPushSender struct {
 	retries atomic.Uint64
 	hints   atomic.Uint64
 	chunks  atomic.Uint64
+	scans   atomic.Uint64
 }
+
+// TCPPushPolicy selects which source pages are proactively transferred.
+type TCPPushPolicy string
+
+const (
+	// TCPPushDemandOnly disables proactive transfer.
+	TCPPushDemandOnly TCPPushPolicy = "demand-only"
+	// TCPPushDirtyOrphan transfers fork-time pages when the source breaks COW.
+	TCPPushDirtyOrphan TCPPushPolicy = "dirty-orphan"
+	// TCPPushMemoryPressure adds periodic draining above a retained-byte limit.
+	TCPPushMemoryPressure TCPPushPolicy = "memory-pressure"
+	// TCPPushEagerDrain immediately transfers every outstanding page.
+	TCPPushEagerDrain TCPPushPolicy = "eager-drain"
+)
 
 // TCPPushSenderOpts configures proactive push transport and retry behavior.
 type TCPPushSenderOpts struct {
@@ -240,21 +255,42 @@ type TCPPushSenderOpts struct {
 	Timeout      time.Duration
 	RetryLimit   int
 	RetryBackoff time.Duration
+	Policy       TCPPushPolicy
+	// RetainedHighWater triggers a full outstanding-range scan in
+	// memory-pressure mode.
+	RetainedHighWater uint64
+	ScanInterval      time.Duration
 }
 
 // StartTCPPushSender starts a source-side reverse-channel worker.
 func StartTCPPushSender(address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, maxPush uint64, timeout time.Duration) (*TCPPushSender, error) {
 	return StartTCPPushSenderWithOpts(address, token, snapshot, TCPPushSenderOpts{
 		MaxPush: maxPush, Timeout: timeout, RetryLimit: 3, RetryBackoff: 10 * time.Millisecond,
+		Policy: TCPPushDirtyOrphan,
 	})
 }
 
 // StartTCPPushSenderWithOpts starts a configurable source-side reverse-channel
 // worker. Every chunk keeps the same transaction identity across retries.
 func StartTCPPushSenderWithOpts(address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts) (*TCPPushSender, error) {
+	if opts.Policy == "" {
+		opts.Policy = TCPPushDirtyOrphan
+	}
 	if address == "" || snapshot == nil || opts.MaxPush < hostarch.PageSize || !hostarch.IsPageAligned(opts.MaxPush) ||
 		opts.MaxPush > 2<<20 || opts.Timeout <= 0 || opts.RetryLimit < 0 || opts.RetryBackoff < 0 {
 		return nil, errors.New("invalid TCP push sender configuration")
+	}
+	switch opts.Policy {
+	case TCPPushDemandOnly, TCPPushDirtyOrphan, TCPPushEagerDrain:
+	case TCPPushMemoryPressure:
+		if opts.RetainedHighWater < hostarch.PageSize {
+			return nil, errors.New("memory-pressure push requires a retained high-water mark of at least one page")
+		}
+		if opts.ScanInterval <= 0 {
+			opts.ScanInterval = 10 * time.Millisecond
+		}
+	default:
+		return nil, fmt.Errorf("unknown TCP push policy %q", opts.Policy)
 	}
 	s := &TCPPushSender{done: make(chan struct{})}
 	go s.run(address, token, snapshot, opts)
@@ -271,63 +307,107 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 	}()
 	requestID := uint32(1)
 	hints := snapshot.PushHints()
-	for {
-		hint, ok := <-hints
-		if !ok {
+	if opts.Policy == TCPPushDemandOnly {
+		for range hints {
+			s.hints.Add(1)
+		}
+		return
+	}
+	if opts.Policy == TCPPushEagerDrain {
+		outstanding, err := snapshot.OutstandingStreamRanges(opts.MaxPush)
+		if err != nil {
+			s.err.Store(err)
 			return
 		}
-		merged, consumed, closed := collectCoalescedPushHints(hint, hints)
-		s.hints.Add(uint64(consumed))
-		for _, candidate := range merged {
-			for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; requestID++ {
-				length := min(remaining, opts.MaxPush)
-				payload := make([]byte, length)
-				if n, err := snapshot.CopyStreamAt(payload, int64(off)); err != nil || uint64(n) != length {
-					break
-				}
-				header := tcpHeader{type_: tcpPush, token: token, requestID: requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
-				response, err := s.pushWithRetry(&conn, address, token, header, payload, opts)
-				if err != nil {
-					s.err.Store(err)
-					return
-				}
-				if response.offset != off || uint64(response.length) != length {
-					s.err.Store(fmt.Errorf("mismatched TCP push response"))
-					return
-				}
-				switch response.type_ {
-				case tcpPushOK:
-					commit := header
-					commit.type_ = tcpPushCommit
-					commit.checksum = 0
-					response, err = s.pushWithRetry(&conn, address, token, commit, nil, opts)
-					if err != nil {
-						s.err.Store(err)
-						return
-					}
-					if response.type_ != tcpPushCommitOK {
-						s.err.Store(fmt.Errorf("unexpected TCP push commit response %d", response.type_))
-						return
-					}
-					if err := snapshot.AcknowledgeStreamRange(off, length); err != nil {
-						s.err.Store(err)
-						return
-					}
-					s.bytes.Add(length)
-					s.chunks.Add(1)
-				case tcpPushSkip:
-				default:
-					s.err.Store(fmt.Errorf("unexpected TCP push response %d", response.type_))
-					return
-				}
-				off += length
-				remaining -= length
-			}
-		}
-		if closed {
+		s.scans.Add(1)
+		if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID); err != nil {
+			s.err.Store(err)
 			return
 		}
 	}
+	var ticker *time.Ticker
+	var tickerC <-chan time.Time
+	if opts.Policy == TCPPushMemoryPressure {
+		ticker = time.NewTicker(opts.ScanInterval)
+		defer ticker.Stop()
+		tickerC = ticker.C
+	}
+	for {
+		select {
+		case hint, ok := <-hints:
+			if !ok {
+				return
+			}
+			merged, consumed, closed := collectCoalescedPushHints(hint, hints)
+			s.hints.Add(uint64(consumed))
+			if err := s.sendRanges(&conn, address, token, snapshot, opts, merged, &requestID); err != nil {
+				s.err.Store(err)
+				return
+			}
+			if closed {
+				return
+			}
+		case <-tickerC:
+			stats := snapshot.Stats()
+			if stats.PagesOutstanding*hostarch.PageSize < opts.RetainedHighWater {
+				continue
+			}
+			outstanding, err := snapshot.OutstandingStreamRanges(opts.MaxPush)
+			if err != nil {
+				s.err.Store(err)
+				return
+			}
+			s.scans.Add(1)
+			if err := s.sendRanges(&conn, address, token, snapshot, opts, outstanding, &requestID); err != nil {
+				s.err.Store(err)
+				return
+			}
+		}
+	}
+}
+
+func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, ranges []pgalloc.RemotePushHint, requestID *uint32) error {
+	for _, candidate := range ranges {
+		for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; (*requestID)++ {
+			length := min(remaining, opts.MaxPush)
+			payload := make([]byte, length)
+			if n, err := snapshot.CopyStreamAt(payload, int64(off)); err != nil || uint64(n) != length {
+				break
+			}
+			header := tcpHeader{type_: tcpPush, token: token, requestID: *requestID, offset: off, length: uint32(length), checksum: crc32.ChecksumIEEE(payload)}
+			response, err := s.pushWithRetry(conn, address, token, header, payload, opts)
+			if err != nil {
+				return err
+			}
+			if response.offset != off || uint64(response.length) != length {
+				return fmt.Errorf("mismatched TCP push response")
+			}
+			switch response.type_ {
+			case tcpPushOK:
+				commit := header
+				commit.type_ = tcpPushCommit
+				commit.checksum = 0
+				response, err = s.pushWithRetry(conn, address, token, commit, nil, opts)
+				if err != nil {
+					return err
+				}
+				if response.type_ != tcpPushCommitOK {
+					return fmt.Errorf("unexpected TCP push commit response %d", response.type_)
+				}
+				if err := snapshot.AcknowledgeStreamRange(off, length); err != nil {
+					return err
+				}
+				s.bytes.Add(length)
+				s.chunks.Add(1)
+			case tcpPushSkip:
+			default:
+				return fmt.Errorf("unexpected TCP push response %d", response.type_)
+			}
+			off += length
+			remaining -= length
+		}
+	}
+	return nil
 }
 
 func collectCoalescedPushHints(first pgalloc.RemotePushHint, hints <-chan pgalloc.RemotePushHint) ([]pgalloc.RemotePushHint, int, bool) {
@@ -420,11 +500,12 @@ type TCPPushSenderStats struct {
 	Retries     uint64
 	Hints       uint64
 	Chunks      uint64
+	Scans       uint64
 }
 
 // Stats returns source-side proactive push counters.
 func (s *TCPPushSender) Stats() TCPPushSenderStats {
 	return TCPPushSenderStats{
-		BytesPushed: s.bytes.Load(), Retries: s.retries.Load(), Hints: s.hints.Load(), Chunks: s.chunks.Load(),
+		BytesPushed: s.bytes.Load(), Retries: s.retries.Load(), Hints: s.hints.Load(), Chunks: s.chunks.Load(), Scans: s.scans.Load(),
 	}
 }

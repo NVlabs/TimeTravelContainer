@@ -155,6 +155,41 @@ func newEmptyTCPTestMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 	return mf
 }
 
+func newTCPPushPolicyTestSession(t *testing.T, pageCount uint64) (*pgalloc.MemoryFile, memmap.FileRange, *pgalloc.RemoteSnapshot, *pgalloc.AsyncPagesFileLoad) {
+	t.Helper()
+	source, sourceFR, _ := newTCPTestMemoryFile(t, pageCount)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyTCPTestMemoryFile(t)
+	if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, allocator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		target.DecRef(sourceFR)
+		target.Destroy()
+	})
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, 4*hostarch.PageSize, 1, 2)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	t.Cleanup(func() {
+		pages.Cancel()
+		_ = pages.Wait()
+	})
+	return source, sourceFR, snapshot, pages
+}
+
 func startTCPTestServer(t *testing.T, snapshot *pgalloc.RemoteSnapshot, token SnapshotToken, maxRead uint64) (*TCPPageServer, <-chan error) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -902,6 +937,73 @@ func TestTCPProactivePushRecoversLostPushOK(t *testing.T) {
 	receiver.Close()
 	if err := <-receiverDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTCPPushPoliciesWithoutSourceWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy TCPPushPolicy
+		high   uint64
+		want   uint64
+	}{
+		{name: "demand-only", policy: TCPPushDemandOnly, want: 0},
+		{name: "eager-drain", policy: TCPPushEagerDrain, want: 4 * hostarch.PageSize},
+		{name: "memory-pressure", policy: TCPPushMemoryPressure, high: 4 * hostarch.PageSize, want: 4 * hostarch.PageSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source, sourceFR, snapshot, pages := newTCPPushPolicyTestSession(t, 4)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := testSnapshotToken()
+			receiver, err := NewTCPPushReceiver(listener, token, pages, 4*hostarch.PageSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiverDone := make(chan error, 1)
+			go func() { receiverDone <- receiver.Serve() }()
+			sender, err := StartTCPPushSenderWithOpts(listener.Addr().String(), token, snapshot, TCPPushSenderOpts{
+				MaxPush: 4 * hostarch.PageSize, Timeout: time.Second, RetryLimit: 2,
+				Policy: tc.policy, RetainedHighWater: tc.high, ScanInterval: time.Millisecond,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for sender.BytesPushed() != tc.want && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if sender.BytesPushed() != tc.want {
+				t.Fatalf("policy %s pushed %d bytes, want %d", tc.policy, sender.BytesPushed(), tc.want)
+			}
+			if tc.want == 0 {
+				time.Sleep(20 * time.Millisecond)
+				if stats := snapshot.Stats(); stats.PagesOutstanding != 4 {
+					t.Fatalf("demand-only released source pages: %+v", stats)
+				}
+			} else {
+				if stats := snapshot.Stats(); stats.PagesOutstanding != 0 {
+					t.Fatalf("policy %s retained source pages: %+v", tc.policy, stats)
+				}
+				if stats := sender.Stats(); stats.Scans == 0 || stats.Chunks != 1 {
+					t.Fatalf("policy %s sender stats: %+v", tc.policy, stats)
+				}
+				if !source.HasUniqueRef(sourceFR) {
+					t.Fatalf("policy %s did not restore the source unique-page fast path", tc.policy)
+				}
+			}
+			pages.Cancel()
+			_ = pages.Wait()
+			if err := sender.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			receiver.Close()
+			if err := <-receiverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

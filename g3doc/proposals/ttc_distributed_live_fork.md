@@ -415,9 +415,12 @@ execution or a cleanly failed target, never silent corruption.
   coalesces adjacent or overlapping ranges before applying the configured
   network chunk size. Sharded queues and batched installation
   acknowledgements remain to be added.
-* Release old source pages individually and validate the unique-page write
-  fast path without eager PMA splitting or TLB work on ACK.
-* Add memory-pressure and explicit eager-drain policies.
+* `RemoteSnapshot` can enumerate bounded runs of pages that remain
+  unacknowledged. The push transport now implements demand-only,
+  dirty-orphan, retained-memory high-water, and explicit eager-drain policies.
+  Tests cover policy behavior without source writes, per-page reclamation, and
+  restoration of the source allocator's unique-reference fast path after a
+  complete drain.
 
 Exit criteria: the source write path contains no network wait; stress tests show
 no deadlock under queue saturation; acknowledged obsolete pages are reclaimed;

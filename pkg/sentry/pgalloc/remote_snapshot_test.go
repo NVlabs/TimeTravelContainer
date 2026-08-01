@@ -344,6 +344,38 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotOutstandingStreamRanges(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 6)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	if err := snapshot.AcknowledgeStreamRange(hostarch.PageSize, hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.AcknowledgeStreamRange(3*hostarch.PageSize, hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	ranges, err := snapshot.OutstandingStreamRanges(2 * hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []RemotePushHint{
+		{StreamOffset: 0, Length: hostarch.PageSize},
+		{StreamOffset: 2 * hostarch.PageSize, Length: hostarch.PageSize},
+		{StreamOffset: 4 * hostarch.PageSize, Length: 2 * hostarch.PageSize},
+	}
+	if len(ranges) != len(want) {
+		t.Fatalf("outstanding ranges=%+v, want %+v", ranges, want)
+	}
+	for i := range want {
+		if ranges[i] != want[i] {
+			t.Fatalf("outstanding range %d=%+v, want %+v", i, ranges[i], want[i])
+		}
+	}
+}
+
 func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 8)
 	target, targetFR := newRemoteTestMemoryFile(t, 8)

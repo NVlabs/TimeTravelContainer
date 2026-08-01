@@ -364,6 +364,41 @@ func (s *RemoteSnapshot) Stats() RemoteSnapshotStats {
 	}
 }
 
+// OutstandingStreamRanges returns packed-stream ranges that still require the
+// target. Each range is at most maxRange bytes. It is a point-in-time advisory
+// snapshot: concurrent pulls may acknowledge ranges immediately afterward.
+func (s *RemoteSnapshot) OutstandingStreamRanges(maxRange uint64) ([]RemotePushHint, error) {
+	if maxRange < hostarch.PageSize || !hostarch.IsPageAligned(maxRange) {
+		return nil, fmt.Errorf("invalid outstanding remote range limit %d", maxRange)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil
+	}
+	maxPages := maxRange / hostarch.PageSize
+	var ranges []RemotePushHint
+	for i := range s.regions {
+		region := &s.regions[i]
+		pages := region.Range.Length() / hostarch.PageSize
+		for page := uint64(0); page < pages; {
+			if region.released[page/64]&(uint64(1)<<(page%64)) != 0 {
+				page++
+				continue
+			}
+			start := page
+			for page < pages && page-start < maxPages && region.released[page/64]&(uint64(1)<<(page%64)) == 0 {
+				page++
+			}
+			ranges = append(ranges, RemotePushHint{
+				StreamOffset: region.streamStart + start*hostarch.PageSize,
+				Length:       (page - start) * hostarch.PageSize,
+			})
+		}
+	}
+	return ranges, nil
+}
+
 // PushHints returns a bounded stream of advisory proactive-push candidates.
 func (s *RemoteSnapshot) PushHints() <-chan RemotePushHint { return s.pushHints }
 
