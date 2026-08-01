@@ -116,6 +116,15 @@ type RestoreOptions struct {
 	CheckpointBranch string
 }
 
+// DistributedForkOptions materializes a hidden target bundle that refers to
+// filesystem branches created atomically by the source Sentry. The source and
+// target stores must name the same shared TTC repository.
+type DistributedForkOptions struct {
+	SourceContainer string
+	TargetName      string
+	TargetBranch    string
+}
+
 // BranchInfo is immutable branch lineage plus its last known lifecycle state.
 type BranchInfo struct {
 	ID               string     `json:"id"`
@@ -919,6 +928,122 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	}
 	keep = true
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+}
+
+// PrepareDistributedFork creates target container metadata without copying
+// image or writable filesystem contents. Repository branch pointers may not
+// exist yet; the source capture transaction publishes them before the target
+// Sentry is restored.
+func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkOptions) (Prepared, error) {
+	if err := validateName(opts.SourceContainer); err != nil {
+		return Prepared{}, fmt.Errorf("source container: %w", err)
+	}
+	if err := validateName(opts.TargetName); err != nil {
+		return Prepared{}, fmt.Errorf("target container: %w", err)
+	}
+	if err := validateObjectName("target branch", opts.TargetBranch); err != nil {
+		return Prepared{}, err
+	}
+	source, err := s.LoadContainer(opts.SourceContainer)
+	if err != nil {
+		return Prepared{}, err
+	}
+	containers, err := s.ListContainers()
+	if err != nil {
+		return Prepared{}, err
+	}
+	for _, existing := range containers {
+		if existing.Name == opts.TargetName || existing.ID == opts.TargetName {
+			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.TargetName, existing.ID)
+		}
+	}
+	spec, err := s.LoadSpec(source.ID)
+	if err != nil {
+		return Prepared{}, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return Prepared{}, err
+	}
+	childRepositoryBranch := ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch)
+	for i := range repositories {
+		repositories[i].Branch = childRepositoryBranch
+		// The target borrows a repository owned by the source family. Removing
+		// target metadata must never delete that shared repository directory.
+		repositories[i].Private = false
+	}
+	encodedRepositories, err := json.Marshal(repositories)
+	if err != nil {
+		return Prepared{}, err
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	if len(repositories) == 0 {
+		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
+	} else {
+		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
+	}
+	id, containerDir, err := s.createContainerDir(containers)
+	if err != nil {
+		return Prepared{}, err
+	}
+	keep := false
+	leaseID := ""
+	defer func() {
+		if keep {
+			return
+		}
+		if leaseID != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
+			cancel()
+		}
+		_ = os.RemoveAll(containerDir)
+	}()
+	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.CgroupsPath != "" {
+		spec.Linux.CgroupsPath = filepath.Join("ttc", id)
+	}
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.Mkdir(bundleDir, 0700); err != nil {
+		return Prepared{}, err
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		return Prepared{}, err
+	}
+	leaseID = images.ContainerLeaseID(id)
+	if err := images.CreateContentLease(ctx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID, Digest: source.Digest}); err != nil {
+		return Prepared{}, err
+	}
+	encodedSource, err := json.Marshal(source)
+	if err != nil {
+		return Prepared{}, err
+	}
+	var target ContainerInfo
+	if err := json.Unmarshal(encodedSource, &target); err != nil {
+		return Prepared{}, err
+	}
+	now := time.Now().UTC()
+	target.ID = id
+	target.Name = opts.TargetName
+	target.LeaseID = leaseID
+	target.BundleDir = bundleDir
+	target.PublishedPorts = nil
+	target.AutoRemove = false
+	target.State = "created"
+	target.ExitStatus = nil
+	target.CreatedAt = now
+	target.StartedAt = nil
+	target.ExitedAt = nil
+	target.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	for i := range target.Volumes {
+		target.Volumes[i].Anonymous = false
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &target); err != nil {
+		return Prepared{}, err
+	}
+	keep = true
+	return Prepared{BundleDir: bundleDir, RootFS: target.RootFS, Container: target}, nil
 }
 
 func copyRestoreHostPath(source, destination string) error {

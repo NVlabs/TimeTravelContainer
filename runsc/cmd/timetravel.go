@@ -76,6 +76,7 @@ type TimeTravel struct {
 	distributedListen      string
 	distributedAdvertise   string
 	distributedMaxTransfer uint64
+	distributedConfigFD    int
 }
 
 // Name implements subcommands.Command.Name.
@@ -92,6 +93,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> fork <new-branch-id> [<new-branch-id> ...]\n" +
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel <session-id>\n" +
+		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
@@ -133,6 +135,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.distributedListen, "distributed-listen", "", "host TCP address for the source page server")
 	f.StringVar(&t.distributedAdvertise, "distributed-advertise", "", "page server address advertised to the target")
 	f.Uint64Var(&t.distributedMaxTransfer, "distributed-max-transfer", 0, "maximum bytes in one remote page transfer")
+	f.IntVar(&t.distributedConfigFD, "distributed-config-fd", -1, "inherited FD containing a secret distributed restore request")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -233,6 +236,32 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-cancel":
 		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
+	case "distributed-restore":
+		if t.distributedConfigFD < 0 {
+			util.Fatalf("--distributed-config-fd is required")
+		}
+		configFile := os.NewFile(uintptr(t.distributedConfigFD), "distributed-fork-config")
+		if configFile == nil {
+			util.Fatalf("invalid distributed restore config FD")
+		}
+		decoder := json.NewDecoder(io.LimitReader(configFile, 1<<20))
+		decoder.DisallowUnknownFields()
+		var restoreArgs boot.DistributedForkRestoreArgs
+		if err := decoder.Decode(&restoreArgs); err != nil {
+			configFile.Close()
+			util.Fatalf("decoding distributed restore config: %v", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			configFile.Close()
+			util.Fatalf("distributed restore config contains trailing data")
+		}
+		if err := configFile.Close(); err != nil {
+			util.Fatalf("closing distributed restore config: %v", err)
+		}
+		if restoreArgs.SessionID != f.Arg(2) {
+			util.Fatalf("distributed restore session identity mismatch")
+		}
+		output, err = cont.Sandbox.RestoreDistributedFork(&restoreArgs)
 	case "pause":
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":

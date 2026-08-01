@@ -240,6 +240,10 @@ type Loader struct {
 	// much after the sandbox has started because under some configurations, the
 	// restore is allowed to proceed in the background while the sandbox runs.
 	restoreDone *sync.Cond
+	// distributedRestore distinguishes a remote live-fork restore, whose page
+	// loading remains active after the target is published, from checkpoint
+	// restore's background completion lifecycle.
+	distributedRestore bool
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -949,6 +953,10 @@ func New(args Args) (*Loader, error) {
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.
 func (l *Loader) ConfigureNetwork(s inet.Stack) error {
+	return l.configureNetwork(l.k, s)
+}
+
+func (l *Loader) configureNetwork(k *kernel.Kernel, s inet.Stack) error {
 	if l.networkArgs == nil {
 		return nil
 	}
@@ -974,7 +982,7 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 	}
 	n := &Network{
 		Stack:  eps.Stack,
-		Kernel: l.k,
+		Kernel: k,
 	}
 	if err := n.CreateLinksAndRoutes(networkArgs, nil); err != nil {
 		return err
@@ -1359,7 +1367,12 @@ func (l *Loader) run() error {
 	case created:
 		l.state = started
 	case restoringUnstarted:
-		l.state = restoringStarted
+		if l.distributedRestore {
+			l.state = restored
+			l.restoreDone.Broadcast()
+		} else {
+			l.state = restoringStarted
+		}
 	default:
 		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
 	}

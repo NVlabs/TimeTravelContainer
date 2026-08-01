@@ -14,6 +14,7 @@ go_library(
         "compat_arm64.go",
         "controller.go",
         "debug.go",
+		"distributed_fork.go",
         "events.go",
         "fscheckpoint.go",
         "limits.go",

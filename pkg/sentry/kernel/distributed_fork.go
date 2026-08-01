@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -175,13 +176,14 @@ type DistributedForkLoadOptions struct {
 	RestoreOptions             vfs.CompleteRestoreOptions
 	FilesystemResources        vfs.LiveForkFilesystemResources
 	RestoreFilesystemResources vfs.RestoreFilesystemResources
+	RestoreFilesystemFDMap     map[checkpoint.ResourceID]int
 	DemandOnly                 bool
 	PrefetchBytes              uint64
 	PrefetchBehindBytes        uint64
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
-	ConfigureNetwork func(inet.Stack) error
+	ConfigureNetwork func(*Kernel, inet.Stack) error
 }
 
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a
@@ -229,12 +231,16 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		pgalloc.CtxLiveForkClone:             true,
 		pgalloc.CtxLiveForkRemoteMemoryClone: true,
 		vfs.CtxLiveForkChildBranchID:         opts.ChildBranchID,
+		devutil.CtxDevGoferClientProvider:    child,
 	}
 	if opts.FilesystemResources != nil {
 		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
 	}
 	if opts.RestoreFilesystemResources != nil {
 		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
+	}
+	if opts.RestoreFilesystemFDMap != nil {
+		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
 	}
 	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
@@ -257,7 +263,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 			child.Release()
 			return nil, fmt.Errorf("distributed target network configurator was not provided")
 		}
-		if err := opts.ConfigureNetwork(rootNS.Stack()); err != nil {
+		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
 			child.Release()
 			return nil, fmt.Errorf("configuring distributed target network: %w", err)
 		}

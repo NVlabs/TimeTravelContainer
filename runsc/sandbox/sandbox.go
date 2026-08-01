@@ -2172,6 +2172,15 @@ func (s *Sandbox) CancelDistributedForkSession(id string) error {
 	return nil
 }
 
+// RestoreDistributedFork installs a hidden, paused remote target Kernel.
+func (s *Sandbox) RestoreDistributedFork(args *boot.DistributedForkRestoreArgs) (boot.DistributedForkRestoreInfo, error) {
+	var info boot.DistributedForkRestoreInfo
+	if err := s.call(boot.ContMgrRestoreDistributedFork, args, &info); err != nil {
+		return boot.DistributedForkRestoreInfo{}, fmt.Errorf("restoring distributed fork %q: %w", args.SessionID, err)
+	}
+	return info, nil
+}
+
 // ListBranches lists all in-memory branches in the sandbox family.
 func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
 	var branches []boot.BranchInfo

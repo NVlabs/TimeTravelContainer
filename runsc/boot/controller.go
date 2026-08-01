@@ -113,6 +113,9 @@ const (
 	// ContMgrCancelDistributedForkSession releases a remote snapshot session.
 	ContMgrCancelDistributedForkSession = "containerManager.CancelDistributedForkSession"
 
+	// ContMgrRestoreDistributedFork installs a remotely paged target Kernel.
+	ContMgrRestoreDistributedFork = "containerManager.RestoreDistributedFork"
+
 	// ContMgrListBranches lists all in-memory branches in the sandbox family.
 	ContMgrListBranches = "containerManager.ListBranches"
 
@@ -371,11 +374,22 @@ func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	cm.l.mu.Lock()
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != created {
+	if state != created && !(state == restoringUnstarted && cm.l.distributedRestore) {
 		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
 	}
 	// Tell the root container to start and wait for the result.
 	return cm.onStart()
+}
+
+// RestoreDistributedFork replaces the unstarted placeholder Kernel with a
+// paused remote-memory target.
+func (cm *containerManager) RestoreDistributedFork(args *DistributedForkRestoreArgs, out *DistributedForkRestoreInfo) error {
+	info, err := cm.l.restoreDistributedFork(args)
+	if err != nil {
+		return err
+	}
+	*out = *info
+	return nil
 }
 
 // onStart notifies that sandbox is ready to start and wait for the result.
