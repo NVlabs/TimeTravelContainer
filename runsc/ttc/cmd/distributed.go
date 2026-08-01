@@ -258,7 +258,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		"--distributed-family", source.container,
 		"--distributed-external-listener",
 		"--distributed-advertise", advertise,
-		"--distributed-max-transfer", fmt.Sprint(tx.Negotiated.MaxTransferSize),
+		"--distributed-max-transfer", fmt.Sprint(tx.Negotiated.PagingPolicy.TransferBytes),
 	}
 	args = append(args, source.container, "distributed-capture", transactionID)
 	output, err := b.command(args...)
@@ -276,7 +276,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes: tx.Negotiated.MaxTransferSize,
+		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {

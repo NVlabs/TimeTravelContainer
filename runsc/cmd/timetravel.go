@@ -82,6 +82,8 @@ type TimeTravel struct {
 	distributedConnectionFD       int
 	distributedConnectionsStartFD int
 	distributedConnectionsCount   int
+	distributedPrefetchBytes      uint64
+	distributedPrefetchBehind     uint64
 }
 
 // Name implements subcommands.Command.Name.
@@ -99,6 +101,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
@@ -148,6 +151,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
 	f.IntVar(&t.distributedConnectionsStartFD, "distributed-connections-start-fd", -1, "first inherited target page stream")
 	f.IntVar(&t.distributedConnectionsCount, "distributed-connections-count", 0, "number of inherited target page streams")
+	f.Uint64Var(&t.distributedPrefetchBytes, "distributed-prefetch-bytes", 0, "remote-memory bytes to prefetch after a fault")
+	f.Uint64Var(&t.distributedPrefetchBehind, "distributed-prefetch-behind-bytes", 0, "remote-memory bytes to prefetch before a fault")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -296,6 +301,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-dependency":
 		output, err = cont.Sandbox.DistributedForkDependencyStatus(f.Arg(2))
+	case "distributed-prefetch":
+		err = cont.Sandbox.SetDistributedForkPrefetchWindow(f.Arg(2), t.distributedPrefetchBehind, t.distributedPrefetchBytes)
 	case "distributed-drain":
 		err = cont.Sandbox.DrainDistributedForkMemory(f.Arg(2))
 	case "distributed-cancel":

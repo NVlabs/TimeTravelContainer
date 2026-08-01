@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcremote"
 )
 
 func testCapabilities(node string) Capabilities {
@@ -35,6 +37,12 @@ func testCapabilities(node string) Capabilities {
 
 func TestNegotiateCapabilities(t *testing.T) {
 	source, target := testCapabilities("source"), testCapabilities("target")
+	source.PagingPolicy = ttcremote.DefaultPolicy()
+	target.PagingPolicy = ttcremote.DefaultPolicy()
+	source.PagingPolicy.Push = ttcremote.PushEagerDrain
+	target.PagingPolicy.TransferBytes = 128 << 10
+	target.PagingPolicy.MaxOutstandingBytes = 256 << 10
+	target.PagingPolicy.MaxConcurrency = 16
 	target.ProtocolMax = 1
 	target.MaxTransferSize = 64 << 10
 	target.Features = append(append([]string(nil), target.Features[:1]...), target.Features[2:]...)
@@ -42,8 +50,23 @@ func TestNegotiateCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if negotiated.Protocol != 1 || negotiated.MaxTransferSize != 64<<10 || len(negotiated.Features) != len(target.Features) {
+	if negotiated.Protocol != 1 || negotiated.MaxTransferSize != 64<<10 || len(negotiated.Features) != len(target.Features) ||
+		negotiated.PagingPolicy.TransferBytes != 64<<10 || negotiated.PagingPolicy.MaxConcurrency != 4 ||
+		negotiated.PagingPolicy.Push != ttcremote.PushEagerDrain {
 		t.Fatalf("negotiated=%+v", negotiated)
+	}
+}
+
+func TestLegacyCapabilitiesReceiveDefaultPagingPolicy(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := negotiated.PagingPolicy.TransferBytes, uint64(64<<10); got != want {
+		t.Fatalf("transfer bytes=%d, want %d", got, want)
+	}
+	if got, want := negotiated.PagingPolicy.PageSize, uint64(4096); got != want {
+		t.Fatalf("page size=%d, want %d", got, want)
 	}
 }
 

@@ -42,15 +42,15 @@ const (
 // Policy configures remote-memory transfer. PageSize is the correctness unit;
 // TransferBytes is only the preferred network range size.
 type Policy struct {
-	PageSize            uint64
-	TransferBytes       uint64
-	Prefetch            PrefetchPolicy
-	Push                PushPolicy
-	MaxOutstandingBytes uint64
-	MaxConcurrency      int
-	AckInterval         time.Duration
-	AckBatchPages       int
-	Adaptive            bool
+	PageSize            uint64         `json:"page_size"`
+	TransferBytes       uint64         `json:"transfer_bytes"`
+	Prefetch            PrefetchPolicy `json:"prefetch"`
+	Push                PushPolicy     `json:"push"`
+	MaxOutstandingBytes uint64         `json:"max_outstanding_bytes"`
+	MaxConcurrency      int            `json:"max_concurrency"`
+	AckInterval         time.Duration  `json:"ack_interval"`
+	AckBatchPages       int            `json:"ack_batch_pages"`
+	Adaptive            bool           `json:"adaptive"`
 }
 
 // DefaultPolicy returns the initial experimental policy from the proposal.

@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
@@ -644,9 +646,16 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		"--cluster-max-transactions", "17",
 		"--cluster-page-listen", "0.0.0.0:0",
 		"--cluster-page-advertise", "node-a.example:0",
+		"--cluster-transfer-bytes", "131072",
+		"--cluster-max-outstanding-bytes", "8388608",
+		"--cluster-max-parallel", "8",
+		"--cluster-ack-batch-pages", "128",
+		"--cluster-ack-interval", "250us",
+		"--cluster-prefetch", "adaptive",
+		"--cluster-push", "eager-drain",
 		"--cluster-peer", "node-b=https://10.0.0.2:7443,node-b.example",
 	}
-	opts := daemonClusterOptions{MaxTransactions: 32}
+	opts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		consumed, err := consumeDaemonClusterOption(args, &opts)
 		if err != nil {
@@ -660,7 +669,12 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 	if !opts.Configured || opts.Listen != "127.0.0.1:7443" || opts.NodeID != "node-a" ||
 		opts.RepositoryID != "repo" || opts.CertFile != "cert.pem" || opts.KeyFile != "key.pem" ||
 		opts.CAFile != "ca.pem" || opts.MaxTransactions != 17 || opts.PageListen != "0.0.0.0:0" ||
-		opts.PageAdvertise != "node-a.example:0" || !reflect.DeepEqual(opts.Peers, []string{"node-b=https://10.0.0.2:7443,node-b.example"}) {
+		opts.PageAdvertise != "node-a.example:0" || opts.PagingPolicy.TransferBytes != 128<<10 ||
+		opts.PagingPolicy.MaxOutstandingBytes != 8<<20 || opts.PagingPolicy.MaxConcurrency != 8 ||
+		opts.PagingPolicy.AckBatchPages != 128 || opts.PagingPolicy.AckInterval != 250*time.Microsecond ||
+		opts.PagingPolicy.Prefetch != ttcpolicy.PrefetchAdaptive || !opts.PagingPolicy.Adaptive ||
+		opts.PagingPolicy.Push != ttcpolicy.PushEagerDrain ||
+		!reflect.DeepEqual(opts.Peers, []string{"node-b=https://10.0.0.2:7443,node-b.example"}) {
 		t.Fatalf("cluster options=%+v", opts)
 	}
 	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "https://10.0.0.2:7443" || name != "node-b.example" {
@@ -672,5 +686,32 @@ func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
+	}
+}
+
+func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
+	policy := ttcpolicy.DefaultPolicy()
+	policy.MaxConcurrency = 4
+	policy.MaxOutstandingBytes = 8 << 20
+	controller := newAdaptivePrefetchController(policy)
+	now := time.Unix(1000, 0)
+	status := pgalloc.AsyncPagesFileLoadStats{PrefetchBytes: policy.TransferBytes - policy.PageSize}
+	if _, _, changed := controller.observe(status, now); changed {
+		t.Fatal("initial observation changed the prefetch window")
+	}
+	status.BytesLoaded = policy.TransferBytes
+	status.BytesWaited = policy.PageSize
+	status.TotalWaiters = 1
+	behind, ahead, changed := controller.observe(status, now.Add(600*time.Millisecond))
+	if !changed || behind != 0 || ahead != 2*policy.TransferBytes-policy.PageSize {
+		t.Fatalf("blocking-fault update=(%d,%d,%t)", behind, ahead, changed)
+	}
+	grownAhead := ahead
+	for i := 0; i < 8; i++ {
+		status.BytesLoaded += 4 * (grownAhead + policy.PageSize)
+		behind, ahead, changed = controller.observe(status, now.Add(3*time.Second+time.Duration(i)*250*time.Millisecond))
+	}
+	if !changed || behind != 0 || ahead != policy.TransferBytes-policy.PageSize {
+		t.Fatalf("quiet-throughput update=(%d,%d,%t)", behind, ahead, changed)
 	}
 }

@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
+	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -133,6 +134,14 @@ type daemonClusterOptions struct {
 	PageListen      string
 	PageAdvertise   string
 	Peers           []string
+	PagingPolicy    ttcpolicy.Policy
+}
+
+func defaultDaemonClusterOptions() daemonClusterOptions {
+	policy := ttcpolicy.DefaultPolicy()
+	policy.MaxConcurrency = 4
+	policy.AckInterval = time.Millisecond
+	return daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0", PagingPolicy: policy}
 }
 
 type daemonClusterRuntime struct {
@@ -176,7 +185,16 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
-		MaxParallel: 4, Timeout: 30 * time.Second, RetryLimit: 2, PrefetchBytes: 64 << 10,
+		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
+		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
+	}
+	switch tx.Negotiated.PagingPolicy.Prefetch {
+	case ttcpolicy.PrefetchSequential, ttcpolicy.PrefetchAdaptive:
+		restoreArgs.PrefetchBytes = tx.Negotiated.PagingPolicy.TransferBytes - tx.Negotiated.PagingPolicy.PageSize
+	case ttcpolicy.PrefetchFixed:
+		windowPages := tx.Negotiated.PagingPolicy.TransferPages() - 1
+		restoreArgs.PrefetchBehindBytes = (windowPages / 2) * tx.Negotiated.PagingPolicy.PageSize
+		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
 	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	var runtimeState struct {
@@ -334,6 +352,82 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 
 func (*daemonTargetRuntime) MarkIndependent(context.Context, *cluster.Transaction) error { return nil }
 
+type adaptivePrefetchController struct {
+	policy       ttcpolicy.Policy
+	ahead        uint64
+	behind       uint64
+	maxAhead     uint64
+	lastLoaded   uint64
+	lastWaited   uint64
+	lastWaiters  int
+	lastChange   time.Time
+	quietSamples int
+	initialized  bool
+}
+
+func newAdaptivePrefetchController(policy ttcpolicy.Policy) *adaptivePrefetchController {
+	perWorkerBudget := policy.MaxOutstandingBytes / uint64(policy.MaxConcurrency)
+	maxRead := min(perWorkerBudget, uint64(2<<20))
+	maxRead -= maxRead % policy.PageSize
+	if maxRead < policy.TransferBytes {
+		maxRead = policy.TransferBytes
+	}
+	return &adaptivePrefetchController{
+		policy:   policy,
+		ahead:    policy.TransferBytes - policy.PageSize,
+		maxAhead: maxRead - policy.PageSize,
+	}
+}
+
+// observe applies deliberately slow hysteresis: blocking faults grow the
+// window quickly, while sustained non-blocking throughput probes for a smaller
+// window one step at a time. It returns a change only after the prior setting
+// has had time to affect multiple fault/read cycles.
+func (c *adaptivePrefetchController) observe(status pgalloc.AsyncPagesFileLoadStats, now time.Time) (uint64, uint64, bool) {
+	if !c.initialized {
+		c.initialized = true
+		c.lastLoaded = status.BytesLoaded
+		c.lastWaited = status.BytesWaited
+		c.lastWaiters = status.TotalWaiters
+		c.lastChange = now
+		if status.PrefetchBytes != 0 || status.PrefetchBehindBytes != 0 {
+			c.ahead, c.behind = status.PrefetchBytes, status.PrefetchBehindBytes
+		}
+		return 0, 0, false
+	}
+	loaded := status.BytesLoaded - min(status.BytesLoaded, c.lastLoaded)
+	waited := status.BytesWaited - min(status.BytesWaited, c.lastWaited)
+	waiters := status.TotalWaiters - min(status.TotalWaiters, c.lastWaiters)
+	c.lastLoaded, c.lastWaited, c.lastWaiters = status.BytesLoaded, status.BytesWaited, status.TotalWaiters
+
+	if waited != 0 || waiters != 0 || status.Waiters != 0 {
+		c.quietSamples = 0
+		if now.Sub(c.lastChange) < 500*time.Millisecond || c.ahead >= c.maxAhead {
+			return 0, 0, false
+		}
+		total := min((c.ahead+c.policy.PageSize)*2, c.maxAhead+c.policy.PageSize)
+		c.ahead = total - c.policy.PageSize
+		c.behind = 0
+		c.lastChange = now
+		return c.behind, c.ahead, true
+	}
+	if loaded >= 4*(c.ahead+c.policy.PageSize) {
+		c.quietSamples++
+	} else {
+		c.quietSamples = 0
+	}
+	if c.quietSamples < 8 || now.Sub(c.lastChange) < 2*time.Second || c.ahead <= c.policy.TransferBytes-c.policy.PageSize {
+		return 0, 0, false
+	}
+	c.quietSamples = 0
+	total := max((c.ahead+c.policy.PageSize)/2, c.policy.TransferBytes)
+	total -= total % c.policy.PageSize
+	c.ahead = total - c.policy.PageSize
+	c.behind = 0
+	c.lastChange = now
+	return c.behind, c.ahead, true
+}
+
 func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID string) {
 	if r == nil || r.store == nil || transactionID == "" || containerID == "" {
 		return
@@ -346,6 +440,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		failedPolls := 0
+		var adaptive *adaptivePrefetchController
 		for {
 			select {
 			case <-r.done:
@@ -358,6 +453,9 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			}
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining {
 				continue
+			}
+			if adaptive == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+				adaptive = newAdaptivePrefetchController(tx.Negotiated.PagingPolicy)
 			}
 			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", defaultBranchID)
 			if statusErr != nil {
@@ -376,6 +474,17 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			var status pgalloc.AsyncPagesFileLoadStats
 			if err := json.Unmarshal(output, &status); err != nil {
 				continue
+			}
+			if adaptive != nil && !status.Done {
+				behind, ahead, changed := adaptive.observe(status, time.Now())
+				if changed {
+					_, _ = r.backend.command(
+						"timetravel",
+						"--distributed-prefetch-bytes", strconv.FormatUint(ahead, 10),
+						"--distributed-prefetch-behind-bytes", strconv.FormatUint(behind, 10),
+						containerID, "distributed-prefetch", defaultBranchID,
+					)
+				}
 			}
 			if !status.Done {
 				continue
@@ -810,7 +919,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	unsafeNoHostIsolation := false
 	allowSlowVolumeCopy := false
 	daemonDataRoot := dataRoot()
-	clusterOpts := daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0"}
+	clusterOpts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		switch {
 		case args[0] == "--socket" && len(args) >= 2:
@@ -936,6 +1045,89 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 			return consumed, err
 		}
 	}
+	optionValue := func(name string) (string, int, bool, error) {
+		if args[0] == name {
+			if len(args) < 2 || args[1] == "" {
+				return "", 0, true, fmt.Errorf("%s requires a value", name)
+			}
+			return args[1], 2, true, nil
+		}
+		if strings.HasPrefix(args[0], name+"=") {
+			value := strings.TrimPrefix(args[0], name+"=")
+			if value == "" {
+				return "", 0, true, fmt.Errorf("%s requires a value", name)
+			}
+			return value, 1, true, nil
+		}
+		return "", 0, false, nil
+	}
+	for name, dst := range map[string]*uint64{
+		"--cluster-transfer-bytes":        &opts.PagingPolicy.TransferBytes,
+		"--cluster-max-outstanding-bytes": &opts.PagingPolicy.MaxOutstandingBytes,
+	} {
+		value, consumed, matched, err := optionValue(name)
+		if !matched {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || parsed == 0 {
+			return 0, fmt.Errorf("%s must be a positive byte count", name)
+		}
+		*dst = parsed
+		opts.Configured = true
+		return consumed, nil
+	}
+	for name, dst := range map[string]*int{
+		"--cluster-max-parallel":    &opts.PagingPolicy.MaxConcurrency,
+		"--cluster-ack-batch-pages": &opts.PagingPolicy.AckBatchPages,
+	} {
+		value, consumed, matched, err := optionValue(name)
+		if !matched {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		*dst = parsed
+		opts.Configured = true
+		return consumed, nil
+	}
+	if value, consumed, matched, err := optionValue("--cluster-ack-interval"); matched {
+		if err != nil {
+			return 0, err
+		}
+		interval, err := time.ParseDuration(value)
+		if err != nil || interval < 0 {
+			return 0, fmt.Errorf("--cluster-ack-interval must be a non-negative duration")
+		}
+		opts.PagingPolicy.AckInterval = interval
+		opts.Configured = true
+		return consumed, nil
+	}
+	if value, consumed, matched, err := optionValue("--cluster-prefetch"); matched {
+		if err != nil {
+			return 0, err
+		}
+		opts.PagingPolicy.Prefetch = ttcpolicy.PrefetchPolicy(value)
+		opts.PagingPolicy.Adaptive = opts.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive
+		opts.Configured = true
+		return consumed, nil
+	}
+	if value, consumed, matched, err := optionValue("--cluster-push"); matched {
+		if err != nil {
+			return 0, err
+		}
+		opts.PagingPolicy.Push = ttcpolicy.PushPolicy(value)
+		opts.Configured = true
+		return consumed, nil
+	}
 	const maxName = "--cluster-max-transactions"
 	var value string
 	consumed := 0
@@ -972,6 +1164,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if len(opts.Peers) != 0 && opts.PageAdvertise == "" {
 		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:PORT (PORT may be 0)")
 	}
+	opts.PagingPolicy.PageSize = hostarch.PageSize
+	if err := opts.PagingPolicy.Validate(); err != nil {
+		return nil, fmt.Errorf("cluster paging policy: %w", err)
+	}
 	tlsConfig, err := cluster.LoadServerTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile)
 	if err != nil {
 		return nil, err
@@ -983,7 +1179,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	capabilities := cluster.Capabilities{
 		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
 		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
-		MaxTransferSize: 2 << 20, RepositoryID: opts.RepositoryID,
+		MaxTransferSize: 2 << 20, RepositoryID: opts.RepositoryID, PagingPolicy: opts.PagingPolicy,
 		Features: []string{
 			cluster.FeatureRemotePull, cluster.FeatureReversePush, cluster.FeatureAckBatch,
 			cluster.FeatureNetworkRecreate, cluster.FeatureRuntimePrefetch, cluster.FeatureFilesystemBranch,
@@ -1904,6 +2100,13 @@ func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlo
 			"--cluster-ca", clusterOpts.CAFile,
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 			"--cluster-page-listen", clusterOpts.PageListen,
+			"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
+			"--cluster-max-outstanding-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.MaxOutstandingBytes, 10),
+			"--cluster-max-parallel", strconv.Itoa(clusterOpts.PagingPolicy.MaxConcurrency),
+			"--cluster-ack-batch-pages", strconv.Itoa(clusterOpts.PagingPolicy.AckBatchPages),
+			"--cluster-ack-interval", clusterOpts.PagingPolicy.AckInterval.String(),
+			"--cluster-prefetch", string(clusterOpts.PagingPolicy.Prefetch),
+			"--cluster-push", string(clusterOpts.PagingPolicy.Push),
 		)
 		if clusterOpts.PageAdvertise != "" {
 			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
@@ -1971,7 +2174,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is valid with 'daemon start' only")
 		return 2
 	}
-	clusterOpts := daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0"}
+	clusterOpts := defaultDaemonClusterOptions()
 	if len(args) != 0 && args[0] == "start" {
 		startArgs := args[1:]
 		for len(startArgs) != 0 {

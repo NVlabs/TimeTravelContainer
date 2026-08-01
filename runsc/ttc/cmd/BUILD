@@ -14,6 +14,7 @@ go_library(
 		"//pkg/hostarch",
 		"//pkg/sentry/pgalloc",
 		"//pkg/sentry/ttcremote",
+		"//pkg/ttcremote",
         "//pkg/ttcvolume",
 		"//runsc/boot",
         "//runsc/flag",

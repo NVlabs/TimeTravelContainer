@@ -120,6 +120,12 @@ func NewTransaction(identity ForkIdentity, negotiated NegotiatedCapabilities, no
 	if negotiated.Protocol == 0 || negotiated.BasePageSize == 0 || negotiated.MaxTransferSize < negotiated.BasePageSize {
 		return nil, errors.New("invalid negotiated capabilities")
 	}
+	if negotiated.PagingPolicy.PageSize != negotiated.BasePageSize || negotiated.PagingPolicy.TransferBytes > negotiated.MaxTransferSize {
+		return nil, errors.New("negotiated paging policy is outside capability bounds")
+	}
+	if err := negotiated.PagingPolicy.Validate(); err != nil {
+		return nil, fmt.Errorf("negotiated paging policy: %w", err)
+	}
 	if now.IsZero() {
 		return nil, errors.New("transaction creation time is zero")
 	}

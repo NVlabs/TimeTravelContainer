@@ -147,7 +147,9 @@ type DistributedForkSessionStatus struct {
 
 // DistributedForkDependencyArgs selects a target branch's remote loader.
 type DistributedForkDependencyArgs struct {
-	BranchID string
+	BranchID            string
+	PrefetchBytes       uint64
+	PrefetchBehindBytes uint64
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -690,6 +692,16 @@ func (f *SandboxFamily) DistributedForkDependencyStatus(branchID string) (pgallo
 	}
 	defer release()
 	return b.k.DistributedForkDependencyStatus(), nil
+}
+
+// SetDistributedForkPrefetchWindow changes future remote-memory fault reads.
+func (f *SandboxFamily) SetDistributedForkPrefetchWindow(branchID string, behind, ahead uint64) error {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return b.k.SetDistributedForkPrefetchWindow(behind, ahead)
 }
 
 // DrainDistributedForkMemory eagerly materializes a target branch's pages.

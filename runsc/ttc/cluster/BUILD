@@ -13,6 +13,7 @@ go_library(
         "store.go",
         "transaction.go",
     ],
+    deps = ["//pkg/ttcremote"],
     visibility = ["//visibility:public"],
 )
 
@@ -24,4 +25,5 @@ go_test(
         "control_test.go",
     ],
     library = ":cluster",
+    deps = ["//pkg/ttcremote"],
 )

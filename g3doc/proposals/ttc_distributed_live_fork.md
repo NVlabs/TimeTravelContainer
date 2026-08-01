@@ -7,11 +7,20 @@ Implementation progress:
 * Phase 0 protocol model, trace replay, invariant tests, randomized schedules,
   policy validation, and analytical pull simulator: implemented.
 * Phase 1 `MemoryFile` snapshot ownership, page-granular acknowledgement,
-  sender leases, loopback `AsyncReader`, and asynchronous target-page loading:
-  implemented and tested. Metadata-only allocator cloning and MemoryManager PMA
-  rebinding to a distinct target `MemoryFile` are also implemented; full Kernel
-  object-graph orchestration is pending.
-* Phases 2 through 6: pending.
+  sender leases, loopback `AsyncReader`, asynchronous target-page loading,
+  metadata-only allocator cloning, and whole-Kernel remote-memory cloning:
+  implemented and tested.
+* Phase 2 bounded TCP pull, checksummed metadata envelopes, multi-process
+  whole-Kernel reconstruction, demand paging, prefetch, batched ACKs, retries,
+  metrics, and target-local network reconstruction: implemented and tested.
+* Phase 3 post-CoW push hints, reverse TCP push, idempotent pull/push races,
+  coalescing, and demand/dirty/high-water/eager push policies: implemented and
+  tested.
+* Phase 4 mutually authenticated daemon coordination, transactional target
+  publication, host-owned connection donation, end-to-end remote container
+  restore, durable dependency state, restart recovery, and drain-before-source
+  stop: implemented and tested in a two-daemon same-host cluster.
+* Phase 5: in progress. Phase 6: pending.
 
 ## Summary
 
@@ -446,10 +455,17 @@ budget selected below.
   the cluster listen/node/repository/certificate/key/CA/quota configuration,
   start the peer listener only with a complete configuration, report its
   capabilities through daemon status, and shut it down with the local daemon.
-* Add `ttc fork --target` and equivalent SDK operations.
-* Keep filesystem publication transactional on the common repository and make
-  target cleanup idempotent.
-* Add drain-before-source-stop and explicit dependent-target status.
+* `ttc fork --target` publishes a restored target through the ordinary TTC API;
+  the language SDKs use the same versioned daemon command contract.
+* Filesystem publication is transactional on the common repository and target
+  cleanup is idempotent.
+* Target loader progress is reported in bytes. The target daemon durably marks
+  a transaction independent or failed, both nodes resume monitors after daemon
+  restart, `ttc inspect` includes the transaction, and source daemon shutdown
+  requests and waits for eager drain before stopping source containers.
+* Host-side `ttcd` owns page listeners and outgoing connections, then donates
+  connected streams into isolated Sentries. This keeps host networking outside
+  the guest kernel while retaining direct source-to-target page transfer.
 
 Exit criteria: repeatable end-to-end forks work across two hosts, daemon restart
 does not publish partial target containers, and cleanup leaves neither memory

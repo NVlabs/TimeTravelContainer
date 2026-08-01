@@ -50,6 +50,8 @@ type DistributedForkRestoreArgs struct {
 	RetryLimit          int
 	PrefetchBytes       uint64
 	PrefetchBehindBytes uint64
+	AckBatchPages       int
+	AckInterval         time.Duration
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -65,7 +67,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || args.Address == "" {
 		return nil, errors.New("distributed target restore is missing session, family, branch, or source address")
 	}
-	if args.MetadataBytes == 0 || args.MaxTransferBytes == 0 || args.MaxParallel <= 0 || args.Timeout <= 0 || args.RetryLimit < 0 {
+	if args.MetadataBytes == 0 || args.MaxTransferBytes == 0 || args.MaxParallel <= 0 || args.Timeout <= 0 || args.RetryLimit < 0 || args.AckBatchPages <= 0 || args.AckInterval < 0 {
 		return nil, errors.New("distributed target restore has invalid transfer bounds")
 	}
 	l.mu.Lock()
@@ -126,7 +128,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
 		MaxReadBytes: args.MaxTransferBytes, MaxRanges: 64, MaxParallel: args.MaxParallel,
 		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
-		AckBatchPages: 256, AckInterval: time.Millisecond,
+		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
 	var reader *ttcremote.TCPRemoteReader
 	if donatedMode {

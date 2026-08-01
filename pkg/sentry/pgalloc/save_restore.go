@@ -1357,13 +1357,18 @@ type AsyncPagesFileLoadOpts struct {
 // AsyncPagesFileLoadStats is a point-in-time view of a remote or checkpoint
 // page loader. It contains no transport credentials or process-local state.
 type AsyncPagesFileLoadStats struct {
-	Done             bool   `json:"done"`
-	DemandOnly       bool   `json:"demand_only"`
-	BytesLoaded      uint64 `json:"bytes_loaded"`
-	BytesOutstanding uint64 `json:"bytes_outstanding"`
-	Waiters          int    `json:"waiters"`
-	TotalWaiters     int    `json:"total_waiters"`
-	Error            string `json:"error,omitempty"`
+	Done                  bool          `json:"done"`
+	DemandOnly            bool          `json:"demand_only"`
+	BytesLoaded           uint64        `json:"bytes_loaded"`
+	BytesOutstanding      uint64        `json:"bytes_outstanding"`
+	BytesWaited           uint64        `json:"bytes_waited"`
+	WaitDuration          time.Duration `json:"wait_duration"`
+	AggregateWaitDuration time.Duration `json:"aggregate_wait_duration"`
+	PrefetchBytes         uint64        `json:"prefetch_bytes"`
+	PrefetchBehindBytes   uint64        `json:"prefetch_behind_bytes"`
+	Waiters               int           `json:"waiters"`
+	TotalWaiters          int           `json:"total_waiters"`
+	Error                 string        `json:"error,omitempty"`
 }
 
 // Stats returns loader progress without waiting for outstanding I/O.
@@ -1380,6 +1385,11 @@ func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
 	apfl.amflsMu.Lock()
 	apfl.mu.Lock()
 	stats.BytesLoaded = apfl.bytesLoaded
+	stats.BytesWaited = apfl.bytesWaited
+	stats.WaitDuration = apfl.durWaitedOne
+	stats.AggregateWaitDuration = apfl.durWaitedTotal
+	stats.PrefetchBytes = apfl.prefetchAheadBytes.Load()
+	stats.PrefetchBehindBytes = apfl.prefetchBehindBytes.Load()
 	stats.Waiters = apfl.numWaiters
 	stats.TotalWaiters = apfl.totalWaiters
 	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {

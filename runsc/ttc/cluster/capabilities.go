@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"gvisor.dev/gvisor/pkg/ttcremote"
 )
 
 const (
@@ -42,15 +44,16 @@ var requiredForkFeatures = []string{
 
 // Capabilities describes one ttcd peer without including credentials.
 type Capabilities struct {
-	NodeID          string   `json:"node_id"`
-	ProtocolMin     uint32   `json:"protocol_min"`
-	ProtocolMax     uint32   `json:"protocol_max"`
-	BuildID         string   `json:"build_id"`
-	Architecture    string   `json:"architecture"`
-	BasePageSize    uint64   `json:"base_page_size"`
-	MaxTransferSize uint64   `json:"max_transfer_size"`
-	RepositoryID    string   `json:"repository_id"`
-	Features        []string `json:"features"`
+	NodeID          string           `json:"node_id"`
+	ProtocolMin     uint32           `json:"protocol_min"`
+	ProtocolMax     uint32           `json:"protocol_max"`
+	BuildID         string           `json:"build_id"`
+	Architecture    string           `json:"architecture"`
+	BasePageSize    uint64           `json:"base_page_size"`
+	MaxTransferSize uint64           `json:"max_transfer_size"`
+	RepositoryID    string           `json:"repository_id"`
+	Features        []string         `json:"features"`
+	PagingPolicy    ttcremote.Policy `json:"paging_policy"`
 }
 
 // Validate checks capability bounds before negotiation.
@@ -66,6 +69,9 @@ func (c Capabilities) Validate() error {
 	}
 	if c.MaxTransferSize < c.BasePageSize || c.MaxTransferSize%c.BasePageSize != 0 || c.MaxTransferSize > 2<<20 {
 		return fmt.Errorf("invalid maximum transfer size %d for page size %d", c.MaxTransferSize, c.BasePageSize)
+	}
+	if err := validatePagingPolicy(c, normalizedPagingPolicy(c)); err != nil {
+		return fmt.Errorf("paging policy: %w", err)
 	}
 	seen := make(map[string]struct{}, len(c.Features))
 	for _, feature := range c.Features {
@@ -83,12 +89,32 @@ func (c Capabilities) Validate() error {
 // NegotiatedCapabilities is the immutable result recorded with a fork
 // transaction.
 type NegotiatedCapabilities struct {
-	Protocol        uint32   `json:"protocol"`
-	BasePageSize    uint64   `json:"base_page_size"`
-	MaxTransferSize uint64   `json:"max_transfer_size"`
-	Features        []string `json:"features"`
-	SourceBuildID   string   `json:"source_build_id"`
-	TargetBuildID   string   `json:"target_build_id"`
+	Protocol        uint32           `json:"protocol"`
+	BasePageSize    uint64           `json:"base_page_size"`
+	MaxTransferSize uint64           `json:"max_transfer_size"`
+	Features        []string         `json:"features"`
+	SourceBuildID   string           `json:"source_build_id"`
+	TargetBuildID   string           `json:"target_build_id"`
+	PagingPolicy    ttcremote.Policy `json:"paging_policy"`
+}
+
+func normalizedPagingPolicy(c Capabilities) ttcremote.Policy {
+	p := c.PagingPolicy
+	if p.PageSize == 0 {
+		p = ttcremote.DefaultPolicy()
+		p.PageSize = c.BasePageSize
+	}
+	if p.TransferBytes > c.MaxTransferSize {
+		p.TransferBytes = c.MaxTransferSize
+	}
+	return p
+}
+
+func validatePagingPolicy(c Capabilities, p ttcremote.Policy) error {
+	if p.PageSize != c.BasePageSize {
+		return fmt.Errorf("page size %d does not match capability page size %d", p.PageSize, c.BasePageSize)
+	}
+	return p.Validate()
 }
 
 // Negotiate validates two peers and selects their highest common protocol and
@@ -134,9 +160,19 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 			return NegotiatedCapabilities{}, fmt.Errorf("target lacks required common feature %q", required)
 		}
 	}
+	policy := normalizedPagingPolicy(target)
+	policy.Push = normalizedPagingPolicy(source).Push
+	policy.TransferBytes = min(policy.TransferBytes, source.MaxTransferSize, target.MaxTransferSize)
+	if policy.MaxOutstandingBytes < policy.TransferBytes {
+		policy.MaxOutstandingBytes = policy.TransferBytes
+	}
+	if limit := int(policy.MaxOutstandingBytes / policy.TransferBytes); policy.MaxConcurrency > limit {
+		policy.MaxConcurrency = limit
+	}
 	return NegotiatedCapabilities{
 		Protocol: protocolMax, BasePageSize: source.BasePageSize,
 		MaxTransferSize: min(source.MaxTransferSize, target.MaxTransferSize),
 		Features:        common, SourceBuildID: source.BuildID, TargetBuildID: target.BuildID,
+		PagingPolicy: policy,
 	}, nil
 }

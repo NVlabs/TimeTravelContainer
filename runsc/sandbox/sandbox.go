@@ -2174,6 +2174,15 @@ func (s *Sandbox) DistributedForkDependencyStatus(branchID string) (pgalloc.Asyn
 	return status, nil
 }
 
+// SetDistributedForkPrefetchWindow changes future target remote-memory reads.
+func (s *Sandbox) SetDistributedForkPrefetchWindow(branchID string, behind, ahead uint64) error {
+	args := &boot.DistributedForkDependencyArgs{BranchID: branchID, PrefetchBehindBytes: behind, PrefetchBytes: ahead}
+	if err := s.call(boot.ContMgrSetDistributedForkPrefetchWindow, args, nil); err != nil {
+		return fmt.Errorf("setting distributed fork prefetch window for branch %q: %w", branchID, err)
+	}
+	return nil
+}
+
 // DrainDistributedForkMemory eagerly loads all remote pages for one branch.
 func (s *Sandbox) DrainDistributedForkMemory(branchID string) error {
 	if err := s.call(boot.ContMgrDrainDistributedForkMemory, &boot.DistributedForkDependencyArgs{BranchID: branchID}, nil); err != nil {

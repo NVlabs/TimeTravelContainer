@@ -114,6 +114,9 @@ const (
 	// ContMgrDistributedForkDependencyStatus reports target loader progress.
 	ContMgrDistributedForkDependencyStatus = "containerManager.DistributedForkDependencyStatus"
 
+	// ContMgrSetDistributedForkPrefetchWindow changes target fault prefetching.
+	ContMgrSetDistributedForkPrefetchWindow = "containerManager.SetDistributedForkPrefetchWindow"
+
 	// ContMgrDrainDistributedForkMemory makes a target source-independent.
 	ContMgrDrainDistributedForkMemory = "containerManager.DrainDistributedForkMemory"
 
@@ -1073,6 +1076,11 @@ func (cm *containerManager) DistributedForkDependencyStatus(args *DistributedFor
 	}
 	*out = status
 	return nil
+}
+
+// SetDistributedForkPrefetchWindow updates future target remote-memory reads.
+func (cm *containerManager) SetDistributedForkPrefetchWindow(args *DistributedForkDependencyArgs, _ *struct{}) error {
+	return cm.l.family.SetDistributedForkPrefetchWindow(args.BranchID, args.PrefetchBehindBytes, args.PrefetchBytes)
 }
 
 // DrainDistributedForkMemory eagerly loads all remote pages for one branch.
