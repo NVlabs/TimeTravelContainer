@@ -434,6 +434,7 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		VolumeCopyMode:   b.volumeCopyMode,
 		RestorePaused:    manifest.RestorePaused,
 		CheckpointBranch: manifest.SourceBranch,
+		NodeID:           b.nodeID,
 	})
 	if err != nil {
 		return "", err

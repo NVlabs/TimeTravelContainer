@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -227,11 +228,33 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		if t.distributedSessionID == "" || t.distributedFamilyID == "" || t.distributedListen == "" || t.distributedMaxTransfer == 0 {
 			util.Fatalf("--distributed-session, --distributed-family, --distributed-listen, and --distributed-max-transfer are required")
 		}
+		listener, listenErr := net.Listen("tcp", t.distributedListen)
+		if listenErr != nil {
+			util.Fatalf("opening host distributed page listener: %v", listenErr)
+		}
+		tcpListener, ok := listener.(*net.TCPListener)
+		if !ok {
+			listener.Close()
+			util.Fatalf("distributed page listener is %T, want TCP", listener)
+		}
+		listenerFile, fileErr := tcpListener.File()
+		if fileErr != nil {
+			listener.Close()
+			util.Fatalf("duplicating distributed page listener: %v", fileErr)
+		}
+		advertise, advertiseErr := distributedAdvertiseAddress(t.distributedAdvertise, listener.Addr().String())
+		if advertiseErr != nil {
+			listenerFile.Close()
+			listener.Close()
+			util.Fatalf("resolving distributed advertise address: %v", advertiseErr)
+		}
 		output, err = cont.Sandbox.CaptureDistributedFork(&boot.DistributedForkCaptureArgs{
-			SessionID: t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
-			TargetBranchID: f.Arg(2), ListenAddress: t.distributedListen,
-			AdvertiseAddress: t.distributedAdvertise, MaxTransferBytes: t.distributedMaxTransfer,
+			FilePayload: urpc.FilePayload{Files: []*os.File{listenerFile}},
+			SessionID:   t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
+			TargetBranchID: f.Arg(2), AdvertiseAddress: advertise, MaxTransferBytes: t.distributedMaxTransfer,
 		})
+		listenerFile.Close()
+		listener.Close()
 	case "distributed-status":
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-cancel":
@@ -556,6 +579,27 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 	}
 	return subcommands.ExitSuccess
+}
+
+func distributedAdvertiseAddress(configured, bound string) (string, error) {
+	if configured == "" {
+		return bound, nil
+	}
+	host, port, err := net.SplitHostPort(configured)
+	if err != nil {
+		return "", err
+	}
+	if host == "" {
+		return "", fmt.Errorf("advertise host is empty")
+	}
+	if port == "0" || port == "" {
+		_, boundPort, err := net.SplitHostPort(bound)
+		if err != nil {
+			return "", err
+		}
+		port = boundPort
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func writeConsoleWaitStatus(path string, status uint32) error {

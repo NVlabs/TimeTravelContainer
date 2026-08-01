@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -641,6 +642,9 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		"--cluster-key", "key.pem",
 		"--cluster-ca", "ca.pem",
 		"--cluster-max-transactions", "17",
+		"--cluster-page-listen", "0.0.0.0:0",
+		"--cluster-page-advertise", "node-a.example:0",
+		"--cluster-peer", "node-b=https://10.0.0.2:7443,node-b.example",
 	}
 	opts := daemonClusterOptions{MaxTransactions: 32}
 	for len(args) != 0 {
@@ -655,8 +659,12 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 	}
 	if !opts.Configured || opts.Listen != "127.0.0.1:7443" || opts.NodeID != "node-a" ||
 		opts.RepositoryID != "repo" || opts.CertFile != "cert.pem" || opts.KeyFile != "key.pem" ||
-		opts.CAFile != "ca.pem" || opts.MaxTransactions != 17 {
+		opts.CAFile != "ca.pem" || opts.MaxTransactions != 17 || opts.PageListen != "0.0.0.0:0" ||
+		opts.PageAdvertise != "node-a.example:0" || !reflect.DeepEqual(opts.Peers, []string{"node-b=https://10.0.0.2:7443,node-b.example"}) {
 		t.Fatalf("cluster options=%+v", opts)
+	}
+	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "https://10.0.0.2:7443" || name != "node-b.example" {
+		t.Fatalf("parseClusterPeer=(%q, %q, %q, %v)", node, url, name, err)
 	}
 }
 

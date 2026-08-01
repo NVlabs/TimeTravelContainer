@@ -155,13 +155,19 @@ type RevisionRequest struct {
 	Revision uint64 `json:"revision"`
 }
 
+// PublishRequest controls the initial externally visible target state.
+type PublishRequest struct {
+	Revision uint64 `json:"revision"`
+	Paused   bool   `json:"paused"`
+}
+
 // TargetRuntime implements idempotent target-local container operations. Each
 // method is keyed by tx.Identity.TransactionID and may be called again after a
 // lost response or daemon restart.
 type TargetRuntime interface {
 	Reserve(context.Context, *Transaction) error
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
-	Publish(context.Context, *Transaction) error
+	Publish(context.Context, *Transaction, bool) error
 	Cancel(context.Context, *Transaction) error
 	MarkIndependent(context.Context, *Transaction) error
 }
@@ -391,11 +397,44 @@ func (c *ControlPlane) prepare(w http.ResponseWriter, r *http.Request, id, peer 
 }
 
 func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer string) {
-	var operation func(context.Context, *Transaction) error
-	if c.TargetRuntime != nil {
-		operation = c.TargetRuntime.Publish
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+	if c.TargetRuntime == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
+		return
 	}
-	c.advanceRuntime(w, r, id, peer, TransactionTargetPaused, TransactionPublished, operation)
+	tx, err := c.Store.Load(id)
+	if err != nil {
+		writeControlError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if peer != tx.Identity.SourceNodeID {
+		writeControlError(w, http.StatusForbidden, "only the source node may publish the target")
+		return
+	}
+	var request PublishRequest
+	if err := decodeControlJSON(r.Body, &request); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent {
+		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
+	if tx.State != TransactionTargetPaused || tx.Revision != request.Revision {
+		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionTargetPaused, request.Revision))
+		return
+	}
+	if err := c.TargetRuntime.Publish(r.Context(), tx, request.Paused); err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	tx, err = c.Store.Advance(id, tx.Revision, TransactionPublished, "", c.Now())
+	if err != nil {
+		writeControlError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeControlJSON(w, http.StatusOK, tx)
 }
 
 func (c *ControlPlane) independent(w http.ResponseWriter, r *http.Request, id, peer string) {
@@ -599,8 +638,15 @@ func (c *Client) Prepare(ctx context.Context, id string, revision uint64, sessio
 }
 
 // Publish makes a successfully prepared paused target externally visible.
-func (c *Client) Publish(ctx context.Context, id string, revision uint64) (*Transaction, error) {
-	return c.advance(ctx, id, "publish", revision)
+func (c *Client) Publish(ctx context.Context, id string, revision uint64, paused bool) (*Transaction, error) {
+	if !transactionIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid transaction ID %q", id)
+	}
+	var tx Transaction
+	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/publish", PublishRequest{Revision: revision, Paused: paused}, &tx); err != nil {
+		return nil, err
+	}
+	return &tx, nil
 }
 
 // MarkIndependent records that all remote pages are local and the source may

@@ -79,6 +79,7 @@ type PrepareOptions struct {
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
+	NodeID         string
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -115,6 +116,7 @@ type RestoreOptions struct {
 	VolumeCopyMode   ttcvolume.CopyMode
 	RestorePaused    bool
 	CheckpointBranch string
+	NodeID           string
 }
 
 // DistributedForkOptions materializes a hidden target bundle that refers to
@@ -211,6 +213,7 @@ type ContainerInfo struct {
 	DistributedForkTransactionID string            `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string            `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool              `json:"distributed_fork_hidden,omitempty"`
+	NodeID                       string            `json:"node_id,omitempty"`
 }
 
 func cloneIntPointer(value *int) *int {
@@ -674,6 +677,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		RootfsUpperCopyMode: opts.RootfsUpperCopyMode,
 		State:               "created",
 		CreatedAt:           time.Now().UTC(),
+		NodeID:              opts.NodeID,
 	}
 	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
@@ -921,6 +925,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
 	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	metadata.NodeID = opts.NodeID
 	for index := range metadata.Volumes {
 		oldID := metadata.Volumes[index].ID
 		if info, ok := volumeIDMap[oldID]; ok {
@@ -1059,6 +1064,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
+	target.NodeID = opts.NodeID
 	for i := range target.Volumes {
 		target.Volumes[i].Anonymous = false
 	}

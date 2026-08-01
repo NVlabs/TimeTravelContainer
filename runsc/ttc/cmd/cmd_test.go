@@ -491,6 +491,36 @@ func TestForkCreatesSiblingBatch(t *testing.T) {
 	}
 }
 
+type fakeDistributedBackend struct {
+	*fakeBackend
+	source          selector
+	targetNode      string
+	targetContainer string
+	targetPaused    bool
+}
+
+func (b *fakeDistributedBackend) forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error) {
+	b.source = source
+	b.targetNode = targetNode
+	b.targetContainer = targetContainer
+	b.targetPaused = paused
+	return selector{container: targetContainer, branch: defaultBranchID}, nil
+}
+
+func TestForkTargetsRemoteNode(t *testing.T) {
+	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "remote" || !b.targetPaused {
+		t.Fatalf("distributed fork call source=%+v node=%q container=%q paused=%t", b.source, b.targetNode, b.targetContainer, b.targetPaused)
+	}
+	if got, want := stdout.String(), "remote@main\n"; got != want {
+		t.Fatalf("fork output=%q, want %q", got, want)
+	}
+}
+
 func TestForkRejectsCrossFamilyDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer

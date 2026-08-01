@@ -99,6 +99,7 @@ type daemonServer struct {
 	volumeCapability      ttcvolume.Capability
 	clusterCapabilities   *cluster.Capabilities
 	clusterListen         string
+	distributedSource     *distributedSourceRuntime
 
 	stopOnce sync.Once
 
@@ -127,12 +128,16 @@ type daemonClusterOptions struct {
 	KeyFile         string
 	CAFile          string
 	MaxTransactions int
+	PageListen      string
+	PageAdvertise   string
+	Peers           []string
 }
 
 type daemonClusterRuntime struct {
 	listen       string
 	tlsConfig    *tls.Config
 	controlPlane *cluster.ControlPlane
+	source       *distributedSourceRuntime
 }
 
 type daemonTargetRuntime struct {
@@ -223,9 +228,27 @@ func (r *daemonTargetRuntime) Prepare(_ context.Context, tx *cluster.Transaction
 	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "paused")
 }
 
-func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction) error {
-	_, err := r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
-	return err
+func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction, paused bool) error {
+	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	if !paused && info.State != "running" {
+		if _, err := r.backend.command("timetravel", info.ID, "resume", defaultBranchID); err != nil {
+			return fmt.Errorf("resuming distributed target: %w", err)
+		}
+		if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "running"); err != nil {
+			return err
+		}
+	}
+	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: defaultBranchID}, true); err != nil {
+		return fmt.Errorf("starting distributed target console drain: %w", err)
+	}
+	return nil
 }
 
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
@@ -597,7 +620,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	unsafeNoHostIsolation := false
 	allowSlowVolumeCopy := false
 	daemonDataRoot := dataRoot()
-	clusterOpts := daemonClusterOptions{MaxTransactions: 32}
+	clusterOpts := daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0"}
 	for len(args) != 0 {
 		switch {
 		case args[0] == "--socket" && len(args) >= 2:
@@ -696,10 +719,25 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		}
 		return 0, nil
 	}
+	if consumed, err := setString("--cluster-peer", new(string)); consumed != 0 || err != nil {
+		if err != nil {
+			return consumed, err
+		}
+		var value string
+		if args[0] == "--cluster-peer" {
+			value = args[1]
+		} else {
+			value = strings.TrimPrefix(args[0], "--cluster-peer=")
+		}
+		opts.Peers = append(opts.Peers, value)
+		opts.Configured = true
+		return consumed, nil
+	}
 	for name, dst := range map[string]*string{
 		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
 		"--cluster-repository-id": &opts.RepositoryID, "--cluster-cert": &opts.CertFile,
 		"--cluster-key": &opts.KeyFile, "--cluster-ca": &opts.CAFile,
+		"--cluster-page-listen": &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
 	} {
 		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
 			if consumed != 0 {
@@ -738,6 +776,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if opts.Listen == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
 		return nil, errors.New("cluster mode requires listen address, node ID, repository ID, certificate, key, and CA")
 	}
+	if opts.PageListen == "" {
+		return nil, errors.New("cluster page listen address is empty")
+	}
+	if len(opts.Peers) != 0 && opts.PageAdvertise == "" {
+		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:PORT (PORT may be 0)")
+	}
 	tlsConfig, err := cluster.LoadServerTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile)
 	if err != nil {
 		return nil, err
@@ -758,12 +802,53 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if err := capabilities.Validate(); err != nil {
 		return nil, err
 	}
+	clients := make(map[string]*cluster.Client, len(opts.Peers))
+	for _, peerSpec := range opts.Peers {
+		nodeID, baseURL, serverName, err := parseClusterPeer(peerSpec)
+		if err != nil {
+			return nil, err
+		}
+		if nodeID == opts.NodeID {
+			return nil, fmt.Errorf("cluster peer %q is the local node", nodeID)
+		}
+		if _, ok := clients[nodeID]; ok {
+			return nil, fmt.Errorf("cluster peer %q is configured more than once", nodeID)
+		}
+		clientTLS, err := cluster.LoadClientTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile, serverName)
+		if err != nil {
+			return nil, fmt.Errorf("configuring cluster peer %q TLS: %w", nodeID, err)
+		}
+		client, err := cluster.NewClient(baseURL, clientTLS, 2*time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("configuring cluster peer %q: %w", nodeID, err)
+		}
+		clients[nodeID] = client
+	}
 	return &daemonClusterRuntime{
 		listen: opts.Listen, tlsConfig: tlsConfig,
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: store, MaxTransactions: opts.MaxTransactions, Now: time.Now,
 		},
+		source: &distributedSourceRuntime{
+			capabilities: capabilities, peers: clients,
+			pageListen: opts.PageListen, pageAdvertise: opts.PageAdvertise,
+		},
 	}, nil
+}
+
+func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err error) {
+	equals := strings.IndexByte(value, '=')
+	comma := strings.LastIndexByte(value, ',')
+	if equals <= 0 || comma <= equals+1 || comma == len(value)-1 {
+		return "", "", "", fmt.Errorf("invalid --cluster-peer %q; want NODE=https://HOST:PORT,SERVER_NAME", value)
+	}
+	nodeID = value[:equals]
+	baseURL = value[equals+1 : comma]
+	serverName = value[comma+1:]
+	if strings.TrimSpace(nodeID) != nodeID || strings.TrimSpace(serverName) != serverName {
+		return "", "", "", fmt.Errorf("invalid whitespace in --cluster-peer %q", value)
+	}
+	return nodeID, baseURL, serverName, nil
 }
 
 func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
@@ -879,6 +964,7 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 		}, strings.NewReader(""), io.Discard, io.Discard)
 		server.configureVolumeBackend(targetBackend)
 		targetBackend.consoleSidecars = server
+		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		clusterRuntime.controlPlane.TargetRuntime = &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 		}
@@ -889,6 +975,7 @@ func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCom
 		clusterRuntime.listen = clusterListener.Addr().String()
 		server.clusterCapabilities = &clusterRuntime.controlPlane.Capabilities
 		server.clusterListen = clusterRuntime.listen
+		server.distributedSource = clusterRuntime.source
 		clusterServer = &http.Server{
 			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
@@ -1015,6 +1102,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			s.configureVolumeBackend(backend)
 			backend.consoleSidecars = s
+			if s.clusterCapabilities != nil {
+				backend.nodeID = s.clusterCapabilities.NodeID
+			}
 			unlock := s.lockDataRoot(opts.dataRoot)
 			err := stopDaemonContainers(backend)
 			unlock()
@@ -1075,6 +1165,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend.progressTerminal = request.StderrTerminal
 	backend.progressWidth = request.StderrWidth
 	backend.consoleSidecars = s
+	backend.distributedSource = s.distributedSource
+	if s.clusterCapabilities != nil {
+		backend.nodeID = s.clusterCapabilities.NodeID
+	}
 	if request.Args[0] == "events" {
 		status := 0
 		if err := s.streamEvents(opts.dataRoot, request.Args[1:], backend.stdout); err != nil {
@@ -1105,6 +1199,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
 		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.consoleSidecars = s
+		mutationBackend.distributedSource = s.distributedSource
+		if s.clusterCapabilities != nil {
+			mutationBackend.nodeID = s.clusterCapabilities.NodeID
+		}
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
 		completed, err := completeDaemonMutation(opts.dataRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
@@ -1603,7 +1701,14 @@ func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlo
 			"--cluster-key", clusterOpts.KeyFile,
 			"--cluster-ca", clusterOpts.CAFile,
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
+			"--cluster-page-listen", clusterOpts.PageListen,
 		)
+		if clusterOpts.PageAdvertise != "" {
+			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
+		}
+		for _, peer := range clusterOpts.Peers {
+			commandArgs = append(commandArgs, "--cluster-peer", peer)
+		}
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -1664,7 +1769,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is valid with 'daemon start' only")
 		return 2
 	}
-	clusterOpts := daemonClusterOptions{MaxTransactions: 32}
+	clusterOpts := daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0"}
 	if len(args) != 0 && args[0] == "start" {
 		startArgs := args[1:]
 		for len(startArgs) != 0 {

@@ -3867,11 +3867,12 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
+	targetNode := fs.String("target", "", "fork into a container on another configured ttcd node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: ttc fork [--paused] SOURCE [DEST...]")
+		return errors.New("usage: ttc fork [--paused] [--target NODE] SOURCE [DEST...]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -3880,6 +3881,21 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	destinationValues := fs.Args()[1:]
 	if len(destinationValues) == 0 {
 		destinationValues = []string{"fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")}
+	}
+	if *targetNode != "" {
+		if len(destinationValues) != 1 {
+			return errors.New("a distributed fork currently requires exactly one destination container")
+		}
+		distributed, ok := backend.(distributedForkBackend)
+		if !ok {
+			return errors.New("this backend does not support distributed forks")
+		}
+		target, err := distributed.forkRemote(source, *targetNode, destinationValues[0], *paused)
+		if err != nil {
+			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, destinationValues[0], err)
+		}
+		fmt.Fprintln(stdout, target)
+		return nil
 	}
 	destinations := make([]selector, len(destinationValues))
 	destinationBranches := make([]string, len(destinationValues))
@@ -4628,6 +4644,8 @@ type runtimeBackend struct {
 	stdout                io.Writer
 	stderr                io.Writer
 	consoleSidecars       consoleSidecarOwner
+	distributedSource     *distributedSourceRuntime
+	nodeID                string
 }
 
 func terminalType(value string) string {
@@ -4659,7 +4677,14 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	if b.dataRoot == "" {
 		return ttcbundle.ContainerInfo{ID: identifier, Name: identifier}, nil
 	}
-	return b.containerStore().LoadContainer(identifier)
+	info, err := b.containerStore().LoadContainer(identifier)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, err
+	}
+	if b.nodeID != "" && info.NodeID != "" && info.NodeID != b.nodeID {
+		return ttcbundle.ContainerInfo{}, fmt.Errorf("container %q belongs to cluster node %q", identifier, info.NodeID)
+	}
+	return info, nil
 }
 
 func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.ContainerInfo, error) {
@@ -5007,6 +5032,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		PublishedPorts:     request.publishedPorts,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
+		NodeID:             b.nodeID,
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -5079,6 +5105,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		PublishedPorts:     request.publishedPorts,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
+		NodeID:             b.nodeID,
 	})
 	if err != nil {
 		return "", err
@@ -7462,6 +7489,9 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
+		if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
+			continue
+		}
 		state := container.State
 		if state == "" {
 			state = "created"

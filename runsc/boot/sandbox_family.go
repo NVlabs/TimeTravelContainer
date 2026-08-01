@@ -102,6 +102,7 @@ type ForkBranchesArgs struct {
 // is returned to the peer and may differ when the listener is behind a routed
 // or translated address; if empty, the listener's address is advertised.
 type DistributedForkCaptureArgs struct {
+	urpc.FilePayload
 	SessionID        string
 	Source           string
 	FamilyID         string
@@ -424,8 +425,11 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 // it through a bounded TCP page server. The source is restored to its original
 // pause state before this method returns.
 func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs) (*DistributedForkSessionInfo, error) {
-	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || args.ListenAddress == "" {
+	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || (args.ListenAddress == "" && len(args.FilePayload.Files) == 0) {
 		return nil, errors.New("distributed fork capture is missing session, family, branch, or listen identity")
+	}
+	if len(args.FilePayload.Files) > 1 {
+		return nil, fmt.Errorf("distributed fork capture received %d listener files, want at most one", len(args.FilePayload.Files))
 	}
 	if args.MaxTransferBytes == 0 {
 		return nil, errors.New("distributed fork maximum transfer size is zero")
@@ -448,9 +452,18 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp", args.ListenAddress)
+	var listener net.Listener
+	if len(args.FilePayload.Files) == 1 {
+		listener, err = net.FileListener(args.FilePayload.Files[0])
+	} else {
+		listener, err = net.Listen("tcp", args.ListenAddress)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listening for distributed pages: %w", err)
+	}
+	if _, ok := listener.(*net.TCPListener); !ok {
+		listener.Close()
+		return nil, fmt.Errorf("distributed page listener is %T, want TCP", listener)
 	}
 	keepListener := false
 	defer func() {

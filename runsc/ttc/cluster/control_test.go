@@ -49,7 +49,7 @@ func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSession
 	return nil
 }
 
-func (r *testTargetRuntime) Publish(context.Context, *Transaction) error {
+func (r *testTargetRuntime) Publish(context.Context, *Transaction, bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.published++
@@ -245,7 +245,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil || retried.Revision != prepared.Revision {
 		t.Fatalf("prepare retry=%+v err=%v", retried, err)
 	}
-	published, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision)
+	published, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, true)
 	if err != nil || published.State != TransactionPublished {
 		t.Fatalf("publish=%+v err=%v", published, err)
 	}
