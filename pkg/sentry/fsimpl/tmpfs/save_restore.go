@@ -126,21 +126,19 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 	if pgalloc.IsLiveForkClone(ctx) {
 		resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
-		resource, ok := resources[fs.diskVolume.ResourceID]
-		if !ok {
-			return fmt.Errorf("TTC volume resource %q was not provided", fs.diskVolume.ResourceID)
+		if resource, ok := resources[fs.diskVolume.ResourceID]; ok {
+			repository, ok := resource.(*ttcvolume.Repository)
+			if !ok {
+				return fmt.Errorf("TTC volume resource %q has type %T", fs.diskVolume.ResourceID, resource)
+			}
+			childBranch := vfs.LiveForkChildBranchIDFromContext(ctx)
+			if childBranch == "" {
+				return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
+			}
+			fs.diskVolume.Repository = repository
+			fs.diskVolume.Branch = childBranch
+			return nil
 		}
-		repository, ok := resource.(*ttcvolume.Repository)
-		if !ok {
-			return fmt.Errorf("TTC volume resource %q has type %T", fs.diskVolume.ResourceID, resource)
-		}
-		childBranch := vfs.LiveForkChildBranchIDFromContext(ctx)
-		if childBranch == "" {
-			return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
-		}
-		fs.diskVolume.Repository = repository
-		fs.diskVolume.Branch = childBranch
-		return nil
 	}
 	resources := vfs.RestoreFilesystemResourcesFromContext(ctx)
 	resource, ok := resources[fs.diskVolume.ResourceID]

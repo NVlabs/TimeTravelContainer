@@ -170,13 +170,14 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 
 // DistributedForkLoadOptions controls target reconstruction.
 type DistributedForkLoadOptions struct {
-	Clocks              sentrytime.Clocks
-	ChildBranchID       string
-	RestoreOptions      vfs.CompleteRestoreOptions
-	FilesystemResources vfs.LiveForkFilesystemResources
-	DemandOnly          bool
-	PrefetchBytes       uint64
-	PrefetchBehindBytes uint64
+	Clocks                     sentrytime.Clocks
+	ChildBranchID              string
+	RestoreOptions             vfs.CompleteRestoreOptions
+	FilesystemResources        vfs.LiveForkFilesystemResources
+	RestoreFilesystemResources vfs.RestoreFilesystemResources
+	DemandOnly                 bool
+	PrefetchBytes              uint64
+	PrefetchBehindBytes        uint64
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
@@ -222,14 +223,20 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		targetMF.Destroy()
 	}()
 	mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
-	loadCtx := context.WithValues(child.SupervisorContext(), map[any]any{
+	loadValues := map[any]any{
 		pgalloc.CtxMemoryFile:                targetMF,
 		pgalloc.CtxMemoryFileMap:             mfs,
 		pgalloc.CtxLiveForkClone:             true,
 		pgalloc.CtxLiveForkRemoteMemoryClone: true,
-		vfs.CtxLiveForkFilesystemResources:   opts.FilesystemResources,
 		vfs.CtxLiveForkChildBranchID:         opts.ChildBranchID,
-	})
+	}
+	if opts.FilesystemResources != nil {
+		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
+	}
+	if opts.RestoreFilesystemResources != nil {
+		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
+	}
+	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
 		return nil, fmt.Errorf("loading distributed Kernel metadata: %w", err)
 	}
