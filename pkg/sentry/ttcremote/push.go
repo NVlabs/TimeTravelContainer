@@ -204,6 +204,25 @@ func (r *TCPPushReceiver) Stats() (installed, skipped uint64) {
 	return r.installed.Load(), r.skipped.Load()
 }
 
+// TCPPushReceiverDebugState reports push results and uncommitted retry
+// receipts. A nonzero receipt count is expected only while transactions are
+// in flight or after a source disconnects between PUSH_OK and commit.
+type TCPPushReceiverDebugState struct {
+	BytesInstalled  uint64
+	BytesSkipped    uint64
+	PendingReceipts int
+}
+
+// DebugState returns current target-side push state.
+func (r *TCPPushReceiver) DebugState() TCPPushReceiverDebugState {
+	r.mu.Lock()
+	receipts := len(r.receipts)
+	r.mu.Unlock()
+	return TCPPushReceiverDebugState{
+		BytesInstalled: r.installed.Load(), BytesSkipped: r.skipped.Load(), PendingReceipts: receipts,
+	}
+}
+
 // TCPPushSender consumes source COW hints and sends them to the target.
 type TCPPushSender struct {
 	done    chan struct{}
@@ -343,3 +362,14 @@ func (s *TCPPushSender) BytesPushed() uint64 { return s.bytes.Load() }
 
 // Retries returns the number of repeated push or commit attempts.
 func (s *TCPPushSender) Retries() uint64 { return s.retries.Load() }
+
+// TCPPushSenderStats reports source-side proactive push activity.
+type TCPPushSenderStats struct {
+	BytesPushed uint64
+	Retries     uint64
+}
+
+// Stats returns source-side proactive push counters.
+func (s *TCPPushSender) Stats() TCPPushSenderStats {
+	return TCPPushSenderStats{BytesPushed: s.bytes.Load(), Retries: s.retries.Load()}
+}

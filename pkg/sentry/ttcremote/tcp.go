@@ -458,6 +458,13 @@ type TCPRemoteReader struct {
 	once   sync.Once
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
+
+	submitted      atomic.Uint64
+	completed      atomic.Uint64
+	failed         atomic.Uint64
+	bytesInstalled atomic.Uint64
+	retries        atomic.Uint64
+	ackOnlyRetries atomic.Uint64
 }
 
 // TCPRemoteReaderOpts configures remote page reads.
@@ -468,6 +475,29 @@ type TCPRemoteReaderOpts struct {
 	Timeout      time.Duration
 	RetryLimit   int
 	RetryBackoff time.Duration
+}
+
+// TCPRemoteReaderStats reports target-side demand paging activity.
+type TCPRemoteReaderStats struct {
+	SubmittedReads uint64
+	CompletedReads uint64
+	FailedReads    uint64
+	BytesInstalled uint64
+	Retries        uint64
+	AckOnlyRetries uint64
+}
+
+// TCPRemoteReaderDebugState is a token-free transaction snapshot suitable for
+// logs, diagnostics, and experiment result capture.
+type TCPRemoteReaderDebugState struct {
+	Address      string
+	MaxReadBytes uint64
+	MaxRanges    int
+	MaxParallel  int
+	Timeout      time.Duration
+	RetryLimit   int
+	RetryBackoff time.Duration
+	Stats        TCPRemoteReaderStats
 }
 
 // NewTCPRemoteReader constructs a TCP page reader. timeout applies to dialing
@@ -526,11 +556,32 @@ func (r *TCPRemoteReader) MaxReadBytes() uint64 { return r.maxReadBytes }
 func (r *TCPRemoteReader) MaxRanges() int       { return r.maxRanges }
 func (r *TCPRemoteReader) MaxParallel() int     { return cap(r.subs) }
 
+// Stats returns target-side paging counters.
+func (r *TCPRemoteReader) Stats() TCPRemoteReaderStats {
+	return TCPRemoteReaderStats{
+		SubmittedReads: r.submitted.Load(), CompletedReads: r.completed.Load(),
+		FailedReads: r.failed.Load(), BytesInstalled: r.bytesInstalled.Load(),
+		Retries: r.retries.Load(), AckOnlyRetries: r.ackOnlyRetries.Load(),
+	}
+}
+
+// DebugState returns reader configuration and current counters without the
+// session token.
+func (r *TCPRemoteReader) DebugState() TCPRemoteReaderDebugState {
+	return TCPRemoteReaderDebugState{
+		Address: r.address, MaxReadBytes: r.maxReadBytes, MaxRanges: r.maxRanges,
+		MaxParallel: cap(r.subs), Timeout: r.timeout, RetryLimit: r.retryLimit,
+		RetryBackoff: r.retryBackoff, Stats: r.Stats(),
+	}
+}
+
 func (r *TCPRemoteReader) AddRead(id int, off int64, _ stateio.DestinationFile, _ memmap.FileRange, dstMap []byte) {
+	r.submitted.Add(1)
 	r.subs <- tcpReadSubmission{id: id, offset: off, total: uint64(len(dstMap)), dst: stateio.LocalClientMapping(dstMap)}
 }
 
 func (r *TCPRemoteReader) AddReadv(id int, off int64, total uint64, _ stateio.DestinationFile, _ []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.submitted.Add(1)
 	r.subs <- tcpReadSubmission{id: id, offset: off, total: total, dst: stateio.LocalClientMappings(dstMaps)}
 }
 
@@ -568,6 +619,11 @@ func (r *TCPRemoteReader) worker() {
 			return
 		case sub := <-r.subs:
 			n, err := r.performReadWithRetry(&conn, sub)
+			if err != nil {
+				r.failed.Add(1)
+			} else {
+				r.completed.Add(1)
+			}
 			if conn != nil && err != nil {
 				r.mu.Lock()
 				delete(r.conns, conn)
@@ -588,6 +644,12 @@ func (r *TCPRemoteReader) performReadWithRetry(conn *net.Conn, sub tcpReadSubmis
 	installed := false
 	var lastErr error
 	for attempt := 0; attempt <= r.retryLimit; attempt++ {
+		if attempt != 0 {
+			r.retries.Add(1)
+			if installed {
+				r.ackOnlyRetries.Add(1)
+			}
+		}
 		if *conn == nil {
 			dialer := net.Dialer{Timeout: r.timeout}
 			var err error
@@ -669,6 +731,7 @@ func (r *TCPRemoteReader) performReadAttempt(conn net.Conn, sub tcpReadSubmissio
 			return false, false, fmt.Errorf("destination mappings contain %d bytes, want %d", copied, sub.total)
 		}
 		installed = true
+		r.bytesInstalled.Add(sub.total)
 	}
 	if err := writeTCPMessage(conn, tcpHeader{
 		type_:     tcpAck,

@@ -376,7 +376,11 @@ after a full drain and branch destruction.
   prefetch window: waiter-owned reads keep priority while spare asynchronous
   slots fetch adjacent pages in multi-page requests. Fixed-window/adaptive
   prefetch and ACK batching remain to be added.
-* Expose metrics and a debug transaction dump.
+* Reader, page-server, push-sender, and push-receiver counters are exposed,
+  including installed bytes, failures, retries, ACK-only recovery, skipped
+  pushes, and pending push receipts. Token-free reader configuration/state can
+  be captured with experiment results. Daemon-wide aggregation and a complete
+  multi-component transaction dump remain to be added.
 
 Exit criteria: B starts and runs before full transfer; induced duplication,
 reordering, corruption, disconnects, and reconnects produce either correct

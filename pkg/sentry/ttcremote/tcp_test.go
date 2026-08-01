@@ -204,6 +204,14 @@ func TestTCPRemoteReaderConcurrentPulls(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatal("TCP reader returned incorrect memory contents")
 	}
+	if stats := reader.Stats(); stats.SubmittedReads != 4 || stats.CompletedReads != 4 || stats.FailedReads != 0 ||
+		stats.BytesInstalled != uint64(len(want)) || stats.Retries != 0 || stats.AckOnlyRetries != 0 {
+		t.Fatalf("reader stats: %+v", stats)
+	}
+	if debug := reader.DebugState(); debug.Address != server.Addr().String() || debug.MaxReadBytes != 64<<10 ||
+		debug.MaxParallel != 4 || debug.Stats.CompletedReads != 4 {
+		t.Fatalf("reader debug state: %+v", debug)
+	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -541,6 +549,10 @@ func TestTCPRemoteReaderRecoversLostAckOK(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatal("retry changed installed page data")
 	}
+	if stats := reader.Stats(); stats.SubmittedReads != 1 || stats.CompletedReads != 1 || stats.FailedReads != 0 ||
+		stats.BytesInstalled != hostarch.PageSize || stats.Retries != 1 || stats.AckOnlyRetries != 1 {
+		t.Fatalf("lost-ACK reader stats: %+v", stats)
+	}
 	reader.Close()
 	listener.Close()
 	if err := <-serverDone; err != nil {
@@ -745,6 +757,9 @@ func TestTCPProactivePushRecoversLostPushOK(t *testing.T) {
 	installed, skipped := receiver.Stats()
 	if installed != hostarch.PageSize || skipped != 0 {
 		t.Fatalf("duplicate push installed=%d skipped=%d", installed, skipped)
+	}
+	if debug := receiver.DebugState(); debug.PendingReceipts != 0 || debug.BytesInstalled != hostarch.PageSize {
+		t.Fatalf("push receiver debug state after commit: %+v", debug)
 	}
 	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 {
 		t.Fatalf("retried push retained source page: %+v", stats)
