@@ -244,6 +244,9 @@ func TestAttachRemotePageLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if got := target.AsyncLoadingMapUnit(); got != 0 {
+		t.Fatalf("background-load map unit=%d, want default cap", got)
+	}
 
 	if !target.IsAsyncLoading() {
 		t.Fatal("target did not enter asynchronous loading state")
@@ -308,6 +311,9 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+		t.Fatalf("demand-only map unit=%d, want one page", got)
+	}
 
 	// MemoryFilesDone must not turn a demand-only load into an eager drain.
 	time.Sleep(25 * time.Millisecond)
@@ -409,6 +415,9 @@ func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if got := target.AsyncLoadingMapUnit(); got != 4*hostarch.PageSize {
+		t.Fatalf("forward-prefetch map unit=%d, want four pages", got)
+	}
 
 	page := uint64(2)
 	pageFR := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
@@ -464,6 +473,9 @@ func TestDemandOnlyRemotePageLoadFixedWindowAndPolicySwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if got := target.AsyncLoadingMapUnit(); got != 4*hostarch.PageSize {
+		t.Fatalf("fixed-window map unit=%d, want four pages", got)
+	}
 	fault := func(page uint64) {
 		t.Helper()
 		fr := memmap.FileRange{targetFR.Start + page*hostarch.PageSize, targetFR.Start + (page+1)*hostarch.PageSize}
@@ -481,6 +493,9 @@ func TestDemandOnlyRemotePageLoadFixedWindowAndPolicySwitch(t *testing.T) {
 	}
 	if err := pages.SetPrefetchWindow(0, 0); err != nil {
 		t.Fatal(err)
+	}
+	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+		t.Fatalf("disabled-prefetch map unit=%d, want one page", got)
 	}
 	fault(7)
 	if stats := snapshot.Stats(); stats.PagesReleased != 5 {

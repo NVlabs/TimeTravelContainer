@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -260,13 +261,20 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	relayBackend.stderr = io.Discard
 	relay = newDistributedPageRelay(listener, &relayBackend, source.container, transactionID)
 
+	dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
+	if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+		// TransferBytes is the adaptive controller's initial request/window
+		// size. Negotiate the full protocol limit with the transport so runtime
+		// window growth can also coalesce I/O into larger network requests.
+		dataPlaneMax = tx.Negotiated.MaxTransferSize
+	}
 	args := []string{
 		"timetravel", "--source", source.branch,
 		"--distributed-session", transactionID,
 		"--distributed-family", source.container,
 		"--distributed-external-listener",
 		"--distributed-advertise", advertise,
-		"--distributed-max-transfer", fmt.Sprint(tx.Negotiated.PagingPolicy.TransferBytes),
+		"--distributed-max-transfer", fmt.Sprint(dataPlaneMax),
 		"--distributed-push-policy", string(tx.Negotiated.PagingPolicy.Push),
 		"--distributed-push-high-water", fmt.Sprint(tx.Negotiated.PagingPolicy.MaxOutstandingBytes),
 	}
@@ -286,7 +294,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
+		MaxTransferBytes: dataPlaneMax,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -342,7 +350,20 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 			continue
 		}
 		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-		tx, err := peer.MarkIndependent(ctx, transactionID, revision)
+		metrics := cluster.TransferMetrics{
+			PullRequests:     status.Transport.PullRequests,
+			AckRequests:      status.Transport.AckRequests,
+			AckBatches:       status.Transport.AckBatches,
+			PullBytes:        status.Transport.BytesSent,
+			MetadataBytes:    status.Transport.MetadataBytesSent,
+			PushBytes:        status.Transport.PushBytesSent,
+			PushRetries:      status.Transport.PushRetries,
+			PagesTotal:       status.Snapshot.PagesTotal,
+			PagesReleased:    status.Snapshot.PagesReleased,
+			PushHints:        status.Snapshot.PushEnqueued,
+			PushHintsDropped: status.Snapshot.PushDropped,
+		}
+		tx, err := peer.MarkIndependentWithMetrics(ctx, transactionID, revision, metrics)
 		if err != nil {
 			if current, statusErr := peer.Status(ctx, transactionID); statusErr == nil && current.State == cluster.TransactionIndependent {
 				tx = current

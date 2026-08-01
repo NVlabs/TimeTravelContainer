@@ -702,8 +702,10 @@ func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 	status.BytesLoaded = policy.TransferBytes
 	status.BytesWaited = policy.PageSize
 	status.TotalWaiters = 1
+	status.Faults = 4
+	status.SequentialFaults = 3
 	behind, ahead, changed := controller.observe(status, now.Add(600*time.Millisecond))
-	if !changed || behind != 0 || ahead != 2*policy.TransferBytes-policy.PageSize {
+	if !changed || behind != 0 || ahead != controller.maxAhead {
 		t.Fatalf("blocking-fault update=(%d,%d,%t)", behind, ahead, changed)
 	}
 	grownAhead := ahead
@@ -711,7 +713,51 @@ func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 		status.BytesLoaded += 4 * (grownAhead + policy.PageSize)
 		behind, ahead, changed = controller.observe(status, now.Add(3*time.Second+time.Duration(i)*250*time.Millisecond))
 	}
-	if !changed || behind != 0 || ahead != policy.TransferBytes-policy.PageSize {
+	wantShrunk := (grownAhead+policy.PageSize)/2 - policy.PageSize
+	if !changed || behind != 0 || ahead != wantShrunk {
 		t.Fatalf("quiet-throughput update=(%d,%d,%t)", behind, ahead, changed)
+	}
+}
+
+func TestAdaptivePrefetchControllerShrinksRandomFaults(t *testing.T) {
+	policy := ttcpolicy.DefaultPolicy()
+	policy.MaxConcurrency = 4
+	controller := newAdaptivePrefetchController(policy)
+	now := time.Unix(2000, 0)
+	status := pgalloc.AsyncPagesFileLoadStats{PrefetchBytes: policy.TransferBytes - policy.PageSize}
+	if _, _, changed := controller.observe(status, now); changed {
+		t.Fatal("initial observation changed the prefetch window")
+	}
+	status.BytesLoaded = 8 * policy.TransferBytes
+	status.BytesWaited = 8 * policy.PageSize
+	status.TotalWaiters = 8
+	status.Faults = 8
+	behind, ahead, changed := controller.observe(status, now.Add(300*time.Millisecond))
+	if !changed || behind != 0 || ahead != policy.TransferBytes/2-policy.PageSize {
+		t.Fatalf("random-fault update=(%d,%d,%t)", behind, ahead, changed)
+	}
+}
+
+func TestAdaptivePrefetchControllerAccumulatesLocalitySamples(t *testing.T) {
+	policy := ttcpolicy.DefaultPolicy()
+	policy.MaxConcurrency = 4
+	controller := newAdaptivePrefetchController(policy)
+	now := time.Unix(3000, 0)
+	status := pgalloc.AsyncPagesFileLoadStats{PrefetchBytes: policy.TransferBytes - policy.PageSize}
+	controller.observe(status, now)
+	status.BytesWaited = 2 * policy.PageSize
+	status.TotalWaiters = 2
+	status.Faults = 2
+	status.SequentialFaults = 2
+	if _, _, changed := controller.observe(status, now.Add(60*time.Millisecond)); changed {
+		t.Fatal("two locality samples changed the window")
+	}
+	status.BytesWaited += 2 * policy.PageSize
+	status.TotalWaiters += 2
+	status.Faults += 2
+	status.SequentialFaults += 2
+	behind, ahead, changed := controller.observe(status, now.Add(120*time.Millisecond))
+	if !changed || behind != 0 || ahead != controller.maxAhead {
+		t.Fatalf("accumulated sequential update=(%d,%d,%t)", behind, ahead, changed)
 	}
 }

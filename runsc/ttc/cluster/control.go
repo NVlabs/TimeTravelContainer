@@ -152,7 +152,8 @@ type PrepareRequest struct {
 
 // RevisionRequest advances a transaction without carrying new secret state.
 type RevisionRequest struct {
-	Revision uint64 `json:"revision"`
+	Revision uint64           `json:"revision"`
+	Metrics  *TransferMetrics `json:"metrics,omitempty"`
 }
 
 // PublishRequest controls the initial externally visible target state.
@@ -496,7 +497,13 @@ func (c *ControlPlane) advanceRuntime(w http.ResponseWriter, r *http.Request, id
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
-	tx, err = c.Store.Advance(id, tx.Revision, next, "", c.Now())
+	if next == TransactionIndependent && request.Metrics != nil {
+		metrics := *request.Metrics
+		metrics.TimeToIndependent = c.Now().Sub(tx.CreatedAt)
+		tx, err = c.Store.AdvanceIndependent(id, tx.Revision, metrics, c.Now())
+	} else {
+		tx, err = c.Store.Advance(id, tx.Revision, next, "", c.Now())
+	}
 	if err != nil {
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -667,6 +674,22 @@ func (c *Client) Publish(ctx context.Context, id string, revision uint64, paused
 // be stopped without affecting the target.
 func (c *Client) MarkIndependent(ctx context.Context, id string, revision uint64) (*Transaction, error) {
 	return c.advance(ctx, id, "independent", revision)
+}
+
+// MarkIndependentWithMetrics records final source transfer accounting with the
+// independence transition.
+func (c *Client) MarkIndependentWithMetrics(ctx context.Context, id string, revision uint64, metrics TransferMetrics) (*Transaction, error) {
+	if !transactionIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid transaction ID %q", id)
+	}
+	if err := metrics.Validate(); err != nil {
+		return nil, err
+	}
+	var tx Transaction
+	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/independent", RevisionRequest{Revision: revision, Metrics: &metrics}, &tx); err != nil {
+		return nil, err
+	}
+	return &tx, nil
 }
 
 // Drain requests eager target materialization so the source may stop safely.

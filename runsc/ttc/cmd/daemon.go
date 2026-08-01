@@ -357,16 +357,20 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 func (*daemonTargetRuntime) MarkIndependent(context.Context, *cluster.Transaction) error { return nil }
 
 type adaptivePrefetchController struct {
-	policy       ttcpolicy.Policy
-	ahead        uint64
-	behind       uint64
-	maxAhead     uint64
-	lastLoaded   uint64
-	lastWaited   uint64
-	lastWaiters  int
-	lastChange   time.Time
-	quietSamples int
-	initialized  bool
+	policy               ttcpolicy.Policy
+	ahead                uint64
+	behind               uint64
+	maxAhead             uint64
+	lastLoaded           uint64
+	lastWaited           uint64
+	lastWaiters          int
+	lastFaults           uint64
+	lastSequentialFaults uint64
+	localityFaults       uint64
+	localitySequential   uint64
+	lastChange           time.Time
+	quietSamples         int
+	initialized          bool
 }
 
 func newAdaptivePrefetchController(policy ttcpolicy.Policy) *adaptivePrefetchController {
@@ -390,28 +394,69 @@ func newAdaptivePrefetchController(policy ttcpolicy.Policy) *adaptivePrefetchCon
 func (c *adaptivePrefetchController) observe(status pgalloc.AsyncPagesFileLoadStats, now time.Time) (uint64, uint64, bool) {
 	if !c.initialized {
 		c.initialized = true
-		c.lastLoaded = status.BytesLoaded
-		c.lastWaited = status.BytesWaited
-		c.lastWaiters = status.TotalWaiters
-		c.lastChange = now
+		c.lastChange = now.Add(-50 * time.Millisecond)
 		if status.PrefetchBytes != 0 || status.PrefetchBehindBytes != 0 {
 			c.ahead, c.behind = status.PrefetchBytes, status.PrefetchBehindBytes
 		}
-		return 0, 0, false
+		if status.Faults == 0 {
+			c.lastLoaded = status.BytesLoaded
+			c.lastWaited = status.BytesWaited
+			c.lastWaiters = status.TotalWaiters
+			c.lastFaults = status.Faults
+			c.lastSequentialFaults = status.SequentialFaults
+			return 0, 0, false
+		}
 	}
 	loaded := status.BytesLoaded - min(status.BytesLoaded, c.lastLoaded)
 	waited := status.BytesWaited - min(status.BytesWaited, c.lastWaited)
 	waiters := status.TotalWaiters - min(status.TotalWaiters, c.lastWaiters)
+	faults := status.Faults - min(status.Faults, c.lastFaults)
+	sequentialFaults := status.SequentialFaults - min(status.SequentialFaults, c.lastSequentialFaults)
 	c.lastLoaded, c.lastWaited, c.lastWaiters = status.BytesLoaded, status.BytesWaited, status.TotalWaiters
+	c.lastFaults, c.lastSequentialFaults = status.Faults, status.SequentialFaults
+	c.localityFaults += faults
+	c.localitySequential += sequentialFaults
+
+	// Random faults should reduce speculative amplification even when every
+	// fault blocks. Exact adjacency is a deliberately conservative signal:
+	// ambiguous or concurrent samples retain the current setting.
+	if c.localityFaults >= 4 && c.localitySequential*4 <= c.localityFaults {
+		c.quietSamples = 0
+		if c.ahead == 0 {
+			c.localityFaults, c.localitySequential = 0, 0
+			return 0, 0, false
+		}
+		if now.Sub(c.lastChange) < 50*time.Millisecond {
+			return 0, 0, false
+		}
+		total := (c.ahead + c.policy.PageSize) / 2
+		if total < c.policy.PageSize {
+			total = c.policy.PageSize
+		}
+		total -= total % c.policy.PageSize
+		c.ahead = total - c.policy.PageSize
+		c.behind = 0
+		c.localityFaults, c.localitySequential = 0, 0
+		c.lastChange = now
+		return c.behind, c.ahead, true
+	}
 
 	if waited != 0 || waiters != 0 || status.Waiters != 0 {
 		c.quietSamples = 0
-		if now.Sub(c.lastChange) < 500*time.Millisecond || c.ahead >= c.maxAhead {
+		if c.localityFaults < 4 || c.localitySequential*4 < c.localityFaults*3 || now.Sub(c.lastChange) < 50*time.Millisecond {
 			return 0, 0, false
 		}
-		total := min((c.ahead+c.policy.PageSize)*2, c.maxAhead+c.policy.PageSize)
-		c.ahead = total - c.policy.PageSize
+		if c.ahead >= c.maxAhead {
+			c.localityFaults, c.localitySequential = 0, 0
+			return 0, 0, false
+		}
+		// Once an adjacent run is established, request the full negotiated
+		// transport window immediately. RTT-bound sequential workloads are too
+		// short for a slow doubling ladder; later random or quiet samples still
+		// shrink with hysteresis.
+		c.ahead = c.maxAhead
 		c.behind = 0
+		c.localityFaults, c.localitySequential = 0, 0
 		c.lastChange = now
 		return c.behind, c.ahead, true
 	}
@@ -441,7 +486,11 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 	}
 	go func() {
 		defer r.watch.Delete(transactionID)
-		ticker := time.NewTicker(250 * time.Millisecond)
+		interval := 250 * time.Millisecond
+		if tx, err := r.store.Load(transactionID); err == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+			interval = 50 * time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		failedPolls := 0
 		var adaptive *adaptivePrefetchController

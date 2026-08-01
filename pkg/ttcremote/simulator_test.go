@@ -24,6 +24,10 @@ func TestPolicyValidate(t *testing.T) {
 	if err := p.Validate(); err != nil {
 		t.Fatalf("DefaultPolicy.Validate(): %v", err)
 	}
+	if p.PageSize != 4<<10 || p.TransferBytes != 64<<10 || p.Prefetch != PrefetchAdaptive ||
+		p.Push != PushDirtyOrphan || !p.Adaptive {
+		t.Fatalf("DefaultPolicy() = %+v, want adaptive 64 KiB dirty-orphan policy", p)
+	}
 	for _, test := range []struct {
 		name   string
 		mutate func(*Policy)

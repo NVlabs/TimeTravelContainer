@@ -261,9 +261,13 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil || draining.State != TransactionDraining || !draining.SourceNeeded {
 		t.Fatalf("draining=%+v err=%v", draining, err)
 	}
-	independent, err := client.MarkIndependent(context.Background(), tx.Identity.TransactionID, draining.Revision)
+	metrics := TransferMetrics{PullRequests: 7, PullBytes: 4096, MetadataBytes: 512, PagesTotal: 1, PagesReleased: 1}
+	independent, err := client.MarkIndependentWithMetrics(context.Background(), tx.Identity.TransactionID, draining.Revision, metrics)
 	if err != nil || independent.State != TransactionIndependent || independent.SourceNeeded {
 		t.Fatalf("independent=%+v err=%v", independent, err)
+	}
+	if independent.Metrics == nil || independent.Metrics.PullRequests != 7 || independent.Metrics.TimeToIndependent <= 0 {
+		t.Fatalf("independent metrics=%+v", independent.Metrics)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()

@@ -20,7 +20,9 @@ Implementation progress:
   publication, host-owned connection donation, end-to-end remote container
   restore, durable dependency state, restart recovery, and drain-before-source
   stop: implemented and tested in a two-daemon same-host cluster.
-* Phase 5: in progress. Phase 6: pending.
+* Phase 5 policy controls, durable metrics, real-container benchmark harness,
+  PMA-aware demand granularity, and adaptive locality selection: implemented
+  and tested. Phase 6: pending.
 
 ## Summary
 
@@ -262,8 +264,11 @@ through the TTC API and SDKs. Initial knobs should include:
 * optional bandwidth cap; and
 * adaptive-policy enablement, sampling interval, and hysteresis.
 
-Configuration must be reported in fork statistics so every benchmark is
-reproducible. Defaults are not finalized by this proposal.
+Configuration is reported in fork statistics so every benchmark is
+reproducible. The selected default is adaptive sequential prefetch beginning
+at 64 KiB and bounded by the negotiated 2 MiB protocol maximum, with four
+parallel requests, a 64 MiB outstanding-byte limit, 1 ms or 256-page ACK
+aggregation, and dirty-orphan push. Every component remains configurable.
 
 ### Adaptive strategy
 
@@ -285,13 +290,16 @@ page correctness state.
 The first adaptive algorithm should be intentionally simple and explainable:
 
 1. Start at 64 KiB with sequential prefetch and dirty-orphan push.
-2. Grow the range after sustained high prefetch usefulness and available
-   bandwidth.
-3. Shrink it after sustained low usefulness or high fault head-of-line delay.
-4. Increase push aggressiveness when retained bytes grow faster than pages are
-   acknowledged.
-5. Switch to eager drain when the estimated remaining-demand transfer cost is
-   close to the remaining snapshot size, or when source shutdown is requested.
+2. Accumulate exact fault-adjacency samples across 50 ms observations. After a
+   strongly sequential run, grow directly to the negotiated transport limit;
+   this avoids a slow doubling ladder on short RTT-bound workloads.
+3. When at most one quarter of a sampled run is adjacent, halve the window
+   with hysteresis until loading is page-granular.
+4. Keep correctness and network transfer units separate: the address-space
+   mapper limits demand-only mappings to the active prefetch window, while the
+   transport may split or coalesce that range independently.
+5. Enter eager drain when source shutdown is requested. Pressure-driven
+   switching and latency/usefulness inputs remain later controller extensions.
 
 ## Expected code boundaries
 
@@ -473,11 +481,41 @@ references nor filesystem transaction debris.
 
 ### Phase 5: policy experimentation and adaptive selection
 
-* Implement all policy knobs and record them with metrics.
-* Run the network and workload matrix below.
-* Select workload-independent conservative defaults.
-* Implement the adaptive controller and compare it with the best fixed policy
-  for every workload/network cell.
+* All initial policy knobs are exposed through `ttcd` and persisted with each
+  transaction. Final pull, push, ACK, byte, page-release, and independence-time
+  counters are committed atomically with the independent transition.
+* `tools/ttc/distributed_benchmark` runs two real daemons with independent
+  runtime roots, short-lived mutual-TLS identities, a shared repository, an
+  unmodified OCI image, and an in-container page workload. It supports
+  `tc netem` delay, rate, and loss, emits raw JSONL, and verifies both source
+  and target after every fork.
+* Demand-only address-space mapping now follows the current prefetch window
+  rather than mapping a hard-coded 32 MiB PMA. This makes a 4 KiB policy truly
+  page-granular and prevents sparse workloads from silently loading whole PMAs.
+* The adaptive controller uses accumulated page-fault adjacency, grows to the
+  negotiated 2 MiB limit for a sequential run, and halves to page-sized demand
+  loading for random runs.
+
+Corrected representative measurements used a 16 MiB prefaulted working set,
+four parallel requests, 1 Gbit/s shaping, and 5 ms one-way delay (about 10 ms
+request/response RTT):
+
+| Workload and policy | Workload time | Page bytes | Pull requests |
+|---|---:|---:|---:|
+| Sequential, fixed 64 KiB | 5656 ms | 17.21 MB | 525 |
+| Sequential, fixed 1 MiB | 792 ms | 18.24 MB | 41 |
+| Sequential, adaptive | **695 ms** | 18.52 MB | 35 |
+| Sparse random, fixed 4 KiB | 4583 ms | 2.35 MB | 574 |
+| Sparse random, fixed 64 KiB | **3284 ms** | 15.68 MB | 287 |
+| Sparse random, adaptive | 4279 ms | 2.96 MB | 219 |
+
+Adaptive sequential loading finished about 12% faster than the best fixed
+sequential window tested. On sparse random access, adaptive stayed within 7%
+of conservative fixed 4 KiB latency while transferring only 26% more bytes;
+fixed 64 KiB was faster only by spending about 6.7 times as much bandwidth.
+These results select adaptive mode as the workload-independent default. A fixed
+window remains useful when bandwidth is cheap and minimizing sparse-fault
+latency is the only objective.
 
 Exit criteria: adaptive mode avoids catastrophic choices, remains within 10%
 of the best fixed policy on representative cells where one policy dominates,

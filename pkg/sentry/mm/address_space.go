@@ -67,11 +67,16 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		// Impose an arbitrary mapUnit in order to avoid calling
-		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
-		// with unnecessarily large ranges, resulting in unnecessarily long
-		// waits.
-		setMapUnit(32 << 20)
+		// Demand-only remote loading must not map an entire PMA: MapFile may
+		// call MemoryFile.MapInternal for the complete mapping and thereby
+		// materialize untouched pages. Follow the active prefetch window so
+		// transfer granularity remains a policy choice. Ordinary background
+		// checkpoint restore retains its historical 32 MiB cap.
+		if unit := mf.AsyncLoadingMapUnit(); unit != 0 {
+			setMapUnit(unit)
+		} else {
+			setMapUnit(32 << 20)
+		}
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {

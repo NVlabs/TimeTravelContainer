@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "name": "local-sequential-64k",
+      "workload": "sequential",
+      "transfer_bytes": 65536,
+      "prefetch": "sequential",
+      "push": "dirty-orphan"
+    },
+    {
+      "name": "local-random-4k",
+      "workload": "random",
+      "transfer_bytes": 4096,
+      "prefetch": "none",
+      "push": "demand-only"
+    },
+    {
+      "name": "wan-sequential-adaptive",
+      "workload": "sequential",
+      "transfer_bytes": 65536,
+      "prefetch": "adaptive",
+      "push": "dirty-orphan",
+      "netem_device": "lo",
+      "delay_ms": 5,
+      "rate_mbit": 1000
+    },
+    {
+      "name": "wan-eager-drain",
+      "workload": "sequential",
+      "transfer_bytes": 262144,
+      "prefetch": "sequential",
+      "push": "eager-drain",
+      "netem_device": "lo",
+      "delay_ms": 5,
+      "rate_mbit": 1000
+    }
+  ]
+}

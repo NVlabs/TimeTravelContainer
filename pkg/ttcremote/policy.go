@@ -53,18 +53,21 @@ type Policy struct {
 	Adaptive            bool           `json:"adaptive"`
 }
 
-// DefaultPolicy returns the initial experimental policy from the proposal.
+// DefaultPolicy returns the conservative policy selected by the distributed
+// benchmark. Adaptive prefetch starts with a 64 KiB window, grows to the
+// negotiated transport limit for adjacent faults, and shrinks to demand-only
+// loading for sparse random access.
 func DefaultPolicy() Policy {
 	return Policy{
 		PageSize:            4 << 10,
 		TransferBytes:       64 << 10,
-		Prefetch:            PrefetchSequential,
+		Prefetch:            PrefetchAdaptive,
 		Push:                PushDirtyOrphan,
 		MaxOutstandingBytes: 64 << 20,
 		MaxConcurrency:      64,
 		AckInterval:         50 * time.Microsecond,
 		AckBatchPages:       256,
-		Adaptive:            false,
+		Adaptive:            true,
 	}
 }
 

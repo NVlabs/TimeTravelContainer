@@ -107,6 +107,19 @@ func (s *Store) Load(id string) (*Transaction, error) {
 // Advance loads revision, applies one state transition, and atomically
 // replaces the record. A revision mismatch makes retries explicit.
 func (s *Store) Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error) {
+	return s.advance(id, revision, next, failure, nil, now)
+}
+
+// AdvanceIndependent persists final source transfer metrics atomically with
+// the transition that releases the source dependency.
+func (s *Store) AdvanceIndependent(id string, revision uint64, metrics TransferMetrics, now time.Time) (*Transaction, error) {
+	if err := metrics.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid transfer metrics: %w", err)
+	}
+	return s.advance(id, revision, TransactionIndependent, "", &metrics, now)
+}
+
+func (s *Store) advance(id string, revision uint64, next TransactionState, failure string, metrics *TransferMetrics, now time.Time) (*Transaction, error) {
 	path, err := s.path(id)
 	if err != nil {
 		return nil, err
@@ -121,6 +134,9 @@ func (s *Store) Advance(id string, revision uint64, next TransactionState, failu
 		if next == TransactionFailed && tx.Failure != failure {
 			return nil, errors.New("idempotent failed transition changed its diagnostic")
 		}
+		if next == TransactionIndependent && metrics != nil && tx.Metrics == nil {
+			return nil, errors.New("idempotent independent transition omitted previously committed metrics")
+		}
 		return tx, nil
 	}
 	if tx.Revision != revision {
@@ -128,6 +144,10 @@ func (s *Store) Advance(id string, revision uint64, next TransactionState, failu
 	}
 	if err := tx.Advance(next, failure, now); err != nil {
 		return nil, err
+	}
+	if metrics != nil {
+		copy := *metrics
+		tx.Metrics = &copy
 	}
 	data, err := marshalTransaction(tx)
 	if err != nil {

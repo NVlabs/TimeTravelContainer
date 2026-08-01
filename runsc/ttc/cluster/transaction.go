@@ -55,6 +55,39 @@ type ForkIdentity struct {
 	RepositoryID    string `json:"repository_id"`
 }
 
+// TransferMetrics is the final token-free source-side accounting captured
+// immediately before a distributed target becomes independent. It is durable
+// so experiments remain reproducible after the source session is released.
+type TransferMetrics struct {
+	TimeToIndependent time.Duration `json:"time_to_independent"`
+	PullRequests      uint64        `json:"pull_requests"`
+	AckRequests       uint64        `json:"ack_requests"`
+	AckBatches        uint64        `json:"ack_batches"`
+	PullBytes         uint64        `json:"pull_bytes"`
+	MetadataBytes     uint64        `json:"metadata_bytes"`
+	PushBytes         uint64        `json:"push_bytes"`
+	PushRetries       uint64        `json:"push_retries"`
+	PagesTotal        uint64        `json:"pages_total"`
+	PagesReleased     uint64        `json:"pages_released"`
+	PushHints         uint64        `json:"push_hints"`
+	PushHintsDropped  uint64        `json:"push_hints_dropped"`
+}
+
+// Validate ensures final accounting cannot claim independence while retaining
+// source pages or contain impossible page totals.
+func (m TransferMetrics) Validate() error {
+	if m.PagesReleased > m.PagesTotal {
+		return fmt.Errorf("released pages %d exceed total pages %d", m.PagesReleased, m.PagesTotal)
+	}
+	if m.PagesReleased != m.PagesTotal {
+		return fmt.Errorf("independent metrics retain %d pages", m.PagesTotal-m.PagesReleased)
+	}
+	if m.TimeToIndependent < 0 {
+		return errors.New("time to independence is negative")
+	}
+	return nil
+}
+
 // Validate rejects ambiguous identities before any target reservation.
 func (i ForkIdentity) Validate() error {
 	if !transactionIDPattern.MatchString(i.TransactionID) {
@@ -97,6 +130,7 @@ type Transaction struct {
 	UpdatedAt    time.Time              `json:"updated_at"`
 	Failure      string                 `json:"failure,omitempty"`
 	SourceNeeded bool                   `json:"source_needed"`
+	Metrics      *TransferMetrics       `json:"metrics,omitempty"`
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`

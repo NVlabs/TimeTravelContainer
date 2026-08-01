@@ -1171,7 +1171,11 @@ type AsyncPagesFileLoad struct {
 
 	// totalWaiters is the number of waiters that have ever waited for pages
 	// from this pages file. totalWaiters is protected by mu.
-	totalWaiters int
+	totalWaiters     int
+	faults           uint64
+	sequentialFaults uint64
+	lastFaultEnd     uint64
+	haveLastFault    bool
 
 	// timeStartWaiters was the value of gohacks.Nanotime() when numWaiters
 	// most recently transitioned from 0 to 1. If numWaiters is 0,
@@ -1368,6 +1372,8 @@ type AsyncPagesFileLoadStats struct {
 	PrefetchBehindBytes   uint64        `json:"prefetch_behind_bytes"`
 	Waiters               int           `json:"waiters"`
 	TotalWaiters          int           `json:"total_waiters"`
+	Faults                uint64        `json:"faults"`
+	SequentialFaults      uint64        `json:"sequential_faults"`
 	Error                 string        `json:"error,omitempty"`
 }
 
@@ -1392,6 +1398,8 @@ func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
 	stats.PrefetchBehindBytes = apfl.prefetchBehindBytes.Load()
 	stats.Waiters = apfl.numWaiters
 	stats.TotalWaiters = apfl.totalWaiters
+	stats.Faults = apfl.faults
+	stats.SequentialFaults = apfl.sequentialFaults
 	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
 		for seg := amfl.unloaded.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			stats.BytesOutstanding += seg.Range().Length()
@@ -1622,6 +1630,26 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 	return f.asyncPageLoad.Load() != nil
 }
 
+// AsyncLoadingMapUnit returns the maximum address-space mapping unit that
+// should be used while demand-only page loading is active. Mapping a larger
+// PMA range calls MapInternal for that entire range and accidentally turns one
+// guest fault into an eager remote load. The unit follows the current runtime
+// prefetch window, while the async reader remains free to split or coalesce
+// network requests independently.
+func (f *MemoryFile) AsyncLoadingMapUnit() uint64 {
+	amfl := f.asyncPageLoad.Load()
+	if amfl == nil || !amfl.pf.demandOnly.Load() {
+		return 0
+	}
+	unit := hostarch.PageSize + amfl.pf.prefetchBehindBytes.Load() + amfl.pf.prefetchAheadBytes.Load()
+	if unit < hostarch.PageSize || unit&(unit-1) != 0 {
+		// mapAS alignment requires a power of two. Fall back to the correctness
+		// unit for an unusual page-aligned but non-power-of-two policy.
+		return hostarch.PageSize
+	}
+	return unit
+}
+
 // AwaitLoadAll blocks until async page loading has completed. If async page
 // loading is not in progress, AwaitLoadAll returns immediately.
 func (f *MemoryFile) AwaitLoadAll() error {
@@ -1689,6 +1717,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	})
 	pending := w.pending != 0
 	if pending {
+		apfl.faults++
+		if apfl.haveLastFault && fr.Start == apfl.lastFaultEnd {
+			apfl.sequentialFaults++
+		}
+		apfl.lastFaultEnd = fr.End
+		apfl.haveLastFault = true
 		w.timeStart = gohacks.Nanotime()
 		if apfl.numWaiters == 0 {
 			apfl.timeStartWaiters = w.timeStart
