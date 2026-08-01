@@ -438,8 +438,12 @@ budget selected below.
   independence separate. A private per-daemon store atomically persists each
   revision, rejects stale writers, reloads after restart, and permits deletion
   only after a terminal state.
-* Add peer configuration, mutually authenticated transport, quotas, and
-  daemon-wide observability.
+* A TLS 1.3 control plane now requires CA-verified client certificates and
+  binds the certificate common name to the claimed TTC node ID. Its bounded
+  JSON API supports idempotent hidden-target reservation, reconnect-safe
+  status, and revisioned cancellation; per-target active transaction quotas
+  are enforced before reservation. Peer configuration and daemon-wide
+  observability still need wiring into `ttcd` startup.
 * Add `ttc fork --target` and equivalent SDK operations.
 * Keep filesystem publication transactional on the common repository and make
   target cleanup idempotent.

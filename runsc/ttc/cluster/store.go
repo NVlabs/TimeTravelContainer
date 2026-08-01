@@ -117,6 +117,12 @@ func (s *Store) Advance(id string, revision uint64, next TransactionState, failu
 	if err != nil {
 		return nil, err
 	}
+	if tx.State == next {
+		if next == TransactionFailed && tx.Failure != failure {
+			return nil, errors.New("idempotent failed transition changed its diagnostic")
+		}
+		return tx, nil
+	}
 	if tx.Revision != revision {
 		return nil, fmt.Errorf("transaction %q revision is %d, not %d", id, tx.Revision, revision)
 	}

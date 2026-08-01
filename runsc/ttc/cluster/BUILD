@@ -9,6 +9,7 @@ go_library(
     name = "cluster",
     srcs = [
         "capabilities.go",
+        "control.go",
         "store.go",
         "transaction.go",
     ],
@@ -18,6 +19,9 @@ go_library(
 go_test(
     name = "cluster_test",
     size = "small",
-    srcs = ["cluster_test.go"],
+    srcs = [
+        "cluster_test.go",
+        "control_test.go",
+    ],
     library = ":cluster",
 )
