@@ -392,6 +392,11 @@ execution or a cleanly failed target, never silent corruption.
   a reverse-channel push for the same page, and verifies that `PUSH_SKIP`
   retains the source reference until the pull installs and acknowledges it
   exactly once.
+* Proactive pushes now use stable transaction identities, bounded reconnect
+  retries, and an idempotent commit handshake. The target retains a receipt
+  until commit, so loss of `PUSH_OK` replays success instead of misclassifying
+  an already installed page as pull-owned. Fault-injection and race-detector
+  tests cover this response-loss path.
 * Implement sharded bounded queues, range coalescing, dirty-orphan push, and
   batched installation acknowledgements.
 * Release old source pages individually and validate the unique-page write

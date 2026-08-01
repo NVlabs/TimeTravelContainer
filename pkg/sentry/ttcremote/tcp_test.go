@@ -56,6 +56,38 @@ func (r *blockingSnapshotReaderAt) ReadAt(dst []byte, off int64) (int, error) {
 
 func (r *blockingSnapshotReaderAt) Close() error { return r.snapshot.Close() }
 
+type dropFirstPushOKListener struct {
+	net.Listener
+	once sync.Once
+}
+
+func (l *dropFirstPushOKListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &dropFirstPushOKConn{Conn: conn, listener: l}, nil
+}
+
+type dropFirstPushOKConn struct {
+	net.Conn
+	listener *dropFirstPushOKListener
+}
+
+func (c *dropFirstPushOKConn) Write(data []byte) (int, error) {
+	if len(data) == tcpHeaderSize && string(data[:4]) == string(tcpMagic[:]) && tcpMessageType(data[5]) == tcpPushOK {
+		drop := false
+		c.listener.once.Do(func() { drop = true })
+		if drop {
+			// Pretend the response was written, but make the peer observe loss.
+			// The retry must replay the same transaction on a new connection.
+			_ = c.Conn.Close()
+			return len(data), nil
+		}
+	}
+	return c.Conn.Write(data)
+}
+
 func newTCPTestMemoryFile(t *testing.T, pages uint64) (*pgalloc.MemoryFile, memmap.FileRange, []byte) {
 	t.Helper()
 	file, err := os.CreateTemp("", "ttc-tcp-pages-")
@@ -645,6 +677,77 @@ func TestTCPProactivePushInstallAndAcknowledge(t *testing.T) {
 	}
 	if !bytes.Equal(got, want[:hostarch.PageSize]) {
 		t.Fatal("TCP pushed page differs")
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+	if err := sender.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	receiver.Close()
+	if err := <-receiverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPProactivePushRecoversLostPushOK(t *testing.T) {
+	source, sourceFR, _ := newTCPTestMemoryFile(t, 1)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyTCPTestMemoryFile(t)
+	if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, allocator); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		target.DecRef(sourceFR)
+		target.Destroy()
+	}()
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &dropFirstPushOKListener{Listener: base}
+	token := testSnapshotToken()
+	receiver, err := NewTCPPushReceiver(listener, token, pages, hostarch.PageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiver.Serve() }()
+	sender, err := StartTCPPushSenderWithOpts(listener.Addr().String(), token, snapshot, TCPPushSenderOpts{
+		MaxPush: hostarch.PageSize, Timeout: time.Second, RetryLimit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.NotifyRemoteCOW(sourceFR)
+	deadline := time.Now().Add(5 * time.Second)
+	for sender.BytesPushed() != hostarch.PageSize && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sender.BytesPushed() != hostarch.PageSize || sender.Retries() == 0 {
+		t.Fatalf("push bytes=%d retries=%d", sender.BytesPushed(), sender.Retries())
+	}
+	installed, skipped := receiver.Stats()
+	if installed != hostarch.PageSize || skipped != 0 {
+		t.Fatalf("duplicate push installed=%d skipped=%d", installed, skipped)
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 {
+		t.Fatalf("retried push retained source page: %+v", stats)
 	}
 	pages.Cancel()
 	_ = pages.Wait()
