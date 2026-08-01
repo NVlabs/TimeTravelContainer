@@ -11,11 +11,13 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__", "//runsc/ttcd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
+		"//pkg/hostarch",
         "//pkg/ttcvolume",
         "//runsc/flag",
         "//runsc/specutils",
         "//runsc/ttc/bundle",
         "//runsc/ttc/checkpoint",
+		"//runsc/ttc/cluster",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
         "//runsc/version",

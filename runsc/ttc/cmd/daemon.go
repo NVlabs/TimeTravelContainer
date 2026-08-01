@@ -17,15 +17,18 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +37,10 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
 const (
@@ -86,6 +92,8 @@ type daemonServer struct {
 	runsc                 string
 	clientExecutable      string
 	volumeCapability      ttcvolume.Capability
+	clusterCapabilities   *cluster.Capabilities
+	clusterListen         string
 
 	stopOnce sync.Once
 
@@ -103,6 +111,23 @@ type daemonServer struct {
 
 	sidecarMu sync.Mutex
 	sidecars  map[string]*exec.Cmd
+}
+
+type daemonClusterOptions struct {
+	Configured      bool
+	Listen          string
+	NodeID          string
+	RepositoryID    string
+	CertFile        string
+	KeyFile         string
+	CAFile          string
+	MaxTransactions int
+}
+
+type daemonClusterRuntime struct {
+	listen       string
+	tlsConfig    *tls.Config
+	controlPlane *cluster.ControlPlane
 }
 
 type daemonFrameWriter struct {
@@ -464,6 +489,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	unsafeNoHostIsolation := false
 	allowSlowVolumeCopy := false
 	daemonDataRoot := dataRoot()
+	clusterOpts := daemonClusterOptions{MaxTransactions: 32}
 	for len(args) != 0 {
 		switch {
 		case args[0] == "--socket" && len(args) >= 2:
@@ -485,8 +511,16 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			daemonDataRoot = strings.TrimPrefix(args[0], "--data-root=")
 			args = args[1:]
 		default:
-			fmt.Fprintf(stderr, "ttcd: unknown option %q\n", args[0])
-			return 2
+			consumed, err := consumeDaemonClusterOption(args, &clusterOpts)
+			if err != nil {
+				fmt.Fprintf(stderr, "ttcd: %v\n", err)
+				return 2
+			}
+			if consumed == 0 {
+				fmt.Fprintf(stderr, "ttcd: unknown option %q\n", args[0])
+				return 2
+			}
+			args = args[consumed:]
 		}
 	}
 	if socket == "" {
@@ -521,11 +555,107 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
 	}
-	if err := serveDaemon(socket, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, manager.Capability(), stdout, stderr); err != nil {
+	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
+		return 1
+	}
+	if err := serveDaemonWithCluster(socket, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int, error) {
+	if len(args) == 0 {
+		return 0, nil
+	}
+	setString := func(name string, dst *string) (int, error) {
+		if args[0] == name {
+			if len(args) < 2 || args[1] == "" {
+				return 0, fmt.Errorf("%s requires a value", name)
+			}
+			*dst = args[1]
+			return 2, nil
+		}
+		if strings.HasPrefix(args[0], name+"=") {
+			*dst = strings.TrimPrefix(args[0], name+"=")
+			if *dst == "" {
+				return 0, fmt.Errorf("%s requires a value", name)
+			}
+			return 1, nil
+		}
+		return 0, nil
+	}
+	for name, dst := range map[string]*string{
+		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
+		"--cluster-repository-id": &opts.RepositoryID, "--cluster-cert": &opts.CertFile,
+		"--cluster-key": &opts.KeyFile, "--cluster-ca": &opts.CAFile,
+	} {
+		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
+			if consumed != 0 {
+				opts.Configured = true
+			}
+			return consumed, err
+		}
+	}
+	const maxName = "--cluster-max-transactions"
+	var value string
+	consumed := 0
+	if args[0] == maxName {
+		if len(args) < 2 {
+			return 0, fmt.Errorf("%s requires a value", maxName)
+		}
+		value, consumed = args[1], 2
+	} else if strings.HasPrefix(args[0], maxName+"=") {
+		value, consumed = strings.TrimPrefix(args[0], maxName+"="), 1
+	}
+	if consumed != 0 {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return 0, fmt.Errorf("%s must be a positive integer", maxName)
+		}
+		opts.MaxTransactions = parsed
+		opts.Configured = true
+		return consumed, nil
+	}
+	return 0, nil
+}
+
+func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonClusterRuntime, error) {
+	if !opts.Configured {
+		return nil, nil
+	}
+	if opts.Listen == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
+		return nil, errors.New("cluster mode requires listen address, node ID, repository ID, certificate, key, and CA")
+	}
+	tlsConfig, err := cluster.LoadServerTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	store, err := cluster.OpenStore(filepath.Join(dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return nil, err
+	}
+	capabilities := cluster.Capabilities{
+		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
+		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
+		MaxTransferSize: 2 << 20, RepositoryID: opts.RepositoryID,
+		Features: []string{
+			cluster.FeatureRemotePull, cluster.FeatureReversePush, cluster.FeatureAckBatch,
+			cluster.FeatureNetworkRecreate, cluster.FeatureRuntimePrefetch, cluster.FeatureFilesystemBranch,
+		},
+	}
+	if err := capabilities.Validate(); err != nil {
+		return nil, err
+	}
+	return &daemonClusterRuntime{
+		listen: opts.Listen, tlsConfig: tlsConfig,
+		controlPlane: &cluster.ControlPlane{
+			Capabilities: capabilities, Store: store, MaxTransactions: opts.MaxTransactions, Now: time.Now,
+		},
+	}, nil
 }
 
 func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
@@ -583,6 +713,10 @@ func secureDaemonDirectory(dir string) error {
 }
 
 func serveDaemon(socket string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
+	return serveDaemonWithCluster(socket, unsafeNoHostIsolation, kernelCompatibility, dataRoot, volumeCapability, nil, stdout, stderr)
+}
+
+func serveDaemonWithCluster(socket string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -627,13 +761,50 @@ func serveDaemon(socket string, unsafeNoHostIsolation bool, kernelCompatibility 
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	var clusterServer *http.Server
+	clusterErr := make(chan error, 1)
+	if clusterRuntime != nil {
+		clusterListener, err := net.Listen("tcp", clusterRuntime.listen)
+		if err != nil {
+			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)
+		}
+		clusterRuntime.listen = clusterListener.Addr().String()
+		server.clusterCapabilities = &clusterRuntime.controlPlane.Capabilities
+		server.clusterListen = clusterRuntime.listen
+		clusterServer = &http.Server{
+			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
+		}
+		tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
+		go func() {
+			err := clusterServer.Serve(tlsListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			clusterErr <- err
+			listener.Close()
+		}()
+		defer clusterServer.Close()
+	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "ttcd listening on %s (API v%d, isolation=%s, volume-copy=%s)\n", socket, daemonAPIVersion, daemonIsolationMode(unsafeNoHostIsolation), volumeCapability.Mode)
+		if clusterRuntime != nil {
+			fmt.Fprintf(stdout, "ttcd cluster node %s listening on %s (repository=%s)\n", clusterRuntime.controlPlane.Capabilities.NodeID, clusterRuntime.listen, clusterRuntime.controlPlane.Capabilities.RepositoryID)
+		}
 	}
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
+				if clusterServer != nil {
+					select {
+					case clusterServeErr := <-clusterErr:
+						if clusterServeErr != nil {
+							return fmt.Errorf("serving cluster peers: %w", clusterServeErr)
+						}
+					default:
+					}
+				}
 				return nil
 			}
 			return fmt.Errorf("accepting client: %w", err)
@@ -698,7 +869,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	switch request.Action {
 	case "ping":
-		payload, _ := json.Marshal(map[string]any{
+		status := map[string]any{
 			"version":                  daemonAPIVersion,
 			"pid":                      os.Getpid(),
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
@@ -709,7 +880,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"volume_copy_mode":         s.volumeCapability.Mode,
 			"volume_filesystem_type":   s.volumeCapability.FilesystemType,
 			"volume_device":            s.volumeCapability.Device,
-		})
+		}
+		if s.clusterCapabilities != nil {
+			status["cluster"] = map[string]any{
+				"listen": s.clusterListen, "capabilities": s.clusterCapabilities,
+			}
+		}
+		payload, _ := json.Marshal(status)
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		return
@@ -1277,7 +1454,7 @@ func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
 }
 
-func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlowVolumeCopy bool) (string, <-chan error, error) {
+func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -1298,6 +1475,17 @@ func startDaemonProcess(socket, dataRoot string, unsafeNoHostIsolation, allowSlo
 	}
 	if allowSlowVolumeCopy {
 		commandArgs = append(commandArgs, "--allow-slow-volume-copy")
+	}
+	if clusterOpts.Configured {
+		commandArgs = append(commandArgs,
+			"--cluster-listen", clusterOpts.Listen,
+			"--cluster-node-id", clusterOpts.NodeID,
+			"--cluster-repository-id", clusterOpts.RepositoryID,
+			"--cluster-cert", clusterOpts.CertFile,
+			"--cluster-key", clusterOpts.KeyFile,
+			"--cluster-ca", clusterOpts.CAFile,
+			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
+		)
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -1358,16 +1546,28 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is valid with 'daemon start' only")
 		return 2
 	}
+	clusterOpts := daemonClusterOptions{MaxTransactions: 32}
 	if len(args) != 0 && args[0] == "start" {
-		for _, arg := range args[1:] {
-			switch arg {
+		startArgs := args[1:]
+		for len(startArgs) != 0 {
+			switch startArgs[0] {
 			case "--unsafe-no-host-isolation":
 				opts.unsafeNoHostIsolation = true
+				startArgs = startArgs[1:]
 			case "--allow-slow-volume-copy":
 				opts.allowSlowVolumeCopy = true
+				startArgs = startArgs[1:]
 			default:
-				fmt.Fprintf(stderr, "ttc: unknown daemon start option %q\n", arg)
-				return 2
+				consumed, err := consumeDaemonClusterOption(startArgs, &clusterOpts)
+				if err != nil {
+					fmt.Fprintf(stderr, "ttc: %v\n", err)
+					return 2
+				}
+				if consumed == 0 {
+					fmt.Fprintf(stderr, "ttc: unknown daemon start option %q\n", startArgs[0])
+					return 2
+				}
+				startArgs = startArgs[consumed:]
 			}
 		}
 		args = args[:1]
@@ -1387,7 +1587,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		return status
 	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]|status|stop|requests|request inspect|request resolve")
+		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve")
 		return 2
 	}
 	action := args[0]
@@ -1404,7 +1604,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
-		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy)
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1

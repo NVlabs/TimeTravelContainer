@@ -442,8 +442,10 @@ budget selected below.
   binds the certificate common name to the claimed TTC node ID. Its bounded
   JSON API supports idempotent hidden-target reservation, reconnect-safe
   status, and revisioned cancellation; per-target active transaction quotas
-  are enforced before reservation. Peer configuration and daemon-wide
-  observability still need wiring into `ttcd` startup.
+  are enforced before reservation. `ttcd` and `ttc daemon start` now accept
+  the cluster listen/node/repository/certificate/key/CA/quota configuration,
+  start the peer listener only with a complete configuration, report its
+  capabilities through daemon status, and shut it down with the local daemon.
 * Add `ttc fork --target` and equivalent SDK operations.
 * Keep filesystem publication transactional on the common repository and make
   target cleanup idempotent.

@@ -631,3 +631,38 @@ func TestDefaultDaemonSocketHonorsTTCRuntimeDir(t *testing.T) {
 		t.Fatalf("defaultDaemonSocket() = %q, want %q", got, want)
 	}
 }
+
+func TestConsumeDaemonClusterOptions(t *testing.T) {
+	args := []string{
+		"--cluster-listen=127.0.0.1:7443",
+		"--cluster-node-id", "node-a",
+		"--cluster-repository-id", "repo",
+		"--cluster-cert", "cert.pem",
+		"--cluster-key", "key.pem",
+		"--cluster-ca", "ca.pem",
+		"--cluster-max-transactions", "17",
+	}
+	opts := daemonClusterOptions{MaxTransactions: 32}
+	for len(args) != 0 {
+		consumed, err := consumeDaemonClusterOption(args, &opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if consumed == 0 {
+			t.Fatalf("option was not consumed: %q", args[0])
+		}
+		args = args[consumed:]
+	}
+	if !opts.Configured || opts.Listen != "127.0.0.1:7443" || opts.NodeID != "node-a" ||
+		opts.RepositoryID != "repo" || opts.CertFile != "cert.pem" || opts.KeyFile != "key.pem" ||
+		opts.CAFile != "ca.pem" || opts.MaxTransactions != 17 {
+		t.Fatalf("cluster options=%+v", opts)
+	}
+}
+
+func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
+	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "requires") {
+		t.Fatalf("partial cluster configuration error=%v", err)
+	}
+}
