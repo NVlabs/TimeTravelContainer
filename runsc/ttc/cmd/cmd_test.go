@@ -2982,6 +2982,15 @@ if [ "$3" = "list" ]; then
 	case "$(cat "$0.mode")" in
 	stopped) echo '[{"id":"web","status":"stopped"}]' ;;
 	running) echo '[{"id":"web","status":"running"}]' ;;
+	transition)
+		count=$(cat "$0.transition")
+		if [ "$count" -lt 2 ]; then
+			echo $((count + 1)) >"$0.transition"
+			echo '[{"id":"web","status":"running"}]'
+		else
+			echo '[{"id":"web","status":"stopped"}]'
+		fi
+		;;
 	absent) echo '[]' ;;
 	esac
 	exit 0
@@ -3000,7 +3009,7 @@ exit 2
 	if err := os.WriteFile(runsc+".mode", []byte("stopped\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.removeStoppedRuntime("web"); err != nil {
+	if err := b.removeStoppedRuntime("web", false); err != nil {
 		t.Fatalf("removeStoppedRuntime(stopped): %v", err)
 	}
 	if _, err := os.Stat(runsc + ".deleted"); err != nil {
@@ -3012,11 +3021,23 @@ exit 2
 	if err := os.WriteFile(runsc+".mode", []byte("running\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.removeStoppedRuntime("web"); err == nil || !strings.Contains(err.Error(), "already running") {
+	if err := b.removeStoppedRuntime("web", false); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("removeStoppedRuntime(running)=%v, want already-running error", err)
 	}
 	if _, err := os.Stat(runsc + ".deleted"); !os.IsNotExist(err) {
 		t.Errorf("running runtime delete marker err=%v", err)
+	}
+	if err := os.WriteFile(runsc+".mode", []byte("transition\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsc+".transition", []byte("0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.removeStoppedRuntime("web", true); err != nil {
+		t.Fatalf("removeStoppedRuntime(transition): %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Errorf("transitioned runtime was not deleted: %v", err)
 	}
 }
 

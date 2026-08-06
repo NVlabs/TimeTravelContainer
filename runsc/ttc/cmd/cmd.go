@@ -5119,7 +5119,14 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err != nil {
 		return 1, err
 	}
-	if err := b.removeStoppedRuntime(info.ID); err != nil {
+	// Waiting for the branch init process and tearing down its sandbox are
+	// separate events. In particular, a multi-process container may report its
+	// init's exit just before runsc changes the old runtime from running to
+	// stopped. A restart must not race that short teardown window, but an
+	// ordinary attempt to start a persistently-running container should still
+	// fail immediately.
+	waitForTeardown := info.State == "exited" || info.State == "failed" || info.State == "dead"
+	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
 		return 1, err
 	}
 	status, err := b.launch(info, detach, interactive)
@@ -5197,24 +5204,39 @@ func (b *runtimeBackend) scheduleAutoRemove(id string) error {
 	return nil
 }
 
-func (b *runtimeBackend) removeStoppedRuntime(name string) error {
-	families, err := b.listRuntimeFamilies()
-	if err != nil {
-		return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
+func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool) error {
+	const (
+		teardownTimeout = 5 * time.Second
+		teardownPoll    = 10 * time.Millisecond
+	)
+	deadline := time.Now().Add(teardownTimeout)
+	for {
+		families, err := b.listRuntimeFamilies()
+		if err != nil {
+			return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
+		}
+		found := false
+		for _, family := range families {
+			if family.ID != name {
+				continue
+			}
+			found = true
+			if family.State == "stopped" || family.State == "exited" {
+				if _, err := b.command("delete", "--force", name); err != nil {
+					return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
+				}
+				return nil
+			}
+			if !waitForTeardown || time.Now().After(deadline) {
+				return fmt.Errorf("container %q is already %s", name, family.State)
+			}
+			break
+		}
+		if !found {
+			return nil
+		}
+		time.Sleep(teardownPoll)
 	}
-	for _, family := range families {
-		if family.ID != name {
-			continue
-		}
-		if family.State != "stopped" && family.State != "exited" {
-			return fmt.Errorf("container %q is already %s", name, family.State)
-		}
-		if _, err := b.command("delete", "--force", name); err != nil {
-			return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
-		}
-		return nil
-	}
-	return nil
 }
 
 func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error) {
