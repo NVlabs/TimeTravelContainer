@@ -5129,6 +5129,12 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
 		return 1, err
 	}
+	if b.dataRoot != "" {
+		info, err = b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+		if err != nil {
+			return 1, err
+		}
+	}
 	status, err := b.launch(info, detach, interactive)
 	if err == nil {
 		b.recordLaunchState(info.ID, detach, status)

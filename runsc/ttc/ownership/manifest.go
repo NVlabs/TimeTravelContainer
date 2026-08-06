@@ -58,9 +58,13 @@ type Owner struct {
 // unprivileged host cannot represent directly. The root directory is
 // represented by ".".
 type Manifest struct {
-	Version int                          `json:"version"`
-	Entries map[string]Owner             `json:"entries"`
-	Xattrs  map[string]map[string][]byte `json:"xattrs,omitempty"`
+	Version int              `json:"version"`
+	Entries map[string]Owner `json:"entries"`
+	// Modes contains guest-visible Unix mode bits for immutable image paths
+	// whose host backing permissions were relaxed so an unprivileged gofer can
+	// serve them. Presence in this map is significant: mode 0000 is valid.
+	Modes  map[string]uint32            `json:"modes,omitempty"`
+	Xattrs map[string]map[string][]byte `json:"xattrs,omitempty"`
 }
 
 // NewManifest returns an empty manifest using the current format version.
@@ -68,6 +72,7 @@ func NewManifest() *Manifest {
 	return &Manifest{
 		Version: currentVersion,
 		Entries: make(map[string]Owner),
+		Modes:   make(map[string]uint32),
 		Xattrs:  make(map[string]map[string][]byte),
 	}
 }
@@ -102,6 +107,19 @@ func (m *Manifest) Lookup(name string) (Owner, bool) {
 	}
 	owner, ok := m.Entries[clean]
 	return owner, ok
+}
+
+// LookupMode returns guest-visible Unix permission and special bits for name.
+func (m *Manifest) LookupMode(name string) (uint32, bool) {
+	if m == nil {
+		return 0, false
+	}
+	clean, err := CleanPath(name)
+	if err != nil {
+		return 0, false
+	}
+	mode, ok := m.Modes[clean]
+	return mode, ok
 }
 
 // LookupXattr returns a copy of a virtual extended attribute.
@@ -173,6 +191,21 @@ func ReadFrom(name string, r io.Reader) (*Manifest, error) {
 		}
 		if clean != entry {
 			return nil, fmt.Errorf("ownership manifest %q contains non-canonical path %q", name, entry)
+		}
+	}
+	for entry, mode := range manifest.Modes {
+		clean, err := CleanPath(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ownership manifest %q modes: %w", name, err)
+		}
+		if clean != entry {
+			return nil, fmt.Errorf("ownership manifest %q contains non-canonical mode path %q", name, entry)
+		}
+		if _, ok := manifest.Entries[entry]; !ok {
+			return nil, fmt.Errorf("ownership manifest %q contains a mode for unknown path %q", name, entry)
+		}
+		if mode&^uint32(07777) != 0 {
+			return nil, fmt.Errorf("ownership manifest %q contains invalid mode %#o for %q", name, mode, entry)
 		}
 	}
 	for entry, attributes := range manifest.Xattrs {

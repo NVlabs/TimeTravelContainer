@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	imageRootFormatVersion   = "v3"
+	imageRootFormatVersion   = "v4"
 	containerIDBytes         = 32
 	rootfsUpperRepositoryDir = "rootfs-upper"
 	hostMountRepositoryDir   = "host-mounts"
@@ -1919,6 +1919,55 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	return &spec, nil
 }
 
+// RefreshContainerImageRoot moves a stopped container bundle onto the current
+// immutable-image root format without changing its writable TTC volume. This
+// keeps containers created by older TTC builds startable after image backing
+// metadata gains new virtualization requirements.
+func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (ContainerInfo, error) {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
+	wantPrefix := imageRootFormatVersion + "-"
+	if strings.HasPrefix(filepath.Base(filepath.Dir(info.RootFS)), wantPrefix) {
+		return info, nil
+	}
+	pulled, err := s.resolveImage(ctx, info.Digest, info.Platform, "never", nil)
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("resolving image for container %q rootfs upgrade: %w", info.Name, err)
+	}
+	_, rootfs, err := s.prepareImageRoot(ctx, pulled, info.Platform, nil)
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("preparing current image root for container %q: %w", info.Name, err)
+	}
+	if rootfs == info.RootFS {
+		return info, nil
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
+	if spec.Root == nil {
+		return ContainerInfo{}, fmt.Errorf("container %q OCI config has no root", info.Name)
+	}
+	spec.Root.Path = rootfs
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
+	delete(spec.Annotations, ownership.LegacyAnnotation)
+	// Publish the complete OCI config first. If TTC exits before container.json
+	// is updated, the next start harmlessly repeats this migration.
+	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
+		return ContainerInfo{}, fmt.Errorf("updating OCI config for container %q image root: %w", info.Name, err)
+	}
+	info.RootFS = rootfs
+	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		return ContainerInfo{}, fmt.Errorf("updating container %q image root: %w", info.Name, err)
+	}
+	return info, nil
+}
+
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
 	return s.listContainers(false)
@@ -2297,6 +2346,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 	prefixes := []string{
 		safeComponent(digest + "-"),
 		safeComponent("v2-" + digest + "-"),
+		safeComponent("v3-" + digest + "-"),
 		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
 	}
 	removed := 0

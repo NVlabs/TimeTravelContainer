@@ -490,6 +490,10 @@ type inodeOwners struct {
 func (s *ownershipState) finalize(root string) (*ownership.Manifest, error) {
 	manifest := ownership.NewManifest()
 	inodes := make(map[inodeKey]*inodeOwners)
+	// chmod(2) on one hard link changes every alias. Retain the first observed
+	// image mode so all aliases receive the same guest-visible mode even after
+	// the first path is made host-readable.
+	inodeModes := make(map[inodeKey]uint32)
 	err := filepath.WalkDir(root, func(name string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -516,10 +520,41 @@ func (s *ownershipState) finalize(root string) (*ownership.Manifest, error) {
 			return err
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Nlink < 2 || entry.IsDir() {
-			return nil
+		if !ok {
+			return fmt.Errorf("image path %q has unsupported stat metadata", name)
 		}
 		key := inodeKey{dev: uint64(stat.Dev), ino: stat.Ino}
+		guestMode, seenMode := inodeModes[key]
+		if !seenMode {
+			guestMode = uint32(stat.Mode) & 07777
+			inodeModes[key] = guestMode
+		}
+		relaxedMode := info.Mode()
+		switch {
+		case entry.IsDir() && guestMode&0500 != 0500:
+			relaxedMode |= 0500
+		case info.Mode().IsRegular() && guestMode&0400 == 0:
+			relaxedMode |= 0400
+		}
+		if relaxedMode != info.Mode() {
+			// The immutable image gofer is read-only, so these extra host bits
+			// provide backing access without granting guest writes. fsgofer
+			// reports guestMode from the manifest instead.
+			manifest.Modes[rel] = guestMode
+			if err := os.Chmod(name, relaxedMode); err != nil {
+				return fmt.Errorf("making immutable image path %q host-readable: %w", name, err)
+			}
+		} else if seenMode {
+			// A prior hard-link alias may already have relaxed the shared inode.
+			// Preserve the common pre-relaxation mode for this alias too.
+			actualMode := uint32(stat.Mode) & 07777
+			if actualMode != guestMode {
+				manifest.Modes[rel] = guestMode
+			}
+		}
+		if stat.Nlink < 2 || entry.IsDir() {
+			return nil
+		}
 		group := inodes[key]
 		if group == nil {
 			group = &inodeOwners{}

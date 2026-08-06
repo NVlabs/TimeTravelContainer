@@ -127,6 +127,10 @@ func (i *connectionImpl) stat(hostFD int, virtualPath string) (lisafs.Statx, err
 		stat.UID = owner.UID
 		stat.GID = owner.GID
 	}
+	if mode, ok := i.config.VirtualOwners.LookupMode(virtualPath); ok {
+		stat.Mask |= unix.STATX_MODE
+		stat.Mode = stat.Mode&unix.S_IFMT | uint16(mode)
+	}
 	return stat, nil
 }
 

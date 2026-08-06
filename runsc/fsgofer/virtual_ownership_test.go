@@ -39,6 +39,7 @@ func TestConnectionStatScopesVirtualOwnership(t *testing.T) {
 	manifest := ownership.NewManifest()
 	manifest.Entries["."] = ownership.Owner{}
 	manifest.Entries["file"] = ownership.Owner{UID: 1234, GID: 5678}
+	manifest.Modes["file"] = 0
 	manifest.Xattrs["file"] = map[string][]byte{"security.capability": []byte("virtual-cap")}
 	virtual := &connectionImpl{config: &Config{VirtualOwners: manifest}}
 	got, err := virtual.stat(hostFD, "file")
@@ -48,7 +49,7 @@ func TestConnectionStatScopesVirtualOwnership(t *testing.T) {
 	if got.UID != 1234 || got.GID != 5678 {
 		t.Fatalf("virtual owner=%d:%d, want 1234:5678", got.UID, got.GID)
 	}
-	if got.Ino != raw.Ino || got.Mode != raw.Mode || got.Size != raw.Size {
+	if got.Ino != raw.Ino || got.Mode != raw.Mode&unix.S_IFMT || got.Size != raw.Size {
 		t.Fatalf("virtual stat changed non-owner fields: got=%+v raw=%+v", got, raw)
 	}
 	unmapped, err := virtual.stat(hostFD, "other")

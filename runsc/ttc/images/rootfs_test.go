@@ -152,6 +152,43 @@ func TestApplyLayerVirtualizesPrivilegedXattrs(t *testing.T) {
 	}
 }
 
+func TestFinalizeMakesRestrictiveImageFilesHostReadable(t *testing.T) {
+	root := t.TempDir()
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(root, "private"), 0700)
+	})
+	owners := newOwnershipState()
+	layer := makeLayer(t, false, []tarEntry{
+		{name: "etc/", mode: 0700},
+		{name: "etc/shadow", body: "root:*:1:0:99999:7:::", mode: 0000},
+		{name: "hard-target", body: "hard", mode: 0000},
+		{name: "hard-copy", mode: 0000, typeflag: tar.TypeLink, linkname: "hard-target"},
+		{name: "private/", mode: 0000},
+		{name: "private/value", body: "value", mode: 0000},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(layer), owners); err != nil {
+		t.Fatalf("applying restrictive image layer: %v", err)
+	}
+	manifest, err := owners.finalize(root)
+	if err != nil {
+		t.Fatalf("finalizing restrictive image: %v", err)
+	}
+	for _, name := range []string{"etc/shadow", "hard-copy", "hard-target", "private/value"} {
+		if mode, ok := manifest.LookupMode(name); !ok || mode != 0 {
+			t.Errorf("virtual mode for %q = %#o, %t; want 0, true", name, mode, ok)
+		}
+		if data, err := os.ReadFile(filepath.Join(root, name)); err != nil || len(data) == 0 {
+			t.Errorf("host backing for %q is unreadable: data=%q err=%v", name, data, err)
+		}
+	}
+	if mode, ok := manifest.LookupMode("private"); !ok || mode != 0 {
+		t.Errorf("virtual directory mode = %#o, %t; want 0, true", mode, ok)
+	}
+	if info, err := os.Stat(filepath.Join(root, "private")); err != nil || info.Mode().Perm()&0500 != 0500 {
+		t.Errorf("host backing directory is not searchable: info=%v err=%v", info, err)
+	}
+}
+
 func TestPrepareEmptyRootNormalizesGuestRootMode(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0700); err != nil {
