@@ -216,3 +216,20 @@ func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 	}
 	return fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode))
 }
+
+// flushDiskWriteMetadata publishes metadata deferred by ordinary regular-file
+// writes. liveForkFiles contains every live regular file, including unlinked
+// files that remain reachable through an open description.
+func (fs *filesystem) flushDiskWriteMetadata() error {
+	if fs.diskVolume == nil {
+		return nil
+	}
+	fs.liveForkMu.Lock()
+	defer fs.liveForkMu.Unlock()
+	for file := range fs.liveForkFiles {
+		if err := file.flushDiskMetadata(); err != nil {
+			return err
+		}
+	}
+	return nil
+}

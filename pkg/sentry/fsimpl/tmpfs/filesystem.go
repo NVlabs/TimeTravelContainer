@@ -41,6 +41,9 @@ const (
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	if fs.diskVolume != nil {
+		if err := fs.flushDiskWriteMetadata(); err != nil {
+			return err
+		}
 		return fs.diskVolume.Repository.SyncMetadata()
 	}
 	return nil

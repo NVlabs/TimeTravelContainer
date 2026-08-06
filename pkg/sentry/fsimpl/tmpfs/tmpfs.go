@@ -569,6 +569,9 @@ func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemElig
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	if err := fs.flushDiskWriteMetadata(); err != nil {
+		ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
+	}
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.mu.Lock()
 	if fs.root.inode.isDir() {
@@ -864,6 +867,7 @@ func (i *inode) decRef(ctx context.Context) {
 		case *regularFile:
 			impl.inode.fs.unregisterLiveForkFile(impl)
 			if i.fs.diskVolume != nil {
+				impl.invalidateDiskIO()
 				i.fs.adjustDiskBytes(impl.size.Load(), 0)
 				impl.diskMmap.MappableRelease()
 				break

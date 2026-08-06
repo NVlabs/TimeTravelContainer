@@ -65,6 +65,9 @@ func (d *dentry) loadParent(_ goContext.Context, parent *dentry) {
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	if pgalloc.IsLiveForkSource(ctx) {
+		if err := fs.flushDiskWriteMetadata(); err != nil {
+			return fmt.Errorf("flushing TTC volume metadata before live fork: %w", err)
+		}
 		fs.liveForkMu.Lock()
 		files := make([]*regularFile, 0, len(fs.liveForkFiles))
 		for file := range fs.liveForkFiles {
