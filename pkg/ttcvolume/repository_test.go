@@ -106,6 +106,50 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	}
 }
 
+func TestPackedTreeNodesRecoverMissingLooseCache(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("packed-nodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, MainBranch, ino, "packed", 0)
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	path := repo.path
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(path, "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := os.Remove(filepath.Join(path, "nodes", entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo, err = manager.Open("packed-nodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	gotIno, err := repo.Lookup(MainBranch, RootInode, "value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIno != ino {
+		t.Fatalf("recovered inode = %d, want %d", gotIno, ino)
+	}
+	if got := readAll(t, repo, MainBranch, ino); got != "packed" {
+		t.Fatalf("recovered data = %q, want packed", got)
+	}
+}
+
 func TestRegularFileRepositoryRootForks(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("regular-root")
@@ -489,31 +533,31 @@ func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
 	}
 }
 
-func TestTreeMutationIsPathCopyAndForkWritesNoNodes(t *testing.T) {
+func TestTreeMutationAppendsPackedPathAndForkWritesNoNodes(t *testing.T) {
 	repo, err := openTestManager(t).Create("tree")
 	if err != nil {
 		t.Fatal(err)
 	}
-	countNodes := func() int {
+	packSize := func() int64 {
 		t.Helper()
-		entries, err := os.ReadDir(filepath.Join(repo.path, "nodes"))
+		info, err := os.Stat(filepath.Join(repo.path, treeNodePackName))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(entries)
+		return info.Size()
 	}
-	beforeFork := countNodes()
+	beforeFork := packSize()
 	if err := repo.Fork("main", "child"); err != nil {
 		t.Fatal(err)
 	}
-	if afterFork := countNodes(); afterFork != beforeFork {
-		t.Fatalf("fork wrote %d metadata nodes, want 0", afterFork-beforeFork)
+	if afterFork := packSize(); afterFork != beforeFork {
+		t.Fatalf("fork appended %d metadata bytes, want 0", afterFork-beforeFork)
 	}
 	if _, err := repo.CreateRegular("child", rootInode, "x", 0644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if delta := countNodes() - beforeFork; delta <= 0 || delta > 100 {
-		t.Fatalf("one mutation wrote %d nodes, want bounded path-copy", delta)
+	if delta := packSize() - beforeFork; delta <= 0 || delta > 1<<20 {
+		t.Fatalf("one mutation appended %d bytes, want bounded path-copy", delta)
 	}
 }
 

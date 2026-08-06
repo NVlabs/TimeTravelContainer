@@ -789,7 +789,10 @@ func (fd *regularFileFD) Sync(context.Context) error {
 	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, false); err != nil {
 		return err
 	}
-	return f.flushDiskMetadataLocked()
+	if err := f.flushDiskMetadataLocked(); err != nil {
+		return err
+	}
+	return f.inode.fs.diskVolume.Repository.SyncMetadata()
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -1097,6 +1100,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 				return done, offset + done, err
 			}
 			if err := f.flushDiskMetadataLocked(); err != nil {
+				return done, offset + done, err
+			}
+			if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
 				return done, offset + done, err
 			}
 		}

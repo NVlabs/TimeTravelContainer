@@ -572,6 +572,11 @@ func (fs *filesystem) Release(ctx context.Context) {
 	if err := fs.flushDiskWriteMetadata(); err != nil {
 		ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
 	}
+	if fs.diskVolume != nil {
+		if err := fs.diskVolume.Repository.SyncMetadata(); err != nil {
+			ctx.Warningf("syncing TTC volume metadata during filesystem release: %v", err)
+		}
+	}
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.mu.Lock()
 	if fs.root.inode.isDir() {

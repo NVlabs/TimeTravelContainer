@@ -17,10 +17,12 @@ package ttcvolume
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +33,182 @@ import (
 type treeNode struct {
 	Value    json.RawMessage   `json:"value,omitempty"`
 	Children map[string]string `json:"children,omitempty"`
+}
+
+const maxCachedTreeNodes = 8192
+
+const (
+	treeNodePackName       = "nodes.pack"
+	treeNodePackHeaderSize = 4 + sha256.Size + 4
+	maxPackedTreeNodeSize  = 16 << 20
+)
+
+var treeNodePackMagic = [4]byte{'T', 'T', 'C', 'N'}
+
+type packedTreeNode struct {
+	offset int64
+	length uint32
+}
+
+func (r *Repository) openTreeNodePackLocked() error {
+	if r.pack != nil {
+		return nil
+	}
+	pack, err := r.openFile(treeNodePackName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	r.pack = pack
+	if r.packIndex == nil {
+		r.packIndex = make(map[string]packedTreeNode)
+	}
+	return nil
+}
+
+// scanTreeNodePackLocked indexes complete records appended by this or another
+// repository client. An incomplete tail is ignored: it was not made reachable
+// by a subsequently published branch root and a later complete record can only
+// be appended while the repository flock excludes this scanner.
+func (r *Repository) scanTreeNodePackLocked() error {
+	if err := r.openTreeNodePackLocked(); err != nil {
+		return err
+	}
+	info, err := r.pack.Stat()
+	if err != nil {
+		return err
+	}
+	for r.packRead+treeNodePackHeaderSize <= info.Size() {
+		var header [treeNodePackHeaderSize]byte
+		if _, err := r.pack.ReadAt(header[:], r.packRead); err != nil {
+			return err
+		}
+		if !bytes.Equal(header[:4], treeNodePackMagic[:]) {
+			return fmt.Errorf("invalid tree-node pack record at offset %d", r.packRead)
+		}
+		length := binary.LittleEndian.Uint32(header[4+sha256.Size:])
+		if length == 0 || length > maxPackedTreeNodeSize {
+			return fmt.Errorf("invalid tree-node pack record length %d at offset %d", length, r.packRead)
+		}
+		next := r.packRead + treeNodePackHeaderSize + int64(length)
+		if next > info.Size() {
+			break
+		}
+		id := hex.EncodeToString(header[4 : 4+sha256.Size])
+		r.packIndex[id] = packedTreeNode{offset: r.packRead + treeNodePackHeaderSize, length: length}
+		r.packRead = next
+	}
+	return nil
+}
+
+func (r *Repository) appendPackedTreeNode(id string, data []byte) error {
+	rawID, err := hex.DecodeString(id)
+	if err != nil || len(rawID) != sha256.Size {
+		return fmt.Errorf("invalid metadata node ID %q", id)
+	}
+	if len(data) == 0 || len(data) > maxPackedTreeNodeSize {
+		return fmt.Errorf("invalid packed metadata node size %d", len(data))
+	}
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	if err := r.scanTreeNodePackLocked(); err != nil {
+		return err
+	}
+	if _, ok := r.packIndex[id]; ok {
+		return nil
+	}
+	info, err := r.pack.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != r.packRead {
+		// Discard an incomplete record left by an interrupted, non-durable
+		// append before adding another record after it.
+		if err := r.pack.Truncate(r.packRead); err != nil {
+			return err
+		}
+	}
+	offset, err := r.pack.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	record := make([]byte, treeNodePackHeaderSize+len(data))
+	copy(record[:4], treeNodePackMagic[:])
+	copy(record[4:4+sha256.Size], rawID)
+	binary.LittleEndian.PutUint32(record[4+sha256.Size:treeNodePackHeaderSize], uint32(len(data)))
+	copy(record[treeNodePackHeaderSize:], data)
+	n, err := r.pack.Write(record)
+	if err != nil {
+		return err
+	}
+	if n != len(record) {
+		return io.ErrShortWrite
+	}
+	r.packIndex[id] = packedTreeNode{offset: offset + treeNodePackHeaderSize, length: uint32(len(data))}
+	r.packRead = offset + int64(len(record))
+	return nil
+}
+
+func (r *Repository) readPackedTreeNode(id string) ([]byte, bool, error) {
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	if err := r.scanTreeNodePackLocked(); err != nil {
+		return nil, false, err
+	}
+	record, ok := r.packIndex[id]
+	if !ok {
+		return nil, false, nil
+	}
+	data := make([]byte, record.length)
+	if _, err := r.pack.ReadAt(data, record.offset); err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+func (r *Repository) syncTreeNodePack() error {
+	r.packMu.Lock()
+	defer r.packMu.Unlock()
+	if r.pack == nil {
+		return nil
+	}
+	return r.pack.Sync()
+}
+
+func cloneTreeNode(node treeNode) treeNode {
+	cloned := treeNode{Value: append(json.RawMessage(nil), node.Value...)}
+	if len(node.Children) != 0 {
+		cloned.Children = make(map[string]string, len(node.Children))
+		for edge, child := range node.Children {
+			cloned.Children[edge] = child
+		}
+	}
+	return cloned
+}
+
+func (r *Repository) cachedTreeNode(id string) (treeNode, bool) {
+	r.nodeMu.Lock()
+	defer r.nodeMu.Unlock()
+	node, ok := r.nodeCache[id]
+	return cloneTreeNode(node), ok
+}
+
+func (r *Repository) cacheTreeNode(id string, node treeNode) {
+	r.nodeMu.Lock()
+	defer r.nodeMu.Unlock()
+	if r.nodeCache == nil {
+		r.nodeCache = make(map[string]treeNode)
+	}
+	if _, ok := r.nodeCache[id]; ok {
+		return
+	}
+	if len(r.nodeOrder) < maxCachedTreeNodes {
+		r.nodeOrder = append(r.nodeOrder, id)
+	} else {
+		delete(r.nodeCache, r.nodeOrder[r.nodeNext])
+		r.nodeOrder[r.nodeNext] = id
+		r.nodeNext = (r.nodeNext + 1) % maxCachedTreeNodes
+	}
+	r.nodeCache[id] = cloneTreeNode(node)
 }
 
 func (r *Repository) emptyTree() (string, error) {
@@ -44,7 +222,10 @@ func (r *Repository) getTreeNode(id string) (treeNode, error) {
 	if _, err := hex.DecodeString(id); err != nil {
 		return treeNode{}, fmt.Errorf("invalid metadata node ID %q", id)
 	}
-	data, err := r.readFile(filepath.Join("nodes", id))
+	if node, ok := r.cachedTreeNode(id); ok {
+		return node, nil
+	}
+	data, err := r.treeNodeData(id)
 	if err != nil {
 		return treeNode{}, err
 	}
@@ -68,7 +249,20 @@ func (r *Repository) getTreeNode(id string) (treeNode, error) {
 			return treeNode{}, fmt.Errorf("metadata node %q has invalid child %q", id, child)
 		}
 	}
+	r.cacheTreeNode(id, node)
 	return node, nil
+}
+
+func (r *Repository) treeNodeData(id string) ([]byte, error) {
+	data, err := r.readFile(filepath.Join("nodes", id))
+	if errors.Is(err, os.ErrNotExist) {
+		var ok bool
+		data, ok, err = r.readPackedTreeNode(id)
+		if err == nil && !ok {
+			return nil, os.ErrNotExist
+		}
+	}
+	return data, err
 }
 
 func (r *Repository) putTreeNode(node treeNode) (string, error) {
@@ -81,19 +275,24 @@ func (r *Repository) putTreeNode(node treeNode) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	id := hex.EncodeToString(sum[:])
+	if _, ok := r.cachedTreeNode(id); ok {
+		return id, nil
+	}
 	path := filepath.Join("nodes", id)
 	if file, err := r.openFile(path, 0, 0); err == nil {
 		file.Close()
+		r.cacheTreeNode(id, node)
 		return id, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := r.atomicWriteFile(path, data, 0600); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return id, nil
-		}
-		return "", fmt.Errorf("publishing metadata node %q: %w", id, err)
+	// nodes.pack is the durability authority for immutable trie nodes. Loose
+	// files are retained only as a backward-compatible read path for existing
+	// repositories and imported snapshots.
+	if err := r.appendPackedTreeNode(id, data); err != nil {
+		return "", fmt.Errorf("packing metadata node %q: %w", id, err)
 	}
+	r.cacheTreeNode(id, node)
 	return id, nil
 }
 

@@ -89,7 +89,7 @@ func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo,
 		if err != nil {
 			return err
 		}
-		data, err := r.readFile(filepath.Join("nodes", id))
+		data, err := r.treeNodeData(id)
 		if err != nil {
 			return err
 		}

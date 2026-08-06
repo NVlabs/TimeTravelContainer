@@ -28,8 +28,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -211,6 +213,26 @@ type Repository struct {
 	dir      *os.File
 	copyMode CopyMode
 	info     VolumeInfo
+
+	// Metadata trie nodes are immutable and content-addressed. Keep recently
+	// used decoded nodes in memory so namespace-heavy workloads don't reopen
+	// and decode every ancestor for every mutation. The cache is bounded since
+	// persistent updates continuously create new node identities.
+	nodeMu    sync.Mutex
+	nodeCache map[string]treeNode
+	nodeOrder []string
+	nodeNext  int
+	packMu    sync.Mutex
+	pack      *os.File
+	packIndex map[string]packedTreeNode
+	packRead  int64
+
+	// Ordinary Linux namespace mutations are not durable until fsync(2),
+	// sync(2), or filesystem teardown. Track atomically published metadata
+	// files that still need their contents made durable. This avoids turning
+	// each guest create/rename into fsyncs for every radix-trie ancestor.
+	dirtyMu    sync.Mutex
+	dirtyFiles map[string]struct{}
 }
 
 // Create creates a new volume with an empty main branch.
@@ -302,6 +324,10 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		return nil, err
 	}
 	if err := atomicWriteFile(filepath.Join(path, "staging"), filepath.Join(path, "format"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
+		_ = os.RemoveAll(path)
+		return nil, err
+	}
+	if err := repo.SyncMetadata(); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
@@ -447,8 +473,18 @@ func (r *Repository) Close() error {
 	if r == nil || r.dir == nil {
 		return nil
 	}
+	r.packMu.Lock()
+	var packErr error
+	if r.pack != nil {
+		packErr = r.pack.Close()
+		r.pack = nil
+	}
+	r.packMu.Unlock()
 	err := r.dir.Close()
 	r.dir = nil
+	if packErr != nil {
+		return packErr
+	}
 	return err
 }
 
@@ -1441,24 +1477,88 @@ func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error 
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	// Branch and immutable-node publication precede every exposed mutation.
-	// Sync their directories so fsync(file) also preserves name resolution.
-	for _, dir := range []string{"nodes", "branches", "objects"} {
-		if err := r.syncDirectory(dir); err != nil {
-			return err
-		}
-	}
-	return r.dir.Sync()
+	return nil
 }
 
 // SyncMetadata makes repository namespace and inode metadata durable.
 func (r *Repository) SyncMetadata() error {
-	for _, dir := range []string{"nodes", "branches", "objects"} {
-		if err := r.syncDirectory(dir); err != nil {
-			return err
+	return r.withLock(r.syncMetadataLocked)
+}
+
+// syncMetadataLocked persists files before the directories that make their
+// current names reachable. Repository mutations and this flush are serialized
+// by the repository flock, so a successful call covers every mutation that
+// completed before it began.
+func (r *Repository) syncMetadataLocked() error {
+	if err := r.syncTreeNodePack(); err != nil {
+		return err
+	}
+	// Persist the pack's name before any branch directory entry that may make
+	// its nodes reachable.
+	if err := r.dir.Sync(); err != nil {
+		return err
+	}
+	r.dirtyMu.Lock()
+	var rootDirty, branchDirty []string
+	for name := range r.dirtyFiles {
+		// Loose node files are a read cache for nodes.pack. Once the pack is
+		// durable, syncing thousands of individual immutable files adds no
+		// recoverability and causes extreme write amplification.
+		if strings.HasPrefix(name, "nodes/") {
+			continue
+		}
+		if strings.HasPrefix(name, "branches/") {
+			branchDirty = append(branchDirty, name)
+		} else {
+			rootDirty = append(rootDirty, name)
 		}
 	}
-	return r.dir.Sync()
+	r.dirtyMu.Unlock()
+	sort.Strings(rootDirty)
+	sort.Strings(branchDirty)
+	syncFiles := func(names []string) error {
+		for _, name := range names {
+			file, err := r.openFile(name, os.O_RDONLY, 0)
+			if err != nil {
+				return err
+			}
+			err = file.Sync()
+			closeErr := file.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+		return nil
+	}
+	if err := syncFiles(rootDirty); err != nil {
+		return err
+	}
+	if err := r.dir.Sync(); err != nil {
+		return err
+	}
+	// New object names must be durable before branch roots that reference
+	// their inodes. Object contents themselves are synchronized by SyncData.
+	if err := r.syncDirectory("objects"); err != nil {
+		return err
+	}
+	if err := syncFiles(branchDirty); err != nil {
+		return err
+	}
+	if err := r.syncDirectory("branches"); err != nil {
+		return err
+	}
+	if err := r.dir.Sync(); err != nil {
+		return err
+	}
+	r.dirtyMu.Lock()
+	for name := range r.dirtyFiles {
+		delete(r.dirtyFiles, name)
+	}
+	r.dirtyMu.Unlock()
+	return nil
 }
 
 // Truncate applies the same first-writer CoW rule as WriteAt.
@@ -1807,18 +1907,18 @@ func (r *Repository) atomicWriteFile(name string, data []byte, mode fs.FileMode)
 	if _, err := file.Write(data); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
 	if err := file.Close(); err != nil {
 		return err
 	}
 	if err := unix.Renameat(int(r.dir.Fd()), staging, int(r.dir.Fd()), name); err != nil {
 		return err
 	}
-	if err := r.syncDirectory(filepath.Dir(name)); err != nil {
-		return err
+	r.dirtyMu.Lock()
+	if r.dirtyFiles == nil {
+		r.dirtyFiles = make(map[string]struct{})
 	}
+	r.dirtyFiles[name] = struct{}{}
+	r.dirtyMu.Unlock()
 	keep = true
 	return nil
 }
