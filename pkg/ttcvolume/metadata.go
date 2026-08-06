@@ -1,0 +1,737 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ttcvolume
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	metadataSetInode    = "set-inode"
+	metadataDeleteInode = "delete-inode"
+	metadataSetEntry    = "set-entry"
+	metadataDeleteEntry = "delete-entry"
+
+	metadataJournalHeaderSize = 16
+	maxMetadataRecordSize     = 4 << 20
+	inodeReservationSize      = 4096
+)
+
+var metadataJournalMagic = [4]byte{'T', 'T', 'C', 'J'}
+
+type metadataEntryKey struct {
+	Parent uint64
+	Name   string
+}
+
+type metadataOp struct {
+	Kind   string          `json:"kind"`
+	Inode  *Inode          `json:"inode,omitempty"`
+	Parent uint64          `json:"parent,omitempty"`
+	Entry  *DirectoryEntry `json:"entry,omitempty"`
+	Number uint64          `json:"number,omitempty"`
+	Name   string          `json:"name,omitempty"`
+}
+
+type metadataTransaction struct {
+	Sequence uint64       `json:"sequence"`
+	Ops      []metadataOp `json:"ops"`
+}
+
+type branchMetadata struct {
+	mu           sync.RWMutex
+	branch       Branch
+	layers       []string
+	inodes       map[uint64]Inode
+	entries      map[metadataEntryKey]DirectoryEntry
+	nextSequence uint64
+	layerSizes   map[string]int64
+}
+
+func newBranchMetadata(branch Branch) *branchMetadata {
+	return &branchMetadata{
+		branch: branch, inodes: make(map[uint64]Inode),
+		entries: make(map[metadataEntryKey]DirectoryEntry),
+		// Sequence numbers are local to a layer and start at one.
+		nextSequence: 1, layerSizes: make(map[string]int64),
+	}
+}
+
+type metadataLayer struct {
+	Parent string `json:"parent,omitempty"`
+}
+
+type metadataV1Migration struct {
+	Branches []Branch `json:"branches"`
+}
+
+// migrateV1 converts the pre-release byte-radix metadata representation into
+// transactional layers. The marker preserves all old branch roots until the
+// format marker is committed, making an interrupted migration restartable.
+func (r *Repository) migrateV1() error {
+	const marker = "migration-v2.json"
+	if err := r.mkdir("layers", 0700); err != nil {
+		return err
+	}
+	var migration metadataV1Migration
+	if err := r.readJSON(marker, &migration); errors.Is(err, os.ErrNotExist) {
+		branchDir, openErr := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if openErr != nil {
+			return openErr
+		}
+		names, readErr := branchDir.Readdirnames(-1)
+		closeErr := branchDir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			var branch Branch
+			if err := r.readJSON(filepath.Join("branches", name), &branch); err != nil {
+				return err
+			}
+			if branch.ID == "" || len(branch.Root) != 64 {
+				return fmt.Errorf("invalid format-1 branch record %q", name)
+			}
+			migration.Branches = append(migration.Branches, branch)
+		}
+		if len(migration.Branches) == 0 {
+			return errors.New("format-1 repository has no branches")
+		}
+		if err := r.writeJSONAtomic(marker, migration); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	for _, oldBranch := range migration.Branches {
+		ops, err := r.readV1Metadata(oldBranch.Root)
+		if err != nil {
+			return fmt.Errorf("reading format-1 branch %q: %w", oldBranch.ID, err)
+		}
+		layer, err := r.createMetadataLayer("")
+		if err != nil {
+			return err
+		}
+		branch := oldBranch
+		branch.Root = layer
+		state := newBranchMetadata(branch)
+		for len(ops) != 0 {
+			count := len(ops)
+			if count > 1000 {
+				count = 1000
+			}
+			if err := r.commitMetadata(&branch, state, ops[:count]); err != nil {
+				return err
+			}
+			ops = ops[count:]
+		}
+		if err := r.writeBranch(branch); err != nil {
+			return err
+		}
+	}
+	if err := r.syncMetadataLocked(); err != nil {
+		return err
+	}
+	if err := r.atomicWriteFile("format", []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
+		return err
+	}
+	if err := r.syncMetadataLocked(); err != nil {
+		return err
+	}
+	if err := r.unlink(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return r.dir.Sync()
+}
+
+func (r *Repository) readV1Metadata(root string) ([]metadataOp, error) {
+	var ops []metadataOp
+	var walk func(string, []byte) error
+	walk = func(id string, key []byte) error {
+		node, err := r.getTreeNode(id)
+		if err != nil {
+			return err
+		}
+		if len(node.Value) != 0 {
+			keyString := string(key)
+			switch {
+			case strings.HasPrefix(keyString, "i/"):
+				var inode Inode
+				if err := json.Unmarshal(node.Value, &inode); err != nil {
+					return err
+				}
+				ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &inode})
+			case strings.HasPrefix(keyString, "d/"):
+				parts := strings.SplitN(keyString, "/", 3)
+				if len(parts) != 3 {
+					return fmt.Errorf("invalid format-1 dentry key %q", keyString)
+				}
+				parent, err := strconv.ParseUint(parts[1], 16, 64)
+				if err != nil {
+					return err
+				}
+				var entry DirectoryEntry
+				if err := json.Unmarshal(node.Value, &entry); err != nil {
+					return err
+				}
+				ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: parent, Entry: &entry})
+			default:
+				return fmt.Errorf("invalid format-1 metadata key %q", keyString)
+			}
+		}
+		edges := make([]string, 0, len(node.Children))
+		for edge := range node.Children {
+			edges = append(edges, edge)
+		}
+		sort.Strings(edges)
+		for _, edge := range edges {
+			raw, err := hex.DecodeString(edge)
+			if err != nil || len(raw) != 1 {
+				return fmt.Errorf("invalid format-1 tree edge %q", edge)
+			}
+			childKey := append(append([]byte(nil), key...), raw[0])
+			if err := walk(node.Children[edge], childKey); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(root, nil); err != nil {
+		return nil, err
+	}
+	return ops, nil
+}
+
+func (r *Repository) createMetadataLayer(parent string) (string, error) {
+	if parent != "" && !validID(parent) {
+		return "", fmt.Errorf("invalid parent metadata layer %q", parent)
+	}
+	id, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Join("layers", id)
+	if err := r.mkdir(name, 0700); err != nil {
+		return "", err
+	}
+	for _, child := range []string{"inodes", "dirents"} {
+		if err := r.mkdir(filepath.Join(name, child), 0700); err != nil {
+			return "", err
+		}
+	}
+	if err := r.writeJSONAtomic(filepath.Join(name, "layer.json"), metadataLayer{Parent: parent}); err != nil {
+		return "", err
+	}
+	journal, err := r.openFile(filepath.Join(name, "journal"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return "", err
+	}
+	if err := journal.Close(); err != nil {
+		return "", err
+	}
+	r.markDirtyDirectory(name)
+	r.markDirtyDirectory("layers")
+	return id, nil
+}
+
+func normalizeBranchLayers(branch *Branch) error {
+	if !validID(branch.Root) {
+		return fmt.Errorf("branch %q has invalid metadata root %q", branch.ID, branch.Root)
+	}
+	return nil
+}
+
+func (r *Repository) metadataLayers(root string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var reversed []string
+	for root != "" {
+		if !validID(root) {
+			return nil, fmt.Errorf("invalid metadata layer %q", root)
+		}
+		if _, ok := seen[root]; ok {
+			return nil, fmt.Errorf("metadata layer cycle at %q", root)
+		}
+		seen[root] = struct{}{}
+		reversed = append(reversed, root)
+		var layer metadataLayer
+		if err := r.readJSON(filepath.Join("layers", root, "layer.json"), &layer); err != nil {
+			return nil, err
+		}
+		root = layer.Parent
+	}
+	layers := make([]string, len(reversed))
+	for i := range reversed {
+		layers[len(reversed)-1-i] = reversed[i]
+	}
+	return layers, nil
+}
+
+func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
+	if err := normalizeBranchLayers(&branch); err != nil {
+		return nil, err
+	}
+	layers, err := r.metadataLayers(branch.Root)
+	if err != nil {
+		return nil, err
+	}
+	r.metadataMu.Lock()
+	defer r.metadataMu.Unlock()
+	if r.metadata == nil {
+		r.metadata = make(map[string]*branchMetadata)
+	}
+	if state := r.metadata[branch.ID]; state != nil {
+		state.mu.RLock()
+		sameChain := sameLayers(state.layers, layers)
+		knownSizes := make(map[string]int64, len(state.layerSizes))
+		for layer, size := range state.layerSizes {
+			knownSizes[layer] = size
+		}
+		state.mu.RUnlock()
+		if !sameChain {
+			goto reload
+		}
+		current, err := r.metadataLayerSizes(layers)
+		if err != nil {
+			return nil, err
+		}
+		if sameLayerSizes(knownSizes, current) {
+			state.mu.Lock()
+			state.branch = branch
+			state.mu.Unlock()
+			return state, nil
+		}
+	}
+
+reload:
+	state := newBranchMetadata(branch)
+	state.layers = layers
+	for _, layer := range layers {
+		size, sequence, err := r.replayMetadataLayer(layer, state)
+		if err != nil {
+			return nil, fmt.Errorf("replaying metadata layer %q: %w", layer, err)
+		}
+		state.layerSizes[layer] = size
+		if sequence >= state.nextSequence {
+			state.nextSequence = sequence + 1
+		}
+	}
+	if state.nextSequence == 0 {
+		state.nextSequence = 1
+	}
+	r.metadata[branch.ID] = state
+	return state, nil
+}
+
+func sameLayers(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameLayerSizes(a, b map[string]int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for layer, size := range a {
+		if b[layer] != size {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Repository) metadataLayerSizes(layers []string) (map[string]int64, error) {
+	sizes := make(map[string]int64, len(layers))
+	for _, layer := range layers {
+		file, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		info, err := file.Stat()
+		file.Close()
+		if err != nil {
+			return nil, err
+		}
+		sizes[layer] = info.Size()
+	}
+	return sizes, nil
+}
+
+func (r *Repository) replayMetadataLayer(layer string, state *branchMetadata) (int64, uint64, error) {
+	file, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDONLY, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer file.Close()
+	var offset int64
+	var sequence uint64
+	for {
+		transaction, next, err := readMetadataTransaction(file, offset)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return offset, sequence, nil
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		if transaction.Sequence <= sequence {
+			return 0, 0, fmt.Errorf("non-increasing transaction sequence %d", transaction.Sequence)
+		}
+		if err := applyMetadataOps(state, transaction.Ops); err != nil {
+			return 0, 0, err
+		}
+		sequence = transaction.Sequence
+		offset = next
+	}
+}
+
+func readMetadataTransaction(file *os.File, offset int64) (metadataTransaction, int64, error) {
+	var header [metadataJournalHeaderSize]byte
+	if _, err := file.ReadAt(header[:], offset); err != nil {
+		return metadataTransaction{}, offset, err
+	}
+	if !bytes.Equal(header[:4], metadataJournalMagic[:]) {
+		return metadataTransaction{}, offset, fmt.Errorf("invalid metadata journal magic at offset %d", offset)
+	}
+	length := binary.LittleEndian.Uint32(header[4:8])
+	if length == 0 || length > maxMetadataRecordSize {
+		return metadataTransaction{}, offset, fmt.Errorf("invalid metadata transaction length %d at offset %d", length, offset)
+	}
+	payload := make([]byte, length)
+	if _, err := file.ReadAt(payload, offset+metadataJournalHeaderSize); err != nil {
+		return metadataTransaction{}, offset, err
+	}
+	if got, want := crc32.ChecksumIEEE(payload), binary.LittleEndian.Uint32(header[8:12]); got != want {
+		return metadataTransaction{}, offset, fmt.Errorf("metadata transaction checksum mismatch at offset %d", offset)
+	}
+	var transaction metadataTransaction
+	if err := json.Unmarshal(payload, &transaction); err != nil {
+		return metadataTransaction{}, offset, err
+	}
+	if transaction.Sequence == 0 || len(transaction.Ops) == 0 {
+		return metadataTransaction{}, offset, errors.New("empty metadata transaction")
+	}
+	return transaction, offset + metadataJournalHeaderSize + int64(length), nil
+}
+
+func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops []metadataOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	state.mu.RLock()
+	sequence := state.nextSequence
+	durableEnd := state.layerSizes[branch.Root]
+	state.mu.RUnlock()
+	transaction := metadataTransaction{Sequence: sequence, Ops: ops}
+	payload, err := json.Marshal(transaction)
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxMetadataRecordSize {
+		return syscall.E2BIG
+	}
+	record := make([]byte, metadataJournalHeaderSize+len(payload))
+	copy(record[:4], metadataJournalMagic[:])
+	binary.LittleEndian.PutUint32(record[4:8], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(record[8:12], crc32.ChecksumIEEE(payload))
+	copy(record[metadataJournalHeaderSize:], payload)
+	journalName := filepath.Join("layers", branch.Root, "journal")
+	journal, err := r.openFile(journalName, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	info, err := journal.Stat()
+	if err != nil {
+		journal.Close()
+		return err
+	}
+	if info.Size() != durableEnd {
+		// Recovery deliberately ignores a torn final record. Remove that tail
+		// before appending so it cannot hide all subsequent transactions.
+		if info.Size() < durableEnd {
+			journal.Close()
+			return fmt.Errorf("metadata journal shrank from %d to %d", durableEnd, info.Size())
+		}
+		if err := journal.Truncate(durableEnd); err != nil {
+			journal.Close()
+			return err
+		}
+	}
+	if _, err := journal.Seek(0, io.SeekEnd); err != nil {
+		journal.Close()
+		return err
+	}
+	written, err := journal.Write(record)
+	closeErr := journal.Close()
+	if err != nil {
+		return err
+	}
+	if written != len(record) {
+		return io.ErrShortWrite
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	state.mu.Lock()
+	if err := applyMetadataOps(state, ops); err != nil {
+		state.mu.Unlock()
+		return err
+	}
+	state.nextSequence++
+	state.layerSizes[branch.Root] += int64(len(record))
+	state.branch = *branch
+	state.mu.Unlock()
+	r.markDirtyFile(journalName)
+	// Materialized records are deliberately not synchronization points. The
+	// journal replays whole transactions after a crash and repairs any partial
+	// cache update.
+	for _, op := range ops {
+		if err := r.materializeMetadataOp(branch.Root, transaction.Sequence, op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
+	for _, op := range ops {
+		switch op.Kind {
+		case metadataSetInode:
+			if op.Inode == nil || op.Inode.Number == 0 {
+				return errors.New("invalid set-inode operation")
+			}
+			state.inodes[op.Inode.Number] = *op.Inode
+		case metadataDeleteInode:
+			if op.Number == 0 {
+				return errors.New("invalid delete-inode operation")
+			}
+			delete(state.inodes, op.Number)
+		case metadataSetEntry:
+			if op.Entry == nil || op.Parent == 0 || validateEntryName(op.Entry.Name) != nil || op.Entry.Inode == 0 {
+				return errors.New("invalid set-entry operation")
+			}
+			state.entries[metadataEntryKey{Parent: op.Parent, Name: op.Entry.Name}] = *op.Entry
+		case metadataDeleteEntry:
+			if op.Parent == 0 || validateEntryName(op.Name) != nil {
+				return errors.New("invalid delete-entry operation")
+			}
+			delete(state.entries, metadataEntryKey{Parent: op.Parent, Name: op.Name})
+		default:
+			return fmt.Errorf("unknown metadata operation %q", op.Kind)
+		}
+	}
+	return nil
+}
+
+type materializedMetadata struct {
+	Sequence uint64     `json:"sequence"`
+	Op       metadataOp `json:"op"`
+}
+
+func (r *Repository) materializeMetadataOp(layer string, sequence uint64, op metadataOp) error {
+	var name string
+	switch op.Kind {
+	case metadataSetInode:
+		name = inodeMaterializedPath(layer, op.Inode.Number)
+	case metadataDeleteInode:
+		name = inodeMaterializedPath(layer, op.Number)
+	case metadataSetEntry:
+		name = entryMaterializedPath(layer, op.Parent, op.Entry.Name)
+	case metadataDeleteEntry:
+		name = entryMaterializedPath(layer, op.Parent, op.Name)
+	default:
+		return fmt.Errorf("cannot materialize metadata operation %q", op.Kind)
+	}
+	if err := r.mkdirAll(filepath.Dir(name), 0700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(materializedMetadata{Sequence: sequence, Op: op})
+	if err != nil {
+		return err
+	}
+	return r.atomicWriteFile(name, append(data, '\n'), 0600)
+}
+
+func inodeMaterializedPath(layer string, ino uint64) string {
+	hexIno := fmt.Sprintf("%016x", ino)
+	return filepath.Join("layers", layer, "inodes", hexIno[:2], hexIno[2:4], hexIno+".json")
+}
+
+func entryMaterializedPath(layer string, parent uint64, name string) string {
+	hash := sha256.Sum256([]byte(name))
+	encoded := hex.EncodeToString(hash[:])
+	parentHex := fmt.Sprintf("%016x", parent)
+	// Shard first by parent inode and then by a stable two-byte name prefix;
+	// no repository directory grows with the total guest namespace size.
+	nameShard := encoded[:4]
+	return filepath.Join("layers", layer, "dirents", parentHex[:2], parentHex[2:4], parentHex, nameShard, encoded+".json")
+}
+
+func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, error) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	inode, ok := state.inodes[ino]
+	if !ok {
+		return Inode{}, fs.ErrNotExist
+	}
+	return inode, nil
+}
+
+func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name string) (uint64, error) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	entry, ok := state.entries[metadataEntryKey{Parent: parent, Name: name}]
+	if !ok {
+		return 0, fs.ErrNotExist
+	}
+	return entry.Inode, nil
+}
+
+func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) []DirectoryEntry {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	entries := make([]DirectoryEntry, 0)
+	for key, entry := range state.entries {
+		if key.Parent == parent {
+			entries = append(entries, entry)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	return entries
+}
+
+func (r *Repository) allocateInodeLocked() (uint64, error) {
+	if r.allocNext == r.allocEnd {
+		start := r.info.NextInode
+		if start <= rootInode {
+			start = rootInode + 1
+		}
+		end := start + inodeReservationSize
+		if end < start {
+			return 0, syscall.ENOSPC
+		}
+		r.info.NextInode = end
+		if err := r.writeJSONAtomic("volume.json", r.info); err != nil {
+			return 0, err
+		}
+		r.allocNext, r.allocEnd = start, end
+	}
+	ino := r.allocNext
+	r.allocNext++
+	return ino, nil
+}
+
+func (r *Repository) markDirtyFile(name string) {
+	r.dirtyMu.Lock()
+	defer r.dirtyMu.Unlock()
+	if r.dirtyFiles == nil {
+		r.dirtyFiles = make(map[string]struct{})
+	}
+	r.dirtyFiles[name] = struct{}{}
+}
+
+func (r *Repository) markDirtyDirectory(name string) {
+	r.dirtyMu.Lock()
+	defer r.dirtyMu.Unlock()
+	if r.dirtyDirs == nil {
+		r.dirtyDirs = make(map[string]struct{})
+	}
+	r.dirtyDirs[name] = struct{}{}
+}
+
+func (r *Repository) mkdir(name string, mode fs.FileMode) error {
+	if err := validateInternalPath(name); err != nil {
+		return err
+	}
+	err := unix.Mkdirat(int(r.dir.Fd()), name, uint32(mode.Perm()))
+	if err != nil && !errors.Is(err, syscall.EEXIST) {
+		return err
+	}
+	r.markDirtyDirectory(filepath.Dir(name))
+	return nil
+}
+
+func (r *Repository) mkdirAll(name string, mode fs.FileMode) error {
+	if err := validateInternalPath(name); err != nil {
+		return err
+	}
+	current := ""
+	for _, part := range strings.Split(name, string(filepath.Separator)) {
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.Join(current, part)
+		}
+		if err := r.mkdir(current, mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Repository) objectPath(id string) string {
+	return filepath.Join("objects", id[:2], id[2:4], id)
+}
+
+func (r *Repository) openObject(id string, flags int) (*os.File, error) {
+	if !validID(id) {
+		return nil, fmt.Errorf("invalid object ID %q", id)
+	}
+	file, err := r.openFile(r.objectPath(id), flags, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		// Version-1 repositories and snapshots used a flat object directory.
+		return r.openFile(filepath.Join("objects", id), flags, 0)
+	}
+	return file, err
+}
+
+func parseMaterializedInodeName(name string) (uint64, bool) {
+	if !strings.HasSuffix(name, ".json") {
+		return 0, false
+	}
+	ino, err := strconv.ParseUint(strings.TrimSuffix(name, ".json"), 16, 64)
+	return ino, err == nil && ino != 0
+}

@@ -15,8 +15,6 @@
 package ttcvolume
 
 import (
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,7 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const snapshotFormatVersion = 1
+const snapshotFormatVersion = 2
 
 // SnapshotInfo describes one self-contained repository branch snapshot.
 type SnapshotInfo struct {
@@ -38,6 +36,16 @@ type SnapshotInfo struct {
 	Root          string    `json:"root"`
 	NextInode     uint64    `json:"next_inode"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+type snapshotMetadata struct {
+	Inodes  []Inode                  `json:"inodes"`
+	Entries []snapshotDirectoryEntry `json:"entries"`
+}
+
+type snapshotDirectoryEntry struct {
+	Parent uint64 `json:"parent"`
+	DirectoryEntry
 }
 
 // ExportSnapshot writes the immutable metadata and regular-file objects
@@ -72,70 +80,54 @@ func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo,
 			_ = os.RemoveAll(destination)
 		}
 	}()
-	for _, name := range []string{"nodes", "objects"} {
-		if err := os.Mkdir(filepath.Join(destination, name), 0700); err != nil {
-			return SnapshotInfo{}, err
-		}
+	if err := os.Mkdir(filepath.Join(destination, "objects"), 0700); err != nil {
+		return SnapshotInfo{}, err
 	}
-
-	nodes := make(map[string][]byte)
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	metadata := snapshotMetadata{
+		Inodes:  make([]Inode, 0, len(state.inodes)),
+		Entries: make([]snapshotDirectoryEntry, 0, len(state.entries)),
+	}
 	objects := make(map[string]struct{})
-	var visit func(string) error
-	visit = func(id string) error {
-		if _, ok := nodes[id]; ok {
-			return nil
-		}
-		node, err := r.getTreeNode(id)
-		if err != nil {
-			return err
-		}
-		data, err := r.treeNodeData(id)
-		if err != nil {
-			return err
-		}
-		nodes[id] = data
-		if len(node.Value) != 0 {
-			var inode Inode
-			if err := json.Unmarshal(node.Value, &inode); err == nil && inode.Number != 0 && inode.Type != "" && inode.Object != "" {
-				if !validID(inode.Object) {
-					return fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
-				}
-				objects[inode.Object] = struct{}{}
+	for _, inode := range state.inodes {
+		metadata.Inodes = append(metadata.Inodes, inode)
+		if inode.Object != "" {
+			if !validID(inode.Object) {
+				return SnapshotInfo{}, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 			}
+			objects[inode.Object] = struct{}{}
 		}
-		children := make([]string, 0, len(node.Children))
-		for _, child := range node.Children {
-			children = append(children, child)
-		}
-		sort.Strings(children)
-		for _, child := range children {
-			if err := visit(child); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
-	if err := visit(branch.Root); err != nil {
-		return SnapshotInfo{}, fmt.Errorf("walking snapshot tree: %w", err)
+	for key, entry := range state.entries {
+		metadata.Entries = append(metadata.Entries, snapshotDirectoryEntry{Parent: key.Parent, DirectoryEntry: entry})
+	}
+	sort.Slice(metadata.Inodes, func(i, j int) bool { return metadata.Inodes[i].Number < metadata.Inodes[j].Number })
+	sort.Slice(metadata.Entries, func(i, j int) bool {
+		if metadata.Entries[i].Parent != metadata.Entries[j].Parent {
+			return metadata.Entries[i].Parent < metadata.Entries[j].Parent
+		}
+		return metadata.Entries[i].Name < metadata.Entries[j].Name
+	})
+	if err := writeJSONAtomic(destination, filepath.Join(destination, "metadata.json"), metadata); err != nil {
+		return SnapshotInfo{}, err
 	}
 
-	nodeIDs := make([]string, 0, len(nodes))
-	for id := range nodes {
-		nodeIDs = append(nodeIDs, id)
-	}
-	sort.Strings(nodeIDs)
-	for _, id := range nodeIDs {
-		if err := os.WriteFile(filepath.Join(destination, "nodes", id), nodes[id], 0600); err != nil {
-			return SnapshotInfo{}, err
-		}
-	}
 	objectIDs := make([]string, 0, len(objects))
 	for id := range objects {
 		objectIDs = append(objectIDs, id)
 	}
 	sort.Strings(objectIDs)
 	for _, id := range objectIDs {
-		if err := snapshotCopyFile(filepath.Join(r.path, "objects", id), filepath.Join(destination, "objects", id), r.copyMode == CopyModeReflink); err != nil {
+		source := filepath.Join(r.path, r.objectPath(id))
+		if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
+			source = filepath.Join(r.path, "objects", id)
+		}
+		if err := snapshotCopyFile(source, filepath.Join(destination, "objects", id), r.copyMode == CopyModeReflink); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("copying object %q: %w", id, err)
 		}
 	}
@@ -183,63 +175,121 @@ func (r *Repository) importSnapshot(source string) (SnapshotInfo, error) {
 	if err := requireSnapshotDirectory(source); err != nil {
 		return SnapshotInfo{}, err
 	}
-	metadataPath := filepath.Join(source, "snapshot.json")
-	if err := requireSnapshotRegularFile(metadataPath); err != nil {
+	snapshotPath := filepath.Join(source, "snapshot.json")
+	if err := requireSnapshotRegularFile(snapshotPath); err != nil {
 		return SnapshotInfo{}, err
 	}
 	var snapshot SnapshotInfo
-	if err := readJSON(metadataPath, &snapshot); err != nil {
+	if err := readJSON(snapshotPath, &snapshot); err != nil {
 		return SnapshotInfo{}, err
 	}
-	if snapshot.FormatVersion != snapshotFormatVersion || !validID(snapshot.RepositoryID) || !validSnapshotNodeID(snapshot.Root) || snapshot.NextInode <= rootInode {
+	if snapshot.FormatVersion != snapshotFormatVersion || !validID(snapshot.RepositoryID) || !validID(snapshot.Root) || snapshot.NextInode <= rootInode {
 		return SnapshotInfo{}, fmt.Errorf("invalid TTC volume snapshot metadata %+v", snapshot)
 	}
-	for _, kind := range []string{"nodes", "objects"} {
-		directory := filepath.Join(source, kind)
-		if err := requireSnapshotDirectory(directory); err != nil {
-			return SnapshotInfo{}, err
+	metadataPath := filepath.Join(source, "metadata.json")
+	if err := requireSnapshotRegularFile(metadataPath); err != nil {
+		return SnapshotInfo{}, err
+	}
+	var metadata snapshotMetadata
+	if err := readJSON(metadataPath, &metadata); err != nil {
+		return SnapshotInfo{}, err
+	}
+	inodes := make(map[uint64]Inode, len(metadata.Inodes))
+	objects := make(map[string]struct{})
+	for _, inode := range metadata.Inodes {
+		if inode.Number == 0 || inode.Type == "" {
+			return SnapshotInfo{}, fmt.Errorf("invalid snapshot inode %+v", inode)
 		}
-		entries, err := os.ReadDir(directory)
-		if err != nil {
-			return SnapshotInfo{}, err
+		if _, exists := inodes[inode.Number]; exists {
+			return SnapshotInfo{}, fmt.Errorf("duplicate snapshot inode %d", inode.Number)
 		}
-		for _, entry := range entries {
-			valid := validID(entry.Name())
-			if kind == "nodes" {
-				decoded, err := hex.DecodeString(entry.Name())
-				valid = err == nil && len(decoded) == 32
+		inodes[inode.Number] = inode
+		if inode.Object != "" {
+			if !validID(inode.Object) {
+				return SnapshotInfo{}, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 			}
-			entryInfo, err := entry.Info()
-			if err != nil {
-				return SnapshotInfo{}, err
-			}
-			if !entryInfo.Mode().IsRegular() || !valid {
-				return SnapshotInfo{}, fmt.Errorf("invalid snapshot %s entry %q", kind, entry.Name())
-			}
-			if err := snapshotCopyFile(
-				filepath.Join(source, kind, entry.Name()),
-				filepath.Join(r.path, kind, entry.Name()),
-				r.copyMode == CopyModeReflink,
-			); err != nil {
-				if errors.Is(err, os.ErrExist) && kind == "nodes" {
-					continue
-				}
-				return SnapshotInfo{}, err
-			}
+			objects[inode.Object] = struct{}{}
 		}
 	}
-	if err := r.validateSnapshotTree(snapshot.Root); err != nil {
-		return SnapshotInfo{}, fmt.Errorf("validating imported snapshot root: %w", err)
+	if _, ok := inodes[rootInode]; !ok {
+		return SnapshotInfo{}, errors.New("snapshot omits root inode")
+	}
+	seenEntries := make(map[metadataEntryKey]struct{}, len(metadata.Entries))
+	for _, entry := range metadata.Entries {
+		key := metadataEntryKey{Parent: entry.Parent, Name: entry.Name}
+		if validateEntryName(entry.Name) != nil || entry.Parent == 0 || entry.Inode == 0 {
+			return SnapshotInfo{}, fmt.Errorf("invalid snapshot directory entry %+v", entry)
+		}
+		if _, ok := inodes[entry.Parent]; !ok {
+			return SnapshotInfo{}, fmt.Errorf("directory entry %q has missing parent inode %d", entry.Name, entry.Parent)
+		}
+		if _, ok := inodes[entry.Inode]; !ok {
+			return SnapshotInfo{}, fmt.Errorf("directory entry %q has missing inode %d", entry.Name, entry.Inode)
+		}
+		if _, exists := seenEntries[key]; exists {
+			return SnapshotInfo{}, fmt.Errorf("duplicate directory entry %d/%q", entry.Parent, entry.Name)
+		}
+		seenEntries[key] = struct{}{}
+	}
+	objectsDir := filepath.Join(source, "objects")
+	if err := requireSnapshotDirectory(objectsDir); err != nil {
+		return SnapshotInfo{}, err
+	}
+	for object := range objects {
+		destination := filepath.Join(r.path, r.objectPath(object))
+		if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+			return SnapshotInfo{}, err
+		}
+		if err := snapshotCopyFile(filepath.Join(objectsDir, object), destination, r.copyMode == CopyModeReflink); err != nil {
+			return SnapshotInfo{}, fmt.Errorf("importing object %q: %w", object, err)
+		}
 	}
 	r.info.NextInode = snapshot.NextInode
 	if err := writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "volume.json"), r.info); err != nil {
 		return SnapshotInfo{}, err
 	}
+	layer, err := r.createMetadataLayer("")
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
 	branch := Branch{
 		ID:         mainBranch,
-		Root:       snapshot.Root,
+		Root:       layer,
 		Generation: 1,
 		CreatedAt:  time.Now().UTC(),
+	}
+	state := newBranchMetadata(branch)
+	const transactionOps = 1000
+	ops := make([]metadataOp, 0, transactionOps)
+	flush := func() error {
+		if len(ops) == 0 {
+			return nil
+		}
+		if err := r.commitMetadata(&branch, state, ops); err != nil {
+			return err
+		}
+		ops = ops[:0]
+		return nil
+	}
+	for i := range metadata.Inodes {
+		ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &metadata.Inodes[i]})
+		if len(ops) == cap(ops) {
+			if err := flush(); err != nil {
+				return SnapshotInfo{}, err
+			}
+		}
+	}
+	for i := range metadata.Entries {
+		item := &metadata.Entries[i]
+		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: item.Parent, Entry: &item.DirectoryEntry})
+		if len(ops) == cap(ops) {
+			if err := flush(); err != nil {
+				return SnapshotInfo{}, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return SnapshotInfo{}, err
 	}
 	if err := r.writeBranch(branch); err != nil {
 		return SnapshotInfo{}, err
@@ -304,46 +354,4 @@ func requireSnapshotRegularFile(path string) error {
 		return fmt.Errorf("snapshot path %q is not a regular file", path)
 	}
 	return nil
-}
-
-func validSnapshotNodeID(id string) bool {
-	decoded, err := hex.DecodeString(id)
-	return err == nil && len(decoded) == 32
-}
-
-func (r *Repository) validateSnapshotTree(root string) error {
-	visited := make(map[string]struct{})
-	var walk func(string) error
-	walk = func(id string) error {
-		if _, ok := visited[id]; ok {
-			return nil
-		}
-		visited[id] = struct{}{}
-		node, err := r.getTreeNode(id)
-		if err != nil {
-			return err
-		}
-		if len(node.Value) != 0 {
-			var inode Inode
-			if err := json.Unmarshal(node.Value, &inode); err == nil && inode.Number != 0 && inode.Type != "" && inode.Object != "" {
-				if !validID(inode.Object) {
-					return fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
-				}
-				file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_RDONLY, 0)
-				if err != nil {
-					return fmt.Errorf("opening inode %d object %q: %w", inode.Number, inode.Object, err)
-				}
-				if err := file.Close(); err != nil {
-					return err
-				}
-			}
-		}
-		for _, child := range node.Children {
-			if err := walk(child); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return walk(root)
 }

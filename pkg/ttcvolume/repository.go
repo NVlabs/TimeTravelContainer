@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Package ttcvolume implements TTC's persistent, branchable managed-volume
-// repository. Namespace metadata is stored in an immutable radix trie, while
-// regular-file contents live in opaque host files.
+// repository. Namespace metadata is stored in transactional, branchable
+// journals and materialized into sharded host directories, while regular-file
+// contents live in opaque host files.
 package ttcvolume
 
 import (
@@ -39,7 +40,7 @@ import (
 )
 
 const (
-	formatVersion = 1
+	formatVersion = 2
 	mainBranch    = "main"
 	rootInode     = uint64(1)
 )
@@ -171,7 +172,9 @@ type VolumeInfo struct {
 	NextInode uint64    `json:"next_inode"`
 }
 
-// Branch is an immutable-tree root and branch-local data generation.
+// Branch identifies the immutable metadata layers inherited by a branch and
+// its final writable layer. Root aliases the writable layer for compatibility
+// with older callers that use it as an opaque change identity.
 type Branch struct {
 	ID         string    `json:"id"`
 	Parent     string    `json:"parent,omitempty"`
@@ -233,6 +236,15 @@ type Repository struct {
 	// each guest create/rename into fsyncs for every radix-trie ancestor.
 	dirtyMu    sync.Mutex
 	dirtyFiles map[string]struct{}
+	dirtyDirs  map[string]struct{}
+
+	// metadata is the decoded view of each locally-used branch. The journal is
+	// authoritative; sharded inode and dentry files are rebuildable lookup
+	// materializations and never participate in fork-time copying.
+	metadataMu sync.Mutex
+	metadata   map[string]*branchMetadata
+	allocNext  uint64
+	allocEnd   uint64
 }
 
 // Create creates a new volume with an empty main branch.
@@ -281,7 +293,7 @@ func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
 }
 
 func (m *Manager) createAt(path, name, id string) (*Repository, error) {
-	for _, dir := range []string{path, filepath.Join(path, "nodes"), filepath.Join(path, "objects"), filepath.Join(path, "staging"), filepath.Join(path, "branches")} {
+	for _, dir := range []string{path, filepath.Join(path, "objects"), filepath.Join(path, "staging"), filepath.Join(path, "branches"), filepath.Join(path, "layers")} {
 		if err := os.Mkdir(dir, 0700); err != nil {
 			_ = os.RemoveAll(path)
 			return nil, fmt.Errorf("creating volume repository: %w", err)
@@ -303,7 +315,7 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	root, err := repo.emptyTree()
+	layer, err := repo.createMetadataLayer("")
 	if err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
@@ -313,13 +325,13 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2,
 		AtimeNsec: now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 	}
-	root, err = repo.setInode(root, rootMeta)
-	if err != nil {
+	branch := Branch{ID: mainBranch, Root: layer, Generation: 1, CreatedAt: time.Now().UTC()}
+	state := newBranchMetadata(branch)
+	if err := repo.commitMetadata(&state.branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &rootMeta}}); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	branch := Branch{ID: mainBranch, Root: root, Generation: 1, CreatedAt: time.Now().UTC()}
-	if err := repo.writeBranch(branch); err != nil {
+	if err := repo.writeBranch(state.branch); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
@@ -353,10 +365,21 @@ func (m *Manager) OpenPrivate(path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
+	version := strings.TrimSpace(string(format))
+	if version != "1" && version != strconv.Itoa(formatVersion) {
 		return nil, fmt.Errorf("private repository uses unsupported format %q", strings.TrimSpace(string(format)))
 	}
-	return m.openPath(path, info)
+	repository, err := m.openPath(path, info)
+	if err != nil {
+		return nil, err
+	}
+	if version == "1" {
+		if err := repository.migrateV1(); err != nil {
+			repository.Close()
+			return nil, fmt.Errorf("migrating private repository to format 2: %w", err)
+		}
+	}
+	return repository, nil
 }
 
 // List returns all valid v2 volumes.
@@ -378,7 +401,8 @@ func (m *Manager) List() ([]VolumeInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("loading volume repository %q format: %w", entry.Name(), err)
 		}
-		if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
+		version := strings.TrimSpace(string(format))
+		if version != "1" && version != strconv.Itoa(formatVersion) {
 			return nil, fmt.Errorf("volume repository %q uses unsupported format %q", entry.Name(), strings.TrimSpace(string(format)))
 		}
 		var info VolumeInfo
@@ -387,6 +411,19 @@ func (m *Manager) List() ([]VolumeInfo, error) {
 		}
 		if info.ID != entry.Name() || !validID(info.ID) {
 			return nil, fmt.Errorf("volume repository %q has invalid identity %q", entry.Name(), info.ID)
+		}
+		if version == "1" {
+			repository, err := m.openPath(filepath.Join(m.volumes, entry.Name()), info)
+			if err != nil {
+				return nil, err
+			}
+			if err := repository.migrateV1(); err != nil {
+				repository.Close()
+				return nil, fmt.Errorf("migrating volume repository %q to format 2: %w", info.Name, err)
+			}
+			if err := repository.Close(); err != nil {
+				return nil, err
+			}
 		}
 		result = append(result, info)
 	}
@@ -461,9 +498,16 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		repo.Close()
 		return nil, err
 	}
-	if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
+	version := strings.TrimSpace(string(format))
+	if version != "1" && version != strconv.Itoa(formatVersion) {
 		repo.Close()
 		return nil, fmt.Errorf("unsupported repository format %q", strings.TrimSpace(string(format)))
+	}
+	if version == "1" {
+		if err := repo.migrateV1(); err != nil {
+			repo.Close()
+			return nil, fmt.Errorf("migrating donated repository to format 2: %w", err)
+		}
 	}
 	return repo, nil
 }
@@ -531,7 +575,11 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 		if err != nil {
 			return err
 		}
-		root, err := r.getInode(branch.Root, rootInode)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		root, err := r.metadataInode(state, rootInode)
 		if err != nil {
 			return err
 		}
@@ -541,10 +589,7 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 			}
 			return fmt.Errorf("repository root has unsupported type %q", root.Type)
 		}
-		entries, err := r.treePrefix(branch.Root, entryPrefix(rootInode))
-		if err != nil {
-			return err
-		}
+		entries := r.metadataDirectory(state, rootInode)
 		if len(entries) != 0 {
 			return errors.New("regular repository root requires an empty namespace")
 		}
@@ -559,11 +604,7 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 			DataGeneration: branch.Generation,
 			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
-		branch.Root, err = r.setInode(branch.Root, root)
-		if err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &root}})
 	})
 }
 
@@ -638,6 +679,9 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 	if branch.ID != id || branch.Root == "" || branch.Generation == 0 {
 		return Branch{}, fmt.Errorf("invalid branch record for %q", id)
 	}
+	if err := normalizeBranchLayers(&branch); err != nil {
+		return Branch{}, err
+	}
 	return branch, nil
 }
 
@@ -684,7 +728,11 @@ func (r *Repository) ReapOrphan(branchID string, ino uint64) error {
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		inode, err := r.metadataInode(state, ino)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -697,13 +745,7 @@ func (r *Repository) ReapOrphan(branchID string, ino uint64) error {
 			// must remain unchanged in that case.
 			return nil
 		}
-		root, err := r.treeDelete(branch.Root, inodeKey(ino))
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		branch.Generation++
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataDeleteInode, Number: ino}})
 	})
 }
 
@@ -738,9 +780,22 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 			return err
 		}
 		tx.source = sourceBranch
+		// Seal the source's current writable layer by giving each resulting
+		// branch a fresh writable layer. Both new manifests retain the sealed
+		// layer by reference, so namespace fork cost is independent of its size.
+		sharedLayer := sourceBranch.Root
+		sourceLayer, err := r.createMetadataLayer(sharedLayer)
+		if err != nil {
+			return err
+		}
+		childLayer, err := r.createMetadataLayer(sharedLayer)
+		if err != nil {
+			return err
+		}
+		sourceBranch.Root = sourceLayer
 		sourceBranch.Generation++
 		childBranch := Branch{
-			ID: child, Parent: source, Root: sourceBranch.Root,
+			ID: child, Parent: source, Root: childLayer,
 			Generation: sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes
@@ -847,14 +902,18 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		if err != nil {
 			return err
 		}
-		parentInode, err := r.getInode(branch.Root, parent)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		parentInode, err := r.metadataInode(state, parent)
 		if err != nil {
 			return err
 		}
 		if parentInode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		if _, err := r.lookup(branch.Root, parent, name); err == nil {
+		if _, err := r.metadataLookup(state, parent, name); err == nil {
 			return os.ErrExist
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -863,8 +922,10 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		if err != nil {
 			return err
 		}
-		created = r.info.NextInode
-		r.info.NextInode++
+		created, err = r.allocateInodeLocked()
+		if err != nil {
+			return err
+		}
 		now := time.Now().UnixNano()
 		inode := Inode{
 			Number: created, Type: "regular", Mode: mode & 07777,
@@ -872,21 +933,11 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 			DataGeneration: branch.Generation,
 			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
-		root, err := r.setInode(branch.Root, inode)
-		if err != nil {
-			return err
-		}
 		entry := DirectoryEntry{Name: name, Inode: created}
-		raw, _ := json.Marshal(entry)
-		root, err = r.treeSet(root, entryKey(parent, name), raw)
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		if err := r.writeJSONAtomic("volume.json", r.info); err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{
+			{Kind: metadataSetInode, Inode: &inode},
+			{Kind: metadataSetEntry, Parent: parent, Entry: &entry},
+		})
 	})
 	return created, err
 }
@@ -931,47 +982,40 @@ func (r *Repository) createNonRegular(branchID string, parent uint64, name strin
 		if err != nil {
 			return err
 		}
-		parentInode, err := r.getInode(branch.Root, parent)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		parentInode, err := r.metadataInode(state, parent)
 		if err != nil {
 			return err
 		}
 		if parentInode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		if _, err := r.lookup(branch.Root, parent, name); err == nil {
+		if _, err := r.metadataLookup(state, parent, name); err == nil {
 			return os.ErrExist
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		created = r.info.NextInode
-		r.info.NextInode++
+		created, err = r.allocateInodeLocked()
+		if err != nil {
+			return err
+		}
 		now := time.Now().UnixNano()
 		inode.Number = created
 		inode.AtimeNsec = now
 		inode.BtimeNsec = now
 		inode.CtimeNsec = now
 		inode.MtimeNsec = now
-		root, err := r.setInode(branch.Root, inode)
-		if err != nil {
-			return err
-		}
+		ops := []metadataOp{{Kind: metadataSetInode, Inode: &inode}}
 		if inode.Type == "directory" {
 			parentInode.Nlink++
-			root, err = r.setInode(root, parentInode)
-			if err != nil {
-				return err
-			}
+			ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &parentInode})
 		}
-		raw, _ := json.Marshal(DirectoryEntry{Name: name, Inode: created})
-		root, err = r.treeSet(root, entryKey(parent, name), raw)
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		if err := r.writeJSONAtomic("volume.json", r.info); err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		entry := DirectoryEntry{Name: name, Inode: created}
+		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: parent, Entry: &entry})
+		return r.commitMetadata(&branch, state, ops)
 	})
 	return created, err
 }
@@ -1003,7 +1047,11 @@ func (r *Repository) Lookup(branchID string, parent uint64, name string) (uint64
 	if err != nil {
 		return 0, err
 	}
-	return r.lookup(branch.Root, parent, name)
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return 0, err
+	}
+	return r.metadataLookup(state, parent, name)
 }
 
 // Inode returns branch-local inode metadata.
@@ -1012,7 +1060,11 @@ func (r *Repository) Inode(branchID string, ino uint64) (Inode, error) {
 	if err != nil {
 		return Inode{}, err
 	}
-	return r.getInode(branch.Root, ino)
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return Inode{}, err
+	}
+	return r.metadataInode(state, ino)
 }
 
 // Link creates a hard link to an existing non-directory inode.
@@ -1025,30 +1077,28 @@ func (r *Repository) Link(branchID string, parent uint64, name string, target ui
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, target)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		inode, err := r.metadataInode(state, target)
 		if err != nil {
 			return err
 		}
 		if inode.Type == "directory" {
 			return syscall.EPERM
 		}
-		if _, err := r.lookup(branch.Root, parent, name); err == nil {
+		if _, err := r.metadataLookup(state, parent, name); err == nil {
 			return os.ErrExist
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		inode.Nlink++
-		root, err := r.setInode(branch.Root, inode)
-		if err != nil {
-			return err
-		}
-		raw, _ := json.Marshal(DirectoryEntry{Name: name, Inode: target})
-		root, err = r.treeSet(root, entryKey(parent, name), raw)
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		return r.writeBranch(branch)
+		entry := DirectoryEntry{Name: name, Inode: target}
+		return r.commitMetadata(&branch, state, []metadataOp{
+			{Kind: metadataSetInode, Inode: &inode},
+			{Kind: metadataSetEntry, Parent: parent, Entry: &entry},
+		})
 	})
 }
 
@@ -1063,20 +1113,20 @@ func (r *Repository) Unlink(branchID string, parent uint64, name string) error {
 		if err != nil {
 			return err
 		}
-		ino, err := r.lookup(branch.Root, parent, name)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		ino, err := r.metadataLookup(state, parent, name)
+		if err != nil {
+			return err
+		}
+		inode, err := r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
 		if inode.Type == "directory" {
 			return syscall.EISDIR
-		}
-		root, err := r.treeDelete(branch.Root, entryKey(parent, name))
-		if err != nil {
-			return err
 		}
 		if inode.Nlink > 1 {
 			inode.Nlink--
@@ -1087,12 +1137,10 @@ func (r *Repository) Unlink(branchID string, parent uint64, name string) error {
 			// reaps it after the final in-memory reference is released.
 			inode.Nlink = 0
 		}
-		root, err = r.setInode(root, inode)
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{
+			{Kind: metadataDeleteEntry, Parent: parent, Name: name},
+			{Kind: metadataSetInode, Inode: &inode},
+		})
 	})
 }
 
@@ -1106,51 +1154,43 @@ func (r *Repository) RemoveDirectory(branchID string, parent uint64, name string
 		if err != nil {
 			return err
 		}
-		ino, err := r.lookup(branch.Root, parent, name)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		ino, err := r.metadataLookup(state, parent, name)
+		if err != nil {
+			return err
+		}
+		inode, err := r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
 		if inode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		entries, err := r.treePrefix(branch.Root, entryPrefix(ino))
-		if err != nil {
-			return err
-		}
+		entries := r.metadataDirectory(state, ino)
 		if len(entries) != 0 {
 			return syscall.ENOTEMPTY
 		}
-		parentInode, err := r.getInode(branch.Root, parent)
+		parentInode, err := r.metadataInode(state, parent)
 		if err != nil {
 			return err
 		}
 		if parentInode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		root, err := r.treeDelete(branch.Root, entryKey(parent, name))
-		if err != nil {
-			return err
-		}
 		// An open directory remains observable after unlink. Retain its inode
 		// metadata until repository GC, just like regular-file orphans.
 		inode.Nlink = 0
-		root, err = r.setInode(root, inode)
-		if err != nil {
-			return err
-		}
 		if parentInode.Nlink > 0 {
 			parentInode.Nlink--
 		}
-		root, err = r.setInode(root, parentInode)
-		if err != nil {
-			return err
-		}
-		branch.Root = root
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{
+			{Kind: metadataDeleteEntry, Parent: parent, Name: name},
+			{Kind: metadataSetInode, Inode: &inode},
+			{Kind: metadataSetInode, Inode: &parentInode},
+		})
 	})
 }
 
@@ -1168,26 +1208,30 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 		if err != nil {
 			return err
 		}
-		oldParentInode, err := r.getInode(branch.Root, oldParent)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		newParentInode, err := r.getInode(branch.Root, newParent)
+		oldParentInode, err := r.metadataInode(state, oldParent)
+		if err != nil {
+			return err
+		}
+		newParentInode, err := r.metadataInode(state, newParent)
 		if err != nil {
 			return err
 		}
 		if oldParentInode.Type != "directory" || newParentInode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		movedIno, err := r.lookup(branch.Root, oldParent, oldName)
+		movedIno, err := r.metadataLookup(state, oldParent, oldName)
 		if err != nil {
 			return err
 		}
-		moved, err := r.getInode(branch.Root, movedIno)
+		moved, err := r.metadataInode(state, movedIno)
 		if err != nil {
 			return err
 		}
-		replacedIno, replacedErr := r.lookup(branch.Root, newParent, newName)
+		replacedIno, replacedErr := r.metadataLookup(state, newParent, newName)
 		if replacedErr == nil && noReplace {
 			return os.ErrExist
 		}
@@ -1197,9 +1241,9 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 		if replacedErr == nil && replacedIno == movedIno {
 			return nil
 		}
-		root := branch.Root
+		ops := make([]metadataOp, 0, 6)
 		if replacedErr == nil {
-			replaced, err := r.getInode(root, replacedIno)
+			replaced, err := r.metadataInode(state, replacedIno)
 			if err != nil {
 				return err
 			}
@@ -1209,18 +1253,12 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 			case moved.Type != "directory" && replaced.Type == "directory":
 				return syscall.EISDIR
 			case replaced.Type == "directory":
-				entries, err := r.treePrefix(root, entryPrefix(replacedIno))
-				if err != nil {
-					return err
-				}
+				entries := r.metadataDirectory(state, replacedIno)
 				if len(entries) != 0 {
 					return syscall.ENOTEMPTY
 				}
 			}
-			root, err = r.treeDelete(root, entryKey(newParent, newName))
-			if err != nil {
-				return err
-			}
+			ops = append(ops, metadataOp{Kind: metadataDeleteEntry, Parent: newParent, Name: newName})
 			if replaced.Nlink > 1 && replaced.Type != "directory" {
 				replaced.Nlink--
 			} else {
@@ -1228,23 +1266,14 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 				// checkpoint restoration. It is no longer reachable by name.
 				replaced.Nlink = 0
 			}
-			root, err = r.setInode(root, replaced)
-			if err != nil {
-				return err
-			}
+			ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &replaced})
 			if replaced.Type == "directory" && newParentInode.Nlink > 0 {
 				newParentInode.Nlink--
 			}
 		}
-		root, err = r.treeDelete(root, entryKey(oldParent, oldName))
-		if err != nil {
-			return err
-		}
-		raw, _ := json.Marshal(DirectoryEntry{Name: newName, Inode: movedIno})
-		root, err = r.treeSet(root, entryKey(newParent, newName), raw)
-		if err != nil {
-			return err
-		}
+		ops = append(ops, metadataOp{Kind: metadataDeleteEntry, Parent: oldParent, Name: oldName})
+		newEntry := DirectoryEntry{Name: newName, Inode: movedIno}
+		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: newParent, Entry: &newEntry})
 		if moved.Type == "directory" && oldParent != newParent {
 			if oldParentInode.Nlink > 0 {
 				oldParentInode.Nlink--
@@ -1254,18 +1283,11 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 		if oldParent == newParent {
 			oldParentInode = newParentInode
 		}
-		root, err = r.setInode(root, oldParentInode)
-		if err != nil {
-			return err
-		}
+		ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &oldParentInode})
 		if newParent != oldParent {
-			root, err = r.setInode(root, newParentInode)
-			if err != nil {
-				return err
-			}
+			ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &newParentInode})
 		}
-		branch.Root = root
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, ops)
 	})
 }
 
@@ -1288,7 +1310,11 @@ func (r *Repository) updateMetadata(branchID string, updated Inode, growSize boo
 		if err != nil {
 			return err
 		}
-		current, err := r.getInode(branch.Root, updated.Number)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		current, err := r.metadataInode(state, updated.Number)
 		if err != nil {
 			return err
 		}
@@ -1305,15 +1331,11 @@ func (r *Repository) updateMetadata(branchID string, updated Inode, growSize boo
 		} else if current.Type == "symlink" {
 			current.Target = updated.Target
 		}
-		branch.Root, err = r.setInode(branch.Root, current)
-		if err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &current}})
 	})
 }
 
-func (r *Repository) ensurePrivate(branch *Branch, inode *Inode) (bool, error) {
+func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode *Inode) (bool, error) {
 	if inode.Type != "regular" {
 		return false, syscall.EINVAL
 	}
@@ -1329,12 +1351,7 @@ func (r *Repository) ensurePrivate(branch *Branch, inode *Inode) (bool, error) {
 	}
 	inode.Object = object
 	inode.DataGeneration = branch.Generation
-	root, err := r.setInode(branch.Root, *inode)
-	if err != nil {
-		return false, err
-	}
-	branch.Root = root
-	if err := r.writeBranch(*branch); err != nil {
+	if err := r.commitMetadata(branch, state, []metadataOp{{Kind: metadataSetInode, Inode: inode}}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1353,15 +1370,19 @@ func (r *Repository) WriteAt(branchID string, ino uint64, data []byte, offset in
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		cloned, err = r.ensurePrivate(&branch, &inode)
+		inode, err := r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
-		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_WRONLY, 0)
+		cloned, err = r.ensurePrivate(&branch, state, &inode)
+		if err != nil {
+			return err
+		}
+		file, err := r.openObject(inode.Object, os.O_WRONLY)
 		if err != nil {
 			return err
 		}
@@ -1376,11 +1397,7 @@ func (r *Repository) WriteAt(branchID string, ino uint64, data []byte, offset in
 		end := offset + int64(written)
 		if end > inode.Size {
 			inode.Size = end
-			branch.Root, err = r.setInode(branch.Root, inode)
-			if err != nil {
-				return err
-			}
-			return r.writeBranch(branch)
+			return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &inode}})
 		}
 		return nil
 	})
@@ -1396,7 +1413,11 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	if err != nil {
 		return 0, err
 	}
-	inode, err := r.getInode(branch.Root, ino)
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return 0, err
+	}
+	inode, err := r.metadataInode(state, ino)
 	if err != nil {
 		return 0, err
 	}
@@ -1406,7 +1427,7 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	if !validID(inode.Object) {
 		return 0, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 	}
-	file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_RDONLY, 0)
+	file, err := r.openObject(inode.Object, os.O_RDONLY)
 	if err != nil {
 		return 0, err
 	}
@@ -1429,7 +1450,11 @@ func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*
 		if err != nil {
 			return err
 		}
-		inode, err = r.getInode(branch.Root, ino)
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		inode, err = r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
@@ -1437,7 +1462,7 @@ func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*
 			return syscall.EINVAL
 		}
 		if writable {
-			cloned, err = r.ensurePrivate(&branch, &inode)
+			cloned, err = r.ensurePrivate(&branch, state, &inode)
 			if err != nil {
 				return err
 			}
@@ -1446,7 +1471,7 @@ func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*
 		if writable {
 			flags = os.O_RDWR
 		}
-		file, err = r.openFile(filepath.Join("objects", inode.Object), flags, 0)
+		file, err = r.openObject(inode.Object, flags)
 		return err
 	}
 	var err error
@@ -1490,32 +1515,37 @@ func (r *Repository) SyncMetadata() error {
 // by the repository flock, so a successful call covers every mutation that
 // completed before it began.
 func (r *Repository) syncMetadataLocked() error {
-	if err := r.syncTreeNodePack(); err != nil {
-		return err
-	}
-	// Persist the pack's name before any branch directory entry that may make
-	// its nodes reachable.
-	if err := r.dir.Sync(); err != nil {
-		return err
-	}
 	r.dirtyMu.Lock()
-	var rootDirty, branchDirty []string
+	var journals, rootDirty, branchDirty []string
 	for name := range r.dirtyFiles {
-		// Loose node files are a read cache for nodes.pack. Once the pack is
-		// durable, syncing thousands of individual immutable files adds no
-		// recoverability and causes extreme write amplification.
-		if strings.HasPrefix(name, "nodes/") {
+		// Sharded inode/dentry files are a rebuildable materialization of the
+		// journal. Synchronizing every one would reproduce the metadata fsync
+		// amplification that this format replaces.
+		if strings.HasPrefix(name, "layers/") && !strings.HasSuffix(name, "/journal") && !strings.HasSuffix(name, "/layer.json") {
 			continue
 		}
-		if strings.HasPrefix(name, "branches/") {
+		switch {
+		case strings.HasSuffix(name, "/journal"):
+			journals = append(journals, name)
+		case strings.HasPrefix(name, "branches/"):
 			branchDirty = append(branchDirty, name)
-		} else {
+		default:
 			rootDirty = append(rootDirty, name)
 		}
 	}
+	dirtyDirs := make([]string, 0, len(r.dirtyDirs))
+	for name := range r.dirtyDirs {
+		dirtyDirs = append(dirtyDirs, name)
+	}
 	r.dirtyMu.Unlock()
+	sort.Strings(journals)
 	sort.Strings(rootDirty)
 	sort.Strings(branchDirty)
+	// Children must precede parents so every object name is durable before a
+	// journal transaction that makes it reachable.
+	sort.Slice(dirtyDirs, func(i, j int) bool {
+		return strings.Count(dirtyDirs[i], string(filepath.Separator)) > strings.Count(dirtyDirs[j], string(filepath.Separator))
+	})
 	syncFiles := func(names []string) error {
 		for _, name := range names {
 			file, err := r.openFile(name, os.O_RDONLY, 0)
@@ -1533,15 +1563,18 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 		return nil
 	}
+	for _, name := range dirtyDirs {
+		if name == "." {
+			continue
+		}
+		if err := r.syncDirectory(name); err != nil {
+			return err
+		}
+	}
 	if err := syncFiles(rootDirty); err != nil {
 		return err
 	}
-	if err := r.dir.Sync(); err != nil {
-		return err
-	}
-	// New object names must be durable before branch roots that reference
-	// their inodes. Object contents themselves are synchronized by SyncData.
-	if err := r.syncDirectory("objects"); err != nil {
+	if err := syncFiles(journals); err != nil {
 		return err
 	}
 	if err := syncFiles(branchDirty); err != nil {
@@ -1556,6 +1589,9 @@ func (r *Repository) syncMetadataLocked() error {
 	r.dirtyMu.Lock()
 	for name := range r.dirtyFiles {
 		delete(r.dirtyFiles, name)
+	}
+	for name := range r.dirtyDirs {
+		delete(r.dirtyDirs, name)
 	}
 	r.dirtyMu.Unlock()
 	return nil
@@ -1572,15 +1608,19 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		cloned, err = r.ensurePrivate(&branch, &inode)
+		inode, err := r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
-		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_WRONLY, 0)
+		cloned, err = r.ensurePrivate(&branch, state, &inode)
+		if err != nil {
+			return err
+		}
+		file, err := r.openObject(inode.Object, os.O_WRONLY)
 		if err != nil {
 			return err
 		}
@@ -1593,11 +1633,7 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 			return closeErr
 		}
 		inode.Size = size
-		branch.Root, err = r.setInode(branch.Root, inode)
-		if err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &inode}})
 	})
 	return cloned, err
 }
@@ -1615,15 +1651,19 @@ func (r *Repository) Allocate(branchID string, ino uint64, offset, length int64)
 		if err != nil {
 			return err
 		}
-		inode, err := r.getInode(branch.Root, ino)
+		state, err := r.metadataForBranch(branch)
 		if err != nil {
 			return err
 		}
-		cloned, err = r.ensurePrivate(&branch, &inode)
+		inode, err := r.metadataInode(state, ino)
 		if err != nil {
 			return err
 		}
-		file, err := r.openFile(filepath.Join("objects", inode.Object), os.O_RDWR, 0)
+		cloned, err = r.ensurePrivate(&branch, state, &inode)
+		if err != nil {
+			return err
+		}
+		file, err := r.openObject(inode.Object, os.O_RDWR)
 		if err != nil {
 			return err
 		}
@@ -1640,11 +1680,7 @@ func (r *Repository) Allocate(branchID string, ino uint64, offset, length int64)
 			return nil
 		}
 		inode.Size = end
-		branch.Root, err = r.setInode(branch.Root, inode)
-		if err != nil {
-			return err
-		}
-		return r.writeBranch(branch)
+		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &inode}})
 	})
 	return cloned, err
 }
@@ -1655,19 +1691,11 @@ func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryE
 	if err != nil {
 		return nil, err
 	}
-	values, err := r.treePrefix(branch.Root, entryPrefix(parent))
+	state, err := r.metadataForBranch(branch)
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]DirectoryEntry, 0, len(values))
-	for _, raw := range values {
-		var entry DirectoryEntry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
-	}
-	return entries, nil
+	return r.metadataDirectory(state, parent), nil
 }
 
 func (r *Repository) createObject(source string) (string, error) {
@@ -1678,9 +1706,11 @@ func (r *Repository) createObject(source string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	staging := filepath.Join("staging", "object-"+id)
-	destination := filepath.Join("objects", id)
-	dst, err := r.openFile(staging, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	destination := r.objectPath(id)
+	if err := r.mkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return "", err
+	}
+	dst, err := r.openFile(destination, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		return "", err
 	}
@@ -1688,11 +1718,11 @@ func (r *Repository) createObject(source string) (string, error) {
 	defer func() {
 		dst.Close()
 		if !keep {
-			_ = r.unlink(staging)
+			_ = r.unlink(destination)
 		}
 	}()
 	if source != "" {
-		src, err := r.openFile(filepath.Join("objects", source), os.O_RDONLY, 0)
+		src, err := r.openObject(source, os.O_RDONLY)
 		if err != nil {
 			return "", err
 		}
@@ -1727,18 +1757,12 @@ func (r *Repository) createObject(source string) (string, error) {
 			return "", fmt.Errorf("privatizing volume object %q using %s: %w", source, r.copyMode, err)
 		}
 	}
-	if err := dst.Sync(); err != nil {
-		return "", err
-	}
 	if err := dst.Close(); err != nil {
 		return "", err
 	}
-	if err := unix.Renameat(int(r.dir.Fd()), staging, int(r.dir.Fd()), destination); err != nil {
-		return "", err
-	}
-	if err := r.syncDirectory(filepath.Dir(destination)); err != nil {
-		return "", err
-	}
+	// The object name is synchronized before any metadata journal that refers
+	// to it. Avoid forcing an fsync for every empty file creation.
+	r.markDirtyDirectory(filepath.Dir(destination))
 	keep = true
 	return id, nil
 }

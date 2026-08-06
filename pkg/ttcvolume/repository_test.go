@@ -15,12 +15,14 @@
 package ttcvolume
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func openTestManager(t *testing.T) *Manager {
@@ -106,7 +108,7 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	}
 }
 
-func TestPackedTreeNodesRecoverMissingLooseCache(t *testing.T) {
+func TestJournalRecoversMissingMaterializedMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("packed-nodes")
 	if err != nil {
@@ -124,12 +126,16 @@ func TestPackedTreeNodesRecoverMissingLooseCache(t *testing.T) {
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(filepath.Join(path, "nodes"))
-	if err != nil {
+	var branch Branch
+	if err := readJSON(filepath.Join(path, "branches", MainBranch+".json"), &branch); err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range entries {
-		if err := os.Remove(filepath.Join(path, "nodes", entry.Name())); err != nil {
+	for _, kind := range []string{"inodes", "dirents"} {
+		materialized := filepath.Join(path, "layers", branch.Root, kind)
+		if err := os.RemoveAll(materialized); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(materialized, 0700); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -147,6 +153,112 @@ func TestPackedTreeNodesRecoverMissingLooseCache(t *testing.T) {
 	}
 	if got := readAll(t, repo, MainBranch, ino); got != "packed" {
 		t.Fatalf("recovered data = %q, want packed", got)
+	}
+}
+
+func TestJournalDiscardsTornTailBeforeNextTransaction(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("torn-journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(repo.path, "layers", branch.Root, "journal")
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(journal, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("TTCJ\x80")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("torn-journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateRegular(MainBranch, RootInode, "after-crash", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("torn-journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if _, err := repo.Lookup(MainBranch, RootInode, "after-crash"); err != nil {
+		t.Fatalf("transaction after torn tail was not replayed: %v", err)
+	}
+}
+
+func TestFormatOneRepositoryMigratesInPlace(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := repo.emptyTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixNano()
+	root, err = repo.setInode(root, Inode{Number: RootInode, Type: "directory", Mode: 0755, Nlink: 2, CtimeNsec: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := repo.createObject("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyInode := uint64(42)
+	root, err = repo.setInode(root, Inode{Number: legacyInode, Type: "regular", Mode: 0644, Nlink: 1, Object: object, DataGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := json.Marshal(DirectoryEntry{Name: "legacy-file", Inode: legacyInode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err = repo.treeSet(root, entryKey(RootInode, "legacy-file"), entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.writeBranch(Branch{ID: MainBranch, Root: root, Generation: 1, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.atomicWriteFile("format", []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = manager.Open("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if got, err := repo.Lookup(MainBranch, RootInode, "legacy-file"); err != nil || got != legacyInode {
+		t.Fatalf("migrated lookup=(%d, %v), want (%d, nil)", got, err, legacyInode)
+	}
+	format, err := os.ReadFile(filepath.Join(repo.path, "format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(format) != "2\n" {
+		t.Fatalf("migrated format=%q, want 2", format)
 	}
 }
 
@@ -533,31 +645,40 @@ func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
 	}
 }
 
-func TestTreeMutationAppendsPackedPathAndForkWritesNoNodes(t *testing.T) {
+func TestMutationAppendsOneBoundedJournalTransactionAndForkCopiesNoMetadata(t *testing.T) {
 	repo, err := openTestManager(t).Create("tree")
 	if err != nil {
 		t.Fatal(err)
 	}
-	packSize := func() int64 {
+	journalSize := func(layer string) int64 {
 		t.Helper()
-		info, err := os.Stat(filepath.Join(repo.path, treeNodePackName))
+		info, err := os.Stat(filepath.Join(repo.path, "layers", layer, "journal"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return info.Size()
 	}
-	beforeFork := packSize()
+	before, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedSize := journalSize(before.Root)
 	if err := repo.Fork("main", "child"); err != nil {
 		t.Fatal(err)
 	}
-	if afterFork := packSize(); afterFork != beforeFork {
-		t.Fatalf("fork appended %d metadata bytes, want 0", afterFork-beforeFork)
+	if afterFork := journalSize(before.Root); afterFork != sealedSize {
+		t.Fatalf("fork changed sealed layer by %d bytes, want 0", afterFork-sealedSize)
 	}
+	child, err := repo.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeMutation := journalSize(child.Root)
 	if _, err := repo.CreateRegular("child", rootInode, "x", 0644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if delta := packSize() - beforeFork; delta <= 0 || delta > 1<<20 {
-		t.Fatalf("one mutation appended %d bytes, want bounded path-copy", delta)
+	if delta := journalSize(child.Root) - beforeMutation; delta <= 0 || delta > 4096 {
+		t.Fatalf("one mutation appended %d bytes, want one bounded transaction", delta)
 	}
 }
 
@@ -865,7 +986,7 @@ func TestImportSnapshotRejectsSymlinkMetadata(t *testing.T) {
 	}
 }
 
-func TestImportSnapshotRejectsSymlinkNode(t *testing.T) {
+func TestImportSnapshotRejectsSymlinkNamespaceMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	source, err := manager.Create("source")
 	if err != nil {
@@ -873,11 +994,10 @@ func TestImportSnapshotRejectsSymlinkNode(t *testing.T) {
 	}
 	defer source.Close()
 	snapshotPath := filepath.Join(t.TempDir(), "snapshot")
-	snapshot, err := source.ExportSnapshot(MainBranch, snapshotPath)
-	if err != nil {
+	if _, err := source.ExportSnapshot(MainBranch, snapshotPath); err != nil {
 		t.Fatal(err)
 	}
-	node := filepath.Join(snapshotPath, "nodes", snapshot.Root)
+	node := filepath.Join(snapshotPath, "metadata.json")
 	outside := filepath.Join(t.TempDir(), "outside-node")
 	data, err := os.ReadFile(node)
 	if err != nil {
