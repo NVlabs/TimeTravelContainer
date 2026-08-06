@@ -680,6 +680,51 @@ func TestMutationAppendsOneBoundedJournalTransactionAndForkCopiesNoMetadata(t *t
 	if delta := journalSize(child.Root) - beforeMutation; delta <= 0 || delta > 4096 {
 		t.Fatalf("one mutation appended %d bytes, want one bounded transaction", delta)
 	}
+	journal, err := os.Open(filepath.Join(repo.path, "layers", child.Root, "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, next, err := readMetadataTransaction(journal, beforeMutation)
+	journal.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != journalSize(child.Root) || len(transaction.Ops) != 2 {
+		t.Fatalf("create transaction ended at %d with %d ops, want end %d and 2 ops", next, len(transaction.Ops), journalSize(child.Root))
+	}
+}
+
+func TestCloseDrainsShardedMetadataMaterialization(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("materialized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "a-very-long-guest-name", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repo.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := repo.path
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, inodeMaterializedPath(branch.Root, ino)),
+		filepath.Join(root, entryMaterializedPath(branch.Root, RootInode, "a-very-long-guest-name")),
+		filepath.Join(root, "objects", meta.Object[:2], meta.Object[2:4], meta.Object),
+	} {
+		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("sharded record %q: info=%v err=%v", path, info, err)
+		}
+	}
 }
 
 func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {

@@ -237,6 +237,7 @@ type Repository struct {
 	dirtyMu    sync.Mutex
 	dirtyFiles map[string]struct{}
 	dirtyDirs  map[string]struct{}
+	knownDirs  map[string]struct{}
 
 	// metadata is the decoded view of each locally-used branch. The journal is
 	// authoritative; sharded inode and dentry files are rebuildable lookup
@@ -245,6 +246,26 @@ type Repository struct {
 	metadata   map[string]*branchMetadata
 	allocNext  uint64
 	allocEnd   uint64
+
+	operationMu sync.Mutex
+	lockFile    *os.File
+
+	materializeOnce sync.Once
+	materializeCh   chan materializeRequest
+	materializeWG   sync.WaitGroup
+
+	branchMu    sync.Mutex
+	branchCache map[string]cachedBranch
+	journalMu   sync.Mutex
+	journals    map[string]*os.File
+}
+
+type cachedBranch struct {
+	branch    Branch
+	device    uint64
+	inode     uint64
+	size      int64
+	mtimeNsec int64
 }
 
 // Create creates a new volume with an empty main branch.
@@ -517,6 +538,11 @@ func (r *Repository) Close() error {
 	if r == nil || r.dir == nil {
 		return nil
 	}
+	if r.materializeCh != nil {
+		close(r.materializeCh)
+		r.materializeWG.Wait()
+		r.materializeCh = nil
+	}
 	r.packMu.Lock()
 	var packErr error
 	if r.pack != nil {
@@ -524,10 +550,30 @@ func (r *Repository) Close() error {
 		r.pack = nil
 	}
 	r.packMu.Unlock()
+	r.journalMu.Lock()
+	var journalErr error
+	for layer, journal := range r.journals {
+		if err := journal.Close(); err != nil && journalErr == nil {
+			journalErr = fmt.Errorf("closing metadata journal %q: %w", layer, err)
+		}
+	}
+	r.journals = nil
+	r.journalMu.Unlock()
+	var lockErr error
+	if r.lockFile != nil {
+		lockErr = r.lockFile.Close()
+		r.lockFile = nil
+	}
 	err := r.dir.Close()
 	r.dir = nil
 	if packErr != nil {
 		return packErr
+	}
+	if lockErr != nil {
+		return lockErr
+	}
+	if journalErr != nil {
+		return journalErr
 	}
 	return err
 }
@@ -615,18 +661,19 @@ func (r *Repository) HostPath() string {
 }
 
 func (r *Repository) withLock(fn func() error) error {
-	lock, err := r.openFile("lock", os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
+	r.operationMu.Lock()
+	defer r.operationMu.Unlock()
+	if r.lockFile == nil {
+		lock, err := r.openFile("lock", os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return err
+		}
+		r.lockFile = lock
+	}
+	if err := unix.Flock(int(r.lockFile.Fd()), unix.LOCK_EX); err != nil {
 		return err
 	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	if err := r.readJSON("volume.json", &r.info); err != nil {
-		return err
-	}
+	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)
 	return fn()
 }
 
@@ -672,8 +719,19 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 	if err := validateName(id, "branch"); err != nil {
 		return Branch{}, err
 	}
+	name := filepath.Join("branches", id+".json")
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(r.dir.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return Branch{}, err
+	}
+	r.branchMu.Lock()
+	if cached, ok := r.branchCache[id]; ok && cached.device == uint64(stat.Dev) && cached.inode == stat.Ino && cached.size == stat.Size && cached.mtimeNsec == stat.Mtim.Sec*1e9+stat.Mtim.Nsec {
+		r.branchMu.Unlock()
+		return cached.branch, nil
+	}
+	r.branchMu.Unlock()
 	var branch Branch
-	if err := r.readJSON(filepath.Join("branches", id+".json"), &branch); err != nil {
+	if err := r.readJSON(name, &branch); err != nil {
 		return Branch{}, err
 	}
 	if branch.ID != id || branch.Root == "" || branch.Generation == 0 {
@@ -682,11 +740,26 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 	if err := normalizeBranchLayers(&branch); err != nil {
 		return Branch{}, err
 	}
+	r.branchMu.Lock()
+	if r.branchCache == nil {
+		r.branchCache = make(map[string]cachedBranch)
+	}
+	r.branchCache[id] = cachedBranch{
+		branch: branch, device: uint64(stat.Dev), inode: stat.Ino,
+		size: stat.Size, mtimeNsec: stat.Mtim.Sec*1e9 + stat.Mtim.Nsec,
+	}
+	r.branchMu.Unlock()
 	return branch, nil
 }
 
 func (r *Repository) writeBranch(branch Branch) error {
-	return r.writeJSONAtomic(filepath.Join("branches", branch.ID+".json"), branch)
+	if err := r.writeJSONAtomic(filepath.Join("branches", branch.ID+".json"), branch); err != nil {
+		return err
+	}
+	r.branchMu.Lock()
+	delete(r.branchCache, branch.ID)
+	r.branchMu.Unlock()
+	return nil
 }
 
 // Branch returns a branch root.

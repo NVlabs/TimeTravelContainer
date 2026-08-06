@@ -308,10 +308,6 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 	if err := normalizeBranchLayers(&branch); err != nil {
 		return nil, err
 	}
-	layers, err := r.metadataLayers(branch.Root)
-	if err != nil {
-		return nil, err
-	}
 	r.metadataMu.Lock()
 	defer r.metadataMu.Unlock()
 	if r.metadata == nil {
@@ -319,28 +315,32 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 	}
 	if state := r.metadata[branch.ID]; state != nil {
 		state.mu.RLock()
-		sameChain := sameLayers(state.layers, layers)
-		knownSizes := make(map[string]int64, len(state.layerSizes))
-		for layer, size := range state.layerSizes {
-			knownSizes[layer] = size
-		}
+		sameRoot := state.branch.Root == branch.Root
+		knownSize := state.layerSizes[branch.Root]
+		layers := append([]string(nil), state.layers...)
 		state.mu.RUnlock()
-		if !sameChain {
-			goto reload
-		}
-		current, err := r.metadataLayerSizes(layers)
-		if err != nil {
-			return nil, err
-		}
-		if sameLayerSizes(knownSizes, current) {
-			state.mu.Lock()
-			state.branch = branch
-			state.mu.Unlock()
-			return state, nil
+		if sameRoot {
+			current, err := r.metadataLayerSizes([]string{branch.Root})
+			if err != nil {
+				return nil, err
+			}
+			if current[branch.Root] == knownSize {
+				state.mu.Lock()
+				state.branch = branch
+				state.mu.Unlock()
+				return state, nil
+			}
+			return r.reloadBranchMetadata(branch, layers)
 		}
 	}
+	layers, err := r.metadataLayers(branch.Root)
+	if err != nil {
+		return nil, err
+	}
+	return r.reloadBranchMetadata(branch, layers)
+}
 
-reload:
+func (r *Repository) reloadBranchMetadata(branch Branch, layers []string) (*branchMetadata, error) {
 	state := newBranchMetadata(branch)
 	state.layers = layers
 	for _, layer := range layers {
@@ -360,39 +360,14 @@ reload:
 	return state, nil
 }
 
-func sameLayers(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func sameLayerSizes(a, b map[string]int64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for layer, size := range a {
-		if b[layer] != size {
-			return false
-		}
-	}
-	return true
-}
-
 func (r *Repository) metadataLayerSizes(layers []string) (map[string]int64, error) {
 	sizes := make(map[string]int64, len(layers))
 	for _, layer := range layers {
-		file, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDONLY, 0)
+		file, err := r.metadataJournal(layer)
 		if err != nil {
 			return nil, err
 		}
 		info, err := file.Stat()
-		file.Close()
 		if err != nil {
 			return nil, err
 		}
@@ -402,11 +377,10 @@ func (r *Repository) metadataLayerSizes(layers []string) (map[string]int64, erro
 }
 
 func (r *Repository) replayMetadataLayer(layer string, state *branchMetadata) (int64, uint64, error) {
-	file, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDONLY, 0)
+	file, err := r.metadataJournal(layer)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer file.Close()
 	var offset int64
 	var sequence uint64
 	for {
@@ -426,6 +400,26 @@ func (r *Repository) replayMetadataLayer(layer string, state *branchMetadata) (i
 		sequence = transaction.Sequence
 		offset = next
 	}
+}
+
+func (r *Repository) metadataJournal(layer string) (*os.File, error) {
+	if !validID(layer) {
+		return nil, fmt.Errorf("invalid metadata layer %q", layer)
+	}
+	r.journalMu.Lock()
+	defer r.journalMu.Unlock()
+	if journal := r.journals[layer]; journal != nil {
+		return journal, nil
+	}
+	journal, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	if r.journals == nil {
+		r.journals = make(map[string]*os.File)
+	}
+	r.journals[layer] = journal
+	return journal, nil
 }
 
 func readMetadataTransaction(file *os.File, offset int64) (metadataTransaction, int64, error) {
@@ -479,41 +473,33 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	binary.LittleEndian.PutUint32(record[8:12], crc32.ChecksumIEEE(payload))
 	copy(record[metadataJournalHeaderSize:], payload)
 	journalName := filepath.Join("layers", branch.Root, "journal")
-	journal, err := r.openFile(journalName, os.O_RDWR, 0)
+	journal, err := r.metadataJournal(branch.Root)
 	if err != nil {
 		return err
 	}
 	info, err := journal.Stat()
 	if err != nil {
-		journal.Close()
 		return err
 	}
 	if info.Size() != durableEnd {
 		// Recovery deliberately ignores a torn final record. Remove that tail
 		// before appending so it cannot hide all subsequent transactions.
 		if info.Size() < durableEnd {
-			journal.Close()
 			return fmt.Errorf("metadata journal shrank from %d to %d", durableEnd, info.Size())
 		}
 		if err := journal.Truncate(durableEnd); err != nil {
-			journal.Close()
 			return err
 		}
 	}
 	if _, err := journal.Seek(0, io.SeekEnd); err != nil {
-		journal.Close()
 		return err
 	}
 	written, err := journal.Write(record)
-	closeErr := journal.Close()
 	if err != nil {
 		return err
 	}
 	if written != len(record) {
 		return io.ErrShortWrite
-	}
-	if closeErr != nil {
-		return closeErr
 	}
 	state.mu.Lock()
 	if err := applyMetadataOps(state, ops); err != nil {
@@ -525,14 +511,10 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	state.branch = *branch
 	state.mu.Unlock()
 	r.markDirtyFile(journalName)
-	// Materialized records are deliberately not synchronization points. The
-	// journal replays whole transactions after a crash and repairs any partial
-	// cache update.
-	for _, op := range ops {
-		if err := r.materializeMetadataOp(branch.Root, transaction.Sequence, op); err != nil {
-			return err
-		}
-	}
+	// Materialized records are deliberately not synchronization points. Apply
+	// them off the guest syscall path; the journal replays whole transactions
+	// after a crash and repairs any partial cache update.
+	r.enqueueMaterialization(branch.Root, transaction.Sequence, ops)
 	return nil
 }
 
@@ -571,6 +553,49 @@ type materializedMetadata struct {
 	Op       metadataOp `json:"op"`
 }
 
+type materializeRequest struct {
+	layer    string
+	sequence uint64
+	ops      []metadataOp
+}
+
+func (r *Repository) enqueueMaterialization(layer string, sequence uint64, ops []metadataOp) {
+	r.materializeOnce.Do(func() {
+		r.materializeCh = make(chan materializeRequest, 65536)
+		r.materializeWG.Add(1)
+		go func() {
+			defer r.materializeWG.Done()
+			for request := range r.materializeCh {
+				for _, op := range request.ops {
+					// Materialized files are only a rebuildable lookup cache. A
+					// failure never changes the committed journal transaction and
+					// replay can repair or regenerate the cache later.
+					_ = r.materializeMetadataOp(request.layer, request.sequence, op)
+				}
+			}
+		}()
+	})
+	cloned := make([]metadataOp, len(ops))
+	for i, op := range ops {
+		cloned[i] = op
+		if op.Inode != nil {
+			inode := *op.Inode
+			if op.Inode.Xattrs != nil {
+				inode.Xattrs = make(map[string]string, len(op.Inode.Xattrs))
+				for name, value := range op.Inode.Xattrs {
+					inode.Xattrs[name] = value
+				}
+			}
+			cloned[i].Inode = &inode
+		}
+		if op.Entry != nil {
+			entry := *op.Entry
+			cloned[i].Entry = &entry
+		}
+	}
+	r.materializeCh <- materializeRequest{layer: layer, sequence: sequence, ops: cloned}
+}
+
 func (r *Repository) materializeMetadataOp(layer string, sequence uint64, op metadataOp) error {
 	var name string
 	switch op.Kind {
@@ -604,10 +629,11 @@ func entryMaterializedPath(layer string, parent uint64, name string) string {
 	hash := sha256.Sum256([]byte(name))
 	encoded := hex.EncodeToString(hash[:])
 	parentHex := fmt.Sprintf("%016x", parent)
-	// Shard first by parent inode and then by a stable two-byte name prefix;
-	// no repository directory grows with the total guest namespace size.
-	nameShard := encoded[:4]
-	return filepath.Join("layers", layer, "dirents", parentHex[:2], parentHex[2:4], parentHex, nameShard, encoded+".json")
+	// Parent inodes are sharded across the repository; entries in one virtual
+	// directory share a host directory. Modern host filesystems index such
+	// directories efficiently, and avoiding a mostly-empty hash-bucket
+	// directory per guest name is important for package-install workloads.
+	return filepath.Join("layers", layer, "dirents", parentHex[:2], parentHex[2:4], parentHex, encoded+".json")
 }
 
 func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, error) {
@@ -645,6 +671,11 @@ func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) []D
 
 func (r *Repository) allocateInodeLocked() (uint64, error) {
 	if r.allocNext == r.allocEnd {
+		// Refresh only when reserving a new lease. Ordinary metadata operations
+		// do not need to decode the repository-wide allocator record.
+		if err := r.readJSON("volume.json", &r.info); err != nil {
+			return 0, err
+		}
 		start := r.info.NextInode
 		if start <= rootInode {
 			start = rootInode + 1
@@ -686,11 +717,29 @@ func (r *Repository) mkdir(name string, mode fs.FileMode) error {
 	if err := validateInternalPath(name); err != nil {
 		return err
 	}
+	r.dirtyMu.Lock()
+	if _, ok := r.knownDirs[name]; ok {
+		r.dirtyMu.Unlock()
+		return nil
+	}
+	r.dirtyMu.Unlock()
 	err := unix.Mkdirat(int(r.dir.Fd()), name, uint32(mode.Perm()))
+	created := err == nil
 	if err != nil && !errors.Is(err, syscall.EEXIST) {
 		return err
 	}
-	r.markDirtyDirectory(filepath.Dir(name))
+	r.dirtyMu.Lock()
+	if r.knownDirs == nil {
+		r.knownDirs = make(map[string]struct{})
+	}
+	r.knownDirs[name] = struct{}{}
+	if created {
+		if r.dirtyDirs == nil {
+			r.dirtyDirs = make(map[string]struct{})
+		}
+		r.dirtyDirs[filepath.Dir(name)] = struct{}{}
+	}
+	r.dirtyMu.Unlock()
 	return nil
 }
 
