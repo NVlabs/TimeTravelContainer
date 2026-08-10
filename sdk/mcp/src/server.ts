@@ -144,6 +144,8 @@ export function createServer(client = new Client()): McpServer {
   for (const [name, description] of [
     ["pause", "Pause a running TTC branch."],
     ["resume", "Resume a paused TTC branch."],
+    ["dehydrate", "Persist and evict a TTC branch's private runtime state."],
+    ["rehydrate", "Restore a dehydrated TTC branch."],
     ["stop", "Stop a TTC container branch."],
   ] as const) {
     server.registerTool(

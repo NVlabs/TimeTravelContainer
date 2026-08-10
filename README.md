@@ -77,6 +77,8 @@ and kernel objects rather than the amount of resident application memory.
 ### Live container branching
 
 - Pause and resume a running branch.
+- Dehydrate a branch to durable storage, release its guest runtime state, and
+  rehydrate it later in the same family.
 - Fork a branch into a running or initially paused child.
 - Fork children again to build a tree of experiments.
 - Save one live or paused branch to a checkpoint file and restore it later as
@@ -101,8 +103,8 @@ The `ttc` command provides a Docker-like interface:
   and `rm`
 - Interaction: `exec`, `attach`, `logs`, and `cp`
 - Inspection: `inspect`, `ps`, `top`, and `events`
-- Branching: `fork`, `pause`, `resume`, `checkpoint`, `restore`, `branch rm`,
-  and `ls --tree`
+- Branching: `fork`, `pause`, `resume`, `dehydrate`, `rehydrate`, `checkpoint`,
+  `restore`, `branch rm`, and `ls --tree`
 - Storage: `volume create`, `volume ls`, `volume inspect`, and `volume rm`
 - Shell completion for Bash, Zsh, and Fish
 
@@ -418,6 +420,14 @@ ttc pause demo@test-a
 ttc resume demo@test-a
 ```
 
+Move a branch's private runtime state to durable storage, then bring
+it back without removing it from the fork tree:
+
+```sh
+ttc dehydrate demo@test-a
+ttc rehydrate demo@test-a
+```
+
 Copy files between the host and a running, paused, or fully stopped branch:
 
 ```sh
@@ -438,10 +448,13 @@ ttc stop demo
 ttc rm --force demo
 ```
 
-Stop the daemon when it is no longer needed:
+Daemon shutdown never guesses what to do with active branches. Stop them, or
+choose an explicit shutdown policy:
 
 ```sh
 ttc daemon stop
+ttc daemon stop --dehydrate-all
+ttc daemon stop --stop-all
 ```
 
 ## SDKs and agent integration
@@ -504,6 +517,16 @@ checkpoint containing all container memory.
 For implementation details, see the
 [live-fork design](g3doc/proposals/timetravel_live_fork.md).
 
+Dehydration is family-preserving hibernation. TTC writes a branch's private
+runtime state to its data root, releases its guest kernel/task graph and
+private application-memory mappings, and leaves a `dehydrated` node in the
+same fork tree. Rehydration reconstructs that node with the same filesystem
+ancestry and copy-on-write relationships. Pages shared only by dehydrated
+siblings are persisted and reclaimable; pages still used by a live sibling
+remain shared in memory. This also composes with distributed fork: TTC first
+drains any pages the branch still depends on from a remote source, then
+persists the now-local state.
+
 Durable checkpointing is a separate, explicitly requested operation. It
 captures one selected branch's process, memory, filesystem, and supported
 runtime state in a file. The immutable OCI image is identified by its exact
@@ -517,6 +540,11 @@ container family with no ancestry or mutable storage shared with the source.
   Network performance, especially for large payloads, will be reduced.
 - Branches in one family share a runtime process, so a runtime failure can
   affect the whole family.
+- Dehydration currently retains a small Sentry control shell and the read-only
+  filesystem transport needed to rehydrate after `ttcd` exits. Guest tasks,
+  guest kernel objects, and private application-memory mappings are released,
+  but this is not yet a process-free cold archive. Use a checkpoint for a
+  portable standalone file.
 - Fork duration depends on the number of processes, mappings, and resources.
   It is not universally constant time.
 - Some resources connected directly to the host or another container cannot be

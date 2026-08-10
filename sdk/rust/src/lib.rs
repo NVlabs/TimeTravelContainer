@@ -270,6 +270,14 @@ impl Client {
         self.command(["resume", target])
     }
 
+    pub fn dehydrate(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["dehydrate", target])
+    }
+
+    pub fn rehydrate(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["rehydrate", target])
+    }
+
     pub fn stop(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["stop", target])
     }

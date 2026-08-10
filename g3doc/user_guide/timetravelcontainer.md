@@ -1,9 +1,9 @@
 # TimeTravelContainer user guide
 
 TimeTravelContainer (TTC) is an experimental, rootless container manager built
-on a modified gVisor userspace kernel. In addition to Docker-like image and container
-commands, TTC can pause, resume, and live-fork a running container into
-multiple branches inside one Sentry process.
+on a modified gVisor userspace kernel. In addition to Docker-like image and
+container commands, TTC can pause, resume, dehydrate, rehydrate, and live-fork
+a running container into multiple branches inside one Sentry process.
 
 TTC is currently intended for trusted development and integration-test
 workloads. It is not yet a general Docker replacement or a production security
@@ -363,11 +363,61 @@ Distributed live fork currently targets one remote node per command. Use a
 durable checkpoint for offline transfer or for TTC installations that do not
 share a repository and trust configuration.
 
+## Dehydrate and rehydrate
+
+Dehydration hibernates a branch inside its existing family. It is useful when
+the branch must remain available in the fork tree but should stop consuming
+private application memory and active guest-kernel resources:
+
+```shell
+ttc dehydrate web@test-a
+ttc ls --tree
+ttc rehydrate web@test-a
+```
+
+A running branch is paused atomically before capture; a paused branch remains
+paused. Rehydrating a branch returns it to the state it had before dehydration:
+formerly running branches run, while formerly paused branches remain paused.
+Its persistent root filesystem, volumes, ancestry, and copy-on-write sharing
+with siblings are unchanged.
+
+TTC tracks page ownership across the entire family. A page used only by one or
+more dehydrated branches is synchronized to the application-memory backing
+file and may be reclaimed from host RAM. A page also referenced by a live
+branch stays resident and copy-on-write shared. Rehydrating any owner faults
+the persisted bytes back on demand without making private copies for its
+dehydrated siblings.
+
+For a distributed child that still reads memory from its source node,
+dehydration first drains every outstanding page over the page-transfer
+connection. Only then does TTC persist and release the child's local runtime,
+so the dehydrated branch has no remaining remote-memory dependency. Concurrent
+remote reads are quiesced as part of that transition.
+
+Dehydration and checkpointing solve different problems:
+
+| | Dehydration | Checkpoint |
+|---|---|---|
+| Result | The same branch remains in its family tree | A standalone archive file |
+| Restore identity | Rehydrates the original branch | Creates a new unrelated family |
+| Filesystem relationship | Keeps existing branch ancestry and CoW sharing | Imports private writable repositories |
+| Portability | Internal to the same TTC data root and compatible build | Intended for explicit transfer, subject to image/build compatibility |
+| Immutable image | Referenced from the existing family | Locked by exact recorded digest |
+
+Dehydration persists task, kernel, internal-resource, tmpfs, and private-memory
+state rather than merely writing anonymous pages. It releases the guest task
+and kernel graph and private application-memory mappings. The current
+implementation intentionally retains a small Sentry control shell and its
+read-only filesystem transport so rehydration remains possible after `ttcd`
+has exited; it is therefore not yet a process-free cold archive. A checkpoint
+is the appropriate representation when a single portable file or an unrelated
+restored family is required.
+
 ## Durable checkpoint and restore
 
 `ttc fork` is the fast, in-memory operation for creating another branch in the
 same live family. Use `ttc checkpoint` when the state must survive removal of
-the source container or a daemon restart:
+the source container or must be exported as one standalone file:
 
 ```shell
 ttc checkpoint web@test-a web-test-a.ttc
@@ -754,14 +804,21 @@ direct mutations with daemon-mediated commands against the same data root.
 Durable mutation records can be inspected with `ttc daemon requests` after an
 interrupted operation.
 
-`ttc daemon stop` is an orderly manager shutdown: it resumes paused branches,
-stops descendants before their source branches using each container's normal
-stop policy, and then exits the daemon. Rootfs and managed-volume writes were
-already applied directly to their repositories; shutdown performs no TTC
-save/export step. If a stop fails, the daemon remains available and reports
-the failure. In contrast, an unexpected `ttcd` crash does not terminate Sentry
-sandboxes; after restarting the daemon, TTC reconciles those live containers
-and their console/port sidecars.
+`ttc daemon stop` refuses to exit while any branch is running, paused,
+dehydrating, or rehydrating. Choose the desired policy explicitly:
+
+```shell
+ttc daemon stop --dehydrate-all  # hibernate every live branch, then exit
+ttc daemon stop --stop-all       # stop every live branch, then exit
+```
+
+`--dehydrate-all` waits for all captures, including any required remote-page
+drain, before stopping the daemon. If any transition fails, the daemon remains
+available and reports the failure. Dehydrated families remain visible after a
+later daemon start and may be rehydrated individually. In contrast, an
+unexpected `ttcd` crash does not terminate live Sentry sandboxes; after
+restarting the daemon, TTC reconciles those containers and their console/port
+sidecars.
 
 ## Shell completion
 

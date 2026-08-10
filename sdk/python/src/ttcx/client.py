@@ -153,6 +153,12 @@ class Client:
     def resume(self, target: str) -> Result:
         return self.command(["resume", target])
 
+    def dehydrate(self, target: str) -> Result:
+        return self.command(["dehydrate", target])
+
+    def rehydrate(self, target: str) -> Result:
+        return self.command(["rehydrate", target])
+
     def stop(self, target: str) -> Result:
         return self.command(["stop", target])
 

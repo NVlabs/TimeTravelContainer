@@ -38,6 +38,8 @@ ttc.pull("alpine:3.20").check()
 ttc.run("alpine:3.20", ["sleep", "infinity"],
         options=["-d", "--name", "demo"]).check()
 ttc.fork("demo", "demo@experiment").check()
+ttc.dehydrate("demo@experiment").check()
+ttc.rehydrate("demo@experiment").check()
 
 for family in ttc.list():
     print(family)

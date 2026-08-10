@@ -38,7 +38,8 @@ The environment entry is optional when the host inherits the same
 ## Tools
 
 The server provides `ttc_status`, `ttc_list`, `ttc_inspect`, `ttc_pull`,
-`ttc_run`, `ttc_exec`, `ttc_fork`, `ttc_pause`, `ttc_resume`, `ttc_stop`, and
+`ttc_run`, `ttc_exec`, `ttc_fork`, `ttc_pause`, `ttc_resume`, `ttc_dehydrate`,
+`ttc_rehydrate`, `ttc_stop`, and
 `ttc_remove`. `ttc_command` provides the rest of TTC's non-interactive command
 surface.
 

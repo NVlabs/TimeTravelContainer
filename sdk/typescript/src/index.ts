@@ -185,6 +185,14 @@ export class Client {
     return this.command(["resume", target]);
   }
 
+  dehydrate(target: string): Promise<Result> {
+    return this.command(["dehydrate", target]);
+  }
+
+  rehydrate(target: string): Promise<Result> {
+    return this.command(["rehydrate", target]);
+  }
+
   stop(target: string): Promise<Result> {
     return this.command(["stop", target]);
   }
