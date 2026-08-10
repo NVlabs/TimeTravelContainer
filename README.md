@@ -117,7 +117,8 @@ and does not require a Docker or containerd daemon.
 ### Rootless images and containers
 
 - Pull and fully prepare images using familiar names such as `alpine:3.20`.
-- Select image tags, digests, and multi-architecture variants.
+- Select image tags and digests; multi-architecture manifests automatically
+  resolve to the daemon host's native architecture.
 - Use Docker configuration files and credential helpers for authenticated
   registries.
 - See human-readable download, reuse, and extraction progress.
@@ -253,6 +254,29 @@ ttc daemon start --unsafe-no-host-isolation
 The daemon uses one isolation mode for its entire lifetime. Stop it before
 changing modes.
 
+### Runtime platform
+
+TTC uses gVisor's `systrap` execution platform by default. It requires no
+hardware virtualization support and is the portable choice for nested and
+legacy environments:
+
+```sh
+ttc daemon start
+```
+
+On a host with usable KVM, select gVisor's KVM platform for every container
+owned by that daemon:
+
+```sh
+test -r /dev/kvm && test -w /dev/kvm
+ttc daemon start --platform=kvm
+```
+
+The daemon validates `/dev/kvm` during startup and reports the selected
+`runtime_platform` in `ttc daemon status`. The setting belongs to the daemon;
+`run` and `create` do not select an execution platform or emulate a different
+CPU architecture. Stop the daemon before changing platforms.
+
 ### Reflink storage
 
 By default, the TTC data root must reside on a filesystem with working
@@ -336,6 +360,9 @@ Start the per-user daemon:
 ttc daemon start
 ttc daemon status
 ```
+
+To use the optional KVM runtime on a host that exposes `/dev/kvm`, start it as
+`ttc daemon start --platform=kvm` instead.
 
 Pull and run an image:
 
@@ -512,8 +539,9 @@ container family with no ancestry or mutable storage shared with the source.
   at the same time.
 - TTC does not yet implement the Docker Engine API, Compose, Swarm, general
   device or accelerator passthrough, or Docker named networks.
-- One image reference currently records one selected platform. Image signature,
-  attestation, and content-trust policy are not yet implemented.
+- Containers run the image variant matching the daemon host's OS and CPU
+  architecture; TTC does not provide cross-architecture CPU emulation. Image
+  signature, attestation, and content-trust policy are not yet implemented.
 - Cross-node live fork currently requires mutually authenticated `ttcd` peers,
   a common TTC repository and image content, and a reachable page-transfer
   network. A durable checkpoint remains the portable option for unrelated TTC

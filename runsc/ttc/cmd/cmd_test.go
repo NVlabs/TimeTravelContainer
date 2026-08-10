@@ -1298,6 +1298,25 @@ func TestWritableHostMountsDefaultToManagedCoW(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateRejectImagePlatformOverride(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--platform", "linux/arm64", "busybox"},
+		{"create", "--platform=linux/arm64", "busybox"},
+	} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand(args, &stdout, &stderr, b); status != 1 {
+			t.Errorf("runCommand(%q) status=%d, want 1", args, status)
+		}
+		if b.runRequest.reference != "" {
+			t.Errorf("runCommand(%q) invoked backend with %+v", args, b.runRequest)
+		}
+		if !strings.Contains(stderr.String(), "flag provided but not defined: -platform") {
+			t.Errorf("runCommand(%q) stderr=%q, want unsupported platform flag", args, stderr.String())
+		}
+	}
+}
+
 func TestRunRejectsInvalidFilesystemMounts(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--tmpfs", "relative", "busybox"},
@@ -2524,15 +2543,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHardened := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHost := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := []string{"--root", "/runtime", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
+	wantTTCNAT := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -2541,7 +2560,7 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
 	wantUnsafe := []string{
-		"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true",
+		"--root", "/runtime", "--platform=systrap", "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
 	}
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
@@ -2550,6 +2569,11 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	wantOldKernel := append(append([]string(nil), wantHardened...), "--gso=false")
 	if got := (&runtimeBackend{root: "/runtime", disableHostGSO: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantOldKernel) {
 		t.Errorf("old-kernel runsc args=%q, want %q", got, wantOldKernel)
+	}
+	wantKVM := append([]string(nil), wantHardened...)
+	wantKVM[2] = "--platform=kvm"
+	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
+		t.Errorf("KVM runsc args=%q, want %q", got, wantKVM)
 	}
 }
 
@@ -3660,7 +3684,8 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		notWant string
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
-		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--allow-slow-volume-copy", "--unsafe-no-host-isolation"}},
+		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--allow-slow-volume-copy", "--platform", "--unsafe-no-host-isolation"}},
+		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: []string{"kvm", "systrap"}},
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},

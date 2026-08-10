@@ -1,6 +1,6 @@
 # TimeTravelContainer `ttc` product and CLI roadmap
 
-Status: implemented for the documented rootless systrap scope. The original
+Status: implemented for the documented systrap and KVM scope. The original
 tmpfs-plus-tar managed-volume prototype was removed before release and replaced
 by the direct-to-disk `ttcvol` filesystem specified in
 [ttc_disk_backed_volumes.md](ttc_disk_backed_volumes.md).

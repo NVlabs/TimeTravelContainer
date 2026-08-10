@@ -26,6 +26,10 @@ Docker, containerd, CRIU, KVM, and a containerd snapshotter are not required.
 TTC talks directly to OCI registries and stores image content under its own
 data root.
 
+The default `systrap` runtime needs no hardware virtualization. On a host that
+exposes a usable `/dev/kvm`, `ttc daemon start --platform=kvm` selects gVisor's
+KVM runtime for all containers owned by that daemon.
+
 ## Host requirements
 
 TTC builds and runs on Linux x86-64 and ARM64. Build with the Bazel version in
@@ -88,8 +92,19 @@ ttc run --rm busybox:1.36 echo hello
 Isolation mode is fixed for the lifetime of that daemon. All ordinary commands
 inherit it, so do not repeat the flag on `run`, `exec`, or other operations.
 `ttc daemon status` reports `isolation_mode` and
-`unsafe_no_host_isolation`. Stop and explicitly restart the daemon to change
-isolation or volume-copy modes. Ordinary commands do not autostart the service; if it is absent, they
+`unsafe_no_host_isolation`. It also reports `runtime_platform`, which defaults
+to `systrap`. To use KVM instead:
+
+```shell
+test -r /dev/kvm && test -w /dev/kvm
+ttc daemon start --platform=kvm
+```
+
+The KVM device is checked during daemon startup. Platform selection is
+daemon-wide; `ttc run` and `ttc create` always use the daemon's native CPU
+architecture and runtime platform. TTC does not emulate foreign CPU
+architectures. Stop and explicitly restart the daemon to change isolation,
+volume-copy, or runtime-platform modes. Ordinary commands do not autostart the service; if it is absent, they
 tell you to run `ttc daemon start`.
 
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but
@@ -724,12 +739,15 @@ ttc daemon status
 ttc daemon stop
 ```
 
-One daemon uses one isolation mode across every data root it serves. Start it
-without an option for normal rootless host isolation, or use
+One daemon uses one runtime platform and one isolation mode across every data
+root it serves. Start it without an option for systrap and normal rootless host
+isolation, use `ttc daemon start --platform=kvm` when `/dev/kvm` is available,
+or use
 `ttc daemon start --unsafe-no-host-isolation` for trusted workloads on a host
 that cannot create an unprivileged user namespace. An explicit start request
 does not reconfigure an already-running daemon; stop it first if you want to
-change modes. `daemon status` returns the active mode in JSON.
+change modes. `daemon status` returns the active platform and isolation mode in
+JSON.
 
 `--direct` bypasses `ttcd` for recovery and debugging. Do not routinely mix
 direct mutations with daemon-mediated commands against the same data root.

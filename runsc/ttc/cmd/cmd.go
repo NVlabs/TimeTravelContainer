@@ -72,6 +72,7 @@ type options struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	allowSlowVolumeCopy   bool
@@ -156,6 +157,7 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 		root:             runtimeRoot(),
 		runsc:            runscPath(),
 		dataRoot:         dataRoot(),
+		runtimePlatform:  runtimePlatformFromEnvironment(),
 		daemonSocket:     defaultDaemonSocket(),
 		clientExecutable: currentExecutable(),
 	}
@@ -329,7 +331,8 @@ Commands:
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
-  daemon start [--unsafe-no-host-isolation] [--allow-slow-volume-copy]
+  daemon start [--platform systrap|kvm] [--unsafe-no-host-isolation]
+               [--allow-slow-volume-copy]
                [--cluster-listen ADDR --cluster-node-id ID
                 --cluster-repository-id ID --cluster-cert FILE
                 --cluster-key FILE --cluster-ca FILE]
@@ -351,7 +354,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"branch":     "Usage: ttc branch rm TARGET [TARGET...]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon":     "Usage: ttc daemon start [isolation/volume/cluster options]|status|stop|requests|request",
+			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttc pause TARGET [TARGET...]",
 			"resume":     "Usage: ttc resume TARGET [TARGET...]",
@@ -1381,7 +1384,6 @@ func parseNanoCPUs(value string) (int64, error) {
 type runRequest struct {
 	name               string
 	reference          string
-	platform           string
 	pullPolicy         string
 	args               []string
 	env                []string
@@ -1470,11 +1472,10 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
-	platform := fs.String("platform", "", "target platform, such as linux/amd64")
 	pullPolicy := fs.String("pull", "missing", "pull policy: missing, always, or never")
 	detach := fs.Bool("detach", false, "run in the background")
 	fs.BoolVar(detach, "d", false, "run in the background")
@@ -1671,7 +1672,6 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
-		platform:           *platform,
 		pullPolicy:         *pullPolicy,
 		args:               append([]string(nil), fs.Args()[1:]...),
 		env:                envValues,
@@ -1736,11 +1736,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--platform", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
-	platform := fs.String("platform", "", "target platform, such as linux/amd64")
 	pullPolicy := fs.String("pull", "missing", "pull policy: missing, always, or never")
 	interactive := fs.Bool("interactive", false, "keep stdin open")
 	fs.BoolVar(interactive, "i", false, "keep stdin open")
@@ -1935,7 +1934,6 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	request := runRequest{
 		name:               containerName,
 		reference:          fs.Arg(0),
-		platform:           *platform,
 		pullPolicy:         *pullPolicy,
 		args:               append([]string(nil), fs.Args()[1:]...),
 		env:                envValues,
@@ -4633,6 +4631,7 @@ type runtimeBackend struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	allowSlowVolumeCopy   bool
@@ -5018,7 +5017,6 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
-		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
 		LogDriver:          request.logDriver,
 		LogOptions:         request.logOptions,
@@ -5091,7 +5089,6 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
-		Platform:           request.platform,
 		PullPolicy:         request.pullPolicy,
 		LogDriver:          request.logDriver,
 		LogOptions:         request.logOptions,
@@ -5197,6 +5194,12 @@ func (b *runtimeBackend) scheduleAutoRemove(id string) error {
 	}
 	defer errorLog.Close()
 	command := exec.Command(executable, args...)
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "TTC_RUNTIME_PLATFORM=") {
+			command.Env = append(command.Env, value)
+		}
+	}
+	command.Env = append(command.Env, "TTC_RUNTIME_PLATFORM="+b.runtimePlatform)
 	command.Stdin = devNull
 	command.Stdout = devNull
 	command.Stderr = errorLog
@@ -6902,8 +6905,13 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkNAT(networkMode string, ne
 }
 
 func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string, networkNAT bool, networkIP, networkMAC string) []string {
+	runtimePlatform := b.runtimePlatform
+	if runtimePlatform == "" {
+		runtimePlatform = defaultRuntimePlatform
+	}
 	args := []string{
 		"--root", b.root,
+		"--platform=" + runtimePlatform,
 	}
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")

@@ -48,6 +48,7 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 		root:                  "/run/ttc/runsc",
 		runsc:                 "/opt/ttc/bin/ttcd",
 		dataRoot:              "/var/lib/ttc",
+		runtimePlatform:       "kvm",
 		clientExecutable:      "/opt/ttc/bin/ttc",
 		unsafeNoHostIsolation: true,
 		disableHostGSO:        true,
@@ -64,6 +65,9 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
 		t.Errorf("client executable=%q, want %q", got, want)
+	}
+	if got, want := opts.runtimePlatform, "kvm"; got != want {
+		t.Errorf("runtime platform=%q, want %q", got, want)
 	}
 	if !opts.unsafeNoHostIsolation {
 		t.Error("unsafe-no-host-isolation daemon mode was not applied")
@@ -135,6 +139,51 @@ func TestHostKernelCompatibility(t *testing.T) {
 				t.Errorf("evaluateHostKernelCompatibility(%q)=%+v, want version=%+v disableHostGSO=%t", test.release, compatibility, test.version, test.disableHostGSO)
 			}
 		})
+	}
+}
+
+func TestRuntimePlatformValidation(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+		ok    bool
+	}{
+		{value: "systrap", want: "systrap", ok: true},
+		{value: "KVM", want: "kvm", ok: true},
+		{value: "ptrace"},
+		{value: ""},
+	} {
+		got, err := normalizeRuntimePlatform(test.value)
+		if test.ok {
+			if err != nil || got != test.want {
+				t.Errorf("normalizeRuntimePlatform(%q)=(%q, %v), want %q", test.value, got, err, test.want)
+			}
+		} else if err == nil {
+			t.Errorf("normalizeRuntimePlatform(%q)=%q, want error", test.value, got)
+		}
+	}
+}
+
+func TestDaemonKVMPreflightFailure(t *testing.T) {
+	original := daemonPlatformPreflight
+	defer func() { daemonPlatformPreflight = original }()
+	var gotPlatform string
+	daemonPlatformPreflight = func(platform string) error {
+		gotPlatform = platform
+		return errors.New("test KVM unavailable")
+	}
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{"--platform=kvm", "--socket", filepath.Join(t.TempDir(), "ttcd.sock")}, &stdout, &stderr)
+	if status != 1 || gotPlatform != "kvm" || !strings.Contains(stderr.String(), "test KVM unavailable") {
+		t.Fatalf("KVM preflight: status=%d platform=%q stdout=%q stderr=%q", status, gotPlatform, stdout.String(), stderr.String())
+	}
+}
+
+func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
+	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "supported platforms are systrap and kvm") {
+		t.Fatalf("unsupported platform: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 }
 
@@ -533,7 +582,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	dataRoot := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
+		done <- serveDaemon(socket, "kvm", true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -575,6 +624,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 
 	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
 	if status != 0 ||
+		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
 		!strings.Contains(stdout, `"host_kernel_release":"6.8.0"`) ||

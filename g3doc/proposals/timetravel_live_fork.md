@@ -1,7 +1,7 @@
 # TimeTravelContainer live container fork
 
-Status: implemented for the documented systrap scope; unsupported external
-resources are rejected by design.
+Status: implemented for the documented systrap and KVM scope; unsupported
+external resources are rejected by design.
 
 Follow-on product, mount, volume, exec, attach/detach, image-management, and
 Docker-like CLI work is tracked in
@@ -17,15 +17,16 @@ not create a checkpoint image or copy resident application memory.
 
 The implemented design hosts all branches of a sandbox in one Sentry
 process. Each branch has a distinct `kernel.Kernel` and virtual object graph,
-but the family shares the systrap `platform.Platform` and one or more
+but the family shares the daemon-selected `platform.Platform` and one or more
 `pgalloc.MemoryFile`s. This avoids forking the Go runtime, permits reuse of
 gVisor's existing private-memory CoW machinery, and optimizes for low fork
 latency rather than branch failure isolation.
 
 ## Goals
 
-1. Fork a systrap sandbox without KVM, root privilege, checkpoint files, or
-   work proportional to resident memory size.
+1. Fork a sandbox without checkpoint files or work proportional to resident
+   memory size, using rootless systrap by default or KVM when selected for the
+   daemon.
 2. Preserve the source branch's virtual PIDs, parentage, registers, signal
    state, UTS state, clocks, file descriptions, and internal object topology.
 3. Preserve sharing inside a branch while preventing writes from crossing
@@ -43,7 +44,7 @@ latency rather than branch failure isolation.
 ## Non-goals for the first implementation
 
 * Running different branches in different Sentry processes or hosts.
-* Supporting KVM, ptrace, or other gVisor platforms before systrap.
+* Supporting ptrace or other gVisor platforms beyond systrap and KVM.
 * Migrating or persisting branches.
 * Cloning host-network/hostinet or arbitrary external links, writable gofer
   mounts, host FDs, devices, GPU state, packet mmap rings, KCOV, AIO, or
@@ -117,10 +118,9 @@ its existing per-page reference counts. Creation starts with one owner;
 creating a branch acquires an owner; releasing a branch drops it; final owner
 release performs today's `Destroy()` operation.
 
-The systrap platform can be shared because it creates independent address
-spaces and contexts and already uses global stub/process pools. The first
-implementation must add tests proving that two started Kernels can safely use
-the same `platform.Platform` concurrently.
+The systrap and KVM platforms can be shared because they create independent
+address spaces and contexts. Tests must prove that two started Kernels can
+safely use the same `platform.Platform` concurrently.
 
 ## Core invariants
 
