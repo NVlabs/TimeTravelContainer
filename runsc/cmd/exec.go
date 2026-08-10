@@ -85,6 +85,10 @@ type Exec struct {
 	// pausedManagement admits a TTC management helper while all pre-existing
 	// tasks in the selected paused branch remain stopped.
 	pausedManagement bool
+
+	// allowStoppedSandbox permits TTC to address a rehydrated family whose OCI
+	// init process was intentionally released during dehydration.
+	allowStoppedSandbox bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -138,11 +142,12 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
 	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 	f.BoolVar(&ex.pausedManagement, "paused-management", false, "TTC-internal: run a management helper while existing branch tasks remain paused")
+	f.BoolVar(&ex.allowStoppedSandbox, "ttc-allow-stopped-sandbox", false, "TTC-internal: connect to a rehydrated family after its original OCI init exited")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (ex *Exec) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := ex.loadContainer(conf, f, container.LoadOpts{})
+	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -155,7 +160,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	conf := args[0].(*config.Config)
 	waitStatus := args[1].(*unix.WaitStatus)
 
-	c, err := ex.loadContainer(conf, f, container.LoadOpts{})
+	c, err := ex.loadContainer(conf, f, container.LoadOpts{SkipCheck: ex.allowStoppedSandbox})
 	if err != nil {
 		util.Fatalf("loading container failed: %v", err)
 	}
@@ -167,6 +172,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	e.BranchID = ex.branch
 	e.ExecID = ex.execID
 	e.PausedManagement = ex.pausedManagement
+	e.AllowStoppedContainer = ex.allowStoppedSandbox
 	if ex.pausedManagement && ex.execFD < 0 {
 		util.Fatalf("--paused-management requires --exec-fd")
 	}

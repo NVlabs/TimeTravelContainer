@@ -183,6 +183,54 @@ func TestRemoteSnapshotSiblingsShareSourceReferences(t *testing.T) {
 	}
 }
 
+func TestSyncAndDropSnapshotCacheSharedDehydratedPages(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	fr, err := mf.Allocate(2*hostarch.PageSize, AllocOpts{
+		Kind: usage.Anonymous,
+		Mode: AllocateAndWritePopulate,
+	})
+	if err != nil {
+		mf.Destroy()
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte("dehydrated"), int(fr.Length())/len("dehydrated")+1)[:fr.Length()]
+	fillRemoteTestRange(t, mf, fr, want)
+	first, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		mf.DecRef(fr)
+		mf.Destroy()
+		t.Fatal(err)
+	}
+	second, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
+	if err != nil {
+		first.Close()
+		mf.DecRef(fr)
+		mf.Destroy()
+		t.Fatal(err)
+	}
+	// Model the last live Kernel releasing a page that remains shared by two
+	// dehydrated branches. Collective eviction must account for both snapshot
+	// references and leave their bytes reloadable from disk.
+	mf.DecRef(fr)
+	if err := SyncAndDropSnapshotCache([]*RemoteSnapshot{first, second}); err != nil {
+		t.Fatalf("SyncAndDropSnapshotCache: %v", err)
+	}
+	got := make([]byte, len(want))
+	if n, err := first.CopyStreamAt(got, 0); err != nil || n != len(got) {
+		t.Fatalf("CopyStreamAt after eviction: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("reloaded dehydrated bytes differ")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mf.Destroy()
+}
+
 func TestLoopbackRemoteReader(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 4)
 	want := make([]byte, fr.Length())

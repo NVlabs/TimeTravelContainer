@@ -104,6 +104,10 @@ type ExecArgs struct {
 	// until the process exits.
 	PausedManagement bool `json:"paused_management,omitempty"`
 
+	// AllowStoppedContainer permits TTC to reach a rehydrated family after
+	// dehydration intentionally terminated the original OCI init task.
+	AllowStoppedContainer bool `json:"allow_stopped_container,omitempty"`
+
 	// Filename is the filename to load.
 	//
 	// If this is provided as "", then the file will be guessed via Argv[0].

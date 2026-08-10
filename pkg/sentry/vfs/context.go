@@ -105,6 +105,14 @@ type LiveForkBranchingResource interface {
 	RemoveBranch(branch string) error
 }
 
+// DehydrationFilesystemResource keeps a process-local filesystem transport
+// usable after the captured Kernel releases its VFS graph. This is needed for
+// resources such as a read-only gofer connection that a rehydrated filesystem
+// will borrow again.
+type DehydrationFilesystemResource interface {
+	PreserveForDehydration()
+}
+
 // LiveForkFilesystemResourcesFromContext returns live-fork resources, or nil.
 func LiveForkFilesystemResourcesFromContext(ctx goContext.Context) LiveForkFilesystemResources {
 	resources, _ := ctx.Value(CtxLiveForkFilesystemResources).(LiveForkFilesystemResources)

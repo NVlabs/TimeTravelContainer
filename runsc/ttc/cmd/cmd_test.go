@@ -2624,6 +2624,9 @@ if [ "$3" = "list" ]; then
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	if [ -e "$0.stopped" ]; then
+		exit 128
+	fi
 	echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
 	exit 0
 fi
@@ -2898,15 +2901,16 @@ func TestRuntimeBackendExecUsesBranchFlag(t *testing.T) {
 	runsc := filepath.Join(dir, "runsc")
 	script := `#!/bin/sh
 if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
-   [ "$3" = "exec" ] && [ "$4" = "--branch" ] && [ "$5" = "child" ] &&
-   [ "$6" = "--env" ] && [ "$7" = "A=1" ] &&
-   [ "$8" = "--cwd" ] && [ "$9" = "/work" ] &&
-   [ "${10}" = "--user" ] && [ "${11}" = "123:456" ] &&
-   [ "${12}" = "--additional-gids" ] && [ "${13}" = "12" ] &&
-   [ "${14}" = "--additional-gids" ] && [ "${15}" = "34" ] &&
-   [ "${16}" = "--cap" ] && [ "${17}" = "CAP_CHOWN" ] &&
-   [ "${18}" = "--cap" ] && [ "${19}" = "CAP_SYS_PTRACE" ] &&
-   [ "${20}" = "web" ] && [ "${21}" = "echo" ] && [ "${22}" = "ok" ]; then
+   [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
+   [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
+   [ "$7" = "--env" ] && [ "$8" = "A=1" ] &&
+   [ "$9" = "--cwd" ] && [ "${10}" = "/work" ] &&
+   [ "${11}" = "--user" ] && [ "${12}" = "123:456" ] &&
+   [ "${13}" = "--additional-gids" ] && [ "${14}" = "12" ] &&
+   [ "${15}" = "--additional-gids" ] && [ "${16}" = "34" ] &&
+   [ "${17}" = "--cap" ] && [ "${18}" = "CAP_CHOWN" ] &&
+   [ "${19}" = "--cap" ] && [ "${20}" = "CAP_SYS_PTRACE" ] &&
+   [ "${21}" = "web" ] && [ "${22}" = "echo" ] && [ "${23}" = "ok" ]; then
 	echo branch-output
 	exit 0
 fi
@@ -2940,9 +2944,10 @@ func TestRuntimeBackendExecForwardsProcessFile(t *testing.T) {
 	runsc := filepath.Join(dir, "runsc")
 	script := `#!/bin/sh
 if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
-   [ "$3" = "exec" ] && [ "$4" = "--branch" ] && [ "$5" = "child" ] &&
-   [ "$6" = "--process" ] && [ "$7" = "/process.json" ] &&
-   [ "$8" = "web" ] && [ -z "$9" ]; then
+   [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
+   [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
+   [ "$7" = "--process" ] && [ "$8" = "/process.json" ] &&
+   [ "$9" = "web" ] && [ -z "${10}" ]; then
 	exit 0
 fi
 echo "unexpected command: $*" >&2

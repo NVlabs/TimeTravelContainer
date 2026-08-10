@@ -600,17 +600,9 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.resolveWritableHostMounts(containerDir, &opts); err != nil {
 		return Prepared{}, err
 	}
-	memoryDir := filepath.Join(containerDir, "memory")
-	if err := os.Mkdir(memoryDir, 0700); err != nil {
-		return Prepared{}, fmt.Errorf("creating persistent memory directory: %w", err)
-	}
-	opts.SpecOptions.MemoryFilePath = filepath.Join(memoryDir, "application.mem")
-	memoryFile, err := os.OpenFile(opts.SpecOptions.MemoryFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	opts.SpecOptions.MemoryFilePath, err = createApplicationMemoryFile(containerDir)
 	if err != nil {
-		return Prepared{}, fmt.Errorf("creating persistent application memory file: %w", err)
-	}
-	if err := memoryFile.Close(); err != nil {
-		return Prepared{}, fmt.Errorf("closing persistent application memory file: %w", err)
+		return Prepared{}, err
 	}
 	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
 	if err != nil {
@@ -855,6 +847,11 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
+	memoryFilePath, err := createApplicationMemoryFile(containerDir)
+	if err != nil {
+		return Prepared{}, err
+	}
+	spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFilePath
 	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
 	if len(repositories) == 0 {
 		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
@@ -1025,6 +1022,12 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err != nil {
 		return Prepared{}, err
 	}
+	memoryFilePath, err := createApplicationMemoryFile(containerDir)
+	if err != nil {
+		_ = os.RemoveAll(containerDir)
+		return Prepared{}, err
+	}
+	spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFilePath
 	keep := false
 	leaseID := ""
 	defer func() {
@@ -1690,6 +1693,22 @@ func randomObjectID(kind string, size int) (string, error) {
 		return "", fmt.Errorf("generating %s ID: %w", kind, err)
 	}
 	return hex.EncodeToString(data), nil
+}
+
+func createApplicationMemoryFile(containerDir string) (string, error) {
+	memoryDir := filepath.Join(containerDir, "memory")
+	if err := os.Mkdir(memoryDir, 0700); err != nil {
+		return "", fmt.Errorf("creating persistent memory directory: %w", err)
+	}
+	path := filepath.Join(memoryDir, "application.mem")
+	memoryFile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return "", fmt.Errorf("creating persistent application memory file: %w", err)
+	}
+	if err := memoryFile.Close(); err != nil {
+		return "", fmt.Errorf("closing persistent application memory file: %w", err)
+	}
+	return path, nil
 }
 
 func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {

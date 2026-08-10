@@ -241,7 +241,24 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	child.Unpause()
 	parent.Pause()
 	child.Pause()
+	dehydrated, err := child.CaptureDehydration(child.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "remote"})
+	if err != nil {
+		t.Fatalf("dehydrating distributed target: %v", err)
+	}
 	child.Release()
+	if err := dehydrated.SyncAndDropCache(); err != nil {
+		t.Fatalf("evicting distributed target memory: %v", err)
+	}
+	restored, err := kernel.LoadDehydration(parent.SupervisorContext(), parent.Platform, dehydrated, kernel.DehydrationLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), BranchID: "remote",
+	})
+	if err != nil {
+		t.Fatalf("rehydrating distributed target: %v", err)
+	}
+	if err := restored.StartPaused(); err != nil {
+		t.Fatalf("starting rehydrated distributed target: %v", err)
+	}
+	restored.Release()
 	parent.Release()
 }
 

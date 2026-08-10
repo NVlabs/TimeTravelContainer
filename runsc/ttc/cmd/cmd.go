@@ -324,6 +324,8 @@ Commands:
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
+  dehydrate TARGET...             Persist and release one or more branches
+  rehydrate TARGET...             Reconstruct one or more dehydrated branches
   unpause TARGET...               Resume branches (Docker alias)
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
@@ -358,6 +360,8 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttc pause TARGET [TARGET...]",
 			"resume":     "Usage: ttc resume TARGET [TARGET...]",
+			"dehydrate":  "Usage: ttc dehydrate TARGET [TARGET...]",
+			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
@@ -438,6 +442,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume", "unpause":
 		err = runPauseResume(args[1:], stdout, backend, false)
+	case "dehydrate":
+		err = runDehydrateRehydrate(args[1:], stdout, backend, true)
+	case "rehydrate":
+		err = runDehydrateRehydrate(args[1:], stdout, backend, false)
 	case "kill":
 		err = runKill(args[1:], stdout, stderr, backend)
 	case "stop":
@@ -3941,6 +3949,35 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 	return nil
 }
 
+func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, dehydrate bool) error {
+	if len(args) == 0 {
+		if dehydrate {
+			return errors.New("usage: ttc dehydrate TARGET [TARGET...]")
+		}
+		return errors.New("usage: ttc rehydrate TARGET [TARGET...]")
+	}
+	db, ok := backend.(dehydrationBackend)
+	if !ok {
+		return errors.New("this backend does not support dehydration")
+	}
+	for _, arg := range args {
+		target, err := parseSelector(arg)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", arg, err)
+		}
+		if dehydrate {
+			err = db.dehydrate(target)
+		} else {
+			err = db.rehydrate(target)
+		}
+		if err != nil {
+			return fmt.Errorf("updating %s: %w", target, err)
+		}
+		fmt.Fprintln(stdout, target)
+	}
+	return nil
+}
+
 func runKill(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -4621,10 +4658,59 @@ type backend interface {
 	wait(target selector) (uint32, error)
 }
 
+type dehydrationBackend interface {
+	dehydrate(target selector) error
+	rehydrate(target selector) error
+}
+
 type consoleSidecarOwner interface {
 	OwnConsoleSidecar(key string, command *exec.Cmd) error
+	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
+}
+
+func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
+	if paths.Lock == "" {
+		return nil
+	}
+	if b.consoleSidecars != nil {
+		stopped, err := b.consoleSidecars.StopConsoleSidecar(paths.Lock)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			_ = os.Remove(paths.PID)
+			_ = os.Remove(paths.WaitStatus)
+			return nil
+		}
+	}
+	pidData, err := os.ReadFile(paths.PID)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("invalid console follower PID %q", strings.TrimSpace(string(pidData)))
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	lockFile, err := os.OpenFile(paths.Lock, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	if err := waitForPortLock(lockFile, 5*time.Second); err != nil {
+		return fmt.Errorf("waiting for console follower %d: %w", pid, err)
+	}
+	_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	_ = os.Remove(paths.PID)
+	_ = os.Remove(paths.WaitStatus)
+	return nil
 }
 
 type runtimeBackend struct {
@@ -5274,7 +5360,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			return 1, err
 		}
 	}
-	args := []string{"--root", b.root, "exec", "--branch", request.target.branch}
+	args := []string{"--root", b.root, "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch}
 	consoleID := ""
 	if request.detach {
 		if request.execID == "" {
@@ -7226,7 +7312,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	defer readyReader.Close()
 	endpoint := fmt.Sprintf("%s:%d:%d", binding.HostIP, binding.HostPort, binding.ContainerPort)
 	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
-	args = append(args, "port-forward", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
+	args = append(args, "port-forward", "--ttc-allow-stopped-sandbox", "--branch="+binding.Branch(), "--ready-fd=4", info.ID, endpoint)
 	command := runscCommand(b.runsc, args...)
 	command.Stdout = errorFile
 	command.Stderr = errorFile
@@ -7683,11 +7769,6 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 			continue
 		}
 		family := Family{ID: state.ID, State: state.Status, SandboxPID: state.PID, Branches: []Branch{}}
-		if state.Status == "stopped" {
-			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: "exited"})
-			families = append(families, family)
-			continue
-		}
 		output, err := b.command("timetravel", state.ID, "branches")
 		if err != nil {
 			family.Error = err.Error()
@@ -7704,6 +7785,9 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 		}
 		for _, branch := range branches {
 			family.Branches = append(family.Branches, branchView(branch))
+			if branch.ID == defaultBranchID {
+				family.State = branch.State
+			}
 		}
 		sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
 		families = append(families, family)
@@ -7974,6 +8058,147 @@ func (b *runtimeBackend) resume(target selector) error {
 		err = b.containerStore().UpdateBranchState(target.container, target.branch, "running")
 	}
 	return err
+}
+
+func (b *runtimeBackend) dehydrate(target selector) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	store := b.containerStore()
+	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
+	execSessions, _ := b.execSessions(target)
+	dehydrated := false
+	defer func() {
+		if dehydrated {
+			return
+		}
+		// Capture failure leaves the branch in its original running or paused
+		// state. Restore every sidecar stopped in preparation for the attempt.
+		_, _ = b.ensureConsoleDrain(target, false)
+		for _, session := range execSessions {
+			if session.State == "running" {
+				_, _ = b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false)
+			}
+		}
+		_ = b.ensurePublishedPortsForBranch(info, target.branch)
+	}()
+	if err := b.stopConsoleDrain(initConsolePaths); err != nil {
+		return fmt.Errorf("stopping init console follower before dehydration: %w", err)
+	}
+	for _, session := range execSessions {
+		if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+			if err := b.stopConsoleDrain(paths); err != nil {
+				return fmt.Errorf("stopping exec console follower %q before dehydration: %w", session.ID, err)
+			}
+		}
+	}
+	if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
+		return fmt.Errorf("stopping published ports before dehydration: %w", err)
+	}
+	var metadataFile *os.File
+	var metadataTemp, metadataFinal string
+	if b.dataRoot != "" {
+		metadataDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated")
+		if err := os.MkdirAll(metadataDir, 0700); err != nil {
+			return fmt.Errorf("creating dehydration metadata directory: %w", err)
+		}
+		metadataFinal = filepath.Join(metadataDir, hex.EncodeToString([]byte(target.branch))+".state")
+		metadataFile, err = os.CreateTemp(metadataDir, ".state-*")
+		if err != nil {
+			return fmt.Errorf("creating dehydration metadata: %w", err)
+		}
+		metadataTemp = metadataFile.Name()
+		defer func() {
+			metadataFile.Close()
+			_ = os.Remove(metadataTemp)
+		}()
+	}
+	if metadataFile != nil {
+		_, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
+	} else {
+		_, err = b.command("timetravel", target.container, "dehydrate", target.branch)
+	}
+	if err != nil {
+		return err
+	}
+	dehydrated = true
+	if metadataFile != nil {
+		if err := os.Rename(metadataTemp, metadataFinal); err != nil {
+			return fmt.Errorf("publishing dehydration metadata: %w", err)
+		}
+		metadataTemp = ""
+	}
+	// The old console followers observe the intentionally released Kernel as an
+	// exit and record SIGKILL. That is not a container exit: discard those
+	// transient statuses so rehydration can attach fresh followers.
+	for _, path := range []string{initConsolePaths.WaitStatus, initConsolePaths.PID} {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
+	for _, session := range execSessions {
+		if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+			_ = os.Remove(paths.WaitStatus)
+			_ = os.Remove(paths.PID)
+		}
+	}
+	if err == nil && b.dataRoot != "" {
+		err = b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
+	}
+	return err
+}
+
+func (b *runtimeBackend) rehydrate(target selector) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	_, err = b.command("timetravel", target.container, "rehydrate", target.branch)
+	if err != nil || b.dataRoot == "" {
+		return err
+	}
+	metadataPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch))+".state")
+	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing consumed dehydration metadata: %w", err)
+	}
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	for _, family := range families {
+		if family.ID != target.container {
+			continue
+		}
+		for _, branch := range family.Branches {
+			if branch.ID == target.branch {
+				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
+					return err
+				}
+				if _, err := b.ensureConsoleDrain(target, false); err != nil {
+					return fmt.Errorf("reattaching init console: %w", err)
+				}
+				sessions, err := b.execSessions(target)
+				if err != nil {
+					return fmt.Errorf("listing rehydrated exec sessions: %w", err)
+				}
+				for _, session := range sessions {
+					if session.State == "running" {
+						if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false); err != nil {
+							return fmt.Errorf("reattaching exec console %q: %w", session.ID, err)
+						}
+					}
+				}
+				if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
+					return fmt.Errorf("restoring published ports: %w", err)
+				}
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
 }
 
 func (b *runtimeBackend) destroy(target selector) error {

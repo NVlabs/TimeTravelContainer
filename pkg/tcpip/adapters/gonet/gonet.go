@@ -262,7 +262,7 @@ func (l *TCPListener) Accept() (net.Conn, error) {
 
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+		waitEntry, notifyCh := waiter.NewTransientChannelEntry(waiter.ReadableEvents)
 		l.wq.EventRegister(&waitEntry)
 		defer l.wq.EventUnregister(&waitEntry)
 
@@ -312,7 +312,7 @@ func commonRead(b []byte, ep tcpip.Endpoint, wq *waiter.Queue, deadline <-chan s
 
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
+		waitEntry, notifyCh := waiter.NewTransientChannelEntry(waiter.ReadableEvents)
 		wq.EventRegister(&waitEntry)
 		defer wq.EventUnregister(&waitEntry)
 		for {
@@ -392,7 +392,7 @@ func (c *TCPConn) Write(b []byte) (int, error) {
 		case nil:
 		case *tcpip.ErrWouldBlock:
 			if ch == nil {
-				entry, ch = waiter.NewChannelEntry(waiter.WritableEvents)
+				entry, ch = waiter.NewTransientChannelEntry(waiter.WritableEvents)
 				c.wq.EventRegister(&entry)
 				defer c.wq.EventUnregister(&entry)
 			} else {
@@ -495,7 +495,7 @@ func DialTCPWithBind(ctx context.Context, s *stack.Stack, localAddr, remoteAddr 
 	// Create wait queue entry that notifies a channel.
 	//
 	// We do this unconditionally as Connect will always return an error.
-	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	waitEntry, notifyCh := waiter.NewTransientChannelEntry(waiter.WritableEvents)
 	wq.EventRegister(&waitEntry)
 	defer wq.EventUnregister(&waitEntry)
 
@@ -673,7 +673,7 @@ func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := c.ep.Write(&r, writeOptions)
 	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 		// Create wait queue entry that notifies a channel.
-		waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+		waitEntry, notifyCh := waiter.NewTransientChannelEntry(waiter.WritableEvents)
 		c.wq.EventRegister(&waitEntry)
 		defer c.wq.EventUnregister(&waitEntry)
 		for {

@@ -71,6 +71,16 @@ type savedDentryRW struct {
 type liveForkFilesystemResource struct {
 	client *lisafs.Client
 	rootFD lisafs.ClientFD
+	source *filesystem
+}
+
+// PreserveForDehydration keeps the shared read-only LISAFS connection open
+// when the captured filesystem graph is released. Restored live-fork filesystems
+// already treat the connection and root control FD as borrowed.
+func (r *liveForkFilesystemResource) PreserveForDehydration() {
+	if r.source != nil {
+		r.source.iopts.LeakConnection = true
+	}
 }
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
@@ -89,6 +99,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		resources[fs.iopts.UniqueID] = &liveForkFilesystemResource{
 			client: fs.client,
 			rootFD: root.controlFD,
+			source: fs,
 		}
 	}
 

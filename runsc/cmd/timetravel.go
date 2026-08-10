@@ -73,6 +73,7 @@ type TimeTravel struct {
 	consoleLogFiles               int
 	checkpointImagePath           string
 	checkpointCompression         CheckpointCompression
+	dehydrationFD                 int
 	distributedSessionID          string
 	distributedFamilyID           string
 	distributedListen             string
@@ -145,6 +146,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
 	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
+	f.IntVar(&t.dehydrationFD, "dehydration-fd", -1, "inherited file for durable dehydration metadata")
 	f.StringVar(&t.distributedSessionID, "distributed-session", "", "distributed fork transaction/session ID")
 	f.StringVar(&t.distributedFamilyID, "distributed-family", "", "portable distributed fork family identity")
 	f.StringVar(&t.distributedListen, "distributed-listen", "", "host TCP address for the source page server")
@@ -381,6 +383,18 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":
 		err = cont.Sandbox.ResumeBranch(f.Arg(2))
+	case "dehydrate":
+		var metadataFile *os.File
+		if t.dehydrationFD >= 0 {
+			metadataFile = os.NewFile(uintptr(t.dehydrationFD), "dehydration-metadata")
+			if metadataFile == nil {
+				util.Fatalf("invalid dehydration metadata FD")
+			}
+			defer metadataFile.Close()
+		}
+		err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
+	case "rehydrate":
+		err = cont.Sandbox.RehydrateBranch(f.Arg(2))
 	case "destroy":
 		err = cont.Sandbox.DestroyBranch(f.Arg(2))
 	case "checkpoint":

@@ -610,8 +610,10 @@ func (c *Container) Update(res *specs.LinuxResources) error {
 // the newly created process.
 func (c *Container) Execute(conf *config.Config, args *control.ExecArgs) (int32, error) {
 	log.Debugf("Execute in container, cid: %s, args: %+v", c.ID, args)
-	if err := c.requireStatus("execute in", Created, Running); err != nil {
-		return 0, err
+	if !args.AllowStoppedContainer {
+		if err := c.requireStatus("execute in", Created, Running); err != nil {
+			return 0, err
+		}
 	}
 	args.ContainerID = c.ID
 	return c.Sandbox.Execute(conf, args)
@@ -636,8 +638,10 @@ func (c *Container) Event() (*boot.EventOut, error) {
 
 // PortForward starts port forwarding to the container.
 func (c *Container) PortForward(opts *boot.PortForwardOpts) error {
-	if err := c.requireStatus("port forward", Running); err != nil {
-		return err
+	if !opts.AllowStoppedContainer {
+		if err := c.requireStatus("port forward", Running); err != nil {
+			return err
+		}
 	}
 	opts.ContainerID = c.ID
 	return c.Sandbox.PortForward(opts)

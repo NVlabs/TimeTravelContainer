@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -173,9 +174,111 @@ func TestSandboxFamilyDistributedForkCaptureMany(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	defer func() {
+		family.DestroyChildren()
+		parent.Pause()
+		parent.Release()
+	}()
+
+	if _, err := family.Fork(&ForkBranchArgs{ID: "sleeping", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	family.mu.Lock()
+	original := family.branches["sleeping"].k
+	family.mu.Unlock()
+	metadata, err := os.CreateTemp(t.TempDir(), "dehydration-*.state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := family.Dehydrate("sleeping", metadata); err != nil {
+		t.Fatalf("Dehydrate: %v", err)
+	}
+	if stat, err := os.Stat(metadata.Name()); err != nil || stat.Size() <= 48 {
+		t.Fatalf("metadata stat=%v err=%v", stat, err)
+	}
+	infos := family.List()
+	if got := branchStateForTest(infos, "sleeping"); got != BranchDehydrated {
+		t.Fatalf("state after dehydration=%q, want %q", got, BranchDehydrated)
+	}
+	if parent.IsPaused() {
+		t.Fatal("dehydrating child paused the parent")
+	}
+	if err := family.Rehydrate("sleeping"); err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	family.mu.Lock()
+	restored := family.branches["sleeping"].k
+	family.mu.Unlock()
+	if restored == nil || restored == original {
+		t.Fatalf("rehydrated Kernel=%p, original=%p", restored, original)
+	}
+	if !restored.IsPaused() {
+		t.Fatal("previously paused branch resumed during rehydration")
+	}
+	if got := branchStateForTest(family.List(), "sleeping"); got != BranchPaused {
+		t.Fatalf("state after rehydration=%q, want %q", got, BranchPaused)
+	}
+
+	if err := family.Resume("sleeping"); err != nil {
+		t.Fatalf("Resume before remote capture: %v", err)
+	}
+	session, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
+		SessionID: "dehydration-remote", Source: "sleeping", FamilyID: "family-1",
+		TargetBranchID: "remote-child", ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	defer family.CancelDistributedForkSession("dehydration-remote")
+	remoteMetadata, err := os.CreateTemp(t.TempDir(), "dehydration-remote-*.state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := family.Dehydrate("sleeping", remoteMetadata); err != nil {
+		t.Fatalf("Dehydrate with remote session: %v", err)
+	}
+	if _, err := ttcremote.FetchTCPMetadata(context.Background(), session.Address, session.Token, 64<<10, 64<<20, 5*time.Second); err != nil {
+		t.Fatalf("remote metadata after source dehydration: %v", err)
+	}
+	if status, err := family.DistributedForkSessionStatus("dehydration-remote"); err != nil || status.Snapshot.PagesOutstanding == 0 {
+		t.Fatalf("remote session after source dehydration: status=%+v err=%v", status, err)
+	}
+	if err := family.Rehydrate("sleeping"); err != nil {
+		t.Fatalf("Rehydrate with remote session: %v", err)
+	}
+	if got := branchStateForTest(family.List(), "sleeping"); got != BranchRunning {
+		t.Fatalf("running state after second rehydration=%q, want %q", got, BranchRunning)
+	}
+}
+
+func branchStateForTest(infos []BranchInfo, id string) BranchState {
+	for _, info := range infos {
+		if info.ID == id {
+			return info.State
+		}
+	}
+	return "missing"
+}
+
 func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	first := &SandboxFamily{volumeBranchScope: "sandbox-a"}
 	second := &SandboxFamily{volumeBranchScope: "sandbox-b"}
+	if got := first.volumeBranchID(DefaultBranchID); got != ttcvolume.MainBranch {
+		t.Fatalf("default volume branch = %q, want %q", got, ttcvolume.MainBranch)
+	}
 	if got, want := first.volumeBranchID("child"), first.volumeBranchID("child"); got != want {
 		t.Fatalf("volume branch ID is not deterministic: got %q, want %q", got, want)
 	}

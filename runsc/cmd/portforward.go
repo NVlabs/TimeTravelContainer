@@ -41,10 +41,11 @@ import (
 // PortForward implements subcommands.Command for the "portforward" command.
 type PortForward struct {
 	containerLoader
-	portNum int
-	stream  string
-	branch  string
-	readyFD int
+	portNum             int
+	stream              string
+	branch              string
+	readyFD             int
+	allowStoppedSandbox bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -86,11 +87,12 @@ func (p *PortForward) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&p.stream, "stream", "", "Stream mode - a Unix domain socket")
 	f.StringVar(&p.branch, "branch", boot.DefaultBranchID, "TimeTravel branch to receive forwarded connections")
 	f.IntVar(&p.readyFD, "ready-fd", -1, "write one byte after the local listener is ready")
+	f.BoolVar(&p.allowStoppedSandbox, "ttc-allow-stopped-sandbox", false, "TTC-internal: connect to a rehydrated family after its original OCI init exited")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (p *PortForward) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
-	c, err := p.loadContainer(conf, f, container.LoadOpts{})
+	c, err := p.loadContainer(conf, f, container.LoadOpts{SkipCheck: p.allowStoppedSandbox})
 	if err != nil {
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
@@ -108,7 +110,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 
 	portStr := f.Arg(1)
 
-	c, err := p.loadContainer(conf, f, container.LoadOpts{})
+	c, err := p.loadContainer(conf, f, container.LoadOpts{SkipCheck: p.allowStoppedSandbox})
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
@@ -152,7 +154,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 		defer wg.Done()
 		// Print message to local user.
 		fmt.Printf("Forwarding local port %d to %d...\n", localPort, portNum)
-		if err := localForward(ctx, c, p.branch, localAddress, localPort, uint16(portNum), p.readyFD); err != nil {
+		if err := localForward(ctx, c, p.branch, p.allowStoppedSandbox, localAddress, localPort, uint16(portNum), p.readyFD); err != nil {
 			log.Warningf("port forwarding: %v", err)
 		}
 	}(localPort, portNum)
@@ -180,7 +182,7 @@ func (p *PortForward) Execute(ctx context.Context, f *flag.FlagSet, args ...any)
 }
 
 // localForward starts port forwarding from the given local port.
-func localForward(ctx context.Context, c *container.Container, branch, localAddress string, localPort int, containerPort uint16, readyFD int) error {
+func localForward(ctx context.Context, c *container.Container, branch string, allowStoppedSandbox bool, localAddress string, localPort int, containerPort uint16, readyFD int) error {
 	address := net.JoinHostPort(localAddress, strconv.Itoa(localPort))
 	l, err := net.Listen("tcp", address)
 	if err != nil {
@@ -231,7 +233,7 @@ func localForward(ctx context.Context, c *container.Container, branch, localAddr
 			go func() {
 				defer localConn.Close()
 				fmt.Println("Forwarding new connection...")
-				err := portCopy(ctx, c, branch, localConn, containerPort)
+				err := portCopy(ctx, c, branch, allowStoppedSandbox, localConn, containerPort)
 				if err != nil {
 					log.Warningf("port forwarding: %v", err)
 				}
@@ -260,10 +262,11 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 	defer f.Close()
 
 	if err := c.PortForward(&boot.PortForwardOpts{
-		Port:        uint16(p.portNum),
-		ContainerID: c.ID,
-		BranchID:    p.branch,
-		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
+		Port:                  uint16(p.portNum),
+		ContainerID:           c.ID,
+		BranchID:              p.branch,
+		AllowStoppedContainer: p.allowStoppedSandbox,
+		FilePayload:           urpc.FilePayload{Files: []*os.File{f}},
 	}); err != nil {
 		return fmt.Errorf("PortForward: %v", err)
 	}
@@ -273,7 +276,7 @@ func (p *PortForward) doStream(ctx context.Context, port string, c *container.Co
 
 // portCopy creates a UDS and begins copying data to and from the local
 // connection.
-func portCopy(ctx context.Context, c *container.Container, branch string, localConn net.Conn, port uint16) error {
+func portCopy(ctx context.Context, c *container.Container, branch string, allowStoppedSandbox bool, localConn net.Conn, port uint16) error {
 	// Create a new path address for the UDS.
 	addr, err := tmpUDSAddr()
 	if err != nil {
@@ -298,9 +301,10 @@ func portCopy(ctx context.Context, c *container.Container, branch string, localC
 	// immediately after port forwarding is started and connection state is
 	// handled via the UDS from then on.
 	if err := c.PortForward(&boot.PortForwardOpts{
-		Port:        port,
-		BranchID:    branch,
-		FilePayload: urpc.FilePayload{Files: []*os.File{streamFile}},
+		Port:                  port,
+		BranchID:              branch,
+		AllowStoppedContainer: allowStoppedSandbox,
+		FilePayload:           urpc.FilePayload{Files: []*os.File{streamFile}},
 	}); err != nil {
 		return fmt.Errorf("PortForward: %v", err)
 	}

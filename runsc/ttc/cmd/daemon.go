@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -572,6 +573,11 @@ func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd) error {
 	return s.ownSidecar("console", key, command)
 }
 
+// StopConsoleSidecar terminates a console follower owned by this daemon.
+func (s *daemonServer) StopConsoleSidecar(key string) (bool, error) {
+	return s.stopOwnedSidecar(key)
+}
+
 // OwnPortSidecar tracks and reaps a published-port listener.
 func (s *daemonServer) OwnPortSidecar(key string, command *exec.Cmd) error {
 	return s.ownSidecar("port", key, command)
@@ -581,6 +587,10 @@ func (s *daemonServer) OwnPortSidecar(key string, command *exec.Cmd) error {
 // false when the listener survived an older daemon and must be found through
 // its advisory lock instead.
 func (s *daemonServer) StopPortSidecar(key string) (bool, error) {
+	return s.stopOwnedSidecar(key)
+}
+
+func (s *daemonServer) stopOwnedSidecar(key string) (bool, error) {
 	s.sidecarMu.Lock()
 	command := s.sidecars[key]
 	s.sidecarMu.Unlock()
@@ -613,7 +623,7 @@ func (s *daemonServer) StopPortSidecar(key string) (bool, error) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return true, fmt.Errorf("port sidecar %q did not exit", key)
+	return true, fmt.Errorf("sidecar %q did not exit", key)
 }
 
 func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd) error {
@@ -764,6 +774,52 @@ func stopDaemonContainers(backend backend) error {
 		}
 	}
 	return errors.Join(stopErrors...)
+}
+
+func dehydrateDaemonContainers(backend backend) error {
+	db, ok := backend.(dehydrationBackend)
+	if !ok {
+		return errors.New("backend does not support dehydration")
+	}
+	families, err := backend.listFamilies()
+	if err != nil {
+		return err
+	}
+	for _, family := range families {
+		for _, branch := range family.Branches {
+			switch branch.State {
+			case "running", "paused":
+				if err := db.dehydrate(selector{container: family.ID, branch: branch.ID}); err != nil {
+					return fmt.Errorf("dehydrating %s@%s: %w", family.ID, branch.ID, err)
+				}
+			case "dehydrated", "exited", "stopped", "deleted", "created":
+			default:
+				return fmt.Errorf("branch %s@%s is %s", family.ID, branch.ID, branch.State)
+			}
+		}
+	}
+	return nil
+}
+
+func rejectActiveDaemonContainers(backend backend) error {
+	families, err := backend.listFamilies()
+	if err != nil {
+		return err
+	}
+	var active []string
+	for _, family := range families {
+		for _, branch := range family.Branches {
+			switch branch.State {
+			case "running", "paused", "restarting", "dehydrating", "rehydrating":
+				active = append(active, selector{container: family.ID, branch: branch.ID}.String()+" ("+branch.State+")")
+			}
+		}
+	}
+	if len(active) != 0 {
+		sort.Strings(active)
+		return fmt.Errorf("managed branches are still active: %s; use --dehydrate-all or --stop-all", strings.Join(active, ", "))
+	}
+	return nil
 }
 
 func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID string) error {
@@ -1631,7 +1687,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				err = drainSourceDependencies(backend, s.distributedSource, s.clusterStore, s.clusterCapabilities.NodeID)
 			}
 			if err == nil {
-				err = stopDaemonContainers(backend)
+				switch {
+				case slices.Contains(request.Args, "--dehydrate-all"):
+					err = dehydrateDaemonContainers(backend)
+				case slices.Contains(request.Args, "--stop-all"):
+					err = stopDaemonContainers(backend)
+				default:
+					err = rejectActiveDaemonContainers(backend)
+				}
 			}
 			unlock()
 			if err != nil {
@@ -1773,7 +1836,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "kill", "stop", "restart", "fork", "checkpoint", "restore":
+	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore":
 		return true
 	case "cp":
 		_, _, _, err := parseCopyCommandArgs(args[1:])
@@ -2358,6 +2421,11 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		}
 		return status
 	}
+	stopMode := ""
+	if len(args) == 2 && args[0] == "stop" && (args[1] == "--dehydrate-all" || args[1] == "--stop-all") {
+		stopMode = args[1]
+		args = args[:1]
+	}
 	if len(args) != 1 {
 		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve")
 		return 2
@@ -2408,6 +2476,9 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		request := daemonRequest{Version: daemonAPIVersion, Action: map[string]string{"status": "ping", "stop": "stop"}[action]}
 		if action == "stop" {
 			request.Options = wireOptions(opts)
+			if stopMode != "" {
+				request.Args = []string{stopMode}
+			}
 		}
 		status, err := exchangeDaemon(conn, request, strings.NewReader(""), stdout, stderr)
 		if err != nil {

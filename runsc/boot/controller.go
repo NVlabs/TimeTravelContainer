@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strconv"
 	"sync"
@@ -144,6 +145,12 @@ const (
 
 	// ContMgrResumeBranch resumes one in-memory branch.
 	ContMgrResumeBranch = "containerManager.ResumeBranch"
+
+	// ContMgrDehydrateBranch hibernates one live branch.
+	ContMgrDehydrateBranch = "containerManager.DehydrateBranch"
+
+	// ContMgrRehydrateBranch reconstructs one dehydrated branch.
+	ContMgrRehydrateBranch = "containerManager.RehydrateBranch"
 
 	// ContMgrDestroyBranch destroys one non-default in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
@@ -661,6 +668,9 @@ type PortForwardOpts struct {
 	ContainerID string
 	// BranchID selects the TimeTravel branch. Empty means the default branch.
 	BranchID string
+	// AllowStoppedContainer permits TTC to address a rehydrated family after
+	// the original OCI init task was intentionally released.
+	AllowStoppedContainer bool
 	// Port is the port to to forward.
 	Port uint16
 }
@@ -1146,6 +1156,27 @@ func (cm *containerManager) PauseBranch(args *BranchArgs, _ *struct{}) error {
 // ResumeBranch resumes one branch.
 func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Resume(args.ID)
+}
+
+// DehydrateBranch hibernates one branch and releases its live Kernel graph.
+func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, _ *struct{}) error {
+	if args == nil || len(args.FilePayload.Files) > 1 {
+		return errors.New("dehydration requires at most one metadata file")
+	}
+	var metadataFile *os.File
+	if len(args.FilePayload.Files) == 1 {
+		dup, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
+		if err != nil {
+			return fmt.Errorf("duplicating dehydration metadata file: %w", err)
+		}
+		metadataFile = os.NewFile(uintptr(dup), "dehydration-metadata")
+	}
+	return cm.l.family.Dehydrate(args.ID, metadataFile)
+}
+
+// RehydrateBranch reconstructs one dehydrated branch.
+func (cm *containerManager) RehydrateBranch(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.Rehydrate(args.ID)
 }
 
 // DestroyBranch destroys one non-default branch.

@@ -901,6 +901,12 @@ func New(args Args) (*Loader, error) {
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
 		VolumeBranchScope:              l.sandboxID,
+		ConfigureNetwork:               l.configureNetwork,
+		OnDefaultKernelChanged: func(k *kernel.Kernel) {
+			l.mu.Lock()
+			l.k = k
+			l.mu.Unlock()
+		},
 	})
 
 	if err := registerFilesystems(l.k, &l.root, l.rdmaSysfs); err != nil {
@@ -1877,7 +1883,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	defer l.mu.Unlock()
 
 	var tg *kernel.ThreadGroup
-	if targetKernel == l.k {
+	if targetKernel == l.k && !args.AllowStoppedContainer {
 		tg, err = l.tryThreadGroupFromIDLocked(execID{cid: args.ContainerID})
 	} else {
 		tg, err = branchThreadGroup(targetKernel, args.ContainerID, 0)
@@ -2179,10 +2185,7 @@ func (l *Loader) WaitForStartSignal() {
 
 // WaitExit waits for the root container to exit, and returns its exit status.
 func (l *Loader) WaitExit() linux.WaitStatus {
-	// Wait for container.
-	l.k.WaitExited()
-
-	return l.k.GlobalInit().ExitStatus()
+	return l.family.WaitDefaultExit()
 }
 
 // ExportFinalMounts serializes configured writable mounts after init exits and

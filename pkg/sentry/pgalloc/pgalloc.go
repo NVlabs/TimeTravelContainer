@@ -1889,6 +1889,79 @@ func (f *MemoryFile) IsDiskBacked() bool {
 	return f.opts.DiskBackedFile
 }
 
+type cacheDropCandidate struct {
+	range_       memmap.FileRange
+	expectedRefs uint64
+}
+
+// SyncAndDropUniqueCache writes dirty mappings to the backing file, then asks
+// the host to evict only pages in candidates that currently have one
+// MemoryFile reference. TTC dehydration holds that last reference through a
+// snapshot reservation, so these pages are private to the dehydrated branch.
+// Shared CoW pages are deliberately left mapped for live siblings.
+func (f *MemoryFile) SyncAndDropUniqueCache(candidates []memmap.FileRange) error {
+	owned := make([]cacheDropCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		owned = append(owned, cacheDropCandidate{range_: candidate, expectedRefs: 1})
+	}
+	return f.syncAndDropCache(owned)
+}
+
+// syncAndDropCache evicts candidate subranges only when their complete
+// MemoryFile reference count is accounted for by dehydration reservations.
+func (f *MemoryFile) syncAndDropCache(candidates []cacheDropCandidate) error {
+	if f.file == nil {
+		return fmt.Errorf("MemoryFile has no backing file")
+	}
+	if err := f.file.Sync(); err != nil {
+		return fmt.Errorf("syncing MemoryFile: %w", err)
+	}
+	var unique []memmap.FileRange
+	f.mu.Lock()
+	for _, candidate := range candidates {
+		f.forEachChunk(candidate.range_, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			unfree := &f.unfreeSmall
+			if chunk.huge {
+				unfree = &f.unfreeHuge
+			}
+			unfree.VisitFullRange(chunkFR, func(seg unfreeIterator) bool {
+				if seg.ValuePtr().refs != candidate.expectedRefs {
+					return true
+				}
+				fr := seg.Range().Intersect(chunkFR)
+				if n := len(unique); n != 0 && unique[n-1].End == fr.Start {
+					unique[n-1].End = fr.End
+				} else {
+					unique = append(unique, fr)
+				}
+				return true
+			})
+			return true
+		})
+	}
+	f.mu.Unlock()
+	for _, fr := range unique {
+		var dropErr error
+		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			if chunk.mapping == 0 {
+				return true
+			}
+			chunkStart := chunkFR.Start &^ chunkMask
+			addr := chunk.mapping + uintptr(chunkFR.Start-chunkStart)
+			_, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, uintptr(chunkFR.Length()), unix.MADV_DONTNEED)
+			if errno != 0 {
+				dropErr = errno
+				return false
+			}
+			return true
+		})
+		if dropErr != nil {
+			return fmt.Errorf("dropping MemoryFile mapping cache for %v: %w", fr, dropErr)
+		}
+	}
+	return nil
+}
+
 // HugepagesEnabled returns true if the MemoryFile expects to back allocations
 // for which AllocOpts.Huge == true with huge pages.
 func (f *MemoryFile) HugepagesEnabled() bool {

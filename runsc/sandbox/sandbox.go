@@ -2287,6 +2287,26 @@ func (s *Sandbox) ResumeBranch(id string) error {
 	return nil
 }
 
+// DehydrateBranch hibernates one branch.
+func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) error {
+	args := &boot.BranchDehydrateArgs{ID: id}
+	if metadataFile != nil {
+		args.FilePayload.Files = []*os.File{metadataFile}
+	}
+	if err := s.call(boot.ContMgrDehydrateBranch, args, nil); err != nil {
+		return fmt.Errorf("dehydrating branch %q: %w", id, err)
+	}
+	return nil
+}
+
+// RehydrateBranch reconstructs one dehydrated branch.
+func (s *Sandbox) RehydrateBranch(id string) error {
+	if err := s.call(boot.ContMgrRehydrateBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("rehydrating branch %q: %w", id, err)
+	}
+	return nil
+}
+
 // DestroyBranch destroys one non-default in-memory branch.
 func (s *Sandbox) DestroyBranch(id string) error {
 	if err := s.call(boot.ContMgrDestroyBranch, &boot.BranchArgs{ID: id}, nil); err != nil {

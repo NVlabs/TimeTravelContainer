@@ -24,8 +24,8 @@ import (
 
 var topLevelCompletionCommands = []string{
 	"attach", "branch", "completion", "container", "cp", "create", "daemon", "events", "exec", "fork",
-	"help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
-	"port", "ps", "pull", "restart", "resume", "rm", "rmi", "run", "start", "stop",
+	"dehydrate", "help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
+	"port", "ps", "pull", "rehydrate", "restart", "resume", "rm", "rmi", "run", "start", "stop",
 	"top", "unpause", "wait",
 }
 
@@ -252,7 +252,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return imageCompletionCandidates(backend)
 	case "start", "restart", "rm", "inspect":
 		return familyCompletionCandidates(backend, false, true)
-	case "attach", "logs", "pause", "resume", "kill", "stop", "wait", "top":
+	case "attach", "logs", "pause", "resume", "dehydrate", "rehydrate", "kill", "stop", "wait", "top":
 		return familyCompletionCandidates(backend, true, true)
 	case "cp":
 		return familyCompletionCandidates(backend, true, true)

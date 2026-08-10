@@ -21,15 +21,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"sort"
 	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -45,11 +49,14 @@ const DefaultBranchID = "main"
 type BranchState string
 
 const (
-	BranchCreating   BranchState = "creating"
-	BranchPaused     BranchState = "paused"
-	BranchRunning    BranchState = "running"
-	BranchDestroying BranchState = "destroying"
-	BranchFailed     BranchState = "failed"
+	BranchCreating    BranchState = "creating"
+	BranchPaused      BranchState = "paused"
+	BranchRunning     BranchState = "running"
+	BranchDehydrating BranchState = "dehydrating"
+	BranchDehydrated  BranchState = "dehydrated"
+	BranchRehydrating BranchState = "rehydrating"
+	BranchDestroying  BranchState = "destroying"
+	BranchFailed      BranchState = "failed"
 )
 
 // BranchInfo is the branch metadata exposed over the control socket.
@@ -175,6 +182,12 @@ type DistributedForkDependencyArgs struct {
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
 type BranchArgs struct {
+	ID string
+}
+
+// BranchDehydrateArgs selects a branch and donates its durable metadata file.
+type BranchDehydrateArgs struct {
+	urpc.FilePayload
 	ID string
 }
 
@@ -357,6 +370,14 @@ type sandboxBranch struct {
 
 	execSessions map[string]*execSession
 	consoleWaits map[*consoleWaitLease]struct{}
+	dehydration  *branchDehydration
+}
+
+type branchDehydration struct {
+	image        *kernel.DehydrationCapture
+	platform     platform.Platform
+	resume       bool
+	execSessions []ExecSessionInfo
 }
 
 // SandboxFamily owns all in-memory branches in one sentry process.
@@ -365,6 +386,10 @@ type sandboxBranch struct {
 // backing with their ancestors, but each branch owns its Kernel lifecycle.
 type SandboxFamily struct {
 	mu sync.Mutex
+	// dehydrationMu serializes capture ownership changes across sibling
+	// branches so collective page-cache eviction sees a stable reservation set.
+	dehydrationMu sync.Mutex
+	stateChanged  *sync.Cond
 
 	branches         map[string]*sandboxBranch
 	controlsQuiesced bool
@@ -383,6 +408,8 @@ type SandboxFamily struct {
 	testOnlyExecFailureInjector    func(SandboxExecStage) error
 	volumeBranchScope              string
 	distributedSessions            map[string]*distributedForkSession
+	configureNetwork               func(*kernel.Kernel, inet.Stack) error
+	onDefaultKernelChanged         func(*kernel.Kernel)
 }
 
 type distributedForkSession struct {
@@ -400,7 +427,9 @@ type SandboxFamilyOptions struct {
 	WatchdogOpts                   *watchdog.Opts
 	// VolumeBranchScope distinguishes repository branch names created by this
 	// sandbox from identically named live branches in other sandboxes.
-	VolumeBranchScope string
+	VolumeBranchScope      string
+	ConfigureNetwork       func(*kernel.Kernel, inet.Stack) error
+	OnDefaultKernelChanged func(*kernel.Kernel)
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
@@ -435,13 +464,15 @@ const (
 // NewSandboxFamily creates a family containing k as its default branch.
 func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamily {
 	createdAt := time.Now().UTC()
-	return &SandboxFamily{
+	f := &SandboxFamily{
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
 		testOnlyForkFailureInjector:    opts.TestOnlyForkFailureInjector,
 		testOnlyExecFailureInjector:    opts.TestOnlyExecFailureInjector,
 		volumeBranchScope:              opts.VolumeBranchScope,
+		configureNetwork:               opts.ConfigureNetwork,
+		onDefaultKernelChanged:         opts.OnDefaultKernelChanged,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
@@ -454,6 +485,8 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 			},
 		},
 	}
+	f.stateChanged = sync.NewCond(&f.mu)
+	return f
 }
 
 // CaptureDistributedFork atomically captures a paused instant and publishes
@@ -835,6 +868,12 @@ func (f *SandboxFamily) CloseDistributedForkSessions() {
 }
 
 func (f *SandboxFamily) volumeBranchID(visibleBranchID string) string {
+	// A repository's initial branch is always named "main". Only descendants
+	// are scoped, since they may be created by multiple sandbox families that
+	// share a managed volume repository.
+	if visibleBranchID == DefaultBranchID {
+		return ttcvolume.MainBranch
+	}
 	return ttcvolume.ScopedBranchID(f.volumeBranchScope, visibleBranchID)
 }
 
@@ -1455,11 +1494,236 @@ func (f *SandboxFamily) Resume(id string) error {
 	return nil
 }
 
+// Dehydrate hibernates one branch. Its task and kernel-object graph is
+// serialized as metadata, page ownership is replaced by compact reservations,
+// and the live Kernel is released. The persistent filesystem branch is left in
+// place.
+func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
+	f.dehydrationMu.Lock()
+	defer f.dehydrationMu.Unlock()
+	metadataOwned := false
+	defer func() {
+		if metadataFile != nil && !metadataOwned {
+			_ = metadataFile.Close()
+		}
+	}()
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	dehydrated := false
+	defer func() {
+		if !dehydrated {
+			b.opMu.Unlock()
+		}
+	}()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, cannot dehydrate", id, state)
+	}
+	wasRunning := b.state == BranchRunning
+	b.state = BranchDehydrating
+	f.stateChanged.Broadcast()
+	k := b.k
+	f.mu.Unlock()
+
+	f.cancelConsoleWaits(b)
+	if wasRunning {
+		k.Pause()
+	}
+	execSessions := make([]ExecSessionInfo, 0, len(b.execSessions))
+	f.mu.Lock()
+	for _, session := range b.execSessions {
+		execSessions = append(execSessions, cloneExecSessionInfo(session.info))
+	}
+	f.mu.Unlock()
+	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
+	image, err := k.CaptureDehydration(k.SupervisorContext(), kernel.DehydrationCaptureOptions{
+		BranchID: f.volumeBranchID(b.id), MetadataFile: metadataFile,
+	})
+	if err != nil {
+		if wasRunning {
+			k.Unpause()
+			_ = control.PostResume(k, nil)
+		}
+		f.mu.Lock()
+		b.state = kernelBranchState(k)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return err
+	}
+	metadataOwned = true
+	if b.watchdog != nil {
+		b.watchdog.Stop()
+	}
+	k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	k.Unpause()
+	k.WaitExited()
+	// Existing console followers take opMu for their authoritative final drain.
+	// No new controls can begin in BranchDehydrating, so temporarily yield the
+	// lifecycle lock and let those leases finish before releasing the Kernel.
+	b.opMu.Unlock()
+	b.controlOps.Wait()
+	b.opMu.Lock()
+	p := k.Platform
+	k.Release()
+	f.mu.Lock()
+	b.k = nil
+	b.watchdog = nil
+	b.dehydration = &branchDehydration{
+		image: image, platform: p, resume: wasRunning, execSessions: execSessions,
+	}
+	var captures []*kernel.DehydrationCapture
+	for _, branch := range f.branches {
+		if branch.dehydration != nil {
+			captures = append(captures, branch.dehydration.image)
+		}
+	}
+	f.mu.Unlock()
+	if err := kernel.SyncAndDropDehydrationCache(captures); err != nil {
+		_ = image.Close()
+		f.mu.Lock()
+		b.state = BranchFailed
+		b.dehydration = nil
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("persisting dehydrated memory: %w", err)
+	}
+	f.mu.Lock()
+	b.state = BranchDehydrated
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
+	if id == DefaultBranchID && f.onDefaultKernelChanged != nil {
+		f.onDefaultKernelChanged(nil)
+	}
+	b.opMu.Unlock()
+	dehydrated = true
+	return nil
+}
+
+// Rehydrate reconstructs a dehydrated branch. The branch returns to its
+// pre-dehydration running/paused state.
+func (f *SandboxFamily) Rehydrate(id string) error {
+	f.dehydrationMu.Lock()
+	defer f.dehydrationMu.Unlock()
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchDehydrated || b.dehydration == nil {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, not dehydrated", id, state)
+	}
+	d := b.dehydration
+	b.state = BranchRehydrating
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
+
+	child, err := kernel.LoadDehydration(context.Background(), d.platform, d.image, kernel.DehydrationLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), BranchID: f.volumeBranchID(b.id),
+		ConfigureNetwork: f.configureNetwork,
+	})
+	if err != nil {
+		f.mu.Lock()
+		b.state = BranchDehydrated
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return err
+	}
+	if err := child.StartPaused(); err != nil {
+		child.Release()
+		f.mu.Lock()
+		b.state = BranchFailed
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("starting rehydrated branch %q: %w", id, err)
+	}
+	newSessions := make(map[string]*execSession)
+	for _, info := range d.execSessions {
+		if info.State != ExecSessionRunning {
+			continue
+		}
+		tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID)
+		if tg != nil {
+			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
+		}
+	}
+	var dog *watchdog.Watchdog
+	if f.watchdogOpts != nil {
+		dog = watchdog.New(child, *f.watchdogOpts)
+		dog.Start()
+	}
+	f.mu.Lock()
+	b.k = child
+	b.watchdog = dog
+	b.execSessions = newSessions
+	b.dehydration = nil
+	b.state = BranchPaused
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
+	if id == DefaultBranchID && f.onDefaultKernelChanged != nil {
+		f.onDefaultKernelChanged(child)
+	}
+	for sessionID, session := range newSessions {
+		f.watchExecSession(id, sessionID, session)
+	}
+	if d.resume {
+		child.Unpause()
+		if err := control.PostResume(child, nil); err != nil {
+			child.Pause()
+			return fmt.Errorf("resuming rehydrated branch %q: %w", id, err)
+		}
+		f.mu.Lock()
+		b.state = kernelBranchState(child)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+	}
+	return nil
+}
+
+// WaitDefaultExit waits for the currently hydrated default Kernel to exit.
+// A Kernel released as part of dehydration is skipped rather than interpreted
+// as container exit.
+func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
+	for {
+		f.mu.Lock()
+		b := f.branches[DefaultBranchID]
+		for b != nil && b.k == nil && (b.state == BranchDehydrating || b.state == BranchDehydrated || b.state == BranchRehydrating) {
+			f.stateChanged.Wait()
+			b = f.branches[DefaultBranchID]
+		}
+		if b == nil || b.k == nil {
+			f.mu.Unlock()
+			return linux.WaitStatusExit(255)
+		}
+		k := b.k
+		f.mu.Unlock()
+		k.WaitExited()
+		f.mu.Lock()
+		if b.k != k || b.state == BranchDehydrating || b.state == BranchDehydrated || b.state == BranchRehydrating {
+			f.mu.Unlock()
+			continue
+		}
+		status := k.GlobalInit().ExitStatus()
+		f.mu.Unlock()
+		return status
+	}
+}
+
 // Destroy destroys a non-default branch and removes it from the family.
 func (f *SandboxFamily) Destroy(id string) error {
 	if id == DefaultBranchID {
 		return fmt.Errorf("the default branch is owned by the loader")
 	}
+	f.dehydrationMu.Lock()
+	defer f.dehydrationMu.Unlock()
 	b, err := f.branch(id)
 	if err != nil {
 		return err
@@ -1473,11 +1737,26 @@ func (f *SandboxFamily) Destroy(id string) error {
 		return fmt.Errorf("branch %q is %s", id, state)
 	}
 	b.state = BranchDestroying
-	paused := b.k.IsPaused()
+	image := b.dehydration
+	if image != nil {
+		b.dehydration = nil
+	}
+	var paused bool
+	if b.k != nil {
+		paused = b.k.IsPaused()
+	}
 	dog := b.watchdog
 	f.mu.Unlock()
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
+	if image != nil {
+		err := image.image.Close()
+		f.mu.Lock()
+		delete(f.branches, id)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return err
+	}
 
 	if dog != nil {
 		dog.Stop()

@@ -102,6 +102,94 @@ type RemotePushHint struct {
 	Length       uint64
 }
 
+// SyncAndDropUniqueCache persists and evicts pages whose only remaining
+// MemoryFile reference is held by s. Pages shared with another live branch are
+// intentionally retained.
+func (s *RemoteSnapshot) SyncAndDropUniqueCache() error {
+	if s == nil {
+		return errors.New("remote snapshot is nil")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("remote snapshot is closed")
+	}
+	byFile := make(map[*MemoryFile][]memmap.FileRange)
+	for _, region := range s.regions {
+		byFile[region.File] = append(byFile[region.File], region.Range)
+	}
+	s.mu.Unlock()
+	var result error
+	for file, ranges := range byFile {
+		if err := file.SyncAndDropUniqueCache(ranges); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+// SyncAndDropSnapshotCache persists and evicts pages whose references are
+// owned entirely by the given stable snapshots. This includes pages shared by
+// multiple dehydrated branches, while retaining pages referenced by any live
+// Kernel or unrelated remote transfer.
+func SyncAndDropSnapshotCache(snapshots []*RemoteSnapshot) error {
+	type event struct {
+		offset uint64
+		delta  int64
+	}
+	byFile := make(map[*MemoryFile][]event)
+	seenShared := make(map[*remoteSnapshotShared]struct{})
+	for _, snapshot := range snapshots {
+		if snapshot == nil {
+			return errors.New("remote snapshot is nil")
+		}
+		snapshot.mu.Lock()
+		if snapshot.closed {
+			snapshot.mu.Unlock()
+			return errors.New("remote snapshot is closed")
+		}
+		if snapshot.pagesReleased != 0 || len(snapshot.shared.views) != 1 {
+			snapshot.mu.Unlock()
+			return errors.New("cache eviction requires an unreleased single-view snapshot")
+		}
+		if _, ok := seenShared[snapshot.shared]; !ok {
+			seenShared[snapshot.shared] = struct{}{}
+			for _, region := range snapshot.regions {
+				byFile[region.File] = append(byFile[region.File],
+					event{offset: region.Range.Start, delta: 1},
+					event{offset: region.Range.End, delta: -1})
+			}
+		}
+		snapshot.mu.Unlock()
+	}
+	var result error
+	for file, events := range byFile {
+		sort.Slice(events, func(i, j int) bool { return events[i].offset < events[j].offset })
+		var candidates []cacheDropCandidate
+		var refs int64
+		for i := 0; i < len(events); {
+			offset := events[i].offset
+			if i != 0 && events[i-1].offset < offset && refs > 0 {
+				candidates = append(candidates, cacheDropCandidate{
+					range_:       memmap.FileRange{Start: events[i-1].offset, End: offset},
+					expectedRefs: uint64(refs),
+				})
+			}
+			for i < len(events) && events[i].offset == offset {
+				refs += events[i].delta
+				i++
+			}
+		}
+		if refs != 0 {
+			return errors.New("unbalanced snapshot cache ranges")
+		}
+		if err := file.syncAndDropCache(candidates); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
 // StartLoopbackRemotePush starts a non-blocking proactive-push pump for local
 // distributed-fork testing. Pull owns any range that has already started;
 // otherwise the pump installs bytes and only then acknowledges the source.

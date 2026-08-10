@@ -97,6 +97,16 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			file.prepareLiveFork()
 		}
 		fs.liveForkMu.Unlock()
+		if fs.diskVolume != nil && vfs.LiveForkBranchesPreparedFromContext(ctx) {
+			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
+			if resources == nil {
+				return fmt.Errorf("CtxLiveForkFilesystemResources was not provided for TTC volume")
+			}
+			if resource, ok := resources[fs.diskVolume.ResourceID]; ok && resource != fs.diskVolume.Repository {
+				return fmt.Errorf("live-fork resource for TTC volume %q conflicts with prepared repository", fs.diskVolume.ResourceID)
+			}
+			resources[fs.diskVolume.ResourceID] = fs.diskVolume.Repository
+		}
 		if fs.diskVolume != nil && !vfs.LiveForkBranchesPreparedFromContext(ctx) {
 			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
 			if resources == nil {
