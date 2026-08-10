@@ -585,6 +585,13 @@ TEST(ProcSysNetIpv4IpForward, Exists) {
   auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(kIpForward, O_RDONLY));
 }
 
+TEST(ProcSysNetIpv4IpForward, WritableMode) {
+  SKIP_IF(!IsRunningOnGvisor());
+  struct stat st;
+  ASSERT_THAT(stat(kIpForward, &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_mode & 0777, 0644);
+}
+
 TEST(ProcSysNetIpv4IpForward, DefaultValueEqZero) {
   // Test is only valid in sandbox. Not hermetic in native tests
   // running on a arbitrary machine.
@@ -619,6 +626,51 @@ TEST(ProcSysNetIpv4IpForward, CanReadAndWrite) {
   EXPECT_THAT(PreadFd(fd.get(), &buf, sizeof(buf), 0),
               SyscallSucceedsWithValue(sizeof(buf)));
   EXPECT_EQ(buf, to_write);
+}
+
+TEST(ProcSysNetIpv4CongestionControl, CanReadAndWrite) {
+  SKIP_IF(!IsRunningOnGvisor() || IsRunningWithHostinet());
+  constexpr char kCurrent[] =
+      "/proc/sys/net/ipv4/tcp_congestion_control";
+  constexpr char kAvailable[] =
+      "/proc/sys/net/ipv4/tcp_available_congestion_control";
+  const std::string original = ASSERT_NO_ERRNO_AND_VALUE(GetContents(kCurrent));
+  const std::string available =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kAvailable));
+  EXPECT_THAT(available, ::testing::HasSubstr("reno"));
+  EXPECT_THAT(available, ::testing::HasSubstr("cubic"));
+
+  const std::string replacement =
+      original.find("reno") == std::string::npos ? "reno" : "cubic";
+  ASSERT_NO_ERRNO(SetContents(kCurrent, replacement));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(kCurrent)),
+            absl::StrCat(replacement, "\n"));
+  EXPECT_THAT(SetContents(kCurrent, "not-an-algorithm"),
+              PosixErrorIs(ENOENT));
+  ASSERT_NO_ERRNO(SetContents(kCurrent, original));
+}
+
+TEST(ProcSysNetIpv4Retries, CanReadAndWrite) {
+  SKIP_IF(!IsRunningOnGvisor() || IsRunningWithHostinet());
+  constexpr char kSynRetries[] = "/proc/sys/net/ipv4/tcp_syn_retries";
+  constexpr char kRetries2[] = "/proc/sys/net/ipv4/tcp_retries2";
+  const std::string original_syn =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kSynRetries));
+  const std::string original_retries2 =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(kRetries2));
+
+  ASSERT_NO_ERRNO(SetContents(kSynRetries, "7"));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(kSynRetries)), "7\n");
+  EXPECT_THAT(SetContents(kSynRetries, "0"), PosixErrorIs(EINVAL));
+  EXPECT_THAT(SetContents(kSynRetries, "256"), PosixErrorIs(EINVAL));
+
+  ASSERT_NO_ERRNO(SetContents(kRetries2, "12"));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(kRetries2)), "12\n");
+  EXPECT_THAT(SetContents(kRetries2, "-1"), PosixErrorIs(EINVAL));
+  EXPECT_THAT(SetContents(kRetries2, "256"), PosixErrorIs(EINVAL));
+
+  ASSERT_NO_ERRNO(SetContents(kSynRetries, original_syn));
+  ASSERT_NO_ERRNO(SetContents(kRetries2, original_retries2));
 }
 
 TEST(ProcSysNetPortRange, CanReadAndWrite) {

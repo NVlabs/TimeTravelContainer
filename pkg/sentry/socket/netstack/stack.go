@@ -806,6 +806,57 @@ func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
 	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
 }
 
+// TCPCongestionControl returns the stack-wide default TCP congestion control
+// algorithm.
+func (s *Stack) TCPCongestionControl() (string, error) {
+	var opt tcpip.CongestionControlOption
+	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &opt)
+	return string(opt), syserr.TranslateNetstackError(err).ToError()
+}
+
+// SetTCPCongestionControl changes the stack-wide default TCP congestion
+// control algorithm.
+func (s *Stack) SetTCPCongestionControl(name string) error {
+	opt := tcpip.CongestionControlOption(name)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
+}
+
+// TCPAvailableCongestionControl returns the TCP congestion control algorithms
+// implemented by netstack.
+func (s *Stack) TCPAvailableCongestionControl() (string, error) {
+	var opt tcpip.TCPAvailableCongestionControlOption
+	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &opt)
+	return string(opt), syserr.TranslateNetstackError(err).ToError()
+}
+
+// TCPSynRetries returns the stack-wide SYN retransmission limit.
+func (s *Stack) TCPSynRetries() (uint8, error) {
+	var opt tcpip.TCPSynRetriesOption
+	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &opt)
+	return uint8(opt), syserr.TranslateNetstackError(err).ToError()
+}
+
+// SetTCPSynRetries changes the stack-wide SYN retransmission limit.
+func (s *Stack) SetTCPSynRetries(retries uint8) error {
+	opt := tcpip.TCPSynRetriesOption(retries)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
+}
+
+// TCPMaxRetries returns the stack-wide established-connection retransmission
+// limit exposed by Linux as tcp_retries2.
+func (s *Stack) TCPMaxRetries() (uint8, error) {
+	var opt tcpip.TCPMaxRetriesOption
+	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &opt)
+	return uint8(opt), syserr.TranslateNetstackError(err).ToError()
+}
+
+// SetTCPMaxRetries changes the stack-wide established-connection
+// retransmission limit exposed by Linux as tcp_retries2.
+func (s *Stack) SetTCPMaxRetries(retries uint8) error {
+	opt := tcpip.TCPMaxRetriesOption(retries)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
+}
+
 // Statistics implements inet.Stack.Statistics.
 func (s *Stack) Statistics(stat any, arg string) error {
 	netStats := s.Stats()

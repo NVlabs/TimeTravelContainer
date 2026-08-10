@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -45,6 +46,20 @@ const (
 	tcpRMem tcpMemDir = iota
 	tcpWMem
 )
+
+// tcpSysctlStack is implemented by network stacks whose existing TCP protocol
+// options can be exposed through procfs. Host-backed networking intentionally
+// does not implement this interface since changing host sysctls is out of
+// scope.
+type tcpSysctlStack interface {
+	TCPCongestionControl() (string, error)
+	SetTCPCongestionControl(string) error
+	TCPAvailableCongestionControl() (string, error)
+	TCPSynRetries() (uint8, error)
+	SetTCPSynRetries(uint8) error
+	TCPMaxRetries() (uint8, error)
+	SetTCPMaxRetries(uint8) error
+}
 
 // newSysDir returns the dentry corresponding to /proc/sys directory.
 func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *kernel.Kernel) kernfs.Inode {
@@ -98,55 +113,63 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 	// TODO(gvisor.dev/issue/1833): Support for using the network stack in the
 	// network namespace of the calling process.
 	if stack := k.RootNetworkNamespace().Stack(); stack != nil {
+		ipv4Contents := map[string]kernfs.Inode{
+			"ip_forward":          fs.newInode(ctx, root, 0444, &ipForwarding{stack: stack}),
+			"ip_local_port_range": fs.newInode(ctx, root, 0644, &portRange{stack: stack}),
+			"tcp_recovery":        fs.newInode(ctx, root, 0644, &tcpRecoveryData{stack: stack}),
+			"tcp_rmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpRMem}),
+			"tcp_sack":            fs.newInode(ctx, root, 0644, &tcpSackData{stack: stack}),
+			"tcp_wmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpWMem}),
+
+			// The following files are simple stubs until they are implemented in
+			// netstack, most of these files are configuration related. We use the
+			// value closest to the actual netstack behavior or any empty file, all
+			// of these files will have mode 0444 (read-only for all users).
+			"ip_local_reserved_ports": fs.newInode(ctx, root, 0444, newStaticFile("")),
+			"ipfrag_time":             fs.newInode(ctx, root, 0444, newStaticFile("30")),
+			"ip_nonlocal_bind":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"ip_no_pmtu_disc":         fs.newInode(ctx, root, 0444, newStaticFile("1")),
+
+			// tcp_allowed_congestion_control remains empty until netstack supports
+			// restricting the set of algorithms available to unprivileged tasks.
+			"tcp_allowed_congestion_control":   fs.newInode(ctx, root, 0444, newStaticFile("")),
+			"tcp_available_congestion_control": fs.newInode(ctx, root, 0444, newStaticFile("reno")),
+			"tcp_congestion_control":           fs.newInode(ctx, root, 0444, newStaticFile("reno")),
+
+			// Many of the following stub files are features netstack doesn't
+			// support. The unsupported features return "0" to indicate they are
+			// disabled.
+			"tcp_base_mss":              fs.newInode(ctx, root, 0444, newStaticFile("1280")),
+			"tcp_dsack":                 fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_early_retrans":         fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_fack":                  fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_fastopen":              fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_fastopen_key":          fs.newInode(ctx, root, 0444, newStaticFile("")),
+			"tcp_invalid_ratelimit":     fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_intvl":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_probes":      fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_keepalive_time":        fs.newInode(ctx, root, 0444, newStaticFile("7200")),
+			"tcp_mtu_probing":           fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_no_metrics_save":       fs.newInode(ctx, root, 0444, newStaticFile("1")),
+			"tcp_probe_interval":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_probe_threshold":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
+			"tcp_retries1":              fs.newInode(ctx, root, 0444, newStaticFile("3")),
+			"tcp_retries2":              fs.newInode(ctx, root, 0444, newStaticFile("15")),
+			"tcp_rfc1337":               fs.newInode(ctx, root, 0444, newStaticFile("1")),
+			"tcp_slow_start_after_idle": fs.newInode(ctx, root, 0444, newStaticFile("1")),
+			"tcp_synack_retries":        fs.newInode(ctx, root, 0444, newStaticFile("5")),
+			"tcp_syn_retries":           fs.newInode(ctx, root, 0444, newStaticFile("3")),
+			"tcp_timestamps":            fs.newInode(ctx, root, 0444, newStaticFile("1")),
+		}
+		if _, ok := stack.(tcpSysctlStack); ok {
+			ipv4Contents["ip_forward"] = fs.newInode(ctx, root, 0644, &ipForwarding{stack: stack})
+			ipv4Contents["tcp_available_congestion_control"] = fs.newInode(ctx, root, 0444, &tcpCongestionControlData{stack: stack, available: true})
+			ipv4Contents["tcp_congestion_control"] = fs.newInode(ctx, root, 0644, &tcpCongestionControlData{stack: stack})
+			ipv4Contents["tcp_syn_retries"] = fs.newInode(ctx, root, 0644, &tcpRetriesData{stack: stack, kind: tcpSynRetries})
+			ipv4Contents["tcp_retries2"] = fs.newInode(ctx, root, 0644, &tcpRetriesData{stack: stack, kind: tcpMaxRetries})
+		}
 		contents = map[string]kernfs.Inode{
-			"ipv4": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-				"ip_forward":          fs.newInode(ctx, root, 0444, &ipForwarding{stack: stack}),
-				"ip_local_port_range": fs.newInode(ctx, root, 0644, &portRange{stack: stack}),
-				"tcp_recovery":        fs.newInode(ctx, root, 0644, &tcpRecoveryData{stack: stack}),
-				"tcp_rmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpRMem}),
-				"tcp_sack":            fs.newInode(ctx, root, 0644, &tcpSackData{stack: stack}),
-				"tcp_wmem":            fs.newInode(ctx, root, 0644, &tcpMemData{stack: stack, dir: tcpWMem}),
-
-				// The following files are simple stubs until they are implemented in
-				// netstack, most of these files are configuration related. We use the
-				// value closest to the actual netstack behavior or any empty file, all
-				// of these files will have mode 0444 (read-only for all users).
-				"ip_local_reserved_ports": fs.newInode(ctx, root, 0444, newStaticFile("")),
-				"ipfrag_time":             fs.newInode(ctx, root, 0444, newStaticFile("30")),
-				"ip_nonlocal_bind":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"ip_no_pmtu_disc":         fs.newInode(ctx, root, 0444, newStaticFile("1")),
-
-				// tcp_allowed_congestion_control tell the user what they are able to
-				// do as an unprivledged process so we leave it empty.
-				"tcp_allowed_congestion_control":   fs.newInode(ctx, root, 0444, newStaticFile("")),
-				"tcp_available_congestion_control": fs.newInode(ctx, root, 0444, newStaticFile("reno")),
-				"tcp_congestion_control":           fs.newInode(ctx, root, 0444, newStaticFile("reno")),
-
-				// Many of the following stub files are features netstack doesn't
-				// support. The unsupported features return "0" to indicate they are
-				// disabled.
-				"tcp_base_mss":              fs.newInode(ctx, root, 0444, newStaticFile("1280")),
-				"tcp_dsack":                 fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_early_retrans":         fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_fack":                  fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_fastopen":              fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_fastopen_key":          fs.newInode(ctx, root, 0444, newStaticFile("")),
-				"tcp_invalid_ratelimit":     fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_keepalive_intvl":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_keepalive_probes":      fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_keepalive_time":        fs.newInode(ctx, root, 0444, newStaticFile("7200")),
-				"tcp_mtu_probing":           fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_no_metrics_save":       fs.newInode(ctx, root, 0444, newStaticFile("1")),
-				"tcp_probe_interval":        fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_probe_threshold":       fs.newInode(ctx, root, 0444, newStaticFile("0")),
-				"tcp_retries1":              fs.newInode(ctx, root, 0444, newStaticFile("3")),
-				"tcp_retries2":              fs.newInode(ctx, root, 0444, newStaticFile("15")),
-				"tcp_rfc1337":               fs.newInode(ctx, root, 0444, newStaticFile("1")),
-				"tcp_slow_start_after_idle": fs.newInode(ctx, root, 0444, newStaticFile("1")),
-				"tcp_synack_retries":        fs.newInode(ctx, root, 0444, newStaticFile("5")),
-				"tcp_syn_retries":           fs.newInode(ctx, root, 0444, newStaticFile("3")),
-				"tcp_timestamps":            fs.newInode(ctx, root, 0444, newStaticFile("1")),
-			}),
+			"ipv4": fs.newStaticDir(ctx, root, ipv4Contents),
 			"core": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 				"default_qdisc": fs.newInode(ctx, root, 0444, newStaticFile("pfifo_fast")),
 				"message_burst": fs.newInode(ctx, root, 0444, newStaticFile("10")),
@@ -330,6 +353,139 @@ func (d *tcpRecoveryData) Write(ctx context.Context, _ *vfs.FileDescription, src
 		return 0, err
 	}
 	if err := d.stack.SetTCPRecovery(inet.TCPLossRecovery(buf[0])); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// tcpCongestionControlData implements tcp_congestion_control and
+// tcp_available_congestion_control.
+//
+// +stateify savable
+type tcpCongestionControlData struct {
+	kernfs.DynamicBytesFile
+
+	stack     inet.Stack `state:"wait"`
+	available bool
+}
+
+var _ vfs.WritableDynamicBytesSource = (*tcpCongestionControlData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *tcpCongestionControlData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	stack := d.stack.(tcpSysctlStack)
+	var value string
+	var err error
+	if d.available {
+		value, err = stack.TCPAvailableCongestionControl()
+	} else {
+		value, err = stack.TCPCongestionControl()
+	}
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(buf, "%s\n", value)
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *tcpCongestionControlData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if d.available {
+		return 0, linuxerr.EPERM
+	}
+	if offset != 0 {
+		return 0, linuxerr.EINVAL
+	}
+	if src.NumBytes() == 0 {
+		return 0, nil
+	}
+	toCopy := src.NumBytes()
+	if toCopy >= hostarch.PageSize {
+		toCopy = hostarch.PageSize - 1
+	}
+	b := make([]byte, toCopy)
+	if _, err := src.TakeFirst(int(toCopy)).CopyIn(ctx, b); err != nil {
+		return 0, err
+	}
+	name := strings.TrimSpace(string(b))
+	if name == "" || strings.IndexByte(name, 0) >= 0 {
+		return 0, linuxerr.EINVAL
+	}
+	if err := d.stack.(tcpSysctlStack).SetTCPCongestionControl(name); err != nil {
+		return 0, err
+	}
+	return src.NumBytes(), nil
+}
+
+// tcpRetriesKind identifies an integer TCP retry sysctl.
+//
+// +stateify savable
+type tcpRetriesKind int
+
+const (
+	tcpSynRetries tcpRetriesKind = iota
+	tcpMaxRetries
+)
+
+// tcpRetriesData implements tcp_syn_retries and tcp_retries2.
+//
+// +stateify savable
+type tcpRetriesData struct {
+	kernfs.DynamicBytesFile
+
+	stack inet.Stack `state:"wait"`
+	kind  tcpRetriesKind
+}
+
+var _ vfs.WritableDynamicBytesSource = (*tcpRetriesData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *tcpRetriesData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	stack := d.stack.(tcpSysctlStack)
+	var value uint8
+	var err error
+	switch d.kind {
+	case tcpSynRetries:
+		value, err = stack.TCPSynRetries()
+	case tcpMaxRetries:
+		value, err = stack.TCPMaxRetries()
+	default:
+		panic(fmt.Sprintf("unknown TCP retries sysctl kind: %d", d.kind))
+	}
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(buf, "%d\n", value)
+	return err
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *tcpRetriesData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	if offset != 0 {
+		return 0, linuxerr.EINVAL
+	}
+	values := make([]int32, 1)
+	n, err := ParseInt32Vec(ctx, src, values)
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	minimum := int32(0)
+	if d.kind == tcpSynRetries {
+		minimum = 1
+	}
+	if values[0] < minimum || values[0] > math.MaxUint8 {
+		return 0, linuxerr.EINVAL
+	}
+	stack := d.stack.(tcpSysctlStack)
+	switch d.kind {
+	case tcpSynRetries:
+		err = stack.SetTCPSynRetries(uint8(values[0]))
+	case tcpMaxRetries:
+		err = stack.SetTCPMaxRetries(uint8(values[0]))
+	default:
+		panic(fmt.Sprintf("unknown TCP retries sysctl kind: %d", d.kind))
+	}
+	if err != nil {
 		return 0, err
 	}
 	return n, nil

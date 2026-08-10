@@ -41,6 +41,10 @@ type TestStack struct {
 	TCPSACKFlag       bool
 	Recovery          TCPLossRecovery
 	IPForwarding      bool
+	CongestionControl string
+	AvailableCC       string
+	SynRetries        uint8
+	MaxRetries        uint8
 }
 
 // NewTestStack returns a TestStack with no network interfaces. The value of
@@ -155,6 +159,44 @@ func (s *TestStack) TCPRecovery() (TCPLossRecovery, error) {
 // SetTCPRecovery implements Stack.
 func (s *TestStack) SetTCPRecovery(recovery TCPLossRecovery) error {
 	s.Recovery = recovery
+	return nil
+}
+
+// TCPCongestionControl returns the configured test congestion control.
+func (s *TestStack) TCPCongestionControl() (string, error) {
+	return s.CongestionControl, nil
+}
+
+// SetTCPCongestionControl changes the configured test congestion control.
+func (s *TestStack) SetTCPCongestionControl(name string) error {
+	s.CongestionControl = name
+	return nil
+}
+
+// TCPAvailableCongestionControl returns the test stack's available algorithms.
+func (s *TestStack) TCPAvailableCongestionControl() (string, error) {
+	return s.AvailableCC, nil
+}
+
+// TCPSynRetries returns the configured test SYN retransmission limit.
+func (s *TestStack) TCPSynRetries() (uint8, error) {
+	return s.SynRetries, nil
+}
+
+// SetTCPSynRetries changes the configured test SYN retransmission limit.
+func (s *TestStack) SetTCPSynRetries(retries uint8) error {
+	s.SynRetries = retries
+	return nil
+}
+
+// TCPMaxRetries returns the configured test established retransmission limit.
+func (s *TestStack) TCPMaxRetries() (uint8, error) {
+	return s.MaxRetries, nil
+}
+
+// SetTCPMaxRetries changes the configured test established retransmission limit.
+func (s *TestStack) SetTCPMaxRetries(retries uint8) error {
+	s.MaxRetries = retries
 	return nil
 }
 
