@@ -2785,6 +2785,32 @@ TEST(ProcSysKernelHostname, MatchesUname) {
   EXPECT_EQ(procfs_hostname, hostname);
 }
 
+TEST(ProcSysKernelHostname, WriteRequiresSysAdmin) {
+  SKIP_IF(!IsRunningOnGvisor());
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+  EXPECT_THAT(SetContents("/proc/sys/kernel/hostname", "denied-host"),
+              PosixErrorIs(EPERM));
+}
+
+TEST(ProcSysKernelHostname, CanWriteWithSysAdmin) {
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  struct utsname original;
+  ASSERT_THAT(uname(&original), SyscallSucceeds());
+  auto restore = Cleanup([original] {
+    sethostname(original.nodename, strlen(original.nodename));
+  });
+
+  ASSERT_NO_ERRNO(
+      SetContents("/proc/sys/kernel/hostname", "proc-hostname\nignored"));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(
+                GetContents("/proc/sys/kernel/hostname")),
+            "proc-hostname\n");
+  struct utsname changed;
+  ASSERT_THAT(uname(&changed), SyscallSucceeds());
+  EXPECT_STREQ(changed.nodename, "proc-hostname");
+}
+
 // Ensure that epoll triggers EPOLLERR when the hostname changes.
 TEST(ProcSysKernelHostname, EpollNotifiesOnChange) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
@@ -2847,6 +2873,32 @@ TEST(ProcSysKernelDomainname, MatchesUname) {
   auto procfs_domainname =
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/domainname"));
   EXPECT_EQ(procfs_domainname, domainname);
+}
+
+TEST(ProcSysKernelDomainname, WriteRequiresSysAdmin) {
+  SKIP_IF(!IsRunningOnGvisor());
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+  EXPECT_THAT(SetContents("/proc/sys/kernel/domainname", "denied-domain"),
+              PosixErrorIs(EPERM));
+}
+
+TEST(ProcSysKernelDomainname, CanWriteWithSysAdmin) {
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  struct utsname original;
+  ASSERT_THAT(uname(&original), SyscallSucceeds());
+  auto restore = Cleanup([original] {
+    setdomainname(original.domainname, strlen(original.domainname));
+  });
+
+  ASSERT_NO_ERRNO(
+      SetContents("/proc/sys/kernel/domainname", "proc-domain\nignored"));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(
+                GetContents("/proc/sys/kernel/domainname")),
+            "proc-domain\n");
+  struct utsname changed;
+  ASSERT_THAT(uname(&changed), SyscallSucceeds());
+  EXPECT_STREQ(changed.domainname, "proc-domain");
 }
 
 TEST(ProcSysKernelDomainname, EpollNotifiesOnChange) {

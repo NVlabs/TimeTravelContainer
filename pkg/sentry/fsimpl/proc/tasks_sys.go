@@ -66,8 +66,8 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 	return fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 		"kernel": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 			"cap_last_cap":       fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", linux.CAP_LAST_CAP))),
-			"hostname":           fs.newInode(ctx, root, 0444, &hostnameData{}),
-			"domainname":         fs.newInode(ctx, root, 0444, &domainnameData{}),
+			"hostname":           fs.newInode(ctx, root, 0644, &hostnameData{}),
+			"domainname":         fs.newInode(ctx, root, 0644, &domainnameData{}),
 			"overflowgid":        fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", auth.OverflowGID))),
 			"overflowuid":        fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", auth.OverflowUID))),
 			"pid_max":            fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", kernel.TasksLimit))),
@@ -213,6 +213,7 @@ type hostnameData struct {
 }
 
 var _ dynamicInode = (*hostnameData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*hostnameData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*hostnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -221,6 +222,40 @@ func (*hostnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(utsns.HostName())
 	buf.WriteString("\n")
 	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (*hostnameData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	utsns := kernel.UTSNamespaceFromContext(ctx)
+	defer utsns.DecRef(ctx)
+	t := kernel.TaskFromContext(ctx)
+	if t == nil || !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, utsns.UserNamespace()) {
+		return 0, linuxerr.EPERM
+	}
+	if offset < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	current := utsns.HostName()
+	if offset > int64(len(current)) {
+		// Linux strict sysctl writes ignore writes beyond the current string.
+		return 0, nil
+	}
+
+	srcLen := src.NumBytes()
+	copyLen := srcLen
+	if max := int64(linux.UTSLen) - offset; copyLen > max {
+		copyLen = max
+	}
+	b := make([]byte, copyLen)
+	if _, err := src.TakeFirst(int(copyLen)).CopyIn(ctx, b); err != nil {
+		return 0, err
+	}
+	if end := bytes.IndexAny(b, "\x00\n"); end >= 0 {
+		b = b[:end]
+	}
+	utsns.SetHostName(ctx, current[:offset]+string(b))
+	// Linux consumes the complete write even when the value is truncated.
+	return srcLen, nil
 }
 
 // GetDynamicBytesPoller implements vfs.PollableDynamicBytesSource.GetDynamicBytesPoller.
@@ -236,6 +271,7 @@ type domainnameData struct {
 }
 
 var _ dynamicInode = (*domainnameData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*domainnameData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*domainnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -244,6 +280,40 @@ func (*domainnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(utsns.DomainName())
 	buf.WriteString("\n")
 	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (*domainnameData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	utsns := kernel.UTSNamespaceFromContext(ctx)
+	defer utsns.DecRef(ctx)
+	t := kernel.TaskFromContext(ctx)
+	if t == nil || !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, utsns.UserNamespace()) {
+		return 0, linuxerr.EPERM
+	}
+	if offset < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	current := utsns.DomainName()
+	if offset > int64(len(current)) {
+		// Linux strict sysctl writes ignore writes beyond the current string.
+		return 0, nil
+	}
+
+	srcLen := src.NumBytes()
+	copyLen := srcLen
+	if max := int64(linux.UTSLen) - offset; copyLen > max {
+		copyLen = max
+	}
+	b := make([]byte, copyLen)
+	if _, err := src.TakeFirst(int(copyLen)).CopyIn(ctx, b); err != nil {
+		return 0, err
+	}
+	if end := bytes.IndexAny(b, "\x00\n"); end >= 0 {
+		b = b[:end]
+	}
+	utsns.SetDomainName(ctx, current[:offset]+string(b))
+	// Linux consumes the complete write even when the value is truncated.
+	return srcLen, nil
 }
 
 // uuidData implements vfs.DynamicBytesSource for /proc/sys/kernel/random/uuid.
