@@ -36,6 +36,10 @@ func (*liveForkTestRights) Clone() RightsControlMessage {
 	return &liveForkTestRights{}
 }
 
+func (*liveForkTestRights) TransferRights() RightsControlMessage {
+	return &liveForkTestRights{}
+}
+
 func (*liveForkTestRights) Release(context.Context) {}
 
 func TestValidateLiveForkRejectsQueuedRights(t *testing.T) {

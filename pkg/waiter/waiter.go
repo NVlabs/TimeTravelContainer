@@ -238,6 +238,8 @@ func NewFunctionEntry(mask EventMask, fn func(EventMask)) (e Entry) {
 }
 
 // NoopListener is an EventListener that does nothing.
+//
+// +stateify savable
 type NoopListener struct{}
 
 // NotifyEvent implements EventListener.NotifyEvent.
@@ -282,7 +284,13 @@ func (q *Queue) StateSave(s state.Sink) {
 // StateLoad restores the persistent queue topology from StateSave's snapshot.
 func (q *Queue) StateLoad(_ context.Context, s state.Source) {
 	var entries []*Entry
-	s.LoadWait(0, &entries)
+	// Do not make the Queue's owner wait for the entries to complete. An
+	// Entry's listener commonly points back to that owner (for example, a
+	// hostinet Socket), so LoadWait would create a dependency cycle. All object
+	// storage and fields have been decoded before AfterLoad callbacks begin;
+	// rebuilding the intrusive links only requires the Entry pointers, not the
+	// completion of their listeners' AfterLoad callbacks.
+	s.Load(0, &entries)
 	s.AfterLoad(func() {
 		q.list = waiterList{}
 		for _, e := range entries {

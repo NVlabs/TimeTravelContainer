@@ -21,6 +21,7 @@ TTC=${TTC:-}
 RUNSC=${RUNSC:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 
 fail() {
@@ -83,11 +84,14 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-  ttc daemon start --unsafe-no-host-isolation
-else
-  ttc daemon start
+  set -- "$@" --unsafe-no-host-isolation
 fi
+if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
+  set -- "$@" --allow-slow-volume-copy
+fi
+ttc "$@"
 
 # Repetition makes the original post-start follower race deterministic on an
 # unfixed runtime. Every run also checks that stdin and stdout are real TTYs.

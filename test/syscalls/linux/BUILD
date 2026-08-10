@@ -708,6 +708,27 @@ cc_binary(
 )
 
 cc_binary(
+    name = "cgroup2_ebpf_test",
+    testonly = 1,
+    srcs = ["cgroup2_ebpf.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:capability_util",
+        "//test/util:cgroup_util",
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "//test/util:logging",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+    ],
+)
+
+cc_binary(
     name = "epoll_test",
     testonly = 1,
     srcs = ["epoll.cc"],
@@ -1112,6 +1133,7 @@ cc_binary(
         "@com_google_absl//absl/container:node_hash_map",
         "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )
 
@@ -1197,6 +1219,20 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "iptables_util",
+    testonly = 1,
+    srcs = [
+        "iptables_util.cc",
+    ],
+    hdrs = [
+        "iptables_util.h",
+    ],
+    deps = [
+        ":iptables_types",
+    ],
+)
+
 cc_binary(
     name = "iptables_test",
     testonly = 1,
@@ -1207,6 +1243,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         ":iptables_types",
+        ":iptables_util",
         "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:logging",
@@ -1230,6 +1267,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         ":iptables_types",
+        ":iptables_util",
         "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:logging",
@@ -1313,6 +1351,109 @@ cc_binary(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "landlock_util",
+    testonly = 1,
+    hdrs = ["landlock_util.h"],
+)
+
+cc_binary(
+    name = "landlock_v1_test",
+    testonly = 1,
+    srcs = ["landlock_v1.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:fs_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v2_test",
+    testonly = 1,
+    srcs = ["landlock_v2.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:fs_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v3_test",
+    testonly = 1,
+    srcs = ["landlock_v3.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v4_test",
+    testonly = 1,
+    srcs = ["landlock_v4.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v5_test",
+    testonly = 1,
+    srcs = ["landlock_v5.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "landlock_v6_test",
+    testonly = 1,
+    srcs = ["landlock_v6.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        ":landlock_util",
+        "//test/util:fs_util",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
     ],
 )
 
@@ -1645,6 +1786,7 @@ cc_binary(
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -1771,6 +1913,7 @@ cc_binary(
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:pty_util",
+        "//test/util:save_util",
         "//test/util:signal_util",
         "//test/util:temp_path",
         "//test/util:test_main",
@@ -1778,6 +1921,7 @@ cc_binary(
         "//test/util:thread_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
@@ -2426,12 +2570,15 @@ cc_binary(
     deps = [
         "//test/util:capability_util",
         "//test/util:cleanup",
+        "//test/util:fs_util",
+        "//test/util:posix_error",
         "//test/util:proc_util",
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )
 
@@ -2821,6 +2968,7 @@ cc_library(
     hdrs = ["socket_unix_dgram.h"],
     deps = select_gtest() + [
         ":unix_domain_socket_test_util",
+        "//test/util:posix_error",
         "//test/util:socket_util",
         "//test/util:test_util",
         "@com_google_absl//absl/time",
@@ -3931,6 +4079,7 @@ cc_library(
         "//test/util:test_util",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
     ],
@@ -4748,6 +4897,9 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:logging",
+        "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
@@ -4764,7 +4916,7 @@ cc_binary(
     srcs = ["shm.cc"],
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
-    deps = [
+    deps = select_gtest() + [
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
         "//test/util:temp_path",
@@ -4782,10 +4934,14 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         "//test/util:capability_util",
+        "//test/util:logging",
+        "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:signal_util",
         "//test/util:temp_path",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
@@ -4937,6 +5093,26 @@ cc_binary(
         "//test/util:test_util",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_binary(
+    name = "posix_acl_test",
+    testonly = 1,
+    srcs = ["posix_acl.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:capability_util",
+        "//test/util:cleanup",
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+        "@com_google_absl//absl/time",
     ],
 )
 

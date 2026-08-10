@@ -899,6 +899,12 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	if !ats.MayWrite() {
 		return nil
 	}
+	if !d.upperVD.Ok() && !d.canBeCopiedUp() {
+		return linuxerr.EPERM
+	}
+	if linux.FileMode(d.mode.Load()).IsSpecialFile() {
+		return nil
+	}
 
 	// Copy up!
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -908,8 +914,8 @@ func (d *dentry) ensureOpenableLocked(ctx context.Context, rp *vfs.ResolvingPath
 	return d.copyUpLocked(ctx)
 }
 
-// Preconditions: If vfs.AccessTypesForOpenFlags(opts).MayWrite(), then d has
-// been copied up.
+// Preconditions: If vfs.AccessTypesForOpenFlags(opts).MayWrite() and d is not a
+// special file, then d has been copied up.
 func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	mnt := rp.Mount()
 
@@ -1500,7 +1506,7 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 // Precondition: d.fs.renameMu must be held for reading.
 func (d *dentry) setStatLocked(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	mode := linux.FileMode(d.mode.Load())
-	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts, mode, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
+	if err := vfs.CheckSetStat(ctx, rp.Credentials(), &opts, mode, nil, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
 	}
 	mnt := rp.Mount()
@@ -1860,6 +1866,29 @@ func (fs *filesystem) removeXattrLocked(ctx context.Context, d *dentry, mnt *vfs
 	}
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
 	return vfsObj.RemoveXattrAt(ctx, fs.creds, &vfs.PathOperation{Root: d.upperVD, Start: d.upperVD}, name)
+}
+
+// GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
+func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
+	var ds *[]*dentry
+	fs.renameMu.RLock()
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+	// overlayfs does not currently support POSIX ACLs.
+	_, err := fs.resolveLocked(ctx, rp, &ds)
+	return nil, err
+}
+
+// SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
+func (fs *filesystem) SetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
+	var ds *[]*dentry
+	fs.renameMu.RLock()
+	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+	_, err := fs.resolveLocked(ctx, rp, &ds)
+	if err != nil {
+		return nil, 0, err
+	}
+	// overlayfs does not currently support POSIX ACLs.
+	return nil, 0, linuxerr.EOPNOTSUPP
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.

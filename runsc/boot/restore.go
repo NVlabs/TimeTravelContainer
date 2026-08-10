@@ -110,6 +110,8 @@ const (
 	// annotationSaveRestoreExecTimeout is the timeout to use for the save/restore
 	// exec binary.
 	annotationSaveRestoreExecTimeout = annotationCheckpointPrefix + "save-restore-exec-timeout"
+
+	networkKey = "network"
 )
 
 // GetAnnotationCheckpointPath returns the checkpoint path specified in the
@@ -226,22 +228,12 @@ func saveOptsFromSpec(spec *specs.Spec, fds []*fd.FD, useCheckpointGofer bool) (
 	return saveOpts, nil
 }
 
-// The root container has the annotationCheckpointPath annotation set if
-// application-driven checkpoint is enabled. Since the root container is
-// always the first container, we can use it to initialize this global variable
-// and it will inform the future sub-containers.
-var appDrivenCheckpointEnabled = false
-
 func newProcInternalData(conf *config.Config, spec *specs.Spec) *proc.InternalData {
-	if len(spec.Annotations[annotationCheckpointPath]) != 0 {
-		appDrivenCheckpointEnabled = true
-	}
 	return &proc.InternalData{
-		GVisorMarkerFile:           conf.GVisorMarkerFile,
-		OverrideProcs:              procFiles(conf),
-		AppDrivenCheckpointEnabled: appDrivenCheckpointEnabled,
-		SaveTriggerEnabled:         specutils.AnnotationToBool(spec, annotationCheckpointEnable),
-		FSCheckpointEnabled:        specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
+		GVisorMarkerFile:    conf.GVisorMarkerFile,
+		OverrideProcs:       procFiles(conf),
+		SaveTriggerEnabled:  specutils.AnnotationToBool(spec, annotationCheckpointEnable),
+		FSCheckpointEnabled: specutils.AnnotationToBool(spec, annotationFSCheckpointEnable),
 	}
 }
 
@@ -353,6 +345,16 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	return nil
 }
 
+type restoreMounts struct {
+	fdmap     map[checkpoint.ResourceID]int
+	mfmap     map[checkpoint.ResourceID]*pgalloc.MemoryFile
+	sharedMfs map[string]bool
+}
+
+func (r *restoreMounts) String() string {
+	return fmt.Sprintf("fdmap: %#v, mfmap: %v", r.fdmap, r.mfmap)
+}
+
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
 	if l.family.HasChildren() {
@@ -364,9 +366,17 @@ func (r *restorer) restore(l *Loader) error {
 	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
 		return fmt.Errorf("failed to handle restore spec validation: %w", err)
 	}
-	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkTimeTravel {
-		// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-		return errors.New("checkpoint not supported when using hostinet")
+	if l.root.conf.Network != config.NetworkSandbox && l.root.conf.Network != config.NetworkNone && l.root.conf.Network != config.NetworkHost && l.root.conf.Network != config.NetworkTimeTravel {
+		return fmt.Errorf("checkpoint not supported when using %s networking", l.root.conf.Network)
+	}
+	// Checkpoints without the network key predate hostinet support.
+	savedNetwork, ok := r.metadata[networkKey]
+	if !ok {
+		savedNetwork = config.NetworkSandbox.String()
+	}
+	savedHost := savedNetwork == config.NetworkHost.String()
+	if restoreHost := l.root.conf.Network == config.NetworkHost; savedHost != restoreHost {
+		return fmt.Errorf("checkpoint created with %s networking cannot be restored with %s networking", savedNetwork, l.root.conf.Network)
 	}
 	r.timer.Reached("specs validated")
 
@@ -398,6 +408,31 @@ func (r *restorer) restore(l *Loader) error {
 		pprof.Initialize()
 	}
 
+	if l.root.conf.Network == config.NetworkHost {
+		devFile, err := os.Open("/proc/net/dev")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/dev during restore: %v", err)
+		} else {
+			l.hostinetNetDevFile = devFile
+		}
+		snmpFile, err := os.Open("/proc/net/snmp")
+		if err != nil {
+			log.Warningf("Failed to open /proc/net/snmp during restore: %v", err)
+		} else {
+			l.hostinetNetSNMPFile = snmpFile
+		}
+		defer func() {
+			if l.hostinetNetDevFile != nil {
+				l.hostinetNetDevFile.Close()
+				l.hostinetNetDevFile = nil
+			}
+			if l.hostinetNetSNMPFile != nil {
+				l.hostinetNetSNMPFile.Close()
+				l.hostinetNetSNMPFile = nil
+			}
+		}()
+	}
+
 	// Seccomp filters have to be applied before vfs restore and before parsing
 	// the state file.
 	if err := l.installSeccompFilters(); err != nil {
@@ -410,8 +445,11 @@ func (r *restorer) restore(l *Loader) error {
 	})
 	defer cu.Clean()
 
-	fdmap := make(map[checkpoint.ResourceID]int)
-	mfmap := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	restoreMnts := restoreMounts{
+		fdmap:     make(map[checkpoint.ResourceID]int),
+		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		sharedMfs: make(map[string]bool),
+	}
 	filesystemResources := make(vfs.RestoreFilesystemResources)
 	for _, donated := range l.ttcVolumeRepositories {
 		info := donated.repository.Info()
@@ -431,34 +469,33 @@ func (r *restorer) restore(l *Loader) error {
 	for _, cont := range r.containers {
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)
-		if err = mntr.configureRestore(fdmap, mfmap); err != nil {
+		if err = mntr.configureRestore(&restoreMnts); err != nil {
 			return fmt.Errorf("configuring filesystem restore: %v", err)
 		}
 
 		for i, fd := range cont.stdioFDs {
 			key := host.MakeResourceID(cont.containerName, i)
-			fdmap[key] = fd.Release()
+			restoreMnts.fdmap[key] = fd.Release()
 		}
 		for _, customFD := range cont.passFDs {
 			key := host.MakeResourceID(cont.containerName, customFD.guest)
-			fdmap[key] = customFD.host.FD()
+			restoreMnts.fdmap[key] = customFD.host.FD()
 		}
 	}
 
-	log.Debugf("Restore using fdmap: %#v", fdmap)
+	log.Debugf("Restore using mounts: %v", &restoreMnts)
 	ctx := l.k.SupervisorContext()
-	log.Debugf("Restore using mfmap: %v", mfmap)
 	ctx = context.WithValues(ctx, map[any]any{
-		vfs.CtxRestoreFilesystemFDMap:     fdmap,
+		vfs.CtxRestoreFilesystemFDMap:     restoreMnts.fdmap,
 		vfs.CtxRestoreFilesystemResources: filesystemResources,
-		pgalloc.CtxMemoryFileMap:          mfmap,
+		pgalloc.CtxMemoryFileMap:          restoreMnts.mfmap,
 		devutil.CtxDevGoferClientProvider: l.k,
 	})
 
 	if r.asyncMFLoader != nil {
 		// Now that private memory files are known, kick off their loading in the
 		// background goroutine.
-		r.asyncMFLoader.KickoffPrivate(mfmap)
+		r.asyncMFLoader.KickoffPrivate(restoreMnts.mfmap)
 	}
 
 	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
@@ -719,11 +756,6 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 		k.OnCheckpointAttempt(err)
 	}()
 
-	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-	if l.root.conf.Network == config.NetworkHost {
-		return errors.New("checkpoint not supported when using hostinet")
-	}
-
 	if saveOpts.Metadata == nil {
 		saveOpts.Metadata = make(map[string]string)
 	}
@@ -731,6 +763,8 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 
 	// Save runsc version.
 	saveOpts.Metadata[VersionKey] = version.Version()
+
+	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())

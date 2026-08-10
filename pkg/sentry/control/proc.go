@@ -177,6 +177,15 @@ type ExecArgs struct {
 	// PIDNamespace is the pid namespace for the process being executed.
 	PIDNamespace *kernel.PIDNamespace
 
+	// InitialCgroupV2 is the cgroup2 node the process being executed starts
+	// in. If nil, it starts in the root cgroup.
+	InitialCgroupV2 kernel.Cgroup2
+
+	// CgroupNamespace is the cgroup namespace for the process being executed.
+	// If nil, the root cgroup namespace is used. A reference on
+	// CgroupNamespace must be held for the lifetime of the ExecArgs.
+	CgroupNamespace *kernel.CgroupNamespace
+
 	// Limits is the limit set for the process being executed.
 	Limits *limits.LimitSet
 
@@ -262,6 +271,8 @@ func (proc *Proc) execAsync(args *ExecArgs, hooks ExecAsyncHooks) (*kernel.Threa
 		IPCNamespace:         proc.Kernel.RootIPCNamespace(),
 		ContainerID:          args.ContainerID,
 		PIDNamespace:         pidns,
+		InitialCgroupV2:      args.InitialCgroupV2,
+		CgroupNamespace:      args.CgroupNamespace,
 		Origin:               kernel.OriginExec,
 	}
 	ctx := initArgs.NewContext(proc.Kernel)

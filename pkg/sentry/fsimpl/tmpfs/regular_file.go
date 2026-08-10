@@ -116,10 +116,15 @@ type regularFile struct {
 	// shmem_anon_vm_ops rather than shmem_vm_ops.
 	//
 	// initiallyUnlinked is immutable, but stored here since it fits into
-	// alignment padding.
+	// alignment padding after seals.
 	initiallyUnlinked bool
 
+	// memfd is true if this file was created using NewMemfd.
+	// Immutable; fits in padding.
+	memfd bool
+
 	// huge is true if pages in this file may be hugepage-backed.
+	// Fits in padding.
 	huge bool
 
 	// size is the size of data.
@@ -131,6 +136,10 @@ type regularFile struct {
 	size atomicbitops.Uint64
 }
 
+// newRegularFile creates a new regular file.
+//
+// If parentDir is not nil, certain fields (such as setgid and default ACL) will be inherited
+// from parentDir.
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) (*inode, error) {
 	file := &regularFile{
 		memoryUsageKind: fs.usage,
@@ -421,8 +430,10 @@ func NewMemfd(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount, al
 	if err != nil {
 		return nil, err
 	}
+	rf := fd.inode().impl.(*regularFile)
+	rf.memfd = true
 	if allowSeals {
-		fd.inode().impl.(*regularFile).seals = 0
+		rf.seals = 0
 	}
 	return &fd.vfsfd, nil
 }
@@ -779,14 +790,14 @@ func (fd *regularFileFD) OnClose(context.Context) error {
 
 // Sync synchronizes data before publishing the size and timestamps that make
 // those bytes reachable after restart.
-func (fd *regularFileFD) Sync(context.Context) error {
+func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	f := fd.inode().impl.(*regularFile)
 	if f.inode.fs.diskVolume == nil {
 		return nil
 	}
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
-	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, false); err != nil {
+	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, opts.DataOnly); err != nil {
 		return err
 	}
 	if err := f.flushDiskMetadataLocked(); err != nil {
@@ -1523,4 +1534,28 @@ func AddSeals(fd *vfs.FileDescription, val uint32) error {
 	// Seals can only be added, never removed.
 	rf.seals |= val
 	return nil
+}
+
+// IsMemfd returns whether fd represents a memfd.
+func IsMemfd(fd *vfs.FileDescription) bool {
+	if fd == nil {
+		return false
+	}
+	return IsMemfdDentry(fd.Dentry())
+}
+
+// IsMemfdDentry returns whether d represents a memfd.
+func IsMemfdDentry(d *vfs.Dentry) bool {
+	if d == nil {
+		return false
+	}
+	f, ok := d.Impl().(*dentry)
+	if !ok {
+		return false
+	}
+	rf, ok := f.inode.impl.(*regularFile)
+	if !ok {
+		return false
+	}
+	return rf.memfd
 }

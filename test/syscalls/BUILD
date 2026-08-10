@@ -78,6 +78,7 @@ syscall_test(
 syscall_test(
     size = "large",
     mount_cgroup_v2 = True,
+    shard_count = more_shards,
     test = "//test/syscalls/linux:cgroup2_test",
 )
 
@@ -192,6 +193,11 @@ syscall_test(
 )
 
 syscall_test(
+    mount_cgroup_v2 = True,
+    test = "//test/syscalls/linux:cgroup2_ebpf_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:epoll_test",
 )
 
@@ -294,6 +300,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:getdents_test",
@@ -356,6 +363,36 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:kill_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v1_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v2_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v3_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v4_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v5_test",
+)
+
+syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:landlock_v6_test",
 )
 
 syscall_test(
@@ -979,6 +1016,11 @@ syscall_test(
 
 syscall_test(
     nftables = True,
+    save = False,
+    tags = [
+        "local",
+        "notap",
+    ],
     test = "//test/syscalls/linux:socket_netlink_netfilter_test",
 )
 
@@ -1337,4 +1379,8 @@ syscall_test(
     add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:xattr_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:posix_acl_test",
 )

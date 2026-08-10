@@ -22,6 +22,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -145,13 +146,21 @@ func ImageByName(name string) string {
 // ConfigureExePath configures the executable for runsc in the test environment.
 func ConfigureExePath() error {
 	if *runscPath == "" {
-		path, err := FindFile("runsc/runsc")
+		path, err := FindFile("release/runsc")
 		if err != nil {
-			return err
+			path, err = FindFile("runsc/runsc")
+			if err != nil {
+				return err
+			}
 		}
 		*runscPath = path
 	}
 	specutils.ExePath = *runscPath
+	if os.Getenv("GVISOR_SIDECAR_BINARIES_DIR") == "" {
+		if dir, err := FindFile("release/gvisor-bin"); err == nil {
+			os.Setenv("GVISOR_SIDECAR_BINARIES_DIR", dir)
+		}
+	}
 	return nil
 }
 
@@ -308,7 +317,10 @@ func SetupRootDir() (string, func(), error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating root dir: %v", err)
 	}
-	return rootDir, func() { os.RemoveAll(rootDir) }, nil
+	return rootDir, func() {
+		specutils.UnmountNullNetNS(rootDir)
+		os.RemoveAll(rootDir)
+	}, nil
 }
 
 // SetupContainer creates a bundle and root dir for the container, generates a
@@ -656,4 +668,25 @@ func TestIndicesForShard(numTests int) ([]int, error) {
 		}
 	}
 	return indices, nil
+}
+
+// Partition returns the current partition number (1-indexed).
+func Partition() int {
+	return *partition
+}
+
+// TotalPartitions returns the total number of partitions.
+func TotalPartitions() int {
+	return *totalPartitions
+}
+
+// ShouldRun returns true if the test should run on the current partition/shard.
+func ShouldRun(testName string) bool {
+	if *totalPartitions <= 1 {
+		return true
+	}
+	h := fnv.New32a()
+	h.Write([]byte(testName))
+	idx := int(h.Sum32() % uint32(*totalPartitions))
+	return idx == (*partition - 1)
 }

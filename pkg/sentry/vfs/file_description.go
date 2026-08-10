@@ -344,6 +344,13 @@ type LiveForkFileDescription interface {
 	ValidateLiveFork() (referenced []*FileDescription, err error)
 }
 
+// SyncOptions contains options for FileDescriptionImpl.Sync.
+type SyncOptions struct {
+	// DataOnly indicates that only file data (and necessary metadata to read data)
+	// needs to be synced, equivalent to fdatasync(2).
+	DataOnly bool
+}
+
 // FileDescriptionImpl contains implementation details for an FileDescription.
 // Implementations of FileDescriptionImpl should contain their associated
 // FileDescription by value as their first field.
@@ -473,7 +480,7 @@ type FileDescriptionImpl interface {
 	// Sync requests that cached state associated with the file represented by
 	// the FileDescription is synchronized with persistent storage, and blocks
 	// until this is complete.
-	Sync(ctx context.Context) error
+	Sync(ctx context.Context, opts SyncOptions) error
 
 	// ConfigureMMap mutates opts to implement mmap(2) for the file. Most
 	// implementations that support memory mapping can call
@@ -496,6 +503,12 @@ type FileDescriptionImpl interface {
 
 	// RemoveXattr removes the given extended attribute from the file.
 	RemoveXattr(ctx context.Context, name string) error
+
+	// GetPosixACL fetches the POSIX ACL from the file.
+	GetPosixACL(ctx context.Context, t ACLType) (*PosixACL, error)
+
+	// SetPosixACL sets the POSIX ACL for the file, returning the resulting ACL and mode.
+	SetPosixACL(ctx context.Context, t ACLType, acl *PosixACL, clearSGID bool) (*PosixACL, linux.FileMode, error)
 
 	// SupportsLocks indicates whether file locks are supported.
 	SupportsLocks() bool
@@ -742,7 +755,12 @@ func (fd *FileDescription) Seek(ctx context.Context, offset int64, whence int32)
 
 // Sync has the semantics of fsync(2).
 func (fd *FileDescription) Sync(ctx context.Context) error {
-	return fd.impl.Sync(ctx)
+	return fd.impl.Sync(ctx, SyncOptions{DataOnly: false})
+}
+
+// SyncData has the semantics of fdatasync(2).
+func (fd *FileDescription) SyncData(ctx context.Context) error {
+	return fd.impl.Sync(ctx, SyncOptions{DataOnly: true})
 }
 
 // ConfigureMMap mutates opts to implement mmap(2) for the file represented by
@@ -844,6 +862,37 @@ func (fd *FileDescription) RemoveXattr(ctx context.Context, name string) error {
 	}
 	fd.Dentry().InotifyWithParent(ctx, linux.IN_ATTRIB, 0, InodeEvent)
 	return nil
+}
+
+// GetPosixACL gets the POSIX ACL from the file represented by fd.
+func (fd *FileDescription) GetPosixACL(ctx context.Context, t ACLType) (*PosixACL, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		acl, err := fd.vd.mount.fs.impl.GetPosixACLAt(ctx, rp, t)
+		rp.Release(ctx)
+		return acl, err
+	}
+	return fd.impl.GetPosixACL(ctx, t)
+}
+
+// SetPosixACL sets the POSIX ACL for the file represented by fd.
+// The resulting ACL and mode are returned.
+func (fd *FileDescription) SetPosixACL(ctx context.Context, t ACLType, acl *PosixACL, clearSGID bool) (*PosixACL, linux.FileMode, error) {
+	if fd.opts.UseDentryMetadata {
+		vfsObj := fd.vd.mount.vfs
+		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
+			Root:  fd.vd,
+			Start: fd.vd,
+		})
+		acl, mode, err := fd.vd.mount.fs.impl.SetPosixACLAt(ctx, rp, t, acl, clearSGID)
+		rp.Release(ctx)
+		return acl, mode, err
+	}
+	return fd.impl.SetPosixACL(ctx, t, acl, clearSGID)
 }
 
 // SyncFS instructs the filesystem containing fd to execute the semantics of

@@ -23,6 +23,68 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
+type queueStateRoot struct {
+	owner *queueStateOwner
+}
+
+func (*queueStateRoot) StateTypeName() string { return "pkg/waiter.queueStateRoot" }
+func (*queueStateRoot) StateFields() []string { return []string{"owner"} }
+func (r *queueStateRoot) StateSave(s state.Sink) {
+	s.Save(0, &r.owner)
+}
+func (r *queueStateRoot) StateLoad(_ context.Context, s state.Source) {
+	s.Load(0, &r.owner)
+}
+
+type queueStateOwner struct {
+	queue    Queue
+	notified EventMask
+}
+
+func (*queueStateOwner) StateTypeName() string { return "pkg/waiter.queueStateOwner" }
+func (*queueStateOwner) StateFields() []string { return []string{"queue"} }
+func (o *queueStateOwner) StateSave(s state.Sink) {
+	s.Save(0, &o.queue)
+}
+func (o *queueStateOwner) StateLoad(_ context.Context, s state.Source) {
+	s.Load(0, &o.queue)
+}
+func (o *queueStateOwner) NotifyEvent(mask EventMask) {
+	o.notified |= mask
+}
+
+func init() {
+	state.Register((*queueStateRoot)(nil))
+	state.Register((*queueStateOwner)(nil))
+}
+
+func TestQueueStateRestoresListenerCycle(t *testing.T) {
+	owner := &queueStateOwner{}
+	entry := &Entry{}
+	entry.Init(owner, ReadableEvents)
+	owner.queue.EventRegister(entry)
+	source := queueStateRoot{owner: owner}
+
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, &source); err != nil {
+		t.Fatalf("saving Queue with cyclic listener: %v", err)
+	}
+	var restored queueStateRoot
+	if _, err := state.Load(context.Background(), &image, &restored); err != nil {
+		t.Fatalf("loading Queue with cyclic listener: %v", err)
+	}
+	if restored.owner == nil {
+		t.Fatal("restored listener owner is nil")
+	}
+	if got, want := restored.owner.queue.Events(), ReadableEvents; got != want {
+		t.Fatalf("restored events=%#x, want %#x", got, want)
+	}
+	restored.owner.queue.Notify(ReadableEvents)
+	if got, want := restored.owner.notified, ReadableEvents; got != want {
+		t.Fatalf("listener notification=%#x, want %#x", got, want)
+	}
+}
+
 func TestQueueStateOmitsTransientChannelWaiter(t *testing.T) {
 	var source Queue
 	entry, _ := NewTransientChannelEntry(ReadableEvents | EventErr | EventHUp)

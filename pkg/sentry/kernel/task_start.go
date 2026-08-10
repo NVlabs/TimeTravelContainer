@@ -87,6 +87,9 @@ type TaskConfig struct {
 	// IPCNamespace is the IPCNamespace of the new task.
 	IPCNamespace *IPCNamespace
 
+	// CgroupNamespace is the CgroupNamespace of the new task.
+	CgroupNamespace *CgroupNamespace
+
 	// MountNamespace is the MountNamespace of the new task.
 	MountNamespace *vfs.MountNamespace
 
@@ -102,6 +105,11 @@ type TaskConfig struct {
 
 	// InitialCgroups are the cgroups the container is initialised to.
 	InitialCgroups map[Cgroup]struct{}
+
+	// InitialCgroupV2 is the cgroup2 node the new task starts in. Only
+	// consulted when the task is created from a non-task context (i.e.
+	// CreateProcess); if nil, the root cgroup is used.
+	InitialCgroupV2 Cgroup2
 
 	// UserCounters is user resource counters.
 	UserCounters *UserCounters
@@ -145,6 +153,7 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		cfg.FDTable.DecRef(ctx)
 		cfg.UTSNamespace.DecRef(ctx)
 		cfg.IPCNamespace.DecRef(ctx)
+		cfg.CgroupNamespace.DecRef(ctx)
 		cfg.NetworkNamespace.DecRef(ctx)
 		if cfg.MountNamespace != nil {
 			cfg.MountNamespace.DecRef(ctx)
@@ -177,10 +186,11 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	var cachedKillSeq uint64 // To avoid racing with cgroup.kill.
 
 	if cfg.cloneIntoCgroup {
-		c, err := srcT.getCgroup2NodeFromFD(cfg.cgroupFD)
+		c, err := srcT.GetCgroup2NodeFromFD(cfg.cgroupFD)
 		if err != nil {
 			return nil, err
 		}
+		srcCgroupNS := srcT.CgroupNamespace()
 		// We must lock the cgroup2 tree down to avoid racing with another
 		// thread that might destroy the destination cgroup. Note that we
 		// only lock this after we have extracted the destination cgroup to
@@ -194,7 +204,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 			// committing the entry of the new task into the cgroup.
 			srcT.k.Cgroup2FS().RUnlockTree()
 		})
-		if err := c.CanCloneInto(ctx, srcT.Credentials()); err != nil {
+		if err := c.CanCloneInto(ctx, srcT.Credentials(), srcCgroupNS); err != nil {
 			return nil, err
 		}
 		cgroup2 = c
@@ -220,6 +230,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		niceness:        cfg.Niceness,
 		utsns:           cfg.UTSNamespace,
 		ipcns:           cfg.IPCNamespace,
+		cgroupns:        cfg.CgroupNamespace,
 		mountNamespace:  cfg.MountNamespace,
 		rseqCPU:         -1,
 		rseqAddr:        cfg.RSeqAddr,
@@ -300,6 +311,9 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	if !cfg.cloneIntoCgroup {
 		if srcT != nil {
 			cgroup2 = srcT.Cgroup2()
+		} else if cfg.InitialCgroupV2 != nil {
+			// Container start or exec into an existing container.
+			cgroup2 = cfg.InitialCgroupV2
 		} else {
 			// Direct exec into the sandbox.
 			cgroup2 = cfg.Kernel.Cgroup2FS().RootCgroup()

@@ -16,7 +16,6 @@
 package sandbox
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,10 +32,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cenkalti/backoff"
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -47,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/prometheus"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -61,10 +61,10 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/cgroup"
-	"gvisor.dev/gvisor/runsc/checkpointgofer"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/gvisorbinaries"
 	"gvisor.dev/gvisor/runsc/hostsettings"
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -943,8 +943,22 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	lfOpts.Command = "boot" // Revert command to "boot".
 
+	sentryBin := &gvisorbinaries.GvisorSentry
+	sentryUsesCgo := false
+	if conf.Network == config.NetworkPlugin {
+		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
+		sentryUsesCgo = true
+	}
+	bootBinPath := specutils.ExePath
+	if p, err := sentryBin.Path(); err == nil {
+		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
+		bootBinPath = p
+	} else {
+		log.Warningf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err)
+	}
+
 	// Relay all the config flags to the sandbox process.
-	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
+	cmd := exec.Command(bootBinPath, conf.ToFlags()...)
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from this session, otherwise cmd will get SIGHUP and SIGCONT
 		// when re-parented.
@@ -965,11 +979,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	cmd.Args = append(cmd.Args, "boot", "--bundle="+args.BundleDir)
 
 	// Clear environment variables, unless --TESTONLY-unsafe-nonroot is set.
-	if !conf.AllowRunAsCurrentUserWithoutChroot() {
-		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
+	if conf.AllowRunAsCurrentUserWithoutChroot() {
+		cmd.Env = os.Environ()
+	} else {
 		cmd.Env = []string{}
 	}
-	if config.CgoEnabled {
+	if bootBinPath != specutils.ExePath {
+		cmd.Env = gvisorbinaries.WithEnforceRelease(cmd.Env)
+	}
+	if sentryUsesCgo {
 		// Platforms that use stub processes are not compatible with
 		// the glibc rseq, because they unmap everything from a process
 		// address space.
@@ -1848,8 +1866,8 @@ type FSSaveOpts struct {
 	// provided for parity with that feature.
 	ExitAfterSaving bool
 
-	// Path is the path inside the container to save.
-	Path string
+	// Paths is the list of paths inside the containers to save.
+	Paths []checkpoint.ResourceID
 }
 
 // FSSave sends the filesystem checkpointing call to the sandbox.
@@ -1858,7 +1876,7 @@ func (s *Sandbox) FSSave(conf *config.Config, cid string, imagePath string, opts
 
 	args := boot.FSSaveArgs{
 		ExitAfterSaving: opts.ExitAfterSaving,
-		Path:            opts.Path,
+		Paths:           opts.Paths,
 	}
 	defer func() {
 		for _, f := range args.FilePayload.Files {
@@ -2031,7 +2049,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 		// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
 		// v1.service.newCommand()).
 		env := slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") })
-		_, err := checkpointgofer.ForkExec(checkpointgofer.Options{
+		_, err := gvisorbinaries.CheckpointGofer.ForkExec(gvisorbinaries.Options{
 			Argv:  argv,
 			Envv:  env,
 			Files: extraFiles,
@@ -2594,16 +2612,11 @@ func (s *Sandbox) waitForStopped() error {
 		s.Pid.Store(0)
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
-	defer cancel()
-	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
-	op := func() error {
-		if s.IsRunning() {
-			return fmt.Errorf("sandbox is still running")
-		}
+	pid := s.Pid.Load()
+	if pid == 0 {
 		return nil
 	}
-	return backoff.Retry(op, b)
+	return specutils.WaitForNonChildExit(pid, waitTimeout)
 }
 
 // configureStdios change stdios ownership to give access to the sandbox
@@ -2908,12 +2921,13 @@ func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error 
 	return nil
 }
 
-// ReadFile reads a file of the sandbox from the given container (or root container if containerID is empty) up to the specified size.
-func (s *Sandbox) ReadFile(containerID, path string, size int64, outFD *os.File) error {
-	log.Debugf("ReadFile, sandbox: %q, container: %q, path: %q, size: %d", s.ID, containerID, path, size)
+// ReadFile reads a file of the sandbox from the given container (or root container if containerID is empty) up to the specified size from the specified offset.
+func (s *Sandbox) ReadFile(containerID, path string, offset, size int64, outFD *os.File) error {
+	log.Debugf("ReadFile, sandbox: %q, container: %q, path: %q, offset: %d, size: %d", s.ID, containerID, path, offset, size)
 	opts := control.ReadOpts{
 		ContainerID: containerID,
 		Path:        path,
+		Offset:      offset,
 		Size:        size,
 		FilePayload: urpc.FilePayload{Files: []*os.File{outFD}},
 	}

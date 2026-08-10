@@ -176,10 +176,15 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err != nil {
 		return nil, fmt.Errorf("creating distributed target platform: %w", err)
 	}
-	fdmap := make(map[checkpoint.ResourceID]int)
-	mfmap := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	restoreMnts := restoreMounts{
+		fdmap:     make(map[checkpoint.ResourceID]int),
+		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		sharedMfs: make(map[string]bool),
+	}
+	fdmap := restoreMnts.fdmap
+	mfmap := restoreMnts.mfmap
 	mounter := l.newContainerMounter(&l.root)
-	if err := mounter.configureRestore(fdmap, mfmap); err != nil {
+	if err := mounter.configureRestore(&restoreMnts); err != nil {
 		return nil, fmt.Errorf("configuring distributed target filesystems: %w", err)
 	}
 	if len(mfmap) != 0 {

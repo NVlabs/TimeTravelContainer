@@ -112,10 +112,14 @@ go_library(
 go_test(
     name = "transport_test",
     size = "small",
-    srcs = ["live_fork_test.go"],
+    srcs = [
+        "live_fork_test.go",
+        "queue_test.go",
+    ],
     library = ":transport",
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",
+        "//pkg/syserr",
     ],
 )

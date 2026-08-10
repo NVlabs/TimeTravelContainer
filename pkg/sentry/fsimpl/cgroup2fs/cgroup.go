@@ -27,10 +27,13 @@ package cgroup2fs
 // The treeMu is an analogue to the kernel's cgroup_mutex, whereas
 // tasksMu is an analogue to the kernel's css_set_lock. The former
 // governs matters of topology: the basic structure of the tree and
-// the controllers enabled in each node. The latter governs membership:
-// the tasks associated with each cgroup.
+// the controllers enabled in each node. It also governs eBPF programs
+// attached to cgroups. The latter governs membership: the tasks
+// associated with each cgroup.
 
 import (
+	"bytes"
+	"fmt"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -43,6 +46,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // limitMax is the value for max.descendants and max.depth that indicates no limit.
@@ -125,6 +130,13 @@ type cgroup struct {
 	// killSeq tracks cgroup.kill invocations.
 	// +checklocks:fs.tasksMu
 	killSeq uint64
+
+	// xattrs stores extended attributes on this cgroup directory.
+	xattrs memxattr.SimpleExtendedAttributes
+
+	// bpf contains eBPF programs associated with the cgroup.
+	// +checklocks:fs.treeMu
+	bpf *kernel.Cgroup2BPF
 }
 
 // +checklocks:c.fs.treeMu
@@ -501,9 +513,10 @@ func (c *cgroup) Exit(ctx context.Context, t *kernel.Task) {
 }
 
 // CanCloneInto implements kernel.Cgroup2.CanCloneInto.
-// It is used to check permissions for CLONE_CGROUP_INTO.
+// It is used to check permissions for CLONE_CGROUP_INTO. ns is the forking
+// task's cgroup namespace.
 // +checklocksread:c.fs.treeMu
-func (c *cgroup) CanCloneInto(ctx context.Context, creds *auth.Credentials) error {
+func (c *cgroup) CanCloneInto(ctx context.Context, creds *auth.Credentials, ns *kernel.CgroupNamespace) error {
 	if c.deleted.Load() {
 		return linuxerr.ENOENT
 	}
@@ -523,7 +536,11 @@ func (c *cgroup) CanCloneInto(ctx context.Context, creds *auth.Credentials) erro
 	t := kernel.TaskFromContext(ctx)
 	if t != nil {
 		if parentCg, ok := t.Cgroup2().(*cgroup); ok {
-			return c.checkMigrationPermsLocked(ctx, creds, parentCg)
+			var nsRoot *cgroup
+			if ns != nil {
+				nsRoot = ns.Root().(*cgroup)
+			}
+			return c.checkMigrationPermsLocked(ctx, creds, parentCg, nsRoot)
 		}
 	}
 	return nil
@@ -634,12 +651,90 @@ func (c *cgroup) removeInterfaceFiles(ctx context.Context, ctrl controller) {
 	}
 }
 
-// Path returns the path of the cgroup.
+// Path returns the path of the cgroup (`without " (deleted)"`).
 func (c *cgroup) Path() string {
-	if c.deleted.Load() {
-		return c.path + " (deleted)"
-	}
 	return c.path
+}
+
+// PathFrom implements kernel.Cgroup2.PathFrom.
+//
+// It mirrors Linux's cgroup_path_ns(): the returned path is relative
+// to nsRoot, always starts with '/', and contains one leading "/.." component
+// per level separating nsRoot from the lowest common ancestor of the two
+// cgroups.
+//
+// It relies only on immutable fields (parent, level, path), so it
+// needs no locks.
+func (c *cgroup) PathFrom(nsRoot kernel.Cgroup2) string {
+	root, ok := nsRoot.(*cgroup)
+	if !ok || root.fs != c.fs || root.parent == nil {
+		// Namespace rooted at the real root (or a foreign node, which
+		// shouldn't happen): the path is absolute.
+		return c.Path()
+	}
+
+	lca := lowestCommonAncestor(c, root)
+	var b strings.Builder
+	for i := 0; i < root.level-lca.level; i++ {
+		b.WriteString("/..")
+	}
+	if c != lca {
+		if lca.parent == nil {
+			b.WriteString(c.path)
+		} else {
+			b.WriteString(c.path[len(lca.path):])
+		}
+	}
+	if b.Len() == 0 {
+		b.WriteString("/")
+	}
+	return b.String()
+}
+
+// Deleted implements kernel.Cgroup2.Deleted.
+func (c *cgroup) Deleted() bool {
+	return c.deleted.Load()
+}
+
+// IfBPF implements kernel.Cgroup2.IfBPF.
+func (c *cgroup) IfBPF(f func(*kernel.Cgroup2BPF)) {
+	c.fs.treeMu.RLock()
+	defer c.fs.treeMu.RUnlock()
+	if c.bpf != nil {
+		f(c.bpf)
+	}
+}
+
+// WriteBPF implements kernel.Cgroup2.WriteBPF.
+func (c *cgroup) WriteBPF(f func(*kernel.Cgroup2BPF, []*kernel.Cgroup2BPF) error) error {
+	c.fs.treeMu.Lock()
+	defer c.fs.treeMu.Unlock()
+
+	bpf := c.bpf
+	if bpf == nil {
+		bpf = &kernel.Cgroup2BPF{}
+	}
+
+	// Fetch the Cgroup2BPF structures for each ancestor.
+	ancestors := c.getAncestorsBPF()
+
+	err := f(bpf, ancestors)
+	if err == nil {
+		c.bpf = bpf
+	}
+	return err
+}
+
+// getAncestorsBPF returns the eBPF programs of each ancestor of c,
+// starting with its immediate parent.
+//
+// +checklocksread:c.fs.treeMu
+func (c *cgroup) getAncestorsBPF() []*kernel.Cgroup2BPF {
+	parents := make([]*kernel.Cgroup2BPF, 0, c.level)
+	for cur := c.parent; cur != nil; cur = cur.parent {
+		parents = append(parents, cur.bpf) // +checklocksforce: c.fs.treeMu is locked
+	}
+	return parents
 }
 
 // KillSeq implements kernel.Cgroup2.KillSeq.
@@ -668,8 +763,11 @@ func (c *cgroup) walkSubtreeLocked(f func(n *cgroup) bool) {
 	}
 }
 
+// checkMigrationPermsLocked checks whether the caller may migrate a process
+// from oldNode to c. nsRoot is the root cgroup of the calling task's cgroup
+// namespace.
 // +checklocksread:c.fs.treeMu
-func (c *cgroup) checkMigrationPermsLocked(ctx context.Context, creds *auth.Credentials, oldNode *cgroup) error {
+func (c *cgroup) checkMigrationPermsLocked(ctx context.Context, creds *auth.Credentials, oldNode, nsRoot *cgroup) error {
 	lca := lowestCommonAncestor(oldNode, c)
 	if lca == nil {
 		return nil
@@ -678,7 +776,53 @@ func (c *cgroup) checkMigrationPermsLocked(ctx context.Context, creds *auth.Cred
 	if err != nil {
 		return err
 	}
-	return lcaProcs.CheckPermissions(ctx, creds, vfs.MayWrite)
+	if err := lcaProcs.CheckPermissions(ctx, creds, vfs.MayWrite); err != nil {
+		return err
+	}
+
+	// If cgroup namespaces are delegation boundaries, both the source and
+	// destination cgroups must be reachable from the migrating task's cgroup
+	// namespace.
+	if c.fs.nsDelegate.Load() && nsRoot != nil {
+		if !oldNode.isDescendantOf(nsRoot) || !c.isDescendantOf(nsRoot) {
+			return linuxerr.ENOENT
+		}
+	}
+	return nil
+}
+
+// isDescendantOf returns true if c is a descendant of (or the same as) a.
+// It relies only on immutable fields and needs no locks.
+func (c *cgroup) isDescendantOf(ancestor *cgroup) bool {
+	if c == nil || ancestor == nil {
+		return false
+	}
+	for c != nil && c.level > ancestor.level {
+		c = c.parent
+	}
+	return c == ancestor
+}
+
+// checkNSDelegateWrite enforces the "nsdelegate" mount option: cgroup
+// namespace roots are delegation boundaries, so writes from inside a
+// non-init namespace to non-delegatable interface files of the namespace
+// root cgroup are rejected.
+func (c *cgroup) checkNSDelegateWrite(ctx context.Context, fd *vfs.FileDescription) error {
+	if !c.fs.nsDelegate.Load() {
+		return nil
+	}
+	ifd, ok := fd.Impl().(*interfaceFD)
+	if !ok || ifd.ns == nil {
+		return nil
+	}
+	ns := ifd.ns
+	if k := kernel.KernelFromContext(ctx); k == nil || ns == k.RootCgroupNamespace() {
+		return nil
+	}
+	if ns.Root().(*cgroup) == c {
+		return linuxerr.EPERM
+	}
+	return nil
 }
 
 func lowestCommonAncestor(a, b *cgroup) *cgroup {
@@ -732,7 +876,9 @@ func (c *cgroup) hasControllersEnabledLocked() bool {
 }
 
 // attachProcess handles writes to cgroup.procs.
-func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, pid int64) error {
+// nsRoot is the root cgroup of the cgroupns of the task at the time of the
+// opening of the cgroup.procs fd.
+func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, nsRoot *cgroup, pid int64) error {
 	c.fs.treeMu.Lock()
 	defer c.fs.treeMu.Unlock()
 	if c.deleted.Load() {
@@ -760,7 +906,7 @@ func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, pid
 		return linuxerr.ESRCH
 	}
 	oldNode := targetTask.Cgroup2().(*cgroup)
-	if err := c.checkMigrationPermsLocked(ctx, creds, oldNode); err != nil {
+	if err := c.checkMigrationPermsLocked(ctx, creds, oldNode, nsRoot); err != nil {
 		return err
 	}
 
@@ -799,7 +945,17 @@ func (c *cgroup) attachProcess(ctx context.Context, creds *auth.Credentials, pid
 
 // getPIDs handles reads from cgroup.procs.
 func (c *cgroup) getPIDs(t *kernel.Task) []int {
-	currPidns := t.PIDNamespace()
+	if t == nil {
+		return nil
+	}
+	return c.getPIDsInNamespace(t.PIDNamespace())
+}
+
+// getPIDsInNamespace returns task IDs in currPidns for all tasks in c.
+func (c *cgroup) getPIDsInNamespace(currPidns *kernel.PIDNamespace) []int {
+	if currPidns == nil {
+		return nil
+	}
 	var tasks []*kernel.Task
 
 	c.fs.tasksMu.RLock()
@@ -960,4 +1116,64 @@ func (c *cgroup) updateTaskMemoryCgIDsLocked() {
 	for t := range c.tasks {
 		t.SetMemCgID(memCgID)
 	}
+}
+
+// ReadControl implements kernel.Cgroup2.ReadControl.
+// It allows reading from control files from outside the sandbox.
+func (c *cgroup) ReadControl(ctx context.Context, name string) (string, error) {
+	cfi, err := c.Lookup(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("no such control file")
+	}
+	dbf, ok := cfi.(*cgroupInterfaceFile)
+	var data vfs.DynamicBytesSource
+	if ok {
+		data, err = dbf.Data(ctx)
+		if err != nil {
+			return "", err
+		}
+	} else if ef, ok := cfi.(*eventFile); ok {
+		data, err = ef.Data(ctx)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		return "", fmt.Errorf("no such control file")
+	}
+
+	var buf bytes.Buffer
+	if err := data.Generate(ctx, &buf); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// WriteControl implements kernel.Cgroup2.WriteControl.
+// It allows writing to control files from outside the sandbox.
+func (c *cgroup) WriteControl(ctx context.Context, name string, val string) error {
+	cfi, err := c.Lookup(ctx, name)
+	if err != nil {
+		return fmt.Errorf("no such control file")
+	}
+	dbf, ok := cfi.(*cgroupInterfaceFile)
+	if !ok {
+		return fmt.Errorf("control file not writable")
+	}
+	data, err := dbf.Data(ctx)
+	if err != nil {
+		return err
+	}
+	wdata, ok := data.(vfs.WritableDynamicBytesSource)
+	if !ok {
+		return fmt.Errorf("control file not writable")
+	}
+	ioSeq := usermem.BytesIOSequence([]byte(val))
+	n, err := wdata.Write(ctx, nil, ioSeq, 0)
+	if err != nil {
+		return err
+	}
+	if n != int64(len(val)) {
+		return fmt.Errorf("short write")
+	}
+	return nil
 }

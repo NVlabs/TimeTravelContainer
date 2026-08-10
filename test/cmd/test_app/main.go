@@ -52,6 +52,7 @@ func main() {
 	subcommands.Register(new(fsTreeVerify), "")
 	subcommands.Register(new(assertIsEmpty), "")
 	subcommands.Register(new(gvisorDetect), "")
+	subcommands.Register(new(hostinetSR), "")
 	subcommands.Register(new(ptyRunner), "")
 	subcommands.Register(new(reaper), "")
 	subcommands.Register(new(syscall), "")
@@ -60,6 +61,8 @@ func main() {
 	subcommands.Register(new(uds), "")
 	subcommands.Register(new(zombieTest), "")
 	subcommands.Register(new(fsCheckpoint), "")
+	subcommands.Register(new(setXattr), "")
+	subcommands.Register(new(getXattr), "")
 
 	flag.Parse()
 

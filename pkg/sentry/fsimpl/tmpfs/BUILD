@@ -102,6 +102,7 @@ go_library(
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/sentry/checkpoint",
+        "gvisor.dev/gvisor/pkg/sentry/vfs",
     ],
     marshal = True,
     visibility = ["//pkg/sentry:internal"],

@@ -138,6 +138,11 @@ type RightsControlMessage interface {
 	// Clone returns a copy of the RightsControlMessage.
 	Clone() RightsControlMessage
 
+	// TransferRights moves ownership of the underlying FDs to a new
+	// `RightsControlMessage`, leaving the receiver empty.
+	// Reference counts are left unchanged.
+	TransferRights() RightsControlMessage
+
 	// Release releases any resources owned by the RightsControlMessage.
 	Release(ctx context.Context)
 }
@@ -264,7 +269,14 @@ type Endpoint interface {
 	// SendMsg writes data and a control message to the endpoint's peer.
 	// This method does not block if the data cannot be written.
 	//
-	// SendMsg does not take ownership of any of its arguments on error.
+	// Ownership of the ControlMessages' Rights transfers to the callee iff
+	// the message is consumed, i.e. either enqueued or deliberately dropped
+	// (see `queue.Enqueue`).
+	// That is the case whenever `SendMsg` returns a nil error, or returns
+	// `syserr.ErrWouldBlock` along with a non-zero number of bytes written
+	// (i.e. a truncated stream write).
+	// In every other case, the caller retains ownership and must release
+	// them. Ownership of all other arguments stays with the caller.
 	//
 	// If set, notify is a callback that should be called after RecvMesg
 	// completes without mm.activeMu held.
@@ -787,6 +799,9 @@ type ConnectedEndpoint interface {
 	//
 	// syserr.ErrWouldBlock can be returned along with a partial write if
 	// the caller should block to send the rest of the data.
+	//
+	// Ownership of c.Rights follows the same rules as Endpoint.SendMsg: it
+	// transfers to the callee if and only if err is nil or n is non-zero.
 	Send(ctx context.Context, data [][]byte, c ControlMessages, from Address) (n int64, notify bool, err *syserr.Error)
 
 	// SendNotify notifies the ConnectedEndpoint of a successful Send. This
@@ -970,6 +985,12 @@ type baseEndpoint struct {
 	// or may be used if the endpoint is connected.
 	path string
 
+	// writeShutdown is true if the write side of the endpoint has been
+	// shut down without closing the peer's read side: sends fail with
+	// EPIPE, but the peer is unaffected. This is how shutdown(SHUT_WR)
+	// behaves on datagram sockets. Protected by endpointMutex.
+	writeShutdown bool
+
 	// ops is used to get socket level options.
 	ops tcpip.SocketOptions
 
@@ -1063,6 +1084,10 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 		e.Unlock()
 		return 0, nil, syserr.ErrAlreadyConnected
 	}
+	if e.writeShutdown {
+		e.Unlock()
+		return 0, nil, syserr.ErrClosedForSend
+	}
 
 	connected := e.connected
 	n, notify, err := connected.Send(ctx, data, c, Address{Addr: e.path})
@@ -1152,6 +1177,15 @@ func (e *baseEndpoint) SocketOptions() *tcpip.SocketOptions {
 // Shutdown closes the read and/or write end of the endpoint connection to its
 // peer.
 func (e *baseEndpoint) Shutdown(flags tcpip.ShutdownFlags) *syserr.Error {
+	closePeerRead := true
+	return e.shutdown(flags, closePeerRead)
+}
+
+// shutdown implements shutdown(2). If closePeerRead is true, shutting down
+// the write side also closes the peer's read side, the way Linux does for
+// stream and seqpacket sockets. Datagram sockets pass false: the peer is
+// unaffected, and only local sends start failing.
+func (e *baseEndpoint) shutdown(flags tcpip.ShutdownFlags, closePeerRead bool) *syserr.Error {
 	e.Lock()
 	if !e.Connected() {
 		e.Unlock()
@@ -1168,7 +1202,10 @@ func (e *baseEndpoint) Shutdown(flags tcpip.ShutdownFlags) *syserr.Error {
 		r.CloseRecv()
 	}
 	if shutdownWrite {
-		c.CloseSend()
+		e.writeShutdown = true
+		if closePeerRead {
+			c.CloseSend()
+		}
 	}
 	e.Unlock()
 
@@ -1177,7 +1214,12 @@ func (e *baseEndpoint) Shutdown(flags tcpip.ShutdownFlags) *syserr.Error {
 		r.CloseNotify()
 	}
 	if shutdownWrite {
-		c.CloseNotify()
+		if closePeerRead {
+			c.CloseNotify()
+		} else {
+			// Wake up any local writers.
+			e.Queue.Notify(waiter.WritableEvents)
+		}
 	}
 
 	return nil

@@ -22,6 +22,7 @@ import (
 	"net"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -132,6 +133,10 @@ type Config struct {
 	// virtual NIC. An empty value selects the runtime default.
 	TimeTravelNetworkMAC string `flag:"ttc-network-mac"`
 
+	// GoferNetworkNamespace controls the network namespace used by gofer
+	// processes. The default is the shared empty "null" network namespace.
+	GoferNetworkNamespace GoferNetworkNamespace `flag:"gofer-network-namespace"`
+
 	// EnableRaw indicates whether raw sockets should be enabled. Raw
 	// sockets are disabled by stripping CAP_NET_RAW from the list of
 	// capabilities.
@@ -193,6 +198,10 @@ type Config struct {
 	// an indication that the container being created wishes that its metrics should be exported).
 	// The value of this flag must also match across the two command lines.
 	MetricServer string `flag:"metric-server"`
+
+	// SidecarReleaseEnforcementPolicy controls when spawned sidecar binaries
+	// must match `runsc`'s build label.
+	SidecarReleaseEnforcementPolicy SidecarPolicy `flag:"sidecar-release-enforcement-policy"`
 
 	// FinalMetricsLog is the file to which all metric data should be written
 	// upon sandbox termination.
@@ -388,6 +397,12 @@ type Config struct {
 	// trusted.
 	UnsafeNoHostIsolation bool `flag:"unsafe-no-host-isolation"`
 
+	// RDMAProxy enables RDMA support for containers with
+	// /dev/infiniband/uverbs* devices. It currently gates only the RDMA
+	// device sysfs topology; the verbs device proxy that makes it usable is
+	// still in development.
+	RDMAProxy bool `flag:"rdmaproxy"`
+
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current
 	// user, and without chrooting the sandbox process. This can be
@@ -477,6 +492,13 @@ type Config struct {
 	// once their current RPC finishes. Setting this to 0 closes idle clients
 	// immediately.
 	ControlRPCStopTimeout time.Duration `flag:"control-rpc-stop-timeout"`
+
+	// SharedRootDir is the directory used for state shared across sandboxes
+	// regardless of their runtime root directory (e.g. the null gofer network
+	// namespace bind mount). If empty, RootDir is used.
+	// Access to SharedRootDir grants the ability to identify sandboxes, but
+	// not to control them.
+	SharedRootDir string `flag:"shared-root"`
 }
 
 // AllowRunAsCurrentUserWithoutChroot reports whether host-side chroot setup
@@ -605,6 +627,15 @@ func (c *Config) Log() {
 			}
 		}
 	}
+}
+
+// SharedRoot returns the effective directory for state shared across
+// sandboxes: SharedRootDir if set, otherwise RootDir.
+func (c *Config) SharedRoot() string {
+	if c.SharedRootDir != "" {
+		return c.SharedRootDir
+	}
+	return c.RootDir
 }
 
 // GetHostUDS returns the FS gofer communication that is allowed, taking into
@@ -812,6 +843,55 @@ func (n NetworkType) String() string {
 		return "plugin"
 	}
 	panic(fmt.Sprintf("Invalid network type %d", n))
+}
+
+// GoferNetworkNamespace controls the network namespace used by gofer processes.
+type GoferNetworkNamespace string
+
+const (
+	// GoferNetworkNamespaceNew creates an empty network namespace for each gofer.
+	GoferNetworkNamespaceNew GoferNetworkNamespace = "new"
+
+	// GoferNetworkNamespaceHost runs gofers in runsc's current network namespace.
+	GoferNetworkNamespaceHost GoferNetworkNamespace = "host"
+
+	// GoferNetworkNamespaceNull runs gofers in a shared empty network
+	// namespace. The namespace is pinned by a bind mount under the shared
+	// root directory (`--shared-root`, defaulting to `--root`; same hack as
+	// `ip netns add`), and shared by all gofers using the same directory.
+	// This provides the same isolation as `GoferNetworkNamespaceNew`
+	// without the cost of a new nets per gofer.
+	// Falls back to `GoferNetworkNamespaceNew` if the shared namespace cannot
+	// be set up (e.g. rootless).
+	GoferNetworkNamespaceNull GoferNetworkNamespace = "null"
+)
+
+func goferNetworkNamespacePtr(v GoferNetworkNamespace) *GoferNetworkNamespace {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (n *GoferNetworkNamespace) Set(v string) error {
+	switch v {
+	case string(GoferNetworkNamespaceHost), string(GoferNetworkNamespaceNew), string(GoferNetworkNamespaceNull):
+		*n = GoferNetworkNamespace(v)
+	default:
+		if !filepath.IsAbs(v) {
+			return fmt.Errorf("invalid gofer network namespace %q; must be new, host, null, or an absolute path", v)
+		}
+		*n = GoferNetworkNamespace(v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (n *GoferNetworkNamespace) Get() any {
+	return *n
+}
+
+// String implements flag.Value.
+func (n GoferNetworkNamespace) String() string {
+	return string(n)
 }
 
 // QueueingDiscipline is used to specify the kind of Queueing Discipline to
@@ -1267,6 +1347,57 @@ func (p HostSettingsPolicy) String() string {
 	default:
 		panic(fmt.Sprintf("Invalid host settings policy %d", p))
 	}
+}
+
+// SidecarPolicy controls when a sidecar-related action applies.
+type SidecarPolicy string
+
+// SidecarPolicy values.
+const (
+	SidecarNever          SidecarPolicy = "NEVER"
+	SidecarAlways         SidecarPolicy = "ALWAYS"
+	SidecarIfReleaseBuild SidecarPolicy = "IF_RELEASE_BUILD"
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *SidecarPolicy) Set(v string) error {
+	sp := SidecarPolicy(strings.ToUpper(v))
+	switch sp {
+	case SidecarNever, SidecarAlways, SidecarIfReleaseBuild:
+		*p = sp
+		return nil
+	}
+	return fmt.Errorf("invalid value %q; must be %s, %s, or %s", v, SidecarNever, SidecarAlways, SidecarIfReleaseBuild)
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p SidecarPolicy) Ptr() *SidecarPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *SidecarPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p SidecarPolicy) String() string {
+	return string(p)
+}
+
+// Applies returns whether the policy is in effect for this runsc build.
+func (p SidecarPolicy) Applies() bool {
+	return p == SidecarAlways || (p == SidecarIfReleaseBuild && IsReleaseVersion(version.Version()))
+}
+
+// releaseVersionRE matches the version strings of production release builds:
+// a `release-` or `g<lowercase>-` prefix, then the release date.
+var releaseVersionRE = regexp.MustCompile(`^(?:release|g[a-z]*)-\d{8}(?:\.\d+)?$`)
+
+// IsReleaseVersion returns whether ver is a tagged-release version string.
+func IsReleaseVersion(ver string) bool {
+	return releaseVersionRE.MatchString(ver)
 }
 
 // RestoreSpecValidationPolicy dictates how spec validation should be handled.

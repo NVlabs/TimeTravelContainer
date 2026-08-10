@@ -175,6 +175,7 @@ func Init() {
 					nvgpu.NV_ESC_ALLOC_OS_EVENT:                feHandler(frontendIoctlHasFD[nvgpu.IoctlAllocOSEvent], compUtil),
 					nvgpu.NV_ESC_FREE_OS_EVENT:                 feHandler(frontendIoctlHasFD[nvgpu.IoctlFreeOSEvent], compUtil),
 					nvgpu.NV_ESC_NUMA_INFO:                     feHandler(rmNumaInfo, compUtil),
+					nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD:           feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD], nvconf.CapRDMA),
 					nvgpu.NV_ESC_RM_ALLOC_CONTEXT_DMA2:         feHandler(rmAllocContextDMA2, nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_ALLOC_MEMORY:               feHandler(rmAllocMemory, compUtil|nvconf.CapGraphics),
 					nvgpu.NV_ESC_RM_FREE:                       feHandler(rmFree, compUtil),
@@ -490,6 +491,7 @@ func Init() {
 							nvgpu.NV_ESC_ALLOC_OS_EVENT:                ioctlInfoWithStructName("NV_ESC_ALLOC_OS_EVENT", nvgpu.IoctlAllocOSEvent{}, "nv_ioctl_alloc_os_event_t"),
 							nvgpu.NV_ESC_FREE_OS_EVENT:                 ioctlInfoWithStructName("NV_ESC_FREE_OS_EVENT", nvgpu.IoctlFreeOSEvent{}, "nv_ioctl_free_os_event_t"),
 							nvgpu.NV_ESC_NUMA_INFO:                     simpleIoctlInfo("NV_ESC_NUMA_INFO"), // No params struct because nvproxy ignores this ioctl
+							nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD:           ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD{}, "nv_ioctl_export_to_dma_buf_fd_t"),
 							nvgpu.NV_ESC_RM_ALLOC_MEMORY:               ioctlInfoWithStructName("NV_ESC_RM_ALLOC_MEMORY", nvgpu.IoctlNVOS02ParametersWithFD{}, "nv_ioctl_nvos02_parameters_with_fd"),
 							nvgpu.NV_ESC_RM_FREE:                       ioctlInfo("NV_ESC_RM_FREE", nvgpu.NVOS00_PARAMETERS{}),
 							nvgpu.NV_ESC_RM_CONTROL:                    ioctlInfo("NV_ESC_RM_CONTROL", nvgpu.NVOS54_PARAMETERS{}),
@@ -1005,9 +1007,11 @@ func Init() {
 			abi.allocationClass[nvgpu.BLACKWELL_COMPUTE_B] = allocHandler(rmAllocSimple[nvgpu.NV_GR_ALLOCATION_PARAMETERS], compUtil)
 			abi.allocationClass[nvgpu.BLACKWELL_USERMODE_A] = allocHandler(rmAllocSimple[nvgpu.NV_HOPPER_USERMODE_A_PARAMS], compUtil)
 			abi.allocationClass[nvgpu.NVCFB7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
+			abi.frontendIoctl[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD_V570], nvconf.CapRDMA)
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.FrontendInfos[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD_V570{}, "nv_ioctl_export_to_dma_buf_fd_t")
 				info.ControlInfos[nvgpu.NVB0CC_CTRL_CMD_RESERVE_CCU_PROF] = simpleIoctlInfo("NVB0CC_CTRL_CMD_RESERVE_CCU_PROF", "NVB0CC_CTRL_RESERVE_CCUPROF_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_INFOROM_SUPPORT", "NV2080_CTRL_FB_DRAM_ENCRYPTION_INFOROM_SUPPORT_PARAMS")
 				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS] = simpleIoctlInfo("NV2080_CTRL_CMD_FB_QUERY_DRAM_ENCRYPTION_STATUS", "NV2080_CTRL_FB_QUERY_DRAM_ENCRYPTION_STATUS_PARAMS")
@@ -1064,10 +1068,12 @@ func Init() {
 			abi.allocationClass[nvgpu.NVD1B7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_SKYLINE_INFO] = ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics)
 			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_ECC_GET_REPAIR_STATUS] = ctrlHandler(rmControlSimple, nvconf.CapGraphics)
+			abi.frontendIoctl[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = feHandler(frontendExportToDMABufFD[nvgpu.IoctlExportToDMABufFD_V580], nvconf.CapRDMA)
 
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.FrontendInfos[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD_V580{}, "nv_ioctl_export_to_dma_buf_fd_t")
 				info.FrontendInfos[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = ioctlInfoWithStructName("NV_ESC_RM_MAP_MEMORY_DMA", nvgpu.NVOS46_PARAMETERS_V580{}, "NVOS46_PARAMETERS")
 				info.AllocationInfos[nvgpu.FERMI_VASPACE_A] = ioctlInfoWithStructName("FERMI_VASPACE_A", nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580{}, "NV_VASPACE_ALLOCATION_PARAMETERS")
 				info.AllocationInfos[nvgpu.NVCEB7_VIDEO_ENCODER] = ioctlInfo("NVCEB7_VIDEO_ENCODER", nvgpu.NV_MSENC_ALLOCATION_PARAMETERS{})
@@ -1079,14 +1085,16 @@ func Init() {
 			return abi
 		})
 
-		v580_105_08 := addDriverABI(580, 105, 8, "d9c6e8188672f3eb74dd04cfa69dd58479fa1d0162c8c28c8d17625763293475", ChecksumNoDriver, v580_65_06)
+		v580_95_05 := addUnsupportedDriverABI(580, 95, 05, v580_65_06)
+		v580_105_08 := addDriverABI(580, 105, 8, "d9c6e8188672f3eb74dd04cfa69dd58479fa1d0162c8c28c8d17625763293475", ChecksumNoDriver, v580_95_05)
 
 		// The following versions exist on the "580" branch, which was branched
 		// from the main branch at 580.105.08.
 		v580_126_09 := addDriverABI(580, 126, 9, "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26", "7393c42b112fd6f0a498e1d2a33127b821be58b7570dc9f8d5589a51688da4ad", v580_105_08)
 		v580_126_20 := addDriverABI(580, 126, 20, "a055dbeae72438f20335b41929a060148c82c69d2147c0d922660e8c5a265eb1", ChecksumNoDriver, v580_126_09)
 		v580_159_03 := addDriverABI(580, 159, 03, "32c85d99b0f640c9501f61b39ddad208fd0288d015c4fbc5fd0435c07783fa77", "545445863f84183f4d4769bd35cc00dde269d97f7923d6dff2031b7b52a907d8", v580_126_20)
-		_ = addDriverABI(580, 159, 04, "c1e66761b088d17b3adf6cb6979de9af38be2684d102b001a176dcfafabdca1e", "8912f2623bc7c839765f36fcee3db4a3531834a2caff3aa5d49c1259b2372aeb", v580_159_03)
+		v580_159_04 := addDriverABI(580, 159, 04, "c1e66761b088d17b3adf6cb6979de9af38be2684d102b001a176dcfafabdca1e", "8912f2623bc7c839765f36fcee3db4a3531834a2caff3aa5d49c1259b2372aeb", v580_159_03)
+		_ = addDriverABI(580, 173, 02, "8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b", "d65bd56087ef4d78f04a808da7883c35a5901c5fd37e95d150a7602eba97aa80", v580_159_04)
 
 		v590_44_01 := addUnsupportedDriverABI(590, 44, 01, func() *driverABI {
 			abi := v580_105_08()
@@ -1162,7 +1170,25 @@ func Init() {
 			return abi
 		})
 
-		_ = addDriverABI(615, 15, 00, ChecksumNoDriver, "d5a40daa72e011395721f2a3de8598b77c3271eec057948de9b3d1755d8d02bc", v610_43_02)
+		v615_15_00 := addDriverABI(615, 15, 00, ChecksumNoDriver, "d5a40daa72e011395721f2a3de8598b77c3271eec057948de9b3d1755d8d02bc", v610_43_02)
+		_ = addDriverABI(620, 6, 0, ChecksumNoDriver, "95b94e43fd0cb0fb409fd523be491ac7248fec6d1cf82543fa4119cdcbad05b3", func() *driverABI {
+			abi := v615_15_00()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2] = ctrlHandler(rmControlSimple, nvconf.CapFabricIMEXManagement)
+
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_LOCK_REMAP_TABLE_AND_MSE", "NV2080_CTRL_NVLINK_LOCK_REMAP_TABLE_AND_MSE_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_SETUP_NVLE_ENCRYPTION_KEY", "NV2080_CTRL_NVLINK_SETUP_NVLE_ENCRYPTION_KEY_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_REMAP_TABLE_INFO_V2", "NV2080_CTRL_NVLINK_GET_REMAP_TABLE_INFO_V2_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2] = simpleIoctlInfo("NV2080_CTRL_CMD_NVLINK_GET_UPDATE_NVLE_LIDS_V2", "NV2080_CTRL_NVLINK_GET_UPDATE_NVLE_LIDS_V2_PARAMS")
+				return info
+			}
+			return abi
+		})
 	})
 }
 

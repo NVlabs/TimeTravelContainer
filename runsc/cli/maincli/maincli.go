@@ -21,8 +21,13 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd"
 	"gvisor.dev/gvisor/runsc/cmd/alias"
 	"gvisor.dev/gvisor/runsc/cmd/nvproxy"
+	"gvisor.dev/gvisor/runsc/cmd/sentry/sentrycmd"
 	"gvisor.dev/gvisor/runsc/cmd/trace"
 	"gvisor.dev/gvisor/runsc/cmd/util"
+
+	// TODO(gvisor.dev/issue/13718): Temporary.
+	// Remove this import once sidecar binaries are replaced by on-disk binaries.
+	_ "gvisor.dev/gvisor/runsc/gvisorbinaries/embed"
 )
 
 const (
@@ -37,7 +42,7 @@ const (
 func Main() {
 	alias.HandleAlias()
 	cmds, helpCmds := commands()
-	cli.Run(cmds, helpCmds)
+	cli.Run(nil, cmds, helpCmds)
 }
 
 func commands() (map[util.SubCommand]string, []subcommands.Command) {
@@ -91,9 +96,9 @@ func commands() (map[util.SubCommand]string, []subcommands.Command) {
 		new(cmd.MetricServer):   metricGroup,
 
 		// Internal commands.
-		new(cmd.Boot):   internalGroup,
-		new(cmd.Gofer):  internalGroup,
-		new(cmd.Umount): internalGroup,
+		new(sentrycmd.Boot):   internalGroup,
+		new(cmd.Gofer):        internalGroup,
+		new(sentrycmd.Umount): internalGroup,
 	}
 
 	// Merge alias commands.

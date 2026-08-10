@@ -892,14 +892,14 @@ func (d *dentry) topLookupLayer() lookupLayer {
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
-	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
+	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), nil, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
 	mode := linux.FileMode(d.mode.Load())
 	kuid := auth.KUID(d.uid.Load())
 	kgid := auth.KGID(d.gid.Load())
-	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, nil, kuid, kgid); err != nil {
 		return err
 	}
 	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
@@ -1024,11 +1024,32 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
 }
 
+// GetPosixACL implements vfs.FileDescriptionImpl.GetPosixACL.
+func (fd *fileDescription) GetPosixACL(ctx context.Context, t vfs.ACLType) (*vfs.PosixACL, error) {
+	// overlayfs does not yet support POSIX ACLs.
+	return nil, nil
+}
+
+// SetPosixACL implements vfs.FileDescriptionImpl.SetPosixACL.
+func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
+	// overlayfs does not yet support POSIX ACLs.
+	return nil, 0, linuxerr.EOPNOTSUPP
+}
+
 // IsCopiedUp returns true if the given vfs.Dentry is an overlayfs dentry that has
 // been copied up to the upper layer.
 func IsCopiedUp(d *vfs.Dentry) bool {
 	if impl, ok := d.Impl().(*dentry); ok {
 		return impl.isCopiedUp()
+	}
+	return false
+}
+
+// IsOnLower returns true if the given vfs.Dentry is an overlayfs dentry that
+// exists on the lower layer(s).
+func IsOnLower(d *vfs.Dentry) bool {
+	if impl, ok := d.Impl().(*dentry); ok {
+		return impl.isOnLower()
 	}
 	return false
 }

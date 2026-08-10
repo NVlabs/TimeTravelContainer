@@ -47,6 +47,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
@@ -256,11 +257,11 @@ type NFTables struct {
 	startTime          time.Time                           // Time NFTables object was created.
 	rng                rand.RNG                            // Random number generator.
 	tableHandleCounter atomicbitops.Uint64                 // Table handle counter.
-	Mu                 nfTablesRWMutex                     // Mutex for tableHandles.
 	genid              uint32                              // Generation ID for nftables.
 	connTrack          *stack.ConnTrack                    // Conntrack object for tracking connections.
 	connTrackReaper    tcpip.Timer                         // Reaper timer for reaping timed out connections.
 	natEnabled         bool                                // Whether the nat module is enabled.
+	stack              *stack.Stack                        // Parent stack object.
 }
 
 // Ensures NFTables implements the NFTablesInterface.
@@ -302,6 +303,9 @@ type Table struct {
 
 	// chainHandles is a map of chain handles (ids) to chains for a given table.
 	chainHandles map[uint64]*Chain
+
+	// chainIDs is a map of temporary transaction chain IDs to chains for a given table.
+	chainIDs map[uint32]*Chain
 
 	// flagSet is the set of optional flags for the table.
 	// Note: currently nftables only has the single Dormant flag.
@@ -391,15 +395,9 @@ type Chain struct {
 	// by the kernel, but rather userspace applications like nft binary.
 	userData []byte
 
-	// TODO: b/421437663 - Increment the chainUse field when a jump or goto
-	// instruction is encountered.
 	// From net/netfilter/nf_tables_api.c: nft_data_hold
 	// chainUse is the number of jump references to this chain.
 	chainUse uint32
-
-	// bound can only be set if the chain has the NFT_CHAIN_BINDING flag is set.
-	// If bound is true, the chain is being jumped to by a specific chain in the same table.
-	bound bool
 
 	// comment is the optional comment for the table.
 	comment string
@@ -736,6 +734,12 @@ type operation interface {
 
 	// deepCopy returns a deep copy of the operation.
 	deepCopy() operation
+
+	// updateReferences updates any references/pointers to objects in the given table.
+	updateReferences(table *Table, sourceTable *Table, sourceOp operation)
+
+	// destroy performs cleanup for the operation.
+	destroy()
 }
 
 // Ensures all operations implement the Operation interface at compile time.
@@ -754,6 +758,10 @@ var (
 	_ operation = (*metaSet)(nil)
 	_ operation = (*natOp)(nil)
 	_ operation = (*lookupOp)(nil)
+	_ operation = (*fib)(nil)
+	_ operation = (*ctGet)(nil)
+	_ operation = (*ctSet)(nil)
+	_ operation = (*masqOp)(nil)
 )
 
 // OpType represents the type of operation.
@@ -784,6 +792,12 @@ const (
 	OpTypeNAT
 	// OpTypeLookup is the lookup operation type.
 	OpTypeLookup
+	// OpTypeFIB is the FIB operation type.
+	OpTypeFIB
+	// OpTypeCT is the conntrack operation type.
+	OpTypeCT
+	// OpTypeMasq is the masquerade operation type.
+	OpTypeMasq
 	// OpTypeUnknown is the unknown operation type.
 	OpTypeUnknown
 )
@@ -801,6 +815,9 @@ var opTypeStrings = []string{
 	OpTypeMeta:       "meta",
 	OpTypeNAT:        "nat",
 	OpTypeLookup:     "lookup",
+	OpTypeFIB:        "fib",
+	OpTypeCT:         "ct",
+	OpTypeMasq:       "masq",
 	OpTypeUnknown:    "unknown",
 }
 
@@ -856,7 +873,7 @@ func isRegister(reg uint8) bool {
 // Use registerData.storeData to set data in the registers.
 // Note: Corresponds to nft_regs from include/net/netfilter/nf_tables.h.
 type registerSet struct {
-	verdict stack.NFVerdict         // 16-byte verdict register
+	verdict Verdict                 // 16-byte verdict register
 	data    [registersByteSize]byte // 4 16-byte registers or 16 4-byte registers
 }
 
@@ -864,13 +881,13 @@ type registerSet struct {
 // registers set to 0.
 func newRegisterSet() registerSet {
 	return registerSet{
-		verdict: stack.NFVerdict{Code: VC(linux.NFT_CONTINUE)},
+		verdict: Verdict{Code: VC(linux.NFT_CONTINUE)},
 		data:    [registersByteSize]byte{0},
 	}
 }
 
 // Verdict returns the verdict data.
-func (regs *registerSet) Verdict() stack.NFVerdict {
+func (regs *registerSet) Verdict() Verdict {
 	return regs.verdict
 }
 
@@ -881,10 +898,10 @@ func (regs *registerSet) String() string {
 // NF Verdict Helper Functions
 
 // VerdictString returns a string representation of the verdict.
-func VerdictString(v stack.NFVerdict) string {
+func VerdictString(v Verdict) string {
 	out := VerdictCodeToString(v.Code)
-	if v.ChainName != "" {
-		out += fmt.Sprintf(" -> %s", v.ChainName)
+	if v.Chain != nil {
+		out += fmt.Sprintf(" -> %s", v.Chain.GetName())
 	}
 	return out
 }
@@ -949,8 +966,14 @@ type NftSetBackend interface {
 
 	// Remove removes an element from the set and returns the index of the
 	// removed element.
-	// If the element does not exist, it returns -1.
+	// If the element does not exist, it returns -1 and an error.
 	Remove(e *nftSetElem) (int, *syserr.AnnotatedError)
+
+	// Update updates the index of an element in the set backend.
+	Update(e *nftSetElem, idx int) *syserr.AnnotatedError
+
+	// RemoveAll removes all elements from the set backend.
+	RemoveAll() *syserr.AnnotatedError
 
 	// Clone returns a copy of the set backend.
 	Clone() NftSetBackend
@@ -1023,7 +1046,7 @@ type nftSet struct {
 // dataOrVerdict represents the data or verdict of the set element.
 type dataOrVerdict struct {
 	isVerdict bool
-	verdict   stack.NFVerdict
+	verdict   Verdict
 	data      []byte
 }
 
@@ -1066,13 +1089,13 @@ func AFtoNetlinkAF(af uint8) (stack.AddressFamily, *syserr.Error) {
 }
 
 // parseVerdictAttrs parses and validates the verdict data from the data attributes.
-func parseVerdictAttrs(tab *Table, dataAttrs map[uint16]nlmsg.BytesView) (stack.NFVerdict, *syserr.AnnotatedError) {
-	v := stack.NFVerdict{}
+func parseVerdictAttrs(tab *Table, dataAttrs map[uint16]nlmsg.BytesView) (Verdict, *syserr.AnnotatedError) {
+	v := Verdict{}
 	vBytes, ok := dataAttrs[linux.NFTA_DATA_VERDICT]
 	if !ok {
 		return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: NFTA_DATA_VERDICT attribute is not found")
 	}
-	return validateVerdictData(tab, nlmsg.AttrsView(vBytes))
+	return parseAndValidateVerdictData(tab, nlmsg.AttrsView(vBytes))
 }
 
 func parseDataAttrs(dataAttrs map[uint16]nlmsg.BytesView) ([]byte, *syserr.AnnotatedError) {
@@ -1109,11 +1132,15 @@ func dumpDataAttr(data []byte) ([]byte, *syserr.AnnotatedError) {
 }
 
 // dumpVerdictDataAttr dumps the verdict data attribute for the dump operation.
-func dumpVerdictDataAttr(verdict stack.NFVerdict) ([]byte, *syserr.AnnotatedError) {
+func dumpVerdictDataAttr(verdict Verdict) ([]byte, *syserr.AnnotatedError) {
 	nestedAttr := nlmsg.NestedAttr{}
 	nestedAttr.PutAttr(linux.NFTA_VERDICT_CODE, nlmsg.PutU32(uint32(verdict.Code)))
 	if int32(verdict.Code) == linux.NFT_JUMP || int32(verdict.Code) == linux.NFT_GOTO {
-		nestedAttr.PutAttrString(linux.NFTA_VERDICT_CHAIN, verdict.ChainName)
+		cn := ""
+		if verdict.Chain != nil {
+			cn = verdict.Chain.GetName()
+		}
+		nestedAttr.PutAttrString(linux.NFTA_VERDICT_CHAIN, cn)
 	}
 	m := &nlmsg.Message{}
 	m.PutNestedAttr(linux.NFTA_DATA_VERDICT, nestedAttr)
@@ -1143,22 +1170,24 @@ func regNumToIdx(reg uint8, dataLenBytes int) (int, *syserr.AnnotatedError) {
 
 // formatRegIdxForDump formats the register index for the dump operation.
 // net/netfilter/nf_tables_api.c:nft_dump_register
-func formatRegIdxForDump(regIdx int) uint32 {
+func formatRegIdxForDump(regIdx int) marshal.Marshallable {
 	if regIdx >= registersByteSize {
-		return 0
+		return nlmsg.PutU32(0)
 	}
 	if regIdx%linux.NFT_REG_SIZE == 0 {
-		return uint32(regIdx/linux.NFT_REG_SIZE) + linux.NFT_REG_1
+		val := uint32(regIdx/linux.NFT_REG_SIZE) + linux.NFT_REG_1
+		return nlmsg.PutU32(val)
 	}
 	if regIdx%linux.NFT_REG32_SIZE != 0 {
-		return 0
+		return nlmsg.PutU32(0)
 	}
-	return uint32(regIdx/linux.NFT_REG32_SIZE) + linux.NFT_REG32_00
+	val := uint32(regIdx/linux.NFT_REG32_SIZE) + linux.NFT_REG32_00
+	return nlmsg.PutU32(val)
 }
 
 // validateVerdictData validates the verdict data bytes and returns the data as a verdict.
-func validateVerdictData(tab *Table, bytes nlmsg.AttrsView) (stack.NFVerdict, *syserr.AnnotatedError) {
-	v := stack.NFVerdict{}
+func parseAndValidateVerdictData(tab *Table, bytes nlmsg.AttrsView) (Verdict, *syserr.AnnotatedError) {
+	v := Verdict{}
 	verdictAttrs, ok := NfParse(bytes)
 	if !ok {
 		return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Failed to parse verdict data")
@@ -1186,9 +1215,10 @@ func validateVerdictData(tab *Table, bytes nlmsg.AttrsView) (stack.NFVerdict, *s
 			if chain, err = tab.GetChain(chainNameBytes.String()); err != nil {
 				return v, err
 			}
-		} else if _, ok := verdictAttrs[linux.NFTA_VERDICT_CHAIN_ID]; ok {
-			// TODO - b/434243967: Add support for looking up chains via their transaction id.
-			return v, syserr.NewAnnotatedError(syserr.ErrNotSupported, "Nftables: Looking up chains via their id is not supported")
+		} else if chainID, ok := AttrNetToHost[uint32](linux.NFTA_VERDICT_CHAIN_ID, verdictAttrs); ok {
+			if chain, err = tab.GetChainByID(chainID); err != nil {
+				return v, err
+			}
 		} else {
 			return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Attributes for verdict data must contain a chain name or chain id")
 		}
@@ -1201,21 +1231,16 @@ func validateVerdictData(tab *Table, bytes nlmsg.AttrsView) (stack.NFVerdict, *s
 			return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Already Bound chains cannot be jump targets")
 		}
 
-		if chain.GetFlags()&linux.NFT_CHAIN_BINDING != 0 {
-			return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, "Nftables: Chain binding must be set for chains to be used as jump targets")
-		}
-
 		if !chain.IncrementChainUse() {
 			return v, syserr.NewAnnotatedError(syserr.ErrTooManyOpenFiles, fmt.Sprintf("Nftables: Chain use exceeds the maximum number of chains that can jump to chain %s", chain.GetName()))
 		}
 
-		v.ChainName = chain.name
+		v.Chain = chain
+		v.Code = verdictCode
+		return v, nil
 	default:
 		return v, syserr.NewAnnotatedError(syserr.ErrInvalidArgument, fmt.Sprintf("Nftables: Unsupported verdict code: %d", verdictCode))
 	}
-
-	// TODO - b/345684870: Potentially modify this to take a pointer to the chain it is jumping to.
-	// Would need to ensure that the chain cannot be removed while it is being pointed to (using use field).
 	v.Code = verdictCode
 	return v, nil
 }
@@ -1245,7 +1270,6 @@ func deepCopyChain(chain *Chain, tableCopy *Table) *Chain {
 		handleToRule: make(map[uint64]*Rule),
 		userData:     slices.Clone(chain.userData),
 		chainUse:     chain.chainUse,
-		bound:        chain.bound,
 		comment:      chain.comment,
 	}
 
@@ -1283,6 +1307,50 @@ func deepCopySetElement(elem *nftSetElem) *nftSetElem {
 		elemCopy.ops = append(elemCopy.ops, op.deepCopy())
 	}
 	return elemCopy
+}
+
+// updateReferences updates all ops in the rule.
+func (r *Rule) updateReferences(table *Table, sourceTable *Table, sourceRule *Rule) {
+	for i, op := range r.ops {
+		op.updateReferences(table, sourceTable, sourceRule.ops[i])
+	}
+}
+
+// updateReferences updates all rules in the chain.
+func (c *Chain) updateReferences(table *Table, sourceTable *Table, sourceChain *Chain) {
+	for i, rule := range c.rules {
+		rule.updateReferences(table, sourceTable, sourceChain.rules[i])
+	}
+}
+
+// updateReferences updates the verdict and ops within a set element.
+func (e *nftSetElem) updateReferences(table *Table, sourceTable *Table, sourceElem *nftSetElem) {
+	if e.data.isVerdict && e.data.verdict.Chain != nil {
+		e.data.verdict.Chain = table.chains[sourceElem.data.verdict.Chain.name]
+	}
+	for i, op := range e.ops {
+		op.updateReferences(table, sourceTable, sourceElem.ops[i])
+	}
+}
+
+// updateReferences updates the catchall element and array elements in the set.
+func (s *nftSet) updateReferences(table *Table, sourceTable *Table, sourceSet *nftSet) {
+	if s.catchAllElem != nil {
+		s.catchAllElem.updateReferences(table, sourceTable, sourceSet.catchAllElem)
+	}
+	for i := range s.elements {
+		s.elements[i].updateReferences(table, sourceTable, &sourceSet.elements[i])
+	}
+}
+
+// updateReferences calls updateReferences on all chains and sets in the table, passing the original table.
+func (t *Table) updateReferences(sourceTable *Table) {
+	for _, chain := range t.chains {
+		chain.updateReferences(t, sourceTable, sourceTable.chains[chain.name])
+	}
+	for _, set := range t.sets {
+		set.updateReferences(t, sourceTable, sourceTable.sets[set.name])
+	}
 }
 
 // deepCopySet returns a deep copy of the Set struct.
@@ -1351,17 +1419,6 @@ func deepCopyTable(table *Table, afFilter *addressFamilyFilter) *Table {
 		chainCopy := deepCopyChain(chain, tableCopy)
 		tableCopy.chains[chainName] = chainCopy
 		tableCopy.chainHandles[chainCopy.handle] = chainCopy
-		// Update the set-bindings for lookup operations.
-		for _, ruleCopy := range chainCopy.rules {
-			for _, op := range ruleCopy.ops {
-				lookup, ok := op.(*lookupOp)
-				if !ok {
-					continue
-				}
-				lookup.set = tableCopy.sets[lookup.set.name]
-				lookup.set.bindings = append(lookup.set.bindings, lookup)
-			}
-		}
 	}
 
 	return tableCopy
@@ -1370,18 +1427,17 @@ func deepCopyTable(table *Table, afFilter *addressFamilyFilter) *Table {
 // DeepCopy returns a deep copy of the NFTables struct.
 // Assumes that the caller has already locked the mutex.
 // **********************************************************************
-// TODO: b/436922484: Add a transaction system to avoid deep copying the entire
-// NFTables structure.
-// **********************************************************************
 func (nf *NFTables) DeepCopy() *NFTables {
 	nftCopy := &NFTables{
 		clock:              nf.clock,
 		startTime:          nf.startTime,
 		rng:                nf.rng,
 		tableHandleCounter: atomicbitops.Uint64{},
+		genid:              nf.genid,
 		connTrack:          nf.connTrack,
 		connTrackReaper:    nf.connTrackReaper,
 		natEnabled:         nf.natEnabled,
+		stack:              nf.stack,
 	}
 
 	nftCopy.tableHandleCounter.Store(nf.tableHandleCounter.Load())
@@ -1404,6 +1460,10 @@ func (nf *NFTables) DeepCopy() *NFTables {
 			nftCopy.filters[i].tableHandles[tableCopy.handle] = tableCopy
 		}
 
+		for _, tableCopy := range nftCopy.filters[i].tables {
+			tableCopy.updateReferences(filter.tables[tableCopy.name])
+		}
+
 		for hook, hfStack := range filter.hfStacks {
 			hfStackCopy := &hookFunctionStack{}
 			for _, chain := range hfStack.baseChains {
@@ -1422,16 +1482,21 @@ func (nf *NFTables) DeepCopy() *NFTables {
 	return nftCopy
 }
 
-// ReplaceNFTables replaces the tables of the NFTables struct
-// with the tables of the passed in NFTables struct.
-// TODO: b/436922484: The hook function calls (CheckInput, CheckOutput, etc)
-// do not hold a reader lock, fix this.
-func (nf *NFTables) ReplaceNFTables(nftCopy *NFTables) {
-	nf.filters = nftCopy.filters
-	nf.connTrack = nftCopy.connTrack
-	nf.connTrackReaper = nftCopy.connTrackReaper
-	nf.natEnabled = nftCopy.natEnabled
-	nf.ip4InetBaseChains = nftCopy.ip4InetBaseChains
-	nf.ip6InetBaseChains = nftCopy.ip6InetBaseChains
-	nf.genid++
+//
+// Verdict Implementation.
+// There are two types of verdicts:
+// 1. Netfilter (External) Verdicts: Drop, Accept, Stolen, Queue, Repeat, Stop
+// 		These are terminal verdicts that are returned to the kernel.
+// 2. Nftable (Internal) Verdicts:, Continue, Break, Jump, Goto, Return
+// 		These are internal verdicts that only exist within the nftables library.
+// Both share the same numeric space (uint32 Verdict Code).
+//
+
+// Verdict represents the result of evaluating a packet against a rule or chain.
+type Verdict struct {
+	// Code is the numeric code that represents the verdict issued.
+	Code uint32
+	// Chain is the resolved chain to continue evaluation if the verdict is
+	// Jump or Goto. It allows fast pointer traversal during packet ruleset processing.
+	Chain *Chain
 }

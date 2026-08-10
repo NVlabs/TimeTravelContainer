@@ -1,5 +1,6 @@
 load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
+load("//tools:release.bzl", "SIDECARS", "release_files")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
 
@@ -18,6 +19,21 @@ exports_files([
     "README.md",
     "SECURITY.md",
 ])
+
+# Upstream integration tests expect runsc and its sidecars in an installed
+# release layout. TTC's runsc target is a test-only compatibility launcher for
+# ttcd, so this layout is likewise test-only and includes ttcd explicitly.
+release_files(
+    name = "release",
+    bins = [
+        "//runsc",
+        "//runsc/ttc",
+        "//runsc/ttcd",
+    ],
+    sidecars = SIDECARS,
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
 
 nogo_config(
     name = "nogo_config",

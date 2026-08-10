@@ -167,7 +167,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	d := fd.dentry()
 	mode := linux.FileMode(d.mode.Load())
-	if err := vfs.CheckSetStat(ctx, auth.CredentialsFromContext(ctx), &opts, mode, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
+	if err := vfs.CheckSetStat(ctx, auth.CredentialsFromContext(ctx), &opts, mode, nil, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
 	}
 	mnt := fd.vfsfd.Mount()
@@ -348,7 +348,7 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
-func (fd *regularFileFD) Sync(ctx context.Context) error {
+func (fd *regularFileFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
 	fd.mu.Lock()
 	if !fd.dentry().isCopiedUp() {
 		fd.mu.Unlock()
@@ -362,6 +362,9 @@ func (fd *regularFileFD) Sync(ctx context.Context) error {
 	wrappedFD.IncRef()
 	defer wrappedFD.DecRef(ctx)
 	fd.mu.Unlock()
+	if opts.DataOnly {
+		return wrappedFD.SyncData(ctx)
+	}
 	return wrappedFD.Sync(ctx)
 }
 

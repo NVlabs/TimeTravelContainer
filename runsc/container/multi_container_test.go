@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -2363,10 +2365,13 @@ func TestMultiContainerHomeEnvDir(t *testing.T) {
 }
 
 func TestMultiContainerEvent(t *testing.T) {
-	tests := []string{"enableCgroups", "disableCgroups"}
+	tests := []string{"enableCgroups", "enableCgroupsV2", "disableCgroups"}
 	for _, name := range tests {
-		conf := testutil.TestConfig(t)
 		t.Run(name, func(t *testing.T) {
+			conf := testutil.TestConfig(t)
+			if name == "enableCgroupsV2" {
+				conf.MountCgroupV2 = true
+			}
 			rootDir, cleanup, err := testutil.SetupRootDir()
 			if err != nil {
 				t.Fatalf("error creating root dir: %v", err)
@@ -2377,9 +2382,14 @@ func TestMultiContainerEvent(t *testing.T) {
 			// Setup the containers.
 			sleep := []string{"/bin/sh", "-c", "/bin/sleep 100 | grep 123"}
 			busy := []string{"/bin/bash", "-c", "i=0 ; while true ; do (( i += 1 )) ; done"}
-			quick := []string{"/bin/true"}
+			// quick burns a short burst of CPU and exits. The burn must be
+			// long enough to guarantee that at least one CPU clock tick
+			// (10ms) lands while its task is running: the sentry accounts
+			// task CPU time in whole ticks, so a container as short-lived as
+			// /bin/true can legitimately report zero CPU usage.
+			quick := []string{"/bin/sh", "-c", "i=0; while [ \"$i\" -lt 50000 ]; do i=$((i+1)); done"}
 			podSpecs, ids := createSpecs(sleep, busy, quick)
-			if name == "enableCgroups" {
+			if name == "enableCgroups" || name == "enableCgroupsV2" {
 				mnt := specs.Mount{
 					Destination: "/sys/fs/cgroup",
 					Type:        "cgroup",
@@ -2435,8 +2445,8 @@ func TestMultiContainerEvent(t *testing.T) {
 
 				switch i {
 				case 0:
-					if name != "enableCgroups" && evt.Data.Memory.Usage.Usage != uint64(0) {
-						t.Errorf("root container should report 0 memory usage, got: %v", evt.Data.Memory.Usage.Usage)
+					if name == "disableCgroups" && evt.Data.Memory.Usage.Usage != uint64(0) {
+						t.Errorf("root container should report 0 memory usage when cgroups disabled, got: %v", evt.Data.Memory.Usage.Usage)
 					}
 				case 1:
 					if evt.Data.Memory.Usage.Usage == uint64(0) {
@@ -2444,9 +2454,16 @@ func TestMultiContainerEvent(t *testing.T) {
 					}
 				}
 
-				// The exited container should always have a usage of zero.
-				if exited := ret.ContainerUsage[containers[2].ID]; exited != 0 {
-					t.Errorf("Exited container should report 0 CPU usage, got: %d", exited)
+				if name == "enableCgroupsV2" {
+					// In cgroup v2, cpu.stat accumulates CPU usage even after tasks exit.
+					if exited := ret.ContainerUsage[containers[2].ID]; exited == 0 {
+						t.Errorf("Exited container in cgroup v2 should report non-zero CPU usage, got: %d", exited)
+					}
+				} else {
+					// Without cgroup v2, sentry accounting only counts live thread groups.
+					if exited := ret.ContainerUsage[containers[2].ID]; exited != 0 {
+						t.Errorf("Exited container should report 0 CPU usage, got: %d", exited)
+					}
 				}
 			}
 
@@ -2485,6 +2502,144 @@ func TestMultiContainerEvent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCgroupV2ReadControlFile(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	conf.MountCgroupV2 = true
+
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	podSpecs, ids := createSpecs(sleepCmd)
+	mnt0 := specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+		Options:     nil,
+	}
+	podSpecs[0].Mounts = append(podSpecs[0].Mounts, mnt0)
+	createSharedMount(mnt0, "test-mount", podSpecs...)
+
+	containers, cleanup, err := startContainers(conf, podSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+
+	cgPath := path.Join("/", containers[0].ID)
+	queries := []control.CgroupControlFile{
+		{Controller: "memory", Path: cgPath, Name: "memory.current"},
+		{Controller: "cpu", Path: cgPath, Name: "cpu.stat"},
+		{Controller: "cgroup", Path: cgPath, Name: "cgroup.procs"},
+		{Controller: "cgroup", Path: cgPath, Name: "cgroup.controllers"},
+	}
+	for _, ctrl := range queries {
+		val, err := containers[0].Sandbox.CgroupsReadControlFile(ctrl)
+		if err != nil {
+			t.Fatalf("error reading %s in %q: %v", ctrl.Name, ctrl.Path, err)
+		}
+		if val == "" {
+			t.Fatalf("expected non-empty result for %s", ctrl.Name)
+		}
+		switch ctrl.Name {
+		case "memory.current":
+			// memory.current should be an integer representing bytes.
+			if _, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err != nil {
+				t.Fatalf("expected memory.current to be an integer, got %q: %v", val, err)
+			}
+		case "cpu.stat":
+			// cpu.stat should contain usage statistics like user_usec, system_usec.
+			if !strings.Contains(val, "usage_usec") {
+				t.Fatalf("expected cpu.stat to contain 'usage_usec', got %q", val)
+			}
+		case "cgroup.procs":
+			// cgroup.procs should be a list of PIDs, so it should be parseable as integers.
+			for _, pidStr := range strings.Fields(val) {
+				if _, err := strconv.Atoi(pidStr); err != nil {
+					t.Fatalf("expected cgroup.procs to contain integers, got non-integer %q in %q", pidStr, val)
+				}
+			}
+		case "cgroup.controllers":
+			// cgroup.controllers should list available controllers, separated by spaces.
+			if !strings.Contains(val, "cpu") && !strings.Contains(val, "memory") {
+				t.Fatalf("expected cgroup.controllers to contain 'cpu' or 'memory', got %q", val)
+			}
+		}
+	}
+}
+
+// Tests that destroying a container removes its cgroup2 node, including
+// sub-cgroups the container created, and that a container without a cgroup
+// mount in its spec is never given a cgroup2 node.
+func TestMultiContainerCgroupV2Destroy(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	conf.MountCgroupV2 = true
+
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	// The subcontainer creates a nested cgroup under its namespaced
+	// /sys/fs/cgroup view, then sleeps. The root container has no cgroup
+	// mount in its spec, and hence gets no cgroup.
+	podSpecs, ids := createSpecs(sleepCmd,
+		[]string{"/bin/sh", "-c", "mkdir /sys/fs/cgroup/nested && sleep 1000"})
+	mnt0 := specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+		Options:     nil,
+	}
+	podSpecs[1].Mounts = append(podSpecs[1].Mounts, mnt0)
+	podSpecs[1].Linux = &specs.Linux{
+		Namespaces: []specs.LinuxNamespace{{Type: "pid"}, {Type: "cgroup"}},
+	}
+	createSharedMount(mnt0, "test-mount", podSpecs...)
+
+	containers, cleanup, err := startContainers(conf, podSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+
+	readCtrl := func(cgPath string) error {
+		_, err := containers[0].Sandbox.CgroupsReadControlFile(control.CgroupControlFile{
+			Controller: "cgroup",
+			Path:       cgPath,
+			Name:       "cgroup.controllers",
+		})
+		return err
+	}
+
+	// The root container has no cgroup mount in its spec: no cgroup.
+	if err := readCtrl(path.Join("/", containers[0].ID)); err == nil {
+		t.Errorf("root container has a cgroup even though its spec has no cgroup mount")
+	}
+
+	// Wait until the subcontainer has created its nested cgroup.
+	cg1Path := path.Join("/", containers[1].ID)
+	nestedPath := path.Join(cg1Path, "nested")
+	if err := testutil.Poll(func() error { return readCtrl(nestedPath) }, 10*time.Second); err != nil {
+		t.Fatalf("nested cgroup was not created: %v", err)
+	}
+
+	// Destroying the subcontainer must remove its cgroup subtree, nested
+	// cgroup included.
+	if err := containers[1].Destroy(); err != nil {
+		t.Fatalf("error destroying container: %v", err)
+	}
+	if err := readCtrl(cg1Path); err == nil {
+		t.Errorf("container cgroup %q still present after destroy", cg1Path)
+	}
+	if err := readCtrl(nestedPath); err == nil {
+		t.Errorf("nested cgroup %q still present after destroy", nestedPath)
 	}
 }
 
@@ -3071,89 +3226,121 @@ func TestMultiContainerCgroups(t *testing.T) {
 // mount. Also, checks memory usage stats from cgroups work correctly when the
 // memory is increased for one container.
 func TestMultiContainerCgroupsMemoryUsage(t *testing.T) {
-	_, err := testutil.FindFile("test/cmd/test_app/test_app")
-	if err != nil {
-		t.Fatal("error finding test_app:", err)
-	}
+	for _, cgroupV2 := range []bool{false, true} {
+		for name, conf := range configs(t, false /* noOverlay */) {
+			if cgroupV2 {
+				name += "-cgroupV2"
+				conf.MountCgroupV2 = true
+			}
+			t.Run(name, func(t *testing.T) {
+				rootDir, cleanup, err := testutil.SetupRootDir()
+				if err != nil {
+					t.Fatalf("error creating root dir: %v", err)
+				}
+				defer cleanup()
+				conf.RootDir = rootDir
 
-	for name, conf := range configs(t, false /* noOverlay */) {
-		t.Run(name, func(t *testing.T) {
-			rootDir, cleanup, err := testutil.SetupRootDir()
-			if err != nil {
-				t.Fatalf("error creating root dir: %v", err)
-			}
-			defer cleanup()
-			conf.RootDir = rootDir
+				memCmd := []string{"sh", "-c", "dd if=/dev/zero of=/tmp/memfile bs=1M count=5 && sleep 1000"}
+				podSpecs, ids := createSpecs(sleepCmd, memCmd)
+				podSpecs[1].Linux = &specs.Linux{
+					Namespaces: []specs.LinuxNamespace{{Type: "pid"}},
+				}
 
-			podSpecs, ids := createSpecs(sleepCmd, sleepCmd)
-			podSpecs[1].Linux = &specs.Linux{
-				Namespaces: []specs.LinuxNamespace{{Type: "pid"}},
-			}
+				mnt0 := specs.Mount{
+					Destination: "/sys/fs/cgroup",
+					Type:        "cgroup",
+					Options:     nil,
+				}
+				mntTmp := specs.Mount{
+					Destination: "/tmp",
+					Type:        "tmpfs",
+				}
+				// Append cgroups mount for both containers, and tmpfs for container 1.
+				podSpecs[0].Mounts = append(podSpecs[0].Mounts, mnt0)
+				podSpecs[1].Mounts = append(podSpecs[1].Mounts, mnt0, mntTmp)
 
-			mnt0 := specs.Mount{
-				Destination: "/sys/fs/cgroup",
-				Type:        "cgroup",
-				Options:     nil,
-			}
-			// Append cgroups mount for both containers.
-			podSpecs[0].Mounts = append(podSpecs[0].Mounts, mnt0)
-			podSpecs[1].Mounts = append(podSpecs[1].Mounts, mnt0)
+				createSharedMount(mnt0, "test-mount", podSpecs...)
+				containers, cleanup, err := startContainers(conf, podSpecs, ids)
+				if err != nil {
+					t.Fatalf("error starting containers: %v", err)
+				}
+				defer cleanup()
 
-			createSharedMount(mnt0, "test-mount", podSpecs...)
-			containers, cleanup, err := startContainers(conf, podSpecs, ids)
-			if err != nil {
-				t.Fatalf("error starting containers: %v", err)
-			}
-			defer cleanup()
+				usageFile := "memory.usage_in_bytes"
+				if cgroupV2 {
+					usageFile = "memory.current"
+				}
 
-			ctrlRoot := control.CgroupControlFile{
-				Controller: "memory",
-				Path:       "/",
-				Name:       "memory.usage_in_bytes",
-			}
-			ctrl0 := control.CgroupControlFile{
-				Controller: "memory",
-				Path:       "/" + containers[0].ID,
-				Name:       "memory.usage_in_bytes",
-			}
-			ctrl1 := control.CgroupControlFile{
-				Controller: "memory",
-				Path:       "/" + containers[1].ID,
-				Name:       "memory.usage_in_bytes",
-			}
+				ctrlRoot := control.CgroupControlFile{
+					Controller: "memory",
+					Path:       "/",
+					Name:       usageFile,
+				}
+				ctrl0 := control.CgroupControlFile{
+					Controller: "memory",
+					Path:       path.Join("/", containers[0].ID),
+					Name:       usageFile,
+				}
+				ctrl1 := control.CgroupControlFile{
+					Controller: "memory",
+					Path:       path.Join("/", containers[1].ID),
+					Name:       usageFile,
+				}
 
-			usageTotal, err := containers[0].Sandbox.CgroupsReadControlFile(ctrlRoot)
-			if err != nil {
-				t.Fatalf("error getting total usage %v", err)
-			}
-			usage0, err := containers[0].Sandbox.CgroupsReadControlFile(ctrl0)
-			if err != nil {
-				t.Fatalf("error getting container0 usage %v", err)
-			}
-			usage1, err := containers[1].Sandbox.CgroupsReadControlFile(ctrl1)
-			if err != nil {
-				t.Fatalf("error getting container1 usage %v", err)
-			}
-			if usageTotal < (usage0 + usage1) {
-				t.Fatalf("error total usage is less total %v container0_usage %v container1_usage %v", usageTotal, usage0, usage1)
-			}
+				readUsage := func(ctrl control.CgroupControlFile) uint64 {
+					val, err := containers[0].Sandbox.CgroupsReadControlFile(ctrl)
+					if err != nil {
+						t.Fatalf("error reading control file %s in %s: %v", ctrl.Name, ctrl.Path, err)
+					}
+					u, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+					if err != nil {
+						t.Fatalf("error parsing control file %s value %q: %v", ctrl.Name, val, err)
+					}
+					return u
+				}
 
-			// Kill the second container and check that usage has decreased.
-			if err := containers[1].SignalContainer(unix.SIGKILL, true); err != nil {
-				t.Fatalf("error killing container %q: %v", containers[1].ID, err)
-			}
-			if _, err := containers[1].Wait(); err != nil {
-				t.Fatalf("error waiting forcontainer %q: %v", containers[1].ID, err)
-			}
+				// Wait for container1 to allocate memory.
+				if err := testutil.Poll(func() error {
+					if readUsage(ctrl1) > 4*1024*1024 {
+						return nil
+					}
+					return fmt.Errorf("waiting for container 1 memory allocation")
+				}, 5*time.Second); err != nil {
+					t.Fatalf("error waiting for container 1 memory allocation: %v", err)
+				}
 
-			newUsageTotal, err := containers[0].Sandbox.CgroupsReadControlFile(ctrlRoot)
-			if err != nil {
-				t.Fatalf("error getting total usage %v", err)
-			}
-			if newUsageTotal >= usageTotal {
-				t.Fatalf("error new total usage %v is not less than old total usage %v", newUsageTotal, usageTotal)
-			}
-		})
+				usageTotal := readUsage(ctrlRoot)
+				usage0 := readUsage(ctrl0)
+				usage1 := readUsage(ctrl1)
+				if usage0 == 0 || usage1 == 0 || usageTotal == 0 {
+					t.Fatalf("expected non-zero usages, got total %d, container0 %d, container1 %d", usageTotal, usage0, usage1)
+				}
+				if usageTotal < usage0 || usageTotal < usage1 {
+					t.Fatalf("error total usage %d is less than container0 (%d) or container1 (%d)", usageTotal, usage0, usage1)
+				}
+
+				// Kill the second container, destroy it, and check that usage has decreased.
+				if err := containers[1].SignalContainer(unix.SIGKILL, true); err != nil {
+					t.Fatalf("error killing container %q: %v", containers[1].ID, err)
+				}
+				if _, err := containers[1].Wait(); err != nil {
+					t.Fatalf("error waiting forcontainer %q: %v", containers[1].ID, err)
+				}
+				if err := containers[1].Destroy(); err != nil {
+					t.Fatalf("error destroying container %q: %v", containers[1].ID, err)
+				}
+
+				if err := testutil.Poll(func() error {
+					newUsageTotal := readUsage(ctrlRoot)
+					if newUsageTotal >= usageTotal {
+						return fmt.Errorf("new total usage %v is not less than old total usage %v", newUsageTotal, usageTotal)
+					}
+					return nil
+				}, 5*time.Second); err != nil {
+					t.Fatalf("error waiting for total usage to decrease: %v", err)
+				}
+			})
+		}
 	}
 }
 
@@ -3166,14 +3353,16 @@ func TestMultiContainerCgroupsMemoryUsage(t *testing.T) {
 // - When 'all' is true, all tmpfs filesystems are checkpointed and restored.
 func TestFSCheckpointCommand(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		savePath string
-		lostPath string
-		all      bool
+		name       string
+		savePath   string
+		lostPath   string
+		all        bool
+		multipaths bool
 	}{
 		{name: "root", savePath: "/", lostPath: "/homedir"},
 		{name: "all", savePath: "/", lostPath: "/homedir", all: true},
 		{name: "homedir", savePath: "/homedir", lostPath: "/lost-dir"},
+		{name: "multipath", multipaths: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := testutil.TestConfig(t)
@@ -3235,11 +3424,11 @@ func TestFSCheckpointCommand(t *testing.T) {
 			saveSpecs[1].Annotations[specutils.ContainerdContainerNameAnnotation] = subName
 
 			// Helper to add mount hints.
-			addMountHint := func(spec *specs.Spec, name, source string) {
+			addMountHint := func(spec *specs.Spec, name, source string, share string) {
 				// Adding a "bind" mount type annotation with share=container will cause
 				// the bind mount to be overlayed with medium=self.
 				spec.Annotations["dev.gvisor.spec.mount."+name+".source"] = source
-				spec.Annotations["dev.gvisor.spec.mount."+name+".share"] = "container"
+				spec.Annotations["dev.gvisor.spec.mount."+name+".share"] = share
 				spec.Annotations["dev.gvisor.spec.mount."+name+".type"] = "bind"
 			}
 
@@ -3247,7 +3436,15 @@ func TestFSCheckpointCommand(t *testing.T) {
 			var savedirSources []string
 			var lostdirSources []string
 			for i, spec := range saveSpecs {
-				if tc.savePath != "/" {
+				savePath := tc.savePath
+				lostPath := tc.lostPath
+				share := "container"
+				if tc.multipaths {
+					savePath = fmt.Sprintf("/data%d", i+1)
+					lostPath = fmt.Sprintf("/lost-dir%d", i+1)
+					share = "pod"
+				}
+				if savePath != "/" {
 					saveSource, err := os.MkdirTemp(testutil.TmpDir(), fmt.Sprintf("savedir-%d", i))
 					if err != nil {
 						t.Fatalf("Error creating savedir source: %v", err)
@@ -3257,11 +3454,11 @@ func TestFSCheckpointCommand(t *testing.T) {
 
 					spec.Mounts = append(spec.Mounts, specs.Mount{
 						Source:      saveSource,
-						Destination: tc.savePath,
+						Destination: savePath,
 						Type:        "bind",
 					})
 					// Enable overlay for savePath mount.
-					addMountHint(saveSpecs[0], fmt.Sprintf("savedir-%d", i), saveSource)
+					addMountHint(saveSpecs[0], fmt.Sprintf("savedir-%d", i), saveSource, share)
 				}
 
 				lostdirSource, err := os.MkdirTemp(testutil.TmpDir(), fmt.Sprintf("lostdir-%d", i))
@@ -3273,11 +3470,11 @@ func TestFSCheckpointCommand(t *testing.T) {
 
 				spec.Mounts = append(spec.Mounts, specs.Mount{
 					Source:      lostdirSource,
-					Destination: tc.lostPath,
+					Destination: lostPath,
 					Type:        "bind",
 				})
 				// Enable overlay for lostPath mount.
-				addMountHint(saveSpecs[0], fmt.Sprintf("lostdir-%d", i), lostdirSource)
+				addMountHint(saveSpecs[0], fmt.Sprintf("lostdir-%d", i), lostdirSource, share)
 			}
 
 			cleanupRootsOld, err := setupSpecRoots(saveSpecs, ids)
@@ -3296,15 +3493,21 @@ func TestFSCheckpointCommand(t *testing.T) {
 			savePathFsTreeArgs := make([][]string, len(conts))
 			lostPathFsTreeArgs := make([][]string, len(conts))
 			for i := range conts {
+				savePath := tc.savePath
+				lostPath := tc.lostPath
+				if tc.multipaths {
+					savePath = fmt.Sprintf("/data%d", i+1)
+					lostPath = fmt.Sprintf("/lost-dir%d", i+1)
+				}
 				// Populate the path to be checkpointed.
-				args := []string{"--depth=10", "--file-per-level=10", "--file-size=65537", "--create-symlink", "--add-empty-files", "--target-dir=" + tc.savePath, fmt.Sprintf("--seed=%d", rand.Uint64())}
+				args := []string{"--depth=10", "--file-per-level=10", "--file-size=65537", "--create-symlink", "--add-empty-files", "--target-dir=" + savePath, fmt.Sprintf("--seed=%d", rand.Uint64())}
 				savePathFsTreeArgs[i] = args
 				if ws, err := execute(conf, conts[i], "/app", append([]string{"fsTreeCreate"}, args...)...); err != nil || ws != 0 {
 					t.Fatalf("Error populating checkpoint filesystem for container %d, ws: %v, err: %v", i, ws, err)
 				}
 
 				// Populate the path to be lost with a single file.
-				args = []string{"--depth=1", "--file-per-level=1", "--file-size=0", "--target-dir=" + tc.lostPath, fmt.Sprintf("--seed=%d", rand.Uint64())}
+				args = []string{"--depth=1", "--file-per-level=1", "--file-size=0", "--target-dir=" + lostPath, fmt.Sprintf("--seed=%d", rand.Uint64())}
 				lostPathFsTreeArgs[i] = args
 				if ws, err := execute(conf, conts[i], "/app", append([]string{"fsTreeCreate"}, args...)...); err != nil || ws != 0 {
 					t.Fatalf("Error creating lost file for container %d: ws: %v, err: %v", i, ws, err)
@@ -3326,9 +3529,18 @@ func TestFSCheckpointCommand(t *testing.T) {
 			if tc.all {
 				fsSavePathArg = fscheckpoint.AllTmpfsPath
 			}
+			var paths []checkpoint.ResourceID
+			if tc.multipaths {
+				paths = []checkpoint.ResourceID{
+					{ContainerName: rootName, Path: "/data1"},
+					{ContainerName: subName, Path: "/data2"},
+				}
+			} else {
+				paths = []checkpoint.ResourceID{{Path: fsSavePathArg}}
+			}
 			if err := conts[0].FSSave(conf, imagePath, sandbox.FSSaveOpts{
 				ExitAfterSaving: true,
-				Path:            fsSavePathArg,
+				Paths:           paths,
 			}); err != nil {
 				t.Fatalf("Error saving filesystem checkpoint: %v", err)
 			}
@@ -3373,23 +3585,31 @@ func TestFSCheckpointCommand(t *testing.T) {
 			}
 
 			for i, spec := range restoreSpecs {
-				if tc.savePath != "/" {
+				savePath := tc.savePath
+				lostPath := tc.lostPath
+				share := "container"
+				if tc.multipaths {
+					savePath = fmt.Sprintf("/data%d", i+1)
+					lostPath = fmt.Sprintf("/lost-dir%d", i+1)
+					share = "pod"
+				}
+				if savePath != "/" {
 					spec.Mounts = append(spec.Mounts, specs.Mount{
 						Source:      savedirSources[i],
-						Destination: tc.savePath,
+						Destination: savePath,
 						Type:        "bind",
 					})
 					// Enable overlay for savePath mount.
-					addMountHint(restoreSpecs[0], fmt.Sprintf("savedir-%d", i), savedirSources[i])
+					addMountHint(restoreSpecs[0], fmt.Sprintf("savedir-%d", i), savedirSources[i], share)
 				}
 
 				spec.Mounts = append(spec.Mounts, specs.Mount{
 					Source:      lostdirSources[i],
-					Destination: tc.lostPath,
+					Destination: lostPath,
 					Type:        "bind",
 				})
 				// Enable overlay for lostPath mount.
-				addMountHint(restoreSpecs[0], fmt.Sprintf("lostdir-%d", i), lostdirSources[i])
+				addMountHint(restoreSpecs[0], fmt.Sprintf("lostdir-%d", i), lostdirSources[i], share)
 			}
 
 			cleanupRootsNew, err := setupSpecRoots(restoreSpecs, restoreIDs)
@@ -3409,6 +3629,10 @@ func TestFSCheckpointCommand(t *testing.T) {
 
 			// Verify container filesystems restored from checkpoint.
 			for i := range restoreConts[:2] {
+				lostPath := tc.lostPath
+				if tc.multipaths {
+					lostPath = fmt.Sprintf("/lost-dir%d", i+1)
+				}
 				// Checkpointed path must be verified successfully.
 				if ws, err := execute(conf, restoreConts[i], "/app", append([]string{"fsTreeVerify"}, savePathFsTreeArgs[i]...)...); err != nil || ws != 0 {
 					t.Fatalf("Error verifying checkpointed filesystem for container %d, ws: %v, err: %v", i, ws, err)
@@ -3422,9 +3646,9 @@ func TestFSCheckpointCommand(t *testing.T) {
 					}
 				} else {
 					// Verify that the lost path is cleared.
-					out, status, err := executeCombinedOutputWithStatus(conf, restoreConts[i], nil, "/app", "assertIsEmpty", tc.lostPath)
+					out, status, err := executeCombinedOutputWithStatus(conf, restoreConts[i], nil, "/app", "assertIsEmpty", lostPath)
 					if err != nil || status != 0 {
-						t.Fatalf("Lost path %q was not cleared for container %d, status: %v, err: %v, output: %s", tc.lostPath, i, status, err, string(out))
+						t.Fatalf("Lost path %q was not cleared for container %d, status: %v, err: %v, output: %s", lostPath, i, status, err, string(out))
 					}
 				}
 			}
@@ -3451,9 +3675,13 @@ func TestFSCheckpointCommand(t *testing.T) {
 					t.Fatalf("Error verifying lost path is also restored for restarted container when using --path=all-tmpfs, ws: %v, err: %v", ws, err)
 				}
 			} else {
-				out, status, err := executeCombinedOutputWithStatus(conf, contsRestart[0], nil, "/app", "assertIsEmpty", tc.lostPath)
+				lostPath := tc.lostPath
+				if tc.multipaths {
+					lostPath = "/lost-dir2"
+				}
+				out, status, err := executeCombinedOutputWithStatus(conf, contsRestart[0], nil, "/app", "assertIsEmpty", lostPath)
 				if err != nil || status != 0 {
-					t.Fatalf("Lost path %q was not cleared for restarted container, status: %v, err: %v, output: %s", tc.lostPath, status, err, string(out))
+					t.Fatalf("Lost path %q was not cleared for restarted container, status: %v, err: %v, output: %s", lostPath, status, err, string(out))
 				}
 			}
 			if err := contsRestart[0].WaitFSRestore(); err != nil {
@@ -3594,12 +3822,14 @@ func TestCheckpointRestoreAnnotation(t *testing.T) {
 
 func TestFSCheckpointAnnotation(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		path     string
-		lostPath string
+		name       string
+		path       string
+		lostPath   string
+		multipaths bool
 	}{
 		{name: "root", path: "/", lostPath: "/homedir"},
 		{name: "homedir", path: "/homedir", lostPath: "/lost-dir"},
+		{name: "multipaths", path: "/homedir", lostPath: "/lost-dir", multipaths: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := testutil.TestConfig(t)
@@ -3654,8 +3884,21 @@ func TestFSCheckpointAnnotation(t *testing.T) {
 			// Helper to add mount hints.
 			addMountHint := func(spec *specs.Spec, name, source string) {
 				spec.Annotations["dev.gvisor.spec.mount."+name+".source"] = source
-				spec.Annotations["dev.gvisor.spec.mount."+name+".share"] = "container"
+				if tc.multipaths {
+					spec.Annotations["dev.gvisor.spec.mount."+name+".share"] = "pod"
+				} else {
+					spec.Annotations["dev.gvisor.spec.mount."+name+".share"] = "container"
+				}
 				spec.Annotations["dev.gvisor.spec.mount."+name+".type"] = "bind"
+			}
+
+			const (
+				rootName = "root-container"
+				subName  = "sub-container"
+			)
+			if tc.multipaths {
+				saveSpecs[0].Annotations[specutils.ContainerdContainerNameAnnotation] = rootName
+				saveSpecs[1].Annotations[specutils.ContainerdContainerNameAnnotation] = subName
 			}
 
 			// Add bind mount to /homedir for both containers, using different host directories to avoid filestore conflict.
@@ -3676,7 +3919,7 @@ func TestFSCheckpointAnnotation(t *testing.T) {
 				})
 				addMountHint(saveSpecs[0], fmt.Sprintf("homedir-%d", i), homedirSource)
 
-				if tc.name == "homedir" {
+				if tc.name == "homedir" || tc.multipaths {
 					lostdirSource, err := os.MkdirTemp(testutil.TmpDir(), fmt.Sprintf("lostdir-source-%d", i))
 					if err != nil {
 						t.Fatalf("Error creating lostdir source: %v", err)
@@ -3714,8 +3957,10 @@ func TestFSCheckpointAnnotation(t *testing.T) {
 			// options, but files in /proc/gvisor are enabled on a per-container basis.
 			saveSpecs[0].Annotations["dev.gvisor.internal.fscheckpoint.path"] = imagePath
 			saveSpecs[0].Annotations["dev.gvisor.internal.fscheckpoint.resume"] = "true"
-			if tc.path != "/" {
-				saveSpecs[0].Annotations["dev.gvisor.internal.fscheckpoint.container-path"] = tc.path
+			if tc.multipaths {
+				saveSpecs[0].Annotations["dev.gvisor.internal.fscheckpoint.paths"] = fmt.Sprintf("%s:%s,%s:%s", rootName, tc.path, subName, tc.path)
+			} else if tc.path != "/" {
+				saveSpecs[0].Annotations["dev.gvisor.internal.fscheckpoint.paths"] = tc.path
 			}
 			saveSpecs[1].Annotations["dev.gvisor.internal.fscheckpoint.enable"] = "true"
 			conts, cleanupContsOld, err := startContainers(conf, saveSpecs, ids)
@@ -3763,6 +4008,10 @@ func TestFSCheckpointAnnotation(t *testing.T) {
 
 			// Start containers which sleep, restoring from the filesystem checkpoint.
 			restoreSpecs, ids := createSpecs(testAppSleepArgv, testAppSleepArgv)
+			if tc.multipaths {
+				restoreSpecs[0].Annotations[specutils.ContainerdContainerNameAnnotation] = rootName
+				restoreSpecs[1].Annotations[specutils.ContainerdContainerNameAnnotation] = subName
+			}
 			for i, spec := range restoreSpecs {
 				spec.Mounts = append(spec.Mounts, specs.Mount{
 					Source:      homedirSources[i],
@@ -3771,7 +4020,7 @@ func TestFSCheckpointAnnotation(t *testing.T) {
 				})
 				addMountHint(restoreSpecs[0], fmt.Sprintf("homedir-%d", i), homedirSources[i])
 
-				if tc.name == "homedir" {
+				if tc.name == "homedir" || tc.multipaths {
 					spec.Mounts = append(spec.Mounts, specs.Mount{
 						Source:      lostdirSources[i],
 						Destination: "/lost-dir",
@@ -3904,5 +4153,369 @@ func TestMultiContainerExecSeccomp(t *testing.T) {
 	_, err = executeCombinedOutput(conf, containers[1], nil, "/bin/uname")
 	if err != nil {
 		t.Errorf("uname in container 1 should have succeeded: %v", err)
+	}
+}
+
+func TestFSCheckpointSharedVolume(t *testing.T) {
+	conf := testutil.TestConfig(t)
+
+	rootDir, cleanupRoot, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("Error creating root dir: %v", err)
+	}
+	defer cleanupRoot()
+	conf.RootDir = rootDir
+
+	// Configure overlay.
+	conf.Overlay2.Set("root:self")
+
+	const (
+		rootName = "root-container"
+		subName  = "sub-container"
+	)
+
+	appSrc, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("Error finding test_app:", err)
+	}
+	setupSpecRoots := func(containerSpecs []*specs.Spec, ids []string) (func(), error) {
+		var cleanupSpecRoots cleanup.Cleanup
+		defer cleanupSpecRoots.Clean()
+		for i, spec := range containerSpecs {
+			contRootPath, err := os.MkdirTemp(testutil.TmpDir(), fmt.Sprintf("%s-root", ids[i]))
+			if err != nil {
+				return nil, fmt.Errorf("error creating root directory for container %d: %v", i, err)
+			}
+			cleanupSpecRoots.Add(func() { os.RemoveAll(contRootPath) })
+			spec.Root.Path = contRootPath
+			spec.Root.Readonly = false
+			appDst := filepath.Join(contRootPath, "app")
+			if err := copyFile(appSrc, appDst); err != nil {
+				return nil, fmt.Errorf("error copying app binary from %q to %q: %v", appSrc, appDst, err)
+			}
+		}
+		return cleanupSpecRoots.Release(), nil
+	}
+
+	sharedSource, err := os.MkdirTemp(testutil.TmpDir(), "shared-source")
+	if err != nil {
+		t.Fatalf("Error creating shared source: %v", err)
+	}
+	defer os.RemoveAll(sharedSource)
+
+	testAppSleepArgv := []string{"/app", "reaper"}
+	saveSpecs, ids := createSpecs(testAppSleepArgv, testAppSleepArgv)
+
+	saveSpecs[0].Annotations[specutils.ContainerdContainerNameAnnotation] = rootName
+	saveSpecs[1].Annotations[specutils.ContainerdContainerNameAnnotation] = subName
+
+	// Add mount hint for shared volume.
+	saveSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.source"] = sharedSource
+	saveSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.share"] = "pod"
+	saveSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.type"] = "tmpfs"
+
+	// Both containers mount the same source to /shared.
+	saveSpecs[0].Mounts = append(saveSpecs[0].Mounts, specs.Mount{
+		Source:      sharedSource,
+		Destination: "/shared",
+		Type:        "bind",
+	})
+	saveSpecs[1].Mounts = append(saveSpecs[1].Mounts, specs.Mount{
+		Source:      sharedSource,
+		Destination: "/shared",
+		Type:        "bind",
+	})
+
+	imagePath, err := os.MkdirTemp(testutil.TmpDir(), "fscheckpoint-image")
+	if err != nil {
+		t.Fatalf("Error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(imagePath)
+
+	cleanupRootsOld, err := setupSpecRoots(saveSpecs, ids)
+	if err != nil {
+		t.Fatalf("Error setting up container roots: %v", err)
+	}
+	defer cleanupRootsOld()
+
+	conts, cleanupContsOld, err := startContainers(conf, saveSpecs, ids)
+	if err != nil {
+		t.Fatalf("Error starting containers: %v", err)
+	}
+	defer cleanupContsOld()
+
+	// Write file from root-container.
+	if ws, err := execute(conf, conts[0], "/app", "fsTreeCreate", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error writing to shared volume from root container, ws: %v, err: %v", ws, err)
+	}
+
+	// Verify file is visible in sub-container.
+	if ws, err := execute(conf, conts[1], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container before checkpoint, ws: %v, err: %v", ws, err)
+	}
+
+	// Checkpoint specifying BOTH paths.
+	// Since share=pod is used, the filesystem is created by the first container (root-container).
+	// Specifying both ensures it matches container0's mount and gets saved.
+	if err := conts[0].FSSave(conf, imagePath, sandbox.FSSaveOpts{
+		ExitAfterSaving: true,
+		Paths: []checkpoint.ResourceID{
+			{ContainerName: rootName, Path: "/shared"},
+			{ContainerName: subName, Path: "/shared"},
+		},
+	}); err != nil {
+		t.Fatalf("Error saving filesystem checkpoint: %v", err)
+	}
+
+	for i, c := range conts {
+		if err := c.SignalContainer(unix.SIGKILL, false); err != nil && !strings.Contains(err.Error(), "no such process") {
+			t.Fatalf("Error killing container %d: %v", i, err)
+		}
+	}
+
+	restoreSpecs, restoreIDs := createSpecs(testAppSleepArgv, testAppSleepArgv)
+	restoreSpecs[0].Annotations[specutils.ContainerdContainerNameAnnotation] = rootName
+	restoreSpecs[1].Annotations[specutils.ContainerdContainerNameAnnotation] = subName
+
+	restoreSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.source"] = sharedSource
+	restoreSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.share"] = "pod"
+	restoreSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.type"] = "tmpfs"
+
+	restoreSpecs[0].Mounts = append(restoreSpecs[0].Mounts, specs.Mount{
+		Source:      sharedSource,
+		Destination: "/shared",
+		Type:        "bind",
+	})
+	restoreSpecs[1].Mounts = append(restoreSpecs[1].Mounts, specs.Mount{
+		Source:      sharedSource,
+		Destination: "/shared",
+		Type:        "bind",
+	})
+
+	cleanupRootsNew, err := setupSpecRoots(restoreSpecs, restoreIDs)
+	if err != nil {
+		t.Fatalf("Error setting up container roots: %v", err)
+	}
+	defer cleanupRootsNew()
+
+	restoreConts, cleanupContsNew, err := startContainersWithArgs(conf, restoreSpecs, restoreIDs, func(i int, contArgs *Args) {
+		if i == 0 {
+			contArgs.FSRestoreImagePath = imagePath
+		}
+	})
+	if err != nil {
+		t.Fatalf("Error starting containers: %v", err)
+	}
+	defer cleanupContsNew()
+
+	// Verify data is restored in both containers.
+	if ws, err := execute(conf, restoreConts[0], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from root container after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, restoreConts[1], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container after restore, ws: %v, err: %v", ws, err)
+	}
+}
+
+// TestMultiContainerSharedVolumeCheckpointRestore tests that checkpoint/restore works
+// with multi-containers sharing an overlay filestore volume.
+func TestMultiContainerSharedVolumeCheckpointRestore(t *testing.T) {
+	compression := statefile.CompressionLevelNone
+
+	conf := testutil.TestConfig(t)
+	// Enable host-backed overlay.
+	tempDir, err := os.MkdirTemp(testutil.TmpDir(), "overlay-filestore")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	if err := conf.Overlay2.Set("all:dir=" + tempDir); err != nil {
+		t.Fatalf("error setting overlay2: %v", err)
+	}
+
+	rootDir, cleanupRoot, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanupRoot()
+	conf.RootDir = rootDir
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test-shared")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	sharedDir, err := os.MkdirTemp(testutil.TmpDir(), "shared-vol")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(sharedDir)
+	if err := os.Chmod(sharedDir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", sharedDir, err)
+	}
+
+	singleSharedDir, err := os.MkdirTemp(testutil.TmpDir(), "single-shared-vol")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(singleSharedDir)
+	if err := os.Chmod(singleSharedDir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", singleSharedDir, err)
+	}
+
+	appSrc, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("Error finding test_app:", err)
+	}
+
+	setupSpecRoots := func(containerSpecs []*specs.Spec, ids []string) (func(), error) {
+		var cleanupSpecRoots cleanup.Cleanup
+		defer cleanupSpecRoots.Clean()
+		for i, spec := range containerSpecs {
+			contRootPath, err := os.MkdirTemp(testutil.TmpDir(), fmt.Sprintf("%s-root", ids[i]))
+			if err != nil {
+				return nil, fmt.Errorf("error creating root directory for container %d: %v", i, err)
+			}
+			cleanupSpecRoots.Add(func() { os.RemoveAll(contRootPath) })
+			spec.Root.Path = contRootPath
+			spec.Root.Readonly = false
+			appDst := filepath.Join(contRootPath, "app")
+			if err := copyFile(appSrc, appDst); err != nil {
+				return nil, fmt.Errorf("error copying app binary from %q to %q: %v", appSrc, appDst, err)
+			}
+		}
+		return cleanupSpecRoots.Release(), nil
+	}
+
+	testAppSleepArgv := []string{"/app", "reaper"}
+	testSpecs, ids := createSpecs(
+		testAppSleepArgv,
+		testAppSleepArgv,
+		testAppSleepArgv,
+	)
+
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.share"] = "pod"
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.type"] = "tmpfs"
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.shared-vol.source"] = sharedDir
+
+	sharedMount := specs.Mount{
+		Destination: "/shared",
+		Source:      sharedDir,
+		Type:        "bind",
+	}
+	testSpecs[0].Mounts = append(testSpecs[0].Mounts, sharedMount)
+	testSpecs[1].Mounts = append(testSpecs[1].Mounts, sharedMount)
+	testSpecs[2].Mounts = append(testSpecs[2].Mounts, sharedMount)
+
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.single-shared-vol.share"] = "pod"
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.single-shared-vol.type"] = "tmpfs"
+	testSpecs[0].Annotations["dev.gvisor.spec.mount.single-shared-vol.source"] = singleSharedDir
+
+	singleSharedMount := specs.Mount{
+		Destination: "/single_shared",
+		Source:      singleSharedDir,
+		Type:        "bind",
+	}
+	testSpecs[0].Mounts = append(testSpecs[0].Mounts, singleSharedMount)
+
+	cleanupRoots, err := setupSpecRoots(testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error setting up container roots: %v", err)
+	}
+	defer cleanupRoots()
+
+	conts, cleanupConts, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanupConts()
+
+	// Write file from root-container.
+	if ws, err := execute(conf, conts[0], "/app", "fsTreeCreate", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error writing to shared volume from root container, ws: %v, err: %v", ws, err)
+	}
+
+	// Write file to single-shared volume from root-container.
+	if ws, err := execute(conf, conts[0], "/app", "fsTreeCreate", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/single_shared", "--seed=789"); err != nil || ws != 0 {
+		t.Fatalf("Error writing to single shared volume from root container, ws: %v, err: %v", ws, err)
+	}
+
+	// Verify file is visible in sub-container.
+	if ws, err := execute(conf, conts[1], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container before checkpoint, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, conts[2], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container 2 before checkpoint, ws: %v, err: %v", ws, err)
+	}
+
+	// Write file from sub-container.
+	if ws, err := execute(conf, conts[1], "/app", "fsTreeCreate", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error writing to shared volume from sub container, ws: %v, err: %v", ws, err)
+	}
+
+	// Verify file is visible in root-container.
+	if ws, err := execute(conf, conts[0], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from root container before checkpoint, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, conts[2], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container 2 before checkpoint, ws: %v, err: %v", ws, err)
+	}
+
+	if err := conts[0].Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: compression}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+
+	newIds := make([]string, 0, len(ids))
+	for range ids {
+		newIds = append(newIds, testutil.RandomContainerID())
+	}
+	for _, spec := range testSpecs[1:] {
+		spec.Annotations[specutils.ContainerdSandboxIDAnnotation] = newIds[0]
+	}
+
+	cleanupRootsNew, err := setupSpecRoots(testSpecs, newIds)
+	if err != nil {
+		t.Fatalf("error setting up container roots: %v", err)
+	}
+	defer cleanupRootsNew()
+
+	newConts, newCleanup, err := restoreContainers(conf, testSpecs, newIds, dir)
+	if err != nil {
+		t.Fatalf("error restoring containers: %v", err)
+	}
+	defer newCleanup()
+
+	// Verify data is restored in all containers.
+	if ws, err := execute(conf, newConts[0], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from root container after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, newConts[1], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, newConts[2], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared", "--seed=123"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume from sub-container 2 after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, newConts[0], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/single_shared", "--seed=789"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying single shared volume from root container after restore, ws: %v, err: %v", ws, err)
+	}
+
+	// Verify data from sub-container write.
+	if ws, err := execute(conf, newConts[0], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume sub-dir from root container after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, newConts[1], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume sub-dir from sub-container after restore, ws: %v, err: %v", ws, err)
+	}
+	if ws, err := execute(conf, newConts[2], "/app", "fsTreeVerify", "--depth=1", "--file-per-level=1", "--file-size=10", "--target-dir=/shared/sub", "--seed=456"); err != nil || ws != 0 {
+		t.Fatalf("Error verifying shared volume sub-dir from sub-container 2 after restore, ws: %v, err: %v", ws, err)
+	}
+
+	for _, c := range newConts {
+		c.SignalContainer(unix.SIGKILL, false)
+		c.Wait()
 	}
 }
