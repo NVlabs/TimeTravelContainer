@@ -578,7 +578,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescrip
 // Preconditions:
 //   - f is an ELF file.
 //   - f is the first ELF loaded into m.
-func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs cpuid.FeatureSet, fd *vfs.FileDescription, personality uint32) (loadedELF, *arch.Context64, error) {
+func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs cpuid.FeatureSet, fd *vfs.FileDescription, personality uint32, randomizeVASpace int32) (loadedELF, *arch.Context64, error) {
 	info, err := parseHeader(ctx, fd)
 	if err != nil {
 		ctx.Infof("Failed to parse initial ELF: %v", err)
@@ -595,7 +595,8 @@ func loadInitialELF(ctx context.Context, m *mm.MemoryManager, fs cpuid.FeatureSe
 	// mapping anything.
 	ac := arch.New(info.arch)
 
-	randomize := personality&linux.ADDR_NO_RANDOMIZE == 0
+	// ADDR_NO_RANDOMIZE overrides the sandbox-wide sysctl, as on Linux.
+	randomize := randomizeVASpace != 0 && personality&linux.ADDR_NO_RANDOMIZE == 0
 	l, err := m.SetMmapLayout(ac, limits.FromContext(ctx), randomize)
 	if err != nil {
 		ctx.Warningf("Failed to set mmap layout: %v", err)
@@ -647,7 +648,7 @@ func loadInterpreterELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDe
 //
 // Preconditions: args.File is an ELF file.
 func loadELF(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, error) {
-	bin, ac, err := loadInitialELF(ctx, args.MemoryManager, args.Features, args.File, args.Personality)
+	bin, ac, err := loadInitialELF(ctx, args.MemoryManager, args.Features, args.File, args.Personality, args.RandomizeVASpace)
 	if err != nil {
 		ctx.Infof("Error loading binary: %v", err)
 		return loadedELF{}, nil, err

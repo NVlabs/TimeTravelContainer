@@ -418,6 +418,12 @@ type Kernel struct {
 	// used by processes.
 	MaxFDLimit atomicbitops.Int32
 
+	// RandomizeVASpace controls address-space randomization for newly executed
+	// process images. Its values have the same meaning as Linux's
+	// /proc/sys/kernel/randomize_va_space: 0 disables ASLR, 1 enables
+	// conservative randomization, and 2 enables full randomization.
+	RandomizeVASpace atomicbitops.Int32
+
 	// devGofers maps containers (using its name) to its device gofer client.
 	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
 	devGofersMu sync.Mutex                      `state:"nosave"`
@@ -618,6 +624,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		args.MaxFDLimit = MaxFdLimit
 	}
 	k.MaxFDLimit.Store(args.MaxFDLimit)
+	k.RandomizeVASpace.Store(2)
 	k.containerNames = make(map[string]string)
 	k.CheckpointWait.k = k
 
@@ -1404,6 +1411,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		StopPrivGain:        false,
 		AllowSUID:           k.AllowSUID,
 		Personality:         linux.PER_LINUX,
+		RandomizeVASpace:    k.RandomizeVASpace.Load(),
 	}
 
 	image, newCreds, _, _, se := k.LoadTaskImage(ctx, loadArgs)

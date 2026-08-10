@@ -102,7 +102,10 @@ func (s *State) newTrapLocked(ctx context.Context, mm memoryManager) (hostarch.A
 		}
 		if err != nil {
 			// The usertrap table has not been mapped yet.
-			addr := hostarch.Addr(rand.Int63n(int64(trapTableAddrRange.Length()-trapTableSize))).RoundDown() + trapTableAddrRange.Start
+			addr := trapTableAddrRange.Start
+			if task.MemoryManager().MmapLayoutRandomized() {
+				addr += hostarch.Addr(rand.Int63n(int64(trapTableAddrRange.Length() - trapTableSize))).RoundDown()
+			}
 			ctx.Debugf("Map a usertrap vma at %x", addr)
 			if err := loadUsertrap(ctx, mm, addr); err != nil {
 				return 0, err

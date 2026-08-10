@@ -101,6 +101,11 @@ type LoadArgs struct {
 	// affect exec, such as ADDR_NO_RANDOMIZE, are applied while constructing
 	// the new address space.
 	Personality uint32
+
+	// RandomizeVASpace is the sandbox's /proc/sys/kernel/randomize_va_space
+	// value. Zero disables address-space randomization. Values 1 and 2 both
+	// enable all randomization currently implemented by the Sentry.
+	RandomizeVASpace int32
 }
 
 // openPath opens args.Filename and checks that it is valid for loading.

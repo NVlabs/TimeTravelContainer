@@ -3357,9 +3357,27 @@ TEST(ProcSysKernel, RandomizeVaSpace) {
   EXPECT_GE(randomize_va, 0);
   EXPECT_LE(randomize_va, 2);
   if (IsRunningOnGvisor()) {
-    // gVisor always uses full ASLR, so expect 2.
+    // gVisor defaults to full ASLR.
     EXPECT_EQ(randomize_va, 2);
   }
+}
+
+TEST(ProcSysKernel, SetRandomizeVaSpace) {
+  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  constexpr char kPath[] = "/proc/sys/kernel/randomize_va_space";
+  const std::string original = ASSERT_NO_ERRNO_AND_VALUE(GetContents(kPath));
+  auto restore = Cleanup([original] {
+    SetContents("/proc/sys/kernel/randomize_va_space", original);
+  });
+
+  for (int value : {0, 1, 2}) {
+    ASSERT_NO_ERRNO(SetContents(kPath, absl::StrCat(value)));
+    EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(GetContents(kPath)),
+              absl::StrCat(value, "\n"));
+  }
+  EXPECT_THAT(SetContents(kPath, "-1"), PosixErrorIs(EINVAL));
+  EXPECT_THAT(SetContents(kPath, "3"), PosixErrorIs(EINVAL));
 }
 
 }  // namespace

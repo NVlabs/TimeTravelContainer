@@ -27,6 +27,8 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "test/util/cleanup.h"
+#include "test/util/fs_util.h"
 #include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
@@ -43,7 +45,7 @@ constexpr char kAddressReportFD[] = "GVISOR_PERSONALITY_ADDRESS_REPORT_FD";
 __attribute__((noinline)) void AddressProbeFunction() {}
 
 struct AddressReport {
-  std::array<uintptr_t, 6> addresses;
+  std::array<uintptr_t, 7> addresses;
   std::array<unsigned char, 16> random;
 };
 
@@ -161,7 +163,17 @@ TEST(PersonalityTest, ReportAddresses) {
       reinterpret_cast<uintptr_t>(mapping),
       static_cast<uintptr_t>(getauxval(AT_SYSINFO_EHDR)),
       static_cast<uintptr_t>(getauxval(AT_RANDOM)),
+      0,
   };
+  const std::string maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  const size_t marker = maps.find("[usertrap]");
+  if (marker != std::string::npos) {
+    const size_t line_start = maps.rfind('\n', marker);
+    const char* start = maps.c_str() +
+                        (line_start == std::string::npos ? 0 : line_start + 1);
+    ASSERT_EQ(sscanf(start, "%lx", &report.addresses[6]), 1);
+  }
   memcpy(report.random.data(),
          reinterpret_cast<const void*>(getauxval(AT_RANDOM)),
          report.random.size());
@@ -185,6 +197,49 @@ TEST(PersonalityTest, AddrNoRandomizeMakesExecLayoutDeterministic) {
       snprintf(fd_string, sizeof(fd_string), "%d", pipe_fds[1]);
       TEST_PCHECK(setenv(kAddressReportFD, fd_string, 1) == 0);
       TEST_PCHECK(personality(ADDR_NO_RANDOMIZE) != -1);
+      execl("/proc/self/exe", "/proc/self/exe",
+            "--gtest_filter=PersonalityTest.ReportAddresses", nullptr);
+      _exit(127);
+    }
+    close(pipe_fds[1]);
+    size_t done = 0;
+    while (done != sizeof(result)) {
+      const ssize_t n = read(pipe_fds[0],
+                             reinterpret_cast<char*>(&result) + done,
+                             sizeof(result) - done);
+      ASSERT_GT(n, 0);
+      done += static_cast<size_t>(n);
+    }
+    close(pipe_fds[0]);
+    int status;
+    ASSERT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+  }
+  EXPECT_EQ(results[0].addresses, results[1].addresses);
+  EXPECT_NE(results[0].random, results[1].random);
+}
+
+TEST(PersonalityTest, RandomizeVaSpaceZeroMakesExecLayoutDeterministic) {
+  SKIP_IF(!IsRunningOnGvisor());
+  constexpr char kPath[] = "/proc/sys/kernel/randomize_va_space";
+  const std::string original = ASSERT_NO_ERRNO_AND_VALUE(GetContents(kPath));
+  auto restore = Cleanup([original] {
+    SetContents("/proc/sys/kernel/randomize_va_space", original);
+  });
+  ASSERT_NO_ERRNO(SetContents(kPath, "0"));
+
+  std::array<AddressReport, 2> results;
+  for (auto& result : results) {
+    int pipe_fds[2];
+    ASSERT_THAT(pipe(pipe_fds), SyscallSucceeds());
+    const pid_t child = fork();
+    ASSERT_THAT(child, SyscallSucceeds());
+    if (child == 0) {
+      close(pipe_fds[0]);
+      char fd_string[32];
+      snprintf(fd_string, sizeof(fd_string), "%d", pipe_fds[1]);
+      TEST_PCHECK(setenv(kAddressReportFD, fd_string, 1) == 0);
       execl("/proc/self/exe", "/proc/self/exe",
             "--gtest_filter=PersonalityTest.ReportAddresses", nullptr);
       _exit(127);

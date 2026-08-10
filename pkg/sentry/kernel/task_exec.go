@@ -174,6 +174,7 @@ func (r *runExecveAfterExecveCredsLock) execute(t *Task) taskRunState {
 		StopPrivGain:        stopPrivGain,
 		AllowSUID:           t.Kernel().AllowSUID,
 		Personality:         t.Personality(),
+		RandomizeVASpace:    t.Kernel().RandomizeVASpace.Load(),
 	}
 
 	if seccheck.Global.Enabled(seccheck.PointExecve) {

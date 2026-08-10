@@ -58,6 +58,12 @@ func (mm *MemoryManager) SetMmapLayout(ac *arch.Context64, r *limits.LimitSet, r
 	return layout, nil
 }
 
+// MmapLayoutRandomized reports whether this memory manager's layout uses
+// address-space randomization. The layout is immutable after exec setup.
+func (mm *MemoryManager) MmapLayoutRandomized() bool {
+	return mm.layout.Randomize
+}
+
 // PrepareLiveFork write-protects private PMAs so that a metadata clone can
 // share their MemoryFile ranges safely. The child receives the resulting PMA
 // metadata through state serialization and acquires its own range references
