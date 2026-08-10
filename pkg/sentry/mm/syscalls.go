@@ -277,9 +277,12 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 	szaddr := hostarch.Addr(sz)
 	ctx.Debugf("Allocating stack with size of %v bytes", sz)
 
-	// Determine the stack's desired location. Unlike Linux, address
-	// randomization can't be disabled.
-	stackEnd := mm.layout.MaxAddr - hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+	// Determine the stack's desired location. ADDR_NO_RANDOMIZE places it at
+	// the deterministic top of the task address space.
+	stackEnd := mm.layout.MaxAddr
+	if mm.layout.Randomize {
+		stackEnd -= hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+	}
 	if stackEnd < szaddr {
 		return hostarch.AddrRange{}, linuxerr.ENOMEM
 	}

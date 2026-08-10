@@ -213,8 +213,9 @@ func handlePrivilegedRoot(c *Credentials, f *FilePrivileges, filename string) {
 }
 
 // ComputeCredsForExec computes the new credentials given the file privileges.
-// It returns the new creds and a bool indicating if the task is executing with
-// elevated privileges. A few words about the arguments:
+// It returns the new creds, whether the task is executing with elevated
+// privileges, and whether PER_CLEAR_ON_SETID personality flags must be
+// cleared. A few words about the arguments:
 //   - c: The current credentials of the task.
 //   - f: The file privileges of the executable.
 //   - filename: The name of the executable, used for logging.
@@ -229,7 +230,7 @@ func handlePrivilegedRoot(c *Credentials, f *FilePrivileges, filename string) {
 //
 // Note that gVisor does not support Ambient capabilities.
 func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
-	noNewPrivs bool, stopPrivGain bool, allowSUID bool) (*Credentials, bool, error) {
+	noNewPrivs bool, stopPrivGain bool, allowSUID bool) (*Credentials, bool, bool, error) {
 	if noNewPrivs || !allowSUID {
 		f.SetUserID = NoID
 		f.SetGroupID = NoID
@@ -255,6 +256,7 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 		f.HasCaps = false
 		f.Effective = false
 	}
+	clearPersonality := f.SetUserID.Ok() || f.SetGroupID.Ok()
 
 	newC := c.Fork()
 	if f.SetUserID.Ok() {
@@ -283,7 +285,7 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 		// ...If the process did not obtain the full set of file permitted capabilities,
 		// then execve(2) fails with the error EPERM."
 		if f.Effective && (newC.PermittedCaps&f.PermittedCaps != f.PermittedCaps) {
-			return nil, false, linuxerr.EPERM
+			return nil, false, false, linuxerr.EPERM
 		}
 	}
 	// newC.PermittedCaps and f.Effective are set differently for namespace root.
@@ -292,6 +294,7 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 	// Deny privilege elevation if we have to, see commoncap.c:cap_bprm_creds_from_file().
 	gainedID := (newC.EffectiveKUID != c.RealKUID) || (newC.EffectiveKGID != c.RealKGID)
 	gainedCaps := !newC.PermittedCaps.IsSubsetOf(c.PermittedCaps)
+	clearPersonality = clearPersonality || gainedCaps
 	if (gainedID || gainedCaps) && (noNewPrivs || stopPrivGain) {
 		if noNewPrivs || !c.HasSelfCapability(linux.CAP_SETUID) {
 			newC.EffectiveKUID = c.RealKUID
@@ -316,7 +319,7 @@ func ComputeCredsForExec(c *Credentials, f FilePrivileges, filename string,
 	root := c.UserNamespace.MapToKUID(RootUID)
 	// See commoncap.c:cap_bprm_secureexec() in Linux 4.3+.
 	secureExec := gainedID || (newC.RealKUID != root && (f.Effective || !newC.PermittedCaps.IsSubsetOf(ambientCaps)))
-	return newC, secureExec, nil
+	return newC, secureExec, clearPersonality, nil
 }
 
 // TaskCapabilities represents all the capability sets for a task. Each of these

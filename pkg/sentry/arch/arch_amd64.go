@@ -198,7 +198,7 @@ func mmapRand(max uint64) hostarch.Addr {
 }
 
 // NewMmapLayout implements Context.NewMmapLayout consistently with Linux.
-func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (MmapLayout, error) {
+func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet, randomize bool) (MmapLayout, error) {
 	min, ok := min.RoundUp()
 	if !ok {
 		return MmapLayout{}, unix.EINVAL
@@ -228,9 +228,12 @@ func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (M
 		defaultDir = MmapBottomUp
 	}
 
-	topDownMin := max - gap - maxMmapRand64
-	maxRand := hostarch.Addr(maxMmapRand64)
-	if topDownMin < preferredTopDownBaseMin {
+	maxRand := hostarch.Addr(0)
+	if randomize {
+		maxRand = hostarch.Addr(maxMmapRand64)
+	}
+	topDownMin := max - gap - maxRand
+	if randomize && topDownMin < preferredTopDownBaseMin {
 		// Try to keep TopDownBase above preferredTopDownBaseMin by
 		// shrinking maxRand.
 		maxAdjust := maxRand - minMmapRand64
@@ -240,10 +243,14 @@ func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (M
 		}
 	}
 
-	rnd := mmapRand(uint64(maxRand))
+	var rnd hostarch.Addr
+	if randomize {
+		rnd = mmapRand(uint64(maxRand))
+	}
 	l := MmapLayout{
-		MinAddr: min,
-		MaxAddr: max,
+		Randomize: randomize,
+		MinAddr:   min,
+		MaxAddr:   max,
 		// TASK_UNMAPPED_BASE in Linux.
 		BottomUpBase:     (max/3 + rnd).RoundDown(),
 		TopDownBase:      (max - gap - rnd).RoundDown(),
@@ -266,7 +273,11 @@ func (c *Context64) NewMmapLayout(min, max hostarch.Addr, r *limits.LimitSet) (M
 // PIELoadAddress implements Context.PIELoadAddress.
 func (c *Context64) PIELoadAddress(l MmapLayout) hostarch.Addr {
 	base := preferredPIELoadAddr
-	max, ok := base.AddLength(maxMmapRand64)
+	requiredLength := uint64(0)
+	if l.Randomize {
+		requiredLength = maxMmapRand64
+	}
+	max, ok := base.AddLength(requiredLength)
 	if !ok {
 		panic(fmt.Sprintf("preferredPIELoadAddr %#x too large", base))
 	}
@@ -279,6 +290,9 @@ func (c *Context64) PIELoadAddress(l MmapLayout) hostarch.Addr {
 		base = l.TopDownBase / 3 * 2
 	}
 
+	if !l.Randomize {
+		return base
+	}
 	return base + mmapRand(maxMmapRand64)
 }
 

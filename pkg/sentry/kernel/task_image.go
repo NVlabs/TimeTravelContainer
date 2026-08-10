@@ -142,23 +142,24 @@ func (t *Task) Stack() *arch.Stack {
 }
 
 // LoadTaskImage loads a specified file into a new TaskImage. It also returns
-// the new credentials for the task after execve and a bool indicating whether
-// the task is executing with elevated privileges.
+// the new credentials for the task after execve, whether the task is executing
+// with elevated privileges, and the personality that takes effect with the
+// image.
 //
 // args.MemoryManager does not need to be set by the caller.
-func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskImage, *auth.Credentials, bool, *syserr.Error) {
+func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskImage, *auth.Credentials, bool, uint32, *syserr.Error) {
 	// Prepare a new user address space to load into.
 	m, merr := mm.NewMemoryManager(k, k.mf)
 	if merr != nil {
 		log.Warningf("Failed to create new memory manager: %v", merr)
-		return nil, nil, false, syserr.ErrNoMemory
+		return nil, nil, false, 0, syserr.ErrNoMemory
 	}
 	defer m.DecUsers(ctx)
 	args.MemoryManager = m
 
 	info, creds, secureExec, err := loader.Load(ctx, args, k.extraAuxv, k.vdso)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, 0, err
 	}
 
 	// Lookup our new syscall table.
@@ -166,7 +167,7 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	if !ok {
 		// No syscall table found. This means that the ELF binary does not match
 		// the architecture.
-		return nil, nil, false, errNoSyscalls
+		return nil, nil, false, 0, errNoSyscalls
 	}
 
 	if !m.IncUsers() {
@@ -178,5 +179,5 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 		MemoryManager: m,
 		fu:            k.futexes.Fork(),
 		st:            st,
-	}, creds, secureExec, nil
+	}, creds, secureExec, info.Personality, nil
 }

@@ -64,6 +64,7 @@ func TestComputeCredsForExec(t *testing.T) {
 		allowSUID     bool
 		wantPermitted CapabilitySet
 		wantEffective bool
+		wantClear     bool
 		wantErr       error
 	}{
 		{
@@ -157,6 +158,7 @@ func TestComputeCredsForExec(t *testing.T) {
 			allowSUID:     true,
 			wantPermitted: 0,
 			wantEffective: false,
+			wantClear:     true,
 		},
 		{
 			name: "TestAmbientCapsPreservedWithSUIDAndNoNewPrivs",
@@ -169,9 +171,32 @@ func TestComputeCredsForExec(t *testing.T) {
 			wantPermitted: CapabilitySetOf(linux.CAP_NET_ADMIN),
 			wantEffective: true,
 		},
+		{
+			name: "TestSUIDBitClearsPersonalityWithoutChangingID",
+			filePrivs: FilePrivileges{
+				SetUserID: KUID(1001),
+			},
+			creds:         credentialsWithCaps(AllCapabilities, AllCapabilities, AllCapabilities, 0),
+			allowSUID:     true,
+			wantPermitted: 0,
+			wantEffective: false,
+			wantClear:     true,
+		},
+		{
+			name: "TestGainedFileCapabilityClearsPersonality",
+			filePrivs: FilePrivileges{
+				HasCaps:       true,
+				Effective:     true,
+				PermittedCaps: CapabilitySetOf(linux.CAP_NET_ADMIN),
+			},
+			creds:         credentialsWithCaps(0, 0, AllCapabilities, 0),
+			wantPermitted: CapabilitySetOf(linux.CAP_NET_ADMIN),
+			wantEffective: true,
+			wantClear:     true,
+		},
 	} {
 		t.Run(tst.name, func(t *testing.T) {
-			newC, _, err := ComputeCredsForExec(tst.creds, tst.filePrivs, "", tst.noNewPrivs, tst.stopPrivGain, tst.allowSUID)
+			newC, _, clearPersonality, err := ComputeCredsForExec(tst.creds, tst.filePrivs, "", tst.noNewPrivs, tst.stopPrivGain, tst.allowSUID)
 			if err == nil {
 				if tst.wantErr != nil {
 					t.Errorf("ComputeCredsForExec(%v) returned unexpected error %v", tst.filePrivs, tst.wantErr)
@@ -186,6 +211,9 @@ func TestComputeCredsForExec(t *testing.T) {
 				if !tst.wantEffective && newC.EffectiveCaps != CapabilitySet(0) {
 					t.Errorf("ComputeCredsForExec(%v) did not clear effective caps: %#x",
 						tst.filePrivs, newC.EffectiveCaps)
+				}
+				if clearPersonality != tst.wantClear {
+					t.Errorf("ComputeCredsForExec(%v) clearPersonality=%t, want %t", tst.filePrivs, clearPersonality, tst.wantClear)
 				}
 			} else if tst.wantErr == nil || tst.wantErr.Error() != err.Error() {
 				t.Errorf("ComputeCredsForExec(%v) returned error %v, wantErr: %v", tst.filePrivs, err, tst.wantErr)

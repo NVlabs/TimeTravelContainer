@@ -96,6 +96,11 @@ type LoadArgs struct {
 
 	// AllowSUID indicates whether to allow ID elevation during execve.
 	AllowSUID bool
+
+	// Personality is the calling task's personality(2) value. Flags that
+	// affect exec, such as ADDR_NO_RANDOMIZE, are applied while constructing
+	// the new address space.
+	Personality uint32
 }
 
 // openPath opens args.Filename and checks that it is valid for loading.
@@ -170,19 +175,23 @@ const (
 	maxLoaderAttempts = 6
 )
 
+type loadedExecutable struct {
+	elf         loadedELF
+	arch        *arch.Context64
+	file        *vfs.FileDescription
+	argv        []string
+	creds       *auth.Credentials
+	secureExec  bool
+	personality uint32
+}
+
 // loadExecutable loads an executable that is pointed to by args.File. The
 // caller is responsible for checking that the user can execute this file.
 // If nil, the path args.Filename is resolved and loaded (check that the user
 // can execute this file is done here in this case). If the executable is an
 // interpreter script rather than an ELF, the binary of the corresponding
 // interpreter will be loaded.
-//
-// It returns:
-//   - loadedELF, description of the loaded binary
-//   - arch.Context64 matching the binary arch
-//   - fs.Dirent of the binary file
-//   - Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
+func loadExecutable(ctx context.Context, args LoadArgs) (loadedExecutable, error) {
 	for i := 0; i < maxLoaderAttempts; i++ {
 		if args.File == nil {
 			var err error
@@ -193,13 +202,13 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Contex
 				if !errors.Is(err, linuxerr.ENOENT) {
 					ctx.Infof("Error opening %s: %v", args.Filename, err)
 				}
-				return loadedELF{}, nil, nil, nil, err
+				return loadedExecutable{}, err
 			}
 			// Ensure file is release in case the code loops or errors out.
 			defer args.File.DecRef(ctx)
 		} else {
 			if err := checkIsRegularFile(ctx, args.File, args.Filename); err != nil {
-				return loadedELF{}, nil, nil, nil, err
+				return loadedExecutable{}, err
 			}
 		}
 
@@ -213,41 +222,68 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Contex
 			if err == io.EOF {
 				err = linuxerr.ENOEXEC
 			}
-			return loadedELF{}, nil, nil, nil, err
+			return loadedExecutable{}, err
 		}
 
 		switch {
 		case bytes.Equal(hdr[:], []byte(elfMagic)):
+			// Compute the post-exec credentials before choosing any addresses.
+			// Linux clears security-sensitive personality flags on a
+			// privileged exec, so this must precede loadELF.
+			filePrivs, err := args.File.GetFilePrivileges(ctx)
+			if err != nil {
+				return loadedExecutable{}, fmt.Errorf("reading file privileges for %s: %w", args.File.MappedName(ctx), err)
+			}
+			creds, secureExec, clearPersonality, err := auth.ComputeCredsForExec(
+				auth.CredentialsFromContext(ctx), filePrivs, args.File.MappedName(ctx),
+				args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
+			if err != nil {
+				return loadedExecutable{}, fmt.Errorf("computing credentials for %s: %w", args.File.MappedName(ctx), err)
+			}
+			personality := args.Personality
+			if clearPersonality {
+				personality &^= linux.PER_CLEAR_ON_SETID
+			}
+			args.Personality = personality
+
 			loaded, ac, err := loadELF(ctx, args)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedExecutable{}, err
 			}
 			// An ELF is always terminal. Hold on to file.
 			args.File.IncRef()
-			return loaded, ac, args.File, args.Argv, err
+			return loadedExecutable{
+				elf:         loaded,
+				arch:        ac,
+				file:        args.File,
+				argv:        args.Argv,
+				creds:       creds,
+				secureExec:  secureExec,
+				personality: personality,
+			}, nil
 
 		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
 			if args.CloseOnExec {
-				return loadedELF{}, nil, nil, nil, linuxerr.ENOENT
+				return loadedExecutable{}, linuxerr.ENOENT
 			}
 			args.Filename, args.Argv, err = parseInterpreterScript(ctx, args.Filename, args.File, args.Argv)
 			if err != nil {
 				ctx.Infof("Error loading interpreter script: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedExecutable{}, err
 			}
 			// Refresh the traversal limit for the interpreter.
 			*args.RemainingTraversals = linux.MaxSymlinkTraversals
 
 		default:
 			ctx.Infof("Unknown magic: %v", hdr)
-			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
+			return loadedExecutable{}, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
 		args.File = nil
 	}
 
-	return loadedELF{}, nil, nil, nil, linuxerr.ELOOP
+	return loadedExecutable{}, linuxerr.ELOOP
 }
 
 // ImageInfo represents the information for the loaded image.
@@ -258,6 +294,8 @@ type ImageInfo struct {
 	Arch *arch.Context64
 	// The base name of the binary.
 	Name string
+	// Personality is the personality that takes effect with this image.
+	Personality uint32
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -273,11 +311,15 @@ type ImageInfo struct {
 //   - Load is called on the Task goroutine.
 func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *auth.Credentials, bool, *syserr.Error) {
 	// Load the executable itself.
-	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
+	executable, err := loadExecutable(ctx, args)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	defer file.DecRef(ctx)
+	defer executable.file.DecRef(ctx)
+	loaded := executable.elf
+	ac := executable.arch
+	file := executable.file
+	newArgv := executable.argv
 
 	// Load the VDSO.
 	vdsoAddr, err := loadVDSO(ctx, args.MemoryManager, vdso, loaded)
@@ -316,15 +358,8 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 	random := stack.Bottom
 
-	filePrivs, err := file.GetFilePrivileges(ctx)
-	if err != nil {
-		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
-	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
-		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
-	if err != nil {
-		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
-	}
+	c := executable.creds
+	secureExec := executable.secureExec
 	secureExecInt := 0
 	if secureExec {
 		secureExecInt = 1
@@ -369,8 +404,9 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 
 	return ImageInfo{
-		OS:   loaded.os,
-		Arch: ac,
-		Name: name,
+		OS:          loaded.os,
+		Arch:        ac,
+		Name:        name,
+		Personality: executable.personality,
 	}, c, secureExec, nil
 }

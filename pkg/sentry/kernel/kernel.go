@@ -1403,9 +1403,10 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		NoNewPrivs:          args.NoNewPrivs,
 		StopPrivGain:        false,
 		AllowSUID:           k.AllowSUID,
+		Personality:         linux.PER_LINUX,
 	}
 
-	image, newCreds, _, se := k.LoadTaskImage(ctx, loadArgs)
+	image, newCreds, _, _, se := k.LoadTaskImage(ctx, loadArgs)
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}

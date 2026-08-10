@@ -173,6 +173,7 @@ func (r *runExecveAfterExecveCredsLock) execute(t *Task) taskRunState {
 		NoNewPrivs:          t.GetNoNewPrivs(),
 		StopPrivGain:        stopPrivGain,
 		AllowSUID:           t.Kernel().AllowSUID,
+		Personality:         t.Personality(),
 	}
 
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
@@ -189,13 +190,13 @@ func (r *runExecveAfterExecveCredsLock) execute(t *Task) taskRunState {
 		}
 	}
 
-	image, newCreds, secureExec, se := t.Kernel().LoadTaskImage(t, loadArgs)
+	image, newCreds, secureExec, personality, se := t.Kernel().LoadTaskImage(t, loadArgs)
 	if se != nil {
 		t.releaseExecveCredsLocks()
 		return t.doSyscallError(se.ToError())
 	}
 
-	return r.execveWithImage(t, image, newCreds, secureExec)
+	return r.execveWithImage(t, image, newCreds, secureExec, personality)
 }
 
 // siblingExitStop is a TaskStop that a task sets on itself when it wants to execve
@@ -211,7 +212,7 @@ func (*siblingExitStop) Killable() bool { return true }
 // acquired and the new TaskImage has been loaded.
 //
 // Enters the execStop state to wait for other tasks in the thread group to exit.
-func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskImage, newCreds *auth.Credentials, secureExec bool) taskRunState {
+func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskImage, newCreds *auth.Credentials, secureExec bool, personality uint32) taskRunState {
 	cu := cleanup.Make(func() {
 		newImage.release(t)
 	})
@@ -259,7 +260,12 @@ func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskI
 	}
 
 	cu.Release()
-	return &runExecveAfterSiblingExitStop{newImage, newCreds, secureExec}
+	return &runExecveAfterSiblingExitStop{
+		image:       newImage,
+		newCreds:    newCreds,
+		secureExec:  secureExec,
+		personality: personality,
+	}
 }
 
 // The runExecveAfterSiblingExitStop state continues execve(2) after all siblings of
@@ -267,9 +273,10 @@ func (r *runExecveAfterExecveCredsLock) execveWithImage(t *Task, newImage *TaskI
 //
 // +stateify savable
 type runExecveAfterSiblingExitStop struct {
-	image      *TaskImage
-	newCreds   *auth.Credentials
-	secureExec bool
+	image       *TaskImage
+	newCreds    *auth.Credentials
+	secureExec  bool
+	personality uint32
 }
 
 func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
@@ -385,6 +392,7 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	// Update credentials to reflect the execve. This should precede switching
 	// MMs to ensure that dumpability has been reset first, if needed.
 	t.creds.Store(r.newCreds)
+	t.SetPersonality(r.personality)
 	t.mu.Lock()
 	oldImage := t.image
 	t.image = *r.image

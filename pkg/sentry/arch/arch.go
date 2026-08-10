@@ -188,8 +188,9 @@ type contextInterface interface {
 	// NewMmapLayout returns a layout for a new MM, where MinAddr for the
 	// returned layout must be no lower than min, and MaxAddr for the returned
 	// layout must be no higher than max. Repeated calls to NewMmapLayout may
-	// return different layouts.
-	NewMmapLayout(min, max hostarch.Addr, limits *limits.LimitSet) (MmapLayout, error)
+	// return different layouts if randomize is true; if it is false, identical
+	// inputs produce an identical layout.
+	NewMmapLayout(min, max hostarch.Addr, limits *limits.LimitSet, randomize bool) (MmapLayout, error)
 
 	// PIELoadAddress returns a preferred load address for a
 	// position-independent executable within l.
@@ -257,6 +258,10 @@ const (
 //
 // +stateify savable
 type MmapLayout struct {
+	// Randomize is true if addresses selected from this layout should be
+	// randomized. It is false for tasks with ADDR_NO_RANDOMIZE personality.
+	Randomize bool
+
 	// MinAddr is the lowest mappable address.
 	MinAddr hostarch.Addr
 

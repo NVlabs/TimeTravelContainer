@@ -30,7 +30,7 @@ const (
 // Personality implements Linux syscall personality(2).
 func Personality(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	// allowedPersonalityBits are the personality bits that are allowed to be set.
-	const allowedPersonalityBits = linux.PER_LINUX | linux.PER_BSD | linux.PER_HPUX | linux.SHORT_INODE | linux.WHOLE_SECONDS
+	const allowedPersonalityBits = linux.PER_LINUX | linux.PER_BSD | linux.PER_HPUX | linux.ADDR_NO_RANDOMIZE | linux.SHORT_INODE | linux.WHOLE_SECONDS
 
 	personality := args[0].Uint()
 	if personality == getPersonality {
