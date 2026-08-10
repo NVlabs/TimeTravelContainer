@@ -600,6 +600,18 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.resolveWritableHostMounts(containerDir, &opts); err != nil {
 		return Prepared{}, err
 	}
+	memoryDir := filepath.Join(containerDir, "memory")
+	if err := os.Mkdir(memoryDir, 0700); err != nil {
+		return Prepared{}, fmt.Errorf("creating persistent memory directory: %w", err)
+	}
+	opts.SpecOptions.MemoryFilePath = filepath.Join(memoryDir, "application.mem")
+	memoryFile, err := os.OpenFile(opts.SpecOptions.MemoryFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return Prepared{}, fmt.Errorf("creating persistent application memory file: %w", err)
+	}
+	if err := memoryFile.Close(); err != nil {
+		return Prepared{}, fmt.Errorf("closing persistent application memory file: %w", err)
+	}
 	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err

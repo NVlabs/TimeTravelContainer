@@ -83,6 +83,11 @@ const (
 	// repository directories donated to the Sentry.
 	AnnotationTTCVolumeRepositories = "dev.timetravelcontainer.volume-repositories"
 
+	// AnnotationTTCMemoryFile identifies the persistent sparse file donated as
+	// the application MemoryFile for a TTC sandbox family. The path is a host
+	// control-plane detail and is never exposed in the guest namespace.
+	AnnotationTTCMemoryFile = "dev.timetravelcontainer.memory-file"
+
 	// TTCRootfsUpperSource is the reserved, guest-invisible source key for a
 	// container family's persistent writable rootfs upper repository.
 	TTCRootfsUpperSource = "/run/ttc/rootfs-upper"
@@ -315,6 +320,9 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 		spec.Annotations[AnnotationTTCVolumeRepositories] = string(normalized)
 	}
+	if path := spec.Annotations[AnnotationTTCMemoryFile]; path != "" {
+		spec.Annotations[AnnotationTTCMemoryFile] = absPath(bundleDir, path)
+	}
 	encodedMountTarOnExit := spec.Annotations[AnnotationMountTarOnExit]
 	if encodedMountTarOnExit == "" {
 		encodedMountTarOnExit = spec.Annotations[legacyAnnotationMountTarOnExit]
@@ -359,6 +367,21 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// TTCMemoryFilePath returns the persistent TTC application MemoryFile path.
+func TTCMemoryFilePath(spec *specs.Spec) (string, error) {
+	if spec == nil || spec.Annotations == nil {
+		return "", nil
+	}
+	path := spec.Annotations[AnnotationTTCMemoryFile]
+	if path == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", fmt.Errorf("%s path %q must be absolute and clean", AnnotationTTCMemoryFile, path)
+	}
+	return path, nil
 }
 
 // FixConfig fixes config options that are set via annotations in the spec.

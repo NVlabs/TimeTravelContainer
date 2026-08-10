@@ -1031,6 +1031,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 		donations.DonateAndClose("ttc-volume-fds", dir)
 	}
+	if memoryPath, err := specutils.TTCMemoryFilePath(args.Spec); err != nil {
+		return err
+	} else if memoryPath != "" {
+		memoryFile, err := os.OpenFile(memoryPath, os.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("opening TTC application memory file: %w", err)
+		}
+		donations.DonateAndClose("ttc-memory-file-fd", memoryFile)
+	}
 	finalMountPaths, err := specutils.MountTarOnExitPaths(args.Spec)
 	if err != nil {
 		return err
