@@ -180,6 +180,17 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 		rf.diskObject = ""
 		rf.diskIOFile = nil
 		rf.diskIOWritable = false
+		// diskMmap is not serialized because its host FD and cached host
+		// mappings are runtime-local. Rebuild the mapping references that it
+		// would have acquired through AddMapping before the checkpoint. VMAs
+		// themselves are restored directly from state, so AddMapping is not
+		// called again during restore; without this reconstruction, tearing
+		// down a restored VMA underflows diskMmap's reference counts.
+		for seg := rf.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			for mapping := range seg.Value() {
+				rf.diskMmap.AddMapping(mapping.AddrRange, seg.Start())
+			}
+		}
 	}
 	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		return

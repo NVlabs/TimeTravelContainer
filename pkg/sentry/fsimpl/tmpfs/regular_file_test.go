@@ -101,6 +101,34 @@ func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {
 	}
 }
 
+func TestDiskVolumeAfterLoadRebuildsMmapReferences(t *testing.T) {
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	rf := &regularFile{inode: inode{fs: fs}}
+	firstMS := &recordingMappingSpace{}
+	secondMS := &recordingMappingSpace{}
+	firstAR := hostarch.AddrRange{
+		Start: 0x10000,
+		End:   0x10000 + 4*hostarch.PageSize,
+	}
+	secondAR := hostarch.AddrRange{
+		Start: 0x20000,
+		End:   0x20000 + 2*hostarch.PageSize,
+	}
+
+	// State restore reconstructs MappingSet directly instead of invoking
+	// regularFile.AddMapping. Model that here, including overlapping mappings
+	// of the same file range.
+	rf.mappings.AddMapping(firstMS, firstAR, 0, false)
+	rf.mappings.AddMapping(secondMS, secondAR, hostarch.PageSize, false)
+	rf.afterLoad(contexttest.Context(t))
+
+	// Each removal must have a matching diskMmap reference. Before the restore
+	// reconstruction in afterLoad, the first removal panicked with a reference
+	// count underflow.
+	rf.RemoveMapping(contexttest.Context(t), firstMS, firstAR, 0, false)
+	rf.RemoveMapping(contexttest.Context(t), secondMS, secondAR, hostarch.PageSize, false)
+}
+
 func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fd, cleanup, err := newFileFD(ctx, 0644)
