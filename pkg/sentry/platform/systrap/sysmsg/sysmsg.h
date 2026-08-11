@@ -67,6 +67,7 @@ struct sysmsg {
   int32_t err_line;
   uint64_t debug;
   uint32_t thread_id;
+  char thread_name[16];
 };
 
 enum context_state {
@@ -100,6 +101,7 @@ struct thread_context {
   uint64_t tls;
   uint64_t debug;
   uint64_t err;
+  char thread_name[16];
 };
 
 enum stub_error {

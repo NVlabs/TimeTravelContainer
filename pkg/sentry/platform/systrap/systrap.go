@@ -175,6 +175,12 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	if err := s.activateContext(c); err != nil {
 		return nil, hostarch.NoAccess, err
 	}
+	name := "ttc-systrap"
+	if named, ok := ctx.(interface{ Name() string }); ok {
+		name = named.Name()
+	}
+	c.sharedContext.shared.ThreadName = [linux.TASK_COMM_LEN]byte{}
+	copy(c.sharedContext.shared.ThreadName[:linux.TASK_COMM_LEN-1], name)
 
 restart:
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)

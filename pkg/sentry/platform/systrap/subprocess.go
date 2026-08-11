@@ -221,6 +221,12 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 	s.syscallThread = &t
 
 	s.syscallThread.detach()
+	copy(t.sentryMessage.name[:linux.TASK_COMM_LEN-1], "ttc-systrap")
+	if _, err := t.syscall(unix.SYS_PRCTL,
+		arch.SyscallArgument{Value: unix.PR_SET_NAME},
+		arch.SyscallArgument{Value: t.stubAddr + syscallThreadNameOffset}); err != nil {
+		return fmt.Errorf("naming systrap control thread: %w", err)
+	}
 
 	return nil
 }

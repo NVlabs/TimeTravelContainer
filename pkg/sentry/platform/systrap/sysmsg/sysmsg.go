@@ -159,6 +159,10 @@ type Msg struct {
 	Debug uint64
 	// ThreadID is the ID of the sysmsg thread.
 	ThreadID uint32
+	// ThreadName is the host task name most recently installed by this
+	// sysmsg thread. It avoids a prctl syscall when the next guest context has
+	// the same name.
+	ThreadName [linux.TASK_COMM_LEN]byte
 }
 
 // ContextState defines the reason the context has exited back to the sentry,
@@ -281,6 +285,9 @@ type ThreadContext struct {
 	Debug uint64
 	// SigError is an error code that clarifies the nature of the signal.
 	SigError uint64
+	// ThreadName is the guest thread name to expose through the host's
+	// /proc/[pid]/comm while this context is executing.
+	ThreadName [linux.TASK_COMM_LEN]byte
 }
 
 // StubError are values that represent known stub-thread failure modes.
@@ -317,6 +324,7 @@ func (m *Msg) Init(threadID uint32) {
 	m.Line = -1
 	m.ThreadID = threadID
 	m.Context = 0
+	m.ThreadName = [linux.TASK_COMM_LEN]byte{}
 }
 
 // Init initializes the ThreadContext instance.
@@ -327,6 +335,7 @@ func (c *ThreadContext) Init(initialThreadID uint32) {
 	c.SignalInfo = linux.SignalInfo{}
 	c.State = ContextStateNone
 	c.ThreadID = initialThreadID
+	c.ThreadName = [linux.TASK_COMM_LEN]byte{}
 }
 
 // ConvertSysmsgErr converts m.Err to platform.ContextError.

@@ -77,6 +77,7 @@ func attachedThread(flags uintptr, defaultAction seccomp.Action) (*thread, error
 				unix.SYS_PRCTL: seccomp.Or{
 					seccomp.PerArg{seccomp.EqualTo(unix.PR_SET_PDEATHSIG), seccomp.EqualTo(unix.SIGKILL)},
 					seccomp.PerArg{seccomp.EqualTo(linux.PR_SET_NO_NEW_PRIVS), seccomp.EqualTo(1)},
+					seccomp.PerArg{seccomp.EqualTo(unix.PR_SET_NAME), seccomp.AnyValue{}},
 					seccomp.PerArg{
 						seccomp.EqualTo(unix.PR_SET_SYSCALL_USER_DISPATCH),
 						seccomp.EqualTo(unix.PR_SYS_DISPATCH_ON),

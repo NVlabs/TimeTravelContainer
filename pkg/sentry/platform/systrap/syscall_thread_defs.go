@@ -15,6 +15,9 @@
 package systrap
 
 import (
+	"unsafe"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
@@ -27,7 +30,10 @@ type syscallSentryMessage struct {
 	unused uint32
 	sysno  uint64
 	args   [6]uint64
+	name   [linux.TASK_COMM_LEN]byte
 }
+
+const syscallThreadNameOffset = uintptr(unsafe.Offsetof(syscallSentryMessage{}.name))
 
 // syscallStubMessage is a shared message that can be changed from a stub
 // process. It is used to notify the Sentry that a requested system call has

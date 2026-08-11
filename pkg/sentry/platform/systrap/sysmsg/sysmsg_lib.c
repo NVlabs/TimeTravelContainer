@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
+#include <linux/prctl.h>
 #include <linux/unistd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -107,6 +108,31 @@ void memcpy(uint8_t *dest, uint8_t *src, size_t n) {
   for (size_t i = 0; i < n; i += 1) {
     dest[i] = src[i];
   }
+}
+
+// update_thread_name makes host process monitors identify an executing
+// systrap worker by the guest context it currently runs. Linux task names are
+// limited to 15 visible bytes; thread_context.thread_name is always NUL
+// terminated by the Sentry.
+static void update_thread_name(struct sysmsg *sysmsg,
+                               struct thread_context *ctx) {
+  bool changed = false;
+  for (size_t i = 0; i < sizeof(ctx->thread_name); i++) {
+    if (sysmsg->thread_name[i] != ctx->thread_name[i]) {
+      changed = true;
+      break;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  long ret = __syscall(__NR_prctl, PR_SET_NAME, (long)ctx->thread_name, 0, 0, 0,
+                       0);
+  if (ret != 0) {
+    panic(STUB_ERROR_ARCH_PRCTL, ret);
+  }
+  memcpy((uint8_t *)sysmsg->thread_name, (uint8_t *)ctx->thread_name,
+         sizeof(ctx->thread_name));
 }
 
 // The spinning queue is a queue of spinning threads. It solves the
@@ -398,7 +424,11 @@ struct thread_context *switch_context(struct sysmsg *sysmsg,
     }
   }
 
-  return get_context(sysmsg);
+  struct thread_context *next = get_context(sysmsg);
+  if (next) {
+    update_thread_name(sysmsg, next);
+  }
+  return next;
 }
 
 void verify_offsets() {
