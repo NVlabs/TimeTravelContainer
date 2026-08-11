@@ -1039,18 +1039,18 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RecordBranches: %v", err)
 	}
-	if err := store.MarkBranchDeleted("demo", "child"); err != nil {
-		t.Fatalf("MarkBranchDeleted: %v", err)
+	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
+		t.Fatalf("RemoveBranchRecord: %v", err)
 	}
 	withHistory, err := store.LoadContainer("demo")
 	if err != nil {
 		t.Fatalf("LoadContainer with lineage: %v", err)
 	}
-	if len(withHistory.Branches) != 3 || withHistory.Branches[1].State != "deleted" || withHistory.Branches[1].DeletedAt == nil || withHistory.Branches[2].ParentID != "child" {
+	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" {
 		t.Fatalf("persisted lineage=%+v", withHistory.Branches)
 	}
-	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "other", State: "running"}); err == nil {
-		t.Fatal("RecordBranch accepted a changed historical parent")
+	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", State: "running", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("RecordBranch did not allow reuse: %v", err)
 	}
 	if err := store.UpdateState("demo", "exited", &status); err != nil {
 		t.Fatalf("UpdateState with descendants: %v", err)
@@ -1059,18 +1059,21 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContainer after family exit: %v", err)
 	}
-	if withHistory.Branches[1].State != "deleted" || withHistory.Branches[2].State != "exited" {
-		t.Errorf("family exit states=%+v, want tombstone plus exited descendant", withHistory.Branches)
+	for _, branch := range withHistory.Branches {
+		if branch.State != "exited" {
+			t.Errorf("family exit states=%+v, want all surviving branches exited", withHistory.Branches)
+			break
+		}
 	}
-	if err := store.MarkBranchDeleted("demo", "main"); err != nil {
-		t.Fatalf("MarkBranchDeleted(main): %v", err)
+	if err := store.RemoveBranchRecord("demo", "main"); err != nil {
+		t.Fatalf("RemoveBranchRecord(main): %v", err)
 	}
 	withHistory, err = store.LoadContainer("demo")
 	if err != nil {
 		t.Fatalf("LoadContainer after main deletion: %v", err)
 	}
-	if withHistory.Branches[0].State != "deleted" || withHistory.State != "exited" {
-		t.Errorf("main deletion state=%q branches=%+v, want deleted main and peer-derived exited family", withHistory.State, withHistory.Branches)
+	if len(withHistory.Branches) != 2 || withHistory.Branches[0].ID != "grandchild" || withHistory.Branches[0].ParentID != "" || withHistory.State != "exited" {
+		t.Errorf("main deletion state=%q branches=%+v, want reparented peers", withHistory.State, withHistory.Branches)
 	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
@@ -1148,8 +1151,8 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkBranchDeleted("demo", "main"); err != nil {
-		t.Fatalf("MarkBranchDeleted(main): %v", err)
+	if err := store.RemoveBranchRecord("demo", "main"); err != nil {
+		t.Fatalf("RemoveBranchRecord(main): %v", err)
 	}
 	if err := store.UpdateBranchState("demo", "child", "dehydrated"); err != nil {
 		t.Fatalf("UpdateBranchState(child): %v", err)
@@ -1158,7 +1161,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != "dehydrated" || got.Branches[0].State != "deleted" || got.Branches[1].State != "dehydrated" {
+	if got.State != "dehydrated" || len(got.Branches) != 1 || got.Branches[0].ID != "child" || got.Branches[0].ParentID != "" || got.Branches[0].State != "dehydrated" {
 		t.Fatalf("after deleting main and dehydrating child: %+v", got)
 	}
 	status := 137
@@ -1169,21 +1172,21 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != "dehydrated" || got.Branches[1].State != "dehydrated" || got.ExitStatus != nil {
+	if got.State != "dehydrated" || got.Branches[0].State != "dehydrated" || got.ExitStatus != nil {
 		t.Fatalf("runtime reconciliation corrupted durable child: %+v", got)
 	}
 	if err := store.UpdateBranchState("demo", "child", "running"); err != nil {
 		t.Fatalf("rehydrating child: %v", err)
 	}
-	if err := store.RecordBranchExit("demo", "main", 137); err != nil {
-		t.Fatalf("recording deleted main exit: %v", err)
+	if err := store.RecordBranchExit("demo", "main", 137); err == nil {
+		t.Fatal("recording removed main exit succeeded")
 	}
 	got, err = store.LoadContainer("demo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != "running" || got.Branches[1].State != "running" {
-		t.Fatalf("deleted main exit changed live child: %+v", got)
+	if got.State != "running" || got.Branches[0].State != "running" {
+		t.Fatalf("removed main exit changed live child: %+v", got)
 	}
 }
 
@@ -1226,8 +1229,8 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if err := store.AddPortBinding("demo", child); err != nil {
 		t.Fatalf("re-adding child binding: %v", err)
 	}
-	if err := store.MarkBranchDeleted("demo", "child"); err != nil {
-		t.Fatalf("MarkBranchDeleted: %v", err)
+	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
+		t.Fatalf("RemoveBranchRecord: %v", err)
 	}
 	loaded, err = store.LoadContainer("demo")
 	if err != nil {
@@ -1574,6 +1577,46 @@ func TestPruneImageRoots(t *testing.T) {
 	}
 }
 
+func TestLegacyDeletedBranchSurvivesReadCompactionForCleanup(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{
+			{ID: "main", State: "running"},
+			{ID: "old", ParentID: "main", State: "deleted"},
+		},
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Branches) != 1 || loaded.Branches[0].ID != "main" {
+		t.Fatalf("read compaction exposed tombstone: %+v", loaded.Branches)
+	}
+	legacy, found, err := store.LegacyDeletedBranch("demo", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || legacy.FilesystemBranch != ttcvolume.ScopedBranchID("demo", "old") {
+		t.Fatalf("legacy branch=(%+v, %t)", legacy, found)
+	}
+	if _, found, err := store.LegacyDeletedBranch("demo", "new"); err != nil || found {
+		t.Fatalf("nonexistent legacy branch found=%t err=%v", found, err)
+	}
+}
+
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
@@ -1669,5 +1712,36 @@ func TestCopyRestoreHostDirectory(t *testing.T) {
 	}
 	if target != "nested/data" {
 		t.Fatalf("restored symlink=%q", target)
+	}
+}
+
+func TestRepositoryCanonicalBranchBelongsToFamily(t *testing.T) {
+	tests := []struct {
+		name   string
+		config specutils.TTCVolumeRepository
+		want   bool
+	}{
+		{
+			name:   "rootfs upper",
+			config: specutils.TTCVolumeRepository{Source: specutils.TTCRootfsUpperSource},
+			want:   true,
+		},
+		{
+			name:   "copied host mount",
+			config: specutils.TTCVolumeRepository{Source: "/run/ttc/copied-host/0", Private: true},
+			want:   true,
+		},
+		{
+			name:   "named volume",
+			config: specutils.TTCVolumeRepository{Source: "/run/ttc/volumes/data"},
+			want:   false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := repositoryCanonicalBranchBelongsToFamily(test.config); got != test.want {
+				t.Fatalf("repositoryCanonicalBranchBelongsToFamily(%+v)=%t, want %t", test.config, got, test.want)
+			}
+		})
 	}
 }

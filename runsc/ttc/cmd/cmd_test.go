@@ -461,6 +461,9 @@ func TestCommandsUseQualifiedBranchesAndBareForkDestination(t *testing.T) {
 	if b.destroyed != (selector{container: "web", branch: "test-a"}) {
 		t.Errorf("destroy target=%+v", b.destroyed)
 	}
+	if b.destroyForce {
+		t.Error("branch rm without -f forced removal")
+	}
 }
 
 func TestForkRejectsRemovedCheckFlag(t *testing.T) {
@@ -611,6 +614,14 @@ func TestBranchRMRequiresQualifiedSelectorAndAcceptsMain(t *testing.T) {
 	}
 	if b.destroyed != (selector{container: "web", branch: "main"}) {
 		t.Errorf("destroy target=%+v", b.destroyed)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"branch", "rm", "-f", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("forced branch rm main status=%d, stderr=%q", status, stderr.String())
+	}
+	if !b.destroyForce {
+		t.Error("branch rm -f did not force removal")
 	}
 }
 
@@ -2691,10 +2702,15 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 	if [ -e "$0.stopped" ]; then
 		exit 128
 	fi
-	echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
+	if [ -e "$0.child" ]; then
+		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}},{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}]'
+	else
+		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
+	fi
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$6" = "--paused" ] && [ "$7" = "web" ] && [ "$8" = "fork" ] && [ "$9" = "child" ]; then
+	touch "$0.child"
 	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
@@ -2753,7 +2769,11 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{Name: "web", BundleDir: bundleDir, ImageSize: 2217006, ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now()})
+	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+		Name: "web", BundleDir: bundleDir, ImageSize: 2217006,
+		ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(),
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "deleted"}},
+	})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
 	}
@@ -2816,6 +2836,9 @@ exit 2
 	if _, err := os.Stat(staleOlderLog); !os.IsNotExist(err) {
 		t.Errorf("older stale log still exists: %v", err)
 	}
+	if err := b.destroy(selector{container: "web", branch: "child"}, false); err == nil || !strings.Contains(err.Error(), "use -f to force removal") {
+		t.Fatalf("unforced paused-branch removal error=%v, want force diagnostic", err)
+	}
 	marker := runsc + ".retention"
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -2861,7 +2884,7 @@ exit 2
 	if persisted.State != "exited" || persisted.ExitStatus == nil || *persisted.ExitStatus != 137 || persisted.ExitedAt == nil {
 		t.Errorf("main wait did not reconcile persistent state: %+v", persisted)
 	}
-	if err := b.destroy(selector{container: "web", branch: "child"}); err == nil {
+	if err := b.destroy(selector{container: "web", branch: "child"}, true); err == nil {
 		t.Error("destroy swallowed a live-sandbox control error")
 	}
 	if err := os.WriteFile(runsc+".stopped", nil, 0600); err != nil {
@@ -2882,10 +2905,10 @@ exit 2
 	if len(families) != 1 || families[0].State != "exited" || mainState != "exited" {
 		t.Fatalf("stopped runtime leaked through TTC state: %+v", families)
 	}
-	if err := b.destroy(selector{container: "web", branch: "child"}); err != nil {
+	if err := b.destroy(selector{container: "web", branch: "child"}, true); err != nil {
 		t.Errorf("destroy after sandbox exit: %v", err)
 	}
-	if err := b.destroy(selector{container: "missing", branch: "child"}); err == nil {
+	if err := b.destroy(selector{container: "missing", branch: "child"}, true); err == nil {
 		t.Error("destroy accepted a nonexistent persistent container")
 	}
 }
@@ -3330,6 +3353,7 @@ type fakeBackend struct {
 	paused             selector
 	resumed            selector
 	destroyed          selector
+	destroyForce       bool
 	signals            []signalCall
 	waited             selector
 	waitCalls          []selector
@@ -3544,8 +3568,9 @@ func (b *fakeBackend) resume(target selector) error {
 	return b.err
 }
 
-func (b *fakeBackend) destroy(target selector) error {
+func (b *fakeBackend) destroy(target selector, force bool) error {
 	b.destroyed = target
+	b.destroyForce = force
 	return b.err
 }
 
@@ -3737,7 +3762,7 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 	}
 }
 
-func TestMergeBranchHistoryPreservesTombstones(t *testing.T) {
+func TestMergeBranchHistoryCompactsTombstones(t *testing.T) {
 	now := time.Now().UTC()
 	history := []Branch{
 		{ID: "main", State: "running", CreatedAt: now},
@@ -3750,18 +3775,18 @@ func TestMergeBranchHistoryPreservesTombstones(t *testing.T) {
 		{ID: "grandchild", ParentID: "child", State: "running", CreatedAt: now},
 	}
 	merged := mergeBranchHistory(history, live)
-	if len(merged) != 4 {
-		t.Fatalf("merged branches=%+v, want four", merged)
+	if len(merged) != 3 {
+		t.Fatalf("merged branches=%+v, want three live branches", merged)
 	}
 	byID := make(map[string]Branch)
 	for _, branch := range merged {
 		byID[branch.ID] = branch
 	}
-	if byID["deleted-parent"].State != "deleted" || byID["deleted-parent"].DeletedAt == nil {
-		t.Errorf("tombstone was lost: %+v", byID["deleted-parent"])
+	if _, ok := byID["deleted-parent"]; ok {
+		t.Errorf("deleted tombstone was retained: %+v", byID["deleted-parent"])
 	}
-	if byID["child"].State != "paused" || byID["child"].ParentID != "deleted-parent" {
-		t.Errorf("live child did not override lifecycle state while retaining parent: %+v", byID["child"])
+	if byID["child"].State != "paused" || byID["child"].ParentID != "main" {
+		t.Errorf("live child did not override lifecycle state and splice its parent: %+v", byID["child"])
 	}
 	rows := psRows([]Family{{ID: strings.Repeat("a", 64), Name: "demo", Image: "busybox:latest", Branches: merged}}, now, false)
 	if len(rows) != 3 {
@@ -3803,6 +3828,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "cp", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
+		{args: []string{"_complete", "branch", "rm", ""}, want: []string{"-f", "--force", "demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
 		{args: []string{"_complete", "exec", "wait", "demo@main", "exec-"}, want: []string{"exec-123"}},
 	}

@@ -136,6 +136,72 @@ func TestDaemonEventsPersistFilterAndTimeBound(t *testing.T) {
 	}
 }
 
+func TestDaemonEventLogRotationIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	writeCurrent := func(data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCurrent("first")
+	if err := rotateDaemonEventLog(path, 1, 5, 3); err != nil {
+		t.Fatal(err)
+	}
+	writeCurrent("second")
+	if err := rotateDaemonEventLog(path, 1, 5, 3); err != nil {
+		t.Fatal(err)
+	}
+	writeCurrent("third")
+	if err := rotateDaemonEventLog(path, 1, 5, 3); err != nil {
+		t.Fatal(err)
+	}
+	writeCurrent("fourth")
+	if err := rotateDaemonEventLog(path, 1, 5, 3); err != nil {
+		t.Fatal(err)
+	}
+	for generation, want := range map[int]string{1: "fourth", 2: "third"} {
+		data, err := os.ReadFile(daemonEventLogPath(path, generation))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != want {
+			t.Errorf("generation %d=%q, want %q", generation, data, want)
+		}
+	}
+	if _, err := os.Stat(daemonEventLogPath(path, 3)); !os.IsNotExist(err) {
+		t.Fatalf("rotation exceeded configured generations: %v", err)
+	}
+}
+
+func TestDaemonEventsReadRetainedGenerationsOldestFirst(t *testing.T) {
+	root := t.TempDir()
+	path := daemonEventsPath(root)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent := func(path, id string) {
+		t.Helper()
+		data, err := json.Marshal(DaemonEvent{Version: daemonEventSchemaVersion, ID: id, Time: time.Now().UTC(), Type: "branch", Action: "fork"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEvent(daemonEventLogPath(path, 1), "older")
+	writeEvent(path, "newer")
+	var output bytes.Buffer
+	if err := (&daemonServer{}).streamEvents(root, []string{"--json"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Split(strings.TrimSpace(output.String()), "\n"); len(got) != 2 || !strings.Contains(got[0], `"id":"older"`) || !strings.Contains(got[1], `"id":"newer"`) {
+		t.Fatalf("retained event order=%q", got)
+	}
+}
+
 func TestDaemonEventsFollowNewAppend(t *testing.T) {
 	root := t.TempDir()
 	server := &daemonServer{}

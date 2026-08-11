@@ -30,7 +30,11 @@ import (
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
-const daemonEventSchemaVersion = 1
+const (
+	daemonEventSchemaVersion = 1
+	daemonEventMaxBytes      = 16 << 20
+	daemonEventFiles         = 4
+)
 
 // DaemonEvent is one durable manager-level lifecycle observation.
 type DaemonEvent struct {
@@ -55,6 +59,60 @@ type daemonEventsOptions struct {
 
 func daemonEventsPath(dataRoot string) string {
 	return filepath.Join(dataRoot, "events", "events.jsonl")
+}
+
+func daemonEventLogPath(path string, generation int) string {
+	if generation == 0 {
+		return path
+	}
+	return path + "." + strconv.Itoa(generation)
+}
+
+func retainedDaemonEventPaths(path string, files int) []string {
+	paths := make([]string, 0, files)
+	for generation := files - 1; generation >= 0; generation-- {
+		paths = append(paths, daemonEventLogPath(path, generation))
+	}
+	return paths
+}
+
+// rotateDaemonEventLog bounds durable operational history independently of
+// branch lifecycle state. The caller holds eventMu, so a follower can never
+// leave unread records behind in a file that is being rotated.
+func rotateDaemonEventLog(path string, incoming, maxBytes int64, files int) error {
+	if maxBytes <= 0 || files < 1 {
+		return errors.New("event log retention must have positive bytes and files")
+	}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 || info.Size()+incoming <= maxBytes {
+		return nil
+	}
+	if err := os.Remove(daemonEventLogPath(path, files-1)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for generation := files - 2; generation >= 0; generation-- {
+		oldPath := daemonEventLogPath(path, generation)
+		newPath := daemonEventLogPath(path, generation+1)
+		if err := os.Rename(oldPath, newPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = directory.Sync()
+	closeErr := directory.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func (s *daemonServer) recordCommandEvents(dataRoot string, args []string, status int) {
@@ -125,6 +183,9 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 		return
 	}
 	data = append(data, '\n')
+	if err := rotateDaemonEventLog(daemonEventsPath(dataRoot), int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
+		return
+	}
 	file, err := os.OpenFile(daemonEventsPath(dataRoot), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return
@@ -420,29 +481,51 @@ func (s *daemonServer) streamEvents(dataRoot string, args []string, writer io.Wr
 	}
 	path := daemonEventsPath(dataRoot)
 	var offset int64
+	var currentInfo os.FileInfo
+	initial := true
 	for {
-		file, err := os.Open(path)
-		if err != nil {
-			if !os.IsNotExist(err) {
+		s.eventMu.Lock()
+		paths := []string{path}
+		if initial {
+			paths = retainedDaemonEventPaths(path, daemonEventFiles)
+		}
+		var events []DaemonEvent
+		for _, eventPath := range paths {
+			file, err := os.Open(eventPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				s.eventMu.Unlock()
 				return fmt.Errorf("opening event log: %w", err)
 			}
-		} else {
-			s.eventMu.Lock()
-			if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			info, err := file.Stat()
+			if err != nil {
 				file.Close()
 				s.eventMu.Unlock()
 				return err
 			}
-			var events []DaemonEvent
+			fileOffset := int64(0)
+			if eventPath == path {
+				if !initial && currentInfo != nil && os.SameFile(currentInfo, info) {
+					fileOffset = offset
+				}
+				currentInfo = info
+			}
+			if _, err := file.Seek(fileOffset, io.SeekStart); err != nil {
+				file.Close()
+				s.eventMu.Unlock()
+				return err
+			}
 			scanner := bufio.NewScanner(file)
 			scanner.Buffer(make([]byte, 4096), daemonMaxFrame)
 			for scanner.Scan() {
-				offset += int64(len(scanner.Bytes()) + 1)
+				fileOffset += int64(len(scanner.Bytes()) + 1)
 				var event DaemonEvent
 				if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 					file.Close()
 					s.eventMu.Unlock()
-					return fmt.Errorf("decoding event at offset %d: %w", offset, err)
+					return fmt.Errorf("decoding event log %q at offset %d: %w", filepath.Base(eventPath), fileOffset, err)
 				}
 				if eventMatches(event, options) {
 					events = append(events, event)
@@ -453,12 +536,19 @@ func (s *daemonServer) streamEvents(dataRoot string, args []string, writer io.Wr
 				s.eventMu.Unlock()
 				return err
 			}
-			file.Close()
-			s.eventMu.Unlock()
-			for _, event := range events {
-				if err := writeDaemonEvent(writer, event, options.jsonOutput); err != nil {
-					return err
-				}
+			if err := file.Close(); err != nil {
+				s.eventMu.Unlock()
+				return err
+			}
+			if eventPath == path {
+				offset = fileOffset
+			}
+		}
+		s.eventMu.Unlock()
+		initial = false
+		for _, event := range events {
+			if err := writeDaemonEvent(writer, event, options.jsonOutput); err != nil {
+				return err
 			}
 		}
 		if !options.follow || (!options.until.IsZero() && !time.Now().Before(options.until)) {

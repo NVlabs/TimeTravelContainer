@@ -233,7 +233,8 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return []string{"rm"}, nil
 		}
 		if rest[0] == "rm" {
-			return familyCompletionCandidates(backend, true, true)
+			candidates, err := familyCompletionCandidates(backend, true, true)
+			return append(candidates, "-f", "--force"), err
 		}
 		return nil, nil
 	case "port":

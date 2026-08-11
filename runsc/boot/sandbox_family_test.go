@@ -787,14 +787,20 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 		t.Fatalf("grandchild parent: %q", grandchild.ParentID)
 	}
 	// Descendants own all references needed by their cloned Kernels. Destroying
-	// an ancestor must not constrain their lifetime; ParentID remains historical
-	// creation lineage even after that source no longer exists.
+	// an ancestor must not constrain their lifetime; display lineage is spliced
+	// through the removed node.
 	if err := family.Destroy("child"); err != nil {
 		t.Fatalf("Destroy child before grandchild: %v", err)
 	}
 	branches = family.List()
-	if len(branches) != 2 || branches[0].ID != "grandchild" || branches[0].ParentID != "child" {
+	if len(branches) != 2 || branches[0].ID != "grandchild" || branches[0].ParentID != DefaultBranchID {
 		t.Fatalf("List after ancestor destroy: %+v", branches)
+	}
+	if _, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true}); err != nil {
+		t.Fatalf("reuse deleted branch name: %v", err)
+	}
+	if err := family.Destroy("child"); err != nil {
+		t.Fatalf("destroy reused child: %v", err)
 	}
 	if err := family.Resume("grandchild"); err != nil {
 		t.Fatalf("Resume grandchild after ancestor destroy: %v", err)
@@ -821,7 +827,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if got := family.LoaderBranchID(); got != "great-grandchild" {
 		t.Fatalf("loader branch after deleting main=%q, want great-grandchild", got)
 	}
-	if got := family.List(); len(got) != 1 || got[0].ID != "great-grandchild" {
+	if got := family.List(); len(got) != 1 || got[0].ID != "great-grandchild" || got[0].ParentID != "" {
 		t.Fatalf("List after deleting main: %+v", got)
 	}
 	if err := family.Destroy("great-grandchild"); err == nil {

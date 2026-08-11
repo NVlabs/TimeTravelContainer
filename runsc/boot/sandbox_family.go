@@ -66,12 +66,13 @@ type BranchInfo struct {
 	// ParentID records which branch was forked to create this branch. It is
 	// provenance for the CLI tree only; it imposes no ownership or lifecycle
 	// relationship.
-	ParentID     string
-	State        BranchState
-	CreatedAt    time.Time
-	InitPID      kernel.ThreadID
-	InitState    string
-	SharesMemory bool
+	ParentID         string
+	FilesystemBranch string
+	State            BranchState
+	CreatedAt        time.Time
+	InitPID          kernel.ThreadID
+	InitState        string
+	SharesMemory     bool
 	// ForkMetrics is populated for branches created by Fork.
 	ForkMetrics SandboxForkMetrics
 }
@@ -396,7 +397,8 @@ type sandboxBranch struct {
 	controlOps sync.WaitGroup
 
 	id string
-	// parentID is display-only fork provenance, never an ownership edge.
+	// parentID is display-only fork provenance, never an ownership edge. When
+	// this branch is removed, direct children are spliced to its parent.
 	parentID string
 	// filesystemBranch is the persistent ttcvol branch backing this Kernel.
 	// It normally follows volumeBranchID(id), but a distributed target exposes
@@ -423,7 +425,7 @@ type branchDehydration struct {
 
 // SandboxFamily owns all in-memory branches in one Sentry process. Branches
 // are lifecycle peers. loaderBranchID only identifies the Kernel reachable
-// through Loader.k; parentID is immutable display provenance and confers no
+// through Loader.k; parentID is mutable display provenance and confers no
 // ownership, ordering, or storage relationship.
 type SandboxFamily struct {
 	mu sync.Mutex
@@ -452,6 +454,7 @@ type SandboxFamily struct {
 	distributedSessions            map[string]*distributedForkSession
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
+	forgetFilesystemBranch         func(string)
 }
 
 type distributedForkSession struct {
@@ -476,6 +479,10 @@ type SandboxFamilyOptions struct {
 	VolumeBranchScope     string
 	ConfigureNetwork      func(*kernel.Kernel, inet.Stack) error
 	OnLoaderKernelChanged func(*kernel.Kernel, *watchdog.Watchdog)
+	// ForgetFilesystemBranch releases process-local TTC repository caches once
+	// a branch no longer has a Kernel. Persistent branch pointers are managed by
+	// ttcd and are intentionally unaffected by this callback.
+	ForgetFilesystemBranch func(string)
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
@@ -519,6 +526,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		volumeBranchScope:              opts.VolumeBranchScope,
 		configureNetwork:               opts.ConfigureNetwork,
 		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
+		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
@@ -941,12 +949,10 @@ func (f *SandboxFamily) CloseDistributedForkSessions() {
 }
 
 func (f *SandboxFamily) volumeBranchID(visibleBranchID string) string {
-	// A repository's initial branch is always named "main". Only descendants
-	// are scoped, since they may be created by multiple sandbox families that
-	// share a managed volume repository.
-	if visibleBranchID == DefaultBranchID {
-		return ttcvolume.MainBranch
-	}
+	// The initial loader branch explicitly records the repository's canonical
+	// "main" pointer. Every branch created later is family-scoped, including a
+	// reused visible name "main", so deleting and recreating a branch cannot
+	// collide with a named volume's canonical branch.
 	return ttcvolume.ScopedBranchID(f.volumeBranchScope, visibleBranchID)
 }
 
@@ -1284,14 +1290,15 @@ func (f *SandboxFamily) List() []BranchInfo {
 	for _, b := range f.branches {
 		initPID, initState := branchInitStatus(b)
 		out = append(out, BranchInfo{
-			ID:           b.id,
-			ParentID:     b.parentID,
-			State:        b.state,
-			CreatedAt:    b.createdAt,
-			InitPID:      initPID,
-			InitState:    initState,
-			SharesMemory: b.k != nil && liveKernels > 1,
-			ForkMetrics:  b.metrics,
+			ID:               b.id,
+			ParentID:         b.parentID,
+			FilesystemBranch: b.filesystemBranch,
+			State:            b.state,
+			CreatedAt:        b.createdAt,
+			InitPID:          initPID,
+			InitState:        initState,
+			SharesMemory:     b.k != nil && liveKernels > 1,
+			ForkMetrics:      b.metrics,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1572,11 +1579,12 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 		metrics[i].Total = total
 		childBranch.metrics = metrics[i]
 		infos[i] = BranchInfo{
-			ID:          childBranch.id,
-			ParentID:    childBranch.parentID,
-			State:       childBranch.state,
-			CreatedAt:   childBranch.createdAt,
-			ForkMetrics: metrics[i],
+			ID:               childBranch.id,
+			ParentID:         childBranch.parentID,
+			FilesystemBranch: childBranch.filesystemBranch,
+			State:            childBranch.state,
+			CreatedAt:        childBranch.createdAt,
+			ForkMetrics:      metrics[i],
 		}
 	}
 	f.mu.Unlock()
@@ -1711,6 +1719,9 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	b.opMu.Lock()
 	p := k.Platform
 	k.Release()
+	if f.forgetFilesystemBranch != nil {
+		f.forgetFilesystemBranch(filesystemBranch)
+	}
 	f.mu.Lock()
 	b.k = nil
 	b.watchdog = nil
@@ -1963,6 +1974,14 @@ func (f *SandboxFamily) Destroy(id string) error {
 		loaderKernel = replacement.k
 		loaderWatchdog = replacement.watchdog
 	}
+	// Parent relationships are presentation-only. Splice this node out so the
+	// tree never depends on a tombstone and branch names become immediately
+	// reusable after deletion.
+	for childID, child := range f.branches {
+		if childID != id && child.parentID == id {
+			child.parentID = b.parentID
+		}
+	}
 	b.state = BranchDestroying
 	image := b.dehydration
 	if image != nil {
@@ -1980,6 +1999,9 @@ func (f *SandboxFamily) Destroy(id string) error {
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
+		if f.forgetFilesystemBranch != nil {
+			f.forgetFilesystemBranch(b.filesystemBranch)
+		}
 		err := image.image.Close()
 		f.mu.Lock()
 		delete(f.branches, id)
@@ -1998,6 +2020,9 @@ func (f *SandboxFamily) Destroy(id string) error {
 	b.k.WaitExited()
 	b.controlOps.Wait()
 	b.k.Release()
+	if f.forgetFilesystemBranch != nil {
+		f.forgetFilesystemBranch(b.filesystemBranch)
+	}
 
 	f.mu.Lock()
 	delete(f.branches, id)

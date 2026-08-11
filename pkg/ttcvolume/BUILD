@@ -8,6 +8,7 @@ package(
 go_library(
     name = "ttcvolume",
     srcs = [
+        "gc.go",
         "metadata.go",
         "repository.go",
         "snapshot.go",

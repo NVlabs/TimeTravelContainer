@@ -17,6 +17,7 @@ package ttcvolume
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -66,6 +67,7 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer repo.Close()
 	ino, err := repo.CreateRegular("main", rootInode, "value", 0644, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
@@ -387,6 +389,7 @@ func TestHardLinksTrackBranchLocalInodeObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer repo.Close()
 	ino, err := repo.CreateRegular("main", rootInode, "first", 0644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -997,6 +1000,109 @@ func TestRemoveBranchKeepsMain(t *testing.T) {
 	}
 	if err := repository.RemoveBranch(MainBranch); err == nil {
 		t.Fatal("RemoveBranch accepted main")
+	}
+}
+
+func TestRemoveBranchAllowsMainWithSurvivingPeer(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("main-removal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := repository.Fork(MainBranch, "peer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch(MainBranch); err != nil {
+		t.Fatalf("RemoveBranch(main) with peer: %v", err)
+	}
+	if _, err := repository.Branch(MainBranch); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed main lookup=%v, want not exist", err)
+	}
+	if _, err := repository.Branch("peer"); err != nil {
+		t.Fatalf("surviving peer lookup: %v", err)
+	}
+}
+
+func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("branch-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "main", 0)
+
+	for round := 0; round < metadataCompactionLayerThreshold*2+3; round++ {
+		childID := fmt.Sprintf("temporary-%04d", round)
+		if err := repository.Fork(MainBranch, childID); err != nil {
+			t.Fatalf("round %d Fork: %v", round, err)
+		}
+		if _, _, err := repository.WriteAt(childID, ino, []byte("child"), 0); err != nil {
+			t.Fatalf("round %d child WriteAt: %v", round, err)
+		}
+		child, err := repository.Inode(childID, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		childObject := filepath.Join(repository.path, repository.objectPath(child.Object))
+		repository.ForgetBranch(childID)
+		collector, err := manager.Open("branch-churn")
+		if err != nil {
+			t.Fatalf("round %d opening collector: %v", round, err)
+		}
+		if err := collector.RemoveBranch(childID); err != nil {
+			t.Fatalf("round %d RemoveBranch: %v", round, err)
+		}
+		if err := collector.GarbageCollect(); err != nil {
+			t.Fatalf("round %d GarbageCollect: %v", round, err)
+		}
+		if err := collector.Close(); err != nil {
+			t.Fatalf("round %d closing collector: %v", round, err)
+		}
+		if _, err := os.Stat(childObject); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("round %d child object survived collection: %v", round, err)
+		}
+		if got := readAll(t, repository, MainBranch, ino); got != "main" {
+			t.Fatalf("round %d main data=%q", round, got)
+		}
+	}
+
+	branches, err := os.ReadDir(filepath.Join(repository.path, "branches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 1 || branches[0].Name() != MainBranch+".json" {
+		t.Fatalf("branch pointers after churn=%v", branches)
+	}
+	layers, err := os.ReadDir(filepath.Join(repository.path, "layers"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) > metadataCompactionLayerThreshold {
+		t.Fatalf("metadata layers grew with deleted history: got %d, threshold %d", len(layers), metadataCompactionLayerThreshold)
+	}
+	repository.metadataMu.Lock()
+	metadataEntries := len(repository.metadata)
+	repository.metadataMu.Unlock()
+	if metadataEntries > 1 {
+		t.Fatalf("process-local metadata retained %d historical branches, want at most main", metadataEntries)
+	}
+	repository.branchMu.Lock()
+	branchCacheEntries := len(repository.branchCache)
+	repository.branchMu.Unlock()
+	if branchCacheEntries > 1 {
+		t.Fatalf("process-local branch cache retained %d historical branches, want at most main", branchCacheEntries)
+	}
+	repository.journalMu.Lock()
+	journalEntries := len(repository.journals)
+	repository.journalMu.Unlock()
+	if journalEntries > metadataCompactionLayerThreshold {
+		t.Fatalf("process-local journals retained %d historical layers", journalEntries)
 	}
 }
 

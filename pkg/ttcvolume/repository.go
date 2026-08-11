@@ -766,13 +766,11 @@ func (r *Repository) Branch(id string) (Branch, error) {
 	return r.readBranch(id)
 }
 
-// RemoveBranch removes a non-main branch pointer after its Kernel no longer
-// exists. Immutable nodes and objects remain eligible for repository-wide
-// garbage collection.
+// RemoveBranch removes a branch pointer after its Kernel no longer exists.
+// The canonical main pointer may be removed only when another branch keeps the
+// repository live. Immutable layers and objects are reclaimed separately by
+// GarbageCollect.
 func (r *Repository) RemoveBranch(id string) error {
-	if id == mainBranch {
-		return errors.New("cannot remove the main volume branch")
-	}
 	if err := validateName(id, "branch"); err != nil {
 		return err
 	}
@@ -780,11 +778,67 @@ func (r *Repository) RemoveBranch(id string) error {
 		if _, err := r.readBranch(id); err != nil {
 			return err
 		}
+		if id == mainBranch {
+			branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+			if err != nil {
+				return err
+			}
+			names, readErr := branchDir.Readdirnames(-1)
+			closeErr := branchDir.Close()
+			if readErr != nil {
+				return readErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			branchPointers := 0
+			for _, name := range names {
+				if strings.HasSuffix(name, ".json") {
+					branchPointers++
+				}
+			}
+			if branchPointers <= 1 {
+				return errors.New("cannot remove the repository's final branch")
+			}
+		}
 		if err := r.unlink(filepath.Join("branches", id+".json")); err != nil {
 			return err
 		}
+		r.branchMu.Lock()
+		delete(r.branchCache, id)
+		r.branchMu.Unlock()
 		return r.syncDirectory("branches")
 	})
+}
+
+// ForgetBranch releases process-local caches for a branch whose Kernel has
+// been released. It does not alter the persistent branch pointer; ttcd removes
+// that pointer separately, or a later rehydration reloads it on demand.
+//
+// The materialization barrier prevents the asynchronous lookup cache from
+// recreating a layer after manager-side garbage collection has removed it.
+func (r *Repository) ForgetBranch(id string) {
+	if r == nil || validateName(id, "branch") != nil {
+		return
+	}
+	r.operationMu.Lock()
+	defer r.operationMu.Unlock()
+	r.flushMaterialization()
+
+	r.metadataMu.Lock()
+	var layers []string
+	if state := r.metadata[id]; state != nil {
+		state.mu.RLock()
+		layers = append(layers, state.layers...)
+		state.mu.RUnlock()
+		delete(r.metadata, id)
+	}
+	r.pruneUnreferencedLayerCachesLocked(layers)
+	r.metadataMu.Unlock()
+
+	r.branchMu.Lock()
+	delete(r.branchCache, id)
+	r.branchMu.Unlock()
 }
 
 // ReapOrphan removes inode metadata after the Sentry has released the last

@@ -336,7 +336,7 @@ if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2
   fail "unpublished child port remained reachable"
 fi
 ttc port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
-ttc branch rm "$VNET@child"
+ttc branch rm -f "$VNET@child"
 if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
   fail "deleted child branch left its published port reachable"
 fi
@@ -414,7 +414,7 @@ if ttc exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "parent PID release leaked into the child branch"
 fi
 ttc stop --time 1 "$PIDS_LIMIT@child" "$PIDS_LIMIT@main"
-ttc branch rm "$PIDS_LIMIT@child"
+ttc branch rm -f "$PIDS_LIMIT@child"
 ttc rm "$PIDS_LIMIT"
 
 ttc create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
@@ -735,22 +735,26 @@ echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ FROM_FILE
 [ -z "$(ttc logs --since 4102444800 "$LIFECYCLE@child")" ] || fail "logs --since included records older than its boundary"
 [ -z "$(ttc logs --until 24h "$LIFECYCLE@child")" ] || fail "logs --until included records newer than its boundary"
 
-# Persist immutable lineage when an intermediate source branch is deleted.
+# Splice display lineage when an intermediate source branch is deleted.
 ttc fork "$LIFECYCLE@child" grandchild
 [ "$(ttc exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "child" ] || fail "grandchild did not inherit managed-overlay state"
 ttc exec "$LIFECYCLE@grandchild" sh -c "echo grandchild >/cow-host/value; echo grandchild-created >/cow-host/grandchild-only"
 [ "$(ttc exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "grandchild managed-overlay write leaked into child"
 [ "$(ttc exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "grandchild" ] || fail "grandchild managed-overlay write was not retained"
-ttc branch rm "$LIFECYCLE@child"
+if ttc branch rm "$LIFECYCLE@child" >"$TTC_E2E_ROOT/branch-rm-running.out" 2>"$TTC_E2E_ROOT/branch-rm-running.err"; then
+  fail "branch rm removed a running branch without --force"
+fi
+grep -q "use -f to force removal" "$TTC_E2E_ROOT/branch-rm-running.err" ||
+  fail "running branch removal rejection lacked a force diagnostic"
+ttc branch rm -f "$LIFECYCLE@child"
 [ "$(ttc exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "grandchild" ] || fail "grandchild managed overlay depended on deleted source branch"
 LINEAGE_TREE=$(ttc ls --tree)
-echo "$LINEAGE_TREE" | grep -q "child deleted" || fail "tree omitted the deleted intermediate branch"
-echo "$LINEAGE_TREE" | grep -q "grandchild running" || fail "tree omitted the live grandchild below its tombstone"
-if ttc fork "$LIFECYCLE@main" child >"$TTC_E2E_ROOT/lineage-reuse.out" 2>"$TTC_E2E_ROOT/lineage-reuse.err"; then
-  fail "fork reused a branch ID retained by immutable lineage"
+echo "$LINEAGE_TREE" | grep -q "grandchild running" || fail "tree omitted the reparented live grandchild"
+if echo "$LINEAGE_TREE" | grep -q "child deleted"; then
+  fail "tree retained a deleted intermediate branch"
 fi
-grep -q "retained by immutable lineage" "$TTC_E2E_ROOT/lineage-reuse.err" ||
-  fail "branch ID reuse rejection lacked a lineage diagnostic"
+ttc fork "$LIFECYCLE@main" child >/dev/null || fail "fork did not reuse a deleted branch name"
+ttc branch rm -f "$LIFECYCLE@child"
 
 echo "== branch-native detached exec bookkeeping =="
 EXEC_SELECTOR=$(ttc exec --detach "$LIFECYCLE@main" sh -c 'exec sleep 300')
@@ -772,8 +776,8 @@ ttc exec kill "$LIFECYCLE@process-child:$EXEC_ID" >/dev/null
 ttc exec ls --json "$LIFECYCLE@main" | grep -q '"state": "running"' || fail "child signal reached parent exec"
 ttc exec kill "$LIFECYCLE@main:$EXEC_ID" >/dev/null
 [ "$(ttc exec wait "$LIFECYCLE@main:$EXEC_ID")" = 137 ] || fail "parent exec wait status was not retained"
-ttc branch rm "$LIFECYCLE@process-grandchild"
-ttc branch rm "$LIFECYCLE@process-child"
+ttc branch rm -f "$LIFECYCLE@process-grandchild"
+ttc branch rm -f "$LIFECYCLE@process-child"
 
 echo "== durable daemon events =="
 EVENTS_JSON="$TTC_E2E_ROOT/events.jsonl"
@@ -795,7 +799,7 @@ grep -q '"type":"branch".*"action":"pause"' "$EVENT_FOLLOW" || fail "events foll
 ttc stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE@main"
 [ "$(ttc inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
   fail "inspect did not report the stopped family as exited"
-ttc branch rm "$LIFECYCLE@grandchild"
+ttc branch rm -f "$LIFECYCLE@grandchild"
 ttc rm "$LIFECYCLE_ID"
 
 echo "== intentional daemon stop terminates managed containers =="

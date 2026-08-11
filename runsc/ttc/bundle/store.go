@@ -182,11 +182,13 @@ type DistributedForkOptions struct {
 	NodeID          string
 }
 
-// BranchInfo is immutable branch lineage plus its last known lifecycle state.
+// BranchInfo is branch display lineage plus its last known lifecycle state.
 type BranchInfo struct {
 	ID string `json:"id"`
-	// ParentID is immutable display provenance, not an ownership edge.
+	// ParentID is display provenance, not an ownership edge. Removing a branch
+	// reparents its direct children to this branch's parent.
 	ParentID         string     `json:"parent_id,omitempty"`
+	FilesystemBranch string     `json:"filesystem_branch,omitempty"`
 	State            string     `json:"state"`
 	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`
 	SourceDowntimeNS int64      `json:"source_downtime_ns,omitempty"`
@@ -736,7 +738,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		CreatedAt:           time.Now().UTC(),
 		NodeID:              opts.NodeID,
 	}
-	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: metadata.CreatedAt}}
+	metadata.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
 		value := DefaultStopTimeoutSeconds
 		metadata.StopTimeout = &value
@@ -986,7 +988,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.CreatedAt = now
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
-	metadata.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	metadata.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: now}}
 	metadata.NodeID = opts.NodeID
 	for index := range metadata.Volumes {
 		oldID := metadata.Volumes[index].ID
@@ -1130,7 +1132,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: "main", State: "created", CreatedAt: now}}
+	target.Branches = []BranchInfo{{ID: "main", FilesystemBranch: childRepositoryBranch, State: "created", CreatedAt: now}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
@@ -1912,10 +1914,12 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		info.State = "created"
 	}
 	if len(info.Branches) == 0 {
-		info.Branches = []BranchInfo{{ID: "main", State: info.State, CreatedAt: info.CreatedAt}}
+		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, CreatedAt: info.CreatedAt}}
 	}
+	info.Branches = compactDeletedBranchLineage(info.Branches)
 	seenBranches := make(map[string]struct{}, len(info.Branches))
-	for _, branch := range info.Branches {
+	for i := range info.Branches {
+		branch := &info.Branches[i]
 		if err := validateObjectName("branch", branch.ID); err != nil {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid branch metadata: %w", key, err)
 		}
@@ -1926,26 +1930,33 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 			return ContainerInfo{}, fmt.Errorf("container %q contains duplicate branch %q", key, branch.ID)
 		}
 		seenBranches[branch.ID] = struct{}{}
-	}
-	if _, ok := seenBranches["main"]; !ok {
-		return ContainerInfo{}, fmt.Errorf("container %q branch metadata omits main", key)
+		if branch.FilesystemBranch == "" {
+			if branch.ID == "main" {
+				branch.FilesystemBranch = ttcvolume.MainBranch
+			} else {
+				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
+			}
+		}
 	}
 	seenPortEndpoints := make(map[string]struct{}, len(info.PublishedPorts))
+	bindings := info.PublishedPorts[:0]
 	for i := range info.PublishedPorts {
 		binding, err := normalizePortBinding(info.PublishedPorts[i])
 		if err != nil {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
 		}
 		if _, ok := seenBranches[binding.BranchID]; !ok {
-			return ContainerInfo{}, fmt.Errorf("container %q published port targets unknown branch %q", key, binding.BranchID)
+			// Pre-compaction releases retained bindings for deleted branches.
+			continue
 		}
 		endpoint := portHostEndpoint(binding)
 		if _, ok := seenPortEndpoints[endpoint]; ok {
 			return ContainerInfo{}, fmt.Errorf("container %q contains duplicate published host endpoint %s", key, endpoint)
 		}
 		seenPortEndpoints[endpoint] = struct{}{}
-		info.PublishedPorts[i] = binding
+		bindings = append(bindings, binding)
 	}
+	info.PublishedPorts = bindings
 	networkMode, err := normalizeNetworkMode(info.NetworkMode)
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
@@ -1986,6 +1997,79 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}
 	return info, nil
+}
+
+// compactDeletedBranchLineage upgrades the pre-release tombstone model in
+// memory. Surviving children are spliced through any deleted ancestors, so
+// future writes persist a bounded branch list and immediately free old names.
+func compactDeletedBranchLineage(branches []BranchInfo) []BranchInfo {
+	deletedParents := make(map[string]string)
+	for _, branch := range branches {
+		if branch.State == "deleted" {
+			deletedParents[branch.ID] = branch.ParentID
+		}
+	}
+	resolveParent := func(parent string) string {
+		seen := make(map[string]struct{})
+		for parent != "" {
+			next, deleted := deletedParents[parent]
+			if !deleted {
+				break
+			}
+			if _, duplicate := seen[parent]; duplicate {
+				return ""
+			}
+			seen[parent] = struct{}{}
+			parent = next
+		}
+		return parent
+	}
+	compacted := make([]BranchInfo, 0, len(branches)-len(deletedParents))
+	for _, branch := range branches {
+		if branch.State == "deleted" {
+			continue
+		}
+		branch.ParentID = resolveParent(branch.ParentID)
+		branch.DeletedAt = nil
+		compacted = append(compacted, branch)
+	}
+	return compacted
+}
+
+// LegacyDeletedBranch returns a tombstone written by the pre-release immutable
+// lineage implementation. Current TTC releases remove records outright; this
+// lookup exists so the first reuse of an old name can reclaim its persistent
+// filesystem pointer before asking the Sentry to fork it again.
+func (s Store) LegacyDeletedBranch(name, branchID string) (BranchInfo, bool, error) {
+	if err := validateObjectName("branch", branchID); err != nil {
+		return BranchInfo{}, false, err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return BranchInfo{}, false, err
+	}
+	data, err := os.ReadFile(filepath.Join(s.Root, "containers", info.ID, "container.json"))
+	if err != nil {
+		return BranchInfo{}, false, err
+	}
+	var raw ContainerInfo
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return BranchInfo{}, false, err
+	}
+	for _, branch := range raw.Branches {
+		if branch.ID != branchID || branch.State != "deleted" {
+			continue
+		}
+		if branch.FilesystemBranch == "" {
+			if branch.ID == "main" {
+				branch.FilesystemBranch = ttcvolume.MainBranch
+			} else {
+				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
+			}
+		}
+		return branch, true, nil
+	}
+	return BranchInfo{}, false, nil
 }
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
@@ -2299,7 +2383,7 @@ func (s Store) RemovePortBindingsForBranch(name, branchID string) error {
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
-// RecordBranch appends one immutable branch identity or refreshes its lifecycle data.
+// RecordBranch appends one branch identity or refreshes its lifecycle data.
 func (s Store) RecordBranch(name string, branch BranchInfo) error {
 	return s.RecordBranches(name, []BranchInfo{branch})
 }
@@ -2460,8 +2544,10 @@ func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
-// MarkBranchDeleted retains branch lineage while marking its runtime state gone.
-func (s Store) MarkBranchDeleted(name, branchID string) error {
+// RemoveBranchRecord removes a branch from persistent metadata and splices its
+// direct children to its parent. No tombstone is retained, so branch IDs are
+// reusable and metadata size tracks live branches rather than branch history.
+func (s Store) RemoveBranchRecord(name, branchID string) error {
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
 	}
@@ -2469,24 +2555,149 @@ func (s Store) MarkBranchDeleted(name, branchID string) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
+	index := -1
+	parent := ""
 	for i := range info.Branches {
 		if info.Branches[i].ID == branchID {
-			info.Branches[i].State = "deleted"
-			info.Branches[i].DeletedAt = &now
-			recomputeContainerState(&info)
-			bindings := info.PublishedPorts[:0]
-			for _, binding := range info.PublishedPorts {
-				if binding.Branch() != branchID {
-					bindings = append(bindings, binding)
-				}
-			}
-			info.PublishedPorts = bindings
-			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+			index = i
+			parent = info.Branches[i].ParentID
+			break
 		}
 	}
-	info.Branches = append(info.Branches, BranchInfo{ID: branchID, State: "deleted", CreatedAt: now, DeletedAt: &now})
+	if index < 0 {
+		return fmt.Errorf("branch %q is not recorded", branchID)
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ParentID == branchID {
+			info.Branches[i].ParentID = parent
+		}
+	}
+	info.Branches = append(info.Branches[:index], info.Branches[index+1:]...)
+	recomputeContainerState(&info)
+	bindings := info.PublishedPorts[:0]
+	for _, binding := range info.PublishedPorts {
+		if binding.Branch() != branchID {
+			bindings = append(bindings, binding)
+		}
+	}
+	info.PublishedPorts = bindings
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// RemoveBranchFilesystems drops one branch pointer from every TTC-managed
+// repository and reclaims filesystem state unreachable from surviving branch
+// pointers. A named volume's canonical main pointer belongs to the volume,
+// whereas private rootfs and copied-host repositories belong to the family.
+func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	if len(repositories) == 0 {
+		return nil
+	}
+	persistentBranch := branch.FilesystemBranch
+	if persistentBranch == "" {
+		if branch.ID == "main" {
+			persistentBranch = ttcvolume.MainBranch
+		} else {
+			persistentBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
+		}
+	}
+	manager, err := ttcvolume.OpenManager(s.Root, true)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(repositories))
+	for _, config := range repositories {
+		path := filepath.Clean(config.Path)
+		if _, duplicate := seen[path]; duplicate {
+			continue
+		}
+		seen[path] = struct{}{}
+		if persistentBranch == ttcvolume.MainBranch && !repositoryCanonicalBranchBelongsToFamily(config) {
+			// The canonical branch is named-volume state, not family-private
+			// state. Descendants and reused visible "main" branches are scoped
+			// and therefore take the normal removal path.
+			continue
+		}
+		repository, err := manager.OpenPrivate(path)
+		if err != nil {
+			return fmt.Errorf("opening repository %q: %w", config.Source, err)
+		}
+		removeErr := repository.RemoveBranch(persistentBranch)
+		if errors.Is(removeErr, fs.ErrNotExist) {
+			removeErr = nil
+		}
+		if removeErr == nil {
+			removeErr = repository.GarbageCollect()
+		}
+		closeErr := repository.Close()
+		if removeErr != nil {
+			return fmt.Errorf("removing branch %q from repository %q: %w", persistentBranch, config.Source, removeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing repository %q: %w", config.Source, closeErr)
+		}
+	}
+	return nil
+}
+
+// repositoryCanonicalBranchBelongsToFamily reports whether the initial main
+// branch is private state owned by one container family. Rootfs repositories
+// predate TTCVolumeRepository.Private and are identified by their reserved
+// source name; copied-host repositories explicitly carry Private. Named
+// volumes are the only repositories whose canonical main branch outlives a
+// family.
+func repositoryCanonicalBranchBelongsToFamily(config specutils.TTCVolumeRepository) bool {
+	return config.Private || config.Source == specutils.TTCRootfsUpperSource
+}
+
+// RemoveBranchArtifacts deletes persistent state whose lifetime is exactly one
+// visible branch: dehydration images, init logs, and managed-exec logs.
+func (s Store) RemoveBranchArtifacts(name, branchID string) error {
+	if err := validateObjectName("branch", branchID); err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	containerDir := filepath.Join(s.Root, "containers", info.ID)
+	dehydrated := filepath.Join(containerDir, "memory", "dehydrated", hex.EncodeToString([]byte(branchID)))
+	if err := os.RemoveAll(dehydrated); err != nil {
+		return err
+	}
+	consoleDir := filepath.Join(containerDir, "console")
+	base := filepath.Join(consoleDir, branchID)
+	paths := []string{
+		base + ".log", base + ".lock", base + ".stdin.lock", base + ".error.log",
+		base + ".wait-status", base + ".log.retention.json", base + ".pid",
+	}
+	maxFiles := info.ConsoleLogMaxFiles
+	if maxFiles < 2 {
+		maxFiles = 2
+	}
+	for generation := 1; generation < maxFiles; generation++ {
+		paths = append(paths, ttcconsole.GenerationPath(base+".log", generation))
+	}
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(consoleDir, "exec", branchID)); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RemoveContainer removes persistent configuration for name. Shared image

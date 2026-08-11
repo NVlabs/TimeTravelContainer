@@ -344,6 +344,12 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 }
 
 func (r *Repository) reloadBranchMetadata(branch Branch, layers []string) (*branchMetadata, error) {
+	var replacedLayers []string
+	if previous := r.metadata[branch.ID]; previous != nil {
+		previous.mu.RLock()
+		replacedLayers = append(replacedLayers, previous.layers...)
+		previous.mu.RUnlock()
+	}
 	state := newBranchMetadata(branch)
 	state.layers = layers
 	for _, layer := range layers {
@@ -360,7 +366,71 @@ func (r *Repository) reloadBranchMetadata(branch Branch, layers []string) (*bran
 		state.nextSequence = 1
 	}
 	r.metadata[branch.ID] = state
+	r.pruneUnreferencedLayerCachesLocked(replacedLayers)
 	return state, nil
+}
+
+// pruneUnreferencedLayerCachesLocked drops process-local state for metadata
+// layers that no decoded branch still uses. r.metadataMu must be held. Closing
+// a journal for a layer used only by an uncached branch is harmless: a later
+// mutation reopens it after reconstructing that branch from its pointer.
+func (r *Repository) pruneUnreferencedLayerCachesLocked(candidates []string) {
+	if len(candidates) == 0 {
+		return
+	}
+	live := make(map[string]struct{})
+	for _, state := range r.metadata {
+		state.mu.RLock()
+		for _, layer := range state.layers {
+			live[layer] = struct{}{}
+		}
+		state.mu.RUnlock()
+	}
+	stale := make(map[string]struct{})
+	for _, layer := range candidates {
+		if _, ok := live[layer]; !ok {
+			stale[layer] = struct{}{}
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	r.journalMu.Lock()
+	for layer := range stale {
+		if journal := r.journals[layer]; journal != nil {
+			_ = journal.Close()
+			delete(r.journals, layer)
+		}
+	}
+	r.journalMu.Unlock()
+	r.dirtyMu.Lock()
+	for name := range r.dirtyFiles {
+		if pathUsesMetadataLayer(name, stale) {
+			delete(r.dirtyFiles, name)
+		}
+	}
+	for name := range r.dirtyDirs {
+		if pathUsesMetadataLayer(name, stale) {
+			delete(r.dirtyDirs, name)
+		}
+	}
+	for name := range r.knownDirs {
+		if pathUsesMetadataLayer(name, stale) {
+			delete(r.knownDirs, name)
+		}
+	}
+	r.dirtyMu.Unlock()
+}
+
+func pathUsesMetadataLayer(name string, layers map[string]struct{}) bool {
+	const prefix = "layers/"
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(name, prefix)
+	layer, _, _ := strings.Cut(rest, "/")
+	_, ok := layers[layer]
+	return ok
 }
 
 func (r *Repository) metadataLayerSizes(layers []string) (map[string]int64, error) {
@@ -560,6 +630,7 @@ type materializeRequest struct {
 	layer    string
 	sequence uint64
 	ops      []metadataOp
+	done     chan struct{}
 }
 
 func (r *Repository) enqueueMaterialization(layer string, sequence uint64, ops []metadataOp) {
@@ -574,6 +645,9 @@ func (r *Repository) enqueueMaterialization(layer string, sequence uint64, ops [
 					// failure never changes the committed journal transaction and
 					// replay can repair or regenerate the cache later.
 					_ = r.materializeMetadataOp(request.layer, request.sequence, op)
+				}
+				if request.done != nil {
+					close(request.done)
 				}
 			}
 		}()
@@ -597,6 +671,18 @@ func (r *Repository) enqueueMaterialization(layer string, sequence uint64, ops [
 		}
 	}
 	r.materializeCh <- materializeRequest{layer: layer, sequence: sequence, ops: cloned}
+}
+
+// flushMaterialization waits until every lookup-cache update queued before the
+// call has finished. Callers serialize producers with operationMu before using
+// this barrier.
+func (r *Repository) flushMaterialization() {
+	if r.materializeCh == nil {
+		return
+	}
+	done := make(chan struct{})
+	r.materializeCh <- materializeRequest{done: done}
+	<-done
 }
 
 func (r *Repository) materializeMetadataOp(layer string, sequence uint64, op metadataOp) error {

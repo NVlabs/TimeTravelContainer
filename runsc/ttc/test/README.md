@@ -22,7 +22,7 @@ covers:
   `create --rm` cleanup after a later detached start;
 - Docker-shaped container inspect JSON and Go templates across created,
   running, forked, paused, and exited states, including effective image
-  configuration, persistent immutable branch lineage and deletion tombstones,
+  configuration, compacted branch lineage and reusable branch names,
   env-file/host-import environment overrides, merged labels,
   user mounts, sandbox PID, per-branch processes and timings, and transactional
   fork-rejection diagnostics;

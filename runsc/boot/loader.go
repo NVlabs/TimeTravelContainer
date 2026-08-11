@@ -929,6 +929,11 @@ func New(args Args) (*Loader, error) {
 			l.watchdog = dog
 			l.mu.Unlock()
 		},
+		ForgetFilesystemBranch: func(branch string) {
+			for _, volume := range l.ttcVolumeRepositories {
+				volume.repository.ForgetBranch(branch)
+			}
+		},
 	})
 
 	if err := registerFilesystems(l.k, &l.root, l.rdmaSysfs); err != nil {
