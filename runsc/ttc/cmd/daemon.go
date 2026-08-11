@@ -770,7 +770,7 @@ func stopDaemonContainers(backend backend) error {
 	for _, family := range families {
 		for _, branch := range family.Branches {
 			switch branch.State {
-			case "running", "paused", "dehydrated", "restarting":
+			case "running", "paused", "dehydrated", "restarting", "exited":
 			default:
 				continue
 			}
