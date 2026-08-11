@@ -165,7 +165,7 @@ def bench_ttc(n: int = 30) -> None:
             "stdout": proc.stdout.strip(),
         }
         append_jsonl(out.name, row)
-        run(TTC + ["branch", "rm", f"ttc-bench@{tag}"], env=TTC_ENV)
+        run(TTC + ["rm", f"ttc-bench@{tag}"], env=TTC_ENV)
         print(f"TTC {i + 1}/{n}: {fork_return_ms:.2f} ms", flush=True)
 
 
@@ -426,7 +426,7 @@ def bench_ttc_fanout(n: int = 10, *, batch: bool = False) -> None:
     finally:
         for tag in tags:
             run(
-                TTC + ["branch", "rm", f"ttc-bench@{tag}"],
+                TTC + ["rm", f"ttc-bench@{tag}"],
                 env=TTC_ENV,
                 check=False,
             )

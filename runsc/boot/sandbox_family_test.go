@@ -278,8 +278,8 @@ func branchStateForTest(infos []BranchInfo, id string) BranchState {
 func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	first := &SandboxFamily{volumeBranchScope: "sandbox-a"}
 	second := &SandboxFamily{volumeBranchScope: "sandbox-b"}
-	if got := first.volumeBranchID(DefaultBranchID); got != ttcvolume.MainBranch {
-		t.Fatalf("default volume branch = %q, want %q", got, ttcvolume.MainBranch)
+	if got := first.volumeBranchID(DefaultBranchID); got == ttcvolume.MainBranch {
+		t.Fatalf("a newly-created branch named main reused the initial volume pointer %q", got)
 	}
 	if got, want := first.volumeBranchID("child"), first.volumeBranchID("child"); got != want {
 		t.Fatalf("volume branch ID is not deterministic: got %q, want %q", got, want)
@@ -292,6 +292,21 @@ func TestVolumeBranchIDIsSandboxScoped(t *testing.T) {
 	}
 	if got := (&SandboxFamily{}).volumeBranchID("child"); got != "child" {
 		t.Fatalf("unscoped test family branch ID=%q, want child", got)
+	}
+}
+
+func TestSandboxFamilyInitialBranchIdentity(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		InitialBranchID:         "restarted-child",
+		InitialFilesystemBranch: "filesystem-child",
+	})
+	branches := family.List()
+	if len(branches) != 1 || branches[0].ID != "restarted-child" || branches[0].FilesystemBranch != "filesystem-child" || family.LoaderBranchID() != "restarted-child" {
+		t.Fatalf("initial branch identity: loader=%q branches=%+v", family.LoaderBranchID(), branches)
 	}
 }
 
@@ -820,6 +835,12 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	if err := family.Resume("great-grandchild"); err != nil {
 		t.Fatalf("Resume great-grandchild after ancestor destroy: %v", err)
+	}
+	if err := family.PrepareStop(DefaultBranchID); err != nil {
+		t.Fatalf("PrepareStop loader branch: %v", err)
+	}
+	if got := family.LoaderBranchID(); got != "great-grandchild" {
+		t.Fatalf("loader branch after PrepareStop=%q, want great-grandchild", got)
 	}
 	if err := family.Destroy(DefaultBranchID); err != nil {
 		t.Fatalf("Destroy loader branch while peer remains: %v", err)

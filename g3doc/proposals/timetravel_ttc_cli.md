@@ -304,8 +304,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       Running branches are supported initially; stopped-container VFS access
       remains future work.
 - [x] `ttc create` as persistent image-root and OCI-bundle preparation.
-- [x] `ttc start CONTAINER` for created/exited base containers, detached by
-      default with optional `--attach`. Multiple detached containers start in
+- [x] `ttc start CONTAINER@BRANCH` for created/exited branches, detached by
+      default with optional `--attach`. Multiple detached branches start in
       argument order, and stale stopped runsc records are removed before OCI
       recreation while live duplicate IDs remain protected.
 - [x] Docker-style `ttc container` aliases for run, create, start, attach,
@@ -314,20 +314,16 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] `ttc wait [--condition not-running] CONTAINER@BRANCH...` starts all
       waits concurrently, prints Docker exit codes in argument order, and
       retains branch-aware wait semantics.
-- [x] `ttc restart CONTAINER...` for created, exited, running, or paused base
-      containers, including TERM/timeout/KILL behavior. Restart rejects an
-      individual branch because destroyed in-memory branches cannot be
-      reconstructed. Live descendants require explicit `--force`; restart
-      quiesces and snapshots main before teardown, then seeds the replacement
-      sandbox from that snapshot.
-- [x] `ttc stop CONTAINER@BRANCH` with TERM, timeout, then KILL semantics.
+- [x] `ttc restart CONTAINER@BRANCH...` for created, exited, running, paused,
+      or dehydrated branches. Running branches use TERM/timeout/KILL; paused
+      and dehydrated branches are discarded without resuming.
+- [x] `ttc stop CONTAINER|CONTAINER@BRANCH` with TERM, timeout, then KILL for
+      running branches and direct state discard for paused/dehydrated branches.
 - [x] `ttc kill CONTAINER@BRANCH [SIGNAL]`.
-- [x] Initial `ttc rm CONTAINER`: remove stopped/created family metadata,
-      reject a live family unless `--force` is given, and require `branch rm`
-      for an individual branch.
-- [x] Finalize removal policy: `branch rm` retains immutable lineage tombstones;
-      unforced family removal rejects any live family; forced family removal tears
-      down main and all descendants and deletes the container-local lineage record.
+- [x] `ttc rm CONTAINER|CONTAINER@BRANCH`: remove a whole family or one branch
+      and require `--force` for running or paused state.
+- [x] Finalize removal policy: branch deletion splices presentation lineage,
+      permits deleting `main`, and makes deleted branch IDs immediately reusable.
 - [x] Docker-shaped `ttc inspect CONTAINER...` covering identity, image,
       process configuration, lifecycle state, sandbox PID, graph driver, and
       user mounts. Support Docker-style `--format/-f`, line-delimited
@@ -379,15 +375,14 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] `ttc pause CONTAINER@BRANCH`.
 - [x] `ttc resume CONTAINER@BRANCH` and Docker-compatible top-level and
       `ttc container unpause` aliases.
-- [x] `ttc branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
+- [x] `ttc rm CONTAINER@BRANCH`.
 - [x] Initial `ttc ls --tree` compact Unicode lineage and lifecycle-state
       output, merging persistent base containers with authoritative live runsc
       branch state.
-- [x] Extend tree output with PID 1 state, live CoW memory sharing, creation and
-      deletion times, and the complete persisted lineage/tombstone model.
+- [x] Extend tree output with PID 1 state, live CoW memory sharing, and creation
+      times. Lineage is presentation-only and removed branches leave no tombstone.
 - [x] `ttc ls --json` with a stable machine-readable schema.
-- [x] Mark deleted historical parents in tree output without reparenting their
-      descendants.
+- [x] Reparent display children when a branch is removed.
 - [x] Return structured PID/FD-or-mapping diagnostics from a rejected fork.
 - [x] Make `ttc fork` the sole authoritative operation: pause the source,
       validate the frozen network/resource/mapping graph, resume on rejection,

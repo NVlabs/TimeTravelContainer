@@ -23,7 +23,7 @@ import (
 )
 
 var topLevelCompletionCommands = []string{
-	"attach", "branch", "completion", "container", "cp", "create", "daemon", "events", "exec", "fork",
+	"attach", "completion", "container", "cp", "create", "daemon", "events", "exec", "fork",
 	"dehydrate", "help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
 	"port", "ps", "pull", "rehydrate", "restart", "resume", "rm", "rmi", "run", "start", "stop",
 	"top", "unpause", "wait",
@@ -228,15 +228,6 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return imageCompletionCandidates(backend)
 		}
 		return nil, nil
-	case "branch":
-		if len(rest) == 0 {
-			return []string{"rm"}, nil
-		}
-		if rest[0] == "rm" {
-			candidates, err := familyCompletionCandidates(backend, true, true)
-			return append(candidates, "-f", "--force"), err
-		}
-		return nil, nil
 	case "port":
 		if len(rest) == 0 {
 			return []string{"ls", "publish", "unpublish"}, nil
@@ -251,10 +242,15 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return imageCompletionCandidates(backend)
 	case "rmi":
 		return imageCompletionCandidates(backend)
-	case "start", "restart", "rm", "inspect":
+	case "inspect":
 		return familyCompletionCandidates(backend, false, true)
-	case "attach", "logs", "pause", "resume", "dehydrate", "rehydrate", "kill", "stop", "wait", "top":
+	case "start", "restart", "attach", "logs", "pause", "resume", "rehydrate", "kill", "wait", "top":
 		return familyCompletionCandidates(backend, true, true)
+	case "rm":
+		candidates, err := familyAndBranchCompletionCandidates(backend)
+		return append(candidates, "-f", "--force"), err
+	case "dehydrate", "stop":
+		return familyAndBranchCompletionCandidates(backend)
 	case "cp":
 		return familyCompletionCandidates(backend, true, true)
 	case "fork":
@@ -262,6 +258,24 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func familyAndBranchCompletionCandidates(backend backend) ([]string, error) {
+	families, err := backend.listFamilies()
+	if err != nil {
+		return nil, err
+	}
+	var candidates []string
+	for _, family := range families {
+		name := familyDisplayName(family)
+		candidates = append(candidates, name)
+		for _, branch := range family.Branches {
+			if branch.State != "deleted" {
+				candidates = append(candidates, name+"@"+branch.ID)
+			}
+		}
+	}
+	return candidates, nil
 }
 
 func familyCompletionCandidates(backend backend, branches, includeMain bool) ([]string, error) {

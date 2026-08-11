@@ -53,6 +53,7 @@ const (
 	BranchCreating    BranchState = "creating"
 	BranchPaused      BranchState = "paused"
 	BranchRunning     BranchState = "running"
+	BranchExited      BranchState = "exited"
 	BranchDehydrating BranchState = "dehydrating"
 	BranchDehydrated  BranchState = "dehydrated"
 	BranchRehydrating BranchState = "rehydrating"
@@ -483,6 +484,11 @@ type SandboxFamilyOptions struct {
 	// a branch no longer has a Kernel. Persistent branch pointers are managed by
 	// ttcd and are intentionally unaffected by this callback.
 	ForgetFilesystemBranch func(string)
+	// InitialBranchID and InitialFilesystemBranch identify the branch represented
+	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
+	// defaults used by ordinary OCI creation.
+	InitialBranchID         string
+	InitialFilesystemBranch string
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
@@ -517,6 +523,14 @@ const (
 // NewSandboxFamily creates a family containing k as its default branch.
 func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamily {
 	createdAt := time.Now().UTC()
+	initialID := opts.InitialBranchID
+	if initialID == "" {
+		initialID = DefaultBranchID
+	}
+	initialFilesystemBranch := opts.InitialFilesystemBranch
+	if initialFilesystemBranch == "" {
+		initialFilesystemBranch = ttcvolume.MainBranch
+	}
 	f := &SandboxFamily{
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
@@ -530,9 +544,9 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
-			DefaultBranchID: {
-				id:               DefaultBranchID,
-				filesystemBranch: ttcvolume.MainBranch,
+			initialID: {
+				id:               initialID,
+				filesystemBranch: initialFilesystemBranch,
 				k:                k,
 				watchdog:         opts.LoaderWatchdog,
 				state:            kernelBranchState(k),
@@ -540,7 +554,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 				execSessions:     make(map[string]*execSession),
 			},
 		},
-		loaderBranchID: DefaultBranchID,
+		loaderBranchID: initialID,
 	}
 	f.stateChanged = sync.NewCond(&f.mu)
 	return f
@@ -1919,10 +1933,77 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 			f.mu.Unlock()
 			continue
 		}
-		status := k.GlobalInit().ExitStatus()
+		b.state = BranchExited
+		// The Loader must remain alive while any independent hydrated branch
+		// still has a live init. The branch in the bookkeeping role may exit
+		// naturally, not only through a TTC stop command, so transfer here as a
+		// final invariant rather than relying solely on PrepareStop.
+		replacement := f.liveLoaderReplacementLocked(b.id)
+		if replacement == nil {
+			status := k.GlobalInit().ExitStatus()
+			f.mu.Unlock()
+			return status
+		}
+		f.loaderBranchID = replacement.id
+		loaderKernel := replacement.k
+		loaderWatchdog := replacement.watchdog
+		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return status
+		if f.onLoaderKernelChanged != nil {
+			f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
+		}
 	}
+}
+
+// liveLoaderReplacementLocked returns an established hydrated branch. If its
+// Kernel has already exited, WaitDefaultExit immediately advances again. f.mu
+// must be held. Parent relationships are intentionally not consulted because
+// they have no lifecycle semantics.
+func (f *SandboxFamily) liveLoaderReplacementLocked(exclude string) *sandboxBranch {
+	ids := make([]string, 0, len(f.branches)-1)
+	for candidateID, candidate := range f.branches {
+		if candidateID == exclude || candidate.k == nil || candidate.state == BranchCreating || candidate.state == BranchDestroying || candidate.state == BranchFailed || candidate.state == BranchExited {
+			continue
+		}
+		ids = append(ids, candidateID)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+	return f.branches[ids[0]]
+}
+
+// PrepareStop transfers the Loader bookkeeping role away from id when another
+// branch will survive. Branch ancestry and visible names are unaffected.
+func (f *SandboxFamily) PrepareStop(id string) error {
+	f.dehydrationMu.Lock()
+	defer f.dehydrationMu.Unlock()
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if id != f.loaderBranchID {
+		f.mu.Unlock()
+		return nil
+	}
+	replacement := f.liveLoaderReplacementLocked(id)
+	if replacement == nil {
+		f.mu.Unlock()
+		return nil
+	}
+	f.loaderBranchID = replacement.id
+	loaderKernel := replacement.k
+	loaderWatchdog := replacement.watchdog
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
+	if f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
+	}
+	return nil
 }
 
 // Destroy destroys a branch and removes it from the family. If id currently
@@ -2008,6 +2089,16 @@ func (f *SandboxFamily) Destroy(id string) error {
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
 		return err
+	}
+	if b.k == nil {
+		if f.forgetFilesystemBranch != nil {
+			f.forgetFilesystemBranch(b.filesystemBranch)
+		}
+		f.mu.Lock()
+		delete(f.branches, id)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return nil
 	}
 
 	if dog != nil {
@@ -2131,7 +2222,16 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 		return 0, err
 	}
 	tg.WaitExited()
-	return uint32(tg.ExitStatus()), nil
+	status := uint32(tg.ExitStatus())
+	if pid == 0 {
+		f.mu.Lock()
+		if current := f.branches[b.id]; current == b && (b.state == BranchRunning || b.state == BranchPaused) {
+			b.state = BranchExited
+			f.stateChanged.Broadcast()
+		}
+		f.mu.Unlock()
+	}
+	return status, nil
 }
 
 func (f *SandboxFamily) execSession(args *ExecSessionArgs) (*sandboxBranch, *execSession, func(), error) {
@@ -2286,7 +2386,14 @@ func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWr
 	}
 	tg.WaitExited()
 	status := uint32(tg.ExitStatus())
-	if execID != "" {
+	if execID == "" {
+		f.mu.Lock()
+		if current := f.branches[b.id]; current == b && (b.state == BranchRunning || b.state == BranchPaused) {
+			b.state = BranchExited
+			f.stateChanged.Broadcast()
+		}
+		f.mu.Unlock()
+	} else {
 		f.mu.Lock()
 		if session := b.execSessions[execID]; session != nil && session.tg == tg {
 			session.info.State = ExecSessionExited

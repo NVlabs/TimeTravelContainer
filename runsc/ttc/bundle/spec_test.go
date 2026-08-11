@@ -1059,11 +1059,12 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContainer after family exit: %v", err)
 	}
+	states := make(map[string]string)
 	for _, branch := range withHistory.Branches {
-		if branch.State != "exited" {
-			t.Errorf("family exit states=%+v, want all surviving branches exited", withHistory.Branches)
-			break
-		}
+		states[branch.ID] = branch.State
+	}
+	if states["main"] != "exited" || states["child"] != "running" || states["grandchild"] != "paused" || withHistory.State != "running" || withHistory.ExitStatus != nil {
+		t.Errorf("branch-specific UpdateState produced family state=%q exit=%v branches=%+v", withHistory.State, withHistory.ExitStatus, withHistory.Branches)
 	}
 	if err := store.RemoveBranchRecord("demo", "main"); err != nil {
 		t.Fatalf("RemoveBranchRecord(main): %v", err)
@@ -1072,7 +1073,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContainer after main deletion: %v", err)
 	}
-	if len(withHistory.Branches) != 2 || withHistory.Branches[0].ID != "grandchild" || withHistory.Branches[0].ParentID != "" || withHistory.State != "exited" {
+	if len(withHistory.Branches) != 2 || withHistory.Branches[0].ID != "grandchild" || withHistory.Branches[0].ParentID != "" || withHistory.State != "running" {
 		t.Errorf("main deletion state=%q branches=%+v, want reparented peers", withHistory.State, withHistory.Branches)
 	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
@@ -1126,6 +1127,68 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
 		t.Fatalf("containers after remove=%+v, err=%v", containers, err)
+	}
+}
+
+func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source:   specutils.TTCRootfsUpperSource,
+		Path:     filepath.Join(containerDir, "repository"),
+		Branch:   ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull),
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := specs.Spec{
+		Root:    &specs.Root{Path: "rootfs"},
+		Process: &specs.Process{Args: []string{"true"}},
+		Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories: string(encoded),
+		},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
+		Branches: []BranchInfo{{ID: "child", State: "exited", FilesystemBranch: "fs-child"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	temp, cleanup, err := store.PrepareBranchStartBundle("demo", "child", "fs-child")
+	if err != nil {
+		t.Fatalf("PrepareBranchStartBundle: %v", err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(filepath.Join(temp, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got specs.Spec
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[specutils.AnnotationTTCInitialBranchID] != "child" || got.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] != "fs-child" {
+		t.Fatalf("initial identity annotations=%q", got.Annotations)
+	}
+	gotRepositories, err := specutils.TTCVolumeRepositories(&got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotRepositories) != 1 || gotRepositories[0].Branch != "fs-child" {
+		t.Fatalf("repositories=%+v", gotRepositories)
+	}
+	if got.Root == nil || got.Root.Path != filepath.Join(bundleDir, "rootfs") {
+		t.Fatalf("root path=%+v", got.Root)
 	}
 }
 
@@ -1228,6 +1291,26 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	if err := store.AddPortBinding("demo", child); err != nil {
 		t.Fatalf("re-adding child binding: %v", err)
+	}
+	if err := store.StopBranch("demo", "child", 137); err != nil {
+		t.Fatalf("StopBranch: %v", err)
+	}
+	loaded, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "exited" {
+		t.Fatalf("branch stop rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
+	}
+	if err := store.RecordBranchStart("demo", "child"); err != nil {
+		t.Fatalf("RecordBranchStart: %v", err)
+	}
+	loaded, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "running" {
+		t.Fatalf("branch start rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
 	}
 	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
 		t.Fatalf("RemoveBranchRecord: %v", err)

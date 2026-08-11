@@ -228,7 +228,7 @@ func commandEvents(args []string, status int) []DaemonEvent {
 		event.Type = "image"
 		event.Action = command
 		event.Subject = lastNonFlag(rest)
-	case "create", "run", "start", "restart", "stop", "kill", "wait", "rm", "logs", "inspect":
+	case "create", "run", "start", "restart", "stop", "kill", "wait", "rm", "logs", "inspect", "dehydrate", "rehydrate":
 		event.Type = "container"
 		event.Action = command
 		if command == "wait" || command == "rm" {
@@ -238,6 +238,9 @@ func commandEvents(args []string, status int) []DaemonEvent {
 			event.Subject = lastNonFlag(rest)
 		} else {
 			event.Subject = lifecycleTarget(command, rest)
+		}
+		if strings.Contains(event.Subject, "@") {
+			event.Type = "branch"
 		}
 		if command == "stop" {
 			exitEvent := event
@@ -256,16 +259,6 @@ func commandEvents(args []string, status int) []DaemonEvent {
 			event.Parent = positionals[0]
 			event.Subject = positionals[len(positionals)-1]
 		}
-	case "branch":
-		if len(rest) == 0 {
-			return nil
-		}
-		event.Type = "branch"
-		event.Action = rest[0]
-		if event.Action == "rm" || event.Action == "remove" {
-			event.Action = "destroy"
-		}
-		event.Subject = lastNonFlag(rest[1:])
 	case "exec":
 		if len(rest) != 0 && (rest[0] == "ls" || rest[0] == "wait" || rest[0] == "kill") {
 			event.Type = "exec"

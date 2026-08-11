@@ -61,6 +61,16 @@ type Store struct {
 	Root string
 }
 
+// PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
+// branch from its persistent filesystem pointer without changing its visible
+// branch identity. The canonical container bundle is never modified.
+func (s Store) PrepareBranchStartBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+	if branchID == "" || filesystemBranch == "" {
+		return "", nil, errors.New("branch start identity and filesystem branch are required")
+	}
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false)
+}
+
 // PrepareDehydrationRestoreBundle creates a short-lived OCI bundle that tells
 // runsc to reserve the persistent application MemoryFile for cold restore and
 // opens every TTC-managed repository at filesystemBranch. The canonical
@@ -69,6 +79,10 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	if filesystemBranch == "" {
 		return "", nil, errors.New("dehydration restore filesystem branch is empty")
 	}
+	return s.prepareBranchBundle(name, "", filesystemBranch, true)
+}
+
+func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget bool) (string, func(), error) {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return "", nil, err
@@ -94,11 +108,17 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 		}
 		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
 	}
-	spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
+	if distributedTarget {
+		spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
+	} else {
+		delete(spec.Annotations, specutils.AnnotationTTCDistributedTarget)
+		spec.Annotations[specutils.AnnotationTTCInitialBranchID] = branchID
+		spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] = filesystemBranch
+	}
 	if spec.Root != nil && !filepath.IsAbs(spec.Root.Path) {
 		spec.Root.Path = filepath.Join(info.BundleDir, spec.Root.Path)
 	}
-	temp, err := os.MkdirTemp(filepath.Dir(info.BundleDir), ".dehydration-restore-*")
+	temp, err := os.MkdirTemp(filepath.Dir(info.BundleDir), ".branch-start-*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -2243,43 +2263,37 @@ func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
 	return nil
 }
 
-// UpdateState records the last known base-container lifecycle state.
+// UpdateState is retained for checkpoint restore, whose newly-created family
+// contains only main. It never rewrites peer branches; callers managing an
+// existing family must use the branch-specific state methods instead.
 func (s Store) UpdateState(name, state string, exitStatus *int) error {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	info.State = state
-	info.ExitStatus = exitStatus
+	found := false
 	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if branch.ID == "main" {
-			branch.State = state
-		}
-		if state == "running" && branch.ID != "main" && branch.State != "deleted" {
-			branch.State = "deleted"
-			branch.DeletedAt = &now
-		}
-		if state == "exited" && branch.State != "deleted" {
-			branch.State = "exited"
+		if info.Branches[i].ID == "main" {
+			info.Branches[i].State = state
+			found = true
+			break
 		}
 	}
-	if state == "running" {
-		bindings := info.PublishedPorts[:0]
-		for _, binding := range info.PublishedPorts {
-			if binding.Branch() == "main" {
-				bindings = append(bindings, binding)
-			}
-		}
-		info.PublishedPorts = bindings
+	if !found {
+		return fmt.Errorf("branch %q is not recorded", "main")
 	}
 	switch state {
 	case "running":
 		info.StartedAt = &now
-		info.ExitedAt = nil
-	case "exited":
+	}
+	recomputeContainerState(&info)
+	if info.State == "exited" {
+		info.ExitStatus = exitStatus
 		info.ExitedAt = &now
+	} else {
+		info.ExitStatus = nil
+		info.ExitedAt = nil
 	}
 	path := filepath.Join(s.Root, "containers", info.ID, "container.json")
 	if err := writeJSON(path, &info); err != nil {
@@ -2434,12 +2448,16 @@ func recomputeContainerState(info *ContainerInfo) {
 	priority := map[string]int{
 		"exited":      1,
 		"stopped":     1,
-		"dehydrated":  2,
-		"created":     3,
-		"paused":      4,
-		"dehydrating": 5,
-		"rehydrating": 6,
-		"running":     7,
+		"failed":      2,
+		"dead":        2,
+		"dehydrated":  3,
+		"created":     4,
+		"paused":      5,
+		"dehydrating": 6,
+		"rehydrating": 7,
+		"creating":    8,
+		"restarting":  9,
+		"running":     10,
 	}
 	state := "exited"
 	best := 0
@@ -2476,6 +2494,69 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 	}
 	return fmt.Errorf("branch %q is not recorded", branchID)
+}
+
+// RecordBranchStart records a fresh process incarnation for one branch. Family
+// state is derived from all branches; starting one branch never deletes or
+// rewrites its peers.
+func (s Store) RecordBranchStart(name, branchID string) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.ID != branchID {
+			continue
+		}
+		if branch.State == "deleted" {
+			return fmt.Errorf("branch %q is deleted", branchID)
+		}
+		branch.State = "running"
+		info.StartedAt = &now
+		info.ExitStatus = nil
+		info.ExitedAt = nil
+		recomputeContainerState(&info)
+		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	}
+	return fmt.Errorf("branch %q is not recorded", branchID)
+}
+
+// StopBranch explicitly discards one branch's execution state while retaining
+// its filesystem, logs, identity, and peer branches.
+func (s Store) StopBranch(name, branchID string, exitStatus int) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	found := false
+	alreadyExited := false
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.ID != branchID {
+			continue
+		}
+		if branch.State == "deleted" {
+			return fmt.Errorf("branch %q is deleted", branchID)
+		}
+		alreadyExited = branch.State == "exited" || branch.State == "stopped"
+		branch.State = "exited"
+		found = true
+		break
+	}
+	if !found {
+		return fmt.Errorf("branch %q is not recorded", branchID)
+	}
+	recomputeContainerState(&info)
+	if info.State == "exited" {
+		now := time.Now().UTC()
+		if !alreadyExited || info.ExitStatus == nil {
+			info.ExitStatus = &exitStatus
+		}
+		info.ExitedAt = &now
+	}
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // RecordBranchExit records one branch's termination without treating it as a
@@ -2662,7 +2743,8 @@ func repositoryCanonicalBranchBelongsToFamily(config specutils.TTCVolumeReposito
 }
 
 // RemoveBranchArtifacts deletes persistent state whose lifetime is exactly one
-// visible branch: dehydration images, init logs, and managed-exec logs.
+// visible branch: active/dehydrated memory files, init logs, and managed-exec
+// logs.
 func (s Store) RemoveBranchArtifacts(name, branchID string) error {
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
@@ -2672,9 +2754,11 @@ func (s Store) RemoveBranchArtifacts(name, branchID string) error {
 		return err
 	}
 	containerDir := filepath.Join(s.Root, "containers", info.ID)
-	dehydrated := filepath.Join(containerDir, "memory", "dehydrated", hex.EncodeToString([]byte(branchID)))
-	if err := os.RemoveAll(dehydrated); err != nil {
-		return err
+	encodedBranch := hex.EncodeToString([]byte(branchID))
+	for _, kind := range []string{"active", "dehydrated"} {
+		if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, encodedBranch)); err != nil {
+			return err
+		}
 	}
 	consoleDir := filepath.Join(containerDir, "console")
 	base := filepath.Join(consoleDir, branchID)

@@ -288,16 +288,20 @@ func TestStopDaemonContainersTreatsLineageAsDisplayOnly(t *testing.T) {
 				{ID: "old", ParentID: defaultBranchID, State: "exited"},
 			},
 		}},
-		inspectInfo: InspectInfo{},
+		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+			{Metadata: Branch{ID: defaultBranchID, State: "running"}},
+			{Metadata: Branch{ID: "child", ParentID: defaultBranchID, State: "paused"}},
+			{Metadata: Branch{ID: "grandchild", ParentID: "child", State: "running"}},
+			{Metadata: Branch{ID: "old", ParentID: defaultBranchID, State: "exited"}},
+		}}},
 	}
 	if err := stopDaemonContainers(b); err != nil {
 		t.Fatalf("stopDaemonContainers: %v", err)
 	}
-	if got, want := b.resumed, (selector{container: "web", branch: "child"}); got != want {
-		t.Errorf("resumed=%+v, want %+v", got, want)
+	if b.resumed.container != "" {
+		t.Errorf("daemon stop resumed paused branch: %+v", b.resumed)
 	}
 	wantOrder := []selector{
-		{container: "web", branch: "child"},
 		{container: "web", branch: "grandchild"},
 		{container: "web", branch: defaultBranchID},
 	}
@@ -458,7 +462,7 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"container", "restart", "demo"}, true},
 		{[]string{"image", "rm", "alpine"}, true},
 		{[]string{"image", "pull", "alpine"}, true},
-		{[]string{"branch", "remove", "demo"}, true},
+		{[]string{"rm", "demo@child"}, true},
 		{[]string{"port", "publish", "demo@main", "8080:80"}, true},
 		{[]string{"port", "unpublish", "demo@main", "8080:80"}, true},
 		{[]string{"port", "ls", "demo"}, false},

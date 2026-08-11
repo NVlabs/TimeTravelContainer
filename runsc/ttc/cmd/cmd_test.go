@@ -455,14 +455,14 @@ func TestCommandsUseQualifiedBranchesAndBareForkDestination(t *testing.T) {
 	}
 
 	stdout.Reset()
-	if status := runCommand([]string{"branch", "rm", "web@test-a"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("branch rm status=%d, stderr=%q", status, stderr.String())
+	if status := runCommand([]string{"rm", "web@test-a"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("branch-targeted rm status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.destroyed != (selector{container: "web", branch: "test-a"}) {
 		t.Errorf("destroy target=%+v", b.destroyed)
 	}
 	if b.destroyForce {
-		t.Error("branch rm without -f forced removal")
+		t.Error("branch-targeted rm without -f forced removal")
 	}
 }
 
@@ -597,31 +597,28 @@ func TestForkRejectsQualifiedLocalDestination(t *testing.T) {
 	}
 }
 
-func TestBranchRMRequiresQualifiedSelectorAndAcceptsMain(t *testing.T) {
+func TestRemoveAcceptsFamiliesAndQualifiedBranches(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	status := runCommand([]string{"branch", "rm", "web"}, &stdout, &stderr, b)
-	if status != 1 {
-		t.Fatalf("status=%d, want 1", status)
-	}
-	if b.destroyed.container != "" {
-		t.Errorf("destroy unexpectedly called for %+v", b.destroyed)
+	status := runCommand([]string{"rm", "web"}, &stdout, &stderr, b)
+	if status != 0 || b.removed != "web" {
+		t.Fatalf("family rm status=%d removed=%q stderr=%q", status, b.removed, stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"branch", "rm", "web@main"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("branch rm main status=%d, stderr=%q", status, stderr.String())
+	if status := runCommand([]string{"rm", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("branch-targeted rm main status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.destroyed != (selector{container: "web", branch: "main"}) {
 		t.Errorf("destroy target=%+v", b.destroyed)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"branch", "rm", "-f", "web@main"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("forced branch rm main status=%d, stderr=%q", status, stderr.String())
+	if status := runCommand([]string{"rm", "-f", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("forced branch-targeted rm main status=%d, stderr=%q", status, stderr.String())
 	}
 	if !b.destroyForce {
-		t.Error("branch rm -f did not force removal")
+		t.Error("rm -f did not force branch removal")
 	}
 }
 
@@ -1415,13 +1412,13 @@ func TestCreateAndStart(t *testing.T) {
 		t.Errorf("create output=%q, want %q", got, want)
 	}
 	stdout.Reset()
-	if status := runCommand([]string{"start", "demo"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"start", "demo@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("start status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.started != "demo" || !b.startDetach || b.startInteractive {
-		t.Errorf("start name=%q detach=%t interactive=%t", b.started, b.startDetach, b.startInteractive)
+	if b.started != (selector{container: "demo", branch: "main"}) || !b.startDetach || b.startInteractive {
+		t.Errorf("start target=%v detach=%t interactive=%t", b.started, b.startDetach, b.startInteractive)
 	}
-	if stdout.String() != "demo\n" {
+	if stdout.String() != "demo@main\n" {
 		t.Errorf("start output=%q", stdout.String())
 	}
 }
@@ -1429,20 +1426,20 @@ func TestCreateAndStart(t *testing.T) {
 func TestStartMultipleAndContainerAliases(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"container", "start", "one", "two"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"container", "start", "one@main", "two@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("container start status=%d, stderr=%q", status, stderr.String())
 	}
-	if got, want := stdout.String(), "one\ntwo\n"; got != want {
+	if got, want := stdout.String(), "one@main\ntwo@child\n"; got != want {
 		t.Errorf("multi-start output=%q, want %q", got, want)
 	}
-	if got, want := b.startCalls, []startCall{{name: "one", detach: true}, {name: "two", detach: true}}; !reflect.DeepEqual(got, want) {
+	if got, want := b.startCalls, []startCall{{target: selector{container: "one", branch: "main"}, detach: true}, {target: selector{container: "two", branch: "child"}, detach: true}}; !reflect.DeepEqual(got, want) {
 		t.Errorf("start calls=%+v, want %+v", got, want)
 	}
 
 	b = &fakeBackend{}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"start", "--attach", "one", "two"}, &stdout, &stderr, b); status == 0 {
+	if status := runCommand([]string{"start", "--attach", "one@main", "two@main"}, &stdout, &stderr, b); status == 0 {
 		t.Fatal("multi-start accepted --attach")
 	}
 	if len(b.startCalls) != 0 {
@@ -2212,7 +2209,7 @@ func TestBuildInspectInfo(t *testing.T) {
 
 func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
 	b := &fakeBackend{waitStatus: uint32(7 << 8)}
-	if err := runAutoRemove([]string{"demo"}, b); err != nil {
+	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
 		t.Fatalf("runAutoRemove: %v", err)
 	}
 	if b.waited != (selector{container: "demo", branch: "main"}) {
@@ -2221,8 +2218,8 @@ func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
 	if b.removed != "demo" || !b.removeForce || !b.removeVolumes {
 		t.Errorf("remove=(%q, force=%t, volumes=%t)", b.removed, b.removeForce, b.removeVolumes)
 	}
-	if err := runAutoRemove([]string{"demo@child"}, b); err == nil {
-		t.Fatal("internal auto-remove accepted a branch selector")
+	if err := runAutoRemove([]string{"demo"}, b); err == nil {
+		t.Fatal("internal auto-remove accepted an unqualified family")
 	}
 }
 
@@ -2274,6 +2271,7 @@ func TestStopGraceful(t *testing.T) {
 	b := &fakeBackend{inspectInfo: InspectInfo{
 		Config:     InspectConfig{StopSignal: "SIGUSR1"},
 		HostConfig: InspectHostConfig{StopTimeout: &timeout},
+		TTC:        TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "child", State: "running"}}}},
 	}}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status != 0 {
@@ -2285,6 +2283,10 @@ func TestStopGraceful(t *testing.T) {
 	if b.waited != (selector{container: "web", branch: "child"}) {
 		t.Errorf("wait target=%+v", b.waited)
 	}
+	want := selector{container: "web", branch: "child"}
+	if b.preparedStop != want || b.discarded != want {
+		t.Errorf("prepare=%+v discard=%+v, want %+v", b.preparedStop, b.discarded, want)
+	}
 }
 
 func TestStopEscalatesToKill(t *testing.T) {
@@ -2294,6 +2296,7 @@ func TestStopEscalatesToKill(t *testing.T) {
 		inspectInfo: InspectInfo{
 			Config:     InspectConfig{StopSignal: "SIGUSR2"},
 			HostConfig: InspectHostConfig{StopTimeout: &timeout},
+			TTC:        TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "main", State: "running"}}}},
 		},
 	}
 	var stdout, stderr bytes.Buffer
@@ -2313,6 +2316,7 @@ func TestStopAcceptsGracefulExitRacingWithKill(t *testing.T) {
 		inspectInfo: InspectInfo{
 			Config:     InspectConfig{StopSignal: "SIGTERM"},
 			HostConfig: InspectHostConfig{StopTimeout: &timeout},
+			TTC:        TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "main", State: "running"}}}},
 		},
 	}
 	var stdout, stderr bytes.Buffer
@@ -2328,6 +2332,7 @@ func TestStopTimeoutOverride(t *testing.T) {
 		inspectInfo: InspectInfo{
 			Config:     InspectConfig{StopSignal: "SIGTERM"},
 			HostConfig: InspectHostConfig{StopTimeout: &configuredTimeout},
+			TTC:        TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "main", State: "running"}}}},
 		},
 	}
 	var stdout, stderr bytes.Buffer
@@ -2377,76 +2382,138 @@ func containsSelector(values []selector, target selector) bool {
 	return false
 }
 
-func TestRestartRunningExitedAndPausedFamilies(t *testing.T) {
+func TestStopPausedAndDehydratedDiscardsWithoutResume(t *testing.T) {
+	for _, state := range []string{"paused", "dehydrated"} {
+		t.Run(state, func(t *testing.T) {
+			b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "child", State: state}}}}}}
+			var stdout, stderr bytes.Buffer
+			if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status != 0 {
+				t.Fatalf("stop status=%d stderr=%q", status, stderr.String())
+			}
+			if len(b.signals) != 0 || b.resumed.container != "" || b.preparedStop.container != "" {
+				t.Fatalf("stop %s signaled/resumed/prepared: signals=%+v resumed=%+v prepared=%+v", state, b.signals, b.resumed, b.preparedStop)
+			}
+			if b.discarded != (selector{container: "web", branch: "child"}) {
+				t.Fatalf("discarded=%+v", b.discarded)
+			}
+		})
+	}
+}
+
+func TestStopFamilyAppliesBranchStateSemantics(t *testing.T) {
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "main", State: "running"}},
+		{Metadata: Branch{ID: "paused", State: "paused"}},
+		{Metadata: Branch{ID: "cold", State: "dehydrated"}},
+		{Metadata: Branch{ID: "done", State: "exited"}},
+	}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop family status=%d stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web\n"; got != want {
+		t.Fatalf("stdout=%q, want %q", got, want)
+	}
+	if len(b.signals) != 1 || b.signals[0].target != (selector{container: "web", branch: "main"}) {
+		t.Fatalf("family stop signals=%+v", b.signals)
+	}
+	wantDiscards := []selector{{container: "web", branch: "cold"}, {container: "web", branch: "done"}, {container: "web", branch: "main"}, {container: "web", branch: "paused"}}
+	if !reflect.DeepEqual(b.discards, wantDiscards) {
+		t.Fatalf("family stop discards=%+v, want %+v", b.discards, wantDiscards)
+	}
+	if b.resumed.container != "" {
+		t.Fatalf("family stop resumed %+v", b.resumed)
+	}
+}
+
+func TestDehydrateAcceptsBranchOrFamily(t *testing.T) {
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "main", State: "running"}},
+		{Metadata: Branch{ID: "paused", State: "paused"}},
+		{Metadata: Branch{ID: "cold", State: "dehydrated"}},
+	}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"dehydrate", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("dehydrate family status=%d stderr=%q", status, stderr.String())
+	}
+	want := []selector{{container: "web", branch: "main"}, {container: "web", branch: "paused"}}
+	if !reflect.DeepEqual(b.dehydratedTargets, want) {
+		t.Fatalf("dehydrated=%+v, want %+v", b.dehydratedTargets, want)
+	}
+	b.dehydratedTargets = nil
+	if status := runCommand([]string{"dehydrate", "web@paused"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("dehydrate branch status=%d stderr=%q", status, stderr.String())
+	}
+	if !reflect.DeepEqual(b.dehydratedTargets, []selector{{container: "web", branch: "paused"}}) {
+		t.Fatalf("branch dehydration=%+v", b.dehydratedTargets)
+	}
+}
+
+func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		state      string
-		wantSignal bool
-		wantResume bool
+		name        string
+		state       string
+		wantSignal  bool
+		wantDiscard bool
 	}{
-		{name: "running", state: "running", wantSignal: true},
+		{name: "running", state: "running", wantSignal: true, wantDiscard: true},
 		{name: "exited", state: "exited"},
-		{name: "paused", state: "paused", wantSignal: true, wantResume: true},
+		{name: "paused", state: "paused", wantDiscard: true},
+		{name: "dehydrated", state: "dehydrated", wantDiscard: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			timeout := 1
 			b := &fakeBackend{inspectInfo: InspectInfo{
-				State:      InspectState{Status: test.state},
 				Config:     InspectConfig{StopSignal: "SIGQUIT"},
 				HostConfig: InspectHostConfig{StopTimeout: &timeout},
+				TTC:        TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: "child", State: test.state}}}},
 			}}
 			var stdout, stderr bytes.Buffer
-			if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status != 0 {
+			if status := runCommand([]string{"restart", "web@child"}, &stdout, &stderr, b); status != 0 {
 				t.Fatalf("restart status=%d, stderr=%q", status, stderr.String())
 			}
-			if got, want := stdout.String(), "web\n"; got != want {
+			if got, want := stdout.String(), "web@child\n"; got != want {
 				t.Errorf("restart output=%q, want %q", got, want)
 			}
-			if got, want := b.startCalls, []startCall{{name: "web", detach: true}}; !reflect.DeepEqual(got, want) {
+			wantTarget := selector{container: "web", branch: "child"}
+			if got, want := b.startCalls, []startCall{{target: wantTarget, detach: true}}; !reflect.DeepEqual(got, want) {
 				t.Errorf("start calls=%+v, want %+v", got, want)
 			}
 			if got := len(b.signals) != 0; got != test.wantSignal {
 				t.Errorf("signals=%+v, wantSignal=%t", b.signals, test.wantSignal)
 			}
-			wantTarget := selector{container: "web", branch: "main"}
 			if test.wantSignal && (len(b.signals) != 1 || b.signals[0].target != wantTarget || b.signals[0].signal != 3) {
-				t.Errorf("restart signals=%+v, want configured main SIGQUIT", b.signals)
+				t.Errorf("restart signals=%+v, want configured child SIGQUIT", b.signals)
 			}
-			if test.wantResume && b.resumed != wantTarget {
-				t.Errorf("resumed=%+v, want %+v", b.resumed, wantTarget)
+			if test.wantDiscard != (b.discarded == wantTarget) {
+				t.Errorf("discarded=%+v, wantDiscard=%t", b.discarded, test.wantDiscard)
+			}
+			if b.resumed.container != "" {
+				t.Errorf("restart resumed branch: %+v", b.resumed)
 			}
 		})
 	}
 
-	descendantInfo := InspectInfo{
-		State: InspectState{Status: "running", Running: true},
+	peerInfo := InspectInfo{
 		TTC: TTCInspectInfo{Branches: []InspectBranch{
-			{Metadata: Branch{ID: "main", State: "running"}},
-			{Metadata: Branch{ID: "child", ParentID: "main", State: "running"}},
+			{Metadata: Branch{ID: "main", State: "exited"}},
+			{Metadata: Branch{ID: "child", State: "running"}},
 		}},
 	}
-	if got, want := restartDataLossReason(descendantInfo), `live descendant branch "child"`; got != want {
-		t.Errorf("descendant restart reason=%q, want %q", got, want)
-	}
-	b := &fakeBackend{inspectInfo: descendantInfo}
+	b := &fakeBackend{inspectInfo: peerInfo}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
-		t.Fatal("restart discarded a descendant without --force")
+	if status := runCommand([]string{"restart", "web@main"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("restart proceeded while a peer was active")
 	}
 	if len(b.signals) != 0 || len(b.startCalls) != 0 {
 		t.Errorf("rejected restart mutated backend: signals=%+v starts=%+v", b.signals, b.startCalls)
-	}
-	stdout.Reset()
-	stderr.Reset()
-	if status := runCommand([]string{"restart", "--force", "web"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("forced restart status=%d, stderr=%q", status, stderr.String())
 	}
 
 	b = &fakeBackend{}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"restart", "web@child"}, &stdout, &stderr, b); status == 0 {
-		t.Fatal("restart accepted an individual branch")
+	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("restart accepted a family name")
 	}
 }
 
@@ -2691,11 +2758,19 @@ if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 	exit 2
 fi
 if [ "$3" = "list" ]; then
+	if [ -e "$0.deleted" ]; then
+		echo '[]'
+		exit 0
+	fi
 	if [ -e "$0.stopped" ]; then
 		echo '[{"id":"web","pid":0,"status":"stopped"}]'
 	else
 		echo '[{"id":"web","pid":4321,"status":"running"}]'
 	fi
+	exit 0
+fi
+if [ "$3" = "delete" ] && [ "$4" = "--force" ] && [ "$5" = "web" ]; then
+	touch "$0.deleted"
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
@@ -3451,7 +3526,7 @@ type signalCall struct {
 }
 
 type startCall struct {
-	name        string
+	target      selector
 	detach      bool
 	interactive bool
 }
@@ -3478,6 +3553,12 @@ type fakeBackend struct {
 	unpublishedBinding ttcbundle.PortBinding
 	paused             selector
 	resumed            selector
+	preparedStop       selector
+	preparedStops      []selector
+	discarded          selector
+	discards           []selector
+	dehydratedTargets  []selector
+	rehydratedTargets  []selector
 	destroyed          selector
 	destroyForce       bool
 	signals            []signalCall
@@ -3499,7 +3580,7 @@ type fakeBackend struct {
 	containerID        string
 	runStatus          int
 	created            bool
-	started            string
+	started            selector
 	startCalls         []startCall
 	startDetach        bool
 	startInteractive   bool
@@ -3549,9 +3630,9 @@ func (b *fakeBackend) run(request runRequest) (containerRunResult, error) {
 	return containerRunResult{ID: b.resultID(request), Status: b.runStatus}, b.err
 }
 
-func (b *fakeBackend) start(name string, detach, interactive bool) (int, error) {
-	b.startCalls = append(b.startCalls, startCall{name: name, detach: detach, interactive: interactive})
-	b.started = name
+func (b *fakeBackend) start(target selector, detach, interactive bool) (int, error) {
+	b.startCalls = append(b.startCalls, startCall{target: target, detach: detach, interactive: interactive})
+	b.started = target
 	b.startDetach = detach
 	b.startInteractive = interactive
 	return b.runStatus, b.err
@@ -3691,6 +3772,28 @@ func (b *fakeBackend) pause(target selector) error {
 
 func (b *fakeBackend) resume(target selector) error {
 	b.resumed = target
+	return b.err
+}
+
+func (b *fakeBackend) prepareStop(target selector) error {
+	b.preparedStop = target
+	b.preparedStops = append(b.preparedStops, target)
+	return b.err
+}
+
+func (b *fakeBackend) discard(target selector) error {
+	b.discarded = target
+	b.discards = append(b.discards, target)
+	return b.err
+}
+
+func (b *fakeBackend) dehydrate(target selector) error {
+	b.dehydratedTargets = append(b.dehydratedTargets, target)
+	return b.err
+}
+
+func (b *fakeBackend) rehydrate(target selector) error {
+	b.rehydratedTargets = append(b.rehydratedTargets, target)
 	return b.err
 }
 
@@ -3954,7 +4057,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "cp", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
-		{args: []string{"_complete", "branch", "rm", ""}, want: []string{"-f", "--force", "demo@child", "demo@main"}, notWant: "demo@old"},
+		{args: []string{"_complete", "rm", ""}, want: []string{"-f", "--force", "demo", "demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "image", "inspect", "docker"}, want: []string{"docker.io/library/alpine:3.20"}},
 		{args: []string{"_complete", "exec", "wait", "demo@main", "exec-"}, want: []string{"exec-123"}},
 	}

@@ -123,7 +123,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-export <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
-		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
+		"timetravel [flags] <container-id> ps|size|signal|wait|prepare-stop <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
@@ -504,6 +504,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.RehydrateBranch(f.Arg(2))
 	case "destroy":
 		err = cont.Sandbox.DestroyBranch(f.Arg(2))
+	case "prepare-stop":
+		err = cont.Sandbox.PrepareStopBranch(f.Arg(2))
 	case "checkpoint":
 		if t.checkpointImagePath == "" {
 			util.Fatalf("--image-path is required for checkpoint")

@@ -107,7 +107,7 @@ The `ttc` command provides a Docker-like interface:
 - Interaction: `exec`, `attach`, `logs`, and `cp`
 - Inspection: `inspect`, `ps`, `top`, and `events`
 - Branching: `fork`, `pause`, `resume`, `dehydrate`, `rehydrate`, `checkpoint`,
-  `restore`, `branch rm`, and `ls --tree`
+  `restore`, branch-targeted `rm`, and `ls --tree`
 - Storage: `volume create`, `volume ls`, `volume inspect`, and `volume rm`
 - Shell completion for Bash, Zsh, and Fish
 
@@ -574,9 +574,9 @@ container family with no ancestry or mutable storage shared with the source.
   published host ports.
 - Virtual networking and published ports currently support IPv4; published
   ports currently support TCP.
-- A stopped child branch retains its filesystem for `ttc cp`, but its former
-  live process and memory state cannot be started again. Restarting a container
-  starts its main branch from its persistent configuration and filesystem.
+- Stopping a branch retains its filesystem, configuration, logs, and identity
+  but discards its former live process and memory state. It can be started
+  fresh with `ttc start CONTAINER@BRANCH`.
 - Read-only host binds remain shared live views during a fork. Ordinary
   writable host mounts also retain a live read-only host lower, while each
   branch has an independent persistent upper. A `:copy` mount is fully detached
@@ -611,6 +611,7 @@ the [audit](g3doc/proposals/timetravel_ttc_audit.md).
 ## Documentation
 
 - [End-user guide](g3doc/user_guide/timetravelcontainer.md)
+- [Branch state machine](g3doc/ttc_state_machine.md)
 - [Performance and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
 - [Distributed live-fork development and test plan](g3doc/proposals/ttc_distributed_live_fork.md)

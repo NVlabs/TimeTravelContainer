@@ -161,6 +161,9 @@ const (
 
 	// ContMgrDestroyBranch destroys one in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
+	// ContMgrPrepareStopBranch moves branch-unaware loader bookkeeping away
+	// from a branch that is about to terminate, when a peer survives.
+	ContMgrPrepareStopBranch = "containerManager.PrepareStopBranch"
 
 	// ContMgrBranchProcesses lists processes in one in-memory branch.
 	ContMgrBranchProcesses = "containerManager.BranchProcesses"
@@ -1218,6 +1221,11 @@ func (cm *containerManager) RehydrateBranch(args *BranchArgs, _ *struct{}) error
 // DestroyBranch destroys one branch.
 func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Destroy(args.ID)
+}
+
+// PrepareStopBranch makes stopping one branch independent from its peers.
+func (cm *containerManager) PrepareStopBranch(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.PrepareStop(args.ID)
 }
 
 // BranchProcesses returns processes from one branch.

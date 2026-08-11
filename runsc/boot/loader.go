@@ -916,6 +916,15 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("setting watchdog action: %w", err)
 	}
 	l.watchdog = watchdog.New(l.k, dogOpts)
+	initialBranchID := ""
+	initialFilesystemBranch := ""
+	if args.Spec.Annotations != nil {
+		initialBranchID = args.Spec.Annotations[specutils.AnnotationTTCInitialBranchID]
+		initialFilesystemBranch = args.Spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch]
+	}
+	if (initialBranchID == "") != (initialFilesystemBranch == "") {
+		return nil, fmt.Errorf("TTC initial branch annotations must be specified together")
+	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
@@ -934,6 +943,8 @@ func New(args Args) (*Loader, error) {
 				volume.repository.ForgetBranch(branch)
 			}
 		},
+		InitialBranchID:         initialBranchID,
+		InitialFilesystemBranch: initialFilesystemBranch,
 	})
 
 	if err := registerFilesystems(l.k, &l.root, l.rdmaSysfs); err != nil {

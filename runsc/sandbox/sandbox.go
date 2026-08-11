@@ -2341,6 +2341,15 @@ func (s *Sandbox) DestroyBranch(id string) error {
 	return nil
 }
 
+// PrepareStopBranch moves legacy loader bookkeeping away from a branch before
+// its init process is terminated.
+func (s *Sandbox) PrepareStopBranch(id string) error {
+	if err := s.call(boot.ContMgrPrepareStopBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("preparing live branch %q for stop: %w", id, err)
+	}
+	return nil
+}
+
 // BranchProcesses lists processes in one in-memory branch.
 func (s *Sandbox) BranchProcesses(branchID, cid string) ([]*control.Process, error) {
 	args := &boot.BranchProcessesArgs{BranchID: branchID, CID: cid}

@@ -38,6 +38,7 @@ func TestCommandEventsClassifyManagerOperations(t *testing.T) {
 		{[]string{"exec", "kill", "--signal", "TERM", "demo@child:exec-one"}, "exec", "kill", "demo@child:exec-one"},
 		{[]string{"unpause", "demo@child"}, "branch", "resume", "demo@child"},
 		{[]string{"container", "unpause", "demo@child"}, "branch", "resume", "demo@child"},
+		{[]string{"dehydrate", "demo@child"}, "branch", "dehydrate", "demo@child"},
 		{[]string{"run", "--name", "web", "nginx"}, "container", "run", "web"},
 		{[]string{"logs", "--tail", "10", "demo"}, "container", "logs", "demo"},
 	} {
@@ -238,7 +239,7 @@ func TestCommandEventsExposeExitAndDestroy(t *testing.T) {
 	}{
 		{[]string{"rm", "demo"}, "container", "destroy"},
 		{[]string{"image", "pull", "alpine"}, "image", "pull"},
-		{[]string{"branch", "rm", "demo@child"}, "branch", "destroy"},
+		{[]string{"rm", "demo@child"}, "branch", "destroy"},
 		{[]string{"exec", "wait", "demo@child:exec-one"}, "exec", "exit"},
 	} {
 		events := commandEvents(test.args, 0)

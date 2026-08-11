@@ -304,11 +304,11 @@ ttc pause web@test-a
 ttc resume web@test-a
 ttc kill --signal TERM web@test-a
 ttc wait web@test-a
-ttc branch rm web@test-a
+ttc rm web@test-a
 ```
 
-`branch rm` also accepts `web@main`; `main` is an ordinary branch name and its
-removal does not remove surviving peers.
+`rm` accepts `web@main`; `main` is an ordinary branch name and its removal does
+not remove surviving peers. Use `-f` to remove a running or paused branch.
 
 `ttc rm web` removes the whole family and requires all live branches to be
 stopped unless `--force` is used.

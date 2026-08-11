@@ -759,7 +759,6 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 
 type daemonStopTarget struct {
 	selector selector
-	state    string
 }
 
 func stopDaemonContainers(backend backend) error {
@@ -771,13 +770,12 @@ func stopDaemonContainers(backend backend) error {
 	for _, family := range families {
 		for _, branch := range family.Branches {
 			switch branch.State {
-			case "running", "paused", "restarting":
+			case "running", "paused", "dehydrated", "restarting":
 			default:
 				continue
 			}
 			targets = append(targets, daemonStopTarget{
 				selector: selector{container: family.ID, branch: branch.ID},
-				state:    branch.State,
 			})
 		}
 	}
@@ -789,12 +787,6 @@ func stopDaemonContainers(backend backend) error {
 	})
 	var stopErrors []error
 	for _, target := range targets {
-		if target.state == "paused" {
-			if err := backend.resume(target.selector); err != nil {
-				stopErrors = append(stopErrors, fmt.Errorf("resuming %s before stop: %w", target.selector, err))
-				continue
-			}
-		}
 		if err := runStop([]string{target.selector.String()}, io.Discard, io.Discard, backend); err != nil {
 			stopErrors = append(stopErrors, fmt.Errorf("stopping %s: %w", target.selector, err))
 		}
@@ -1878,8 +1870,6 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		return !daemonCommandBoolFlag(args[1:], 'a', "--attach")
 	case "image":
 		return len(args) > 1 && (args[1] == "pull" || args[1] == "rm" || args[1] == "remove")
-	case "branch":
-		return len(args) > 1 && (args[1] == "rm" || args[1] == "remove")
 	case "port":
 		return len(args) > 1 && (args[1] == "publish" || args[1] == "unpublish")
 	default:

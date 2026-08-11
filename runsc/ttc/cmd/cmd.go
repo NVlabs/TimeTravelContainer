@@ -308,7 +308,7 @@ Commands:
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
-  start [OPTIONS] CONTAINER      Start a prepared or exited container
+  start [OPTIONS] TARGET         Start a prepared or exited branch
   attach [OPTIONS] TARGET        Attach to a branch init or managed exec console
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
@@ -317,8 +317,8 @@ Commands:
   inspect [OPTIONS] CONTAINER... Show Docker and TTC branch/process state
   events [OPTIONS]               Stream durable manager lifecycle events
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
-  restart [OPTIONS] CONTAINER... Restart one or more container families
-  rm [--force] CONTAINER...      Remove container metadata and runtime state
+  restart [OPTIONS] TARGET...    Restart one or more branches
+  rm [--force] TARGET...         Remove branches or whole container families
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
@@ -327,12 +327,11 @@ Commands:
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
-  dehydrate TARGET...             Persist and release one or more branches
+  dehydrate TARGET...             Dehydrate branches or whole container families
   rehydrate TARGET...             Reconstruct one or more dehydrated branches
   unpause TARGET...               Resume branches (Docker alias)
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
-  stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
-  branch rm [-f|--force] TARGET... Destroy one or more branches
+  stop [OPTIONS] TARGET...        Stop branches or whole container families
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
@@ -358,7 +357,6 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container":  "Usage: ttc container COMMAND",
 			"image":      "Usage: ttc image COMMAND",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-			"branch":     "Usage: ttc branch rm [-f|--force] TARGET [TARGET...]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
 			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
@@ -383,7 +381,6 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container unpause": "Usage: ttc container unpause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container top":     "Usage: ttc container top CONTAINER@BRANCH [PS OPTIONS]",
 			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
-			"branch rm":         "Usage: ttc branch rm [-f|--force] TARGET [TARGET...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
@@ -458,8 +455,6 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runWait(args[1:], stdout, stderr, backend)
 	case "restart":
 		err = runRestart(args[1:], stdout, stderr, backend)
-	case "branch":
-		err = runBranch(args[1:], stdout, stderr, backend)
 	case "port":
 		err = runPort(args[1:], stdout, stderr, backend)
 	case "volume":
@@ -2015,7 +2010,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc start [--attach] CONTAINER [CONTAINER...]")
+		return errors.New("usage: ttc start [--attach] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
 	}
 	if *interactive && !*attach {
 		return errors.New("--interactive requires --attach")
@@ -2023,11 +2018,12 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 	if *attach && fs.NArg() != 1 {
 		return errors.New("--attach supports exactly one container")
 	}
-	for _, name := range fs.Args() {
-		if strings.Contains(name, "@") {
-			return fmt.Errorf("start accepts container families, not branch selector %q", name)
+	for _, value := range fs.Args() {
+		target, err := parseSelector(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
-		status, err := backend.start(name, !*attach, *interactive)
+		status, err := backend.start(target, !*attach, *interactive)
 		if err != nil {
 			return err
 		}
@@ -2035,7 +2031,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 			return exitStatus{code: status}
 		}
 		if !*attach {
-			fmt.Fprintln(stdout, name)
+			fmt.Fprintln(stdout, target)
 		}
 	}
 	return nil
@@ -2790,38 +2786,52 @@ func marshalInspectTemplateJSON(value any) ([]byte, error) {
 func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	force := fs.Bool("force", false, "force removal of a running container family")
-	fs.BoolVar(force, "f", false, "force removal of a running container family")
+	force := fs.Bool("force", false, "force removal of running branches")
+	fs.BoolVar(force, "f", false, "force removal of running branches")
 	volumes := fs.Bool("volumes", false, "remove anonymous volumes attached to the container")
 	fs.BoolVar(volumes, "v", false, "remove anonymous volumes attached to the container")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc rm [--force] [--volumes] CONTAINER [CONTAINER...]")
+		return errors.New("usage: ttc rm [--force] [--volumes] (CONTAINER|CONTAINER@BRANCH)...")
 	}
-	for _, name := range fs.Args() {
-		if strings.Contains(name, "@") {
-			return fmt.Errorf("rm removes a whole container family; use 'branch rm' for %q", name)
+	for _, value := range fs.Args() {
+		if strings.Contains(value, "@") {
+			if *volumes {
+				return fmt.Errorf("--volumes applies only when removing a whole container family, not %q", value)
+			}
+			target, err := parseSelector(value)
+			if err != nil {
+				return fmt.Errorf("invalid target %q: %w", value, err)
+			}
+			if err := backend.destroy(target, *force); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, target)
+			continue
 		}
-		if err := backend.remove(name, *force, *volumes); err != nil {
+		if err := backend.remove(value, *force, *volumes); err != nil {
 			return err
 		}
-		fmt.Fprintln(stdout, name)
+		fmt.Fprintln(stdout, value)
 	}
 	return nil
 }
 
 func runAutoRemove(args []string, backend backend) error {
-	if len(args) != 1 || strings.Contains(args[0], "@") {
-		return errors.New("internal auto-remove requires one container ID")
+	if len(args) != 1 {
+		return errors.New("internal auto-remove requires one branch selector")
 	}
-	target := selector{container: args[0], branch: defaultBranchID}
+	target, err := parseSelector(args[0])
+	if err != nil {
+		return fmt.Errorf("internal auto-remove target: %w", err)
+	}
 	if _, err := backend.wait(target); err != nil {
-		return fmt.Errorf("waiting to auto-remove %s: %w", args[0], err)
+		return fmt.Errorf("waiting to auto-remove %s: %w", target, err)
 	}
-	if err := backend.remove(args[0], true, true); err != nil {
-		return fmt.Errorf("auto-removing %s: %w", args[0], err)
+	if err := backend.remove(target.container, true, true); err != nil {
+		return fmt.Errorf("auto-removing %s: %w", target.container, err)
 	}
 	return nil
 }
@@ -3944,6 +3954,50 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+type branchOperationTarget struct {
+	selector selector
+	state    string
+}
+
+func branchOperationTargets(value string, backend backend, allowFamily bool) ([]branchOperationTarget, error) {
+	if strings.Contains(value, "@") {
+		target, err := parseSelector(value)
+		if err != nil {
+			return nil, err
+		}
+		info, err := backend.inspect(target.container)
+		if err != nil {
+			return nil, err
+		}
+		for _, branch := range info.TTC.Branches {
+			if branch.Metadata.ID == target.branch {
+				return []branchOperationTarget{{selector: target, state: normalizeLifecycleState(branch.Metadata.State)}}, nil
+			}
+		}
+		return nil, fmt.Errorf("branch %q does not exist", target.branch)
+	}
+	if !allowFamily {
+		return nil, fmt.Errorf("branch selector %q must be CONTAINER@BRANCH", value)
+	}
+	info, err := backend.inspect(value)
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]branchOperationTarget, 0, len(info.TTC.Branches))
+	for _, branch := range info.TTC.Branches {
+		state := normalizeLifecycleState(branch.Metadata.State)
+		if state == "deleted" {
+			continue
+		}
+		targets = append(targets, branchOperationTarget{
+			selector: selector{container: value, branch: branch.Metadata.ID},
+			state:    state,
+		})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].selector.branch < targets[j].selector.branch })
+	return targets, nil
+}
+
 func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool) error {
 	if len(args) == 0 {
 		if pause {
@@ -3972,28 +4026,40 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, dehydrate bool) error {
 	if len(args) == 0 {
 		if dehydrate {
-			return errors.New("usage: ttc dehydrate TARGET [TARGET...]")
+			return errors.New("usage: ttc dehydrate (CONTAINER|CONTAINER@BRANCH)...")
 		}
-		return errors.New("usage: ttc rehydrate TARGET [TARGET...]")
+		return errors.New("usage: ttc rehydrate CONTAINER@BRANCH [CONTAINER@BRANCH...]")
 	}
 	db, ok := backend.(dehydrationBackend)
 	if !ok {
 		return errors.New("this backend does not support dehydration")
 	}
-	for _, arg := range args {
-		target, err := parseSelector(arg)
+	for _, value := range args {
+		targets, err := branchOperationTargets(value, backend, dehydrate)
 		if err != nil {
-			return fmt.Errorf("invalid target %q: %w", arg, err)
+			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
-		if dehydrate {
-			err = db.dehydrate(target)
-		} else {
-			err = db.rehydrate(target)
+		for _, target := range targets {
+			if dehydrate {
+				switch target.state {
+				case "running", "paused":
+					err = db.dehydrate(target.selector)
+				case "created", "dehydrated", "exited", "failed", "dead":
+					continue
+				default:
+					return fmt.Errorf("cannot dehydrate %s in state %q", target.selector, target.state)
+				}
+			} else {
+				if target.state != "dehydrated" {
+					return fmt.Errorf("cannot rehydrate %s in state %q", target.selector, target.state)
+				}
+				err = db.rehydrate(target.selector)
+			}
+			if err != nil {
+				return fmt.Errorf("updating %s: %w", target.selector, err)
+			}
 		}
-		if err != nil {
-			return fmt.Errorf("updating %s: %w", target, err)
-		}
-		fmt.Fprintln(stdout, target)
+		fmt.Fprintln(stdout, value)
 	}
 	return nil
 }
@@ -4046,20 +4112,23 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc stop [--time SECONDS] TARGET [TARGET...]")
+		return errors.New("usage: ttc stop [--time SECONDS] (CONTAINER|CONTAINER@BRANCH)...")
 	}
 	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
 	if timeoutSet && timeout < -1 {
 		return errors.New("stop timeout must be -1 or greater")
 	}
-	for _, arg := range fs.Args() {
-		target, err := parseSelector(arg)
+	for _, value := range fs.Args() {
+		targets, err := branchOperationTargets(value, backend, true)
 		if err != nil {
-			return fmt.Errorf("invalid target %q: %w", arg, err)
+			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
-		info, err := backend.inspect(target.container)
+		if len(targets) == 0 {
+			return fmt.Errorf("container %q has no branches", value)
+		}
+		info, err := backend.inspect(targets[0].selector.container)
 		if err != nil {
-			return fmt.Errorf("inspecting %s before stop: %w", target.container, err)
+			return fmt.Errorf("inspecting %s before stop: %w", value, err)
 		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
@@ -4068,10 +4137,46 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		if timeoutSet {
 			stopTimeout = timeout
 		}
-		if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
+		for _, target := range targets {
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintln(stdout, value)
+	}
+	return nil
+}
+
+func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+	switch target.state {
+	case "running", "restarting":
+		if err := backend.prepareStop(target.selector); err != nil {
+			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
+			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				if discardErr := backend.discard(target.selector); discardErr == nil {
+					return nil
+				}
+			}
+			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
+		}
+		if err := stopBranch(target.selector, stopSignal, timeoutSeconds, backend); err != nil {
 			return err
 		}
-		fmt.Fprintln(stdout, target)
+		if err := backend.discard(target.selector); err != nil {
+			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
+		}
+	case "paused", "dehydrated":
+		if err := backend.discard(target.selector); err != nil {
+			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
+		}
+	case "exited":
+		if err := backend.discard(target.selector); err != nil {
+			return fmt.Errorf("releasing exited execution state for %s: %w", target.selector, err)
+		}
+	case "created", "failed", "dead":
+		return nil
+	default:
+		return fmt.Errorf("cannot stop %s in state %q", target.selector, target.state)
 	}
 	return nil
 }
@@ -4123,27 +4228,34 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	fs.IntVar(&timeout, "time", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "timeout", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "t", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
-	force := fs.Bool("force", false, "discard live descendant branches")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc restart [--time SECONDS] CONTAINER [CONTAINER...]")
+		return errors.New("usage: ttc restart [--time SECONDS] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
 	}
 	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
 	if timeoutSet && timeout < -1 {
 		return errors.New("restart timeout must be -1 or greater")
 	}
-	for _, name := range fs.Args() {
-		if strings.Contains(name, "@") {
-			return fmt.Errorf("restart accepts container families, not branch selector %q", name)
-		}
-		info, err := backend.inspect(name)
+	for _, value := range fs.Args() {
+		targets, err := branchOperationTargets(value, backend, false)
 		if err != nil {
-			return fmt.Errorf("inspecting %s before restart: %w", name, err)
+			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
-		if reason := restartDataLossReason(info); reason != "" && !*force {
-			return fmt.Errorf("restarting %q would discard %s; use --force", name, reason)
+		target := targets[0]
+		info, err := backend.inspect(target.selector.container)
+		if err != nil {
+			return fmt.Errorf("inspecting %s before restart: %w", target.selector, err)
+		}
+		for _, peer := range info.TTC.Branches {
+			if peer.Metadata.ID == target.selector.branch {
+				continue
+			}
+			switch normalizeLifecycleState(peer.Metadata.State) {
+			case "running", "paused", "restarting", "dehydrating", "rehydrating", "creating":
+				return fmt.Errorf("cannot restart %s while peer %s@%s is %s", target.selector, target.selector.container, peer.Metadata.ID, normalizeLifecycleState(peer.Metadata.State))
+			}
 		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
@@ -4152,47 +4264,25 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if timeoutSet {
 			stopTimeout = timeout
 		}
-		target := selector{container: name, branch: defaultBranchID}
-		switch info.State.Status {
-		case "paused":
-			if err := backend.resume(target); err != nil {
-				return fmt.Errorf("resuming %s before restart: %w", target, err)
-			}
-			if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
-				return err
-			}
-		case "running", "restarting":
-			if err := stopBranch(target, stopSignal, stopTimeout, backend); err != nil {
+		switch target.state {
+		case "running", "restarting", "paused", "dehydrated":
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
 				return err
 			}
 		case "created", "exited", "failed", "dead":
 		default:
-			return fmt.Errorf("cannot restart container %q in state %q", name, info.State.Status)
+			return fmt.Errorf("cannot restart %s in state %q", target.selector, target.state)
 		}
-		status, err := backend.start(name, true, false)
+		status, err := backend.start(target.selector, true, false)
 		if err != nil {
-			return fmt.Errorf("starting %s after restart: %w", name, err)
+			return fmt.Errorf("starting %s after restart: %w", target.selector, err)
 		}
 		if status != 0 {
 			return exitStatus{code: status}
 		}
-		fmt.Fprintln(stdout, name)
+		fmt.Fprintln(stdout, target.selector)
 	}
 	return nil
-}
-
-func restartDataLossReason(info InspectInfo) string {
-	switch info.State.Status {
-	case "running", "paused", "restarting":
-	default:
-		return ""
-	}
-	for _, branch := range info.TTC.Branches {
-		if branch.Metadata.ID != defaultBranchID {
-			return fmt.Sprintf("live descendant branch %q", branch.Metadata.ID)
-		}
-	}
-	return ""
 }
 
 type waitResult struct {
@@ -4222,6 +4312,9 @@ func stopPolicy(info InspectInfo) (int, int, error) {
 func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend) error {
 	const signalKill = 9
 	if err := backend.signal(target, stopSignal, false); err != nil {
+		if _, waitErr := backend.wait(target); waitErr == nil {
+			return nil
+		}
 		return fmt.Errorf("stopping %s with signal %d: %w", target, stopSignal, err)
 	}
 	waited := make(chan waitResult, 1)
@@ -4273,33 +4366,6 @@ func parseSignal(value string) (int, error) {
 		return 0, fmt.Errorf("unknown signal %q", value)
 	}
 	return int(signal), nil
-}
-
-func runBranch(args []string, stdout, stderr io.Writer, backend backend) error {
-	if len(args) < 2 || args[0] != "rm" {
-		return errors.New("usage: ttc branch rm [-f|--force] TARGET [TARGET...]")
-	}
-	fs := flag.NewFlagSet("branch rm", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	force := fs.Bool("force", false, "force removal of a running branch")
-	fs.BoolVar(force, "f", false, "force removal of a running branch")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
-	}
-	if fs.NArg() == 0 {
-		return errors.New("usage: ttc branch rm [-f|--force] TARGET [TARGET...]")
-	}
-	for _, arg := range fs.Args() {
-		target, err := parseSelector(arg)
-		if err != nil {
-			return fmt.Errorf("invalid target %q: %w", arg, err)
-		}
-		if err := backend.destroy(target, *force); err != nil {
-			return fmt.Errorf("removing %s: %w", target, err)
-		}
-		fmt.Fprintln(stdout, target)
-	}
-	return nil
 }
 
 func portBindingSpec(binding ttcbundle.PortBinding) string {
@@ -4651,7 +4717,7 @@ type backend interface {
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
 	create(request runRequest) (string, error)
 	run(request runRequest) (containerRunResult, error)
-	start(name string, detach, interactive bool) (int, error)
+	start(target selector, detach, interactive bool) (int, error)
 	attach(request attachRequest) (uint32, error)
 	logs(target selector, options logsOptions) error
 	exec(request execRequest) (int, error)
@@ -4670,6 +4736,8 @@ type backend interface {
 	unpublishPort(target selector, binding ttcbundle.PortBinding) error
 	pause(target selector) error
 	resume(target selector) error
+	prepareStop(target selector) error
+	discard(target selector) error
 	destroy(target selector, force bool) error
 	signal(target selector, signal int, all bool) error
 	wait(target selector) (uint32, error)
@@ -5140,12 +5208,13 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, err
 	}
 	id := prepared.Container.ID
-	status, err := b.launch(prepared.Container, request.detach, request.interactive)
+	target := selector{container: id, branch: defaultBranchID}
+	status, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
 	if err == nil {
-		b.recordLaunchState(id, request.detach, status)
+		b.recordLaunchState(target, request.detach, status)
 	}
 	if request.autoRemove {
-		status, err = b.applyAutoRemove(id, request.detach, status, err)
+		status, err = b.applyAutoRemove(target, request.detach, status, err)
 	}
 	return containerRunResult{ID: id, Status: status}, err
 }
@@ -5214,10 +5283,22 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	return prepared.Container.ID, nil
 }
 
-func (b *runtimeBackend) start(name string, detach, interactive bool) (int, error) {
-	info, err := b.resolveContainer(name)
+func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, error) {
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return 1, err
+	}
+	target = resolved
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return 1, err
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "created", "exited", "failed", "dead":
+	case "dehydrated":
+		return 1, fmt.Errorf("branch %s is dehydrated; use rehydrate to preserve it or stop it before starting fresh", target)
+	default:
+		return 1, fmt.Errorf("branch %s is %s", target, normalizeLifecycleState(branch.State))
 	}
 	// Waiting for the branch init process and tearing down its sandbox are
 	// separate events. In particular, a multi-process container may report its
@@ -5225,9 +5306,9 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 	// stopped. A restart must not race that short teardown window, but an
 	// ordinary attempt to start a persistently-running container should still
 	// fail immediately.
-	waitForTeardown := info.State == "exited" || info.State == "failed" || info.State == "dead"
+	waitForTeardown := true
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
-		return 1, err
+		return 1, fmt.Errorf("starting %s requires every peer to be process-free: %w", target, err)
 	}
 	if b.dataRoot != "" {
 		store := b.containerStore()
@@ -5238,30 +5319,47 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 		if _, err := store.PruneImageRoots(context.Background()); err != nil {
 			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
 		}
+		branch, err = persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return 1, err
+		}
 	}
-	status, err := b.launch(info, detach, interactive)
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		if target.branch == defaultBranchID {
+			filesystemBranch = ttcvolume.MainBranch
+		} else {
+			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
+		}
+	}
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareBranchStartBundle(info.ID, target.branch, filesystemBranch)
+	if err != nil {
+		return 1, err
+	}
+	defer cleanupBundle()
+	status, err := b.launch(info, target, bundleDir, detach, interactive)
 	if err == nil {
-		b.recordLaunchState(info.ID, detach, status)
+		b.recordLaunchState(target, detach, status)
 	}
 	if info.AutoRemove {
-		return b.applyAutoRemove(info.ID, detach, status, err)
+		return b.applyAutoRemove(target, detach, status, err)
 	}
 	return status, err
 }
 
-func (b *runtimeBackend) applyAutoRemove(id string, detach bool, status int, launchErr error) (int, error) {
+func (b *runtimeBackend) applyAutoRemove(target selector, detach bool, status int, launchErr error) (int, error) {
 	if detach && launchErr == nil && status == 0 {
-		if err := b.scheduleAutoRemove(id); err == nil {
+		if err := b.scheduleAutoRemove(target); err == nil {
 			return status, nil
 		} else {
-			cleanupErr := b.remove(id, true, true)
+			cleanupErr := b.remove(target.container, true, true)
 			if cleanupErr != nil {
 				return 1, fmt.Errorf("scheduling auto-remove: %w (cleanup also failed: %v)", err, cleanupErr)
 			}
 			return 1, fmt.Errorf("scheduling auto-remove: %w; container was removed", err)
 		}
 	}
-	cleanupErr := b.remove(id, true, true)
+	cleanupErr := b.remove(target.container, true, true)
 	if cleanupErr != nil {
 		if launchErr != nil {
 			return status, fmt.Errorf("%w (auto-remove also failed: %v)", launchErr, cleanupErr)
@@ -5271,7 +5369,7 @@ func (b *runtimeBackend) applyAutoRemove(id string, detach bool, status int, lau
 	return status, launchErr
 }
 
-func (b *runtimeBackend) scheduleAutoRemove(id string) error {
+func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 	executable := b.clientExecutable
 	if executable == "" {
 		executable = currentExecutable()
@@ -5288,13 +5386,13 @@ func (b *runtimeBackend) scheduleAutoRemove(id string) error {
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--unsafe-no-host-isolation")
 	}
-	args = append(args, "_auto-remove", id)
+	args = append(args, "_auto-remove", target.String())
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("opening auto-remove stdio: %w", err)
 	}
 	defer devNull.Close()
-	errorPath := filepath.Join(b.dataRoot, "containers", id, "auto-remove.error.log")
+	errorPath := filepath.Join(b.dataRoot, "containers", target.container, "auto-remove.error.log")
 	errorLog, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("opening auto-remove error log: %w", err)
@@ -6518,17 +6616,16 @@ func waitStatusExitCode(status uint32) int {
 	return 1
 }
 
-func (b *runtimeBackend) recordLaunchState(name string, detach bool, status int) {
+func (b *runtimeBackend) recordLaunchState(target selector, detach bool, status int) {
 	store := ttcbundle.Store{Root: b.dataRoot}
-	state := "exited"
-	var exitStatus *int
 	if detach && status == 0 {
-		state = "running"
+		if err := store.RecordBranchStart(target.container, target.branch); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: recording start state for %s: %v\n", target, err)
+		}
 	} else {
-		exitStatus = &status
-	}
-	if err := store.UpdateState(name, state, exitStatus); err != nil && b.stderr != nil {
-		fmt.Fprintf(b.stderr, "ttc: warning: recording state for %s: %v\n", name, err)
+		if err := store.StopBranch(target.container, target.branch, status); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: recording exit state for %s: %v\n", target, err)
+		}
 	}
 }
 
@@ -6949,6 +7046,14 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err != nil {
 		return err
 	}
+	if !force {
+		for _, branch := range info.Branches {
+			switch normalizeLifecycleState(branch.State) {
+			case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
+				return fmt.Errorf("branch %s@%s is %s; stop it or use --force", info.Name, branch.ID, normalizeLifecycleState(branch.State))
+			}
+		}
+	}
 	runtimeID := info.ID
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
@@ -6958,12 +7063,8 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		if family.ID != runtimeID {
 			continue
 		}
-		live := family.State != "stopped" && family.State != "exited"
-		if !force && live {
-			return fmt.Errorf("container %q is %s; stop it or use --force", name, family.State)
-		}
 		args := []string{"delete"}
-		if force {
+		if force || persistentFamilyProcessFree(info) {
 			args = append(args, "--force")
 		}
 		args = append(args, runtimeID)
@@ -7216,8 +7317,8 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 	return nil
 }
 
-func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, detach, interactive bool) (int, error) {
-	name, bundleDir := info.ID, info.BundleDir
+func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (int, error) {
+	name := info.ID
 	configuredArgs := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
@@ -7230,7 +7331,6 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, detach, interactiv
 		}
 		return 1, err
 	}
-	target := selector{container: name, branch: defaultBranchID}
 	startDrain := func(phase string) error {
 		if _, err := b.ensureConsoleDrain(target, true); err != nil {
 			return fmt.Errorf("starting console drain %s container start: %w", phase, err)
@@ -7255,7 +7355,7 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, detach, interactiv
 		}
 		return status, err
 	}
-	if err := b.ensurePublishedPortsForBranch(info, defaultBranchID); err != nil {
+	if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
 			return 1, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
@@ -7970,6 +8070,15 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 	return branches
 }
 
+func persistentBranchInfo(info ttcbundle.ContainerInfo, branchID string) (ttcbundle.BranchInfo, error) {
+	for _, branch := range info.Branches {
+		if branch.ID == branchID && branch.State != "deleted" {
+			return branch, nil
+		}
+	}
+	return ttcbundle.BranchInfo{}, fmt.Errorf("branch %q does not exist", branchID)
+}
+
 func mergeBranchHistory(history, live []Branch) []Branch {
 	byID := make(map[string]Branch, len(history)+len(live))
 	for _, branch := range history {
@@ -8193,6 +8302,134 @@ func (b *runtimeBackend) resume(target selector) error {
 	return err
 }
 
+func (b *runtimeBackend) prepareStop(target selector) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	_, err = b.command("timetravel", resolved.container, "prepare-stop", resolved.branch)
+	return err
+}
+
+// discard releases one branch's process/kernel/dehydration state while
+// retaining its persistent filesystem, logs, identity, and peer branches.
+func (b *runtimeBackend) discard(target selector) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	if _, err := persistentBranchInfo(info, target.branch); err != nil {
+		return err
+	}
+	store := b.containerStore()
+	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
+		if err := b.stopConsoleDrain(paths); err != nil {
+			return fmt.Errorf("stopping console follower for %s: %w", target, err)
+		}
+		for _, path := range []string{paths.PID} {
+			if path != "" {
+				_ = os.Remove(path)
+			}
+		}
+		if _, err := os.Stat(paths.WaitStatus); os.IsNotExist(err) {
+			status := uint32(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+			if err := os.WriteFile(paths.WaitStatus, []byte(strconv.FormatUint(uint64(status), 10)+"\n"), 0600); err != nil {
+				return fmt.Errorf("recording discarded wait status for %s: %w", target, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("checking wait status for %s: %w", target, err)
+		}
+	}
+	if sessions, sessionsErr := b.execSessions(target); sessionsErr == nil {
+		for _, session := range sessions {
+			if paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID); pathErr == nil {
+				if err := b.stopConsoleDrain(paths); err != nil {
+					return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
+				}
+			}
+		}
+	}
+	if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
+		return err
+	}
+
+	runtimeFamilies, listErr := b.listRuntimeFamilies()
+	if listErr != nil {
+		return fmt.Errorf("checking runtime state while discarding %s: %w", target, listErr)
+	}
+	for _, family := range runtimeFamilies {
+		if family.ID != info.ID {
+			continue
+		}
+		present := false
+		for _, branch := range family.Branches {
+			if branch.ID == target.branch {
+				present = true
+				break
+			}
+		}
+		if !present {
+			break
+		}
+		if len(family.Branches) == 1 || runtimeFamilyUnavailable(family) {
+			if _, err := b.command("delete", "--force", info.ID); err != nil {
+				return fmt.Errorf("releasing final runtime branch %s: %w", target, err)
+			}
+		} else if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+			return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
+		}
+		break
+	}
+
+	encodedBranch := hex.EncodeToString([]byte(target.branch))
+	for _, kind := range []string{"active", "dehydrated"} {
+		path := filepath.Join(b.dataRoot, "containers", info.ID, "memory", kind, encodedBranch)
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
+		}
+	}
+	if err := store.StopBranch(info.ID, target.branch, 128+int(linux.SIGKILL)); err != nil {
+		return err
+	}
+	latest, err := store.LoadContainer(info.ID)
+	if err != nil {
+		return err
+	}
+	return b.deleteRuntimeIfProcessFree(latest)
+}
+
+func persistentFamilyProcessFree(info ttcbundle.ContainerInfo) bool {
+	for _, branch := range info.Branches {
+		switch normalizeLifecycleState(branch.State) {
+		case "created", "dehydrated", "exited", "failed", "dead", "deleted":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo) error {
+	if !persistentFamilyProcessFree(info) {
+		return nil
+	}
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("checking process-free runtime %q: %w", info.Name, err)
+	}
+	for _, family := range families {
+		if family.ID != info.ID {
+			continue
+		}
+		if _, err := b.command("delete", "--force", info.ID); err != nil {
+			return fmt.Errorf("deleting process-free runtime %q: %w", info.Name, err)
+		}
+		break
+	}
+	return nil
+}
+
 func (b *runtimeBackend) dehydrate(target selector) error {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -8356,9 +8593,10 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		allCold := len(latest.Branches) != 0
 		for _, branch := range latest.Branches {
-			if branch.State != "deleted" && branch.State != "dehydrated" {
+			switch normalizeLifecycleState(branch.State) {
+			case "created", "dehydrated", "exited", "failed", "dead", "deleted":
+			default:
 				allCold = false
-				break
 			}
 		}
 		if allCold {
@@ -8766,7 +9004,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		return fmt.Errorf("branch %q does not exist", target.branch)
 	}
 	switch normalizeLifecycleState(recorded.State) {
-	case "running", "paused", "creating", "dehydrating", "rehydrating":
+	case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
 		if !force {
 			return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
 		}
@@ -8859,6 +9097,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("persisting deletion of %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
+		}
+		latest, err := store.LoadContainer(target.container)
+		if err != nil {
+			return err
+		}
+		if err := b.deleteRuntimeIfProcessFree(latest); err != nil {
+			return err
 		}
 	}
 	return portErr
@@ -8954,9 +9199,6 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	if info, err := store.LoadContainer(target.container); err == nil {
 		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
-		}
-		if err := store.RemovePortBindingsForBranch(target.container, target.branch); err != nil && b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: removing published-port metadata for exited %s: %v\n", target, err)
 		}
 	}
 	exitStatus := waitStatusExitCode(status)
