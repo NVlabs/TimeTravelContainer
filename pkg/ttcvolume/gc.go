@@ -122,6 +122,14 @@ func (r *Repository) garbageCollectLocked() error {
 			continue
 		}
 		if _, ok := reachableLayers[entry.Name()]; ok {
+			// Format 2 briefly wrote per-inode and per-dentry lookup caches.
+			// Journals have always been authoritative, so these directories are
+			// safe to reclaim when a new runtime next collects the repository.
+			for _, obsolete := range []string{"inodes", "dirents"} {
+				if err := os.RemoveAll(filepath.Join(r.path, "layers", entry.Name(), obsolete)); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		r.journalMu.Lock()

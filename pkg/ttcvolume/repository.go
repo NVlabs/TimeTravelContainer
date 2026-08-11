@@ -14,8 +14,7 @@
 
 // Package ttcvolume implements TTC's persistent, branchable managed-volume
 // repository. Namespace metadata is stored in transactional, branchable
-// journals and materialized into sharded host directories, while regular-file
-// contents live in opaque host files.
+// journals, while regular-file contents live in opaque host files.
 package ttcvolume
 
 import (
@@ -230,17 +229,15 @@ type Repository struct {
 	packRead  int64
 
 	// Ordinary Linux namespace mutations are not durable until fsync(2),
-	// sync(2), or filesystem teardown. Track atomically published metadata
-	// files that still need their contents made durable. This avoids turning
-	// each guest create/rename into fsyncs for every radix-trie ancestor.
+	// sync(2), or filesystem teardown. Track journal and pointer files that
+	// still need their contents made durable.
 	dirtyMu    sync.Mutex
 	dirtyFiles map[string]struct{}
 	dirtyDirs  map[string]struct{}
 	knownDirs  map[string]struct{}
 
 	// metadata is the decoded view of each locally-used branch. The journal is
-	// authoritative; sharded inode and dentry files are rebuildable lookup
-	// materializations and never participate in fork-time copying.
+	// authoritative and is replayed when a branch first becomes active.
 	metadataMu sync.Mutex
 	metadata   map[string]*branchMetadata
 	allocNext  uint64
@@ -248,10 +245,6 @@ type Repository struct {
 
 	operationMu sync.Mutex
 	lockFile    *os.File
-
-	materializeOnce sync.Once
-	materializeCh   chan materializeRequest
-	materializeWG   sync.WaitGroup
 
 	branchMu    sync.Mutex
 	branchCache map[string]cachedBranch
@@ -537,11 +530,6 @@ func (r *Repository) Close() error {
 	if r == nil || r.dir == nil {
 		return nil
 	}
-	if r.materializeCh != nil {
-		close(r.materializeCh)
-		r.materializeWG.Wait()
-		r.materializeCh = nil
-	}
 	r.packMu.Lock()
 	var packErr error
 	if r.pack != nil {
@@ -814,16 +802,12 @@ func (r *Repository) RemoveBranch(id string) error {
 // ForgetBranch releases process-local caches for a branch whose Kernel has
 // been released. It does not alter the persistent branch pointer; ttcd removes
 // that pointer separately, or a later rehydration reloads it on demand.
-//
-// The materialization barrier prevents the asynchronous lookup cache from
-// recreating a layer after manager-side garbage collection has removed it.
 func (r *Repository) ForgetBranch(id string) {
 	if r == nil || validateName(id, "branch") != nil {
 		return
 	}
 	r.operationMu.Lock()
 	defer r.operationMu.Unlock()
-	r.flushMaterialization()
 
 	r.metadataMu.Lock()
 	var layers []string
@@ -1644,12 +1628,6 @@ func (r *Repository) syncMetadataLocked() error {
 	r.dirtyMu.Lock()
 	var journals, rootDirty, branchDirty []string
 	for name := range r.dirtyFiles {
-		// Sharded inode/dentry files are a rebuildable materialization of the
-		// journal. Synchronizing every one would reproduce the metadata fsync
-		// amplification that this format replaces.
-		if strings.HasPrefix(name, "layers/") && !strings.HasSuffix(name, "/journal") && !strings.HasSuffix(name, "/layer.json") {
-			continue
-		}
 		switch {
 		case strings.HasSuffix(name, "/journal"):
 			journals = append(journals, name)

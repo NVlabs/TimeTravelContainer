@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -110,7 +112,7 @@ func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
 	}
 }
 
-func TestJournalRecoversMissingMaterializedMetadata(t *testing.T) {
+func TestJournalRecoversMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("packed-nodes")
 	if err != nil {
@@ -124,22 +126,8 @@ func TestJournalRecoversMissingMaterializedMetadata(t *testing.T) {
 	if err := repo.SyncMetadata(); err != nil {
 		t.Fatal(err)
 	}
-	path := repo.path
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
-	}
-	var branch Branch
-	if err := readJSON(filepath.Join(path, "branches", MainBranch+".json"), &branch); err != nil {
-		t.Fatal(err)
-	}
-	for _, kind := range []string{"inodes", "dirents"} {
-		materialized := filepath.Join(path, "layers", branch.Root, kind)
-		if err := os.RemoveAll(materialized); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(materialized, 0700); err != nil {
-			t.Fatal(err)
-		}
 	}
 	repo, err = manager.Open("packed-nodes")
 	if err != nil {
@@ -697,17 +685,13 @@ func TestMutationAppendsOneBoundedJournalTransactionAndForkCopiesNoMetadata(t *t
 	}
 }
 
-func TestCloseDrainsShardedMetadataMaterialization(t *testing.T) {
+func TestMetadataUsesJournalWithoutPerEntryFiles(t *testing.T) {
 	manager := openTestManager(t)
-	repo, err := manager.Create("materialized")
+	repo, err := manager.Create("journal-only")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ino, err := repo.CreateRegular(MainBranch, RootInode, "a-very-long-guest-name", 0644, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, err := repo.Inode(MainBranch, ino)
+	_, err = repo.CreateRegular(MainBranch, RootInode, "a-very-long-guest-name", 0644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,14 +703,17 @@ func TestCloseDrainsShardedMetadataMaterialization(t *testing.T) {
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{
-		filepath.Join(root, inodeMaterializedPath(branch.Root, ino)),
-		filepath.Join(root, entryMaterializedPath(branch.Root, RootInode, "a-very-long-guest-name")),
-		filepath.Join(root, "objects", meta.Object[:2], meta.Object[2:4], meta.Object),
-	} {
-		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
-			t.Fatalf("sharded record %q: info=%v err=%v", path, info, err)
-		}
+	entries, err := os.ReadDir(filepath.Join(root, "layers", branch.Root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	if got, want := strings.Join(names, ","), "journal,layer.json"; got != want {
+		t.Fatalf("metadata layer entries=%q, want %q", got, want)
 	}
 }
 

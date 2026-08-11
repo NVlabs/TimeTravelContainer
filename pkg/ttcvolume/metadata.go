@@ -16,7 +16,6 @@ package ttcvolume
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -74,6 +73,7 @@ type branchMetadata struct {
 	layers       []string
 	inodes       map[uint64]Inode
 	entries      map[metadataEntryKey]DirectoryEntry
+	directories  map[uint64]map[string]DirectoryEntry
 	nextSequence uint64
 	layerSizes   map[string]int64
 }
@@ -81,7 +81,7 @@ type branchMetadata struct {
 func newBranchMetadata(branch Branch) *branchMetadata {
 	return &branchMetadata{
 		branch: branch, inodes: make(map[uint64]Inode),
-		entries: make(map[metadataEntryKey]DirectoryEntry),
+		entries: make(map[metadataEntryKey]DirectoryEntry), directories: make(map[uint64]map[string]DirectoryEntry),
 		// Sequence numbers are local to a layer and start at one.
 		nextSequence: 1, layerSizes: make(map[string]int64),
 	}
@@ -254,11 +254,6 @@ func (r *Repository) createMetadataLayer(parent string) (string, error) {
 	name := filepath.Join("layers", id)
 	if err := r.mkdir(name, 0700); err != nil {
 		return "", err
-	}
-	for _, child := range []string{"inodes", "dirents"} {
-		if err := r.mkdir(filepath.Join(name, child), 0700); err != nil {
-			return "", err
-		}
 	}
 	if err := r.writeJSONAtomic(filepath.Join(name, "layer.json"), metadataLayer{Parent: parent}); err != nil {
 		return "", err
@@ -584,10 +579,6 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	state.branch = *branch
 	state.mu.Unlock()
 	r.markDirtyFile(journalName)
-	// Materialized records are deliberately not synchronization points. Apply
-	// them off the guest syscall path; the journal replays whole transactions
-	// after a crash and repairs any partial cache update.
-	r.enqueueMaterialization(branch.Root, transaction.Sequence, ops)
 	return nil
 }
 
@@ -608,121 +599,30 @@ func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
 			if op.Entry == nil || op.Parent == 0 || validateEntryName(op.Entry.Name) != nil || op.Entry.Inode == 0 {
 				return errors.New("invalid set-entry operation")
 			}
-			state.entries[metadataEntryKey{Parent: op.Parent, Name: op.Entry.Name}] = *op.Entry
+			key := metadataEntryKey{Parent: op.Parent, Name: op.Entry.Name}
+			state.entries[key] = *op.Entry
+			directory := state.directories[op.Parent]
+			if directory == nil {
+				directory = make(map[string]DirectoryEntry)
+				state.directories[op.Parent] = directory
+			}
+			directory[op.Entry.Name] = *op.Entry
 		case metadataDeleteEntry:
 			if op.Parent == 0 || validateEntryName(op.Name) != nil {
 				return errors.New("invalid delete-entry operation")
 			}
 			delete(state.entries, metadataEntryKey{Parent: op.Parent, Name: op.Name})
+			if directory := state.directories[op.Parent]; directory != nil {
+				delete(directory, op.Name)
+				if len(directory) == 0 {
+					delete(state.directories, op.Parent)
+				}
+			}
 		default:
 			return fmt.Errorf("unknown metadata operation %q", op.Kind)
 		}
 	}
 	return nil
-}
-
-type materializedMetadata struct {
-	Sequence uint64     `json:"sequence"`
-	Op       metadataOp `json:"op"`
-}
-
-type materializeRequest struct {
-	layer    string
-	sequence uint64
-	ops      []metadataOp
-	done     chan struct{}
-}
-
-func (r *Repository) enqueueMaterialization(layer string, sequence uint64, ops []metadataOp) {
-	r.materializeOnce.Do(func() {
-		r.materializeCh = make(chan materializeRequest, 65536)
-		r.materializeWG.Add(1)
-		go func() {
-			defer r.materializeWG.Done()
-			for request := range r.materializeCh {
-				for _, op := range request.ops {
-					// Materialized files are only a rebuildable lookup cache. A
-					// failure never changes the committed journal transaction and
-					// replay can repair or regenerate the cache later.
-					_ = r.materializeMetadataOp(request.layer, request.sequence, op)
-				}
-				if request.done != nil {
-					close(request.done)
-				}
-			}
-		}()
-	})
-	cloned := make([]metadataOp, len(ops))
-	for i, op := range ops {
-		cloned[i] = op
-		if op.Inode != nil {
-			inode := *op.Inode
-			if op.Inode.Xattrs != nil {
-				inode.Xattrs = make(map[string]string, len(op.Inode.Xattrs))
-				for name, value := range op.Inode.Xattrs {
-					inode.Xattrs[name] = value
-				}
-			}
-			cloned[i].Inode = &inode
-		}
-		if op.Entry != nil {
-			entry := *op.Entry
-			cloned[i].Entry = &entry
-		}
-	}
-	r.materializeCh <- materializeRequest{layer: layer, sequence: sequence, ops: cloned}
-}
-
-// flushMaterialization waits until every lookup-cache update queued before the
-// call has finished. Callers serialize producers with operationMu before using
-// this barrier.
-func (r *Repository) flushMaterialization() {
-	if r.materializeCh == nil {
-		return
-	}
-	done := make(chan struct{})
-	r.materializeCh <- materializeRequest{done: done}
-	<-done
-}
-
-func (r *Repository) materializeMetadataOp(layer string, sequence uint64, op metadataOp) error {
-	var name string
-	switch op.Kind {
-	case metadataSetInode:
-		name = inodeMaterializedPath(layer, op.Inode.Number)
-	case metadataDeleteInode:
-		name = inodeMaterializedPath(layer, op.Number)
-	case metadataSetEntry:
-		name = entryMaterializedPath(layer, op.Parent, op.Entry.Name)
-	case metadataDeleteEntry:
-		name = entryMaterializedPath(layer, op.Parent, op.Name)
-	default:
-		return fmt.Errorf("cannot materialize metadata operation %q", op.Kind)
-	}
-	if err := r.mkdirAll(filepath.Dir(name), 0700); err != nil {
-		return err
-	}
-	data, err := json.Marshal(materializedMetadata{Sequence: sequence, Op: op})
-	if err != nil {
-		return err
-	}
-	return r.atomicWriteFile(name, append(data, '\n'), 0600)
-}
-
-func inodeMaterializedPath(layer string, ino uint64) string {
-	hexIno := fmt.Sprintf("%016x", ino)
-	return filepath.Join("layers", layer, "inodes", hexIno[:2], hexIno[2:4], hexIno+".json")
-}
-
-func entryMaterializedPath(layer string, parent uint64, name string) string {
-	hash := sha256.Sum256([]byte(name))
-	encoded := hex.EncodeToString(hash[:])
-	parentHex := fmt.Sprintf("%016x", parent)
-	// Parent inodes are sharded across the repository; entries in one virtual
-	// directory share a host directory. Modern host filesystems index such
-	// directories efficiently, and avoiding a mostly-empty hash-bucket
-	// directory per guest name is important for package-install workloads.
-	return filepath.Join("layers", layer, "dirents", parentHex[:2], parentHex[2:4], parentHex, encoded+".json")
 }
 
 func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, error) {
@@ -748,11 +648,10 @@ func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name s
 func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) []DirectoryEntry {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
-	entries := make([]DirectoryEntry, 0)
-	for key, entry := range state.entries {
-		if key.Parent == parent {
-			entries = append(entries, entry)
-		}
+	directory := state.directories[parent]
+	entries := make([]DirectoryEntry, 0, len(directory))
+	for _, entry := range directory {
+		entries = append(entries, entry)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries
@@ -864,12 +763,4 @@ func (r *Repository) openObject(id string, flags int) (*os.File, error) {
 		return r.openFile(filepath.Join("objects", id), flags, 0)
 	}
 	return file, err
-}
-
-func parseMaterializedInodeName(name string) (uint64, bool) {
-	if !strings.HasSuffix(name, ".json") {
-		return 0, false
-	}
-	ino, err := strconv.ParseUint(strings.TrimSuffix(name, ".json"), 16, 64)
-	return ino, err == nil && ino != 0
 }
