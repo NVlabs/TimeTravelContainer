@@ -270,9 +270,7 @@ func familyAndBranchCompletionCandidates(backend backend) ([]string, error) {
 		name := familyDisplayName(family)
 		candidates = append(candidates, name)
 		for _, branch := range family.Branches {
-			if branch.State != "deleted" {
-				candidates = append(candidates, name+"@"+branch.ID)
-			}
+			candidates = append(candidates, name+"@"+branch.ID)
 		}
 	}
 	return candidates, nil
@@ -291,7 +289,7 @@ func familyCompletionCandidates(backend backend, branches, includeMain bool) ([]
 			continue
 		}
 		for _, branch := range family.Branches {
-			if branch.State == "deleted" || (!includeMain && branch.ID == defaultBranchID) {
+			if !includeMain && branch.ID == defaultBranchID {
 				continue
 			}
 			candidates = append(candidates, name+"@"+branch.ID)

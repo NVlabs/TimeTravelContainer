@@ -812,7 +812,7 @@ func dehydrateDaemonContainers(backend backend) error {
 				if err := db.dehydrate(selector{container: family.ID, branch: branch.ID}); err != nil {
 					return fmt.Errorf("dehydrating %s@%s: %w", family.ID, branch.ID, err)
 				}
-			case "dehydrated", "exited", "stopped", "deleted", "created":
+			case "dehydrated", "exited", "stopped", "created":
 			default:
 				return fmt.Errorf("branch %s@%s is %s", family.ID, branch.ID, branch.State)
 			}

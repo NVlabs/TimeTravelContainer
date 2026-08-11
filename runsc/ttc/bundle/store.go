@@ -131,7 +131,7 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	} else {
 		var branch *BranchInfo
 		for i := range info.Branches {
-			if info.Branches[i].ID == branchID && info.Branches[i].State != "deleted" {
+			if info.Branches[i].ID == branchID {
 				branch = &info.Branches[i]
 				break
 			}
@@ -241,14 +241,13 @@ type BranchInfo struct {
 	ID string `json:"id"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
-	ParentID         string     `json:"parent_id,omitempty"`
-	FilesystemBranch string     `json:"filesystem_branch,omitempty"`
-	State            string     `json:"state"`
-	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64      `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64      `json:"kernel_fork_ns,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+	ParentID         string    `json:"parent_id,omitempty"`
+	FilesystemBranch string    `json:"filesystem_branch,omitempty"`
+	State            string    `json:"state"`
+	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
@@ -1970,7 +1969,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if len(info.Branches) == 0 {
 		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, CreatedAt: info.CreatedAt}}
 	}
-	info.Branches = compactDeletedBranchLineage(info.Branches)
 	seenBranches := make(map[string]struct{}, len(info.Branches))
 	for i := range info.Branches {
 		branch := &info.Branches[i]
@@ -2000,7 +1998,7 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
 		}
 		if _, ok := seenBranches[binding.BranchID]; !ok {
-			// Pre-compaction releases retained bindings for deleted branches.
+			// Drop bindings whose branch no longer exists.
 			continue
 		}
 		endpoint := portHostEndpoint(binding)
@@ -2051,79 +2049,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}
 	return info, nil
-}
-
-// compactDeletedBranchLineage upgrades the pre-release tombstone model in
-// memory. Surviving children are spliced through any deleted ancestors, so
-// future writes persist a bounded branch list and immediately free old names.
-func compactDeletedBranchLineage(branches []BranchInfo) []BranchInfo {
-	deletedParents := make(map[string]string)
-	for _, branch := range branches {
-		if branch.State == "deleted" {
-			deletedParents[branch.ID] = branch.ParentID
-		}
-	}
-	resolveParent := func(parent string) string {
-		seen := make(map[string]struct{})
-		for parent != "" {
-			next, deleted := deletedParents[parent]
-			if !deleted {
-				break
-			}
-			if _, duplicate := seen[parent]; duplicate {
-				return ""
-			}
-			seen[parent] = struct{}{}
-			parent = next
-		}
-		return parent
-	}
-	compacted := make([]BranchInfo, 0, len(branches)-len(deletedParents))
-	for _, branch := range branches {
-		if branch.State == "deleted" {
-			continue
-		}
-		branch.ParentID = resolveParent(branch.ParentID)
-		branch.DeletedAt = nil
-		compacted = append(compacted, branch)
-	}
-	return compacted
-}
-
-// LegacyDeletedBranch returns a tombstone written by the pre-release immutable
-// lineage implementation. Current TTC releases remove records outright; this
-// lookup exists so the first reuse of an old name can reclaim its persistent
-// filesystem pointer before asking the Sentry to fork it again.
-func (s Store) LegacyDeletedBranch(name, branchID string) (BranchInfo, bool, error) {
-	if err := validateObjectName("branch", branchID); err != nil {
-		return BranchInfo{}, false, err
-	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return BranchInfo{}, false, err
-	}
-	data, err := os.ReadFile(filepath.Join(s.Root, "containers", info.ID, "container.json"))
-	if err != nil {
-		return BranchInfo{}, false, err
-	}
-	var raw ContainerInfo
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return BranchInfo{}, false, err
-	}
-	for _, branch := range raw.Branches {
-		if branch.ID != branchID || branch.State != "deleted" {
-			continue
-		}
-		if branch.FilesystemBranch == "" {
-			if branch.ID == "main" {
-				branch.FilesystemBranch = ttcvolume.MainBranch
-			} else {
-				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
-			}
-		}
-		return branch, true, nil
-	}
-	return BranchInfo{}, false, nil
 }
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
@@ -2495,9 +2420,6 @@ func recomputeContainerState(info *ContainerInfo) {
 	state := "exited"
 	best := 0
 	for _, branch := range info.Branches {
-		if branch.State == "deleted" {
-			continue
-		}
 		if rank := priority[branch.State]; rank > best {
 			state, best = branch.State, rank
 		}
@@ -2519,9 +2441,6 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 		if info.Branches[i].ID != branchID {
 			continue
 		}
-		if info.Branches[i].State == "deleted" {
-			return fmt.Errorf("branch %q is deleted", branchID)
-		}
 		info.Branches[i].State = state
 		recomputeContainerState(&info)
 		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
@@ -2542,9 +2461,6 @@ func (s Store) RecordBranchStart(name, branchID string) error {
 		branch := &info.Branches[i]
 		if branch.ID != branchID {
 			continue
-		}
-		if branch.State == "deleted" {
-			return fmt.Errorf("branch %q is deleted", branchID)
 		}
 		branch.State = "running"
 		info.StartedAt = &now
@@ -2569,9 +2485,6 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 		branch := &info.Branches[i]
 		if branch.ID != branchID {
 			continue
-		}
-		if branch.State == "deleted" {
-			return fmt.Errorf("branch %q is deleted", branchID)
 		}
 		alreadyExited = branch.State == "exited" || branch.State == "stopped"
 		branch.State = "exited"
@@ -2608,7 +2521,7 @@ func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
 			continue
 		}
 		found = true
-		if branch.State == "deleted" || branch.State == "dehydrated" {
+		if branch.State == "dehydrated" {
 			return nil
 		}
 		branch.State = "exited"

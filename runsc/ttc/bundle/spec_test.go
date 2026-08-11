@@ -1737,46 +1737,6 @@ func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	}
 }
 
-func TestLegacyDeletedBranchSurvivesReadCompactionForCleanup(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	containerDir := filepath.Join(root, "containers", "demo")
-	bundleDir := filepath.Join(containerDir, "bundle")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	info := ContainerInfo{
-		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "running",
-		Branches: []BranchInfo{
-			{ID: "main", State: "running"},
-			{ID: "old", ParentID: "main", State: "deleted"},
-		},
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := store.LoadContainer("demo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(loaded.Branches) != 1 || loaded.Branches[0].ID != "main" {
-		t.Fatalf("read compaction exposed tombstone: %+v", loaded.Branches)
-	}
-	legacy, found, err := store.LegacyDeletedBranch("demo", "old")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found || legacy.FilesystemBranch != ttcvolume.ScopedBranchID("demo", "old") {
-		t.Fatalf("legacy branch=(%+v, %t)", legacy, found)
-	}
-	if _, found, err := store.LegacyDeletedBranch("demo", "new"); err != nil || found {
-		t.Fatalf("nonexistent legacy branch found=%t err=%v", found, err)
-	}
-}
-
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}

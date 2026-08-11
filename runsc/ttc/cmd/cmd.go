@@ -2833,13 +2833,7 @@ func autoRemoveTarget(target selector, backend backend) error {
 	if err != nil {
 		return err
 	}
-	branches := 0
-	for _, branch := range info.TTC.Branches {
-		if normalizeLifecycleState(branch.Metadata.State) != "deleted" {
-			branches++
-		}
-	}
-	if branches <= 1 {
+	if len(info.TTC.Branches) <= 1 {
 		return backend.remove(target.container, true, true)
 	}
 	return backend.destroy(target, true)
@@ -3515,9 +3509,6 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 		}
 		displayName := familyDisplayName(family)
 		for _, branch := range family.Branches {
-			if branch.State == "deleted" {
-				continue
-			}
 			created := branch.CreatedAt
 			if created.IsZero() {
 				created = family.CreatedAt
@@ -3995,9 +3986,6 @@ func branchOperationTargets(value string, backend backend, allowFamily bool) ([]
 	targets := make([]branchOperationTarget, 0, len(info.TTC.Branches))
 	for _, branch := range info.TTC.Branches {
 		state := normalizeLifecycleState(branch.Metadata.State)
-		if state == "deleted" {
-			continue
-		}
 		targets = append(targets, branchOperationTarget{
 			selector: selector{container: value, branch: branch.Metadata.ID},
 			state:    state,
@@ -4533,17 +4521,16 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
-	ID               string     `json:"id"`
-	ParentID         string     `json:"parent_id,omitempty"`
-	State            string     `json:"state"`
-	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64      `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64      `json:"kernel_fork_ns,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
-	InitPID          int32      `json:"init_pid,omitempty"`
-	InitState        string     `json:"init_state,omitempty"`
-	MemorySharing    string     `json:"memory_sharing,omitempty"`
+	ID               string    `json:"id"`
+	ParentID         string    `json:"parent_id,omitempty"`
+	State            string    `json:"state"`
+	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	InitPID          int32     `json:"init_pid,omitempty"`
+	InitState        string    `json:"init_state,omitempty"`
+	MemorySharing    string    `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttc ls --json.
@@ -5368,7 +5355,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 func freshStartPeers(info ttcbundle.ContainerInfo, target selector) ([]selector, error) {
 	peers := make([]selector, 0, len(info.Branches))
 	for _, branch := range info.Branches {
-		if branch.ID == target.branch || branch.State == "deleted" {
+		if branch.ID == target.branch {
 			continue
 		}
 		switch normalizeLifecycleState(branch.State) {
@@ -8154,8 +8141,6 @@ func enrichPersistentBranchDiagnostics(family *Family) {
 			switch branch.State {
 			case "created", "creating":
 				branch.InitState = "not-started"
-			case "deleted":
-				branch.InitState = "deleted"
 			case "exited", "stopped", "failed":
 				branch.InitState = "exited"
 			default:
@@ -8166,7 +8151,7 @@ func enrichPersistentBranchDiagnostics(family *Family) {
 			switch branch.State {
 			case "created", "creating":
 				branch.MemorySharing = "unallocated"
-			case "deleted", "exited", "stopped", "failed":
+			case "exited", "stopped", "failed":
 				branch.MemorySharing = "released"
 			default:
 				branch.MemorySharing = "unknown"
@@ -8321,7 +8306,7 @@ func normalizeLifecycleState(state string) string {
 
 func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
-		ID: info.ID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt, DeletedAt: info.DeletedAt,
+		ID: info.ID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
 		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 	}
 }
@@ -8336,7 +8321,7 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 
 func persistentBranchInfo(info ttcbundle.ContainerInfo, branchID string) (ttcbundle.BranchInfo, error) {
 	for _, branch := range info.Branches {
-		if branch.ID == branchID && branch.State != "deleted" {
+		if branch.ID == branchID {
 			return branch, nil
 		}
 	}
@@ -8349,7 +8334,7 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 		byID[branch.ID] = branch
 	}
 	for _, branch := range live {
-		if recorded, ok := byID[branch.ID]; ok && recorded.State != "deleted" {
+		if recorded, ok := byID[branch.ID]; ok {
 			// ParentID is durable display metadata. The runtime may retain the
 			// branch's bootstrap hint after that parent is removed while the
 			// parent itself was already process-free, so it is not authoritative
@@ -8358,34 +8343,8 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 		}
 		byID[branch.ID] = branch
 	}
-	deletedParents := make(map[string]string)
-	for id, branch := range byID {
-		if branch.State == "deleted" {
-			deletedParents[id] = branch.ParentID
-		}
-	}
-	resolveParent := func(parent string) string {
-		seen := make(map[string]struct{})
-		for parent != "" {
-			next, deleted := deletedParents[parent]
-			if !deleted {
-				break
-			}
-			if _, duplicate := seen[parent]; duplicate {
-				return ""
-			}
-			seen[parent] = struct{}{}
-			parent = next
-		}
-		return parent
-	}
 	merged := make([]Branch, 0, len(byID))
 	for _, branch := range byID {
-		if branch.State == "deleted" {
-			continue
-		}
-		branch.ParentID = resolveParent(branch.ParentID)
-		branch.DeletedAt = nil
 		merged = append(merged, branch)
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
@@ -8440,24 +8399,6 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		for _, existing := range containerInfo.Branches {
 			if existing.ID == destination {
 				return nil, fmt.Errorf("branch %q already exists", destination)
-			}
-		}
-	}
-	if b.dataRoot != "" {
-		store := b.containerStore()
-		for _, destination := range destinations {
-			legacy, found, err := store.LegacyDeletedBranch(source.container, destination)
-			if err != nil {
-				return nil, fmt.Errorf("checking legacy branch name %q: %w", destination, err)
-			}
-			if !found {
-				continue
-			}
-			if err := store.RemoveBranchFilesystems(source.container, legacy); err != nil {
-				return nil, fmt.Errorf("reclaiming legacy branch name %q: %w", destination, err)
-			}
-			if err := store.RemoveBranchArtifacts(source.container, destination); err != nil {
-				return nil, fmt.Errorf("removing legacy branch artifacts for %q: %w", destination, err)
 			}
 		}
 	}
@@ -8673,7 +8614,7 @@ func (b *runtimeBackend) discard(target selector) error {
 func persistentFamilyProcessFree(info ttcbundle.ContainerInfo) bool {
 	for _, branch := range info.Branches {
 		switch normalizeLifecycleState(branch.State) {
-		case "created", "dehydrated", "exited", "failed", "dead", "deleted":
+		case "created", "dehydrated", "exited", "failed", "dead":
 		default:
 			return false
 		}
@@ -8865,7 +8806,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		allCold := len(latest.Branches) != 0
 		for _, branch := range latest.Branches {
 			switch normalizeLifecycleState(branch.State) {
-			case "created", "dehydrated", "exited", "failed", "dead", "deleted":
+			case "created", "dehydrated", "exited", "failed", "dead":
 			default:
 				allCold = false
 			}
@@ -8907,7 +8848,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			// that stale shell and rebuild directly from the durable image.
 			allCold := true
 			for _, branch := range info.Branches {
-				if branch.State != "deleted" && branch.State != "dehydrated" && branch.State != "exited" && branch.State != "stopped" {
+				if branch.State != "dehydrated" && branch.State != "exited" && branch.State != "stopped" {
 					allCold = false
 					break
 				}
@@ -9284,12 +9225,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
 		}
 	}
-	remaining := 0
-	for _, branch := range info.Branches {
-		if branch.State != "deleted" {
-			remaining++
-		}
-	}
+	remaining := len(info.Branches)
 	if remaining == 1 {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
@@ -9575,7 +9511,7 @@ func writeBranchNode(w io.Writer, branch Branch, prefix string, last bool, byID 
 	suffix := ""
 	if branch.ParentID != "" {
 		if _, ok := byID[branch.ParentID]; !ok {
-			suffix = fmt.Sprintf(" parent=%s (deleted)", branch.ParentID)
+			suffix = fmt.Sprintf(" parent=%s (missing)", branch.ParentID)
 		}
 	}
 	if branch.InitState != "" {
@@ -9590,9 +9526,6 @@ func writeBranchNode(w io.Writer, branch Branch, prefix string, last bool, byID 
 	}
 	if !branch.CreatedAt.IsZero() {
 		suffix += " created=" + branch.CreatedAt.UTC().Format(time.RFC3339Nano)
-	}
-	if branch.DeletedAt != nil {
-		suffix += " deleted=" + branch.DeletedAt.UTC().Format(time.RFC3339Nano)
 	}
 	if branch.ForkTotalNS != 0 {
 		suffix += fmt.Sprintf(" fork=%s downtime=%s", time.Duration(branch.ForkTotalNS), time.Duration(branch.SourceDowntimeNS))

@@ -316,9 +316,6 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 		if branch.ID != resolved.branch {
 			continue
 		}
-		if branch.State == "deleted" {
-			return fmt.Errorf("branch %q is deleted", resolved.branch)
-		}
 		return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 	}
 	return fmt.Errorf("branch %q does not exist", resolved.branch)

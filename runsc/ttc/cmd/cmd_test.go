@@ -139,7 +139,6 @@ func TestPortCommandsAreBranchAware(t *testing.T) {
 
 func TestWriteTree(t *testing.T) {
 	created := time.Date(2026, 7, 17, 8, 9, 10, 123, time.UTC)
-	deleted := created.Add(time.Second)
 	families := []Family{{
 		ID:    "web",
 		State: "running",
@@ -148,17 +147,15 @@ func TestWriteTree(t *testing.T) {
 			{ID: "test-b", ParentID: "main", State: "paused"},
 			{ID: "main", State: "running", CreatedAt: created, InitPID: 1, InitState: "running", MemorySharing: "cow"},
 			{ID: "test-a", ParentID: "main", State: "paused"},
-			{ID: "orphan", ParentID: "deleted", State: "deleted", CreatedAt: created, DeletedAt: &deleted, InitState: "deleted", MemorySharing: "released"},
 		},
 	}}
 	var out bytes.Buffer
 	writeTree(&out, families)
 	want := "web (running)\n" +
-		"├── main running pid1=running(1) memory=cow created=2026-07-17T08:09:10.000000123Z\n" +
-		"│   ├── test-a paused\n" +
-		"│   │   └── retry running fork=2ms downtime=1ms\n" +
-		"│   └── test-b paused\n" +
-		"└── orphan deleted parent=deleted (deleted) pid1=deleted(-) memory=released created=2026-07-17T08:09:10.000000123Z deleted=2026-07-17T08:09:11.000000123Z\n"
+		"└── main running pid1=running(1) memory=cow created=2026-07-17T08:09:10.000000123Z\n" +
+		"    ├── test-a paused\n" +
+		"    │   └── retry running fork=2ms downtime=1ms\n" +
+		"    └── test-b paused\n"
 	if got := out.String(); got != want {
 		t.Errorf("writeTree output:\n%s\nwant:\n%s", got, want)
 	}
@@ -2885,7 +2882,7 @@ exit 2
 	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
 		Name: "web", BundleDir: bundleDir, ImageSize: 2217006,
 		ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(),
-		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "deleted"}},
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}},
 	})
 	if err != nil {
 		t.Fatalf("encoding metadata: %v", err)
@@ -4029,38 +4026,6 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 	}
 }
 
-func TestMergeBranchHistoryCompactsTombstones(t *testing.T) {
-	now := time.Now().UTC()
-	history := []Branch{
-		{ID: "main", State: "running", CreatedAt: now},
-		{ID: "deleted-parent", ParentID: "main", State: "deleted", CreatedAt: now, DeletedAt: &now},
-		{ID: "child", ParentID: "deleted-parent", State: "running", CreatedAt: now},
-	}
-	live := []Branch{
-		{ID: "main", State: "running", CreatedAt: now},
-		{ID: "child", ParentID: "deleted-parent", State: "paused", CreatedAt: now},
-		{ID: "grandchild", ParentID: "child", State: "running", CreatedAt: now},
-	}
-	merged := mergeBranchHistory(history, live)
-	if len(merged) != 3 {
-		t.Fatalf("merged branches=%+v, want three live branches", merged)
-	}
-	byID := make(map[string]Branch)
-	for _, branch := range merged {
-		byID[branch.ID] = branch
-	}
-	if _, ok := byID["deleted-parent"]; ok {
-		t.Errorf("deleted tombstone was retained: %+v", byID["deleted-parent"])
-	}
-	if byID["child"].State != "paused" || byID["child"].ParentID != "main" {
-		t.Errorf("live child did not override lifecycle state and splice its parent: %+v", byID["child"])
-	}
-	rows := psRows([]Family{{ID: strings.Repeat("a", 64), Name: "demo", Image: "busybox:latest", Branches: merged}}, now, false)
-	if len(rows) != 3 {
-		t.Errorf("Docker ps rows included tombstone: %+v", rows)
-	}
-}
-
 func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	now := time.Now().UTC()
 	merged := mergeBranchHistory(
@@ -4089,7 +4054,7 @@ func TestCompletionScripts(t *testing.T) {
 func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 	b := &fakeBackend{
 		families: []Family{{Name: "demo", Branches: []Branch{
-			{ID: "main", State: "running"}, {ID: "child", State: "paused"}, {ID: "old", State: "deleted"},
+			{ID: "main", State: "running"}, {ID: "child", State: "paused"},
 		}}},
 		imageList:       []ImageInfo{{Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc"}},
 		execSessionList: []runscExecSession{{ID: "exec-123", State: "running"}},
