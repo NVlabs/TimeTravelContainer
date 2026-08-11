@@ -69,6 +69,8 @@ const (
 	daemonRootlessProbeArg = "_rootless-userns-probe"
 )
 
+const repositoryMaintenanceInterval = 5 * time.Minute
+
 var (
 	createDaemonRootlessProbe = createRootlessProbe
 	daemonEffectiveUID        = os.Geteuid
@@ -1545,6 +1547,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	maintenanceDone := make(chan struct{})
+	defer close(maintenanceDone)
+	go maintainRepositories(dataRoot, stderr, maintenanceDone)
 	clusterDone := make(chan struct{})
 	defer close(clusterDone)
 	var clusterServer *http.Server
@@ -1613,6 +1618,22 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		go server.handle(conn, stderr)
+	}
+}
+
+func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{}) {
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
+		if _, err := (ttcbundle.Store{Root: dataRoot}).GarbageCollectRepositories(); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
+		}
+		timer.Reset(repositoryMaintenanceInterval)
 	}
 }
 

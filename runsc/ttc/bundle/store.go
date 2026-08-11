@@ -2766,6 +2766,64 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 	return nil
 }
 
+// GarbageCollectRepositories reclaims unreachable metadata and data objects
+// from every named and family-private repository in the data root. Repository
+// GC shares the mutation flock with Sentry, so this is safe while containers
+// are running.
+func (s Store) GarbageCollectRepositories() (int, error) {
+	manager, err := ttcvolume.OpenManager(s.Root, true)
+	if err != nil {
+		return 0, err
+	}
+	paths := make(map[string]struct{})
+	volumes, err := manager.List()
+	if err != nil {
+		return 0, err
+	}
+	for _, volume := range volumes {
+		paths[filepath.Join(s.Root, "volumes-v2", volume.ID)] = struct{}{}
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return 0, err
+	}
+	for _, container := range containers {
+		spec, err := s.LoadSpec(container.ID)
+		if err != nil {
+			return 0, err
+		}
+		repositories, err := specutils.TTCVolumeRepositories(spec)
+		if err != nil {
+			return 0, err
+		}
+		for _, repository := range repositories {
+			paths[filepath.Clean(repository.Path)] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	collected := 0
+	for _, path := range ordered {
+		repository, err := manager.OpenPrivate(path)
+		if err != nil {
+			return collected, fmt.Errorf("opening repository %q: %w", path, err)
+		}
+		gcErr := repository.GarbageCollect()
+		closeErr := repository.Close()
+		if gcErr != nil {
+			return collected, fmt.Errorf("collecting repository %q: %w", path, gcErr)
+		}
+		if closeErr != nil {
+			return collected, fmt.Errorf("closing repository %q: %w", path, closeErr)
+		}
+		collected++
+	}
+	return collected, nil
+}
+
 // repositoryCanonicalBranchBelongsToFamily reports whether the initial main
 // branch is private state owned by one container family. Rootfs repositories
 // predate TTCVolumeRepository.Private and are identified by their reserved

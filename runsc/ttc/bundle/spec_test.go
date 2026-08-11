@@ -1684,6 +1684,59 @@ func TestPruneImageRoots(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
+	root := t.TempDir()
+	manager, err := ttcvolume.OpenManager(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("gc-volume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "data", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, []byte("main"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(ttcvolume.MainBranch, "discarded"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt("discarded", ino, []byte("child"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch("discarded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	countObjects := func() int {
+		count := 0
+		objects := filepath.Join(root, "volumes-v2")
+		if err := filepath.WalkDir(objects, func(path string, entry fs.DirEntry, err error) error {
+			if err == nil && !entry.IsDir() && strings.Contains(path, string(filepath.Separator)+"objects"+string(filepath.Separator)) {
+				count++
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	before := countObjects()
+	collected, err := (Store{Root: root}).GarbageCollectRepositories()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := countObjects()
+	if collected != 1 || before < 2 || after >= before {
+		t.Fatalf("collected=%d objects before=%d after=%d", collected, before, after)
+	}
+}
+
 func TestLegacyDeletedBranchSurvivesReadCompactionForCleanup(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
