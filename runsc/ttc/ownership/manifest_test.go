@@ -47,15 +47,6 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAnnotationValueAcceptsLegacyName(t *testing.T) {
-	if got := AnnotationValue(map[string]string{LegacyAnnotation: "/legacy/ownership.json"}); got != "/legacy/ownership.json" {
-		t.Errorf("AnnotationValue()=%q, want legacy path", got)
-	}
-	if got := AnnotationValue(map[string]string{Annotation: "/current", LegacyAnnotation: "/legacy"}); got != "/current" {
-		t.Errorf("AnnotationValue()=%q, want current value", got)
-	}
-}
-
 func TestCleanPathRejectsEscape(t *testing.T) {
 	for _, name := range []string{"../etc/passwd", "/etc/passwd", "a/../../b"} {
 		if _, err := CleanPath(name); err == nil {

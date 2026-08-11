@@ -895,17 +895,6 @@ func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 	}
 }
 
-func TestLegacyTimeTravelOSNetworkNameNormalizesToTTC(t *testing.T) {
-	backend := &fakeBackend{containerID: "demo"}
-	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--network=ttos", "--nat", "busybox"}, &stdout, &stderr, backend); status != 0 {
-		t.Fatalf("status=%d, stderr=%q", status, stderr.String())
-	}
-	if got := backend.runRequest.networkMode; got != "ttc" {
-		t.Errorf("legacy network mode normalized to %q, want ttc", got)
-	}
-}
-
 func TestImageProgressIsHumanReadable(t *testing.T) {
 	var output bytes.Buffer
 	progress := newImageProgress(&output)

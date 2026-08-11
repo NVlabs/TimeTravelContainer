@@ -552,23 +552,13 @@ const (
 const (
 	InternalConsoleAnnotation = "dev.timetravelcontainer.internal-console"
 	ttcPidsLimitAnnotation    = "dev.timetravelcontainer.resource.pids-limit"
-
-	legacyInternalConsoleAnnotation = "dev.timetravelos.internal-console"
-	legacyPidsLimitAnnotation       = "dev.timetravelos.resource.pids-limit"
 )
-
-func ttcAnnotation(annotations map[string]string, current, legacy string) string {
-	if value := annotations[current]; value != "" {
-		return value
-	}
-	return annotations[legacy]
-}
 
 func ttcMaxTasks(spec *specs.Spec) (uint64, error) {
 	if spec == nil {
 		return 0, nil
 	}
-	if ttcAnnotation(spec.Annotations, ttcPidsLimitAnnotation, legacyPidsLimitAnnotation) == "" {
+	if spec.Annotations[ttcPidsLimitAnnotation] == "" {
 		return 0, nil
 	}
 	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.Resources.Pids == nil {
@@ -970,7 +960,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating init process for root container: %w", err)
 	}
 	l.root.procArgs = procArgs
-	if ttcAnnotation(args.Spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation) != "" && !args.Spec.Process.Terminal {
+	if args.Spec.Annotations[InternalConsoleAnnotation] != "" && !args.Spec.Process.Terminal {
 		fdTable, err := l.newInternalConsoleFDTable(&l.root)
 		if err != nil {
 			return nil, fmt.Errorf("preparing root internal console: %w", err)
@@ -1683,7 +1673,7 @@ func initialInternalPTYWinsize(rows, cols uint64) linux.Winsize {
 }
 
 func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable, error) {
-	consoleID := ttcAnnotation(info.spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation)
+	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
 	if consoleID == "" {
 		return nil, fmt.Errorf("internal console annotation is empty")
 	}
@@ -1725,7 +1715,7 @@ func (l *Loader) newInternalConsoleFDTable(info *containerInfo) (*kernel.FDTable
 func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGroup, *host.TTYFileDescription, error) {
 	// Create the FD map, which will set stdin, stdout, and stderr.
 	ctx := info.procArgs.NewContext(l.k)
-	consoleID := ttcAnnotation(info.spec.Annotations, InternalConsoleAnnotation, legacyInternalConsoleAnnotation)
+	consoleID := info.spec.Annotations[InternalConsoleAnnotation]
 	var fdTable *kernel.FDTable
 	var ttyFile *host.TTYFileDescription
 	var err error

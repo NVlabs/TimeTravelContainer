@@ -861,22 +861,6 @@ func TestMountTarOnExitPathsPrefersWritableDestination(t *testing.T) {
 	}
 }
 
-func TestMountTarOnExitPathsAcceptsLegacyTimeTravelOSAnnotation(t *testing.T) {
-	spec := specs.Spec{
-		Root: &specs.Root{},
-		Annotations: map[string]string{
-			legacyAnnotationMountTarOnExit: `{"dev.timetravelos.rootfs":{"path":"/snapshots/rootfs.tar","ready_path":"/snapshots/rootfs.ready"}}`,
-		},
-	}
-	paths, err := MountTarOnExitPaths(&spec)
-	if err != nil {
-		t.Fatalf("MountTarOnExitPaths: %v", err)
-	}
-	if len(paths) != 1 || paths[0].Source != RootfsMountTarSource || paths[0].Destination != "/" {
-		t.Fatalf("legacy final mount paths=%+v, want current rootfs source", paths)
-	}
-}
-
 func TestFixSpecNormalizesMountHintSources(t *testing.T) {
 	const bundleDir = "/bundle"
 	spec := specs.Spec{

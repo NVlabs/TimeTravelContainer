@@ -30,8 +30,6 @@ import (
 const (
 	// Annotation names the ownership manifest for the OCI root filesystem.
 	Annotation = "dev.timetravelcontainer.rootfs.ownership"
-	// LegacyAnnotation is accepted for bundles created before the rename.
-	LegacyAnnotation = "dev.timetravelos.rootfs.ownership"
 
 	// ManifestName is stored beside, rather than inside, the image rootfs.
 	ManifestName = "ownership.json"
@@ -39,13 +37,9 @@ const (
 	currentVersion = 1
 )
 
-// AnnotationValue returns the current ownership annotation or its legacy
-// TimeTravelOS spelling.
+// AnnotationValue returns the rootfs ownership annotation.
 func AnnotationValue(annotations map[string]string) string {
-	if value := annotations[Annotation]; value != "" {
-		return value
-	}
-	return annotations[LegacyAnnotation]
+	return annotations[Annotation]
 }
 
 // Owner is the guest-visible numeric owner of one image path.

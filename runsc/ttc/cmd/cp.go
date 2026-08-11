@@ -436,7 +436,6 @@ func offlineCopySpec(original *specs.Spec, scope, branch string, helperArgs []st
 		cloned.Annotations = make(map[string]string)
 	}
 	delete(cloned.Annotations, "dev.timetravelcontainer.internal-console")
-	delete(cloned.Annotations, "dev.timetravelos.internal-console")
 	repositories, err := specutils.TTCVolumeRepositories(&cloned)
 	if err != nil {
 		return nil, err

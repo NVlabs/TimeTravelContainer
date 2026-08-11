@@ -2179,7 +2179,6 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 		spec.Annotations = make(map[string]string)
 	}
 	spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
-	delete(spec.Annotations, ownership.LegacyAnnotation)
 	// Publish the complete OCI config first. If TTC exits before container.json
 	// is updated, the next start harmlessly repeats this migration.
 	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {

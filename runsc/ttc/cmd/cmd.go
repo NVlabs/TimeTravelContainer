@@ -251,10 +251,6 @@ func runscPath() string {
 	if path := os.Getenv("TTC_RUNSC"); path != "" {
 		return path
 	}
-	// TTOS_RUNSC is retained as an upgrade bridge for existing installations.
-	if path := os.Getenv("TTOS_RUNSC"); path != "" {
-		return path
-	}
 	if executable, err := os.Executable(); err == nil {
 		sibling := filepath.Join(filepath.Dir(executable), "ttcd")
 		if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
@@ -271,12 +267,6 @@ func currentExecutable() string {
 
 func dataRoot() string {
 	if root := os.Getenv("TTC_DATA_ROOT"); root != "" {
-		return root
-	}
-	// TTOS_DATA_ROOT is retained as an upgrade bridge for explicitly
-	// configured existing installations. Unconfigured installations use the
-	// new TTC directory and never silently adopt unrelated legacy state.
-	if root := os.Getenv("TTOS_DATA_ROOT"); root != "" {
 		return root
 	}
 	if root := os.Getenv("XDG_DATA_HOME"); root != "" {
@@ -1194,8 +1184,6 @@ func parseNetworkMode(value string) (string, error) {
 	switch value {
 	case "none", "host", "ttc":
 		return value, nil
-	case "ttos":
-		return "ttc", nil
 	default:
 		return "", fmt.Errorf("unsupported network mode %q; supported modes are none, host, and ttc", value)
 	}

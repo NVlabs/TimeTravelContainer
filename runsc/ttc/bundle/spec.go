@@ -65,17 +65,9 @@ const (
 	MinimumMemoryLimitBytes int64 = 6 * 1024 * 1024
 )
 
-// AnnotationValue reads a current TimeTravelContainer annotation and falls
-// back to the equivalent TimeTravelOS key for existing bundles.
+// AnnotationValue reads a TimeTravelContainer annotation.
 func AnnotationValue(annotations map[string]string, key string) string {
-	if value := annotations[key]; value != "" {
-		return value
-	}
-	const currentPrefix = "dev.timetravelcontainer."
-	if strings.HasPrefix(key, currentPrefix) {
-		return annotations["dev.timetravelos."+strings.TrimPrefix(key, currentPrefix)]
-	}
-	return ""
+	return annotations[key]
 }
 
 var defaultCapabilities = []string{
@@ -1015,8 +1007,6 @@ func normalizeNetworkMode(mode string) (string, error) {
 	switch mode {
 	case "none", "host", "ttc":
 		return mode, nil
-	case "ttos":
-		return "ttc", nil
 	default:
 		return "", fmt.Errorf("unsupported network mode %q; supported modes are none, host, and ttc", mode)
 	}
