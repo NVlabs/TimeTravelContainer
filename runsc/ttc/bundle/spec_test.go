@@ -1444,6 +1444,75 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	}
 }
 
+func TestPruneImageRoots(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oldDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	currentName := imageRootKey(digest, "linux/amd64")
+	referencedOldName := safeComponent("v3-" + oldDigest + "-linux/amd64")
+	staleOldName := safeComponent("v3-" + digest + "-linux/amd64")
+	tempName := currentName + ".tmp-interrupted"
+
+	makeRoot := func(name string) string {
+		t.Helper()
+		rootfs := filepath.Join(root, "images", name, "rootfs")
+		if err := os.MkdirAll(rootfs, 0700); err != nil {
+			t.Fatal(err)
+		}
+		restricted := filepath.Join(rootfs, "restricted")
+		if err := os.Mkdir(restricted, 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(restricted, "payload"), []byte("x"), 0440); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(restricted, 0550); err != nil {
+			t.Fatal(err)
+		}
+		return rootfs
+	}
+	currentRoot := makeRoot(currentName)
+	referencedOldRoot := makeRoot(referencedOldName)
+	staleOldRoot := makeRoot(staleOldName)
+	tempRoot := makeRoot(tempName)
+	t.Cleanup(func() {
+		_ = removeImageRoot(filepath.Join(root, "images", currentName))
+		_ = removeImageRoot(filepath.Join(root, "images", referencedOldName))
+	})
+	unrelated := filepath.Join(root, "images", "operator-notes")
+	if err := os.MkdirAll(unrelated, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.pruneImageRoots(
+		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
+		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+	)
+	if err != nil {
+		t.Fatalf("pruneImageRoots: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("pruneImageRoots removed %d roots, want 2", removed)
+	}
+	for _, path := range []string{currentRoot, referencedOldRoot, unrelated} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("preserved path %q is unavailable: %v", path, err)
+		}
+	}
+	for _, path := range []string{staleOldRoot, tempRoot} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("stale path %q remains: %v", path, err)
+		}
+	}
+	if removed, err := store.pruneImageRoots(
+		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
+		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+	); err != nil || removed != 0 {
+		t.Errorf("second pruneImageRoots = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}

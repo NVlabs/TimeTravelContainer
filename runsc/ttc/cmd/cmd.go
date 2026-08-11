@@ -5220,9 +5220,13 @@ func (b *runtimeBackend) start(name string, detach, interactive bool) (int, erro
 		return 1, err
 	}
 	if b.dataRoot != "" {
-		info, err = b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+		store := b.containerStore()
+		info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
 		if err != nil {
 			return 1, err
+		}
+		if _, err := store.PruneImageRoots(context.Background()); err != nil {
+			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
 		}
 	}
 	status, err := b.launch(info, detach, interactive)
@@ -6984,6 +6988,9 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			}
 		}
 	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
+		return fmt.Errorf("pruning unreferenced image roots: %w", err)
+	}
 	return nil
 }
 
@@ -7596,6 +7603,9 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 	}
 	if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
 		return ttcimages.Info{}, fmt.Errorf("preparing pulled image root: %w", err)
+	}
+	if _, err := b.containerStore().PruneImageRoots(ctx); err != nil {
+		return ttcimages.Info{}, fmt.Errorf("pruning superseded image roots: %w", err)
 	}
 	return info, nil
 }

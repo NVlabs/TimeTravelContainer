@@ -2653,6 +2653,72 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 	return true, nil
 }
 
+var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)
+
+// PruneImageRoots removes materialized image roots that are no longer usable
+// by either the current image catalog or a persistent container. In
+// particular, this collects roots left behind when imageRootFormatVersion is
+// advanced. Container references are authoritative so that an older stopped
+// container remains startable until RefreshContainerImageRoot migrates it.
+func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
+	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
+	if err != nil {
+		return 0, fmt.Errorf("listing images before pruning roots: %w", err)
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return 0, fmt.Errorf("listing containers before pruning image roots: %w", err)
+	}
+	return s.pruneImageRoots(stored, containers)
+}
+
+func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo) (int, error) {
+	keep := make(map[string]struct{}, len(stored)+len(containers))
+	for _, image := range stored {
+		keep[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+	}
+	imagesDir := filepath.Join(s.Root, "images")
+	for _, container := range containers {
+		rootfs := filepath.Clean(container.RootFS)
+		if filepath.Base(rootfs) != "rootfs" {
+			return 0, fmt.Errorf("container %q has invalid image root path %q", container.Name, container.RootFS)
+		}
+		relative, err := filepath.Rel(imagesDir, filepath.Dir(rootfs))
+		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || strings.ContainsRune(relative, filepath.Separator) {
+			return 0, fmt.Errorf("container %q image root %q is outside the TTC image-root directory", container.Name, container.RootFS)
+		}
+		keep[relative] = struct{}{}
+	}
+
+	removed := 0
+	err := s.withImageRootLock(func() error {
+		entries, err := os.ReadDir(imagesDir)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || !imageRootDirectoryPattern.MatchString(entry.Name()) {
+				continue
+			}
+			if _, referenced := keep[entry.Name()]; referenced && !strings.Contains(entry.Name(), ".tmp-") {
+				continue
+			}
+			if err := removeImageRoot(filepath.Join(imagesDir, entry.Name())); err != nil {
+				return fmt.Errorf("removing unreferenced image root %q: %w", entry.Name(), err)
+			}
+			removed++
+		}
+		return nil
+	})
+	if err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
 // RemoveImageRoots removes every platform-specific immutable root for digest.
 // Callers must first prove that no persistent container or image alias still
 // references the digest.
@@ -2661,13 +2727,6 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 		return 0, fmt.Errorf("invalid image digest %q", digest)
 	}
 	imagesDir := filepath.Join(s.Root, "images")
-	entries, err := os.ReadDir(imagesDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("listing image roots: %w", err)
-	}
 	prefixes := []string{
 		safeComponent(digest + "-"),
 		safeComponent("v2-" + digest + "-"),
@@ -2675,22 +2734,35 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
 	}
 	removed := 0
-	for _, entry := range entries {
-		matches := false
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(entry.Name(), prefix) {
-				matches = true
-				break
+	err := s.withImageRootLock(func() error {
+		entries, err := os.ReadDir(imagesDir)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("listing image roots: %w", err)
+		}
+		for _, entry := range entries {
+			matches := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(entry.Name(), prefix) {
+					matches = true
+					break
+				}
 			}
+			if !entry.IsDir() || !matches {
+				continue
+			}
+			path := filepath.Join(imagesDir, entry.Name())
+			if err := removeImageRoot(path); err != nil {
+				return fmt.Errorf("removing image root %q: %w", path, err)
+			}
+			removed++
 		}
-		if !entry.IsDir() || !matches {
-			continue
-		}
-		path := filepath.Join(imagesDir, entry.Name())
-		if err := removeImageRoot(path); err != nil {
-			return removed, fmt.Errorf("removing image root %q: %w", path, err)
-		}
-		removed++
+		return nil
+	})
+	if err != nil {
+		return removed, err
 	}
 	return removed, nil
 }
@@ -2860,7 +2932,16 @@ func selectStoredImage(stored []images.Info, reference, platform string) (images
 	return images.Info{}, false, nil
 }
 
-func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (_ images.RootFSInfo, _ string, retErr error) {
+func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (info images.RootFSInfo, rootfs string, retErr error) {
+	err := s.withImageRootLock(func() error {
+		var err error
+		info, rootfs, err = s.prepareImageRootLocked(ctx, pulled, platform, progress)
+		return err
+	})
+	return info, rootfs, err
+}
+
+func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (_ images.RootFSInfo, _ string, retErr error) {
 	imagesDir := filepath.Join(s.Root, "images")
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating image cache: %w", err)
@@ -2914,6 +2995,23 @@ func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platfor
 		return images.RootFSInfo{}, "", fmt.Errorf("publishing image root: %w", err)
 	}
 	return info, filepath.Join(finalDir, "rootfs"), nil
+}
+
+func (s Store) withImageRootLock(fn func() error) error {
+	imagesDir := filepath.Join(s.Root, "images")
+	if err := os.MkdirAll(imagesDir, 0700); err != nil {
+		return fmt.Errorf("creating image-root directory: %w", err)
+	}
+	lock, err := os.OpenFile(filepath.Join(imagesDir, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening image-root lock: %w", err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("locking image roots: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	return fn()
 }
 
 func removeStaleImageRootTemps(imagesDir, key string) error {

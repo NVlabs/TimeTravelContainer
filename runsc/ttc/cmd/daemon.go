@@ -1192,6 +1192,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
 	}
+	if _, err := (ttcbundle.Store{Root: daemonDataRoot}).PruneImageRoots(context.Background()); err != nil {
+		fmt.Fprintf(stderr, "ttcd: pruning stale image roots: %v\n", err)
+		return 1
+	}
 	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
