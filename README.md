@@ -386,16 +386,17 @@ ttc exec -it demo@main sh
 Fork the running container:
 
 ```sh
-ttc fork demo@main demo@test-a
-ttc fork --paused demo@main demo@test-b
+ttc fork demo@main test-a
+ttc fork --paused demo@main test-b
 ttc ls --tree
 ttc resume demo@test-b
 ```
 
-A branch selector always has the full form `CONTAINER@BRANCH`; TTC does not
-implicitly select `main`. Container-family operations such as `ttc inspect`
-and `ttc rm` continue to take a container name because they do not select a
-branch.
+A selector for an existing branch always has the full form
+`CONTAINER@BRANCH`; TTC does not implicitly select `main`. A local `ttc fork`
+destination is only the new branch name because it necessarily remains in the
+source family. Container-family operations such as `ttc inspect` and `ttc rm`
+continue to take a container name because they do not select a branch.
 
 Run different work in each branch:
 
@@ -497,7 +498,7 @@ curl http://127.0.0.1:8080/
 Publish a different host port for a fork:
 
 ```sh
-ttc fork web@main web@test
+ttc fork web@main test
 ttc port publish web@test 127.0.0.1:8081:80
 ttc port ls web@test
 ```

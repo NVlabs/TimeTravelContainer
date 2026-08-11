@@ -416,10 +416,10 @@ func TestTopRejectsUnsupportedProcessOptions(t *testing.T) {
 	}
 }
 
-func TestCommandsUseQualifiedBranches(t *testing.T) {
+func TestCommandsUseQualifiedBranchesAndBareForkDestination(t *testing.T) {
 	b := &fakeBackend{families: []Family{{ID: "web", State: "running", Branches: []Branch{{ID: "main", State: "running"}}}}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "web@main", "web@test-a"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "web@main", "test-a"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if got := stdout.String(); got != "web@test-a\n" {
@@ -494,7 +494,7 @@ func TestForkGeneratesDestination(t *testing.T) {
 func TestForkCreatesSiblingBatch(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "web@main", "web@a", "web@b", "web@c"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "web@main", "a", "b", "c"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := b.forkDestinations, []string{"a", "b", "c"}; !reflect.DeepEqual(got, want) {
@@ -582,14 +582,14 @@ func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	}
 }
 
-func TestForkRejectsCrossFamilyDestination(t *testing.T) {
+func TestForkRejectsQualifiedLocalDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
 	status := runCommand([]string{"fork", "web@main", "other@child"}, &stdout, &stderr, b)
 	if status != 1 {
 		t.Fatalf("status=%d, want 1", status)
 	}
-	if !strings.Contains(stderr.String(), "must remain in the source container family") {
+	if !strings.Contains(stderr.String(), "must be a branch name, not CONTAINER@BRANCH") {
 		t.Errorf("stderr=%q", stderr.String())
 	}
 }

@@ -374,8 +374,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ### TimeTravel lifecycle
 
-- [x] `ttc fork SOURCE [DESTINATION]`, for example `ttc fork web@main
-      web@test-a`.
+- [x] `ttc fork SOURCE [BRANCH]`, for example `ttc fork web@main test-a`.
 - [x] Support `--paused`, defaulting according to a documented policy.
 - [x] `ttc pause CONTAINER@BRANCH`.
 - [x] `ttc resume CONTAINER@BRANCH` and Docker-compatible top-level and

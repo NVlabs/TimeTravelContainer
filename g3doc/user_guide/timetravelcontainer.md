@@ -281,13 +281,13 @@ source, writes the reason to stderr, and exits nonzero. Create a running child
 branch directly:
 
 ```shell
-ttc fork web@main web@test-a
+ttc fork web@main test-a
 ```
 
 Or create it paused so no child instruction executes before inspection:
 
 ```shell
-ttc fork --paused web@main web@test-b
+ttc fork --paused web@main test-b
 ttc resume web@test-b
 ```
 

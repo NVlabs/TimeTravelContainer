@@ -269,7 +269,7 @@ while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
 done
 [ "$(ttc inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
   fail "inspect did not retain host network mode"
-if ttc fork "$HOSTNET@main" "$HOSTNET@rejected" >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
+if ttc fork "$HOSTNET@main" rejected >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
   fail "host-network container was incorrectly forked"
 fi
 ttc exec "$HOSTNET@main" true || fail "host-network source did not resume after rejected fork"
@@ -312,7 +312,7 @@ while [ "$VNET_RESPONSE" != parent ]; do
 done
 [ "$(ttc inspect -f '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIP}}:{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostPort}}' "$VNET")" = "127.0.0.1:$PUBLISHED_PORT" ] ||
   fail "inspect omitted the persisted TTC port binding"
-ttc fork "$VNET@main" "$VNET@child" >/dev/null
+ttc fork "$VNET@main" child >/dev/null
 ttc exec "$VNET@child" sh -c 'echo child >/www/index.html'
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published host port switched away from the source branch after fork"
@@ -323,8 +323,8 @@ ttc port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
   fail "dynamically published child port did not reach the forked branch"
 ttc port ls "$VNET@child" | grep -q "127.0.0.1:$CHILD_PUBLISHED_PORT" ||
   fail "branch port listing omitted the dynamically published child port"
-ttc fork "$VNET@main" "$VNET@second" >/dev/null
-ttc fork "$VNET@child" "$VNET@grandchild" >/dev/null
+ttc fork "$VNET@main" second >/dev/null
+ttc fork "$VNET@child" grandchild >/dev/null
 ttc_daemon_crash
 ttc_daemon_start
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
@@ -399,7 +399,7 @@ done
 if ttc exec "$PIDS_LIMIT@main" true >/dev/null 2>&1; then
   fail "exec bypassed a full PID limit"
 fi
-ttc fork "$PIDS_LIMIT@main" "$PIDS_LIMIT@child"
+ttc fork "$PIDS_LIMIT@main" child
 if ttc exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "live-forked child lost its full PID limit"
 fi
@@ -639,7 +639,7 @@ while ! ttc exec "$LIFECYCLE@main" test -e /state/attached-exec-ready >/dev/null
   [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
   sleep 1
 done
-if ttc fork "$LIFECYCLE@main" "$LIFECYCLE@attached-rejected" >"$TTC_E2E_ROOT/attached-fork.out" 2>"$TTC_E2E_ROOT/attached-fork.err"; then
+if ttc fork "$LIFECYCLE@main" attached-rejected >"$TTC_E2E_ROOT/attached-fork.out" 2>"$TTC_E2E_ROOT/attached-fork.err"; then
   fail "live fork accepted an attached exec with imported host stdio"
 fi
 grep -Eq '\*host.fileDescription' "$TTC_E2E_ROOT/attached-fork.out" "$TTC_E2E_ROOT/attached-fork.err" ||
@@ -647,7 +647,7 @@ grep -Eq '\*host.fileDescription' "$TTC_E2E_ROOT/attached-fork.out" "$TTC_E2E_RO
 ttc exec "$LIFECYCLE@main" touch /state/attached-exec-release
 wait "$ATTACHED_EXEC_HOST_PID" || fail "attached exec did not exit successfully"
 
-ttc fork "$LIFECYCLE_PREFIX@main" "$LIFECYCLE_PREFIX@child"
+ttc fork "$LIFECYCLE_PREFIX@main" child
 echo host-mutated >"$HOST_FIXTURE/value"
 echo host-mutated-two >"$HOST_FIXTURE_TWO/value"
 [ "$(ttc exec "$LIFECYCLE@main" cat /host-fixture/value)" = "host-mutated" ] || fail "parent did not observe host-side mutation"
@@ -736,7 +736,7 @@ echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ FROM_FILE
 [ -z "$(ttc logs --until 24h "$LIFECYCLE@child")" ] || fail "logs --until included records newer than its boundary"
 
 # Persist immutable lineage when an intermediate source branch is deleted.
-ttc fork "$LIFECYCLE@child" "$LIFECYCLE@grandchild"
+ttc fork "$LIFECYCLE@child" grandchild
 [ "$(ttc exec "$LIFECYCLE@grandchild" cat /cow-host/value)" = "child" ] || fail "grandchild did not inherit managed-overlay state"
 ttc exec "$LIFECYCLE@grandchild" sh -c "echo grandchild >/cow-host/value; echo grandchild-created >/cow-host/grandchild-only"
 [ "$(ttc exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "grandchild managed-overlay write leaked into child"
@@ -746,7 +746,7 @@ ttc branch rm "$LIFECYCLE@child"
 LINEAGE_TREE=$(ttc ls --tree)
 echo "$LINEAGE_TREE" | grep -q "child deleted" || fail "tree omitted the deleted intermediate branch"
 echo "$LINEAGE_TREE" | grep -q "grandchild running" || fail "tree omitted the live grandchild below its tombstone"
-if ttc fork "$LIFECYCLE@main" "$LIFECYCLE@child" >"$TTC_E2E_ROOT/lineage-reuse.out" 2>"$TTC_E2E_ROOT/lineage-reuse.err"; then
+if ttc fork "$LIFECYCLE@main" child >"$TTC_E2E_ROOT/lineage-reuse.out" 2>"$TTC_E2E_ROOT/lineage-reuse.err"; then
   fail "fork reused a branch ID retained by immutable lineage"
 fi
 grep -q "retained by immutable lineage" "$TTC_E2E_ROOT/lineage-reuse.err" ||
@@ -756,8 +756,8 @@ echo "== branch-native detached exec bookkeeping =="
 EXEC_SELECTOR=$(ttc exec --detach "$LIFECYCLE@main" sh -c 'exec sleep 300')
 EXEC_ID=${EXEC_SELECTOR##*:}
 [ -n "$EXEC_ID" ] || fail "detached exec did not return a session ID"
-ttc fork "$LIFECYCLE@main" "$LIFECYCLE@process-child" >/dev/null
-ttc fork "$LIFECYCLE@process-child" "$LIFECYCLE@process-grandchild" >/dev/null
+ttc fork "$LIFECYCLE@main" process-child >/dev/null
+ttc fork "$LIFECYCLE@process-child" process-grandchild >/dev/null
 for branch in main process-child process-grandchild; do
   SESSION_JSON=$(ttc exec ls --json "$LIFECYCLE@$branch")
   echo "$SESSION_JSON" | grep -q "\"id\": \"$EXEC_ID\"" || fail "branch $branch lost cloned exec session $EXEC_ID"
@@ -800,7 +800,7 @@ ttc rm "$LIFECYCLE_ID"
 
 echo "== intentional daemon stop terminates managed containers =="
 ttc run --detach --name "$DAEMON_STOP" "$BUSYBOX_IMAGE" sleep 300 >/dev/null
-ttc fork "$DAEMON_STOP@main" "$DAEMON_STOP@child" >/dev/null
+ttc fork "$DAEMON_STOP@main" child >/dev/null
 ttc pause "$DAEMON_STOP@child" >/dev/null
 ttc daemon stop
 if ttc daemon status >/dev/null 2>&1; then

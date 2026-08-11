@@ -132,7 +132,7 @@ export function createServer(client = new Client()): McpServer {
       description: "Live-fork a running TTC container branch.",
       inputSchema: {
         source: z.string().describe("Full source container@branch selector"),
-        destination: z.string().describe("New container@branch name"),
+        destination: z.string().describe("New branch name in the source family"),
         paused: z.boolean().default(false),
       },
       annotations: { destructiveHint: true },

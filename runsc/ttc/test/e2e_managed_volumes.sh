@@ -90,7 +90,7 @@ CREATED_EXPORT="$TTC_E2E_ROOT/rootfs-created-export"
 printf 'offline-import\n' >"$HOST_IMPORT"
 ttc run -d --name "$ROOTFS_CONTAINER" "$BUSYBOX_IMAGE" \
   sh -c 'echo base >/rootfs-base; while :; do sleep 60; done' >/dev/null
-ttc fork "$ROOTFS_CONTAINER@main" "$ROOTFS_CONTAINER@child" >/dev/null
+ttc fork "$ROOTFS_CONTAINER@main" child >/dev/null
 ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
 ttc exec "$ROOTFS_CONTAINER@main" test ! -e /rootfs-child
 ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
@@ -144,7 +144,7 @@ test ! -e "$HOST_COW_SOURCE/created" ||
 HOST_COW_ID=$(ttc inspect -f '{{.Id}}' "$HOST_COW_CONTAINER")
 find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
   fail "writable host mount did not write directly to a private repository"
-ttc fork "$HOST_COW_CONTAINER@main" "$HOST_COW_CONTAINER@child" >/dev/null
+ttc fork "$HOST_COW_CONTAINER@main" child >/dev/null
 ttc exec "$HOST_COW_CONTAINER@child" sh -c 'test "$(cat /data/value)" = parent; echo child >/data/value; echo child >/data/child'
 ttc exec "$HOST_COW_CONTAINER@main" sh -c 'test "$(cat /data/value)" = parent; test ! -e /data/child'
 printf 'host-added\n' >"$HOST_COW_SOURCE/added"
@@ -216,7 +216,7 @@ ttc exec "$HOST_COPY_RESTORED@main" sh -c '
 '
 ttc stop "$HOST_COPY_RESTORED@main" >/dev/null
 ttc rm "$HOST_COPY_RESTORED" >/dev/null
-ttc fork "$HOST_COPY_CONTAINER@main" "$HOST_COPY_CONTAINER@child" >/dev/null
+ttc fork "$HOST_COPY_CONTAINER@main" child >/dev/null
 ttc exec "$HOST_COPY_CONTAINER@child" sh -c 'echo child >/copied/sub/value; echo child-file >/single'
 ttc exec "$HOST_COPY_CONTAINER@main" sh -c '
   test "$(cat /copied/sub/value)" = container
@@ -276,7 +276,7 @@ ttc exec "$MAIN@main" sh -c '
 '
 
 # Writes before and between nested forks must produce the expected tree.
-ttc fork "$MAIN@main" "$MAIN@f1" >/dev/null
+ttc fork "$MAIN@main" f1 >/dev/null
 
 # Start both branches' first writers before either writer exits. Detached exec
 # creation is serialized by ttcd, but the guest writers overlap after sleep.
@@ -297,8 +297,8 @@ ttc exec "$MAIN@f1" sh -c 'test "$(cat /data/race)" = round1-f1-009'
 
 ttc exec "$MAIN@main" sh -c 'echo main-1 >>/data/value; echo main >/data/main-only'
 ttc exec "$MAIN@f1" sh -c 'echo f1-1 >>/data/value; echo f1 >/data/f1-only; mv /data/sub /data/f1-sub'
-ttc fork "$MAIN@main" "$MAIN@f2" >/dev/null
-ttc fork "$MAIN@f1" "$MAIN@g1" >/dev/null
+ttc fork "$MAIN@main" f2 >/dev/null
+ttc fork "$MAIN@f1" g1 >/dev/null
 
 # Every side of both second-generation forks now writes the same inherited
 # pathname concurrently. This exercises simultaneous first-writer object
@@ -361,7 +361,7 @@ ttc exec -d "$MAIN@main" sh -c '
 for unused in $(seq 1 50); do
   ttc exec "$MAIN@main" test -e /tmp/fd-ready && break
 done
-ttc fork "$MAIN@main" "$MAIN@fdchild" >/dev/null
+ttc fork "$MAIN@main" fdchild >/dev/null
 ttc exec "$MAIN@main" sh -c 'echo parent-fd >/tmp/fd-content; touch /tmp/fd-go'
 ttc exec "$MAIN@fdchild" sh -c 'echo child-fd >/tmp/fd-content; touch /tmp/fd-go'
 for branch in main fdchild; do
@@ -376,7 +376,7 @@ ttc exec "$MAIN@fdchild" sh -c 'test "$(tail -n 1 /data/openfd)" = child-fd'
 # map to distinct repository branch keys.
 ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
-ttc fork "$SECOND@main" "$SECOND@f1" >/dev/null
+ttc fork "$SECOND@main" f1 >/dev/null
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
 ttc daemon stop >/dev/null

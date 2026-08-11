@@ -97,7 +97,7 @@ ttc exec "$CONTAINER@main" sh -c '
   test "$(stat -c %a /tmp/import/nested/value)" = 640
 '
 
-ttc fork "$CONTAINER@main" "$CONTAINER@child" >/dev/null
+ttc fork "$CONTAINER@main" child >/dev/null
 printf 'parent\n' >"$TTC_E2E_ROOT/parent"
 printf 'child\n' >"$TTC_E2E_ROOT/child"
 ttc cp "$TTC_E2E_ROOT/parent" "$CONTAINER@main:/data/branch"

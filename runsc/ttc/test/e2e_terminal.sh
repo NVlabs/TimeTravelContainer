@@ -105,7 +105,7 @@ while [ "$i" -le 5 ]; do
 done
 
 ttc run -dit --name "$NAME" "$BUSYBOX_IMAGE" sh >/dev/null
-ttc fork "$NAME@main" "$NAME@child" >/dev/null
+ttc fork "$NAME@main" child >/dev/null
 
 {
   sleep 1

@@ -345,9 +345,9 @@ Commands:
   daemon requests [OPTIONS]        List durable mutation requests
   daemon request inspect|resolve   Inspect or resolve an interrupted mutation
 
-Branch selectors and fork destinations must use CONTAINER@BRANCH. Forked
-branches run immediately unless --paused is set; omitting DEST generates a
-branch ID.
+Branch selectors must use CONTAINER@BRANCH. Local fork destinations are branch
+names in the source family. Forked branches run immediately unless --paused is
+set; omitting DEST generates a branch ID.
 `)
 }
 
@@ -3895,7 +3895,7 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		if *targetNode != "" {
 			destinationValues = []string{generated + "@" + defaultBranchID}
 		} else {
-			destinationValues = []string{source.container + "@" + generated}
+			destinationValues = []string{generated}
 		}
 	}
 	if *targetNode != "" {
@@ -4441,14 +4441,13 @@ func (s execSelector) String() string {
 }
 
 func parseDestination(containerID, value string) (selector, error) {
-	destination, err := parseSelector(value)
-	if err != nil {
-		return selector{}, err
+	if value == "" {
+		return selector{}, errors.New("branch name must not be empty")
 	}
-	if destination.container != containerID {
-		return selector{}, errors.New("live branches must remain in the source container family")
+	if strings.Contains(value, "@") {
+		return selector{}, errors.New("local fork destination must be a branch name, not CONTAINER@BRANCH")
 	}
-	return destination, nil
+	return selector{container: containerID, branch: value}, nil
 }
 
 func (s selector) String() string {
