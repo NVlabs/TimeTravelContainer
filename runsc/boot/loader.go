@@ -917,9 +917,11 @@ func New(args Args) (*Loader, error) {
 	}
 	l.watchdog = watchdog.New(l.k, dogOpts)
 	initialBranchID := ""
+	initialBranchParentID := ""
 	initialFilesystemBranch := ""
 	if args.Spec.Annotations != nil {
 		initialBranchID = args.Spec.Annotations[specutils.AnnotationTTCInitialBranchID]
+		initialBranchParentID = args.Spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]
 		initialFilesystemBranch = args.Spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch]
 	}
 	if (initialBranchID == "") != (initialFilesystemBranch == "") {
@@ -944,6 +946,7 @@ func New(args Args) (*Loader, error) {
 			}
 		},
 		InitialBranchID:         initialBranchID,
+		InitialBranchParentID:   initialBranchParentID,
 		InitialFilesystemBranch: initialFilesystemBranch,
 	})
 

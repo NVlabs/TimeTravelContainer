@@ -2830,10 +2830,30 @@ func runAutoRemove(args []string, backend backend) error {
 	if _, err := backend.wait(target); err != nil {
 		return fmt.Errorf("waiting to auto-remove %s: %w", target, err)
 	}
-	if err := backend.remove(target.container, true, true); err != nil {
-		return fmt.Errorf("auto-removing %s: %w", target.container, err)
+	if err := autoRemoveTarget(target, backend); err != nil {
+		return fmt.Errorf("auto-removing %s: %w", target, err)
 	}
 	return nil
+}
+
+// autoRemoveTarget preserves peer branches that may have been forked after a
+// container was launched with --rm. The family (and its anonymous volumes) is
+// removed only while the selected branch is still its sole member.
+func autoRemoveTarget(target selector, backend backend) error {
+	info, err := backend.inspect(target.container)
+	if err != nil {
+		return err
+	}
+	branches := 0
+	for _, branch := range info.TTC.Branches {
+		if normalizeLifecycleState(branch.Metadata.State) != "deleted" {
+			branches++
+		}
+	}
+	if branches <= 1 {
+		return backend.remove(target.container, true, true)
+	}
+	return backend.destroy(target, true)
 }
 
 func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -5352,14 +5372,14 @@ func (b *runtimeBackend) applyAutoRemove(target selector, detach bool, status in
 		if err := b.scheduleAutoRemove(target); err == nil {
 			return status, nil
 		} else {
-			cleanupErr := b.remove(target.container, true, true)
+			cleanupErr := autoRemoveTarget(target, b)
 			if cleanupErr != nil {
 				return 1, fmt.Errorf("scheduling auto-remove: %w (cleanup also failed: %v)", err, cleanupErr)
 			}
 			return 1, fmt.Errorf("scheduling auto-remove: %w; container was removed", err)
 		}
 	}
-	cleanupErr := b.remove(target.container, true, true)
+	cleanupErr := autoRemoveTarget(target, b)
 	if cleanupErr != nil {
 		if launchErr != nil {
 			return status, fmt.Errorf("%w (auto-remove also failed: %v)", launchErr, cleanupErr)
@@ -8085,6 +8105,13 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 		byID[branch.ID] = branch
 	}
 	for _, branch := range live {
+		if recorded, ok := byID[branch.ID]; ok && recorded.State != "deleted" {
+			// ParentID is durable display metadata. The runtime may retain the
+			// branch's bootstrap hint after that parent is removed while the
+			// parent itself was already process-free, so it is not authoritative
+			// for lineage reconciliation.
+			branch.ParentID = recorded.ParentID
+		}
 		byID[branch.ID] = branch
 	}
 	deletedParents := make(map[string]string)

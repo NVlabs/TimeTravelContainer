@@ -93,10 +93,11 @@ const (
 	// uses a temporary memfd so it cannot dirty or allocate from that file.
 	AnnotationTTCDistributedTarget = "dev.timetravelcontainer.distributed-target"
 
-	// AnnotationTTCInitialBranchID and AnnotationTTCInitialFilesystemBranch
+	// AnnotationTTCInitialBranchID, AnnotationTTCInitialBranchParentID, and AnnotationTTCInitialFilesystemBranch
 	// select the visible branch identity and persistent filesystem pointer used
 	// when TTC starts a previously exited branch as a new sandbox loader.
 	AnnotationTTCInitialBranchID         = "dev.timetravelcontainer.initial-branch-id"
+	AnnotationTTCInitialBranchParentID   = "dev.timetravelcontainer.initial-branch-parent-id"
 	AnnotationTTCInitialFilesystemBranch = "dev.timetravelcontainer.initial-filesystem-branch"
 
 	// TTCRootfsUpperSource is the reserved, guest-invisible source key for a

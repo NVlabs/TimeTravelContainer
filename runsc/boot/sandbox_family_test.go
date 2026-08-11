@@ -302,12 +302,53 @@ func TestSandboxFamilyInitialBranchIdentity(t *testing.T) {
 	}
 	family := NewSandboxFamily(parent, SandboxFamilyOptions{
 		InitialBranchID:         "restarted-child",
+		InitialBranchParentID:   "former-parent",
 		InitialFilesystemBranch: "filesystem-child",
 	})
 	branches := family.List()
-	if len(branches) != 1 || branches[0].ID != "restarted-child" || branches[0].FilesystemBranch != "filesystem-child" || family.LoaderBranchID() != "restarted-child" {
+	if len(branches) != 1 || branches[0].ID != "restarted-child" || branches[0].ParentID != "former-parent" || branches[0].FilesystemBranch != "filesystem-child" || family.LoaderBranchID() != "restarted-child" {
 		t.Fatalf("initial branch identity: loader=%q branches=%+v", family.LoaderBranchID(), branches)
 	}
+}
+
+func TestDestroyLoaderPrefersLivePeerOverExitedPeer(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	if _, err := family.Fork(&ForkBranchArgs{ID: "a-exited", Paused: true}); err != nil {
+		t.Fatalf("Fork exited candidate: %v", err)
+	}
+	if _, err := family.Fork(&ForkBranchArgs{ID: "z-live", Paused: true}); err != nil {
+		t.Fatalf("Fork live candidate: %v", err)
+	}
+	family.mu.Lock()
+	family.branches["a-exited"].state = BranchExited
+	family.mu.Unlock()
+	if err := family.Destroy(DefaultBranchID); err != nil {
+		t.Fatalf("Destroy loader: %v", err)
+	}
+	if got := family.LoaderBranchID(); got != "z-live" {
+		t.Fatalf("loader branch=%q, want live peer z-live", got)
+	}
+	if err := family.Destroy("a-exited"); err != nil {
+		t.Fatalf("Destroy exited peer: %v", err)
+	}
+	family.mu.Lock()
+	remaining := family.branches["z-live"].k
+	family.mu.Unlock()
+	remaining.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	remaining.Unpause()
+	remaining.WaitExited()
+	remaining.Release()
 }
 
 func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {

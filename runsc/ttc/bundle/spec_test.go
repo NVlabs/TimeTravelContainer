@@ -1160,7 +1160,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
-		Branches: []BranchInfo{{ID: "child", State: "exited", FilesystemBranch: "fs-child"}},
+		Branches: []BranchInfo{{ID: "child", ParentID: "main", State: "exited", FilesystemBranch: "fs-child"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1177,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Annotations[specutils.AnnotationTTCInitialBranchID] != "child" || got.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] != "fs-child" {
+	if got.Annotations[specutils.AnnotationTTCInitialBranchID] != "child" || got.Annotations[specutils.AnnotationTTCInitialBranchParentID] != "main" || got.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] != "fs-child" {
 		t.Fatalf("initial identity annotations=%q", got.Annotations)
 	}
 	gotRepositories, err := specutils.TTCVolumeRepositories(&got)

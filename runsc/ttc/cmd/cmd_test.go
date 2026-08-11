@@ -2208,7 +2208,12 @@ func TestBuildInspectInfo(t *testing.T) {
 }
 
 func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
-	b := &fakeBackend{waitStatus: uint32(7 << 8)}
+	b := &fakeBackend{
+		waitStatus: uint32(7 << 8),
+		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+			Metadata: Branch{ID: "main", State: "exited"},
+		}}}},
+	}
 	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
 		t.Fatalf("runAutoRemove: %v", err)
 	}
@@ -2220,6 +2225,24 @@ func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
 	}
 	if err := runAutoRemove([]string{"demo"}, b); err == nil {
 		t.Fatal("internal auto-remove accepted an unqualified family")
+	}
+}
+
+func TestInternalAutoRemovePreservesForkedPeers(t *testing.T) {
+	b := &fakeBackend{
+		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+			{Metadata: Branch{ID: "main", State: "exited"}},
+			{Metadata: Branch{ID: "child", State: "running"}},
+		}}},
+	}
+	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
+		t.Fatalf("runAutoRemove: %v", err)
+	}
+	if b.destroyed != (selector{container: "demo", branch: "main"}) || !b.destroyForce {
+		t.Errorf("destroyed=%+v force=%t", b.destroyed, b.destroyForce)
+	}
+	if b.removed != "" {
+		t.Errorf("removed family %q despite live peer", b.removed)
 	}
 }
 
@@ -4020,6 +4043,17 @@ func TestMergeBranchHistoryCompactsTombstones(t *testing.T) {
 	rows := psRows([]Family{{ID: strings.Repeat("a", 64), Name: "demo", Image: "busybox:latest", Branches: merged}}, now, false)
 	if len(rows) != 3 {
 		t.Errorf("Docker ps rows included tombstone: %+v", rows)
+	}
+}
+
+func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
+	now := time.Now().UTC()
+	merged := mergeBranchHistory(
+		[]Branch{{ID: "child", ParentID: "", State: "running", CreatedAt: now}},
+		[]Branch{{ID: "child", ParentID: "removed-parent", State: "paused", CreatedAt: now}},
+	)
+	if len(merged) != 1 || merged[0].ParentID != "" || merged[0].State != "paused" {
+		t.Fatalf("merged branch=%+v, want persisted parent and live state", merged)
 	}
 }
 

@@ -488,6 +488,7 @@ type SandboxFamilyOptions struct {
 	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
 	// defaults used by ordinary OCI creation.
 	InitialBranchID         string
+	InitialBranchParentID   string
 	InitialFilesystemBranch string
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
@@ -546,6 +547,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		branches: map[string]*sandboxBranch{
 			initialID: {
 				id:               initialID,
+				parentID:         opts.InitialBranchParentID,
 				filesystemBranch: initialFilesystemBranch,
 				k:                k,
 				watchdog:         opts.LoaderWatchdog,
@@ -1955,10 +1957,9 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 	}
 }
 
-// liveLoaderReplacementLocked returns an established hydrated branch. If its
-// Kernel has already exited, WaitDefaultExit immediately advances again. f.mu
-// must be held. Parent relationships are intentionally not consulted because
-// they have no lifecycle semantics.
+// liveLoaderReplacementLocked returns an established hydrated branch whose
+// init has not already exited. f.mu must be held. Parent relationships are
+// intentionally not consulted because they have no lifecycle semantics.
 func (f *SandboxFamily) liveLoaderReplacementLocked(exclude string) *sandboxBranch {
 	ids := make([]string, 0, len(f.branches)-1)
 	for candidateID, candidate := range f.branches {
@@ -2028,7 +2029,11 @@ func (f *SandboxFamily) Destroy(id string) error {
 	var loaderWatchdog *watchdog.Watchdog
 	loaderChanged := id == f.loaderBranchID
 	if loaderChanged {
-		var replacement *sandboxBranch
+		// A live hydrated branch is the only useful Loader bookkeeping target
+		// while one exists. In particular, an alphabetically earlier exited
+		// Kernel must not displace a live peer. Process-free and exited peers are
+		// only fallbacks that allow the final Sentry teardown path to complete.
+		replacement := f.liveLoaderReplacementLocked(id)
 		ids := make([]string, 0, len(f.branches)-1)
 		for candidateID, candidate := range f.branches {
 			if candidateID == id || candidate.state == BranchCreating || candidate.state == BranchDestroying || candidate.state == BranchFailed {
@@ -2037,13 +2042,15 @@ func (f *SandboxFamily) Destroy(id string) error {
 			ids = append(ids, candidateID)
 		}
 		sort.Strings(ids)
-		// Prefer an already-hydrated peer so Loader.k remains useful to legacy
-		// branch-unaware teardown paths. A dehydrated peer is still a valid
-		// owner when no process-backed peer exists.
-		for _, candidateID := range ids {
-			candidate := f.branches[candidateID]
-			if replacement == nil || (replacement.k == nil && candidate.k != nil) {
-				replacement = candidate
+		if replacement == nil {
+			// Prefer any process-backed fallback over a process-free one. All
+			// live process-backed candidates were handled above, so these are
+			// relevant only while the family itself is being torn down.
+			for _, candidateID := range ids {
+				candidate := f.branches[candidateID]
+				if replacement == nil || (replacement.k == nil && candidate.k != nil) {
+					replacement = candidate
+				}
 			}
 		}
 		if replacement == nil {

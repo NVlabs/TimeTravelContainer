@@ -111,8 +111,19 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if distributedTarget {
 		spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
 	} else {
+		var branch *BranchInfo
+		for i := range info.Branches {
+			if info.Branches[i].ID == branchID && info.Branches[i].State != "deleted" {
+				branch = &info.Branches[i]
+				break
+			}
+		}
+		if branch == nil {
+			return "", nil, fmt.Errorf("branch %q is not recorded", branchID)
+		}
 		delete(spec.Annotations, specutils.AnnotationTTCDistributedTarget)
 		spec.Annotations[specutils.AnnotationTTCInitialBranchID] = branchID
+		spec.Annotations[specutils.AnnotationTTCInitialBranchParentID] = branch.ParentID
 		spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] = filesystemBranch
 	}
 	if spec.Root != nil && !filepath.IsAbs(spec.Root.Path) {

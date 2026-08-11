@@ -37,6 +37,9 @@ Legacy `stopped` records are presented as `exited`.
 dehydrated branch does not resume it or execute guest instructions. `rm`
 requires `-f` for a running or paused branch. Removing a branch splices its
 children to its display parent, and its branch name can immediately be reused.
+For a container started with `--rm`, automatic removal applies to the exiting
+branch; forked peers survive. The whole family and its anonymous volumes are
+removed automatically only when that branch is the family's sole member.
 
 A family target expands to its current branches. Family-wide operations are
 performed branch by branch and are not transactional: an error after some
