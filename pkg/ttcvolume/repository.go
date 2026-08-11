@@ -223,19 +223,6 @@ type Repository struct {
 	copyMode CopyMode
 	info     VolumeInfo
 
-	// Metadata trie nodes are immutable and content-addressed. Keep recently
-	// used decoded nodes in memory so namespace-heavy workloads don't reopen
-	// and decode every ancestor for every mutation. The cache is bounded since
-	// persistent updates continuously create new node identities.
-	nodeMu    sync.Mutex
-	nodeCache map[string]treeNode
-	nodeOrder []string
-	nodeNext  int
-	packMu    sync.Mutex
-	pack      *os.File
-	packIndex map[string]packedTreeNode
-	packRead  int64
-
 	// Ordinary Linux namespace mutations are not durable until fsync(2),
 	// sync(2), or filesystem teardown. Track journal and pointer files that
 	// still need their contents made durable.
@@ -387,20 +374,10 @@ func (m *Manager) OpenPrivate(path string) (*Repository, error) {
 		return nil, err
 	}
 	version := strings.TrimSpace(string(format))
-	if version != "1" && version != strconv.Itoa(formatVersion) {
+	if version != strconv.Itoa(formatVersion) {
 		return nil, fmt.Errorf("private repository uses unsupported format %q", strings.TrimSpace(string(format)))
 	}
-	repository, err := m.openPath(path, info)
-	if err != nil {
-		return nil, err
-	}
-	if version == "1" {
-		if err := repository.migrateV1(); err != nil {
-			repository.Close()
-			return nil, fmt.Errorf("migrating private repository to format 2: %w", err)
-		}
-	}
-	return repository, nil
+	return m.openPath(path, info)
 }
 
 // List returns all valid v2 volumes.
@@ -423,7 +400,7 @@ func (m *Manager) List() ([]VolumeInfo, error) {
 			return nil, fmt.Errorf("loading volume repository %q format: %w", entry.Name(), err)
 		}
 		version := strings.TrimSpace(string(format))
-		if version != "1" && version != strconv.Itoa(formatVersion) {
+		if version != strconv.Itoa(formatVersion) {
 			return nil, fmt.Errorf("volume repository %q uses unsupported format %q", entry.Name(), strings.TrimSpace(string(format)))
 		}
 		var info VolumeInfo
@@ -432,19 +409,6 @@ func (m *Manager) List() ([]VolumeInfo, error) {
 		}
 		if info.ID != entry.Name() || !validID(info.ID) {
 			return nil, fmt.Errorf("volume repository %q has invalid identity %q", entry.Name(), info.ID)
-		}
-		if version == "1" {
-			repository, err := m.openPath(filepath.Join(m.volumes, entry.Name()), info)
-			if err != nil {
-				return nil, err
-			}
-			if err := repository.migrateV1(); err != nil {
-				repository.Close()
-				return nil, fmt.Errorf("migrating volume repository %q to format 2: %w", info.Name, err)
-			}
-			if err := repository.Close(); err != nil {
-				return nil, err
-			}
 		}
 		result = append(result, info)
 	}
@@ -520,15 +484,9 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		return nil, err
 	}
 	version := strings.TrimSpace(string(format))
-	if version != "1" && version != strconv.Itoa(formatVersion) {
+	if version != strconv.Itoa(formatVersion) {
 		repo.Close()
 		return nil, fmt.Errorf("unsupported repository format %q", strings.TrimSpace(string(format)))
-	}
-	if version == "1" {
-		if err := repo.migrateV1(); err != nil {
-			repo.Close()
-			return nil, fmt.Errorf("migrating donated repository to format 2: %w", err)
-		}
 	}
 	return repo, nil
 }
@@ -538,13 +496,6 @@ func (r *Repository) Close() error {
 	if r == nil || r.dir == nil {
 		return nil
 	}
-	r.packMu.Lock()
-	var packErr error
-	if r.pack != nil {
-		packErr = r.pack.Close()
-		r.pack = nil
-	}
-	r.packMu.Unlock()
 	r.journalMu.Lock()
 	var journalErr error
 	for layer, journal := range r.journals {
@@ -561,9 +512,6 @@ func (r *Repository) Close() error {
 	}
 	err := r.dir.Close()
 	r.dir = nil
-	if packErr != nil {
-		return packErr
-	}
 	if lockErr != nil {
 		return lockErr
 	}
@@ -670,44 +618,6 @@ func (r *Repository) withLock(fn func() error) error {
 	}
 	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)
 	return fn()
-}
-
-func inodeKey(ino uint64) []byte {
-	return []byte(fmt.Sprintf("i/%016x", ino))
-}
-
-func entryKey(parent uint64, name string) []byte {
-	return []byte(fmt.Sprintf("d/%016x/%s", parent, name))
-}
-
-func entryPrefix(parent uint64) []byte {
-	return []byte(fmt.Sprintf("d/%016x/", parent))
-}
-
-func (r *Repository) getInode(root string, ino uint64) (Inode, error) {
-	raw, ok, err := r.treeGet(root, inodeKey(ino))
-	if err != nil {
-		return Inode{}, err
-	}
-	if !ok {
-		return Inode{}, fs.ErrNotExist
-	}
-	var inode Inode
-	if err := json.Unmarshal(raw, &inode); err != nil {
-		return Inode{}, err
-	}
-	if inode.Number != ino {
-		return Inode{}, fmt.Errorf("inode key %d contains inode %d", ino, inode.Number)
-	}
-	return inode, nil
-}
-
-func (r *Repository) setInode(root string, inode Inode) (string, error) {
-	raw, err := json.Marshal(inode)
-	if err != nil {
-		return "", err
-	}
-	return r.treeSet(root, inodeKey(inode.Number), raw)
 }
 
 func (r *Repository) readBranch(id string) (Branch, error) {
@@ -1136,24 +1046,6 @@ func (r *Repository) createNonRegular(branchID string, parent uint64, name strin
 		return r.commitMetadata(&branch, state, ops)
 	})
 	return created, err
-}
-
-func (r *Repository) lookup(root string, parent uint64, name string) (uint64, error) {
-	raw, ok, err := r.treeGet(root, entryKey(parent, name))
-	if err != nil {
-		return 0, err
-	}
-	if !ok {
-		return 0, fs.ErrNotExist
-	}
-	var entry DirectoryEntry
-	if err := json.Unmarshal(raw, &entry); err != nil {
-		return 0, err
-	}
-	if entry.Name != name || entry.Inode == 0 {
-		return 0, errors.New("invalid directory entry")
-	}
-	return entry.Inode, nil
 }
 
 // Lookup resolves a child name.

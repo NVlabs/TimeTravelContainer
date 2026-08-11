@@ -17,7 +17,6 @@ package ttcvolume
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -92,155 +90,6 @@ type metadataLayer struct {
 	// is not a container-branch parent: every branch independently names one
 	// Root, and deleting or rehydrating any branch never traverses UI lineage.
 	Parent string `json:"parent,omitempty"`
-}
-
-type metadataV1Migration struct {
-	Branches []Branch `json:"branches"`
-}
-
-// migrateV1 converts the pre-release byte-radix metadata representation into
-// transactional layers. The marker preserves all old branch roots until the
-// format marker is committed, making an interrupted migration restartable.
-func (r *Repository) migrateV1() error {
-	const marker = "migration-v2.json"
-	if err := r.mkdir("layers", 0700); err != nil {
-		return err
-	}
-	var migration metadataV1Migration
-	if err := r.readJSON(marker, &migration); errors.Is(err, os.ErrNotExist) {
-		branchDir, openErr := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
-		if openErr != nil {
-			return openErr
-		}
-		names, readErr := branchDir.Readdirnames(-1)
-		closeErr := branchDir.Close()
-		if readErr != nil {
-			return readErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			if !strings.HasSuffix(name, ".json") {
-				continue
-			}
-			var branch Branch
-			if err := r.readJSON(filepath.Join("branches", name), &branch); err != nil {
-				return err
-			}
-			if branch.ID == "" || len(branch.Root) != 64 {
-				return fmt.Errorf("invalid format-1 branch record %q", name)
-			}
-			migration.Branches = append(migration.Branches, branch)
-		}
-		if len(migration.Branches) == 0 {
-			return errors.New("format-1 repository has no branches")
-		}
-		if err := r.writeJSONAtomic(marker, migration); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-
-	for _, oldBranch := range migration.Branches {
-		ops, err := r.readV1Metadata(oldBranch.Root)
-		if err != nil {
-			return fmt.Errorf("reading format-1 branch %q: %w", oldBranch.ID, err)
-		}
-		layer, err := r.createMetadataLayer("")
-		if err != nil {
-			return err
-		}
-		branch := oldBranch
-		branch.Root = layer
-		state := newBranchMetadata(branch)
-		for len(ops) != 0 {
-			count := len(ops)
-			if count > 1000 {
-				count = 1000
-			}
-			if err := r.commitMetadata(&branch, state, ops[:count]); err != nil {
-				return err
-			}
-			ops = ops[count:]
-		}
-		if err := r.writeBranch(branch); err != nil {
-			return err
-		}
-	}
-	if err := r.syncMetadataLocked(); err != nil {
-		return err
-	}
-	if err := r.atomicWriteFile("format", []byte(strconv.Itoa(formatVersion)+"\n"), 0600); err != nil {
-		return err
-	}
-	if err := r.syncMetadataLocked(); err != nil {
-		return err
-	}
-	if err := r.unlink(marker); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return r.dir.Sync()
-}
-
-func (r *Repository) readV1Metadata(root string) ([]metadataOp, error) {
-	var ops []metadataOp
-	var walk func(string, []byte) error
-	walk = func(id string, key []byte) error {
-		node, err := r.getTreeNode(id)
-		if err != nil {
-			return err
-		}
-		if len(node.Value) != 0 {
-			keyString := string(key)
-			switch {
-			case strings.HasPrefix(keyString, "i/"):
-				var inode Inode
-				if err := json.Unmarshal(node.Value, &inode); err != nil {
-					return err
-				}
-				ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &inode})
-			case strings.HasPrefix(keyString, "d/"):
-				parts := strings.SplitN(keyString, "/", 3)
-				if len(parts) != 3 {
-					return fmt.Errorf("invalid format-1 dentry key %q", keyString)
-				}
-				parent, err := strconv.ParseUint(parts[1], 16, 64)
-				if err != nil {
-					return err
-				}
-				var entry DirectoryEntry
-				if err := json.Unmarshal(node.Value, &entry); err != nil {
-					return err
-				}
-				ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: parent, Entry: &entry})
-			default:
-				return fmt.Errorf("invalid format-1 metadata key %q", keyString)
-			}
-		}
-		edges := make([]string, 0, len(node.Children))
-		for edge := range node.Children {
-			edges = append(edges, edge)
-		}
-		sort.Strings(edges)
-		for _, edge := range edges {
-			raw, err := hex.DecodeString(edge)
-			if err != nil || len(raw) != 1 {
-				return fmt.Errorf("invalid format-1 tree edge %q", edge)
-			}
-			childKey := append(append([]byte(nil), key...), raw[0])
-			if err := walk(node.Children[edge], childKey); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := walk(root, nil); err != nil {
-		return nil, err
-	}
-	return ops, nil
 }
 
 func (r *Repository) createMetadataLayer(parent string) (string, error) {

@@ -12,7 +12,6 @@ go_library(
         "metadata.go",
         "repository.go",
         "snapshot.go",
-        "tree.go",
     ],
     visibility = ["//visibility:public"],
     deps = [

@@ -15,7 +15,6 @@
 package ttcvolume
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +24,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func openTestManager(t *testing.T) *Manager {
@@ -187,68 +185,6 @@ func TestJournalDiscardsTornTailBeforeNextTransaction(t *testing.T) {
 	defer repo.Close()
 	if _, err := repo.Lookup(MainBranch, RootInode, "after-crash"); err != nil {
 		t.Fatalf("transaction after torn tail was not replayed: %v", err)
-	}
-}
-
-func TestFormatOneRepositoryMigratesInPlace(t *testing.T) {
-	manager := openTestManager(t)
-	repo, err := manager.Create("legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := repo.emptyTree()
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UnixNano()
-	root, err = repo.setInode(root, Inode{Number: RootInode, Type: "directory", Mode: 0755, Nlink: 2, CtimeNsec: now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	object, err := repo.createObject("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacyInode := uint64(42)
-	root, err = repo.setInode(root, Inode{Number: legacyInode, Type: "regular", Mode: 0644, Nlink: 1, Object: object, DataGeneration: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry, err := json.Marshal(DirectoryEntry{Name: "legacy-file", Inode: legacyInode})
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err = repo.treeSet(root, entryKey(RootInode, "legacy-file"), entry)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.writeBranch(Branch{ID: MainBranch, Root: root, Generation: 1, CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.atomicWriteFile("format", []byte("1\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.SyncMetadata(); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	repo, err = manager.Open("legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repo.Close()
-	if got, err := repo.Lookup(MainBranch, RootInode, "legacy-file"); err != nil || got != legacyInode {
-		t.Fatalf("migrated lookup=(%d, %v), want (%d, nil)", got, err, legacyInode)
-	}
-	format, err := os.ReadFile(filepath.Join(repo.path, "format"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(format) != "2\n" {
-		t.Fatalf("migrated format=%q, want 2", format)
 	}
 }
 
