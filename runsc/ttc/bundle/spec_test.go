@@ -1126,6 +1126,67 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 }
 
+func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["sh"]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	info := ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "running", CreatedAt: now,
+		Branches: []BranchInfo{
+			{ID: "main", State: "running", CreatedAt: now},
+			{ID: "child", ParentID: "main", State: "running", CreatedAt: now},
+		},
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkBranchDeleted("demo", "main"); err != nil {
+		t.Fatalf("MarkBranchDeleted(main): %v", err)
+	}
+	if err := store.UpdateBranchState("demo", "child", "dehydrated"); err != nil {
+		t.Fatalf("UpdateBranchState(child): %v", err)
+	}
+	got, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "dehydrated" || got.Branches[0].State != "deleted" || got.Branches[1].State != "dehydrated" {
+		t.Fatalf("after deleting main and dehydrating child: %+v", got)
+	}
+	status := 137
+	if err := store.ReconcileRuntimeUnavailable("demo", &status); err != nil {
+		t.Fatalf("ReconcileRuntimeUnavailable: %v", err)
+	}
+	got, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "dehydrated" || got.Branches[1].State != "dehydrated" || got.ExitStatus != nil {
+		t.Fatalf("runtime reconciliation corrupted durable child: %+v", got)
+	}
+	if err := store.UpdateBranchState("demo", "child", "running"); err != nil {
+		t.Fatalf("rehydrating child: %v", err)
+	}
+	if err := store.RecordBranchExit("demo", "main", 137); err != nil {
+		t.Fatalf("recording deleted main exit: %v", err)
+	}
+	got, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "running" || got.Branches[1].State != "running" {
+		t.Fatalf("deleted main exit changed live child: %+v", got)
+	}
+}
+
 func TestStoreBranchPortBindings(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

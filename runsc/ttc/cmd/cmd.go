@@ -7683,25 +7683,23 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
 				continue
 			}
-			if container.State == "running" || container.State == "paused" {
-				if _, ok := runtimeIDs[container.ID]; ok {
-					continue
+			if _, ok := runtimeIDs[container.ID]; ok {
+				continue
+			}
+			var exitStatus *int
+			if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
+				if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
+					code := waitStatusExitCode(status)
+					exitStatus = &code
 				}
-				var exitStatus *int
-				if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
-					if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
-						code := waitStatusExitCode(status)
-						exitStatus = &code
-					}
-				}
-				_ = store.UpdateState(container.ID, "exited", exitStatus)
+			}
+			if err := store.ReconcileRuntimeUnavailable(container.ID, exitStatus); err != nil {
+				continue
+			}
+			if reconciled, err := store.LoadContainer(container.ID); err == nil {
 				family := byID[container.ID]
-				family.State = "exited"
-				for i := range family.Branches {
-					if family.Branches[i].State != "deleted" {
-						family.Branches[i].State = "exited"
-					}
-				}
+				family.State = normalizeLifecycleState(reconciled.State)
+				family.Branches = persistentBranches(reconciled.Branches)
 				byID[container.ID] = family
 			}
 		}
@@ -8281,7 +8279,22 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 		output, branchesErr := b.command("timetravel", info.ID, "branches")
 		if branchesErr != nil {
-			return branchesErr
+			// A fully dehydrated family has no live Sentry. runsc may briefly
+			// retain a stopped OCI record after the last branch releases it;
+			// state then succeeds even though its control server is gone. Remove
+			// that stale shell and rebuild directly from the durable image.
+			allCold := true
+			for _, branch := range info.Branches {
+				if branch.State != "deleted" && branch.State != "dehydrated" && branch.State != "exited" && branch.State != "stopped" {
+					allCold = false
+					break
+				}
+			}
+			if !allCold {
+				return branchesErr
+			}
+			_, _ = b.command("delete", "--force", info.ID)
+			return b.rehydrateCold(target, info, *persistentBranch, false)
 		}
 		var runtimeBranches []runscBranchInfo
 		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
@@ -8771,23 +8784,17 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	store := ttcbundle.Store{Root: b.dataRoot}
-	if target.branch != defaultBranchID {
-		if info, err := store.LoadContainer(target.container); err == nil {
-			if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
-			}
-			if err := store.RemovePortBindingsForBranch(target.container, target.branch); err != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: removing published-port metadata for exited %s: %v\n", target, err)
-			}
+	if info, err := store.LoadContainer(target.container); err == nil {
+		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
 		}
-		if err := store.UpdateBranchState(target.container, target.branch, "exited"); err != nil && b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: recording branch exit state for %s: %v\n", target, err)
+		if err := store.RemovePortBindingsForBranch(target.container, target.branch); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: removing published-port metadata for exited %s: %v\n", target, err)
 		}
-		return
 	}
 	exitStatus := waitStatusExitCode(status)
-	if err := store.UpdateState(target.container, "exited", &exitStatus); err != nil && b.stderr != nil {
-		fmt.Fprintf(b.stderr, "ttc: warning: recording exit state for %s: %v\n", target, err)
+	if err := store.RecordBranchExit(target.container, target.branch, exitStatus); err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: warning: recording branch exit state for %s: %v\n", target, err)
 	}
 }
 

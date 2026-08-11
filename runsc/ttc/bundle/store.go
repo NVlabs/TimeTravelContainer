@@ -2339,7 +2339,39 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 		index[branch.ID] = len(info.Branches)
 		info.Branches = append(info.Branches, branch)
 	}
+	recomputeContainerState(&info)
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// recomputeContainerState derives the family summary from all surviving
+// branches. Branch ancestry is presentation metadata only: main and its
+// descendants are lifecycle peers, so no particular branch owns this state.
+func recomputeContainerState(info *ContainerInfo) {
+	priority := map[string]int{
+		"exited":      1,
+		"stopped":     1,
+		"dehydrated":  2,
+		"created":     3,
+		"paused":      4,
+		"dehydrating": 5,
+		"rehydrating": 6,
+		"running":     7,
+	}
+	state := "exited"
+	best := 0
+	for _, branch := range info.Branches {
+		if branch.State == "deleted" {
+			continue
+		}
+		if rank := priority[branch.State]; rank > best {
+			state, best = branch.State, rank
+		}
+	}
+	info.State = state
+	if state != "exited" && state != "stopped" {
+		info.ExitStatus = nil
+		info.ExitedAt = nil
+	}
 }
 
 // UpdateBranchState changes only the last known lifecycle state of a recorded branch.
@@ -2356,12 +2388,76 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 			return fmt.Errorf("branch %q is deleted", branchID)
 		}
 		info.Branches[i].State = state
-		if branchID == "main" {
-			info.State = state
-		}
+		recomputeContainerState(&info)
 		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 	}
 	return fmt.Errorf("branch %q is not recorded", branchID)
+}
+
+// RecordBranchExit records one branch's termination without treating it as a
+// family-wide exit. exitStatus is retained on the family only when no other
+// surviving branch remains runnable or recoverable.
+func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	found := false
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.ID != branchID {
+			continue
+		}
+		found = true
+		if branch.State == "deleted" || branch.State == "dehydrated" {
+			return nil
+		}
+		branch.State = "exited"
+		break
+	}
+	if !found {
+		return fmt.Errorf("branch %q is not recorded", branchID)
+	}
+	recomputeContainerState(&info)
+	if info.State == "exited" {
+		info.ExitStatus = &exitStatus
+		info.ExitedAt = &now
+	}
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// ReconcileRuntimeUnavailable marks only branches that required the missing
+// Sentry as exited. Durable dehydrated branches remain recoverable.
+func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		switch branch.State {
+		case "running", "paused", "dehydrating", "rehydrating":
+			branch.State = "exited"
+			changed = true
+		}
+	}
+	oldState := info.State
+	recomputeContainerState(&info)
+	if oldState != info.State {
+		changed = true
+	}
+	if info.State == "exited" && exitStatus != nil {
+		now := time.Now().UTC()
+		info.ExitStatus = exitStatus
+		info.ExitedAt = &now
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // MarkBranchDeleted retains branch lineage while marking its runtime state gone.
@@ -2378,14 +2474,7 @@ func (s Store) MarkBranchDeleted(name, branchID string) error {
 		if info.Branches[i].ID == branchID {
 			info.Branches[i].State = "deleted"
 			info.Branches[i].DeletedAt = &now
-			if branchID == "main" {
-				for _, peer := range info.Branches {
-					if peer.ID != branchID && peer.State != "deleted" {
-						info.State = peer.State
-						break
-					}
-				}
-			}
+			recomputeContainerState(&info)
 			bindings := info.PublishedPorts[:0]
 			for _, binding := range info.PublishedPorts {
 				if binding.Branch() != branchID {
