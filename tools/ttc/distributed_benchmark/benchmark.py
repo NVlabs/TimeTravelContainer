@@ -77,6 +77,10 @@ class Experiment:
         self.txids = []
         self.netem_active = False
 
+    @staticmethod
+    def branch(container):
+        return f"{container}@main"
+
     def env(self, node):
         runtime = self.runtime_a if node == "a" else self.runtime_b
         result = os.environ.copy()
@@ -192,25 +196,40 @@ class Experiment:
             self.case["touch_fraction"], self.case["rounds"],
         )
         self.source_id = result.stdout.strip()
-        self.wait_exec("a", self.source,
+        self.wait_exec("a", self.branch(self.source),
                        "while [ ! -f /tmp/ttc-bench-ready ]; do sleep 0.05; done", 120)
         self.shape_network()
         fork_start = time.monotonic_ns()
         if self.case["capture_mode"] == "batch":
-            self.ttc("a", "fork", "--target", "node-b", self.source, *self.targets, timeout=300)
+            self.ttc("a", "fork", "--target", "node-b", self.branch(self.source),
+                     *(self.branch(target) for target in self.targets), timeout=300)
         elif self.case["capture_mode"] == "sequential":
             for target in self.targets:
-                self.ttc("a", "fork", "--target", "node-b", self.source, target, timeout=300)
+                self.ttc("a", "fork", "--target", "node-b", self.branch(self.source),
+                         self.branch(target), timeout=300)
         else:
             raise ValueError(f"unknown capture_mode {self.case['capture_mode']!r}")
         fork_end = time.monotonic_ns()
         inspected = [self.inspect("b", target) for target in self.targets]
         self.target_ids = [target["TTC"]["container"]["id"] for target in inspected]
         self.txids = [target["TTC"]["distributed_fork"]["identity"]["transaction_id"] for target in inspected]
+        dehydrate_ms = None
+        rehydrate_ms = None
+        if self.args.verify_dehydrate:
+            transition_start = time.monotonic_ns()
+            for target in self.targets:
+                self.ttc("b", "dehydrate", self.branch(target), timeout=300)
+            transition_middle = time.monotonic_ns()
+            for target in self.targets:
+                self.ttc("b", "rehydrate", self.branch(target), timeout=300)
+            transition_end = time.monotonic_ns()
+            dehydrate_ms = (transition_middle - transition_start) / 1e6
+            rehydrate_ms = (transition_end - transition_middle) / 1e6
         work_start = time.monotonic_ns()
         def run_target(target):
-            self.ttc("b", "kill", "--signal", "CONT", target)
-            self.wait_exec("b", target,
+            branch = self.branch(target)
+            self.ttc("b", "kill", "--signal", "CONT", branch)
+            self.wait_exec("b", branch,
                            "while [ ! -f /tmp/ttc-bench-done ]; do sleep 0.01; done",
                            300)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.targets)) as executor:
@@ -227,8 +246,8 @@ class Experiment:
             time.sleep(0.05)
         statuses = [self.source_status(txid) for txid in self.txids]
         target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
-        source_ok = self.ttc("a", "exec", self.source, "true", check=False).returncode == 0
-        target_ok = [self.ttc("b", "exec", target, "true", check=False).returncode == 0 for target in self.targets]
+        source_ok = self.ttc("a", "exec", self.branch(self.source), "true", check=False).returncode == 0
+        target_ok = [self.ttc("b", "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
         return {
             "schema_version": 2,
             "case": self.case,
@@ -236,6 +255,8 @@ class Experiment:
             "image": self.args.image,
             "fork_ms": (fork_end - fork_start) / 1e6,
             "workload_ms": (work_end - work_start) / 1e6,
+            "dehydrate_ms": dehydrate_ms,
+            "rehydrate_ms": rehydrate_ms,
             "independent_ms": independent_ms,
             "source_ok": source_ok,
             "target_ok": target_ok,
@@ -331,6 +352,10 @@ def main():
     parser.add_argument("--work-dir", help="persistent cache/results directory")
     parser.add_argument("--output", help="JSONL output (default: stdout only)")
     parser.add_argument("--independence-timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--verify-dehydrate", action="store_true",
+        help="dehydrate and rehydrate every remote target before its workload",
+    )
     args = parser.parse_args()
     root = pathlib.Path(args.work_dir or tempfile.mkdtemp(prefix="ttc-distributed-benchmark."))
     root.mkdir(parents=True, exist_ok=True)

@@ -61,6 +61,11 @@ than one to issue one ordinary fork command per target. This provides a direct
 comparison for batch fan-out's single source pause, shared capture, and
 parallel target preparation.
 
+Add `--verify-dehydrate` to dehydrate and rehydrate each remote target before
+its access workload. This forces any remaining source-page dependency into the
+shared durable snapshot, verifies process-free target reconstruction, and
+records both transition latencies in the JSON result.
+
 The harness compiles `page_worker.c` once into the work directory and imports
 it through a TTC `:copy` mount. The worker prefaults one byte per 4 KiB page,
 stops itself before the fork, and resumes only on `SIGCONT`. Thus readiness
