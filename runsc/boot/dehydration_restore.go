@@ -283,12 +283,24 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		// Branches in one Sentry share the platform. In particular, systrap's
 		// stub mapping and source subprocess are process-global; constructing a
 		// second platform here can collide with the active platform's mappings.
-		return kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+		child, err := kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
 			},
 		})
+		if err != nil {
+			return nil, err
+		}
+		// A durable peer may have been captured by a short-lived bootstrap
+		// Sentry. Container IDs are runtime-local task metadata, not part of the
+		// guest-visible state, so retarget them to the receiving sandbox before
+		// branch controls attempt to locate the init process.
+		for _, task := range child.TaskSet().Root.Tasks() {
+			task.RestoreContainerID(l.sandboxID)
+		}
+		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		return child, nil
 	})
 	if err != nil {
 		return nil, err

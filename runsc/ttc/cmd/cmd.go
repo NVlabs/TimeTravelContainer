@@ -5316,22 +5316,15 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err != nil {
 		return 1, err
 	}
-	dehydratedPeers := make([]selector, 0, len(preservedPeers))
-	for _, peer := range preservedPeers {
-		if err := b.dehydrate(peer); err != nil {
-			restoreErr := b.restoreFreshStartPeers(dehydratedPeers)
-			if restoreErr != nil {
-				return 1, fmt.Errorf("preserving active peers before starting %s: %w (restoring already preserved peers also failed: %v)", target, err, restoreErr)
-			}
-			return 1, fmt.Errorf("preserving active peers before starting %s: %w", target, err)
+	if len(preservedPeers) != 0 {
+		if err := b.startFreshBranchBesidePeers(info, target, branch); err != nil {
+			return 1, err
 		}
-		dehydratedPeers = append(dehydratedPeers, peer)
-	}
-	restoreAfterFailure := func(startErr error) (int, error) {
-		if restoreErr := b.restoreFreshStartPeers(dehydratedPeers); restoreErr != nil {
-			return 1, fmt.Errorf("%w (restoring preserved peers also failed: %v)", startErr, restoreErr)
+		if err := b.containerStore().RecordBranchStart(target.container, target.branch); err != nil {
+			_, _ = b.command("timetravel", target.container, "destroy", target.branch)
+			return 1, fmt.Errorf("recording fresh start for %s: %w", target, err)
 		}
-		return 1, startErr
+		return b.finishPreservedPeerStart(info, target, detach, interactive)
 	}
 	// Waiting for the branch init process and tearing down its sandbox are
 	// separate events. In particular, a multi-process container may report its
@@ -5341,20 +5334,20 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	// fail immediately.
 	waitForTeardown := true
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
-		return restoreAfterFailure(fmt.Errorf("preparing a fresh runtime for %s: %w", target, err))
+		return 1, fmt.Errorf("preparing a fresh runtime for %s: %w", target, err)
 	}
 	if b.dataRoot != "" {
 		store := b.containerStore()
 		info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
 		if err != nil {
-			return restoreAfterFailure(err)
+			return 1, err
 		}
 		if _, err := store.PruneImageRoots(context.Background()); err != nil {
-			return restoreAfterFailure(fmt.Errorf("pruning superseded image roots: %w", err))
+			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
 		}
 		branch, err = persistentBranchInfo(info, target.branch)
 		if err != nil {
-			return restoreAfterFailure(err)
+			return 1, err
 		}
 	}
 	filesystemBranch := branch.FilesystemBranch
@@ -5365,47 +5358,19 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
 		}
 	}
-	bundleDir, cleanupBundle, err := b.containerStore().PrepareBranchStartBundle(info.ID, target.branch, filesystemBranch, len(dehydratedPeers) != 0)
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareBranchStartBundle(info.ID, target.branch, filesystemBranch, false)
 	if err != nil {
-		return restoreAfterFailure(err)
+		return 1, err
 	}
 	defer cleanupBundle()
-	launchDetached := detach || len(dehydratedPeers) != 0
-	status, err := b.launch(info, target, bundleDir, launchDetached, interactive)
-	if len(dehydratedPeers) == 0 {
-		if err == nil {
-			b.recordLaunchState(target, detach, status)
-		}
-		if info.AutoRemove {
-			return b.applyAutoRemove(target, detach, status, err)
-		}
-		return status, err
+	status, err := b.launch(info, target, bundleDir, detach, interactive)
+	if err == nil {
+		b.recordLaunchState(target, detach, status)
 	}
-	if err != nil || status != 0 {
-		if err == nil {
-			err = fmt.Errorf("starting paused bootstrap for %s exited with status %d", target, status)
-		}
-		return restoreAfterFailure(err)
+	if info.AutoRemove {
+		return b.applyAutoRemove(target, detach, status, err)
 	}
-	store := b.containerStore()
-	if err := store.RecordBranchStart(target.container, target.branch); err != nil {
-		_ = b.discard(target)
-		return restoreAfterFailure(fmt.Errorf("recording paused bootstrap for %s: %w", target, err))
-	}
-	if err := store.UpdateBranchState(target.container, target.branch, "paused"); err != nil {
-		_ = b.discard(target)
-		return restoreAfterFailure(fmt.Errorf("recording paused state for %s: %w", target, err))
-	}
-	if err := b.restoreFreshStartPeers(dehydratedPeers); err != nil {
-		discardErr := b.discard(target)
-		restoreErr := b.restoreFreshStartPeers(dehydratedPeers)
-		return 1, errors.Join(fmt.Errorf("restoring active peers beside %s: %w", target, err), discardErr, restoreErr)
-	}
-	if err := b.resume(target); err != nil {
-		discardErr := b.discard(target)
-		return 1, errors.Join(fmt.Errorf("resuming freshly started branch %s: %w", target, err), discardErr)
-	}
-	return b.finishPreservedPeerStart(info, target, detach, interactive)
+	return status, err
 }
 
 // freshStartPeers returns active branches that must survive replacement of the
@@ -5432,31 +5397,205 @@ func freshStartPeers(info ttcbundle.ContainerInfo, target selector) ([]selector,
 	return peers, nil
 }
 
-func (b *runtimeBackend) restoreFreshStartPeers(peers []selector) error {
-	var errs []error
-	for _, peer := range peers {
-		info, err := b.containerStore().LoadContainer(peer.container)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("loading %s for restoration: %w", peer, err))
-			continue
-		}
-		branch, err := persistentBranchInfo(info, peer.branch)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		switch normalizeLifecycleState(branch.State) {
-		case "running", "paused":
-			continue
-		case "dehydrated":
-			if err := b.rehydrate(peer); err != nil {
-				errs = append(errs, fmt.Errorf("rehydrating %s: %w", peer, err))
-			}
-		default:
-			errs = append(errs, fmt.Errorf("preserved peer %s became %s", peer, normalizeLifecycleState(branch.State)))
+// startFreshBranchBesidePeers constructs target in a short-lived paused Sentry
+// and imports that never-executed Kernel into the family's existing Sentry.
+// Active peers are neither serialized nor replaced; the work is bounded by the
+// fresh target's bootstrap state rather than the aggregate size of its peers.
+func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInfo, target selector, branch ttcbundle.BranchInfo) error {
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		if target.branch == defaultBranchID {
+			filesystemBranch = ttcvolume.MainBranch
+		} else {
+			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
 		}
 	}
-	return errors.Join(errs...)
+	memoryRoot := filepath.Join(b.dataRoot, "containers", info.ID, "memory")
+	if err := os.MkdirAll(memoryRoot, 0700); err != nil {
+		return fmt.Errorf("creating branch bootstrap memory root: %w", err)
+	}
+	stagingDir, err := os.MkdirTemp(memoryRoot, ".fresh-start-")
+	if err != nil {
+		return fmt.Errorf("creating branch bootstrap directory: %w", err)
+	}
+	defer os.RemoveAll(stagingDir)
+	memoryPath := filepath.Join(stagingDir, "application.mem")
+	memoryFile, err := os.OpenFile(memoryPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("creating branch bootstrap memory file: %w", err)
+	}
+	if err := memoryFile.Close(); err != nil {
+		return fmt.Errorf("closing branch bootstrap memory file: %w", err)
+	}
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareTransientBranchStartBundle(info.ID, target.branch, filesystemBranch, memoryPath)
+	if err != nil {
+		return err
+	}
+	defer cleanupBundle()
+	random := make([]byte, 8)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Errorf("creating branch bootstrap runtime ID: %w", err)
+	}
+	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
+	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, runtimeID)
+	if err != nil {
+		return fmt.Errorf("creating paused bootstrap for %s: %w", target, err)
+	}
+	if status != 0 {
+		return fmt.Errorf("creating paused bootstrap for %s exited with status %d", target, status)
+	}
+	bootstrapCreated := true
+	defer func() {
+		if bootstrapCreated {
+			_, _ = b.command("delete", "--force", runtimeID)
+		}
+	}()
+	status, err = b.runConfiguredCommandWithArgs(configured, "start", runtimeID)
+	if err != nil {
+		return fmt.Errorf("starting paused bootstrap for %s: %w", target, err)
+	}
+	if status != 0 {
+		return fmt.Errorf("starting paused bootstrap for %s exited with status %d", target, status)
+	}
+	if err := b.waitForPausedBootstrap(runtimeID, target.branch, 5*time.Second); err != nil {
+		return fmt.Errorf("waiting for paused bootstrap for %s: %w", target, err)
+	}
+	capture, metadata, snapshots, err := b.captureTransientBranch(runtimeID, target.branch, stagingDir)
+	if err != nil {
+		return fmt.Errorf("capturing paused bootstrap for %s: %w", target, err)
+	}
+	defer metadata.Close()
+	defer func() {
+		for _, snapshot := range snapshots {
+			_ = snapshot.Close()
+		}
+	}()
+	if _, err := b.command("delete", "--force", runtimeID); err != nil {
+		return fmt.Errorf("releasing paused bootstrap for %s: %w", target, err)
+	}
+	bootstrapCreated = false
+
+	// An exited incarnation may still have a branch record in the live Sentry.
+	// Remove only that dead Kernel; its persistent filesystem branch is owned by
+	// ttcd and remains available to the imported replacement.
+	if output, err := b.command("timetravel", info.ID, "branches"); err == nil {
+		var runtimeBranches []runscBranchInfo
+		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+			return fmt.Errorf("decoding active branches before starting %s: %w", target, err)
+		}
+		for _, runtimeBranch := range runtimeBranches {
+			if runtimeBranch.ID == target.branch {
+				if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+					return fmt.Errorf("releasing the exited incarnation of %s: %w", target, err)
+				}
+				break
+			}
+		}
+	} else {
+		return fmt.Errorf("querying active peers before starting %s: %w", target, err)
+	}
+	capture.Resume = true
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, snapshots); err != nil {
+		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) waitForPausedBootstrap(runtimeID, branchID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastState string
+	for {
+		output, err := b.command("timetravel", runtimeID, "branches")
+		if err == nil {
+			var branches []runscBranchInfo
+			if err := json.Unmarshal(output, &branches); err != nil {
+				return fmt.Errorf("decoding bootstrap branches: %w", err)
+			}
+			for _, branch := range branches {
+				if branch.ID != branchID {
+					continue
+				}
+				lastState = fmt.Sprintf("state=%s init=%s pid=%d", branch.State, branch.InitState, branch.InitPID)
+				if branch.State == "paused" && branch.InitPID > 0 {
+					return nil
+				}
+			}
+		} else {
+			lastState = err.Error()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out (%s)", lastState)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// captureTransientBranch exports one already-paused bootstrap branch into
+// short-lived files suitable for peer import. The caller owns the returned
+// open files and directory.
+func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir string) (boot.BranchDehydrateInfo, *os.File, []*os.File, error) {
+	metadataPath := filepath.Join(stagingDir, "metadata.state")
+	metadata, err := os.OpenFile(metadataPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, nil, err
+	}
+	output, err := b.commandWithFiles([]*os.File{metadata}, "timetravel", "--dehydration-fd=3", runtimeID, "dehydrate", branchID)
+	if closeErr := metadata.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, nil, err
+	}
+	var capture boot.BranchDehydrateInfo
+	if err := json.Unmarshal(output, &capture); err != nil {
+		return boot.BranchDehydrateInfo{}, nil, nil, fmt.Errorf("decoding bootstrap capture: %w", err)
+	}
+	if len(capture.Memories) == 0 {
+		return boot.BranchDehydrateInfo{}, nil, nil, errors.New("bootstrap capture contains no memory images")
+	}
+	exportFiles := make([]*os.File, 0, len(capture.Memories))
+	for i := range capture.Memories {
+		file, err := os.OpenFile(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+		if err != nil {
+			for _, opened := range exportFiles {
+				_ = opened.Close()
+			}
+			return boot.BranchDehydrateInfo{}, nil, nil, err
+		}
+		exportFiles = append(exportFiles, file)
+	}
+	exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(exportFiles))}
+	if b.allowSlowVolumeCopy {
+		exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
+	}
+	exportArgs = append(exportArgs, runtimeID, "dehydrate-export", branchID)
+	_, exportErr := b.commandWithFiles(exportFiles, exportArgs...)
+	for _, file := range exportFiles {
+		if closeErr := file.Close(); exportErr == nil && closeErr != nil {
+			exportErr = closeErr
+		}
+	}
+	if exportErr != nil {
+		return boot.BranchDehydrateInfo{}, nil, nil, exportErr
+	}
+	metadata, err = os.Open(metadataPath)
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, nil, err
+	}
+	snapshots := make([]*os.File, 0, len(capture.Memories))
+	for i := range capture.Memories {
+		file, err := os.Open(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)))
+		if err != nil {
+			metadata.Close()
+			for _, opened := range snapshots {
+				_ = opened.Close()
+			}
+			return boot.BranchDehydrateInfo{}, nil, nil, err
+		}
+		snapshots = append(snapshots, file)
+	}
+	return capture, metadata, snapshots, nil
 }
 
 func (b *runtimeBackend) finishPreservedPeerStart(info ttcbundle.ContainerInfo, target selector, detach, interactive bool) (int, error) {

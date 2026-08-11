@@ -1193,6 +1193,27 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	if got.Root == nil || got.Root.Path != filepath.Join(bundleDir, "rootfs") {
 		t.Fatalf("root path=%+v", got.Root)
 	}
+
+	transientMemory := filepath.Join(root, "bootstrap.mem")
+	transient, transientCleanup, err := store.PrepareTransientBranchStartBundle("demo", "child", "fs-child", transientMemory)
+	if err != nil {
+		t.Fatalf("PrepareTransientBranchStartBundle: %v", err)
+	}
+	defer transientCleanup()
+	data, err = os.ReadFile(filepath.Join(transient, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = specs.Spec{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[specutils.AnnotationTTCMemoryFile] != transientMemory {
+		t.Fatalf("transient memory annotation=%q, want %q", got.Annotations[specutils.AnnotationTTCMemoryFile], transientMemory)
+	}
+	if got.Annotations[specutils.AnnotationTTCInitialStartPaused] != "true" {
+		t.Fatalf("transient start-paused annotation=%q", got.Annotations[specutils.AnnotationTTCInitialStartPaused])
+	}
 }
 
 func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {

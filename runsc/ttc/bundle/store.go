@@ -68,7 +68,22 @@ func (s Store) PrepareBranchStartBundle(name, branchID, filesystemBranch string,
 	if branchID == "" || filesystemBranch == "" {
 		return "", nil, errors.New("branch start identity and filesystem branch are required")
 	}
-	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, startPaused)
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, startPaused, "")
+}
+
+// PrepareTransientBranchStartBundle creates a paused branch-start bundle whose
+// application MemoryFile is private to a short-lived bootstrap Sentry. TTC uses
+// this to construct a fresh branch beside an existing live family without
+// allowing the bootstrap Sentry to allocate from the family's active memory
+// file.
+func (s Store) PrepareTransientBranchStartBundle(name, branchID, filesystemBranch, memoryFile string) (string, func(), error) {
+	if branchID == "" || filesystemBranch == "" || memoryFile == "" {
+		return "", nil, errors.New("transient branch start identity, filesystem branch, and memory file are required")
+	}
+	if !filepath.IsAbs(memoryFile) || filepath.Clean(memoryFile) != memoryFile {
+		return "", nil, fmt.Errorf("transient memory file path %q must be absolute and clean", memoryFile)
+	}
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, true, memoryFile)
 }
 
 // PrepareDehydrationRestoreBundle creates a short-lived OCI bundle that tells
@@ -79,10 +94,10 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	if filesystemBranch == "" {
 		return "", nil, errors.New("dehydration restore filesystem branch is empty")
 	}
-	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
+	return s.prepareBranchBundle(name, "", filesystemBranch, true, false, "")
 }
 
-func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
+func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool, memoryFile string) (string, func(), error) {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return "", nil, err
@@ -93,6 +108,9 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	}
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
+	}
+	if memoryFile != "" {
+		spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFile
 	}
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
