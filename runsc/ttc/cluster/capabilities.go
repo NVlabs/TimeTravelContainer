@@ -28,18 +28,20 @@ const (
 	// ControlProtocolVersion is the first cross-daemon control protocol.
 	ControlProtocolVersion = 1
 
-	FeatureRemotePull       = "remote-memory-pull"
-	FeatureReversePush      = "reverse-page-push"
-	FeatureAckBatch         = "ack-batch"
-	FeatureNetworkRecreate  = "network-recreate"
-	FeatureRuntimePrefetch  = "runtime-prefetch"
-	FeatureFilesystemBranch = "filesystem-branch"
+	FeatureRemotePull           = "remote-memory-pull"
+	FeatureReversePush          = "reverse-page-push"
+	FeatureAckBatch             = "ack-batch"
+	FeatureNetworkRecreate      = "network-recreate"
+	FeatureRuntimePrefetch      = "runtime-prefetch"
+	FeatureFilesystemBranch     = "filesystem-branch"
+	FeatureSharedMemorySnapshot = "shared-memory-snapshot"
 )
 
 var requiredForkFeatures = []string{
 	FeatureRemotePull,
 	FeatureNetworkRecreate,
 	FeatureFilesystemBranch,
+	FeatureSharedMemorySnapshot,
 }
 
 // Capabilities describes one ttcd peer without including credentials.

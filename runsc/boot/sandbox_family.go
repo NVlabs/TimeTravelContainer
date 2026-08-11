@@ -164,6 +164,14 @@ type DistributedForkServeArgs struct {
 	SessionID string
 }
 
+// DistributedForkExportArgs donates a destination for a durable packed page
+// snapshot. The destination is controlled by ttcd and never guest-visible.
+type DistributedForkExportArgs struct {
+	urpc.FilePayload
+	SessionID string
+	AllowCopy bool
+}
+
 // DistributedForkSessionStatus reports token-free session progress.
 type DistributedForkSessionStatus struct {
 	SessionID string
@@ -360,13 +368,18 @@ type sandboxBranch struct {
 	// these operations before releasing the Kernel.
 	controlOps sync.WaitGroup
 
-	id        string
-	parentID  string
-	k         *kernel.Kernel
-	watchdog  *watchdog.Watchdog
-	state     BranchState
-	createdAt time.Time
-	metrics   SandboxForkMetrics
+	id       string
+	parentID string
+	// filesystemBranch is the persistent ttcvol branch backing this Kernel.
+	// It normally follows volumeBranchID(id), but a distributed target exposes
+	// its restored branch as visible "main" while retaining the source-family
+	// repository branch name.
+	filesystemBranch string
+	k                *kernel.Kernel
+	watchdog         *watchdog.Watchdog
+	state            BranchState
+	createdAt        time.Time
+	metrics          SandboxForkMetrics
 
 	execSessions map[string]*execSession
 	consoleWaits map[*consoleWaitLease]struct{}
@@ -477,11 +490,12 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
 			DefaultBranchID: {
-				id:           DefaultBranchID,
-				k:            k,
-				state:        kernelBranchState(k),
-				createdAt:    createdAt,
-				execSessions: make(map[string]*execSession),
+				id:               DefaultBranchID,
+				filesystemBranch: ttcvolume.MainBranch,
+				k:                k,
+				state:            kernelBranchState(k),
+				createdAt:        createdAt,
+				execSessions:     make(map[string]*execSession),
 			},
 		},
 	}
@@ -756,6 +770,21 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	return session.server.ServeStream(conn)
 }
 
+// ExportDistributedForkSnapshot persists a session's immutable page stream in
+// the exact packed layout consumed by distributed restore.
+func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExportArgs) error {
+	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
+		return errors.New("distributed snapshot export requires a session and one destination")
+	}
+	f.mu.Lock()
+	session := f.distributedSessions[args.SessionID]
+	f.mu.Unlock()
+	if session == nil {
+		return fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
+	}
+	return session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
+}
+
 // DistributedForkSessionStatus returns progress without disclosing the bearer
 // token required to read the snapshot.
 func (f *SandboxFamily) DistributedForkSessionStatus(id string) (*DistributedForkSessionStatus, error) {
@@ -922,6 +951,24 @@ func (f *SandboxFamily) ReplaceDefaultKernel(k *kernel.Kernel) error {
 	// Loader.Run replaces this transitional value with the restored Kernel's
 	// actual state after Kernel.Start.
 	b.state = BranchPaused
+	return nil
+}
+
+// SetDefaultFilesystemBranch records the persistent repository branch used by
+// a replacement default Kernel. Distributed restore needs this because the
+// target is presented as visible branch "main", while its ttcvol branch keeps
+// the globally unique source-family transaction name.
+func (f *SandboxFamily) SetDefaultFilesystemBranch(branch string) error {
+	if branch == "" {
+		return errors.New("default filesystem branch is empty")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.branches[DefaultBranchID]
+	if !ok || b == nil {
+		return errors.New("default branch is unavailable")
+	}
+	b.filesystemBranch = branch
 	return nil
 }
 
@@ -1231,11 +1278,12 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			return nil, fmt.Errorf("branch %q already exists", id)
 		}
 		childBranches[i] = &sandboxBranch{
-			id:           id,
-			parentID:     sourceID,
-			state:        BranchCreating,
-			createdAt:    time.Now().UTC(),
-			execSessions: make(map[string]*execSession),
+			id:               id,
+			parentID:         sourceID,
+			filesystemBranch: f.volumeBranchID(id),
+			state:            BranchCreating,
+			createdAt:        time.Now().UTC(),
+			execSessions:     make(map[string]*execSession),
 		}
 	}
 	for _, childBranch := range childBranches {
@@ -1541,8 +1589,12 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	}
 	f.mu.Unlock()
 	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
+	filesystemBranch := b.filesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = f.volumeBranchID(b.id)
+	}
 	image, err := k.CaptureDehydration(k.SupervisorContext(), kernel.DehydrationCaptureOptions{
-		BranchID: f.volumeBranchID(b.id), MetadataFile: metadataFile,
+		BranchID: filesystemBranch, MetadataFile: metadataFile,
 	})
 	if err != nil {
 		if wasRunning {
@@ -1626,8 +1678,12 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 	f.stateChanged.Broadcast()
 	f.mu.Unlock()
 
+	filesystemBranch := b.filesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = f.volumeBranchID(b.id)
+	}
 	child, err := kernel.LoadDehydration(context.Background(), d.platform, d.image, kernel.DehydrationLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), BranchID: f.volumeBranchID(b.id),
+		Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
 		ConfigureNetwork: f.configureNetwork,
 	})
 	if err != nil {

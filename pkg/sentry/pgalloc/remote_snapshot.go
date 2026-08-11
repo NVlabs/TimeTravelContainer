@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -33,6 +34,77 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/timing"
 )
+
+// ExportPackedSnapshot writes the snapshot's immutable packed byte stream to
+// dst. It prefers extent reflinks, so exporting a large resident branch does
+// not copy its bytes. allowCopy permits a byte-copy fallback on filesystems
+// without FICLONERANGE support.
+func (s *RemoteSnapshot) ExportPackedSnapshot(dst *os.File, allowCopy bool) error {
+	if s == nil || dst == nil {
+		return errors.New("remote snapshot export requires a snapshot and destination")
+	}
+	type exportRegion struct {
+		lease       *RemotePageLease
+		streamStart uint64
+	}
+	regions := make([]exportRegion, 0, len(s.regions))
+	for i := range s.regions {
+		region := &s.regions[i]
+		lease, err := s.AcquireRegion(region.ID, memmap.FileRange{End: region.Range.Length()})
+		if err != nil {
+			for _, acquired := range regions {
+				_ = acquired.lease.Close()
+			}
+			return fmt.Errorf("pinning remote snapshot region %d for export: %w", region.ID, err)
+		}
+		regions = append(regions, exportRegion{lease: lease, streamStart: region.streamStart})
+	}
+	defer func() {
+		for _, region := range regions {
+			_ = region.lease.Close()
+		}
+	}()
+
+	synced := make(map[*os.File]struct{})
+	for _, region := range regions {
+		source := region.lease.File().File()
+		if _, ok := synced[source]; ok {
+			continue
+		}
+		if err := source.Sync(); err != nil {
+			return fmt.Errorf("synchronizing remote snapshot source: %w", err)
+		}
+		synced[source] = struct{}{}
+	}
+	if err := dst.Truncate(int64(s.StreamBytes())); err != nil {
+		return fmt.Errorf("sizing packed remote snapshot: %w", err)
+	}
+	for _, region := range regions {
+		source := region.lease.File().File()
+		fr := region.lease.Range()
+		clone := unix.FileCloneRange{
+			Src_fd: int64(source.Fd()), Src_offset: fr.Start,
+			Src_length: fr.Length(), Dest_offset: region.streamStart,
+		}
+		if err := unix.IoctlFileCloneRange(int(dst.Fd()), &clone); err == nil {
+			continue
+		} else if !allowCopy {
+			return fmt.Errorf("reflinking packed remote snapshot range %v: %w", fr, err)
+		}
+		reader := io.NewSectionReader(source, int64(fr.Start), int64(fr.Length()))
+		writer := io.NewOffsetWriter(dst, int64(region.streamStart))
+		if copied, err := io.CopyBuffer(writer, reader, make([]byte, 1<<20)); err != nil || uint64(copied) != fr.Length() {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return fmt.Errorf("copying packed remote snapshot range %v: %w", fr, err)
+		}
+	}
+	if err := dst.Sync(); err != nil {
+		return fmt.Errorf("synchronizing packed remote snapshot: %w", err)
+	}
+	return nil
+}
 
 // RemoteRegionID identifies a MemoryFile range within one RemoteSnapshot.
 // IDs are stable for the lifetime of the snapshot and are carried by the

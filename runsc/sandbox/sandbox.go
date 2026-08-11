@@ -2201,6 +2201,14 @@ func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServe
 	return nil
 }
 
+// ExportDistributedForkSnapshot persists a distributed session's page stream.
+func (s *Sandbox) ExportDistributedForkSnapshot(args *boot.DistributedForkExportArgs) error {
+	if err := s.call(boot.ContMgrExportDistributedForkSnapshot, args, nil); err != nil {
+		return fmt.Errorf("exporting distributed fork snapshot %q: %w", args.SessionID, err)
+	}
+	return nil
+}
+
 // DistributedForkDependencyStatus reports target-side remote-memory progress.
 func (s *Sandbox) DistributedForkDependencyStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
 	var status pgalloc.AsyncPagesFileLoadStats

@@ -250,6 +250,10 @@ type Loader struct {
 	distributedRestoreSessionID string
 	distributedRestoreInfo      DistributedForkRestoreInfo
 	distributedPushReceiver     *ttcremote.TCPPushReceiver
+	// distributedMemoryFile is the empty persistent application-memory file
+	// reserved by a distributed target's bootstrap Kernel. Ownership transfers
+	// to the restored Kernel in restoreDistributedFork.
+	distributedMemoryFile *os.File
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -787,7 +791,18 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create memory file.
-	mf, err := createMemoryFileFromFD(args.Conf.AppHugePages, args.HostTHP, args.TTCMemoryFileFD)
+	memoryFileFD := args.TTCMemoryFileFD
+	if specutils.TTCDistributedTarget(args.Spec) {
+		if memoryFileFD <= 0 {
+			return nil, errors.New("distributed target requires a persistent application memory file")
+		}
+		l.distributedMemoryFile = os.NewFile(uintptr(memoryFileFD), "ttc-distributed-application-memory")
+		if l.distributedMemoryFile == nil {
+			return nil, fmt.Errorf("invalid distributed application memory FD %d", memoryFileFD)
+		}
+		memoryFileFD = -1
+	}
+	mf, err := createMemoryFileFromFD(args.Conf.AppHugePages, args.HostTHP, memoryFileFD)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1128,6 +1143,10 @@ func (l *Loader) Destroy() {
 	if l.distributedPushReceiver != nil {
 		_ = l.distributedPushReceiver.Close()
 	}
+	if l.distributedMemoryFile != nil {
+		_ = l.distributedMemoryFile.Close()
+		l.distributedMemoryFile = nil
+	}
 	l.k.Release()
 
 	// Release any dangling tcp connections.
@@ -1202,11 +1221,15 @@ func createMemoryFileFromFD(appHugePages bool, hostTHP HostTHP, persistentFD int
 		memfile = os.NewFile(uintptr(memfd), memfileName)
 	}
 
+	return createMemoryFileFromFile(appHugePages, hostTHP, memfile, persistentFD > 0)
+}
+
+func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
 	mfopts := pgalloc.MemoryFileOpts{
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
-		DiskBackedFile: persistentFD > 0,
+		DiskBackedFile: diskBacked,
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {

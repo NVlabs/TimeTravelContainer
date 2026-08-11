@@ -531,10 +531,17 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 		unix.SYS_FDATASYNC: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 		},
-		unix.SYS_IOCTL: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.EqualTo(linux.FICLONE),
-			seccomp.NonNegativeFD{},
+		unix.SYS_IOCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(linux.FICLONE),
+				seccomp.NonNegativeFD{},
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(linux.FICLONERANGE),
+				seccomp.AnyValue{},
+			},
 		},
 	})
 }

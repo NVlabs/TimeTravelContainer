@@ -87,7 +87,8 @@ and kernel objects rather than the amount of resident application memory.
   internal pipes, internal sockets, and supported IPC resources.
 - Share memory page-by-page until one branch writes.
 - Fork one or more live siblings onto another configured TTC cluster node;
-  remote memory is fetched on demand instead of copied through shared storage.
+  target memory is populated on demand from a durable shared snapshot instead
+  of transferring the container's complete RAM over the network.
 - Share disk-backed files through filesystem copy-on-write.
 - Show ancestry and branch state with `ttc ls --tree`.
 - Validate a fork while the source is paused. If a resource cannot be copied
@@ -526,6 +527,15 @@ siblings are persisted and reclaimable; pages still used by a live sibling
 remain shared in memory. This also composes with distributed fork: TTC first
 drains any pages the branch still depends on from a remote source, then
 persists the now-local state.
+
+Distributed forks use the cluster's shared TTC data root as a durable handoff.
+The source publishes an immutable packed memory snapshot, normally using
+filesystem reflinks, and can then release all process-local snapshot references
+immediately. The target reads pages from that snapshot only when needed and
+installs them into its own persistent memory backing. Once every required page
+is local, TTC deletes the handoff snapshot. This lets the source container and
+its node disappear without breaking the target; the TCP page-pull and push
+protocol remains available as an explicitly selected experimental policy.
 
 Durable checkpointing is a separate, explicitly requested operation. It
 captures one selected branch's process, memory, filesystem, and supported

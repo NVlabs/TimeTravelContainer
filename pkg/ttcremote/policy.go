@@ -62,7 +62,7 @@ func DefaultPolicy() Policy {
 		PageSize:            4 << 10,
 		TransferBytes:       64 << 10,
 		Prefetch:            PrefetchAdaptive,
-		Push:                PushDirtyOrphan,
+		Push:                PushDemandOnly,
 		MaxOutstandingBytes: 64 << 20,
 		MaxConcurrency:      64,
 		AckInterval:         50 * time.Microsecond,

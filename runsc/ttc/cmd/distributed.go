@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -167,6 +168,54 @@ func newDistributedTransactionID() (string, error) {
 	return "fork-" + hex.EncodeToString(random[:]), nil
 }
 
+func distributedSnapshotRelativePath(transactionID string) string {
+	return filepath.Join("cluster", "memory-snapshots", transactionID+".mem")
+}
+
+func (b *runtimeBackend) exportDistributedSnapshot(containerID, transactionID string) (string, error) {
+	if b.dataRoot == "" {
+		return "", errors.New("distributed snapshot export requires a TTC data root")
+	}
+	relative := distributedSnapshotRelativePath(transactionID)
+	directory := filepath.Join(b.dataRoot, filepath.Dir(relative))
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", fmt.Errorf("creating distributed snapshot directory: %w", err)
+	}
+	temp, err := os.CreateTemp(directory, ".snapshot-*")
+	if err != nil {
+		return "", fmt.Errorf("creating distributed memory snapshot: %w", err)
+	}
+	tempPath := temp.Name()
+	keep := false
+	defer func() {
+		_ = temp.Close()
+		if !keep {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	args := []string{"timetravel", "--distributed-snapshot-fd=3"}
+	if b.allowSlowVolumeCopy {
+		args = append(args, "--distributed-snapshot-allow-copy")
+	}
+	args = append(args, containerID, "distributed-export", transactionID)
+	if _, err := b.commandWithFiles([]*os.File{temp}, args...); err != nil {
+		return "", fmt.Errorf("exporting durable distributed memory snapshot: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("closing distributed memory snapshot: %w", err)
+	}
+	finalPath := filepath.Join(b.dataRoot, relative)
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return "", fmt.Errorf("publishing distributed memory snapshot: %w", err)
+	}
+	keep = true
+	if dir, err := os.Open(directory); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return relative, nil
+}
+
 func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, repositoryID string) (string, error) {
 	identity := struct {
 		ContainerID  string                    `json:"container_id"`
@@ -204,6 +253,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		return selector{}, err
 	}
 	source = resolved
+	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
+		return selector{}, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
+	}
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
 		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -293,10 +345,23 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
+	sharedSnapshot := ""
+	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
+		sharedSnapshot, err = b.exportDistributedSnapshot(source.container, transactionID)
+		if err != nil {
+			return selector{}, err
+		}
+	}
+	defer func() {
+		if !committed {
+			_ = os.Remove(filepath.Join(b.dataRoot, sharedSnapshot))
+		}
+	}()
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
+		SharedSnapshot:   sharedSnapshot,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -313,11 +378,17 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		tx = status
 	}
 	committed = true
-	monitorBackend := *b
-	monitorBackend.stdin = strings.NewReader("")
-	monitorBackend.stdout = io.Discard
-	monitorBackend.stderr = io.Discard
-	go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+	if sharedSnapshot != "" {
+		if err := b.completeSharedDistributedFork(peer, source.container, transactionID, tx.Revision, relay); err != nil {
+			return selector{}, err
+		}
+	} else {
+		monitorBackend := *b
+		monitorBackend.stdin = strings.NewReader("")
+		monitorBackend.stdout = io.Discard
+		monitorBackend.stderr = io.Discard
+		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+	}
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
 }
 
@@ -362,18 +433,22 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, err
 	}
 	source = resolved
+	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
+		return nil, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
+	}
 	rootfsDigest, err := distributedRootfsDigest(sourceInfo, source.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {
 		return nil, err
 	}
 	type childState struct {
-		target       string
-		transaction  string
-		tx           *cluster.Transaction
-		relay        *distributedPageRelay
-		advertise    string
-		dataPlaneMax uint64
-		captured     bool
+		target         string
+		transaction    string
+		tx             *cluster.Transaction
+		relay          *distributedPageRelay
+		advertise      string
+		dataPlaneMax   uint64
+		captured       bool
+		sharedSnapshot string
 	}
 	children := make([]childState, len(targetContainers))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -398,6 +473,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			cleanupCancel()
 			if child.captured {
 				_, _ = b.command("timetravel", source.container, "distributed-cancel", child.transaction)
+			}
+			if child.sharedSnapshot != "" {
+				_ = os.Remove(filepath.Join(b.dataRoot, child.sharedSnapshot))
 			}
 		}
 	}()
@@ -506,10 +584,17 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
+		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
+			child.sharedSnapshot, err = b.exportDistributedSnapshot(source.container, child.transaction)
+			if err != nil {
+				return nil, fmt.Errorf("exporting snapshot for target %s: %w", child.target, err)
+			}
+		}
 		descriptors[i] = cluster.RemoteSessionDescriptor{
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
+			SharedSnapshot:   child.sharedSnapshot,
 		}
 	}
 	prepareErrors := make([]error, len(children))
@@ -553,18 +638,59 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			return nil, fmt.Errorf("publishing target %s on node %s: %w", children[i].target, targetNode, publishErr)
 		}
 	}
+	// Every target is now externally visible and owns its durable snapshot.
+	// Later independence bookkeeping failures must not cancel or delete them.
+	cleanup = false
 	results := make([]selector, len(children))
 	for i := range children {
 		child := &children[i]
-		monitorBackend := *b
-		monitorBackend.stdin = strings.NewReader("")
-		monitorBackend.stdout = io.Discard
-		monitorBackend.stderr = io.Discard
-		go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+		if child.sharedSnapshot != "" {
+			if err := b.completeSharedDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay); err != nil {
+				return nil, fmt.Errorf("making target %s source-independent: %w", child.target, err)
+			}
+		} else {
+			monitorBackend := *b
+			monitorBackend.stdin = strings.NewReader("")
+			monitorBackend.stdout = io.Discard
+			monitorBackend.stderr = io.Discard
+			go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+		}
 		results[i] = selector{container: child.target, branch: defaultBranchID}
 	}
-	cleanup = false
 	return results, nil
+}
+
+func (b *runtimeBackend) completeSharedDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) error {
+	output, err := b.command("timetravel", sourceContainer, "distributed-status", transactionID)
+	if err != nil {
+		return fmt.Errorf("reading shared-snapshot session status: %w", err)
+	}
+	var status boot.DistributedForkSessionStatus
+	if err := json.Unmarshal(output, &status); err != nil {
+		return fmt.Errorf("decoding shared-snapshot session status: %w", err)
+	}
+	metrics := cluster.TransferMetrics{
+		PullRequests: status.Transport.PullRequests, AckRequests: status.Transport.AckRequests,
+		AckBatches: status.Transport.AckBatches, PullBytes: status.Transport.BytesSent,
+		MetadataBytes: status.Transport.MetadataBytesSent, PushBytes: status.Transport.PushBytesSent,
+		PushRetries: status.Transport.PushRetries, PagesTotal: status.Snapshot.PagesTotal,
+		// The durable snapshot replaces every live source-page reference at this
+		// transition. CompleteDistributedForkSession releases those references
+		// immediately after the control plane records independence.
+		PagesReleased: status.Snapshot.PagesTotal, PushHints: status.Snapshot.PushEnqueued,
+		PushHintsDropped: status.Snapshot.PushDropped,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err = peer.MarkIndependentWithMetrics(ctx, transactionID, revision, metrics)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("recording shared-snapshot independence: %w", err)
+	}
+	if _, err := b.command("timetravel", sourceContainer, "distributed-complete", transactionID); err != nil {
+		return fmt.Errorf("releasing shared-snapshot source references: %w", err)
+	}
+	relay.Close()
+	return nil
 }
 
 func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {

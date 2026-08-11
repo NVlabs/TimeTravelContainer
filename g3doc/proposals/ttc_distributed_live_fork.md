@@ -26,15 +26,28 @@ Implementation progress:
 * Phase 6 coordinated sibling capture, shared source-page ownership,
   per-child transactions, parallel target reconstruction, and advanced
   transport evaluation: implemented and tested.
+* Phase 7 durable shared-memory handoff, demand-only target materialization,
+  source-independent filesystem repository lifetime, and dehydration
+  integration: implemented and tested.
 
 ## Summary
 
-This proposal extends TimeTravelContainer (TTC) so that a branch running on
-node A can be forked into a new branch on node B without first writing or
-transferring the complete memory image. The source briefly pauses to capture
-kernel metadata and establish copy-on-write (CoW) protection. Node B then
-loads memory on demand directly from node A. The source retains each fork-time
-page until node B confirms that it has installed that page.
+TimeTravelContainer (TTC) can fork a branch running on node A into a new branch
+on node B without transferring the complete memory image before the target
+starts. The source briefly pauses to capture kernel metadata and establish
+copy-on-write (CoW) protection. It then publishes an immutable packed memory
+snapshot in the cluster's shared TTC data root, normally by reflinking the
+used ranges of its persistent memory backing. Node B reads pages from this
+snapshot on demand and installs them into its own persistent backing.
+
+The durable shared snapshot is the default data plane. After it has been
+published and the target metadata is committed, node A releases its in-process
+snapshot references immediately; source writes, source deletion, and source
+node shutdown require no page-level coordination with B. TTC deletes the
+shared snapshot after B has materialized every required page or after the
+target is removed. The original TCP pull/reverse-push protocol remains an
+explicit experimental policy for clusters without shared durable memory
+backing and for transport research.
 
 Correctness remains page-granular, normally 4 KiB, but network transfers are
 configurable ranges such as 4 KiB, 64 KiB, or 2 MiB. Pull, prefetch, push, and
@@ -42,26 +55,30 @@ adaptive policies are deliberately configurable so that they can be evaluated
 under controlled network conditions and real workloads before TTC chooses
 production defaults.
 
-The initial implementation assumes:
+The default implementation assumes:
 
 * mutually trusted `ttcd` instances;
-* a common image store and TTC filesystem repository visible on all nodes,
-  initially through a shared filesystem;
-* a reliable, high-speed IP network between nodes; and
+* a common image store, TTC filesystem repository, and memory-snapshot
+  directory visible on all nodes through a shared filesystem;
+* reflink support in that shared filesystem for fast memory handoff, unless
+  the operator explicitly accepts a full-copy fallback; and
+* a reliable IP network for the mutually authenticated control plane; and
 * one target node per distributed-fork operation, with one or more sibling
   children on that node.
 
-Cross-target-node fan-out, source-independent failover, and distributed
-filesystem CoW are later extensions. The memory protocol does not depend on
-NFS and does not route page contents through it.
+Cross-target-node fan-out and transparent target failover remain later
+extensions. A published target is already independent of the source process
+and source node: its memory handoff and promoted filesystem repositories have
+durable shared lifetimes.
 
 ## Goals
 
 1. Keep the source pause independent of resident-memory size.
 2. Allow the target to execute before its complete memory image is present.
 3. Preserve the exact fork-time contents of every guest page.
-4. Release the source's snapshot reference page by page after the target
-   durably installs the corresponding data in its Sentry `MemoryFile`.
+4. Release all source-process snapshot references after the immutable shared
+   snapshot is durably published; reclaim the shared snapshot after the target
+   has installed all required pages.
 5. Never wait for network I/O in the source application's write-fault path.
 6. Support configurable transfer sizes, prefetchers, push policies, flow
    control, and an optional adaptive policy engine.
@@ -71,28 +88,57 @@ NFS and does not route page contents through it.
 
 ## Non-goals of the first implementation
 
-* Transparent continuation after node A fails while node B still depends on
-  source pages.
+* Transparent continuation if node A fails before publishing the shared
+  snapshot and target transaction.
 * Sharing a writable guest page concurrently between nodes.
 * Coherent external devices, host FDs, or external TCP connections. Existing
   distributed-fork resource policies still apply.
 * Selecting one hard-coded transfer policy before workload measurements.
-* Treating the shared filesystem as a coherent shared-memory transport.
+* Coherent writable memory shared between nodes. The shared file is an
+  immutable handoff object, not distributed shared memory.
 
 ## Correctness and transfer granularity
 
-The unit of ownership and acknowledgement is a guest base page. The transfer
-unit is an independently configurable, aligned range containing one or more
-pages. A 2 MiB response therefore carries 512 individually accountable 4 KiB
-pages; its acknowledgement contains a page bitmap or a run-length encoded set
-and does not imply that unrelated pages were installed.
+For the default shared-snapshot path, the source exports the exact packed page
+stream described by the signed allocator metadata. The target may read and
+install that stream in configurable aligned ranges, but its present/missing
+accounting remains page-granular. Publication uses a temporary file, sync, and
+atomic rename; a transaction never advertises a partially written snapshot.
+The target's persistent `application.mem` is distinct from the immutable
+handoff file, so target writes cannot alter the snapshot.
+
+For the optional TCP path, the unit of ownership and acknowledgement is a
+guest base page. The transfer unit is an independently configurable, aligned
+range containing one or more pages. A 2 MiB response therefore carries 512
+individually accountable 4 KiB pages; its acknowledgement contains a page
+bitmap or a run-length encoded set and does not imply that unrelated pages
+were installed.
 
 This separation permits large network operations without making reclamation
 or correctness depend on large-page alignment. It also allows a partially
 successful range transfer to be retried without retaining pages that the
 target already owns.
 
-## Core invariants
+## Default shared-snapshot invariants
+
+1. **Publish before release:** node A retains immutable page ownership until
+   the complete packed snapshot has been synced and atomically published.
+2. **Immutable handoff:** no source or target write can mutate published
+   snapshot contents.
+3. **Install before reclaim:** TTC removes the handoff only after every target
+   load range is local, or after the target transaction is removed.
+4. **Durable repository lifetime:** writable filesystem repositories are
+   promoted outside source-container metadata before target reservation and
+   are garbage-collected only after no container spec references them.
+5. **Dehydration drains dependencies:** dehydration materializes any remaining
+   snapshot-backed pages before releasing the target Kernel graph. Rehydration
+   retains the target's actual repository branch identity, even though a
+   distributed target is presented as visible branch `main`.
+6. **Idempotent recovery:** repeated reserve, publish, dependency polling,
+   cancellation, and cleanup cannot publish two targets or delete a referenced
+   snapshot/repository.
+
+## Optional TCP protocol invariants
 
 1. **Immutable snapshot data:** while a target still needs a fork-time page,
    the source holds a reference to immutable old data. Source writes use local
@@ -116,21 +162,35 @@ target already owns.
    kernel metadata, remote-memory provider, and minimum bootstrap page set are
    ready.
 
-## Proposed architecture
+## Architecture
 
 ### Control plane
 
 The source `ttcd` coordinates a distributed-fork transaction with the target
-`ttcd`:
+`ttcd`. In the default shared-snapshot path it:
 
 1. Reserve a target container identity and transaction UUID.
 2. Validate the source and target image/filesystem identities.
 3. Pause and validate the source using the existing atomic fork path.
-4. Create a `RemoteSnapshot` and stream the metadata clone to node B.
-5. Install CoW protection and immutable page references before resuming A.
-6. Construct B with a `RemotePageProvider` and publish it as paused or running.
-7. Retire the transaction after every required page is acknowledged, or abort
-   it and release all references if B is destroyed.
+4. Creates a `RemoteSnapshot`, resumes A with CoW protection in place, and
+   exports its packed page stream into a temporary shared file.
+5. Syncs and atomically publishes the shared snapshot, then sends B the small
+   metadata envelope and relative snapshot path over mutual TLS.
+6. Constructs B with an asynchronous reader backed by the shared snapshot and
+   publishes it as paused or running.
+7. Marks the transaction source-independent and releases A's `RemoteSnapshot`.
+8. Deletes the shared snapshot once B is fully local, or when B is removed.
+
+Before reservation, source-private ttcvol repositories are atomically renamed
+into a cluster-stable family namespace. Open Sentry directory descriptors stay
+valid across the rename, while updated OCI metadata lets future starts and the
+target donate the stable paths. Reference-scanning garbage collection removes
+the promoted repositories only after the final source/target container is
+gone.
+
+The optional TCP policy replaces steps 4-8 with the page protocol described
+below. It retains source page references until target acknowledgements and may
+use reverse push.
 
 The transaction carries a random snapshot UUID plus a monotonically allocated
 epoch. Every data-plane message includes the source sandbox identity,
@@ -255,8 +315,9 @@ reclaim workers call this helper rather than open-coding transitions.
 
 ## Configurable policies
 
-Configuration belongs to `ttcd` defaults, with safe per-fork overrides exposed
-through the TTC API and SDKs. Initial knobs should include:
+Configuration belongs to `ttcd` defaults. Range and prefetch controls apply to
+target reads from either the shared snapshot or TCP; push controls apply only
+when the legacy TCP data plane is explicitly selected. Knobs include:
 
 * transfer range: `4KiB`, `16KiB`, `64KiB`, `256KiB`, `1MiB`, or `2MiB`;
 * prefetch: `none`, `sequential`, `fixed-window`, or `adaptive`;
@@ -269,10 +330,12 @@ through the TTC API and SDKs. Initial knobs should include:
 * adaptive-policy enablement, sampling interval, and hysteresis.
 
 Configuration is reported in fork statistics so every benchmark is
-reproducible. The selected default is adaptive sequential prefetch beginning
-at 64 KiB and bounded by the negotiated 2 MiB protocol maximum, with four
-parallel requests, a 64 MiB outstanding-byte limit, 1 ms or 256-page ACK
-aggregation, and dirty-orphan push. Every component remains configurable.
+reproducible. The selected default is a durable shared snapshot with demand-only
+source behavior and adaptive target prefetch beginning at 64 KiB, bounded by
+the negotiated 2 MiB maximum, with four parallel reads. No proactive page push
+is needed: publication transfers ownership from the source process to the
+durable snapshot. ACK aggregation, outstanding network bytes, and non-demand
+push policies remain configurable for explicit TCP experiments.
 
 ### Adaptive strategy
 
@@ -293,7 +356,9 @@ page correctness state.
 
 The first adaptive algorithm should be intentionally simple and explainable:
 
-1. Start at 64 KiB with sequential prefetch and dirty-orphan push.
+1. Start at 64 KiB with sequential prefetch. The shared-snapshot default needs
+   no push; an explicit TCP experiment may independently enable dirty-orphan
+   push.
 2. Accumulate exact fault-adjacency samples across 50 ms observations. After a
    strongly sequential run, grow directly to the negotiated transport limit;
    this avoids a slow doubling ladder on short RTT-bound workloads.
@@ -585,6 +650,38 @@ advanced transport evaluation:
 Cross-node siblings therefore share source memory efficiently today, while
 specialized transports and failover remain additive extensions with explicit
 negotiation and tests.
+
+### Phase 7: durable shared handoff and source independence
+
+The default paging policy is now `demand-only`. When both nodes advertise the
+`shared-memory-snapshot` capability, the source exports the immutable packed
+page stream into `cluster/memory-snapshots/<transaction>.mem`. Reflink range
+cloning keeps this proportional to allocator metadata rather than copied RAM
+on a capable shared filesystem; the daemon's explicit slow-copy mode permits
+a buffered fallback for development filesystems.
+
+The target reserves a persistent `application.mem`, restores the Kernel from
+the small metadata envelope, and uses the shared file as its asynchronous page
+reader. Target faults and adaptive prefetch populate the persistent backing.
+The source transaction becomes independent as soon as target publication
+succeeds, so source-side page services and dirty-page push workers are absent.
+Dependency monitoring continues on B and removes the handoff file after the
+last page is materialized. Dehydration forces that materialization and then
+composes normally with rehydration.
+
+Writable rootfs and private host-mount repositories are promoted into
+`cluster/repositories/<source-family>/` before reservation. Source and target
+specs reference the same stable repository while their ttcvol branches remain
+independent. Removing the source therefore cannot invalidate B; removing the
+last referencing target garbage-collects the promoted repository.
+
+Validation includes unit tests for packed stream order, policy negotiation,
+path validation, repository promotion/idempotence/reference lifetime, and the
+distributed target's filesystem-branch identity across dehydration. A real
+two-daemon test verifies target writes, source deletion, process and filesystem
+continuity, dehydration/rehydration, daemon restart, shared-snapshot cleanup,
+and final repository garbage collection. The TCP pull/push implementation and
+simulator remain covered as an optional policy rather than the default.
 
 ## Test plan
 

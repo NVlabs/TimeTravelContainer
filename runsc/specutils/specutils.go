@@ -88,6 +88,11 @@ const (
 	// control-plane detail and is never exposed in the guest namespace.
 	AnnotationTTCMemoryFile = "dev.timetravelcontainer.memory-file"
 
+	// AnnotationTTCDistributedTarget reserves the donated persistent MemoryFile
+	// for a subsequently restored distributed-fork Kernel. The bootstrap Kernel
+	// uses a temporary memfd so it cannot dirty or allocate from that file.
+	AnnotationTTCDistributedTarget = "dev.timetravelcontainer.distributed-target"
+
 	// TTCRootfsUpperSource is the reserved, guest-invisible source key for a
 	// container family's persistent writable rootfs upper repository.
 	TTCRootfsUpperSource = "/run/ttc/rootfs-upper"
@@ -382,6 +387,13 @@ func TTCMemoryFilePath(spec *specs.Spec) (string, error) {
 		return "", fmt.Errorf("%s path %q must be absolute and clean", AnnotationTTCMemoryFile, path)
 	}
 	return path, nil
+}
+
+// TTCDistributedTarget reports whether spec is an unpublished distributed
+// fork target whose persistent application MemoryFile must remain empty until
+// the remote Kernel metadata is installed.
+func TTCDistributedTarget(spec *specs.Spec) bool {
+	return spec != nil && spec.Annotations != nil && spec.Annotations[AnnotationTTCDistributedTarget] == "true"
 }
 
 // FixConfig fixes config options that are set via annotations in the spec.

@@ -194,7 +194,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
-		PushPolicy: ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
+		PushPolicy:     ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
+		SharedSnapshot: session.SharedSnapshot != "",
 	}
 	switch tx.Negotiated.PagingPolicy.Prefetch {
 	case ttcpolicy.PrefetchSequential, ttcpolicy.PrefetchAdaptive:
@@ -241,9 +242,12 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			reader.Close()
 			return err
 		}
-		connectionCount := 1 + (restoreArgs.MaxParallel+1)*(restoreArgs.RetryLimit+1)
-		if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
-			connectionCount++
+		connectionCount := 1
+		if !restoreArgs.SharedSnapshot {
+			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
+			if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
+				connectionCount++
+			}
 		}
 		connectionFiles := make([]*os.File, 0, connectionCount)
 		for i := 0; i < connectionCount; i++ {
@@ -296,11 +300,46 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			}
 			connectionFiles = append(connectionFiles, file)
 		}
-		files := append([]*os.File{reader}, connectionFiles...)
-		_, err = r.backend.commandWithFiles(files, "timetravel", "--distributed-config-fd=3",
-			"--distributed-connections-start-fd=4", "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
+		files := []*os.File{reader}
+		connectionsStartFD := 4
+		var sharedSnapshot *os.File
+		if restoreArgs.SharedSnapshot {
+			sharedPath := filepath.Join(r.backend.dataRoot, session.SharedSnapshot)
+			sharedSnapshot, err = os.Open(sharedPath)
+			if err != nil {
+				reader.Close()
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				return fmt.Errorf("opening shared distributed memory snapshot: %w", err)
+			}
+			if stat, err := sharedSnapshot.Stat(); err != nil || uint64(stat.Size()) != session.StreamBytes {
+				sharedSnapshot.Close()
+				reader.Close()
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				if err != nil {
+					return fmt.Errorf("stating shared distributed memory snapshot: %w", err)
+				}
+				return fmt.Errorf("shared distributed memory snapshot size is %d, want %d", stat.Size(), session.StreamBytes)
+			}
+			files = append(files, sharedSnapshot)
+			connectionsStartFD++
+		}
+		files = append(files, connectionFiles...)
+		commandArgs := []string{"timetravel", "--distributed-config-fd=3"}
+		if restoreArgs.SharedSnapshot {
+			commandArgs = append(commandArgs, "--distributed-snapshot-fd=4")
+		}
+		commandArgs = append(commandArgs,
+			"--distributed-connections-start-fd="+strconv.Itoa(connectionsStartFD), "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
 			info.ID, "distributed-restore", tx.Identity.TransactionID)
+		_, err = r.backend.commandWithFiles(files, commandArgs...)
 		reader.Close()
+		if sharedSnapshot != nil {
+			sharedSnapshot.Close()
+		}
 		for _, file := range connectionFiles {
 			file.Close()
 		}
@@ -508,10 +547,10 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			case <-ticker.C:
 			}
 			tx, err := r.store.Load(transactionID)
-			if err != nil || tx.Terminal() {
+			if err != nil || tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 				return
 			}
-			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining {
+			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
 				continue
 			}
 			if adaptive == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
@@ -554,7 +593,12 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					"remote memory loader failed: "+status.Error, time.Now())
 				return
 			}
-			_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+			if tx.State != cluster.TransactionIndependent {
+				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+			}
+			// The target MemoryFile now contains every page, so the immutable
+			// shared snapshot no longer owns storage for this branch.
+			_ = os.Remove(filepath.Join(r.backend.dataRoot, distributedSnapshotRelativePath(transactionID)))
 			return
 		}
 	}()
@@ -1364,6 +1408,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 		Features: []string{
 			cluster.FeatureRemotePull, cluster.FeatureReversePush, cluster.FeatureAckBatch,
 			cluster.FeatureNetworkRecreate, cluster.FeatureRuntimePrefetch, cluster.FeatureFilesystemBranch,
+			cluster.FeatureSharedMemorySnapshot,
 		},
 	}
 	if err := capabilities.Validate(); err != nil {

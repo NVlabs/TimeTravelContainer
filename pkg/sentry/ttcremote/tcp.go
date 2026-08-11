@@ -22,6 +22,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -246,6 +247,11 @@ func (s *TCPPageServer) SnapshotStats() pgalloc.RemoteSnapshotStats {
 
 // StreamBytes returns the size of the immutable packed memory stream.
 func (s *TCPPageServer) StreamBytes() uint64 { return s.snapshot.StreamBytes() }
+
+// ExportPackedSnapshot persists the immutable page stream in transport order.
+func (s *TCPPageServer) ExportPackedSnapshot(dst *os.File, allowCopy bool) error {
+	return s.snapshot.ExportPackedSnapshot(dst, allowCopy)
+}
 
 // SetMetadata configures the immutable Kernel metadata stream advertised by
 // the session. It must be called before Serve.

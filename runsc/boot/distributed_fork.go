@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -53,6 +55,9 @@ type DistributedForkRestoreArgs struct {
 	AckBatchPages       int
 	AckInterval         time.Duration
 	PushPolicy          ttcremote.TCPPushPolicy
+	// SharedSnapshot selects the first donated file as an immutable packed
+	// memory stream. Network connections are then used only to fetch metadata.
+	SharedSnapshot bool
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -81,9 +86,18 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		return nil, fmt.Errorf("sandbox is %s, not an unstarted distributed target", l.state)
 	}
 
+	files := args.FilePayload.Files
+	var sharedSnapshot *os.File
+	if args.SharedSnapshot {
+		if len(files) == 0 {
+			return nil, errors.New("distributed target is missing its shared memory snapshot")
+		}
+		sharedSnapshot = files[0]
+		files = files[1:]
+	}
 	var donated []net.Conn
-	donatedMode := len(args.FilePayload.Files) != 0
-	for _, file := range args.FilePayload.Files {
+	donatedMode := len(files) != 0
+	for _, file := range files {
 		conn, err := ttcremote.NewDonatedTCPConn(file)
 		if err != nil {
 			for _, opened := range donated {
@@ -102,7 +116,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 	}()
 	var pushConn net.Conn
-	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if !args.SharedSnapshot && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {
 			return nil, errors.New("distributed reverse push requires a dedicated donated stream")
 		}
@@ -144,9 +158,20 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
-	var reader *ttcremote.TCPRemoteReader
-	if donatedMode {
-		reader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
+	var reader stateio.AsyncReader
+	if args.SharedSnapshot {
+		if len(donated) != 0 {
+			return nil, fmt.Errorf("shared distributed snapshot has %d unused page connections", len(donated))
+		}
+		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("duplicating shared distributed snapshot: %w", err)
+		}
+		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, 64, args.MaxParallel)
+	} else if donatedMode {
+		var tcpReader *ttcremote.TCPRemoteReader
+		tcpReader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
+		reader = tcpReader
 		if err == nil {
 			donatedOwned = false
 		}
@@ -162,7 +187,12 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			_ = reader.Close()
 		}
 	}()
-	targetMF, err := createMemoryFile(l.root.conf.AppHugePages, l.hostTHP)
+	if l.distributedMemoryFile == nil {
+		return nil, errors.New("distributed target has no reserved persistent application memory file")
+	}
+	persistentMemoryFile := l.distributedMemoryFile
+	l.distributedMemoryFile = nil
+	targetMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, persistentMemoryFile, true)
 	if err != nil {
 		return nil, fmt.Errorf("creating distributed target memory file: %w", err)
 	}
@@ -205,6 +235,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 	}()
 	resources := make(vfs.RestoreFilesystemResources, len(l.ttcVolumeRepositories))
+	filesystemBranch := ""
 	for _, donated := range l.ttcVolumeRepositories {
 		info := donated.repository.Info()
 		restoreID := donated.config.RestoreID
@@ -213,6 +244,11 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
 		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+		if filesystemBranch == "" {
+			filesystemBranch = donated.config.Branch
+		} else if filesystemBranch != donated.config.Branch {
+			return nil, fmt.Errorf("distributed target repositories use inconsistent branches %q and %q", filesystemBranch, donated.config.Branch)
+		}
 	}
 	readerOwned = false
 	targetMFOwned = false
@@ -261,6 +297,12 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err := l.family.ReplaceDefaultKernel(child); err != nil {
 		old.Release()
 		return nil, err
+	}
+	if filesystemBranch != "" {
+		if err := l.family.SetDefaultFilesystemBranch(filesystemBranch); err != nil {
+			old.Release()
+			return nil, err
+		}
 	}
 	l.k = child
 	l.root.procArgs = kernel.CreateProcessArgs{}

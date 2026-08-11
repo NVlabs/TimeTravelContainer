@@ -116,6 +116,9 @@ const (
 	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
 	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
 
+	// ContMgrExportDistributedForkSnapshot persists a session's immutable page stream.
+	ContMgrExportDistributedForkSnapshot = "containerManager.ExportDistributedForkSnapshot"
+
 	// ContMgrDistributedForkDependencyStatus reports target loader progress.
 	ContMgrDistributedForkDependencyStatus = "containerManager.DistributedForkDependencyStatus"
 
@@ -1090,6 +1093,11 @@ func (cm *containerManager) CaptureDistributedForkMany(args *DistributedForkCapt
 // ServeDistributedForkConnection handles one stream donated by ttcd.
 func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
 	return cm.l.family.ServeDistributedForkConnection(args)
+}
+
+// ExportDistributedForkSnapshot writes a durable shared-filesystem snapshot.
+func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkExportArgs, _ *struct{}) error {
+	return cm.l.family.ExportDistributedForkSnapshot(args)
 }
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.

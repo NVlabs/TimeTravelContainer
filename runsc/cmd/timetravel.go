@@ -84,6 +84,8 @@ type TimeTravel struct {
 	distributedConnectionFD       int
 	distributedConnectionsStartFD int
 	distributedConnectionsCount   int
+	distributedSnapshotFD         int
+	distributedSnapshotAllowCopy  bool
 	distributedPrefetchBytes      uint64
 	distributedPrefetchBehind     uint64
 	distributedPushPolicy         string
@@ -105,6 +107,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-capture-many <batch-id>\n" +
 		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
+		"timetravel [flags] <container-id> distributed-export <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
@@ -157,6 +160,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
 	f.IntVar(&t.distributedConnectionsStartFD, "distributed-connections-start-fd", -1, "first inherited target page stream")
 	f.IntVar(&t.distributedConnectionsCount, "distributed-connections-count", 0, "number of inherited target page streams")
+	f.IntVar(&t.distributedSnapshotFD, "distributed-snapshot-fd", -1, "inherited durable distributed-memory snapshot")
+	f.BoolVar(&t.distributedSnapshotAllowCopy, "distributed-snapshot-allow-copy", false, "allow full copying when distributed snapshot reflinks are unsupported")
 	f.Uint64Var(&t.distributedPrefetchBytes, "distributed-prefetch-bytes", 0, "remote-memory bytes to prefetch after a fault")
 	f.Uint64Var(&t.distributedPrefetchBehind, "distributed-prefetch-behind-bytes", 0, "remote-memory bytes to prefetch before a fault")
 	f.StringVar(&t.distributedPushPolicy, "distributed-push-policy", "demand-only", "reverse push policy")
@@ -330,6 +335,19 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			FilePayload: urpc.FilePayload{Files: []*os.File{connection}}, SessionID: f.Arg(2),
 		})
 		connection.Close()
+	case "distributed-export":
+		if t.distributedSnapshotFD < 0 {
+			util.Fatalf("--distributed-snapshot-fd is required")
+		}
+		snapshot := os.NewFile(uintptr(t.distributedSnapshotFD), "distributed-memory-snapshot")
+		if snapshot == nil {
+			util.Fatalf("invalid distributed snapshot FD")
+		}
+		err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
+			AllowCopy: t.distributedSnapshotAllowCopy,
+		})
+		snapshot.Close()
 	case "distributed-status":
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-dependency":
@@ -366,6 +384,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		if restoreArgs.SessionID != f.Arg(2) {
 			util.Fatalf("distributed restore session identity mismatch")
+		}
+		if restoreArgs.SharedSnapshot {
+			if t.distributedSnapshotFD < 0 {
+				util.Fatalf("--distributed-snapshot-fd is required for shared distributed restore")
+			}
+			snapshot := os.NewFile(uintptr(t.distributedSnapshotFD), "distributed-shared-memory-snapshot")
+			if snapshot == nil {
+				util.Fatalf("invalid inherited distributed snapshot FD")
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, snapshot)
+			defer snapshot.Close()
 		}
 		if t.distributedConnectionsCount < 0 || (t.distributedConnectionsCount != 0 && t.distributedConnectionsStartFD < 0) {
 			util.Fatalf("invalid inherited distributed connection range")

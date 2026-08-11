@@ -149,6 +149,40 @@ func TestRemoteSnapshotPageRelease(t *testing.T) {
 	}
 }
 
+func TestExportPackedSnapshotPreservesStreamOrder(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 2)
+	first := bytes.Repeat([]byte{0x31}, hostarch.PageSize)
+	second := bytes.Repeat([]byte{0x72}, hostarch.PageSize)
+	fillRemoteTestRange(t, mf, memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}, first)
+	fillRemoteTestRange(t, mf, memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}, second)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{
+		{ID: 1, File: mf, Range: memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}},
+		{ID: 2, File: mf, Range: memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	destination, err := os.CreateTemp("", "ttc-packed-snapshot-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationPath := destination.Name()
+	defer os.Remove(destinationPath)
+	defer destination.Close()
+	if err := snapshot.ExportPackedSnapshot(destination, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), second...), first...)
+	if !bytes.Equal(got, want) {
+		t.Fatal("packed snapshot did not preserve remote stream order")
+	}
+}
+
 func TestRemoteSnapshotSiblingsShareSourceReferences(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 2)
 	snapshots, err := NewRemoteSnapshots([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}}, 2)

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1250,6 +1251,91 @@ func TestContainerIdentityResolution(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyDir); err != nil {
 		t.Errorf("legacy directory changed: %v", err)
+	}
+}
+
+func TestPromotedRepositoriesOutliveSourceAndFollowLastReference(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	writeContainer := func(id, name string, repositories []specutils.TTCVolumeRepository) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", id)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(repositories)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := specs.Spec{Process: &specs.Process{Args: []string{"true"}}}
+		if len(repositories) != 0 {
+			spec.Annotations = map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)}
+		}
+		if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+			ID: id, Name: name, BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
+			Branches: []BranchInfo{{ID: "main", State: "created"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sourceID := strings.Repeat("a", 64)
+	sourceRepository := filepath.Join(root, "containers", sourceID, rootfsUpperRepositoryDir)
+	if err := os.MkdirAll(sourceRepository, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRepository, "sentinel"), []byte("filesystem state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: sourceRepository, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}}
+	writeContainer(sourceID, "source", repositories)
+
+	if err := store.PromoteContainerRepositories("source"); err != nil {
+		t.Fatalf("PromoteContainerRepositories: %v", err)
+	}
+	sourceSpec, err := store.LoadSpec("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := specutils.TTCVolumeRepositories(sourceSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(promoted) != 1 || promoted[0].Path == sourceRepository || !promoted[0].Private {
+		t.Fatalf("promoted repositories=%+v", promoted)
+	}
+	if inside, err := pathWithin(store.promotedRepositoryRoot(), promoted[0].Path); err != nil || !inside {
+		t.Fatalf("promoted path %q is outside cluster repository root: inside=%t err=%v", promoted[0].Path, inside, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(promoted[0].Path, "sentinel")); err != nil || string(data) != "filesystem state" {
+		t.Fatalf("promoted contents=%q err=%v", data, err)
+	}
+	if err := store.PromoteContainerRepositories("source"); err != nil {
+		t.Fatalf("idempotent PromoteContainerRepositories: %v", err)
+	}
+
+	targetID := strings.Repeat("b", 64)
+	targetRepositories := append([]specutils.TTCVolumeRepository(nil), promoted...)
+	targetRepositories[0].Branch = "remote"
+	writeContainer(targetID, "target", targetRepositories)
+	if err := store.RemoveContainer("source"); err != nil {
+		t.Fatalf("RemoveContainer(source): %v", err)
+	}
+	if _, err := os.Stat(promoted[0].Path); err != nil {
+		t.Fatalf("repository disappeared while target still referenced it: %v", err)
+	}
+	if err := store.RemoveContainer("target"); err != nil {
+		t.Fatalf("RemoveContainer(target): %v", err)
+	}
+	if _, err := os.Stat(promoted[0].Path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("unreferenced promoted repository remains: %v", err)
 	}
 }
 

@@ -303,10 +303,13 @@ func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {
 	if err := family.ReplaceDefaultKernel(replacement); err != nil {
 		t.Fatal(err)
 	}
+	if err := family.SetDefaultFilesystemBranch("remote-filesystem-branch"); err != nil {
+		t.Fatal(err)
+	}
 	family.mu.Lock()
 	branch := family.branches[DefaultBranchID]
 	family.mu.Unlock()
-	if branch.k != replacement || branch.state != BranchPaused {
+	if branch.k != replacement || branch.state != BranchPaused || branch.filesystemBranch != "remote-filesystem-branch" {
 		t.Fatalf("replacement branch=%+v", branch)
 	}
 }

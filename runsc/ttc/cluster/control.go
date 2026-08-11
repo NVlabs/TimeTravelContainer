@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -111,6 +112,10 @@ type RemoteSessionDescriptor struct {
 	MetadataBytes    uint64 `json:"metadata_bytes"`
 	StreamBytes      uint64 `json:"stream_bytes"`
 	MaxTransferBytes uint64 `json:"max_transfer_bytes"`
+	// SharedSnapshot is a clean repository-relative path containing the
+	// immutable packed memory stream. It is non-secret and remains valid after
+	// the source Sentry and page server exit.
+	SharedSnapshot string `json:"shared_snapshot,omitempty"`
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
@@ -131,6 +136,12 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 	}
 	if s.MaxTransferBytes < negotiated.BasePageSize || s.MaxTransferBytes > negotiated.MaxTransferSize || s.MaxTransferBytes%negotiated.BasePageSize != 0 {
 		return fmt.Errorf("remote transfer size %d is outside negotiated bounds", s.MaxTransferBytes)
+	}
+	if s.SharedSnapshot != "" {
+		clean := filepath.Clean(s.SharedSnapshot)
+		if filepath.IsAbs(s.SharedSnapshot) || clean != s.SharedSnapshot || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("invalid shared memory snapshot path %q", s.SharedSnapshot)
+		}
 	}
 	return nil
 }

@@ -31,6 +31,7 @@ func testCapabilities(node string) Capabilities {
 		Features: []string{
 			FeatureRemotePull, FeatureReversePush, FeatureAckBatch,
 			FeatureNetworkRecreate, FeatureRuntimePrefetch, FeatureFilesystemBranch,
+			FeatureSharedMemorySnapshot,
 		},
 	}
 }
@@ -77,9 +78,31 @@ func TestNegotiateRejectsRepositoryAndRequiredFeatureMismatch(t *testing.T) {
 		t.Fatalf("repository mismatch error=%v", err)
 	}
 	target.RepositoryID = source.RepositoryID
-	target.Features = target.Features[:len(target.Features)-1]
+	target.Features = target.Features[:len(target.Features)-2]
 	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), FeatureFilesystemBranch) {
 		t.Fatalf("feature mismatch error=%v", err)
+	}
+}
+
+func TestRemoteSessionDescriptorSharedSnapshotPath(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
+		SharedSnapshot: "cluster/memory-snapshots/tx.mem",
+	}
+	if err := base.validate(negotiated); err != nil {
+		t.Fatalf("valid shared snapshot: %v", err)
+	}
+	for _, path := range []string{"/tmp/tx.mem", "../tx.mem", "cluster/../tx.mem", "."} {
+		invalid := base
+		invalid.SharedSnapshot = path
+		if err := invalid.validate(negotiated); err == nil {
+			t.Errorf("accepted invalid shared snapshot path %q", path)
+		}
 	}
 }
 
