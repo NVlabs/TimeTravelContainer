@@ -3078,6 +3078,35 @@ esac
 	}
 }
 
+func TestRuntimeBackendTerminalExecPreservesExplicitTERM(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+case " $* " in
+  *" --env TERM=screen-256color "*) ;;
+  *) echo "explicit TERM missing: $*" >&2; exit 2 ;;
+esac
+case " $* " in
+  *" --env TERM=xterm-256color "*) echo "client TERM overrode explicit TERM: $*" >&2; exit 2 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	var stderr bytes.Buffer
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, clientTERM: "xterm-256color", stderr: &stderr}
+	status, err := b.exec(execRequest{
+		target:   selector{container: "web", branch: "main"},
+		args:     []string{"true"},
+		env:      []string{"TERM=screen-256color"},
+		terminal: true,
+	})
+	if err != nil || status != 0 {
+		t.Fatalf("terminal exec returned status=%d err=%v stderr=%q", status, err, stderr.String())
+	}
+}
+
 func TestRemoveStoppedRuntimeBeforeStart(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

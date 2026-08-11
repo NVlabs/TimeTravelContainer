@@ -5352,17 +5352,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	}
 	request.target = resolved
 	if request.terminal && request.processPath == "" && !environmentHasKey(request.env, "TERM") {
-		hasContainerTERM := false
-		if b.dataRoot != "" {
-			spec, loadErr := b.containerStore().LoadSpec(request.target.container)
-			if loadErr != nil {
-				return 1, fmt.Errorf("loading container environment for terminal exec: %w", loadErr)
-			}
-			hasContainerTERM = spec.Process != nil && environmentHasKey(spec.Process.Env, "TERM")
-		}
-		if !hasContainerTERM {
-			request.env = append(request.env, "TERM="+terminalType(b.clientTERM))
-		}
+		request.env = append(request.env, "TERM="+terminalType(b.clientTERM))
 	}
 	cols, rows, hasConsoleSize := 0, 0, false
 	if request.terminal {
