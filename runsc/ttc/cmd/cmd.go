@@ -47,6 +47,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -4268,15 +4269,6 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if err != nil {
 			return fmt.Errorf("inspecting %s before restart: %w", target.selector, err)
 		}
-		for _, peer := range info.TTC.Branches {
-			if peer.Metadata.ID == target.selector.branch {
-				continue
-			}
-			switch normalizeLifecycleState(peer.Metadata.State) {
-			case "running", "paused", "restarting", "dehydrating", "rehydrating", "creating":
-				return fmt.Errorf("cannot restart %s while peer %s@%s is %s", target.selector, target.selector.container, peer.Metadata.ID, normalizeLifecycleState(peer.Metadata.State))
-			}
-		}
 		stopSignal, stopTimeout, err := stopPolicy(info)
 		if err != nil {
 			return err
@@ -5320,6 +5312,27 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	default:
 		return 1, fmt.Errorf("branch %s is %s", target, normalizeLifecycleState(branch.State))
 	}
+	preservedPeers, err := freshStartPeers(info, target)
+	if err != nil {
+		return 1, err
+	}
+	dehydratedPeers := make([]selector, 0, len(preservedPeers))
+	for _, peer := range preservedPeers {
+		if err := b.dehydrate(peer); err != nil {
+			restoreErr := b.restoreFreshStartPeers(dehydratedPeers)
+			if restoreErr != nil {
+				return 1, fmt.Errorf("preserving active peers before starting %s: %w (restoring already preserved peers also failed: %v)", target, err, restoreErr)
+			}
+			return 1, fmt.Errorf("preserving active peers before starting %s: %w", target, err)
+		}
+		dehydratedPeers = append(dehydratedPeers, peer)
+	}
+	restoreAfterFailure := func(startErr error) (int, error) {
+		if restoreErr := b.restoreFreshStartPeers(dehydratedPeers); restoreErr != nil {
+			return 1, fmt.Errorf("%w (restoring preserved peers also failed: %v)", startErr, restoreErr)
+		}
+		return 1, startErr
+	}
 	// Waiting for the branch init process and tearing down its sandbox are
 	// separate events. In particular, a multi-process container may report its
 	// init's exit just before runsc changes the old runtime from running to
@@ -5328,20 +5341,20 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	// fail immediately.
 	waitForTeardown := true
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
-		return 1, fmt.Errorf("starting %s requires every peer to be process-free: %w", target, err)
+		return restoreAfterFailure(fmt.Errorf("preparing a fresh runtime for %s: %w", target, err))
 	}
 	if b.dataRoot != "" {
 		store := b.containerStore()
 		info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
 		if err != nil {
-			return 1, err
+			return restoreAfterFailure(err)
 		}
 		if _, err := store.PruneImageRoots(context.Background()); err != nil {
-			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
+			return restoreAfterFailure(fmt.Errorf("pruning superseded image roots: %w", err))
 		}
 		branch, err = persistentBranchInfo(info, target.branch)
 		if err != nil {
-			return 1, err
+			return restoreAfterFailure(err)
 		}
 	}
 	filesystemBranch := branch.FilesystemBranch
@@ -5352,19 +5365,123 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
 		}
 	}
-	bundleDir, cleanupBundle, err := b.containerStore().PrepareBranchStartBundle(info.ID, target.branch, filesystemBranch)
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareBranchStartBundle(info.ID, target.branch, filesystemBranch, len(dehydratedPeers) != 0)
+	if err != nil {
+		return restoreAfterFailure(err)
+	}
+	defer cleanupBundle()
+	launchDetached := detach || len(dehydratedPeers) != 0
+	status, err := b.launch(info, target, bundleDir, launchDetached, interactive)
+	if len(dehydratedPeers) == 0 {
+		if err == nil {
+			b.recordLaunchState(target, detach, status)
+		}
+		if info.AutoRemove {
+			return b.applyAutoRemove(target, detach, status, err)
+		}
+		return status, err
+	}
+	if err != nil || status != 0 {
+		if err == nil {
+			err = fmt.Errorf("starting paused bootstrap for %s exited with status %d", target, status)
+		}
+		return restoreAfterFailure(err)
+	}
+	store := b.containerStore()
+	if err := store.RecordBranchStart(target.container, target.branch); err != nil {
+		_ = b.discard(target)
+		return restoreAfterFailure(fmt.Errorf("recording paused bootstrap for %s: %w", target, err))
+	}
+	if err := store.UpdateBranchState(target.container, target.branch, "paused"); err != nil {
+		_ = b.discard(target)
+		return restoreAfterFailure(fmt.Errorf("recording paused state for %s: %w", target, err))
+	}
+	if err := b.restoreFreshStartPeers(dehydratedPeers); err != nil {
+		discardErr := b.discard(target)
+		restoreErr := b.restoreFreshStartPeers(dehydratedPeers)
+		return 1, errors.Join(fmt.Errorf("restoring active peers beside %s: %w", target, err), discardErr, restoreErr)
+	}
+	if err := b.resume(target); err != nil {
+		discardErr := b.discard(target)
+		return 1, errors.Join(fmt.Errorf("resuming freshly started branch %s: %w", target, err), discardErr)
+	}
+	return b.finishPreservedPeerStart(info, target, detach, interactive)
+}
+
+// freshStartPeers returns active branches that must survive replacement of the
+// family's Sentry. Process-free peers need no work. Transient states are
+// rejected because daemon mutation serialization should never expose one here
+// unless an earlier operation was interrupted.
+func freshStartPeers(info ttcbundle.ContainerInfo, target selector) ([]selector, error) {
+	peers := make([]selector, 0, len(info.Branches))
+	for _, branch := range info.Branches {
+		if branch.ID == target.branch || branch.State == "deleted" {
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "running", "paused":
+			peers = append(peers, selector{container: target.container, branch: branch.ID})
+		case "created", "dehydrated", "exited", "failed", "dead":
+		case "creating", "dehydrating", "rehydrating", "restarting":
+			return nil, fmt.Errorf("cannot start %s while peer %s@%s is %s", target, target.container, branch.ID, normalizeLifecycleState(branch.State))
+		default:
+			return nil, fmt.Errorf("cannot start %s while peer %s@%s has unknown state %q", target, target.container, branch.ID, branch.State)
+		}
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].branch < peers[j].branch })
+	return peers, nil
+}
+
+func (b *runtimeBackend) restoreFreshStartPeers(peers []selector) error {
+	var errs []error
+	for _, peer := range peers {
+		info, err := b.containerStore().LoadContainer(peer.container)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("loading %s for restoration: %w", peer, err))
+			continue
+		}
+		branch, err := persistentBranchInfo(info, peer.branch)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "running", "paused":
+			continue
+		case "dehydrated":
+			if err := b.rehydrate(peer); err != nil {
+				errs = append(errs, fmt.Errorf("rehydrating %s: %w", peer, err))
+			}
+		default:
+			errs = append(errs, fmt.Errorf("preserved peer %s became %s", peer, normalizeLifecycleState(branch.State)))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *runtimeBackend) finishPreservedPeerStart(info ttcbundle.ContainerInfo, target selector, detach, interactive bool) (int, error) {
+	if detach {
+		if info.AutoRemove {
+			return b.applyAutoRemove(target, true, 0, nil)
+		}
+		return 0, nil
+	}
+	waitStatus, err := b.attach(attachRequest{target: target, stdin: interactive, stdout: true, stderr: true, detachKeys: defaultDetachKeys})
+	if errors.Is(err, errDetached) {
+		if info.AutoRemove {
+			return b.applyAutoRemove(target, true, 0, nil)
+		}
+		return 0, nil
+	}
 	if err != nil {
 		return 1, err
 	}
-	defer cleanupBundle()
-	status, err := b.launch(info, target, bundleDir, detach, interactive)
-	if err == nil {
-		b.recordLaunchState(target, detach, status)
-	}
+	status := waitStatusExitCode(waitStatus)
+	b.recordLaunchState(target, false, status)
 	if info.AutoRemove {
-		return b.applyAutoRemove(target, detach, status, err)
+		return b.applyAutoRemove(target, false, status, nil)
 	}
-	return status, err
+	return status, nil
 }
 
 func (b *runtimeBackend) applyAutoRemove(target selector, detach bool, status int, launchErr error) (int, error) {
@@ -8911,6 +9028,10 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		if err != nil {
 			return fmt.Errorf("creating active dehydration memory %d: %w", i, err)
 		}
+		// Peer restore constructs its MemoryFiles after systrap has reserved the
+		// Sentry's application address range. Perform the executable mmap used
+		// to prime host IMA here, before donating the file to the sandbox.
+		pgalloc.IMAWorkAroundForMemFile(file.Fd())
 		targets = append(targets, file)
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{

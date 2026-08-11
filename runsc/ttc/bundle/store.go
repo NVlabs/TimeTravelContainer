@@ -64,11 +64,11 @@ type Store struct {
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
 // branch from its persistent filesystem pointer without changing its visible
 // branch identity. The canonical container bundle is never modified.
-func (s Store) PrepareBranchStartBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+func (s Store) PrepareBranchStartBundle(name, branchID, filesystemBranch string, startPaused bool) (string, func(), error) {
 	if branchID == "" || filesystemBranch == "" {
 		return "", nil, errors.New("branch start identity and filesystem branch are required")
 	}
-	return s.prepareBranchBundle(name, branchID, filesystemBranch, false)
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, startPaused)
 }
 
 // PrepareDehydrationRestoreBundle creates a short-lived OCI bundle that tells
@@ -79,10 +79,10 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	if filesystemBranch == "" {
 		return "", nil, errors.New("dehydration restore filesystem branch is empty")
 	}
-	return s.prepareBranchBundle(name, "", filesystemBranch, true)
+	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
-func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget bool) (string, func(), error) {
+func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return "", nil, err
@@ -125,6 +125,11 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 		spec.Annotations[specutils.AnnotationTTCInitialBranchID] = branchID
 		spec.Annotations[specutils.AnnotationTTCInitialBranchParentID] = branch.ParentID
 		spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] = filesystemBranch
+		if startPaused {
+			spec.Annotations[specutils.AnnotationTTCInitialStartPaused] = "true"
+		} else {
+			delete(spec.Annotations, specutils.AnnotationTTCInitialStartPaused)
+		}
 	}
 	if spec.Root != nil && !filepath.IsAbs(spec.Root.Path) {
 		spec.Root.Path = filepath.Join(info.BundleDir, spec.Root.Path)

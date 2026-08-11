@@ -1164,7 +1164,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	temp, cleanup, err := store.PrepareBranchStartBundle("demo", "child", "fs-child")
+	temp, cleanup, err := store.PrepareBranchStartBundle("demo", "child", "fs-child", true)
 	if err != nil {
 		t.Fatalf("PrepareBranchStartBundle: %v", err)
 	}
@@ -1179,6 +1179,9 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}
 	if got.Annotations[specutils.AnnotationTTCInitialBranchID] != "child" || got.Annotations[specutils.AnnotationTTCInitialBranchParentID] != "main" || got.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] != "fs-child" {
 		t.Fatalf("initial identity annotations=%q", got.Annotations)
+	}
+	if got.Annotations[specutils.AnnotationTTCInitialStartPaused] != "true" {
+		t.Fatalf("initial start-paused annotation=%q", got.Annotations)
 	}
 	gotRepositories, err := specutils.TTCVolumeRepositories(&got)
 	if err != nil {

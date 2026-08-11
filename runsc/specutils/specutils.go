@@ -99,6 +99,9 @@ const (
 	AnnotationTTCInitialBranchID         = "dev.timetravelcontainer.initial-branch-id"
 	AnnotationTTCInitialBranchParentID   = "dev.timetravelcontainer.initial-branch-parent-id"
 	AnnotationTTCInitialFilesystemBranch = "dev.timetravelcontainer.initial-filesystem-branch"
+	// AnnotationTTCInitialStartPaused starts a fresh branch in a task-set-wide
+	// stop while ttcd restores independently dehydrated peers into its Sentry.
+	AnnotationTTCInitialStartPaused = "dev.timetravelcontainer.initial-start-paused"
 
 	// TTCRootfsUpperSource is the reserved, guest-invisible source key for a
 	// container family's persistent writable rootfs upper repository.

@@ -2525,11 +2525,11 @@ func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 	}
 	b := &fakeBackend{inspectInfo: peerInfo}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"restart", "web@main"}, &stdout, &stderr, b); status == 0 {
-		t.Fatal("restart proceeded while a peer was active")
+	if status := runCommand([]string{"restart", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("restart with active peer status=%d stderr=%q", status, stderr.String())
 	}
-	if len(b.signals) != 0 || len(b.startCalls) != 0 {
-		t.Errorf("rejected restart mutated backend: signals=%+v starts=%+v", b.signals, b.startCalls)
+	if got, want := b.startCalls, []startCall{{target: selector{container: "web", branch: "main"}, detach: true}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("restart starts=%+v, want %+v", got, want)
 	}
 
 	b = &fakeBackend{}
@@ -2537,6 +2537,32 @@ func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 	stderr.Reset()
 	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
 		t.Fatal("restart accepted a family name")
+	}
+}
+
+func TestFreshStartPeers(t *testing.T) {
+	info := ttcbundle.ContainerInfo{Branches: []ttcbundle.BranchInfo{
+		{ID: "target", State: "exited"},
+		{ID: "z-running", State: "running"},
+		{ID: "a-paused", State: "paused"},
+		{ID: "cold", State: "dehydrated"},
+		{ID: "old", State: "stopped"},
+	}}
+	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"})
+	if err != nil {
+		t.Fatalf("freshStartPeers: %v", err)
+	}
+	want := []selector{
+		{container: "demo", branch: "a-paused"},
+		{container: "demo", branch: "z-running"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("freshStartPeers=%+v, want %+v", got, want)
+	}
+
+	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "busy", State: "dehydrating"})
+	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
+		t.Fatalf("freshStartPeers transient error=%v", err)
 	}
 }
 

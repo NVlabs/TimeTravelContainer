@@ -45,10 +45,12 @@ A family target expands to its current branches. Family-wide operations are
 performed branch by branch and are not transactional: an error after some
 branches have completed is reported without undoing those completed changes.
 
-Today, starting or restarting an exited branch requires the family to have no
-other running or paused branch. Freshly inserting another independent kernel
-into an already-running Sentry is not implemented yet. Dehydrated peers are
-process-free and do not prevent a start.
+Starting or restarting an exited branch preserves active peers. TTC briefly
+dehydrates those peers, starts the selected branch paused as a fresh runtime
+bootstrap, restores the peers beside it, and then resumes the new branch.
+Their pre-operation running or paused states are retained. This coordination
+is slower than an ordinary start in a process-free family, but no branch must
+be stopped or manually dehydrated first.
 
 If the branch used internally by runsc for process bookkeeping exits naturally,
 TTC transfers that bookkeeping role to another live branch. This internal role

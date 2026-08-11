@@ -263,7 +263,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 		target := os.NewFile(uintptr(targetFD), fmt.Sprintf("dehydration-peer-memory-%d", i))
 		if i == 0 {
-			loadMemories[i].MemoryFile, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, target, true)
+			loadMemories[i].MemoryFile, err = createPrePrimedMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, target, true)
 		} else {
 			loadMemories[i].MemoryFile, err = createEmptyPrivateMemoryFile(target, metadata.Memories[i].ResourceID)
 		}
@@ -271,11 +271,6 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 			cleanupMemories()
 			return nil, fmt.Errorf("creating dehydration peer memory %d: %w", i, err)
 		}
-	}
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
-	if err != nil {
-		cleanupMemories()
-		return nil, err
 	}
 	consumed := false
 	defer func() {
@@ -285,7 +280,10 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	}()
 	err = l.family.RestoreDurablePeer(args, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		consumed = true
-		return kernel.LoadDurableDehydration(source.SupervisorContext(), p, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+		// Branches in one Sentry share the platform. In particular, systrap's
+		// stub mapping and source subprocess are process-global; constructing a
+		// second platform here can collide with the active platform's mappings.
+		return kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)

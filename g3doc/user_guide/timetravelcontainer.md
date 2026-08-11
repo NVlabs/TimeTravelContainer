@@ -313,6 +313,12 @@ not remove surviving peers. Use `-f` to remove a running or paused branch.
 `ttc rm web` removes the whole family and requires all live branches to be
 stopped unless `--force` is used.
 
+Starting or restarting an exited branch does not require its peers to stop.
+TTC briefly preserves running and paused peers as process-free dehydration
+images, starts the selected branch without allowing its guest tasks to run,
+restores those peers into the new Sentry, and then resumes the selected branch.
+Each peer returns to its previous running or paused state.
+
 ## Distributed live fork
 
 Configured TTC nodes can place a live child on another host without first
@@ -575,9 +581,9 @@ Live fork publishes a new immutable metadata-tree root without walking the
 filesystem. Both branches initially reference the same opaque regular-file
 objects; the first write in either branch reflinks the affected file, after
 which the backing filesystem performs block/extent CoW. A read-only root
-(`--read-only`) has no writable upper. Restart recreates process/kernel state
-only for `main`, while each stopped child retains its filesystem branch for
-offline `ttc cp`.
+(`--read-only`) has no writable upper. Restart recreates only the selected
+branch's process and kernel state; every branch retains its own filesystem
+state.
 
 Plain tmpfs mounts remain ephemeral across stop/start.
 

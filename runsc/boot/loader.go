@@ -251,6 +251,7 @@ type Loader struct {
 	// restore's background completion lifecycle.
 	distributedRestore          bool
 	dehydrationRestore          bool
+	initialStartPaused          bool
 	distributedRestoreSessionID string
 	distributedRestoreInfo      DistributedForkRestoreInfo
 	distributedPushReceiver     *ttcremote.TCPPushReceiver
@@ -923,6 +924,7 @@ func New(args Args) (*Loader, error) {
 		initialBranchID = args.Spec.Annotations[specutils.AnnotationTTCInitialBranchID]
 		initialBranchParentID = args.Spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]
 		initialFilesystemBranch = args.Spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch]
+		l.initialStartPaused = args.Spec.Annotations[specutils.AnnotationTTCInitialStartPaused] == "true"
 	}
 	if (initialBranchID == "") != (initialFilesystemBranch == "") {
 		return nil, fmt.Errorf("TTC initial branch annotations must be specified together")
@@ -1267,11 +1269,24 @@ func createMemoryFileFromFD(appHugePages bool, hostTHP HostTHP, persistentFD int
 }
 
 func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
+	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, false)
+}
+
+// createPrePrimedMemoryFileFromFile creates a MemoryFile for a backing file on
+// which pgalloc.IMAWorkAroundForMemFile has already been called outside the
+// sandbox. Raw executable mmap is unsafe after systrap has installed its
+// application address-space mappings, so peer restore must use this path.
+func createPrePrimedMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
+	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, true)
+}
+
+func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked, disableIMAWorkAround bool) (*pgalloc.MemoryFile, error) {
 	mfopts := pgalloc.MemoryFileOpts{
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
-		DiskBackedFile: diskBacked,
+		DiskBackedFile:       diskBacked,
+		DisableIMAWorkAround: disableIMAWorkAround,
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {
@@ -1495,8 +1510,15 @@ func (l *Loader) run() error {
 
 	log.Infof("Process should have started...")
 	l.watchdog.Start()
-	if err := l.k.Start(); err != nil {
-		return err
+	if l.initialStartPaused {
+		l.k.Pause()
+		if err := l.k.StartPaused(); err != nil {
+			return err
+		}
+	} else {
+		if err := l.k.Start(); err != nil {
+			return err
+		}
 	}
 	l.family.MarkDefaultStarted()
 	if l.dehydrationRestore {
