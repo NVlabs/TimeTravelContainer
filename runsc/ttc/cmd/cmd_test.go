@@ -3140,15 +3140,16 @@ if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 fi
 if [ "$3" = "list" ]; then
 	case "$(cat "$0.mode")" in
-	stopped) echo '[{"id":"web","status":"stopped"}]' ;;
-	running) echo '[{"id":"web","status":"running"}]' ;;
+	stopped) printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID" ;;
+	running) printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID" ;;
+	stale) echo '[{"id":"web","pid":2147483647,"status":"running"}]' ;;
 	transition)
 		count=$(cat "$0.transition")
 		if [ "$count" -lt 2 ]; then
 			echo $((count + 1)) >"$0.transition"
-			echo '[{"id":"web","status":"running"}]'
+			printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$PPID"
 		else
-			echo '[{"id":"web","status":"stopped"}]'
+			printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
 		fi
 		;;
 	absent) echo '[]' ;;
@@ -3186,6 +3187,18 @@ exit 2
 	}
 	if _, err := os.Stat(runsc + ".deleted"); !os.IsNotExist(err) {
 		t.Errorf("running runtime delete marker err=%v", err)
+	}
+	if err := os.WriteFile(runsc+".mode", []byte("stale\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.removeStoppedRuntime("web", false); err != nil {
+		t.Fatalf("removeStoppedRuntime(stale): %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Errorf("stale runtime was not deleted: %v", err)
+	}
+	if err := os.Remove(runsc + ".deleted"); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(runsc+".mode", []byte("transition\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -3315,6 +3328,119 @@ exit 2
 	}
 	if inspected.State.Status != "exited" || inspected.State.ExitCode != 139 {
 		t.Errorf("inspect after reconciliation = %+v, want exited with status 139", inspected.State)
+	}
+}
+
+func TestListFamiliesReconcilesDeadListedSandbox(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+if [ "$3" = "list" ]; then
+	if [ "$(cat "$0.mode")" = "live" ]; then
+		pid=$PPID
+	else
+		pid=2147483647
+	fi
+	printf '[{"id":"web","pid":%s,"status":"running"}]\n' "$pid"
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
+	echo 'connecting to control server: connection refused' >&2
+	exit 128
+fi
+if [ "$3" = "delete" ] && [ "$4" = "--force" ] && [ "$5" = "web" ]; then
+	touch "$0.deleted"
+	exit 0
+fi
+echo "unexpected command: $*" >&2
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	if err := os.WriteFile(runsc+".mode", []byte("live\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC()
+	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: createdAt,
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", State: "exited", CreatedAt: createdAt},
+			{ID: "test", ParentID: "main", State: "running", CreatedAt: createdAt},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	consolePaths, err := store.BranchConsolePaths("web", defaultBranchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(consolePaths.WaitStatus), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// This belongs to main's earlier exit and must not be attributed to test.
+	if err := os.WriteFile(consolePaths.WaitStatus, []byte("0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	if _, err := b.listFamilies(); err != nil {
+		t.Fatalf("listFamilies with live Sentry: %v", err)
+	}
+	info, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State != "running" || info.Branches[1].State != "running" {
+		t.Fatalf("transient RPC failure reconciled a live Sentry: %+v", info)
+	}
+
+	if err := os.WriteFile(runsc+".mode", []byte("stale\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatalf("listFamilies with dead Sentry: %v", err)
+	}
+	if len(families) != 1 || families[0].State != "exited" || families[0].SandboxPID != 0 || families[0].Error == "" {
+		t.Fatalf("dead listed sandbox was not reconciled: %+v", families)
+	}
+	info, err = store.LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State != "exited" || info.ExitStatus != nil {
+		t.Fatalf("reconciled metadata=%+v, want exited with unknown status", info)
+	}
+	for _, branch := range info.Branches {
+		if branch.State != "exited" {
+			t.Errorf("branch %q state=%q, want exited", branch.ID, branch.State)
+		}
+	}
+	if err := b.removeStoppedRuntime("web", false); err != nil {
+		t.Fatalf("removeStoppedRuntime(stale): %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Errorf("stale runtime was not deleted before restart: %v", err)
 	}
 }
 

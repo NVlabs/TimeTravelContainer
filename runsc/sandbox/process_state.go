@@ -16,11 +16,10 @@ package sandbox
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -48,25 +47,5 @@ func sandboxProcessArgv0(spec *specs.Spec, id string) string {
 // kill(pid, 0) alone is insufficient: it succeeds for an unreaped zombie,
 // which previously made forced TTC removal wait for its full timeout.
 func IsProcessRunning(pid int) bool {
-	if pid <= 0 || unix.Kill(pid, 0) != nil {
-		return false
-	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		// The process was observable by kill(2), but procfs may be unavailable
-		// or restricted. Preserve the conservative historical result.
-		return true
-	}
-	// comm is parenthesized and may itself contain spaces or ')'. The state is
-	// the byte after the final ") ".
-	end := strings.LastIndex(string(stat), ") ")
-	if end < 0 || end+2 >= len(stat) {
-		return true
-	}
-	switch stat[end+2] {
-	case 'Z', 'X', 'x':
-		return false
-	default:
-		return true
-	}
+	return processutil.IsRunning(pid)
 }

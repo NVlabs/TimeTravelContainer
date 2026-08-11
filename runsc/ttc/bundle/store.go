@@ -2522,7 +2522,7 @@ func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
 	for i := range info.Branches {
 		branch := &info.Branches[i]
 		switch branch.State {
-		case "running", "paused", "dehydrating", "rehydrating":
+		case "creating", "running", "paused", "dehydrating", "rehydrating":
 			branch.State = "exited"
 			changed = true
 		}

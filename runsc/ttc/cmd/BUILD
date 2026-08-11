@@ -18,6 +18,7 @@ go_library(
         "//pkg/ttcvolume",
 		"//runsc/boot",
         "//runsc/flag",
+        "//runsc/processutil",
         "//runsc/specutils",
         "//runsc/ttc/bundle",
         "//runsc/ttc/checkpoint",

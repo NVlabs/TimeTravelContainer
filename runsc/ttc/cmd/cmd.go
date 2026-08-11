@@ -51,6 +51,7 @@ import (
 
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -5336,9 +5337,9 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 				continue
 			}
 			found = true
-			if family.State == "stopped" || family.State == "exited" {
+			if family.State == "stopped" || family.State == "exited" || runtimeFamilyUnavailable(family) {
 				if _, err := b.command("delete", "--force", name); err != nil {
-					return fmt.Errorf("deleting stopped runtime container %q: %w", name, err)
+					return fmt.Errorf("deleting unavailable runtime container %q: %w", name, err)
 				}
 				return nil
 			}
@@ -7663,7 +7664,15 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
-			runtimeIDs[family.ID] = struct{}{}
+			// A runsc state directory can outlive its Sentry after SIGKILL, which
+			// is common when a batch scheduler terminates a whole job. Merely
+			// appearing in `runsc list` does not make that runtime available.
+			// Keep a live Sentry authoritative during a transient control-server
+			// failure, but reconcile a failed RPC backed by a dead (or zombie)
+			// sandbox process as runtime loss.
+			if !runtimeFamilyUnavailable(family) {
+				runtimeIDs[family.ID] = struct{}{}
+			}
 			if persistent, ok := byID[family.ID]; ok {
 				family.Name = persistent.Name
 				family.Image = persistent.Image
@@ -7697,10 +7706,15 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				continue
 			}
 			var exitStatus *int
-			if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
-				if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
-					code := waitStatusExitCode(status)
-					exitStatus = &code
+			// A wait-status file belongs to one incarnation of main. Do not
+			// attribute an old main exit to a different live branch that was
+			// killed with the sandbox.
+			if persistentBranchRequiredRuntime(container, defaultBranchID) {
+				if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
+					if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
+						code := waitStatusExitCode(status)
+						exitStatus = &code
+					}
 				}
 			}
 			if err := store.ReconcileRuntimeUnavailable(container.ID, exitStatus); err != nil {
@@ -7710,6 +7724,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
 				family.Branches = persistentBranches(reconciled.Branches)
+				family.SandboxPID = 0
 				byID[container.ID] = family
 			}
 		}
@@ -7739,6 +7754,33 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	return families, nil
+}
+
+// runtimeFamilyUnavailable reports whether a runsc list entry is only stale
+// on-disk runtime metadata. A failed branch RPC alone is insufficient because
+// the control server can be temporarily unavailable while the Sentry remains
+// alive; the process-liveness check is the second required signal.
+func runtimeFamilyUnavailable(family Family) bool {
+	return family.Error != "" && !processutil.IsRunning(family.SandboxPID)
+}
+
+func persistentBranchRequiredRuntime(container ttcbundle.ContainerInfo, branchID string) bool {
+	state := ""
+	for _, branch := range container.Branches {
+		if branch.ID == branchID {
+			state = branch.State
+			break
+		}
+	}
+	if state == "" && branchID == defaultBranchID {
+		state = container.State
+	}
+	switch state {
+	case "creating", "running", "paused", "dehydrating", "rehydrating":
+		return true
+	default:
+		return false
+	}
 }
 
 func enrichPersistentBranchDiagnostics(family *Family) {
