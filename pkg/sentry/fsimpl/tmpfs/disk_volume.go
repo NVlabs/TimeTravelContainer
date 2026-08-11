@@ -15,10 +15,13 @@
 package tmpfs
 
 import (
+	"errors"
 	"fmt"
+	stdfs "io/fs"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -32,30 +35,30 @@ func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 	if _, err := fs.diskVolume.Repository.Branch(fs.diskVolume.Branch); err != nil {
 		return nil, err
 	}
-	loaded := make(map[uint64]*inode)
-	visiting := make(map[uint64]bool)
-	rootInode, err := fs.loadDiskInode(ttcvolume.RootInode, nil, loaded, visiting)
+	fs.diskInodes = make(map[uint64]*inode)
+	rootInode, err := fs.loadDiskInode(ttcvolume.RootInode, nil)
 	if err != nil {
 		return nil, err
 	}
 	if rootDir, ok := rootInode.impl.(*directory); ok {
+		inodes, bytes, err := fs.diskVolume.Repository.BranchUsage(fs.diskVolume.Branch)
+		if err != nil {
+			return nil, err
+		}
+		fs.inodesUsed.Store(inodes)
+		fs.diskBytes.Store(bytes)
 		return &rootDir.dentry, nil
 	}
 	return fs.newDentry(rootInode), nil
 }
 
-func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[uint64]*inode, visiting map[uint64]bool) (*inode, error) {
-	if inode, ok := loaded[ino]; ok {
+func (fs *filesystem) loadDiskInode(ino uint64, parent *directory) (*inode, error) {
+	if inode, ok := fs.diskInodes[ino]; ok {
 		if inode.isDir() {
 			return nil, fmt.Errorf("volume directory inode %d has multiple parents", ino)
 		}
 		return inode, nil
 	}
-	if visiting[ino] {
-		return nil, fmt.Errorf("volume inode cycle at %d", ino)
-	}
-	visiting[ino] = true
-	defer delete(visiting, ino)
 	meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 	if err != nil {
 		return nil, err
@@ -93,31 +96,64 @@ func (fs *filesystem) loadDiskInode(ino uint64, parent *directory, loaded map[ui
 	if meta.Type == "regular" {
 		fs.adjustDiskBytes(0, uint64(meta.Size))
 	}
-	loaded[ino] = inode
+	fs.diskInodes[ino] = inode
 	if dir, ok := inode.impl.(*directory); ok {
 		entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, ino)
 		if err != nil {
 			return nil, err
 		}
-		for _, entry := range entries {
-			if len(entry.Name) > fs.maxFilenameLen {
-				return nil, fmt.Errorf("volume entry %q exceeds maximum filename length", entry.Name)
-			}
-			childInode, err := fs.loadDiskInode(entry.Inode, dir, loaded, visiting)
-			if err != nil {
-				return nil, fmt.Errorf("loading %q: %w", entry.Name, err)
-			}
-			var child *dentry
-			if childDir, ok := childInode.impl.(*directory); ok {
-				child = &childDir.dentry
-				dir.inode.incRef() // child directory's ".." lifetime reference.
-			} else {
-				child = fs.newDentry(childInode)
-			}
-			dir.insertChildLocked(child, entry.Name)
-		}
+		dir.numChildren.Store(int64(len(entries)))
 	}
 	return inode, nil
+}
+
+// diskChildLocked returns name from dir, instantiating its inode and dentry
+// from the persistent repository on the first lookup. filesystem.mu must be
+// held for writing.
+func (fs *filesystem) diskChildLocked(dir *directory, name string) (*dentry, error) {
+	if child, ok := dir.childMap[name]; ok {
+		return child, nil
+	}
+	if fs.diskVolume == nil {
+		return nil, linuxerr.ENOENT
+	}
+	ino, err := fs.diskVolume.Repository.Lookup(fs.diskVolume.Branch, dir.inode.ino, name)
+	if err != nil {
+		if errors.Is(err, stdfs.ErrNotExist) {
+			return nil, linuxerr.ENOENT
+		}
+		return nil, err
+	}
+	childInode, err := fs.loadDiskInode(ino, dir)
+	if err != nil {
+		return nil, fmt.Errorf("loading %q: %w", name, err)
+	}
+	var child *dentry
+	if childDir, ok := childInode.impl.(*directory); ok {
+		child = &childDir.dentry
+		dir.inode.incRef() // child directory's ".." lifetime reference.
+	} else {
+		child = fs.newDentry(childInode)
+	}
+	// insertChildLocked updates the logical child count; the count already
+	// came from repository metadata, so insert only into the runtime cache.
+	genericSetParentAndName(fs, child, &dir.dentry, name)
+	if dir.childMap == nil {
+		dir.childMap = make(map[string]*dentry)
+	}
+	dir.childMap[name] = child
+	dir.iterMu.Lock()
+	dir.childList.PushBack(child)
+	dir.iterMu.Unlock()
+	return child, nil
+}
+
+func (fs *filesystem) diskDirectoryEmptyLocked(dir *directory) (bool, error) {
+	if fs.diskVolume == nil {
+		return len(dir.childMap) == 0, nil
+	}
+	entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, dir.inode.ino)
+	return len(entries) == 0, err
 }
 
 func pageRoundedDiskBytes(size uint64) uint64 {
@@ -151,18 +187,106 @@ func (fs *filesystem) adjustDiskBytes(oldSize, newSize uint64) {
 	}
 }
 
-func (fs *filesystem) applyDiskMetadata(inode *inode, meta ttcvolume.Inode) {
-	fileType := inode.mode.Load() & linux.S_IFMT
-	inode.mode.Store(fileType | meta.Mode&07777)
-	inode.uid.Store(meta.UID)
-	inode.gid.Store(meta.GID)
-	inode.nlink.Store(meta.Nlink)
-	inode.ino = meta.Number
-	inode.atime.Store(meta.AtimeNsec)
-	inode.btime.Store(meta.BtimeNsec)
-	inode.ctime.Store(meta.CtimeNsec)
-	inode.mtime.Store(meta.MtimeNsec)
-	inode.xattrs.SetRawXattrs(meta.Xattrs)
+func (fs *filesystem) applyDiskMetadata(node *inode, meta ttcvolume.Inode) {
+	fileType := node.mode.Load() & linux.S_IFMT
+	node.mode.Store(fileType | meta.Mode&07777)
+	node.uid.Store(meta.UID)
+	node.gid.Store(meta.GID)
+	node.nlink.Store(meta.Nlink)
+	node.ino = meta.Number
+	node.atime.Store(meta.AtimeNsec)
+	node.btime.Store(meta.BtimeNsec)
+	node.ctime.Store(meta.CtimeNsec)
+	node.mtime.Store(meta.MtimeNsec)
+	node.xattrs.SetRawXattrs(meta.Xattrs)
+	if fs.diskInodes == nil {
+		fs.diskInodes = make(map[uint64]*inode)
+	}
+	fs.diskInodes[meta.Number] = node
+}
+
+func (fs *filesystem) rebuildDiskInodeCache() {
+	fs.diskInodes = make(map[uint64]*inode)
+	var visit func(*dentry)
+	visit = func(d *dentry) {
+		fs.diskInodes[d.inode.ino] = d.inode
+		if dir, ok := d.inode.impl.(*directory); ok {
+			for _, child := range dir.childMap {
+				visit(child)
+			}
+		}
+	}
+	visit(fs.root)
+	fs.liveForkMu.Lock()
+	for file := range fs.liveForkFiles {
+		fs.diskInodes[file.inode.ino] = &file.inode
+	}
+	fs.liveForkMu.Unlock()
+}
+
+// pruneDiskNamespaceForSave makes state serialization proportional to live
+// runtime references instead of to the number of closed paths cached by this
+// process. The complete source cache is restored by
+// restoreDiskNamespaceAfterSave; the clone resolves omitted entries from its
+// already-forked repository branch.
+func (fs *filesystem) pruneDiskNamespaceForSave() {
+	if fs.diskVolume == nil || fs.diskSaveChildren != nil {
+		return
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.diskSaveChildren = make(map[*directory]map[string]*dentry)
+	var collect func(*directory)
+	collect = func(dir *directory) {
+		original := dir.childMap
+		fs.diskSaveChildren[dir] = original
+		for _, child := range original {
+			if childDir, ok := child.inode.impl.(*directory); ok {
+				collect(childDir)
+			}
+		}
+	}
+	collect(fs.root.inode.impl.(*directory))
+	filtered := make(map[*directory]map[string]*dentry, len(fs.diskSaveChildren))
+	for dir, original := range fs.diskSaveChildren {
+		kept := make(map[string]*dentry)
+		for name, child := range original {
+			if diskDentryNeedsSave(child) {
+				kept[name] = child
+			}
+		}
+		if len(kept) == 0 {
+			kept = nil
+		}
+		filtered[dir] = kept
+	}
+	for dir, kept := range filtered {
+		dir.childMap = kept
+		dir.childList.Reset()
+		for _, child := range kept {
+			child.SetPrev(nil)
+			child.SetNext(nil)
+			dir.childList.PushBack(child)
+		}
+	}
+}
+
+func (fs *filesystem) restoreDiskNamespaceAfterSave() {
+	if fs.diskSaveChildren == nil {
+		return
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	for dir, original := range fs.diskSaveChildren {
+		dir.childMap = original
+		dir.childList.Reset()
+		for _, child := range original {
+			child.SetPrev(nil)
+			child.SetNext(nil)
+			dir.childList.PushBack(child)
+		}
+	}
+	fs.diskSaveChildren = nil
 }
 
 func (fs *filesystem) diskMetadata(inode *inode) ttcvolume.Inode {
@@ -207,14 +331,24 @@ func (fs *filesystem) persistDiskMetadata(inode *inode) error {
 	if fs.diskVolume == nil {
 		return nil
 	}
-	return fs.diskVolume.Repository.UpdateMetadata(fs.diskVolume.Branch, fs.diskMetadata(inode))
+	generation := inode.diskMetadataGeneration.Load()
+	if err := fs.diskVolume.Repository.UpdateMetadata(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
+		return err
+	}
+	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	return nil
 }
 
 func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 	if fs.diskVolume == nil {
 		return nil
 	}
-	return fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode))
+	generation := inode.diskMetadataGeneration.Load()
+	if err := fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
+		return err
+	}
+	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	return nil
 }
 
 // flushDiskWriteMetadata publishes metadata deferred by ordinary regular-file
@@ -225,11 +359,49 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 		return nil
 	}
 	fs.liveForkMu.Lock()
-	defer fs.liveForkMu.Unlock()
 	for file := range fs.liveForkFiles {
 		if err := file.flushDiskMetadata(); err != nil {
+			fs.liveForkMu.Unlock()
 			return err
 		}
+	}
+	fs.liveForkMu.Unlock()
+
+	fs.mu.Lock()
+	inodes := make([]*inode, 0, len(fs.diskInodes))
+	for _, node := range fs.diskInodes {
+		inodes = append(inodes, node)
+	}
+	fs.mu.Unlock()
+	type pendingMetadata struct {
+		inode      *inode
+		generation uint64
+		metadata   ttcvolume.Inode
+	}
+	pending := make([]pendingMetadata, 0)
+	for _, node := range inodes {
+		generation := node.diskMetadataGeneration.Load()
+		if generation == 0 {
+			continue
+		}
+		node.mu.Lock()
+		pending = append(pending, pendingMetadata{
+			inode: node, generation: generation, metadata: fs.diskMetadata(node),
+		})
+		node.mu.Unlock()
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	updates := make([]ttcvolume.Inode, len(pending))
+	for idx := range pending {
+		updates[idx] = pending[idx].metadata
+	}
+	if err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates); err != nil {
+		return err
+	}
+	for _, update := range pending {
+		update.inode.diskMetadataGeneration.CompareAndSwap(update.generation, 0)
 	}
 	return nil
 }

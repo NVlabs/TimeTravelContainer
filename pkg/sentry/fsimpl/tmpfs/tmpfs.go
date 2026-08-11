@@ -169,6 +169,16 @@ type filesystem struct {
 
 	// diskVolume is non-nil for TTC-managed persistent volumes.
 	diskVolume *diskVolumeState
+
+	// diskInodes preserves inode identity for the subset of persistent objects
+	// currently instantiated by paths, file descriptions, mappings, mounts, or
+	// watches. The repository owns the complete namespace; this cache is rebuilt
+	// after restore and is intentionally not serialized.
+	diskInodes map[uint64]*inode `state:"nosave"`
+
+	// diskSaveChildren temporarily holds the complete runtime namespace cache
+	// while state serialization sees only entries carrying live runtime state.
+	diskSaveChildren map[*directory]map[string]*dentry `state:"nosave"`
 }
 
 // AllocatedBytes returns the logical number of bytes allocated by this tmpfs.
@@ -767,6 +777,11 @@ type inode struct {
 	ctime atomicbitops.Int64 // nanoseconds
 	mtime atomicbitops.Int64 // nanoseconds
 
+	// diskMetadataGeneration is incremented when branch-visible metadata is
+	// changed without an immediate repository transaction. It is runtime-only:
+	// save preparation flushes it before serialization.
+	diskMetadataGeneration atomicbitops.Uint64 `state:"nosave"`
+
 	locks vfs.FileLocks
 
 	// Inotify watches for this inode.
@@ -1157,6 +1172,7 @@ func (i *inode) touchAtime(mnt *vfs.Mount) {
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mu.Lock()
 	i.atime.Store(now)
+	i.markDiskMetadataDirty()
 	i.mu.Unlock()
 	mnt.EndWrite()
 }
@@ -1166,6 +1182,7 @@ func (i *inode) touchCtime() {
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mu.Lock()
 	i.ctime.Store(now)
+	i.markDiskMetadataDirty()
 	i.mu.Unlock()
 }
 
@@ -1175,6 +1192,7 @@ func (i *inode) touchCMtime() {
 	i.mu.Lock()
 	i.mtime.Store(now)
 	i.ctime.Store(now)
+	i.markDiskMetadataDirty()
 	i.mu.Unlock()
 }
 
@@ -1185,6 +1203,13 @@ func (i *inode) touchCMtimeLocked() {
 	now := i.fs.clock.Now().Nanoseconds()
 	i.mtime.Store(now)
 	i.ctime.Store(now)
+	i.markDiskMetadataDirty()
+}
+
+func (i *inode) markDiskMetadataDirty() {
+	if i.fs.diskVolume != nil {
+		i.diskMetadataGeneration.Add(1)
+	}
 }
 
 func (i *inode) checkXattrPrefix(name string) error {

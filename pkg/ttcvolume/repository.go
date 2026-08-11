@@ -208,6 +208,14 @@ type DirectoryEntry struct {
 	Inode uint64 `json:"inode"`
 }
 
+// DirectoryItem combines a directory entry with its inode metadata. It lets
+// filesystem implementations serve readdir without instantiating or looking
+// up each child individually.
+type DirectoryItem struct {
+	Entry DirectoryEntry
+	Inode Inode
+}
+
 // Repository is one named persistent volume.
 type Repository struct {
 	path     string
@@ -1407,6 +1415,40 @@ func (r *Repository) UpdateMetadata(branchID string, updated Inode) error {
 	return r.updateMetadata(branchID, updated, false)
 }
 
+// UpdateMetadataBatch publishes coalesced metadata changes in one journal
+// transaction. Identity, type, link count, data object, generation, and
+// regular-file size remain repository-owned.
+func (r *Repository) UpdateMetadataBatch(branchID string, updates []Inode) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	return r.withLock(func() error {
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		ops := make([]metadataOp, 0, len(updates))
+		seen := make(map[uint64]struct{}, len(updates))
+		for _, updated := range updates {
+			if _, ok := seen[updated.Number]; ok {
+				return fmt.Errorf("duplicate metadata update for inode %d", updated.Number)
+			}
+			seen[updated.Number] = struct{}{}
+			current, err := r.metadataInode(state, updated.Number)
+			if err != nil {
+				return err
+			}
+			mergeMutableMetadata(&current, updated)
+			ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &current})
+		}
+		return r.commitMetadata(&branch, state, ops)
+	})
+}
+
 // UpdateAfterWrite replaces metadata and grows the logical size. The size is
 // merged using max so writers through concurrent mounts of one named volume
 // cannot accidentally shrink each other's file.
@@ -1428,21 +1470,26 @@ func (r *Repository) updateMetadata(branchID string, updated Inode, growSize boo
 		if err != nil {
 			return err
 		}
-		current.Mode = updated.Mode & 07777
-		current.UID = updated.UID
-		current.GID = updated.GID
-		current.AtimeNsec = updated.AtimeNsec
-		current.BtimeNsec = updated.BtimeNsec
-		current.CtimeNsec = updated.CtimeNsec
-		current.MtimeNsec = updated.MtimeNsec
-		current.Xattrs = updated.Xattrs
+		mergeMutableMetadata(&current, updated)
 		if current.Type == "regular" && growSize && updated.Size > current.Size {
 			current.Size = updated.Size
-		} else if current.Type == "symlink" {
-			current.Target = updated.Target
 		}
 		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &current}})
 	})
+}
+
+func mergeMutableMetadata(current *Inode, updated Inode) {
+	current.Mode = updated.Mode & 07777
+	current.UID = updated.UID
+	current.GID = updated.GID
+	current.AtimeNsec = updated.AtimeNsec
+	current.BtimeNsec = updated.BtimeNsec
+	current.CtimeNsec = updated.CtimeNsec
+	current.MtimeNsec = updated.MtimeNsec
+	current.Xattrs = updated.Xattrs
+	if current.Type == "symlink" {
+		current.Target = updated.Target
+	}
 }
 
 func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode *Inode) (bool, error) {
@@ -1800,6 +1847,56 @@ func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryE
 		return nil, err
 	}
 	return r.metadataDirectory(state, parent), nil
+}
+
+// ListDirectoryItems returns a directory's entries and inode metadata in
+// deterministic name order from one coherent metadata snapshot.
+func (r *Repository) ListDirectoryItems(branchID string, parent uint64) ([]DirectoryItem, error) {
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return nil, err
+	}
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return nil, err
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	directory := state.directories[parent]
+	items := make([]DirectoryItem, 0, len(directory))
+	for _, entry := range directory {
+		inode, ok := state.inodes[entry.Inode]
+		if !ok {
+			return nil, fmt.Errorf("directory entry %q references missing inode %d", entry.Name, entry.Inode)
+		}
+		items = append(items, DirectoryItem{Entry: entry, Inode: inode})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Entry.Name < items[j].Entry.Name })
+	return items, nil
+}
+
+// BranchUsage returns the number of persistent inodes and page-rounded bytes
+// occupied by regular files in a branch.
+func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return 0, 0, err
+	}
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return 0, 0, err
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	var bytes uint64
+	pageSize := uint64(os.Getpagesize())
+	for _, inode := range state.inodes {
+		if inode.Type == "regular" && inode.Size > 0 {
+			size := uint64(inode.Size)
+			bytes += (size + pageSize - 1) &^ (pageSize - 1)
+		}
+	}
+	return uint64(len(state.inodes)), bytes, nil
 }
 
 func (r *Repository) createObject(source string) (string, error) {

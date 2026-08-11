@@ -99,3 +99,50 @@ func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
 		t.Fatalf("clean flush rewrote repository root: before=%q after=%q", branchFlushed.Root, branchAgain.Root)
 	}
 }
+
+func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	newDir := func() *directory {
+		dir := &directory{}
+		dir.inode.fs = fs
+		dir.inode.impl = dir
+		dir.inode.refs.InitRefs()
+		dir.dentry.inode = &dir.inode
+		return dir
+	}
+	newFile := func() *dentry {
+		link := &symlink{}
+		link.inode.fs = fs
+		link.inode.impl = link
+		link.inode.refs.InitRefs()
+		return &dentry{inode: &link.inode}
+	}
+
+	root := newDir()
+	fs.root = &root.dentry
+	inactive := newFile()
+	active := newFile()
+	active.inode.incRef() // An open FD, cwd, mount, or equivalent VFS owner.
+	subdir := newDir()
+	subdir.inode.incRef() // Keep the directory itself live.
+	root.childMap = map[string]*dentry{
+		"inactive": inactive,
+		"active":   active,
+		"subdir":   &subdir.dentry,
+	}
+	for _, child := range root.childMap {
+		root.childList.PushBack(child)
+	}
+
+	fs.pruneDiskNamespaceForSave()
+	if _, ok := root.childMap["inactive"]; ok {
+		t.Fatal("closed persistent path remained in serialized namespace")
+	}
+	if root.childMap["active"] != active || root.childMap["subdir"] != &subdir.dentry {
+		t.Fatalf("runtime-referenced paths were pruned: %+v", root.childMap)
+	}
+	fs.restoreDiskNamespaceAfterSave()
+	if len(root.childMap) != 3 || root.childMap["inactive"] != inactive {
+		t.Fatalf("source namespace was not restored: %+v", root.childMap)
+	}
+}

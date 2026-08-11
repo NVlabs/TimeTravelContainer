@@ -47,6 +47,34 @@ type directory struct {
 	childList dentryList
 }
 
+func diskDentryNeedsSave(d *dentry) bool {
+	if d.inode.watches.Size() != 0 {
+		return true
+	}
+	switch impl := d.inode.impl.(type) {
+	case *directory:
+		// Each instantiated child directory holds one lifetime reference on
+		// this directory. Discount those references when deciding whether an
+		// external object (cwd, open FD, mount, etc.) retains this dentry.
+		baseline := int64(1)
+		for _, child := range impl.childMap {
+			if child.inode.isDir() {
+				baseline++
+			}
+			if diskDentryNeedsSave(child) {
+				return true
+			}
+		}
+		return d.inode.refs.ReadRefs() > baseline
+	case *socketFile:
+		// A bound pathname socket's endpoint is runtime state even when no FD
+		// currently refers to the dentry.
+		return impl.ep != nil || d.inode.refs.ReadRefs() > 1
+	default:
+		return d.inode.refs.ReadRefs() > 1
+	}
+}
+
 // newDirectory creates a new directory.
 //
 // If parentDir is not nil, certain fields (such as setgid and default ACL) will be inherited
@@ -156,6 +184,30 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 		fd.off++
 	}
 
+	if fs.diskVolume != nil {
+		items, err := fs.diskVolume.Repository.ListDirectoryItems(fs.diskVolume.Branch, dir.inode.ino)
+		if err != nil {
+			return err
+		}
+		start := fd.off - 2
+		if start < 0 {
+			start = 0
+		}
+		for idx := start; idx < int64(len(items)); idx++ {
+			item := items[idx]
+			if err := cb.Handle(vfs.Dirent{
+				Name:    item.Entry.Name,
+				Type:    diskDirentType(item.Inode.Type),
+				Ino:     item.Entry.Inode,
+				NextOff: fd.off + 1,
+			}); err != nil {
+				return err
+			}
+			fd.off++
+		}
+		return nil
+	}
+
 	var child *dentry
 	if fd.iter == nil {
 		// Start iteration at the beginning of dir.
@@ -186,6 +238,27 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	return nil
 }
 
+func diskDirentType(kind string) uint8 {
+	switch kind {
+	case "regular":
+		return linux.DT_REG
+	case "directory":
+		return linux.DT_DIR
+	case "symlink":
+		return linux.DT_LNK
+	case "fifo":
+		return linux.DT_FIFO
+	case "char":
+		return linux.DT_CHR
+	case "block":
+		return linux.DT_BLK
+	case "socket":
+		return linux.DT_SOCK
+	default:
+		return linux.DT_UNKNOWN
+	}
+}
+
 // Seek implements vfs.FileDescriptionImpl.Seek.
 func (fd *directoryFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	dir := fd.inode().impl.(*directory)
@@ -208,6 +281,10 @@ func (fd *directoryFD) Seek(ctx context.Context, offset int64, whence int32) (in
 	// seek even if doing so might reposition the iterator due to concurrent
 	// mutation of the directory. Compare fs/libfs.c:dcache_dir_lseek().
 	if fd.off == offset {
+		return offset, nil
+	}
+	if fd.filesystem().diskVolume != nil {
+		fd.off = offset
 		return offset, nil
 	}
 

@@ -1154,3 +1154,38 @@ func TestImportSnapshotRejectsSymlinkNamespaceMetadata(t *testing.T) {
 		t.Fatal("ImportPrivateSnapshot accepted a symlinked node")
 	}
 }
+
+func TestListDirectoryItemsAndBranchUsage(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("directory-items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateDirectory(MainBranch, RootInode, "z-dir", 0755, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "a-file", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Truncate(MainBranch, ino, 5000); err != nil {
+		t.Fatal(err)
+	}
+	items, err := repository.ListDirectoryItems(MainBranch, RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Entry.Name != "a-file" || items[0].Inode.Type != "regular" ||
+		items[1].Entry.Name != "z-dir" || items[1].Inode.Type != "directory" {
+		t.Fatalf("directory items=%+v", items)
+	}
+	inodes, bytes, err := repository.BranchUsage(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := uint64(2 * os.Getpagesize())
+	if inodes != 3 || bytes != wantBytes {
+		t.Fatalf("BranchUsage=(%d, %d), want (3, %d)", inodes, bytes, wantBytes)
+	}
+}

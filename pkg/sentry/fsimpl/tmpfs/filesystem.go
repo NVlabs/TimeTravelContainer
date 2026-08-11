@@ -38,6 +38,25 @@ const (
 	shortSymlinkLen = 128
 )
 
+// Persistent namespace lookup may populate the runtime dentry cache. Keep the
+// ordinary tmpfs read-lock fast path, but take the write lock for disk-backed
+// volumes.
+func (fs *filesystem) lockForLookup() {
+	if fs.diskVolume != nil {
+		fs.mu.Lock()
+		return
+	}
+	fs.mu.RLock()
+}
+
+func (fs *filesystem) unlockForLookup() {
+	if fs.diskVolume != nil {
+		fs.mu.Unlock()
+		return
+	}
+	fs.mu.RUnlock()
+}
+
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	if fs.diskVolume != nil {
@@ -86,9 +105,9 @@ func stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*dentry,
 	if len(name) > d.inode.fs.maxFilenameLen {
 		return nil, false, linuxerr.ENAMETOOLONG
 	}
-	child, ok := dir.childMap[name]
-	if !ok {
-		return nil, false, linuxerr.ENOENT
+	child, err := d.inode.fs.diskChildLocked(dir, name)
+	if err != nil {
+		return nil, false, err
 	}
 	if err := rp.CheckMount(ctx, &child.vfsd); err != nil {
 		return nil, false, err
@@ -192,8 +211,10 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if len(name) > fs.maxFilenameLen {
 		return linuxerr.ENAMETOOLONG
 	}
-	if _, ok := parentDir.childMap[name]; ok {
+	if _, err := fs.diskChildLocked(parentDir, name); err == nil {
 		return linuxerr.EEXIST
+	} else if !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return err
 	}
 	if !dir && rp.MustBeDir() {
 		return linuxerr.ENOENT
@@ -227,8 +248,8 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 
 // AccessAt implements vfs.Filesystem.Impl.AccessAt.
 func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds *auth.Credentials, ats vfs.AccessTypes) error {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return err
@@ -244,8 +265,8 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
 func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetDentryOptions) (*vfs.Dentry, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, err
@@ -264,8 +285,8 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 
 // GetParentDentryAt implements vfs.FilesystemImpl.GetParentDentryAt.
 func (fs *filesystem) GetParentDentryAt(ctx context.Context, rp *vfs.ResolvingPath) (*vfs.Dentry, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	dir, err := walkParentDirLocked(ctx, rp, rp.Start().Impl().(*dentry))
 	if err != nil {
 		return nil, err
@@ -412,15 +433,15 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	// Handle O_CREAT and !O_CREAT separately, since in the latter case we
 	// don't need fs.mu for writing.
 	if opts.Flags&linux.O_CREAT == 0 {
-		fs.mu.RLock()
+		fs.lockForLookup()
 		d, err := resolveLocked(ctx, rp)
 		if err != nil {
-			fs.mu.RUnlock()
+			fs.unlockForLookup()
 			return nil, err
 		}
 		d.IncRef()
 		defer d.DecRef(ctx)
-		fs.mu.RUnlock()
+		fs.unlockForLookup()
 		return d.open(ctx, rp, &opts, false /* afterCreate */)
 	}
 
@@ -604,8 +625,8 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 
 // ReadlinkAt implements vfs.FilesystemImpl.ReadlinkAt.
 func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (string, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return "", err
@@ -664,9 +685,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	renamed, ok := oldParentDir.childMap[oldName]
-	if !ok {
-		return linuxerr.ENOENT
+	renamed, err := fs.diskChildLocked(oldParentDir, oldName)
+	if err != nil {
+		return err
 	}
 	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
 		return err
@@ -693,8 +714,8 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
-	replaced, ok := newParentDir.childMap[newName]
-	if ok {
+	replaced, lookupErr := fs.diskChildLocked(newParentDir, newName)
+	if lookupErr == nil {
 		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
 			return linuxerr.EEXIST
 		}
@@ -706,7 +727,11 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if !renamed.inode.isDir() {
 				return linuxerr.EISDIR
 			}
-			if len(replacedDir.childMap) != 0 {
+			empty, err := fs.diskDirectoryEmptyLocked(replacedDir)
+			if err != nil {
+				return err
+			}
+			if !empty {
 				return linuxerr.ENOTEMPTY
 			}
 		} else {
@@ -717,10 +742,12 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				return linuxerr.ENOTDIR
 			}
 		}
-	} else {
+	} else if linuxerr.Equals(linuxerr.ENOENT, lookupErr) {
 		if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
 		}
+	} else {
+		return lookupErr
 	}
 	// tmpfs never calls VFS.InvalidateDentry(), so newParentDir.dentry can
 	// only be dead if it was deleted.
@@ -810,9 +837,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if name == ".." {
 		return linuxerr.ENOTEMPTY
 	}
-	child, ok := parentDir.childMap[name]
-	if !ok {
-		return linuxerr.ENOENT
+	child, err := fs.diskChildLocked(parentDir, name)
+	if err != nil {
+		return err
 	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
@@ -821,7 +848,11 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if !ok {
 		return linuxerr.ENOTDIR
 	}
-	if len(childDir.childMap) != 0 {
+	empty, err := fs.diskDirectoryEmptyLocked(childDir)
+	if err != nil {
+		return err
+	}
+	if !empty {
 		return linuxerr.ENOTEMPTY
 	}
 	mnt := rp.Mount()
@@ -856,14 +887,14 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 
 // SetStatAt implements vfs.FilesystemImpl.SetStatAt.
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
-	fs.mu.RLock()
+	fs.lockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
-		fs.mu.RUnlock()
+		fs.unlockForLookup()
 		return err
 	}
 	err = d.inode.setStat(ctx, rp.Credentials(), &opts)
-	fs.mu.RUnlock()
+	fs.unlockForLookup()
 	if err != nil {
 		return err
 	}
@@ -880,8 +911,8 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	if rp.Done() {
 		d = rp.Start().Impl().(*dentry)
 	} else {
-		fs.mu.RLock()
-		defer fs.mu.RUnlock()
+		fs.lockForLookup()
+		defer fs.unlockForLookup()
 		var err error
 		d, err = resolveLocked(ctx, rp)
 		if err != nil {
@@ -895,8 +926,8 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 
 // StatFSAt implements vfs.FilesystemImpl.StatFSAt.
 func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	if _, err := resolveLocked(ctx, rp); err != nil {
 		return linux.Statfs{}, err
 	}
@@ -962,9 +993,9 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if name == "." || name == ".." {
 		return linuxerr.EISDIR
 	}
-	child, ok := parentDir.childMap[name]
-	if !ok {
-		return linuxerr.ENOENT
+	child, err := fs.diskChildLocked(parentDir, name)
+	if err != nil {
+		return err
 	}
 	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
 		return err
@@ -1004,8 +1035,8 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 
 // BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, err
@@ -1026,8 +1057,8 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 
 // ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
 func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, err
@@ -1037,8 +1068,8 @@ func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 
 // GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
 func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return "", err
@@ -1048,14 +1079,14 @@ func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 
 // SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
 func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
-	fs.mu.RLock()
+	fs.lockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
-		fs.mu.RUnlock()
+		fs.unlockForLookup()
 		return err
 	}
 	err = d.inode.setXattr(rp.Credentials(), &opts)
-	fs.mu.RUnlock()
+	fs.unlockForLookup()
 	if err != nil {
 		return err
 	}
@@ -1066,14 +1097,14 @@ func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 
 // RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
 func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
-	fs.mu.RLock()
+	fs.lockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
-		fs.mu.RUnlock()
+		fs.unlockForLookup()
 		return err
 	}
 	err = d.inode.removeXattr(rp.Credentials(), name)
-	fs.mu.RUnlock()
+	fs.unlockForLookup()
 	if err != nil {
 		return err
 	}
@@ -1084,8 +1115,8 @@ func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 
 // GetPosixACLAt implements vfs.FilesystemImpl.GetPosixACLAt.
 func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType) (*vfs.PosixACL, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, err
@@ -1103,8 +1134,8 @@ func (fs *filesystem) GetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, 
 
 // SetPosixACLAt implements vfs.FilesystemImpl.SetPosixACLAt.
 func (fs *filesystem) SetPosixACLAt(ctx context.Context, rp *vfs.ResolvingPath, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, 0, err

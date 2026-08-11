@@ -135,6 +135,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	}
 	resourceID := fs.mf.ResourceID()
 	if !resourceID.Ok() {
+		fs.pruneDiskNamespaceForSave()
 		return nil
 	}
 	mfmap := pgalloc.MemoryFileMapFromContext(ctx)
@@ -145,11 +146,14 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		return fmt.Errorf("memory file for %q already exists in CtxMemoryFileMap", resourceID)
 	}
 	mfmap[resourceID] = fs.mf
+	fs.pruneDiskNamespaceForSave()
 	return nil
 }
 
 // BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
-func (fs *filesystem) BeforeResume(ctx context.Context) {}
+func (fs *filesystem) BeforeResume(ctx context.Context) {
+	fs.restoreDiskNamespaceAfterSave()
+}
 
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
@@ -170,6 +174,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			}
 			fs.diskVolume.Repository = repository
 			fs.diskVolume.Branch = childBranch
+			fs.rebuildDiskInodeCache()
 			return nil
 		}
 	}
@@ -189,5 +194,6 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.diskVolume.Branch = resource.Branch
 	info := repository.Info()
 	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}
+	fs.rebuildDiskInodeCache()
 	return nil
 }

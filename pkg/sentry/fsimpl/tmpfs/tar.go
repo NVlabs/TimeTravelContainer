@@ -369,8 +369,8 @@ func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
 func (fs *filesystem) tarWrite(ctx context.Context, dst io.Writer, cb tarWriterCallbacks) error {
 	tw := tar.NewWriter(dst)
 
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.lockForLookup()
+	defer fs.unlockForLookup()
 
 	err := fs.root.writeToTar(ctx, tw, ".", make(map[uint64]string), cb)
 	if err != nil {
@@ -409,6 +409,22 @@ func (d *dentry) writeToTar(ctx context.Context, tw *tar.Writer, baseDir string,
 
 	switch impl := d.inode.impl.(type) {
 	case *directory:
+		if d.inode.fs.diskVolume != nil {
+			entries, err := d.inode.fs.diskVolume.Repository.ListDirectory(d.inode.fs.diskVolume.Branch, impl.inode.ino)
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				child, err := d.inode.fs.diskChildLocked(impl, entry.Name)
+				if err != nil {
+					return err
+				}
+				if err := child.writeToTar(ctx, tw, path, inoToPath, cb); err != nil {
+					return err
+				}
+			}
+			break
+		}
 		for _, child := range impl.childMap {
 			if err := child.writeToTar(ctx, tw, path, inoToPath, cb); err != nil {
 				return err
