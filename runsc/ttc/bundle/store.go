@@ -61,6 +61,55 @@ type Store struct {
 	Root string
 }
 
+// PrepareDehydrationRestoreBundle creates a short-lived OCI bundle that tells
+// runsc to reserve the persistent application MemoryFile for cold restore and
+// opens every TTC-managed repository at filesystemBranch. The canonical
+// container bundle is never modified.
+func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (string, func(), error) {
+	if filesystemBranch == "" {
+		return "", nil, errors.New("dehydration restore filesystem branch is empty")
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return "", nil, err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return "", nil, err
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return "", nil, err
+	}
+	for i := range repositories {
+		repositories[i].Branch = filesystemBranch
+	}
+	if len(repositories) != 0 {
+		encoded, err := json.Marshal(repositories)
+		if err != nil {
+			return "", nil, err
+		}
+		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+	}
+	spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
+	if spec.Root != nil && !filepath.IsAbs(spec.Root.Path) {
+		spec.Root.Path = filepath.Join(info.BundleDir, spec.Root.Path)
+	}
+	temp, err := os.MkdirTemp(filepath.Dir(info.BundleDir), ".dehydration-restore-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(temp) }
+	if err := writeJSON(filepath.Join(temp, "config.json"), spec); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return temp, cleanup, nil
+}
+
 // PrepareOptions describes an image-backed OCI bundle.
 type PrepareOptions struct {
 	SpecOptions
@@ -135,7 +184,8 @@ type DistributedForkOptions struct {
 
 // BranchInfo is immutable branch lineage plus its last known lifecycle state.
 type BranchInfo struct {
-	ID               string     `json:"id"`
+	ID string `json:"id"`
+	// ParentID is immutable display provenance, not an ownership edge.
 	ParentID         string     `json:"parent_id,omitempty"`
 	State            string     `json:"state"`
 	ForkTotalNS      int64      `json:"fork_total_ns,omitempty"`

@@ -2577,6 +2577,31 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestDehydrationNetworkArgs(t *testing.T) {
+	none, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{NetworkMode: "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !none.IsRestore || len(none.LoopbackLinks) != 1 || none.TimeTravel != nil {
+		t.Fatalf("none network args=%+v", none)
+	}
+	ttc, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{
+		NetworkMode: "ttc", NetworkNAT: true, NetworkIP: "192.0.2.44", NetworkMAC: "02:aa:bb:cc:dd:ee",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttc.TimeTravel == nil || !ttc.TimeTravel.NAT || ttc.TimeTravel.GuestIP.String() != "192.0.2.44" {
+		t.Fatalf("ttc network args=%+v", ttc)
+	}
+	if got := ttc.TimeTravel.GuestMAC.String(); got != "02:aa:bb:cc:dd:ee" {
+		t.Fatalf("restored MAC=%q", got)
+	}
+	if _, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{NetworkMode: "host"}); err == nil {
+		t.Fatal("host network unexpectedly accepted for process-free restore")
+	}
+}
+
 func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

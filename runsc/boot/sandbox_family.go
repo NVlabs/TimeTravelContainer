@@ -29,6 +29,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -61,7 +62,10 @@ const (
 
 // BranchInfo is the branch metadata exposed over the control socket.
 type BranchInfo struct {
-	ID           string
+	ID string
+	// ParentID records which branch was forked to create this branch. It is
+	// provenance for the CLI tree only; it imposes no ownership or lifecycle
+	// relationship.
 	ParentID     string
 	State        BranchState
 	CreatedAt    time.Time
@@ -197,6 +201,29 @@ type BranchArgs struct {
 type BranchDehydrateArgs struct {
 	urpc.FilePayload
 	ID string
+}
+
+// BranchDehydrationMemoryInfo describes one packed memory stream that ttcd
+// must persist before a fully dehydrated family can release its Sentry.
+type BranchDehydrationMemoryInfo struct {
+	ResourceID  checkpoint.ResourceID `json:"resource_id"`
+	StreamBytes uint64                `json:"stream_bytes"`
+}
+
+// BranchDehydrateInfo is returned after durable Kernel metadata is published.
+type BranchDehydrateInfo struct {
+	Memories         []BranchDehydrationMemoryInfo `json:"memories"`
+	Resume           bool                          `json:"resume"`
+	ExecSessions     []ExecSessionInfo             `json:"exec_sessions,omitempty"`
+	FilesystemBranch string                        `json:"filesystem_branch"`
+}
+
+// BranchDehydrationExportArgs donates packed snapshot destinations in the
+// exact order reported by BranchDehydrateInfo.
+type BranchDehydrationExportArgs struct {
+	urpc.FilePayload
+	ID        string
+	AllowCopy bool
 }
 
 // BranchProcessesArgs selects a container inside one live branch.
@@ -368,7 +395,8 @@ type sandboxBranch struct {
 	// these operations before releasing the Kernel.
 	controlOps sync.WaitGroup
 
-	id       string
+	id string
+	// parentID is display-only fork provenance, never an ownership edge.
 	parentID string
 	// filesystemBranch is the persistent ttcvol branch backing this Kernel.
 	// It normally follows volumeBranchID(id), but a distributed target exposes
@@ -393,10 +421,10 @@ type branchDehydration struct {
 	execSessions []ExecSessionInfo
 }
 
-// SandboxFamily owns all in-memory branches in one sentry process.
-//
-// The default branch is Loader.k. Child branches share immutable and COW
-// backing with their ancestors, but each branch owns its Kernel lifecycle.
+// SandboxFamily owns all in-memory branches in one Sentry process. Branches
+// are lifecycle peers. loaderBranchID only identifies the Kernel reachable
+// through Loader.k; parentID is immutable display provenance and confers no
+// ownership, ordering, or storage relationship.
 type SandboxFamily struct {
 	mu sync.Mutex
 	// dehydrationMu serializes capture ownership changes across sibling
@@ -405,6 +433,7 @@ type SandboxFamily struct {
 	stateChanged  *sync.Cond
 
 	branches         map[string]*sandboxBranch
+	loaderBranchID   string
 	controlsQuiesced bool
 	// defaultStarted is closed after Loader.Run has installed and started the
 	// default branch's init thread group. It allows wait RPCs to be established
@@ -422,7 +451,7 @@ type SandboxFamily struct {
 	volumeBranchScope              string
 	distributedSessions            map[string]*distributedForkSession
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
-	onDefaultKernelChanged         func(*kernel.Kernel)
+	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 }
 
 type distributedForkSession struct {
@@ -438,11 +467,15 @@ type SandboxFamilyOptions struct {
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
 	WatchdogOpts                   *watchdog.Opts
+	// LoaderWatchdog is the watchdog already owned by Loader for k. Recording
+	// it on the branch lets dehydration stop and replace the same watchdog
+	// without giving that branch any lineage significance.
+	LoaderWatchdog *watchdog.Watchdog
 	// VolumeBranchScope distinguishes repository branch names created by this
 	// sandbox from identically named live branches in other sandboxes.
-	VolumeBranchScope      string
-	ConfigureNetwork       func(*kernel.Kernel, inet.Stack) error
-	OnDefaultKernelChanged func(*kernel.Kernel)
+	VolumeBranchScope     string
+	ConfigureNetwork      func(*kernel.Kernel, inet.Stack) error
+	OnLoaderKernelChanged func(*kernel.Kernel, *watchdog.Watchdog)
 	// TestOnlyForkFailureInjector verifies family-level transaction cleanup.
 	// Production callers should leave it nil.
 	TestOnlyForkFailureInjector func(SandboxForkStage) error
@@ -485,7 +518,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		testOnlyExecFailureInjector:    opts.TestOnlyExecFailureInjector,
 		volumeBranchScope:              opts.VolumeBranchScope,
 		configureNetwork:               opts.ConfigureNetwork,
-		onDefaultKernelChanged:         opts.OnDefaultKernelChanged,
+		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		branches: map[string]*sandboxBranch{
@@ -493,14 +526,25 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 				id:               DefaultBranchID,
 				filesystemBranch: ttcvolume.MainBranch,
 				k:                k,
+				watchdog:         opts.LoaderWatchdog,
 				state:            kernelBranchState(k),
 				createdAt:        createdAt,
 				execSessions:     make(map[string]*execSession),
 			},
 		},
+		loaderBranchID: DefaultBranchID,
 	}
 	f.stateChanged = sync.NewCond(&f.mu)
 	return f
+}
+
+// LoaderBranchID returns the visible branch currently referenced by Loader.k.
+// This is a runtime bookkeeping role, not a lineage root: all branches remain
+// peers and the recorded ParentID is display-only creation history.
+func (f *SandboxFamily) LoaderBranchID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loaderBranchID
 }
 
 // CaptureDistributedFork atomically captures a paused instant and publishes
@@ -589,7 +633,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	}
 	f.mu.Unlock()
 	if sourceID == "" {
-		sourceID = DefaultBranchID
+		sourceID = f.LoaderBranchID()
 	}
 	source, err := f.branch(sourceID)
 	if err != nil {
@@ -933,17 +977,18 @@ func kernelBranchState(k *kernel.Kernel) BranchState {
 	return BranchRunning
 }
 
-// ReplaceDefaultKernel replaces the default branch during checkpoint restore.
-// No child branches may exist because checkpoint restore cannot preserve them.
+// ReplaceDefaultKernel replaces the loader-referenced branch during checkpoint
+// restore. No peer branches may exist because checkpoint restore cannot
+// preserve a multi-branch family.
 func (f *SandboxFamily) ReplaceDefaultKernel(k *kernel.Kernel) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.branches) != 1 {
-		return fmt.Errorf("cannot replace default kernel with %d live child branches", len(f.branches)-1)
+		return fmt.Errorf("cannot replace loader kernel while %d peer branches exist", len(f.branches)-1)
 	}
-	b, ok := f.branches[DefaultBranchID]
+	b, ok := f.branches[f.loaderBranchID]
 	if !ok || b == nil {
-		return errors.New("default branch is unavailable during kernel replacement")
+		return errors.New("loader branch is unavailable during kernel replacement")
 	}
 	b.k = k
 	// The replacement Kernel has not been loaded yet. In particular, its
@@ -951,6 +996,43 @@ func (f *SandboxFamily) ReplaceDefaultKernel(k *kernel.Kernel) error {
 	// Loader.Run replaces this transitional value with the restored Kernel's
 	// actual state after Kernel.Start.
 	b.state = BranchPaused
+	return nil
+}
+
+// ReplaceLoaderBranchFromDehydration replaces the unstarted placeholder with
+// any durable branch image. The selected branch keeps its identity; becoming
+// Loader.k does not alter its lineage or give it authority over peer branches.
+func (f *SandboxFamily) ReplaceLoaderBranchFromDehydration(id, parentID, filesystemBranch string, k *kernel.Kernel, dog *watchdog.Watchdog, sessions []ExecSessionInfo) error {
+	if id == "" || filesystemBranch == "" || k == nil {
+		return errors.New("cold loader replacement is missing branch, filesystem, or Kernel state")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.branches) != 1 {
+		return fmt.Errorf("cannot replace cold loader while %d peer branches exist", len(f.branches)-1)
+	}
+	placeholder := f.branches[f.loaderBranchID]
+	if placeholder == nil {
+		return errors.New("loader placeholder is unavailable during cold replacement")
+	}
+	execSessions, err := restoredExecSessions(k, sessions)
+	if err != nil {
+		return err
+	}
+	createdAt := placeholder.createdAt
+	f.branches = map[string]*sandboxBranch{
+		id: {
+			id:               id,
+			parentID:         parentID,
+			filesystemBranch: filesystemBranch,
+			k:                k,
+			watchdog:         dog,
+			state:            BranchPaused,
+			createdAt:        createdAt,
+			execSessions:     execSessions,
+		},
+	}
+	f.loaderBranchID = id
 	return nil
 }
 
@@ -964,7 +1046,7 @@ func (f *SandboxFamily) SetDefaultFilesystemBranch(branch string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	b, ok := f.branches[DefaultBranchID]
+	b, ok := f.branches[f.loaderBranchID]
 	if !ok || b == nil {
 		return errors.New("default branch is unavailable")
 	}
@@ -972,8 +1054,9 @@ func (f *SandboxFamily) SetDefaultFilesystemBranch(branch string) error {
 	return nil
 }
 
-// HasChildren reports whether a checkpoint-incompatible child branch exists.
-func (f *SandboxFamily) HasChildren() bool {
+// HasMultipleBranches reports whether this family cannot use gVisor's
+// single-Kernel checkpoint format.
+func (f *SandboxFamily) HasMultipleBranches() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.branches) != 1
@@ -1011,53 +1094,59 @@ func (f *SandboxFamily) Checkpoint(id string, defaultWatchdog *watchdog.Watchdog
 	return save(b.k, dog, sessions)
 }
 
-// RestoreDefaultExecSessions reinstates TTC control-plane identities after a
+// RestoreLoaderExecSessions reinstates TTC control-plane identities after a
 // standalone checkpoint is loaded as a new family. The task graph and internal
 // consoles themselves were restored as Kernel state. Watchers are started
 // separately after Kernel.Start initializes ThreadGroup.liveGoroutines.
-func (f *SandboxFamily) RestoreDefaultExecSessions(sessions []ExecSessionInfo) error {
+func (f *SandboxFamily) RestoreLoaderExecSessions(sessions []ExecSessionInfo) error {
 	f.mu.Lock()
-	b := f.branches[DefaultBranchID]
+	defer f.mu.Unlock()
+	b := f.branches[f.loaderBranchID]
 	if b == nil || b.k == nil {
-		f.mu.Unlock()
-		return errors.New("default branch is unavailable during exec-session restore")
+		return errors.New("loader branch is unavailable during exec-session restore")
 	}
 	if len(b.execSessions) != 0 {
-		f.mu.Unlock()
-		return errors.New("default branch already has exec sessions during restore")
+		return errors.New("loader branch already has exec sessions during restore")
 	}
+	restored, err := restoredExecSessions(b.k, sessions)
+	if err != nil {
+		return err
+	}
+	b.execSessions = restored
+	return nil
+}
+
+func restoredExecSessions(k *kernel.Kernel, sessions []ExecSessionInfo) (map[string]*execSession, error) {
+	restored := make(map[string]*execSession)
 	for _, info := range sessions {
 		if info.State != ExecSessionRunning {
 			continue
 		}
 		if info.ID == "" || info.PID <= 0 {
-			f.mu.Unlock()
-			return fmt.Errorf("invalid restored exec session %+v", info)
+			return nil, fmt.Errorf("invalid restored exec session %+v", info)
 		}
-		if _, ok := b.execSessions[info.ID]; ok {
-			f.mu.Unlock()
-			return fmt.Errorf("duplicate restored exec session %q", info.ID)
+		if _, ok := restored[info.ID]; ok {
+			return nil, fmt.Errorf("duplicate restored exec session %q", info.ID)
 		}
-		tg := b.k.RootPIDNamespace().ThreadGroupWithID(info.PID)
+		tg := k.RootPIDNamespace().ThreadGroupWithID(info.PID)
 		if tg == nil || tg.Leader().Origin != kernel.OriginExec {
-			f.mu.Unlock()
-			return fmt.Errorf("restored exec session %q has no exec thread group with PID %d", info.ID, info.PID)
+			return nil, fmt.Errorf("restored exec session %q has no exec thread group with PID %d", info.ID, info.PID)
 		}
 		session := &execSession{info: cloneExecSessionInfo(info), tg: tg}
-		b.execSessions[info.ID] = session
+		restored[info.ID] = session
 	}
-	f.mu.Unlock()
-	return nil
+	return restored, nil
 }
 
-// WatchRestoredDefaultExecSessions starts exit tracking after the restored
+// WatchRestoredLoaderExecSessions starts exit tracking after the restored
 // Kernel has started all task goroutines.
-func (f *SandboxFamily) WatchRestoredDefaultExecSessions() error {
+func (f *SandboxFamily) WatchRestoredLoaderExecSessions() error {
 	f.mu.Lock()
-	b := f.branches[DefaultBranchID]
+	loaderID := f.loaderBranchID
+	b := f.branches[loaderID]
 	if b == nil || b.k == nil {
 		f.mu.Unlock()
-		return errors.New("default branch is unavailable while starting restored exec-session watchers")
+		return errors.New("loader branch is unavailable while starting restored exec-session watchers")
 	}
 	restored := make([]struct {
 		id      string
@@ -1073,7 +1162,7 @@ func (f *SandboxFamily) WatchRestoredDefaultExecSessions() error {
 	}
 	f.mu.Unlock()
 	for _, item := range restored {
-		f.watchExecSession(DefaultBranchID, item.id, item.session)
+		f.watchExecSession(loaderID, item.id, item.session)
 	}
 	return nil
 }
@@ -1098,7 +1187,7 @@ func (f *SandboxFamily) QuiesceControls() {
 // MarkDefaultStarted records the default kernel state after Loader.Run.
 func (f *SandboxFamily) MarkDefaultStarted() {
 	f.mu.Lock()
-	b := f.branches[DefaultBranchID]
+	b := f.branches[f.loaderBranchID]
 	b.state = kernelBranchState(b.k)
 	f.mu.Unlock()
 	f.defaultStartedOnce.Do(func() { close(f.defaultStarted) })
@@ -1252,7 +1341,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	}
 	sourceID := args.Source
 	if sourceID == "" {
-		sourceID = DefaultBranchID
+		sourceID = f.LoaderBranchID()
 	}
 
 	f.mu.Lock()
@@ -1648,12 +1737,64 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	b.state = BranchDehydrated
 	f.stateChanged.Broadcast()
 	f.mu.Unlock()
-	if id == DefaultBranchID && f.onDefaultKernelChanged != nil {
-		f.onDefaultKernelChanged(nil)
+	if id == f.LoaderBranchID() && f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(nil, nil)
 	}
 	b.opMu.Unlock()
 	dehydrated = true
 	return nil
+}
+
+// DehydrationInfo reports the durable memory streams for an already
+// dehydrated branch.
+func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b.state != BranchDehydrated || b.dehydration == nil || b.dehydration.image == nil {
+		return nil, fmt.Errorf("branch %q is not available for dehydration export", id)
+	}
+	info := &BranchDehydrateInfo{
+		Memories:         make([]BranchDehydrationMemoryInfo, len(b.dehydration.image.MemoryImages)),
+		Resume:           b.dehydration.resume,
+		ExecSessions:     make([]ExecSessionInfo, len(b.dehydration.execSessions)),
+		FilesystemBranch: b.filesystemBranch,
+	}
+	copy(info.ExecSessions, b.dehydration.execSessions)
+	if info.FilesystemBranch == "" {
+		info.FilesystemBranch = f.volumeBranchID(b.id)
+	}
+	for i, memory := range b.dehydration.image.MemoryImages {
+		info.Memories[i] = BranchDehydrationMemoryInfo{ResourceID: memory.ResourceID, StreamBytes: memory.StreamBytes}
+	}
+	return info, nil
+}
+
+// ExportDehydration writes all packed memory streams for an already
+// dehydrated branch.
+func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) error {
+	if args == nil || args.ID == "" {
+		return errors.New("dehydration export requires a branch ID")
+	}
+	b, err := f.branch(args.ID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchDehydrated || b.dehydration == nil || b.dehydration.image == nil {
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is not available for dehydration export", args.ID)
+	}
+	image := b.dehydration.image
+	f.mu.Unlock()
+	return image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its
@@ -1724,8 +1865,8 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 	b.state = BranchPaused
 	f.stateChanged.Broadcast()
 	f.mu.Unlock()
-	if id == DefaultBranchID && f.onDefaultKernelChanged != nil {
-		f.onDefaultKernelChanged(child)
+	if id == f.LoaderBranchID() && f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(child, dog)
 	}
 	for sessionID, session := range newSessions {
 		f.watchExecSession(id, sessionID, session)
@@ -1750,10 +1891,10 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 	for {
 		f.mu.Lock()
-		b := f.branches[DefaultBranchID]
+		b := f.branches[f.loaderBranchID]
 		for b != nil && b.k == nil && (b.state == BranchDehydrating || b.state == BranchDehydrated || b.state == BranchRehydrating) {
 			f.stateChanged.Wait()
-			b = f.branches[DefaultBranchID]
+			b = f.branches[f.loaderBranchID]
 		}
 		if b == nil || b.k == nil {
 			f.mu.Unlock()
@@ -1775,8 +1916,8 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 
 // Destroy destroys a non-default branch and removes it from the family.
 func (f *SandboxFamily) Destroy(id string) error {
-	if id == DefaultBranchID {
-		return fmt.Errorf("the default branch is owned by the loader")
+	if id == f.LoaderBranchID() {
+		return fmt.Errorf("branch %q is currently owned by the OCI loader", id)
 	}
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
@@ -1924,7 +2065,7 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 		return 0, err
 	}
 	defer done()
-	if id == "" || id == DefaultBranchID {
+	if id == "" || id == f.LoaderBranchID() {
 		<-f.defaultStarted
 	}
 	tg, err := branchThreadGroup(b.k, cid, kernel.ThreadID(pid))
@@ -2055,7 +2196,7 @@ func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWr
 	}
 	var tg *kernel.ThreadGroup
 	if execID == "" {
-		if id == "" || id == DefaultBranchID {
+		if id == "" || id == f.LoaderBranchID() {
 			<-f.defaultStarted
 		}
 		tg, err = branchThreadGroup(b.k, cid, 0)
@@ -2506,34 +2647,24 @@ func branchThreadGroup(k *kernel.Kernel, cid string, tgid kernel.ThreadID) (*ker
 	return initTG, nil
 }
 
-// DestroyChildren destroys all non-default branches during loader teardown.
-func (f *SandboxFamily) DestroyChildren() {
+// DestroyNonLoaderBranches destroys every branch not directly referenced by
+// Loader.k.
+// ParentID deliberately does not affect ordering: lineage is display metadata,
+// and each branch owns every reference required for independent destruction.
+func (f *SandboxFamily) DestroyNonLoaderBranches() {
 	for {
 		f.mu.Lock()
 		var id string
-		remaining := len(f.branches) - 1
 		for candidateID := range f.branches {
-			if candidateID == DefaultBranchID {
+			if candidateID == f.loaderBranchID {
 				continue
 			}
-			hasChild := false
-			for _, possibleChild := range f.branches {
-				if possibleChild.parentID == candidateID {
-					hasChild = true
-					break
-				}
-			}
-			if !hasChild {
-				id = candidateID
-				break
-			}
+			id = candidateID
+			break
 		}
 		f.mu.Unlock()
 		if id == "" {
-			if remaining == 0 {
-				return
-			}
-			panic("cycle in live branch family")
+			return
 		}
 		if err := f.Destroy(id); err != nil {
 			// Creating branches are serialized with RPC teardown by the control
@@ -2543,9 +2674,26 @@ func (f *SandboxFamily) DestroyChildren() {
 	}
 }
 
+// CloseLoaderDehydration releases the final process-local capture during Sentry
+// teardown. ttcd has already persisted immutable packed snapshots before it
+// requests deletion of a fully dehydrated family.
+func (f *SandboxFamily) CloseLoaderDehydration() {
+	f.mu.Lock()
+	b := f.branches[f.loaderBranchID]
+	var image *kernel.DehydrationCapture
+	if b != nil && b.dehydration != nil {
+		image = b.dehydration.image
+		b.dehydration = nil
+	}
+	f.mu.Unlock()
+	if image != nil {
+		_ = image.Close()
+	}
+}
+
 func (f *SandboxFamily) branch(id string) (*sandboxBranch, error) {
 	if id == "" {
-		id = DefaultBranchID
+		id = f.LoaderBranchID()
 	}
 	f.mu.Lock()
 	b := f.branches[id]

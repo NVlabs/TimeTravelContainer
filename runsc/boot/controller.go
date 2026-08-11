@@ -139,6 +139,8 @@ const (
 
 	// ContMgrRestoreDistributedFork installs a remotely paged target Kernel.
 	ContMgrRestoreDistributedFork = "containerManager.RestoreDistributedFork"
+	// ContMgrRestoreDurableDehydration installs a process-free branch image.
+	ContMgrRestoreDurableDehydration = "containerManager.RestoreDurableDehydration"
 
 	// ContMgrListBranches lists all in-memory branches in the sandbox family.
 	ContMgrListBranches = "containerManager.ListBranches"
@@ -151,6 +153,8 @@ const (
 
 	// ContMgrDehydrateBranch hibernates one live branch.
 	ContMgrDehydrateBranch = "containerManager.DehydrateBranch"
+	// ContMgrExportDehydratedBranch persists a dehydrated branch's packed memory.
+	ContMgrExportDehydratedBranch = "containerManager.ExportDehydratedBranch"
 
 	// ContMgrRehydrateBranch reconstructs one dehydrated branch.
 	ContMgrRehydrateBranch = "containerManager.RehydrateBranch"
@@ -404,7 +408,7 @@ func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	cm.l.mu.Lock()
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != created && !(state == restoringUnstarted && cm.l.distributedRestore) {
+	if state != created && !(state == restoringUnstarted && (cm.l.distributedRestore || cm.l.dehydrationRestore)) {
 		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
 	}
 	// Tell the root container to start and wait for the result.
@@ -415,6 +419,17 @@ func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 // paused remote-memory target.
 func (cm *containerManager) RestoreDistributedFork(args *DistributedForkRestoreArgs, out *DistributedForkRestoreInfo) error {
 	info, err := cm.l.restoreDistributedFork(args)
+	if err != nil {
+		return err
+	}
+	*out = *info
+	return nil
+}
+
+// RestoreDurableDehydration replaces the unstarted placeholder Kernel with a
+// locally paged process-free branch image.
+func (cm *containerManager) RestoreDurableDehydration(args *DurableDehydrationRestoreArgs, out *DurableDehydrationRestoreInfo) error {
+	info, err := cm.l.restoreDurableDehydration(args)
 	if err != nil {
 		return err
 	}
@@ -1042,12 +1057,12 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
-	return cm.l.family.Pause(DefaultBranchID)
+	return cm.l.family.Pause(cm.l.family.LoaderBranchID())
 }
 
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
-	return cm.l.family.Resume(DefaultBranchID)
+	return cm.l.family.Resume(cm.l.family.LoaderBranchID())
 }
 
 // ForkBranch creates an in-memory child branch.
@@ -1167,7 +1182,7 @@ func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 }
 
 // DehydrateBranch hibernates one branch and releases its live Kernel graph.
-func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, _ *struct{}) error {
+func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, out *BranchDehydrateInfo) error {
 	if args == nil || len(args.FilePayload.Files) > 1 {
 		return errors.New("dehydration requires at most one metadata file")
 	}
@@ -1179,7 +1194,20 @@ func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, _ *struct
 		}
 		metadataFile = os.NewFile(uintptr(dup), "dehydration-metadata")
 	}
-	return cm.l.family.Dehydrate(args.ID, metadataFile)
+	if err := cm.l.family.Dehydrate(args.ID, metadataFile); err != nil {
+		return err
+	}
+	info, err := cm.l.family.DehydrationInfo(args.ID)
+	if err != nil {
+		return err
+	}
+	*out = *info
+	return nil
+}
+
+// ExportDehydratedBranch writes process-independent packed memory streams.
+func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExportArgs, _ *struct{}) error {
+	return cm.l.family.ExportDehydration(args)
 }
 
 // RehydrateBranch reconstructs one dehydrated branch.

@@ -2270,6 +2270,15 @@ func (s *Sandbox) RestoreDistributedFork(args *boot.DistributedForkRestoreArgs) 
 	return info, nil
 }
 
+// RestoreDurableDehydration installs a process-independent local branch image.
+func (s *Sandbox) RestoreDurableDehydration(args *boot.DurableDehydrationRestoreArgs) (boot.DurableDehydrationRestoreInfo, error) {
+	var info boot.DurableDehydrationRestoreInfo
+	if err := s.call(boot.ContMgrRestoreDurableDehydration, args, &info); err != nil {
+		return boot.DurableDehydrationRestoreInfo{}, fmt.Errorf("restoring durable dehydration branch %q: %w", args.ID, err)
+	}
+	return info, nil
+}
+
 // ListBranches lists all in-memory branches in the sandbox family.
 func (s *Sandbox) ListBranches() ([]boot.BranchInfo, error) {
 	var branches []boot.BranchInfo
@@ -2296,13 +2305,22 @@ func (s *Sandbox) ResumeBranch(id string) error {
 }
 
 // DehydrateBranch hibernates one branch.
-func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) error {
+func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.BranchDehydrateInfo, error) {
 	args := &boot.BranchDehydrateArgs{ID: id}
 	if metadataFile != nil {
 		args.FilePayload.Files = []*os.File{metadataFile}
 	}
-	if err := s.call(boot.ContMgrDehydrateBranch, args, nil); err != nil {
-		return fmt.Errorf("dehydrating branch %q: %w", id, err)
+	var info boot.BranchDehydrateInfo
+	if err := s.call(boot.ContMgrDehydrateBranch, args, &info); err != nil {
+		return nil, fmt.Errorf("dehydrating branch %q: %w", id, err)
+	}
+	return &info, nil
+}
+
+// ExportDehydratedBranch persists one packed file per memory image.
+func (s *Sandbox) ExportDehydratedBranch(args *boot.BranchDehydrationExportArgs) error {
+	if err := s.call(boot.ContMgrExportDehydratedBranch, args, nil); err != nil {
+		return fmt.Errorf("exporting dehydrated branch %q: %w", args.ID, err)
 	}
 	return nil
 }

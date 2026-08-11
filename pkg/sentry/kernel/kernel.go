@@ -180,6 +180,10 @@ type Kernel struct {
 	// fork. It is canceled during Release, after users of mf have dropped their
 	// references and before mf itself is destroyed.
 	remotePageLoad *pgalloc.AsyncPagesFileLoad `state:"nosave"`
+	// auxiliaryRemotePageLoads supply private MemoryFiles (for example tmpfs)
+	// restored from a process-free dehydration image. Application memory uses
+	// remotePageLoad so existing distributed-fork controls retain their meaning.
+	auxiliaryRemotePageLoads []*pgalloc.AsyncPagesFileLoad `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
@@ -2423,6 +2427,11 @@ func (k *Kernel) Release() {
 		_ = k.remotePageLoad.Wait()
 		k.remotePageLoad = nil
 	}
+	for _, load := range k.auxiliaryRemotePageLoads {
+		load.Cancel()
+		_ = load.Wait()
+	}
+	k.auxiliaryRemotePageLoads = nil
 	k.mf.Destroy()
 	k.RootPIDNamespace().DecRef(ctx)
 	k.rootUserNamespace.DecRef(ctx)

@@ -88,6 +88,9 @@ func newBranchMetadata(branch Branch) *branchMetadata {
 }
 
 type metadataLayer struct {
+	// Parent links immutable metadata layers into a persistent sharing DAG. It
+	// is not a container-branch parent: every branch independently names one
+	// Root, and deleting or rehydrating any branch never traverses UI lineage.
 	Parent string `json:"parent,omitempty"`
 }
 

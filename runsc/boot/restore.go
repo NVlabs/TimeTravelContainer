@@ -357,8 +357,8 @@ func (r *restoreMounts) String() string {
 
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
-	if l.family.HasChildren() {
-		return errors.New("cannot restore a checkpoint while live child branches exist")
+	if l.family.HasMultipleBranches() {
+		return errors.New("cannot restore a checkpoint while peer branches exist")
 	}
 
 	// Validate the container specs to ensure they did not meaningfully change
@@ -617,7 +617,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	l.k.RestoreContainerMapping(l.containerIDs)
 	if ttcCheckpoint {
-		if err := l.family.RestoreDefaultExecSessions(restoredExecSessions); err != nil {
+		if err := l.family.RestoreLoaderExecSessions(restoredExecSessions); err != nil {
 			return fmt.Errorf("restoring TTC exec sessions: %w", err)
 		}
 	}
@@ -635,7 +635,7 @@ func (r *restorer) restore(l *Loader) error {
 		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
 	}
 	if ttcCheckpoint {
-		if err := l.family.WatchRestoredDefaultExecSessions(); err != nil {
+		if err := l.family.WatchRestoredLoaderExecSessions(); err != nil {
 			return fmt.Errorf("starting restored TTC exec-session watchers: %w", err)
 		}
 	}

@@ -216,6 +216,9 @@ func (s loaderState) String() string {
 type Loader struct {
 	// k is the kernel.
 	k *kernel.Kernel
+	// destroyCtx remains usable after process-free dehydration releases the
+	// root Kernel and clears k.
+	destroyCtx context.Context
 
 	// family owns the default kernel and its live in-memory branches.
 	family *SandboxFamily
@@ -247,6 +250,7 @@ type Loader struct {
 	// loading remains active after the target is published, from checkpoint
 	// restore's background completion lifecycle.
 	distributedRestore          bool
+	dehydrationRestore          bool
 	distributedRestoreSessionID string
 	distributedRestoreInfo      DistributedForkRestoreInfo
 	distributedPushReceiver     *ttcremote.TCPPushReceiver
@@ -904,6 +908,7 @@ func New(args Args) (*Loader, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
+	l.destroyCtx = l.k.SupervisorContext()
 
 	// Create a watchdog.
 	dogOpts := watchdog.DefaultOpts
@@ -915,11 +920,13 @@ func New(args Args) (*Loader, error) {
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
+		LoaderWatchdog:                 l.watchdog,
 		VolumeBranchScope:              l.sandboxID,
 		ConfigureNetwork:               l.configureNetwork,
-		OnDefaultKernelChanged: func(k *kernel.Kernel) {
+		OnLoaderKernelChanged: func(k *kernel.Kernel, dog *watchdog.Watchdog) {
 			l.mu.Lock()
 			l.k = k
+			l.watchdog = dog
 			l.mu.Unlock()
 		},
 	})
@@ -1025,7 +1032,13 @@ func (l *Loader) configureNetwork(k *kernel.Kernel, s inet.Stack) error {
 	if l.networkArgs == nil {
 		return nil
 	}
-	networkArgs := l.networkArgs
+	return l.configureNetworkWithArgs(k, s, l.networkArgs)
+}
+
+func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networkArgs *CreateLinksAndRoutesArgs) error {
+	if networkArgs == nil {
+		return errors.New("network configuration is unavailable")
+	}
 
 	// Close the FDs after they are used to configure the stack.
 	defer func() {
@@ -1110,9 +1123,14 @@ func (l *Loader) Destroy() {
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}
-	l.watchdog.Stop()
+	if l.watchdog != nil {
+		l.watchdog.Stop()
+	}
 
-	ctx := l.k.SupervisorContext()
+	ctx := l.destroyCtx
+	if l.k != nil {
+		ctx = l.k.SupervisorContext()
+	}
 	l.mu.Lock()
 	for _, m := range l.sharedMounts {
 		m.DecRef(ctx)
@@ -1125,7 +1143,9 @@ func (l *Loader) Destroy() {
 
 	// Wake up all checkpoint waiters. This must be done before the controller
 	// is stopped, since its stop sequence requires all pending RPCs to complete.
-	l.k.SignalAllCheckpointWaiters(fmt.Errorf("Loader destroyed"))
+	if l.k != nil {
+		l.k.SignalAllCheckpointWaiters(fmt.Errorf("Loader destroyed"))
+	}
 
 	// Stop the control server. This will indirectly stop any
 	// long-running control operations that are in flight, e.g.
@@ -1138,7 +1158,8 @@ func (l *Loader) Destroy() {
 		l.finalMountNamespace.DecRef(ctx)
 		l.finalMountNamespace = nil
 	}
-	l.family.DestroyChildren()
+	l.family.DestroyNonLoaderBranches()
+	l.family.CloseLoaderDehydration()
 	l.family.CloseDistributedForkSessions()
 	if l.distributedPushReceiver != nil {
 		_ = l.distributedPushReceiver.Close()
@@ -1147,7 +1168,9 @@ func (l *Loader) Destroy() {
 		_ = l.distributedMemoryFile.Close()
 		l.distributedMemoryFile = nil
 	}
-	l.k.Release()
+	if l.k != nil {
+		l.k.Release()
+	}
 
 	// Release any dangling tcp connections.
 	tcpip.ReleaseDanglingEndpoints()
@@ -1457,11 +1480,16 @@ func (l *Loader) run() error {
 		return err
 	}
 	l.family.MarkDefaultStarted()
+	if l.dehydrationRestore {
+		if err := l.family.WatchRestoredLoaderExecSessions(); err != nil {
+			return err
+		}
+	}
 	switch l.state {
 	case created:
 		l.state = started
 	case restoringUnstarted:
-		if l.distributedRestore {
+		if l.distributedRestore || l.dehydrationRestore {
 			l.state = restored
 			l.restoreDone.Broadcast()
 		} else {
@@ -1876,9 +1904,9 @@ func (l *Loader) destroySubcontainer(cid string) error {
 func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	branchID := args.BranchID
 	if branchID == "" {
-		branchID = DefaultBranchID
+		branchID = l.family.LoaderBranchID()
 	}
-	if branchID != DefaultBranchID && args.StdioIsPty && args.InternalConsoleID == "" {
+	if branchID != l.family.LoaderBranchID() && args.StdioIsPty && args.InternalConsoleID == "" {
 		return 0, fmt.Errorf("branch exec with a host TTY is unsupported")
 	}
 	var branch *sandboxBranch
@@ -2634,7 +2662,7 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 	}
 	branchID := opts.BranchID
 	if branchID == "" {
-		branchID = DefaultBranchID
+		branchID = l.family.LoaderBranchID()
 	}
 	branch, done, err := l.family.beginControl(branchID)
 	if err != nil {

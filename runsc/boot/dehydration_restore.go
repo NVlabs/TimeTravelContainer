@@ -1,0 +1,408 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package boot
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/urpc"
+)
+
+// DurableDehydrationRestoreArgs installs one process-independent branch into
+// an unstarted Sentry. Files contains metadata.state followed by one packed
+// memory snapshot for each metadata memory entry.
+type DurableDehydrationRestoreArgs struct {
+	urpc.FilePayload
+	ID               string
+	ParentID         string
+	FilesystemBranch string
+	Resume           bool
+	ExecSessions     []ExecSessionInfo
+	// NetworkArgs reconstructs target-local links after the saved netstack has
+	// been loaded. Cold restore runs before Loader.Run, so it cannot rely on
+	// SetNetworkArgs having reached the Loader yet.
+	NetworkArgs *CreateLinksAndRoutesArgs
+	// UseDonatedMemoryFiles selects peer import into an already-running Sentry.
+	// Files then contains metadata, N snapshots, and N empty target files.
+	UseDonatedMemoryFiles bool
+}
+
+// DurableDehydrationRestoreInfo describes the newly installed runtime root.
+type DurableDehydrationRestoreInfo struct {
+	ID          string `json:"id"`
+	MemoryFiles int    `json:"memory_files"`
+}
+
+func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) (*DurableDehydrationRestoreInfo, error) {
+	if args == nil || args.ID == "" || args.FilesystemBranch == "" || len(args.FilePayload.Files) < 2 {
+		return nil, errors.New("durable dehydration restore is missing branch, filesystem, metadata, or memory state")
+	}
+	if args.UseDonatedMemoryFiles {
+		l.mu.Lock()
+		state := l.state
+		l.mu.Unlock()
+		if state != started && state != restored {
+			return nil, fmt.Errorf("sandbox is %s, not available for dehydration peer import", state)
+		}
+		return l.restoreDurableDehydrationPeer(args)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state != created || l.distributedRestore || l.dehydrationRestore {
+		return nil, fmt.Errorf("sandbox is %s, not an unstarted dehydration target", l.state)
+	}
+	metadataFD, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
+	if err != nil {
+		return nil, fmt.Errorf("duplicating dehydration metadata: %w", err)
+	}
+	metadataFile := os.NewFile(uintptr(metadataFD), "dehydration-metadata")
+	metadata, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
+	metadataFile.Close()
+	if err != nil {
+		return nil, err
+	}
+	if got, want := len(args.FilePayload.Files)-1, len(metadata.Memories); got != want {
+		return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
+	}
+	if l.distributedMemoryFile == nil {
+		return nil, errors.New("dehydration target has no reserved persistent application memory file")
+	}
+	persistentMemoryFile := l.distributedMemoryFile
+	l.distributedMemoryFile = nil
+	mainMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, persistentMemoryFile, true)
+	if err != nil {
+		return nil, fmt.Errorf("creating dehydration application memory file: %w", err)
+	}
+
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+	if err != nil {
+		mainMF.Destroy()
+		return nil, fmt.Errorf("creating dehydration platform: %w", err)
+	}
+	restoreMnts := restoreMounts{
+		fdmap:     make(map[checkpoint.ResourceID]int),
+		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		sharedMfs: make(map[string]bool),
+	}
+	mounter := l.newContainerMounter(&l.root)
+	if err := mounter.configureRestore(&restoreMnts); err != nil {
+		mainMF.Destroy()
+		return nil, fmt.Errorf("configuring dehydration filesystems: %w", err)
+	}
+	fdmapOwned := true
+	defer func() {
+		if fdmapOwned {
+			for _, hostFD := range restoreMnts.fdmap {
+				_ = unix.Close(hostFD)
+			}
+		}
+	}()
+
+	loadMemories := make([]kernel.DurableDehydrationLoadMemory, len(metadata.Memories))
+	loadMemories[0].MemoryFile = mainMF
+	for i := 1; i < len(metadata.Memories); i++ {
+		resourceID := metadata.Memories[i].ResourceID
+		mf := restoreMnts.mfmap[resourceID]
+		if mf == nil {
+			mainMF.Destroy()
+			for _, private := range restoreMnts.mfmap {
+				private.Destroy()
+			}
+			return nil, fmt.Errorf("dehydration target is missing private memory file %q", resourceID)
+		}
+		loadMemories[i].MemoryFile = mf
+		delete(restoreMnts.mfmap, resourceID)
+	}
+	if len(restoreMnts.mfmap) != 0 {
+		mainMF.Destroy()
+		for _, private := range restoreMnts.mfmap {
+			private.Destroy()
+		}
+		for i := 1; i < len(loadMemories); i++ {
+			loadMemories[i].MemoryFile.Destroy()
+		}
+		return nil, fmt.Errorf("dehydration target has %d unexpected private memory files", len(restoreMnts.mfmap))
+	}
+	for i := range loadMemories {
+		fd, err := unix.Dup(int(args.FilePayload.Files[i+1].Fd()))
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = loadMemories[j].Reader.Close()
+			}
+			for j := range loadMemories {
+				loadMemories[j].MemoryFile.Destroy()
+			}
+			return nil, fmt.Errorf("duplicating dehydration snapshot %d: %w", i, err)
+		}
+		loadMemories[i].Reader = stateio.NewFDReader(int32(fd), 1<<20, 64, 4)
+	}
+	resources := make(vfs.RestoreFilesystemResources, len(l.ttcVolumeRepositories))
+	for _, donated := range l.ttcVolumeRepositories {
+		info := donated.repository.Info()
+		restoreID := donated.config.RestoreID
+		if restoreID == "" {
+			restoreID = info.ID
+		}
+		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
+		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+	}
+	fdmapOwned = false // Kernel load and VFS CompleteRestore consume descriptors.
+	child, err := kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: restoreMnts.fdmap,
+		ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
+			return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	childOwned := true
+	defer func() {
+		if childOwned {
+			if err := child.StartPaused(); err == nil {
+				child.Release()
+			}
+		}
+	}()
+	for _, task := range child.TaskSet().Root.Tasks() {
+		task.RestoreContainerID(l.sandboxID)
+	}
+	child.RegisterContainerName(l.sandboxID, l.root.containerName)
+	dogOpts := watchdog.DefaultOpts
+	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
+		return nil, err
+	}
+	newWatchdog := watchdog.New(child, dogOpts)
+	old := l.k
+	old.Pause()
+	if err := old.StartPaused(); err != nil {
+		return nil, fmt.Errorf("starting dehydration placeholder for release: %w", err)
+	}
+	if err := l.family.ReplaceLoaderBranchFromDehydration(args.ID, args.ParentID, args.FilesystemBranch, child, newWatchdog, args.ExecSessions); err != nil {
+		old.Release()
+		return nil, err
+	}
+	l.k = child
+	l.root.procArgs = kernel.CreateProcessArgs{}
+	l.watchdog.Stop()
+	l.watchdog = newWatchdog
+	l.restoreDone = sync.NewCond(&l.mu)
+	l.dehydrationRestore = true
+	l.state = restoringUnstarted
+	old.Release()
+	childOwned = false
+	return &DurableDehydrationRestoreInfo{ID: args.ID, MemoryFiles: len(metadata.Memories)}, nil
+}
+
+func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreArgs) (*DurableDehydrationRestoreInfo, error) {
+	metadataFD, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
+	if err != nil {
+		return nil, err
+	}
+	metadataFile := os.NewFile(uintptr(metadataFD), "dehydration-peer-metadata")
+	metadata, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
+	metadataFile.Close()
+	if err != nil {
+		return nil, err
+	}
+	n := len(metadata.Memories)
+	if got, want := len(args.FilePayload.Files), 1+2*n; got != want {
+		return nil, fmt.Errorf("dehydration peer import got %d files, want %d", got, want)
+	}
+	loadMemories := make([]kernel.DurableDehydrationLoadMemory, n)
+	cleanupMemories := func() {
+		for i := range loadMemories {
+			if loadMemories[i].Reader != nil {
+				_ = loadMemories[i].Reader.Close()
+			}
+			if loadMemories[i].MemoryFile != nil {
+				loadMemories[i].MemoryFile.Destroy()
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		snapshotFD, err := unix.Dup(int(args.FilePayload.Files[1+i].Fd()))
+		if err != nil {
+			cleanupMemories()
+			return nil, err
+		}
+		loadMemories[i].Reader = stateio.NewFDReader(int32(snapshotFD), 1<<20, 64, 4)
+		targetFD, err := unix.Dup(int(args.FilePayload.Files[1+n+i].Fd()))
+		if err != nil {
+			cleanupMemories()
+			return nil, err
+		}
+		target := os.NewFile(uintptr(targetFD), fmt.Sprintf("dehydration-peer-memory-%d", i))
+		if i == 0 {
+			loadMemories[i].MemoryFile, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, target, true)
+		} else {
+			loadMemories[i].MemoryFile, err = createEmptyPrivateMemoryFile(target, metadata.Memories[i].ResourceID)
+		}
+		if err != nil {
+			cleanupMemories()
+			return nil, fmt.Errorf("creating dehydration peer memory %d: %w", i, err)
+		}
+	}
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+	if err != nil {
+		cleanupMemories()
+		return nil, err
+	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			cleanupMemories()
+		}
+	}()
+	err = l.family.RestoreDurablePeer(args, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		consumed = true
+		return kernel.LoadDurableDehydration(source.SupervisorContext(), p, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
+				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
+			},
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DurableDehydrationRestoreInfo{ID: args.ID, MemoryFiles: n}, nil
+}
+
+// RestoreDurablePeer imports a cold branch next to any available active peer.
+// ParentID is copied only for UI provenance; it is never consulted here.
+func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+	if args == nil || args.ID == "" || load == nil {
+		return errors.New("durable peer restore is missing arguments")
+	}
+	f.mu.Lock()
+	if _, ok := f.branches[args.ID]; ok {
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q already exists in the runtime", args.ID)
+	}
+	ids := make([]string, 0, len(f.branches))
+	for id, branch := range f.branches {
+		if branch.k != nil && (branch.state == BranchRunning || branch.state == BranchPaused) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		f.mu.Unlock()
+		return errors.New("no active peer is available for dehydration restore")
+	}
+	source := f.branches[ids[0]]
+	f.mu.Unlock()
+	source.opMu.Lock()
+	defer source.opMu.Unlock()
+	f.mu.Lock()
+	if source.k == nil || (source.state != BranchRunning && source.state != BranchPaused) {
+		state := source.state
+		f.mu.Unlock()
+		return fmt.Errorf("dehydration restore peer %q became %s", source.id, state)
+	}
+	wasRunning := source.state == BranchRunning
+	f.mu.Unlock()
+	if wasRunning {
+		source.k.Pause()
+		defer func() {
+			source.k.Unpause()
+			_ = control.PostResume(source.k, nil)
+			f.mu.Lock()
+			source.state = kernelBranchState(source.k)
+			f.mu.Unlock()
+		}()
+	}
+	var child *kernel.Kernel
+	if err := source.k.WithDehydrationFilesystemResources(source.k.SupervisorContext(), args.FilesystemBranch, func(resources vfs.LiveForkFilesystemResources) error {
+		var err error
+		child, err = load(source.k, resources)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := child.StartPaused(); err != nil {
+		child.Release()
+		return err
+	}
+	newSessions := make(map[string]*execSession)
+	for _, info := range args.ExecSessions {
+		if info.State != ExecSessionRunning {
+			continue
+		}
+		if tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID); tg != nil {
+			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
+		}
+	}
+	var dog *watchdog.Watchdog
+	if f.watchdogOpts != nil {
+		dog = watchdog.New(child, *f.watchdogOpts)
+		dog.Start()
+	}
+	cleanupChild := func() {
+		if dog != nil {
+			dog.Stop()
+		}
+		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		if child.IsPaused() {
+			child.Unpause()
+		}
+		child.WaitExited()
+		child.Release()
+	}
+	state := BranchPaused
+	if args.Resume {
+		child.Unpause()
+		if err := control.PostResume(child, nil); err != nil {
+			cleanupChild()
+			return err
+		}
+		state = kernelBranchState(child)
+	}
+	f.mu.Lock()
+	if _, ok := f.branches[args.ID]; ok {
+		f.mu.Unlock()
+		cleanupChild()
+		return fmt.Errorf("branch %q appeared during dehydration restore", args.ID)
+	}
+	b := &sandboxBranch{
+		id: args.ID, parentID: args.ParentID, filesystemBranch: args.FilesystemBranch,
+		k: child, watchdog: dog, state: state, createdAt: time.Now().UTC(), execSessions: newSessions,
+	}
+	f.branches[args.ID] = b
+	f.stateChanged.Broadcast()
+	f.mu.Unlock()
+	for id, session := range newSessions {
+		f.watchExecSession(args.ID, id, session)
+	}
+	return nil
+}

@@ -49,7 +49,9 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
+	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -8070,9 +8072,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
 	dehydrated := false
+	captured := false
 	defer func() {
 		if dehydrated {
 			return
+		}
+		if captured {
+			// Dehydration has already replaced the live Kernel. If durable export
+			// fails, reconstruct it while the Sentry still owns the capture so the
+			// operation remains atomic from the user's point of view.
+			_, _ = b.command("timetravel", target.container, "rehydrate", target.branch)
 		}
 		// Capture failure leaves the branch in its original running or paused
 		// state. Restore every sidecar stopped in preparation for the attempt.
@@ -8098,38 +8107,94 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return fmt.Errorf("stopping published ports before dehydration: %w", err)
 	}
 	var metadataFile *os.File
-	var metadataTemp, metadataFinal string
+	var stagingDir, finalDir string
 	if b.dataRoot != "" {
 		metadataDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated")
 		if err := os.MkdirAll(metadataDir, 0700); err != nil {
 			return fmt.Errorf("creating dehydration metadata directory: %w", err)
 		}
-		metadataFinal = filepath.Join(metadataDir, hex.EncodeToString([]byte(target.branch))+".state")
-		metadataFile, err = os.CreateTemp(metadataDir, ".state-*")
+		encodedBranch := hex.EncodeToString([]byte(target.branch))
+		finalDir = filepath.Join(metadataDir, encodedBranch)
+		stagingDir, err = os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
+		if err != nil {
+			return fmt.Errorf("creating dehydration staging directory: %w", err)
+		}
+		defer os.RemoveAll(stagingDir)
+		metadataFile, err = os.OpenFile(filepath.Join(stagingDir, "metadata.state"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
 			return fmt.Errorf("creating dehydration metadata: %w", err)
 		}
-		metadataTemp = metadataFile.Name()
-		defer func() {
-			metadataFile.Close()
-			_ = os.Remove(metadataTemp)
-		}()
+		defer metadataFile.Close()
 	}
+	var output []byte
 	if metadataFile != nil {
-		_, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
+		output, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
 	} else {
-		_, err = b.command("timetravel", target.container, "dehydrate", target.branch)
+		output, err = b.command("timetravel", target.container, "dehydrate", target.branch)
 	}
 	if err != nil {
 		return err
 	}
-	dehydrated = true
+	captured = true
 	if metadataFile != nil {
-		if err := os.Rename(metadataTemp, metadataFinal); err != nil {
-			return fmt.Errorf("publishing dehydration metadata: %w", err)
+		var capture boot.BranchDehydrateInfo
+		if err := json.Unmarshal(output, &capture); err != nil {
+			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		metadataTemp = ""
+		if len(capture.Memories) == 0 {
+			return errors.New("dehydration capture contains no memory images")
+		}
+		snapshots := make([]*os.File, 0, len(capture.Memories))
+		for i := range capture.Memories {
+			path := filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i))
+			file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+			if err != nil {
+				for _, opened := range snapshots {
+					_ = opened.Close()
+				}
+				return fmt.Errorf("creating dehydration memory image %d: %w", i, err)
+			}
+			snapshots = append(snapshots, file)
+		}
+		exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots))}
+		if b.allowSlowVolumeCopy {
+			exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
+		}
+		exportArgs = append(exportArgs, target.container, "dehydrate-export", target.branch)
+		_, exportErr := b.commandWithFiles(snapshots, exportArgs...)
+		for _, file := range snapshots {
+			if closeErr := file.Close(); exportErr == nil && closeErr != nil {
+				exportErr = closeErr
+			}
+		}
+		if exportErr != nil {
+			return fmt.Errorf("persisting dehydration memory: %w", exportErr)
+		}
+		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
+			return fmt.Errorf("persisting dehydration control state: %w", err)
+		}
+		if err := metadataFile.Sync(); err != nil {
+			return fmt.Errorf("syncing dehydration metadata: %w", err)
+		}
+		if err := metadataFile.Close(); err != nil {
+			return fmt.Errorf("closing dehydration metadata: %w", err)
+		}
+		metadataFile = nil
+		if _, err := os.Stat(finalDir); err == nil {
+			return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Rename(stagingDir, finalDir); err != nil {
+			return fmt.Errorf("publishing dehydration image: %w", err)
+		}
+		stagingDir = ""
+		if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
 	}
+	dehydrated = true
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
 	// transient statuses so rehydration can attach fresh followers.
@@ -8147,6 +8212,30 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err == nil && b.dataRoot != "" {
 		err = b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
 	}
+	if err == nil && b.dataRoot != "" {
+		activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
+		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
+			return fmt.Errorf("removing superseded active memory: %w", removeErr)
+		}
+	}
+	if err == nil && b.dataRoot != "" {
+		latest, loadErr := b.containerStore().LoadContainer(target.container)
+		if loadErr != nil {
+			return loadErr
+		}
+		allCold := len(latest.Branches) != 0
+		for _, branch := range latest.Branches {
+			if branch.State != "deleted" && branch.State != "dehydrated" {
+				allCold = false
+				break
+			}
+		}
+		if allCold {
+			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
+				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
+			}
+		}
+	}
 	return err
 }
 
@@ -8156,13 +8245,46 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		return err
 	}
 	target = resolved
+	var persistentBranch *ttcbundle.BranchInfo
+	for i := range info.Branches {
+		if info.Branches[i].ID == target.branch {
+			persistentBranch = &info.Branches[i]
+			break
+		}
+	}
+	if persistentBranch == nil {
+		return fmt.Errorf("branch %q is not recorded", target.branch)
+	}
+	if persistentBranch.State == "dehydrated" {
+		if _, stateErr := b.command("state", info.ID); stateErr != nil {
+			return b.rehydrateCold(target, info, *persistentBranch, false)
+		}
+		output, branchesErr := b.command("timetravel", info.ID, "branches")
+		if branchesErr != nil {
+			return branchesErr
+		}
+		var runtimeBranches []runscBranchInfo
+		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+			return fmt.Errorf("decoding runtime branches: %w", err)
+		}
+		present := false
+		for _, runtimeBranch := range runtimeBranches {
+			if runtimeBranch.ID == target.branch {
+				present = true
+				break
+			}
+		}
+		if !present {
+			return b.rehydrateCold(target, info, *persistentBranch, true)
+		}
+	}
 	_, err = b.command("timetravel", target.container, "rehydrate", target.branch)
 	if err != nil || b.dataRoot == "" {
 		return err
 	}
-	metadataPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch))+".state")
-	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing consumed dehydration metadata: %w", err)
+	imageDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch)))
+	if err := os.RemoveAll(imageDir); err != nil {
+		return fmt.Errorf("removing consumed dehydration image: %w", err)
 	}
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
@@ -8199,6 +8321,286 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 	}
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
+}
+
+func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
+	imageDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch)))
+	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
+	if err != nil {
+		return fmt.Errorf("reading dehydration control state: %w", err)
+	}
+	var capture boot.BranchDehydrateInfo
+	if err := json.Unmarshal(controlData, &capture); err != nil {
+		return fmt.Errorf("decoding dehydration control state: %w", err)
+	}
+	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
+		return errors.New("dehydration control state is incomplete")
+	}
+	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
+	if err != nil {
+		return fmt.Errorf("opening dehydration metadata: %w", err)
+	}
+	defer metadata.Close()
+	snapshots := make([]*os.File, 0, len(capture.Memories))
+	defer func() {
+		for _, file := range snapshots {
+			_ = file.Close()
+		}
+	}()
+	for i := range capture.Memories {
+		file, err := os.Open(filepath.Join(imageDir, fmt.Sprintf("memory-%04d.snapshot", i)))
+		if err != nil {
+			return fmt.Errorf("opening dehydration memory image %d: %w", i, err)
+		}
+		if stat, err := file.Stat(); err != nil {
+			file.Close()
+			return err
+		} else if uint64(stat.Size()) != capture.Memories[i].StreamBytes {
+			file.Close()
+			return fmt.Errorf("dehydration memory image %d is %d bytes, want %d", i, stat.Size(), capture.Memories[i].StreamBytes)
+		}
+		snapshots = append(snapshots, file)
+	}
+	if peer {
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots)
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	memoryPath, err := specutils.TTCMemoryFilePath(spec)
+	if err != nil {
+		return err
+	}
+	if memoryPath == "" {
+		return errors.New("container has no persistent application memory file")
+	}
+	if err := os.Truncate(memoryPath, 0); err != nil {
+		return fmt.Errorf("resetting dehydration target memory: %w", err)
+	}
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
+	if err != nil {
+		return fmt.Errorf("preparing dehydration restore bundle: %w", err)
+	}
+	defer cleanupBundle()
+	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
+	if err != nil {
+		return fmt.Errorf("creating dehydration runtime: %w", err)
+	}
+	if status != 0 {
+		return fmt.Errorf("creating dehydration runtime exited with status %d", status)
+	}
+	runtimeCreated := true
+	defer func() {
+		if retErr != nil && runtimeCreated {
+			_, _ = b.command("delete", "--force", info.ID)
+		}
+	}()
+	restoreArgs := boot.DurableDehydrationRestoreArgs{
+		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions,
+	}
+	restoreArgs.NetworkArgs, err = dehydrationNetworkArgs(info)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(&restoreArgs)
+	if err != nil {
+		return err
+	}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	if _, err := configWriter.Write(encoded); err != nil {
+		configReader.Close()
+		configWriter.Close()
+		return err
+	}
+	if err := configWriter.Close(); err != nil {
+		configReader.Close()
+		return err
+	}
+	files := []*os.File{configReader, metadata}
+	files = append(files, snapshots...)
+	commandArgs := []string{
+		"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4",
+		"--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)),
+		info.ID, "dehydrate-restore", target.branch,
+	}
+	_, err = b.commandWithFiles(files, commandArgs...)
+	configReader.Close()
+	if err != nil {
+		return fmt.Errorf("installing dehydration image: %w", err)
+	}
+	status, err = b.runConfiguredCommandWithArgs(configured, "start", info.ID)
+	if err != nil {
+		return fmt.Errorf("starting dehydration runtime: %w", err)
+	}
+	if status != 0 {
+		return fmt.Errorf("starting dehydration runtime exited with status %d", status)
+	}
+	state := "paused"
+	if capture.Resume {
+		if _, err := b.command("timetravel", info.ID, "resume", target.branch); err != nil {
+			return fmt.Errorf("resuming rehydrated branch: %w", err)
+		}
+		state = "running"
+	}
+	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(imageDir); err != nil {
+		return fmt.Errorf("removing consumed dehydration image: %w", err)
+	}
+	runtimeCreated = false
+	if _, err := b.ensureConsoleDrain(target, false); err != nil {
+		return fmt.Errorf("reattaching init console: %w", err)
+	}
+	sessions, err := b.execSessions(target)
+	if err != nil {
+		return fmt.Errorf("listing rehydrated exec sessions: %w", err)
+	}
+	for _, session := range sessions {
+		if session.State == "running" {
+			if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false); err != nil {
+				return fmt.Errorf("reattaching exec console %q: %w", session.ID, err)
+			}
+		}
+	}
+	if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
+		return fmt.Errorf("restoring published ports: %w", err)
+	}
+	return nil
+}
+
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, imageDir string, metadata *os.File, snapshots []*os.File) error {
+	activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
+	if err := os.RemoveAll(activeDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(activeDir, 0700); err != nil {
+		return err
+	}
+	keepTargets := false
+	defer func() {
+		if !keepTargets {
+			_ = os.RemoveAll(activeDir)
+		}
+	}()
+	targets := make([]*os.File, 0, len(snapshots))
+	defer func() {
+		for _, file := range targets {
+			_ = file.Close()
+		}
+	}()
+	for i := range snapshots {
+		file, err := os.OpenFile(filepath.Join(activeDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+		if err != nil {
+			return fmt.Errorf("creating active dehydration memory %d: %w", i, err)
+		}
+		targets = append(targets, file)
+	}
+	restoreArgs := boot.DurableDehydrationRestoreArgs{
+		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true,
+	}
+	networkArgs, err := dehydrationNetworkArgs(info)
+	if err != nil {
+		return err
+	}
+	restoreArgs.NetworkArgs = networkArgs
+	encoded, err := json.Marshal(&restoreArgs)
+	if err != nil {
+		return err
+	}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	if _, err := configWriter.Write(encoded); err != nil {
+		configReader.Close()
+		configWriter.Close()
+		return err
+	}
+	if err := configWriter.Close(); err != nil {
+		configReader.Close()
+		return err
+	}
+	files := []*os.File{configReader, metadata}
+	files = append(files, snapshots...)
+	files = append(files, targets...)
+	targetStartFD := 5 + len(snapshots)
+	commandArgs := []string{
+		"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4",
+		"--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)),
+		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
+		info.ID, "dehydrate-restore", target.branch,
+	}
+	_, err = b.commandWithFiles(files, commandArgs...)
+	configReader.Close()
+	if err != nil {
+		return fmt.Errorf("installing dehydrated peer: %w", err)
+	}
+	keepTargets = true
+	state := "paused"
+	if capture.Resume {
+		state = "running"
+	}
+	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+		if _, destroyErr := b.command("timetravel", info.ID, "destroy", target.branch); destroyErr != nil {
+			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
+		}
+		keepTargets = false
+		return err
+	}
+	if err := os.RemoveAll(imageDir); err != nil {
+		return err
+	}
+	if _, err := b.ensureConsoleDrain(target, false); err != nil {
+		return fmt.Errorf("reattaching init console: %w", err)
+	}
+	sessions, err := b.execSessions(target)
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if session.State == "running" {
+			if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false); err != nil {
+				return err
+			}
+		}
+	}
+	return b.ensurePublishedPortsForBranch(info, target.branch)
+}
+
+func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndRoutesArgs, error) {
+	link := boot.DefaultLoopbackLink
+	args := &boot.CreateLinksAndRoutesArgs{LoopbackLinks: []boot.LoopbackLink{link}, IsRestore: true}
+	switch info.NetworkMode {
+	case "none":
+		return args, nil
+	case "ttc":
+		cfg := &boot.TimeTravelNetworkConfig{NAT: info.NetworkNAT}
+		if info.NetworkIP != "" {
+			cfg.GuestIP = net.ParseIP(info.NetworkIP)
+			if cfg.GuestIP == nil {
+				return nil, fmt.Errorf("invalid persisted TTC network IP %q", info.NetworkIP)
+			}
+		}
+		if info.NetworkMAC != "" {
+			mac, err := net.ParseMAC(info.NetworkMAC)
+			if err != nil {
+				return nil, fmt.Errorf("invalid persisted TTC network MAC %q: %w", info.NetworkMAC, err)
+			}
+			cfg.GuestMAC = mac
+		}
+		args.TimeTravel = cfg
+		return args, nil
+	default:
+		return nil, fmt.Errorf("network mode %q cannot be reconstructed from a process-free dehydration image", info.NetworkMode)
+	}
 }
 
 func (b *runtimeBackend) destroy(target selector) error {

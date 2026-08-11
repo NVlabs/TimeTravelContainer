@@ -1270,6 +1270,26 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	if err != nil {
 		return nil, err
 	}
+	mf, err := createEmptyPrivateMemoryFile(file, resourceID)
+	if err != nil {
+		onLoadEnd(err)
+		return mf, err
+	}
+	if pagesMetadataReader != nil {
+		log.Infof("Loading filesystem checkpoint data for %q", resourceID)
+		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, &pgalloc.LoadOpts{
+			PagesFile:       fsr.apfl,
+			PagesFileOffset: pagesFileOffset,
+			DoneCallback:    onLoadEnd,
+		}); err != nil {
+			mf.Destroy()
+			return nil, err
+		}
+	}
+	return mf, nil
+}
+
+func createEmptyPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID) (*pgalloc.MemoryFile, error) {
 	mfOpts := pgalloc.MemoryFileOpts{
 		// Private memory files are usually backed by files on disk. Ideally we
 		// would confirm with fstatfs(2) but that is prohibited by seccomp.
@@ -1285,19 +1305,7 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	}
 	mf, err := pgalloc.NewMemoryFile(file, mfOpts)
 	if err != nil {
-		onLoadEnd(err)
 		return mf, err
-	}
-	if pagesMetadataReader != nil {
-		log.Infof("Loading filesystem checkpoint data for %q", resourceID)
-		if err := mf.LoadFrom(context.Background(), pagesMetadataReader, &pgalloc.LoadOpts{
-			PagesFile:       fsr.apfl,
-			PagesFileOffset: pagesFileOffset,
-			DoneCallback:    onLoadEnd,
-		}); err != nil {
-			mf.Destroy()
-			return nil, err
-		}
 	}
 	return mf, nil
 }

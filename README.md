@@ -79,8 +79,9 @@ and kernel objects rather than the amount of resident application memory.
 - Pause and resume a running branch.
 - Dehydrate a branch to durable storage, release its guest runtime state, and
   rehydrate it later in the same family.
-- Fork a branch into a running or initially paused child.
-- Fork children again to build a tree of experiments.
+- Fork a branch into a running or initially paused peer.
+- Fork any branch again; the CLI can display creation provenance as a tree,
+  but those edges impose no ownership or lifecycle hierarchy.
 - Save one live or paused branch to a checkpoint file and restore it later as
   an independent container.
 - Preserve process trees, threads, memory, credentials, timers, signals,
@@ -421,8 +422,8 @@ ttc pause demo@test-a
 ttc resume demo@test-a
 ```
 
-Move a branch's private runtime state to durable storage, then bring
-it back without removing it from the fork tree:
+Move a branch's private runtime state to durable storage, then bring it back
+without removing its recorded creation provenance:
 
 ```sh
 ttc dehydrate demo@test-a
@@ -500,7 +501,7 @@ ttc port ls web
 
 ## How live fork works
 
-TTC groups a container and all of its descendants into a container family.
+TTC groups a container and all of its branches into a container family.
 When `ttc fork` is requested, TTC:
 
 1. Pauses the selected source branch.
@@ -518,15 +519,21 @@ checkpoint containing all container memory.
 For implementation details, see the
 [live-fork design](g3doc/proposals/timetravel_live_fork.md).
 
-Dehydration is family-preserving hibernation. TTC writes a branch's private
-runtime state to its data root, releases its guest kernel/task graph and
-private application-memory mappings, and leaves a `dehydrated` node in the
-same fork tree. Rehydration reconstructs that node with the same filesystem
-ancestry and copy-on-write relationships. Pages shared only by dehydrated
-siblings are persisted and reclaimable; pages still used by a live sibling
-remain shared in memory. This also composes with distributed fork: TTC first
-drains any pages the branch still depends on from a remote source, then
-persists the now-local state.
+Dehydration is family-preserving hibernation. TTC writes a branch's guest
+kernel, tasks, memory, internal resources, and filesystem identity to its data
+root. A dehydrated branch needs no guest process. When every active branch in a
+family is dehydrated, TTC also removes that family's Sentry and filesystem
+transport processes; `ttcd` can then stop without losing the family.
+
+Rehydration creates runtime processes on demand and reads memory pages lazily
+from immutable packed snapshots. Rehydrating one branch does not wake any
+other branch, and another dehydrated branch can later join the running family
+as an equal peer. The parent labels shown by `ttc ls --tree`
+record only which branch was forked to create another branch; they do not
+control memory ownership, deletion order, or rehydration. This also composes
+with distributed fork: TTC first makes any remotely sourced pages durable in
+the shared data root, so neither dehydration nor rehydration depends on a
+source-node process.
 
 Distributed forks use the cluster's shared TTC data root as a durable handoff.
 The source publishes an immutable packed memory snapshot, normally using
@@ -548,13 +555,11 @@ container family with no ancestry or mutable storage shared with the source.
 - TTC is not yet a production security boundary for hostile workloads.
 - On Linux 3.17 through 4.14.76, `ttcd` automatically disables host GSO.
   Network performance, especially for large payloads, will be reduced.
-- Branches in one family share a runtime process, so a runtime failure can
-  affect the whole family.
-- Dehydration currently retains a small Sentry control shell and the read-only
-  filesystem transport needed to rehydrate after `ttcd` exits. Guest tasks,
-  guest kernel objects, and private application-memory mappings are released,
-  but this is not yet a process-free cold archive. Use a checkpoint for a
-  portable standalone file.
+- Active branches in one family share a Sentry process, so a runtime failure
+  can affect those active peers. Fully dehydrated families are process-free.
+- Dehydration images belong to TTC's managed data root and are not portable
+  standalone archives. Use a checkpoint when a single exportable file is
+  required.
 - Fork duration depends on the number of processes, mappings, and resources.
   It is not universally constant time.
 - Some resources connected directly to the host or another container cannot be

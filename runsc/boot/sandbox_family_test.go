@@ -188,7 +188,7 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	parent.Unpause()
 	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
 	defer func() {
-		family.DestroyChildren()
+		family.DestroyNonLoaderBranches()
 		parent.Pause()
 		parent.Release()
 	}()
@@ -311,6 +311,37 @@ func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {
 	family.mu.Unlock()
 	if branch.k != replacement || branch.state != BranchPaused || branch.filesystemBranch != "remote-filesystem-branch" {
 		t.Fatalf("replacement branch=%+v", branch)
+	}
+}
+
+func TestReplaceLoaderBranchPreservesPeerIdentity(t *testing.T) {
+	placeholder, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	family := NewSandboxFamily(placeholder, SandboxFamilyOptions{})
+	replacement := &kernel.Kernel{}
+	if err := family.ReplaceLoaderBranchFromDehydration("experiment-b", "experiment-a", "volume-b", replacement, nil, []ExecSessionInfo{{PID: 1, State: ExecSessionRunning}}); err == nil {
+		t.Fatal("replacement with invalid exec-session metadata succeeded")
+	}
+	if got := family.LoaderBranchID(); got != DefaultBranchID {
+		t.Fatalf("failed replacement changed loader branch to %q", got)
+	}
+	if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
+		t.Fatalf("failed replacement changed branch set: %+v", got)
+	}
+	if err := family.ReplaceLoaderBranchFromDehydration("experiment-b", "experiment-a", "volume-b", replacement, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := family.LoaderBranchID(); got != "experiment-b" {
+		t.Fatalf("loader branch=%q, want experiment-b", got)
+	}
+	infos := family.List()
+	if len(infos) != 1 || infos[0].ID != "experiment-b" || infos[0].ParentID != "experiment-a" {
+		t.Fatalf("branch identity changed during loader replacement: %+v", infos)
+	}
+	if _, ok := family.branches[DefaultBranchID]; ok {
+		t.Fatal("cold loader replacement implicitly woke or renamed main")
 	}
 }
 
@@ -778,7 +809,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if err := family.Resume("great-grandchild"); err != nil {
 		t.Fatalf("Resume great-grandchild after ancestor destroy: %v", err)
 	}
-	family.DestroyChildren()
+	family.DestroyNonLoaderBranches()
 	if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
 		t.Fatalf("List after destroy: %+v", got)
 	}

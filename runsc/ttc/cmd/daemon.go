@@ -760,7 +760,6 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 type daemonStopTarget struct {
 	selector selector
 	state    string
-	depth    int
 }
 
 func stopDaemonContainers(backend backend) error {
@@ -770,38 +769,21 @@ func stopDaemonContainers(backend backend) error {
 	}
 	var targets []daemonStopTarget
 	for _, family := range families {
-		parents := make(map[string]string, len(family.Branches))
-		for _, branch := range family.Branches {
-			parents[branch.ID] = branch.ParentID
-		}
 		for _, branch := range family.Branches {
 			switch branch.State {
 			case "running", "paused", "restarting":
 			default:
 				continue
 			}
-			depth := 0
-			seen := map[string]bool{branch.ID: true}
-			for parent := branch.ParentID; parent != "" && !seen[parent]; parent = parents[parent] {
-				seen[parent] = true
-				depth++
-			}
 			targets = append(targets, daemonStopTarget{
 				selector: selector{container: family.ID, branch: branch.ID},
 				state:    branch.State,
-				depth:    depth,
 			})
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
 		if targets[i].selector.container != targets[j].selector.container {
 			return targets[i].selector.container < targets[j].selector.container
-		}
-		if targets[i].selector.branch == defaultBranchID || targets[j].selector.branch == defaultBranchID {
-			return targets[j].selector.branch == defaultBranchID
-		}
-		if targets[i].depth != targets[j].depth {
-			return targets[i].depth > targets[j].depth
 		}
 		return targets[i].selector.branch < targets[j].selector.branch
 	})

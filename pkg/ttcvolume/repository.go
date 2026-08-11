@@ -177,7 +177,6 @@ type VolumeInfo struct {
 // with older callers that use it as an opaque change identity.
 type Branch struct {
 	ID         string    `json:"id"`
-	Parent     string    `json:"parent,omitempty"`
 	Root       string    `json:"root"`
 	Generation uint64    `json:"generation"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -868,7 +867,7 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		sourceBranch.Root = sourceLayer
 		sourceBranch.Generation++
 		childBranch := Branch{
-			ID: child, Parent: source, Root: childLayer,
+			ID: child, Root: childLayer,
 			Generation: sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes

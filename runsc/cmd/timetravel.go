@@ -74,6 +74,12 @@ type TimeTravel struct {
 	checkpointImagePath           string
 	checkpointCompression         CheckpointCompression
 	dehydrationFD                 int
+	dehydrationConfigFD           int
+	dehydrationSnapshotsStartFD   int
+	dehydrationSnapshotsCount     int
+	dehydrationSnapshotAllowCopy  bool
+	dehydrationTargetsStartFD     int
+	dehydrationTargetsCount       int
 	distributedSessionID          string
 	distributedFamilyID           string
 	distributedListen             string
@@ -115,6 +121,8 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
+		"timetravel [flags] <container-id> dehydrate-export <branch-id>\n" +
+		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
 		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
@@ -150,6 +158,12 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
 	f.IntVar(&t.dehydrationFD, "dehydration-fd", -1, "inherited file for durable dehydration metadata")
+	f.IntVar(&t.dehydrationConfigFD, "dehydration-config-fd", -1, "inherited FD containing durable dehydration restore arguments")
+	f.IntVar(&t.dehydrationSnapshotsStartFD, "dehydration-snapshots-start-fd", -1, "first inherited dehydration snapshot destination")
+	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
+	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
+	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
+	f.IntVar(&t.dehydrationTargetsCount, "dehydration-targets-count", 0, "number of inherited dehydration target memory files")
 	f.StringVar(&t.distributedSessionID, "distributed-session", "", "distributed fork transaction/session ID")
 	f.StringVar(&t.distributedFamilyID, "distributed-family", "", "portable distributed fork family identity")
 	f.StringVar(&t.distributedListen, "distributed-listen", "", "host TCP address for the source page server")
@@ -421,7 +435,71 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			defer metadataFile.Close()
 		}
-		err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
+		output, err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
+	case "dehydrate-export":
+		if t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) {
+			util.Fatalf("invalid inherited dehydration snapshot range")
+		}
+		files := make([]*os.File, 0, t.dehydrationSnapshotsCount)
+		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
+			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-snapshot-%d", i))
+			if file == nil {
+				util.Fatalf("invalid inherited dehydration snapshot FD %d", t.dehydrationSnapshotsStartFD+i)
+			}
+			files = append(files, file)
+			defer file.Close()
+		}
+		err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
+			FilePayload: urpc.FilePayload{Files: files},
+			ID:          f.Arg(2),
+			AllowCopy:   t.dehydrationSnapshotAllowCopy,
+		})
+	case "dehydrate-restore":
+		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) {
+			util.Fatalf("--dehydration-config-fd, --dehydration-fd, and a valid snapshot range are required")
+		}
+		configFile := os.NewFile(uintptr(t.dehydrationConfigFD), "dehydration-restore-config")
+		if configFile == nil {
+			util.Fatalf("invalid dehydration restore config FD")
+		}
+		decoder := json.NewDecoder(io.LimitReader(configFile, 1<<20))
+		decoder.DisallowUnknownFields()
+		var restoreArgs boot.DurableDehydrationRestoreArgs
+		if err := decoder.Decode(&restoreArgs); err != nil {
+			configFile.Close()
+			util.Fatalf("decoding dehydration restore config: %v", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			configFile.Close()
+			util.Fatalf("dehydration restore config contains trailing data")
+		}
+		configFile.Close()
+		if restoreArgs.ID != f.Arg(2) {
+			util.Fatalf("dehydration restore branch identity mismatch")
+		}
+		metadata := os.NewFile(uintptr(t.dehydrationFD), "dehydration-restore-metadata")
+		if metadata == nil {
+			util.Fatalf("invalid dehydration metadata FD")
+		}
+		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
+		defer metadata.Close()
+		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
+			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-restore-snapshot-%d", i))
+			if file == nil {
+				util.Fatalf("invalid inherited dehydration snapshot FD %d", t.dehydrationSnapshotsStartFD+i)
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
+			defer file.Close()
+		}
+		for i := 0; i < t.dehydrationTargetsCount; i++ {
+			file := os.NewFile(uintptr(t.dehydrationTargetsStartFD+i), fmt.Sprintf("dehydration-target-memory-%d", i))
+			if file == nil {
+				util.Fatalf("invalid inherited dehydration target FD %d", t.dehydrationTargetsStartFD+i)
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
+			defer file.Close()
+		}
+		output, err = cont.Sandbox.RestoreDurableDehydration(&restoreArgs)
 	case "rehydrate":
 		err = cont.Sandbox.RehydrateBranch(f.Arg(2))
 	case "destroy":

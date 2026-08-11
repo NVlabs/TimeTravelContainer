@@ -277,7 +277,7 @@ func TestReportDaemonStartupWarningsSurfacesHostGSOFallback(t *testing.T) {
 	}
 }
 
-func TestStopDaemonContainersStopsDescendantsBeforeMain(t *testing.T) {
+func TestStopDaemonContainersTreatsLineageAsDisplayOnly(t *testing.T) {
 	b := &fakeBackend{
 		families: []Family{{
 			ID: "web",
@@ -297,8 +297,8 @@ func TestStopDaemonContainersStopsDescendantsBeforeMain(t *testing.T) {
 		t.Errorf("resumed=%+v, want %+v", got, want)
 	}
 	wantOrder := []selector{
-		{container: "web", branch: "grandchild"},
 		{container: "web", branch: "child"},
+		{container: "web", branch: "grandchild"},
 		{container: "web", branch: defaultBranchID},
 	}
 	if len(b.signals) != len(wantOrder) {

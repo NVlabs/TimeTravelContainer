@@ -336,9 +336,13 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 		})
 		ws = unix.WaitStatus(status)
 		err = waitErr
-	} else if e.BranchID == "" || e.BranchID == boot.DefaultBranchID {
+	} else if e.BranchID == "" {
 		ws, err = c.WaitPID(pid)
 	} else {
+		// A cold-rehydrated family may have any visible branch referenced by
+		// Loader.k. Branch names, including "main", do not identify that
+		// implementation role, so every explicit branch uses the branch-aware
+		// waiter.
 		ws, err = c.WaitBranchPID(e.BranchID, pid)
 	}
 	if err != nil {
