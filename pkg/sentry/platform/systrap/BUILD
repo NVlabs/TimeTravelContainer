@@ -59,7 +59,7 @@ go_library(
         "syscall_thread.go",
         "syscall_thread_amd64.go",
         "syscall_thread_arm64.go",
-        "syscall_thread_defs.go",
+        "syscall_thread_defs_unsafe.go",
         "syscall_thread_unsafe.go",
         "sysmsg_thread.go",
         "sysmsg_thread_amd64.go",

@@ -2783,7 +2783,7 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc rm [--force] [--volumes] (CONTAINER|CONTAINER@BRANCH)...")
+		return errors.New("usage: ttc rm [--force] [--volumes] (CONTAINER|CONTAINER@BRANCH) [TARGET...]")
 	}
 	for _, value := range fs.Args() {
 		if strings.Contains(value, "@") {
@@ -4023,7 +4023,7 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, dehydrate bool) error {
 	if len(args) == 0 {
 		if dehydrate {
-			return errors.New("usage: ttc dehydrate (CONTAINER|CONTAINER@BRANCH)...")
+			return errors.New("usage: ttc dehydrate (CONTAINER|CONTAINER@BRANCH) [TARGET...]")
 		}
 		return errors.New("usage: ttc rehydrate CONTAINER@BRANCH [CONTAINER@BRANCH...]")
 	}
@@ -4109,7 +4109,7 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc stop [--time SECONDS] (CONTAINER|CONTAINER@BRANCH)...")
+		return errors.New("usage: ttc stop [--time SECONDS] (CONTAINER|CONTAINER@BRANCH) [TARGET...]")
 	}
 	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
 	if timeoutSet && timeout < -1 {
@@ -8789,16 +8789,18 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = os.Remove(paths.PID)
 		}
 	}
-	if err == nil && b.dataRoot != "" {
-		err = b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
+	if b.dataRoot != "" {
+		if err := b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated"); err != nil {
+			return err
+		}
 	}
-	if err == nil && b.dataRoot != "" {
+	if b.dataRoot != "" {
 		activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
 			return fmt.Errorf("removing superseded active memory: %w", removeErr)
 		}
 	}
-	if err == nil && b.dataRoot != "" {
+	if b.dataRoot != "" {
 		latest, loadErr := b.containerStore().LoadContainer(target.container)
 		if loadErr != nil {
 			return loadErr
@@ -8817,7 +8819,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			}
 		}
 	}
-	return err
+	return nil
 }
 
 func (b *runtimeBackend) rehydrate(target selector) error {

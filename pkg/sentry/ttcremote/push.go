@@ -242,15 +242,16 @@ func (r *TCPPushReceiver) serveConn(conn io.ReadWriteCloser) {
 			return
 		}
 		responseType := tcpPushSkip
-		if result == pgalloc.RemotePageInstallInstalled {
+		switch result {
+		case pgalloc.RemotePageInstallInstalled:
 			responseType = tcpPushOK
 			r.mu.Lock()
 			r.receipts[key] = header.checksum
 			r.mu.Unlock()
 			r.installed.Add(uint64(header.length))
-		} else if result == pgalloc.RemotePageInstallResolved {
+		case pgalloc.RemotePageInstallResolved:
 			responseType = tcpPushResolved
-		} else {
+		default:
 			r.skipped.Add(uint64(header.length))
 		}
 		if err := writeTCPMessage(conn, tcpHeader{
@@ -282,7 +283,7 @@ func (r *TCPPushReceiver) Close() error {
 	return err
 }
 
-// TCPPushReceiverStats reports accepted and pull-owned bytes.
+// Stats reports accepted and pull-owned bytes.
 func (r *TCPPushReceiver) Stats() (installed, skipped uint64) {
 	return r.installed.Load(), r.skipped.Load()
 }

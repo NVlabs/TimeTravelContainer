@@ -1003,7 +1003,7 @@ func New(args Args) (*Loader, error) {
 	}
 
 	if len(args.Conf.TestOnlyAutosaveImagePath) != 0 {
-		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs)
+		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, args.SaveFDs)
 	}
 
 	metric.SentryEntryPointMetric.Increment(&metric.EntryPointTypeRunsc)

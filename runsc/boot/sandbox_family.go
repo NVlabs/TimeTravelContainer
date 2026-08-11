@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	gsync "gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -391,7 +392,9 @@ type consoleWaitLease struct {
 }
 
 type sandboxBranch struct {
-	opMu sync.Mutex
+	// Control leases may be released by the goroutine that waits for an exec
+	// or console operation rather than the goroutine that created the lease.
+	opMu gsync.CrossGoroutineMutex
 	// controlOps holds Kernel lifetime while branch-local controls are active.
 	// Destroy marks the branch destroying, terminates its tasks, then waits for
 	// these operations before releasing the Kernel.
