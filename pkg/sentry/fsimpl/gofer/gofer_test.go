@@ -58,6 +58,15 @@ func TestLiveForkFilesystemEligibility(t *testing.T) {
 	}
 }
 
+func TestLiveForkResourcePreservesSourceConnection(t *testing.T) {
+	fs := &filesystem{}
+	resource := &liveForkFilesystemResource{source: fs}
+	resource.preserveSharedConnection()
+	if !fs.iopts.LeakConnection {
+		t.Fatal("live-fork resource left the shared LISAFS connection branch-owned")
+	}
+}
+
 func TestDestroyIdempotent(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fs := filesystem{

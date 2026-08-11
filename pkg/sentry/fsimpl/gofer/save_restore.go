@@ -74,13 +74,22 @@ type liveForkFilesystemResource struct {
 	source *filesystem
 }
 
+// preserveSharedConnection transfers connection lifetime from the source
+// filesystem to the Sentry process. Live-fork children borrow the same
+// read-only LISAFS client, so no individual branch may close it when that
+// branch is destroyed. The process closes the underlying host descriptor when
+// the final branch causes the Sentry to exit.
+func (r *liveForkFilesystemResource) preserveSharedConnection() {
+	if r.source != nil {
+		r.source.iopts.LeakConnection = true
+	}
+}
+
 // PreserveForDehydration keeps the shared read-only LISAFS connection open
 // when the captured filesystem graph is released. Restored live-fork filesystems
 // already treat the connection and root control FD as borrowed.
 func (r *liveForkFilesystemResource) PreserveForDehydration() {
-	if r.source != nil {
-		r.source.iopts.LeakConnection = true
-	}
+	r.preserveSharedConnection()
 }
 
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
@@ -96,11 +105,17 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		if !ok || !root.controlFD.Ok() {
 			return fmt.Errorf("live fork cannot borrow gofer root for %q", fs.iopts.UniqueID)
 		}
-		resources[fs.iopts.UniqueID] = &liveForkFilesystemResource{
+		resource := &liveForkFilesystemResource{
 			client: fs.client,
 			rootFD: root.controlFD,
 			source: fs,
 		}
+		// The source and every child are lifecycle peers. Ensure that deleting
+		// the source cannot close the shared connection underneath a child (or
+		// trigger Loader's gofer-failure monitor against the replacement
+		// branch).
+		resource.preserveSharedConnection()
+		resources[fs.iopts.UniqueID] = resource
 	}
 
 	// Purge cached dentries, which may not be reopenable after restore due to
