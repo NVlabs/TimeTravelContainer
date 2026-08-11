@@ -86,7 +86,7 @@ class ClientTest(unittest.TestCase):
         payload = b"x" * ((1 << 20) + 17)
 
         def handler(conn, request):
-            self.assertEqual(request["args"], ["exec", "demo", "cat"])
+            self.assertEqual(request["args"], ["exec", "demo@main", "cat"])
             self.assertIs(request["stdin"], True)
             self.assertEqual(len(request["request_id"]), 32)
             received = bytearray()
@@ -107,7 +107,7 @@ class ClientTest(unittest.TestCase):
         with __import__("tempfile").TemporaryDirectory() as directory:
             daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
             try:
-                result = Client(daemon.path).command(["exec", "demo", "cat"], input=payload)
+                result = Client(daemon.path).command(["exec", "demo@main", "cat"], input=payload)
                 self.assertEqual(result.status, 7)
                 self.assertEqual(result.stdout, b"partial output")
                 with self.assertRaises(CommandFailed):

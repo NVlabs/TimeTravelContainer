@@ -2366,9 +2366,6 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 
 // MarkBranchDeleted retains branch lineage while marking its runtime state gone.
 func (s Store) MarkBranchDeleted(name, branchID string) error {
-	if branchID == "main" {
-		return errors.New("main branch is removed with its container family")
-	}
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
 	}
@@ -2381,6 +2378,14 @@ func (s Store) MarkBranchDeleted(name, branchID string) error {
 		if info.Branches[i].ID == branchID {
 			info.Branches[i].State = "deleted"
 			info.Branches[i].DeletedAt = &now
+			if branchID == "main" {
+				for _, peer := range info.Branches {
+					if peer.ID != branchID && peer.State != "deleted" {
+						info.State = peer.State
+						break
+					}
+				}
+			}
 			bindings := info.PublishedPorts[:0]
 			for _, binding := range info.PublishedPorts {
 				if binding.Branch() != branchID {

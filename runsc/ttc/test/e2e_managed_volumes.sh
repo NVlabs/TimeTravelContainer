@@ -90,9 +90,9 @@ CREATED_EXPORT="$TTC_E2E_ROOT/rootfs-created-export"
 printf 'offline-import\n' >"$HOST_IMPORT"
 ttc run -d --name "$ROOTFS_CONTAINER" "$BUSYBOX_IMAGE" \
   sh -c 'echo base >/rootfs-base; while :; do sleep 60; done' >/dev/null
-ttc fork "$ROOTFS_CONTAINER" child >/dev/null
+ttc fork "$ROOTFS_CONTAINER@main" "$ROOTFS_CONTAINER@child" >/dev/null
 ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
-ttc exec "$ROOTFS_CONTAINER" test ! -e /rootfs-child
+ttc exec "$ROOTFS_CONTAINER@main" test ! -e /rootfs-child
 ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
 find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/objects" -type f -size +0c | grep . >/dev/null ||
   fail "running rootfs did not create a non-empty disk object"
@@ -100,30 +100,30 @@ if find "$DATA_ROOT/containers/$ROOTFS_ID" -type f -name '*.tar' | grep . >/dev/
   fail "writable rootfs unexpectedly created a tar persistence image"
 fi
 ttc stop "$ROOTFS_CONTAINER@child" >/dev/null
-ttc stop "$ROOTFS_CONTAINER" >/dev/null
+ttc stop "$ROOTFS_CONTAINER@main" >/dev/null
 ttc cp "$ROOTFS_CONTAINER@child:/rootfs-child" "$CHILD_EXPORT"
 [ "$(cat "$CHILD_EXPORT")" = child ] ||
   fail "stopped child cp selected the wrong persistent rootfs branch"
-ttc cp "$HOST_IMPORT" "$ROOTFS_CONTAINER:/rootfs-offline-import"
+ttc cp "$HOST_IMPORT" "$ROOTFS_CONTAINER@main:/rootfs-offline-import"
 ttc start "$ROOTFS_CONTAINER" >/dev/null
-ttc exec "$ROOTFS_CONTAINER" sh -c '
+ttc exec "$ROOTFS_CONTAINER@main" sh -c '
   test "$(cat /rootfs-base)" = base
   test "$(cat /rootfs-offline-import)" = offline-import
   test ! -e /rootfs-child
 '
-ttc stop "$ROOTFS_CONTAINER" >/dev/null
+ttc stop "$ROOTFS_CONTAINER@main" >/dev/null
 ttc rm --force "$ROOTFS_CONTAINER" >/dev/null
 
 # A created-but-never-started container also has a complete persistent VFS
 # view for offline cp.
 ttc create --name "$CREATED_CONTAINER" "$BUSYBOX_IMAGE" sleep 60 >/dev/null
-ttc cp "$HOST_IMPORT" "$CREATED_CONTAINER:/created-import"
-ttc cp "$CREATED_CONTAINER:/created-import" "$CREATED_EXPORT"
+ttc cp "$HOST_IMPORT" "$CREATED_CONTAINER@main:/created-import"
+ttc cp "$CREATED_CONTAINER@main:/created-import" "$CREATED_EXPORT"
 [ "$(cat "$CREATED_EXPORT")" = offline-import ] ||
   fail "created-container offline cp did not round-trip"
 ttc start "$CREATED_CONTAINER" >/dev/null
-ttc exec "$CREATED_CONTAINER" test -f /created-import
-ttc stop "$CREATED_CONTAINER" >/dev/null
+ttc exec "$CREATED_CONTAINER@main" test -f /created-import
+ttc stop "$CREATED_CONTAINER@main" >/dev/null
 ttc rm "$CREATED_CONTAINER" >/dev/null
 
 # A writable host path is a live read-only lower with a private persistent
@@ -134,9 +134,9 @@ mkdir -p "$HOST_COW_SOURCE"
 printf 'host-lower\n' >"$HOST_COW_SOURCE/value"
 ttc run -d --name "$HOST_COW_CONTAINER" -v "$HOST_COW_SOURCE:/data" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
-[ "$(ttc exec "$HOST_COW_CONTAINER" cat /data/value)" = host-lower ] ||
+[ "$(ttc exec "$HOST_COW_CONTAINER@main" cat /data/value)" = host-lower ] ||
   fail "writable host mount did not expose its lower"
-ttc exec "$HOST_COW_CONTAINER" sh -c 'echo parent >/data/value; echo parent-created >/data/created'
+ttc exec "$HOST_COW_CONTAINER@main" sh -c 'echo parent >/data/value; echo parent-created >/data/created'
 [ "$(cat "$HOST_COW_SOURCE/value")" = host-lower ] ||
   fail "writable host mount modified its host lower"
 test ! -e "$HOST_COW_SOURCE/created" ||
@@ -144,7 +144,7 @@ test ! -e "$HOST_COW_SOURCE/created" ||
 HOST_COW_ID=$(ttc inspect -f '{{.Id}}' "$HOST_COW_CONTAINER")
 find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
   fail "writable host mount did not write directly to a private repository"
-ttc fork "$HOST_COW_CONTAINER" child >/dev/null
+ttc fork "$HOST_COW_CONTAINER@main" "$HOST_COW_CONTAINER@child" >/dev/null
 ttc exec "$HOST_COW_CONTAINER@child" sh -c 'test "$(cat /data/value)" = parent; echo child >/data/value; echo child >/data/child'
 ttc exec "$HOST_COW_CONTAINER@main" sh -c 'test "$(cat /data/value)" = parent; test ! -e /data/child'
 printf 'host-added\n' >"$HOST_COW_SOURCE/added"
@@ -152,34 +152,34 @@ for branch in main child; do
   ttc exec "$HOST_COW_CONTAINER@$branch" sh -c 'test "$(cat /data/added)" = host-added'
 done
 HOST_COW_CHECKPOINT="$TTC_E2E_ROOT/host-cow-checkpoint.ttc"
-ttc checkpoint "$HOST_COW_CONTAINER" "$HOST_COW_CHECKPOINT" >/dev/null
+ttc checkpoint "$HOST_COW_CONTAINER@main" "$HOST_COW_CHECKPOINT" >/dev/null
 printf 'host-after-checkpoint\n' >"$HOST_COW_SOURCE/added"
 ttc restore --name "$HOST_COW_RESTORED" "$HOST_COW_CHECKPOINT" >/dev/null
-ttc exec "$HOST_COW_RESTORED" sh -c '
+ttc exec "$HOST_COW_RESTORED@main" sh -c '
   test "$(cat /data/value)" = parent
   test "$(cat /data/added)" = host-added
   echo restored >/data/added
 '
 [ "$(cat "$HOST_COW_SOURCE/added")" = host-after-checkpoint ] ||
   fail "restored writable host mount wrote through to the original host"
-ttc stop "$HOST_COW_RESTORED" >/dev/null
+ttc stop "$HOST_COW_RESTORED@main" >/dev/null
 ttc rm "$HOST_COW_RESTORED" >/dev/null
 ttc stop "$HOST_COW_CONTAINER@child" >/dev/null
-ttc stop "$HOST_COW_CONTAINER" >/dev/null
+ttc stop "$HOST_COW_CONTAINER@main" >/dev/null
 HOST_COW_EXPORT="$TTC_E2E_ROOT/host-cow-export"
 HOST_COW_IMPORT="$TTC_E2E_ROOT/host-cow-import"
 printf 'offline-host-mount\n' >"$HOST_COW_IMPORT"
-ttc cp "$HOST_COW_CONTAINER:/data/value" "$HOST_COW_EXPORT"
+ttc cp "$HOST_COW_CONTAINER@main:/data/value" "$HOST_COW_EXPORT"
 [ "$(cat "$HOST_COW_EXPORT")" = parent ] ||
   fail "stopped-container cp did not read the writable host mount upper"
-ttc cp "$HOST_COW_IMPORT" "$HOST_COW_CONTAINER:/data/offline"
+ttc cp "$HOST_COW_IMPORT" "$HOST_COW_CONTAINER@main:/data/offline"
 ttc start "$HOST_COW_CONTAINER" >/dev/null
-ttc exec "$HOST_COW_CONTAINER" sh -c '
+ttc exec "$HOST_COW_CONTAINER@main" sh -c '
   test "$(cat /data/value)" = parent
   test "$(cat /data/created)" = parent-created
   test "$(cat /data/offline)" = offline-host-mount
 '
-ttc stop "$HOST_COW_CONTAINER" >/dev/null
+ttc stop "$HOST_COW_CONTAINER@main" >/dev/null
 ttc rm "$HOST_COW_CONTAINER" >/dev/null
 
 # :copy explicitly imports the complete source and then severs the runtime
@@ -195,7 +195,7 @@ ttc run -d --name "$HOST_COPY_CONTAINER" \
   "$BUSYBOX_IMAGE" sh -c 'while :; do sleep 60; done' >/dev/null
 printf 'host-mutated\n' >"$HOST_COPY_SOURCE/sub/value"
 printf 'host-mutated\n' >"$HOST_COPY_FILE"
-ttc exec "$HOST_COPY_CONTAINER" sh -c '
+ttc exec "$HOST_COPY_CONTAINER@main" sh -c '
   test "$(cat /copied/sub/value)" = copied-directory
   test "$(cat /single)" = copied-file
   echo container >/copied/sub/value
@@ -206,17 +206,17 @@ ttc exec "$HOST_COPY_CONTAINER" sh -c '
 [ "$(cat "$HOST_COPY_FILE")" = host-mutated ] ||
   fail ":copy file wrote through to the host"
 HOST_COPY_CHECKPOINT="$TTC_E2E_ROOT/host-copy-checkpoint.ttc"
-ttc checkpoint "$HOST_COPY_CONTAINER" "$HOST_COPY_CHECKPOINT" >/dev/null
+ttc checkpoint "$HOST_COPY_CONTAINER@main" "$HOST_COPY_CHECKPOINT" >/dev/null
 rm -rf "$HOST_COPY_SOURCE"
 rm -f "$HOST_COPY_FILE"
 ttc restore --name "$HOST_COPY_RESTORED" "$HOST_COPY_CHECKPOINT" >/dev/null
-ttc exec "$HOST_COPY_RESTORED" sh -c '
+ttc exec "$HOST_COPY_RESTORED@main" sh -c '
   test "$(cat /copied/sub/value)" = container
   test "$(cat /single)" = container-file
 '
-ttc stop "$HOST_COPY_RESTORED" >/dev/null
+ttc stop "$HOST_COPY_RESTORED@main" >/dev/null
 ttc rm "$HOST_COPY_RESTORED" >/dev/null
-ttc fork "$HOST_COPY_CONTAINER" child >/dev/null
+ttc fork "$HOST_COPY_CONTAINER@main" "$HOST_COPY_CONTAINER@child" >/dev/null
 ttc exec "$HOST_COPY_CONTAINER@child" sh -c 'echo child >/copied/sub/value; echo child-file >/single'
 ttc exec "$HOST_COPY_CONTAINER@main" sh -c '
   test "$(cat /copied/sub/value)" = container
@@ -225,9 +225,9 @@ ttc exec "$HOST_COPY_CONTAINER@main" sh -c '
 [ "$(ttc inspect -f '{{(index .Mounts 0).Mode}}|{{(index .Mounts 1).Mode}}|{{len .TTC.ExternalViews}}' "$HOST_COPY_CONTAINER")" = \
   "rw,copy|rw,copy|0" ] || fail ":copy inspection did not report detached mounts"
 ttc stop "$HOST_COPY_CONTAINER@child" >/dev/null
-ttc stop "$HOST_COPY_CONTAINER" >/dev/null
+ttc stop "$HOST_COPY_CONTAINER@main" >/dev/null
 HOST_COPY_EXPORT="$TTC_E2E_ROOT/host-copy-export"
-ttc cp "$HOST_COPY_CONTAINER:/single" "$HOST_COPY_EXPORT"
+ttc cp "$HOST_COPY_CONTAINER@main:/single" "$HOST_COPY_EXPORT"
 [ "$(cat "$HOST_COPY_EXPORT")" = container-file ] ||
   fail "stopped-container cp did not read a copied single-file mount"
 ttc rm "$HOST_COPY_CONTAINER" >/dev/null
@@ -246,7 +246,7 @@ ttc volume rm "$SEEDED_VOLUME" "$EMPTY_VOLUME" >/dev/null
 ttc volume create "$VOLUME" >/dev/null
 ttc run -d --name "$MAIN" -v "$VOLUME:/data" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
-ttc exec "$MAIN" sh -c '
+ttc exec "$MAIN@main" sh -c '
   printf "base\n" >/data/value
   mkdir /data/sub
   ln /data/value /data/sub/hard
@@ -265,9 +265,9 @@ if find "$DATA_ROOT/volumes-v2" -type f -name '*.tar' | grep . >/dev/null; then
   fail "managed volume unexpectedly created a tar persistence image"
 fi
 
-ttc stop "$MAIN" >/dev/null
+ttc stop "$MAIN@main" >/dev/null
 ttc start "$MAIN" >/dev/null
-ttc exec "$MAIN" sh -c '
+ttc exec "$MAIN@main" sh -c '
   test "$(cat /data/value)" = base
   test "$(cat /data/sub/hard)" = base
   test "$(readlink /data/sub/sym)" = ../value
@@ -276,7 +276,7 @@ ttc exec "$MAIN" sh -c '
 '
 
 # Writes before and between nested forks must produce the expected tree.
-ttc fork "$MAIN" f1 >/dev/null
+ttc fork "$MAIN@main" "$MAIN@f1" >/dev/null
 
 # Start both branches' first writers before either writer exits. Detached exec
 # creation is serialized by ttcd, but the guest writers overlap after sleep.
@@ -297,8 +297,8 @@ ttc exec "$MAIN@f1" sh -c 'test "$(cat /data/race)" = round1-f1-009'
 
 ttc exec "$MAIN@main" sh -c 'echo main-1 >>/data/value; echo main >/data/main-only'
 ttc exec "$MAIN@f1" sh -c 'echo f1-1 >>/data/value; echo f1 >/data/f1-only; mv /data/sub /data/f1-sub'
-ttc fork "$MAIN@main" f2 >/dev/null
-ttc fork "$MAIN@f1" g1 >/dev/null
+ttc fork "$MAIN@main" "$MAIN@f2" >/dev/null
+ttc fork "$MAIN@f1" "$MAIN@g1" >/dev/null
 
 # Every side of both second-generation forks now writes the same inherited
 # pathname concurrently. This exercises simultaneous first-writer object
@@ -361,7 +361,7 @@ ttc exec -d "$MAIN@main" sh -c '
 for unused in $(seq 1 50); do
   ttc exec "$MAIN@main" test -e /tmp/fd-ready && break
 done
-ttc fork "$MAIN@main" fdchild >/dev/null
+ttc fork "$MAIN@main" "$MAIN@fdchild" >/dev/null
 ttc exec "$MAIN@main" sh -c 'echo parent-fd >/tmp/fd-content; touch /tmp/fd-go'
 ttc exec "$MAIN@fdchild" sh -c 'echo child-fd >/tmp/fd-content; touch /tmp/fd-go'
 for branch in main fdchild; do
@@ -376,12 +376,12 @@ ttc exec "$MAIN@fdchild" sh -c 'test "$(tail -n 1 /data/openfd)" = child-fd'
 # map to distinct repository branch keys.
 ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
-ttc fork "$SECOND" f1 >/dev/null
+ttc fork "$SECOND@main" "$SECOND@f1" >/dev/null
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
 ttc daemon stop >/dev/null
 ttc "$@"
 ttc start "$MAIN" >/dev/null
-ttc exec "$MAIN" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
+ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
 
 echo "ttc managed-volume e2e: PASS"

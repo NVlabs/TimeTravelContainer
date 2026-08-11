@@ -2333,7 +2333,7 @@ func (s *Sandbox) RehydrateBranch(id string) error {
 	return nil
 }
 
-// DestroyBranch destroys one non-default in-memory branch.
+// DestroyBranch destroys one in-memory branch.
 func (s *Sandbox) DestroyBranch(id string) error {
 	if err := s.call(boot.ContMgrDestroyBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
 		return fmt.Errorf("destroying live branch %q: %w", id, err)

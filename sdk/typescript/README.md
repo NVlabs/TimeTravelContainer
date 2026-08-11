@@ -23,7 +23,7 @@ console.log(await ttc.ping());
 (await ttc.pull("alpine:3.20")).check();
 (await ttc.run("alpine:3.20", ["sleep", "infinity"],
                ["-d", "--name", "demo"])).check();
-(await ttc.fork("demo", "demo@experiment")).check();
+(await ttc.fork("demo@main", "demo@experiment")).check();
 (await ttc.dehydrate("demo@experiment")).check();
 (await ttc.rehydrate("demo@experiment")).check();
 
@@ -33,7 +33,7 @@ console.log(result.stdoutText());
 result.check();
 ```
 
-Use `client.command(["port", "ls", "--json", "demo"])` for any
+Use `client.command(["port", "ls", "--json", "demo@main"])` for any
 non-interactive TTC command. Results keep stdout, stderr, and exit status
 separate. Pass `input` for stdin and an explicit `requestId` when deliberately
 retrying the same mutation.

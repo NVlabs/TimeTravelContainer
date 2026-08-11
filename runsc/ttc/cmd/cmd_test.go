@@ -82,7 +82,7 @@ func TestParseSelector(t *testing.T) {
 		want  selector
 		err   bool
 	}{
-		{input: "web", want: selector{container: "web", branch: "main"}},
+		{input: "web", err: true},
 		{input: "web@test-a", want: selector{container: "web", branch: "test-a"}},
 		{input: "", err: true},
 		{input: "@child", err: true},
@@ -115,10 +115,10 @@ func TestPortCommandsAreBranchAware(t *testing.T) {
 		t.Errorf("publish=(%+v, %+v)", b.publishedTarget, b.publishedBinding)
 	}
 	stdout.Reset()
-	if status := runCommand([]string{"port", "ls", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"port", "ls", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("port ls status=%d, stderr=%q", status, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "web@main") || !strings.Contains(stdout.String(), "web@child") {
+	if !strings.Contains(stdout.String(), "web@main") || strings.Contains(stdout.String(), "web@child") {
 		t.Errorf("port ls output=%q", stdout.String())
 	}
 	stdout.Reset()
@@ -480,7 +480,7 @@ func TestForkRejectsRemovedCheckFlag(t *testing.T) {
 func TestForkGeneratesDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if !strings.HasPrefix(b.forkDestination, "fork-") {
@@ -494,7 +494,7 @@ func TestForkGeneratesDestination(t *testing.T) {
 func TestForkCreatesSiblingBatch(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "web@main", "a", "web@b", "c"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "web@main", "web@a", "web@b", "web@c"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := b.forkDestinations, []string{"a", "b", "c"}; !reflect.DeepEqual(got, want) {
@@ -543,7 +543,7 @@ func (b *fakeDistributedBackend) forkRemoteMany(source selector, targetNode stri
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "remote" || !b.targetPaused {
@@ -557,7 +557,7 @@ func TestForkTargetsRemoteNode(t *testing.T) {
 func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote-a@main", "remote-b@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := b.targetContainers, []string{"remote-a", "remote-b"}; !reflect.DeepEqual(got, want) {
@@ -568,10 +568,24 @@ func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 	}
 }
 
+func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
+	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"fork", "--target", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+	}
+	if !strings.HasPrefix(b.targetContainer, "fork-") {
+		t.Fatalf("generated remote container=%q", b.targetContainer)
+	}
+	if got, want := stdout.String(), b.targetContainer+"@main\n"; got != want {
+		t.Fatalf("fork output=%q, want %q", got, want)
+	}
+}
+
 func TestForkRejectsCrossFamilyDestination(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	status := runCommand([]string{"fork", "web", "other@child"}, &stdout, &stderr, b)
+	status := runCommand([]string{"fork", "web@main", "other@child"}, &stdout, &stderr, b)
 	if status != 1 {
 		t.Fatalf("status=%d, want 1", status)
 	}
@@ -580,7 +594,7 @@ func TestForkRejectsCrossFamilyDestination(t *testing.T) {
 	}
 }
 
-func TestBranchRMRejectsMain(t *testing.T) {
+func TestBranchRMRequiresQualifiedSelectorAndAcceptsMain(t *testing.T) {
 	b := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
 	status := runCommand([]string{"branch", "rm", "web"}, &stdout, &stderr, b)
@@ -589,6 +603,14 @@ func TestBranchRMRejectsMain(t *testing.T) {
 	}
 	if b.destroyed.container != "" {
 		t.Errorf("destroy unexpectedly called for %+v", b.destroyed)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"branch", "rm", "web@main"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("branch rm main status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.destroyed != (selector{container: "web", branch: "main"}) {
+		t.Errorf("destroy target=%+v", b.destroyed)
 	}
 }
 
@@ -1464,7 +1486,7 @@ func TestAttachStreamSelection(t *testing.T) {
 			b := &fakeBackend{}
 			var stdout, stderr bytes.Buffer
 			args := append([]string{"attach"}, test.args...)
-			args = append(args, "demo")
+			args = append(args, "demo@main")
 			if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 				t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 			}
@@ -1475,9 +1497,9 @@ func TestAttachStreamSelection(t *testing.T) {
 		})
 	}
 	for _, args := range [][]string{
-		{"attach", "--no-stdout", "--no-stderr", "demo"},
-		{"attach", "-i", "--no-stdin", "demo"},
-		{"attach", "-i", "--takeover", "demo"},
+		{"attach", "--no-stdout", "--no-stderr", "demo@main"},
+		{"attach", "-i", "--no-stdin", "demo@main"},
+		{"attach", "-i", "--takeover", "demo@main"},
 	} {
 		b := &fakeBackend{}
 		var stdout, stderr bytes.Buffer
@@ -1493,7 +1515,7 @@ func TestAttachStreamSelection(t *testing.T) {
 func TestAttachDetachIsSuccess(t *testing.T) {
 	b := &fakeBackend{err: errDetached}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"attach", "-i", "demo"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"attach", "-i", "demo@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("attach status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := b.attached.detachKeys, defaultDetachKeys; !bytes.Equal(got, want) {
@@ -1564,13 +1586,13 @@ func TestLogs(t *testing.T) {
 	if options.Since == nil || options.Since.Format(time.RFC3339Nano) != since || options.Until == nil || options.Until.Format(time.RFC3339Nano) != until {
 		t.Errorf("logs time options=%+v", options)
 	}
-	if status := runCommand([]string{"logs", "--tail", "invalid", "demo"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"logs", "--tail", "invalid", "demo@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("logs with Docker-compatible invalid tail status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.logsOptions.Tail != -1 {
 		t.Errorf("invalid --tail selected %d, want all (-1)", b.logsOptions.Tail)
 	}
-	if status := runCommand([]string{"logs", "--since", "not-a-time", "demo"}, &stdout, &stderr, b); status == 0 {
+	if status := runCommand([]string{"logs", "--since", "not-a-time", "demo@main"}, &stdout, &stderr, b); status == 0 {
 		t.Fatal("logs accepted an invalid --since value")
 	}
 }
@@ -1993,7 +2015,7 @@ func TestParseExecSelectorRejectsInvalidValues(t *testing.T) {
 func TestExecForwardsProcessExitStatus(t *testing.T) {
 	b := &fakeBackend{execStatus: 23}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"exec", "demo", "false"}, &stdout, &stderr, b); status != 23 {
+	if status := runCommand([]string{"exec", "demo@main", "false"}, &stdout, &stderr, b); status != 23 {
 		t.Fatalf("exec status=%d, want 23; stderr=%q", status, stderr.String())
 	}
 }
@@ -2264,7 +2286,7 @@ func TestStopEscalatesToKill(t *testing.T) {
 		},
 	}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"stop", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"stop", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("stop status=%d, stderr=%q", status, stderr.String())
 	}
 	if len(b.signals) != 2 || b.signals[0].signal != 12 || b.signals[1].signal != 9 {
@@ -2283,7 +2305,7 @@ func TestStopAcceptsGracefulExitRacingWithKill(t *testing.T) {
 		},
 	}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"stop", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"stop", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("stop race status=%d, stderr=%q", status, stderr.String())
 	}
 }
@@ -2298,7 +2320,7 @@ func TestStopTimeoutOverride(t *testing.T) {
 		},
 	}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"stop", "--time", "0", "web"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"stop", "--time", "0", "web@main"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("stop override status=%d, stderr=%q", status, stderr.String())
 	}
 	if len(b.signals) != 2 || b.signals[0].signal != 15 || b.signals[1].signal != 9 {
@@ -2314,7 +2336,7 @@ func TestWaitPrintsDockerExitCodesInArgumentOrder(t *testing.T) {
 		child: uint32(syscall.SIGTERM),
 	}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"container", "wait", "web", "web@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"container", "wait", "web@main", "web@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("wait status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), "7\n143\n"; got != want {

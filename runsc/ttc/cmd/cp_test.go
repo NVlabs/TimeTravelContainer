@@ -50,8 +50,8 @@ func TestSplitCopyContainerEndpoint(t *testing.T) {
 		path      string
 	}{
 		{"demo@child:/src/.", true, selector{container: "demo", branch: "child"}, "/src/."},
-		{"demo:relative", true, selector{container: "demo", branch: defaultBranchID}, "/relative"},
-		{"demo:/.", true, selector{container: "demo", branch: defaultBranchID}, "/"},
+		{"demo@main:relative", true, selector{container: "demo", branch: defaultBranchID}, "/relative"},
+		{"demo@main:/.", true, selector{container: "demo", branch: defaultBranchID}, "/"},
 		{"./local:name", false, selector{}, ""},
 		{"/tmp/local", false, selector{}, ""},
 	} {
@@ -132,7 +132,7 @@ func TestOfflineCopySpecRejectsLegacyWritableRoot(t *testing.T) {
 }
 
 func TestNormalizeCopyCommandArgsResolvesHostPath(t *testing.T) {
-	args, err := normalizeCopyCommandArgs([]string{"cp", "-a", "local/.", "demo:/dest"})
+	args, err := normalizeCopyCommandArgs([]string{"cp", "-a", "local/.", "demo@main:/dest"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestNormalizeCopyCommandArgsResolvesHostPath(t *testing.T) {
 	if got := args[len(args)-2]; got != want+string(filepath.Separator)+"." {
 		t.Fatalf("normalized source=%q, want %q", got, want+string(filepath.Separator)+".")
 	}
-	if args[len(args)-1] != "demo:/dest" {
+	if args[len(args)-1] != "demo@main:/dest" {
 		t.Fatalf("container destination changed to %q", args[len(args)-1])
 	}
 }

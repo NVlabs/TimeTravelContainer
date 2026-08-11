@@ -246,6 +246,7 @@ go_test(
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/vfs",
+        "//pkg/ttcvolume",
         "//pkg/usermem",
         "//pkg/sentry/platform/systrap",
     ],

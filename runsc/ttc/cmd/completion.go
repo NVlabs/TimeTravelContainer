@@ -233,7 +233,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return []string{"rm"}, nil
 		}
 		if rest[0] == "rm" {
-			return familyCompletionCandidates(backend, true, false)
+			return familyCompletionCandidates(backend, true, true)
 		}
 		return nil, nil
 	case "port":
@@ -271,8 +271,8 @@ func familyCompletionCandidates(backend backend, branches, includeMain bool) ([]
 	var candidates []string
 	for _, family := range families {
 		name := familyDisplayName(family)
-		candidates = append(candidates, name)
 		if !branches {
+			candidates = append(candidates, name)
 			continue
 		}
 		for _, branch := range family.Branches {

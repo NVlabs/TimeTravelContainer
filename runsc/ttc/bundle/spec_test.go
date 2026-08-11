@@ -1062,6 +1062,16 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if withHistory.Branches[1].State != "deleted" || withHistory.Branches[2].State != "exited" {
 		t.Errorf("family exit states=%+v, want tombstone plus exited descendant", withHistory.Branches)
 	}
+	if err := store.MarkBranchDeleted("demo", "main"); err != nil {
+		t.Fatalf("MarkBranchDeleted(main): %v", err)
+	}
+	withHistory, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatalf("LoadContainer after main deletion: %v", err)
+	}
+	if withHistory.Branches[0].State != "deleted" || withHistory.State != "exited" {
+		t.Errorf("main deletion state=%q branches=%+v, want deleted main and peer-derived exited family", withHistory.State, withHistory.Branches)
+	}
 	if containers[0].ConsoleLogMaxBytes != 8<<20 || containers[0].ConsoleLogMaxFiles != 5 {
 		t.Errorf("retention after metadata update=(%d, %d), want (%d, 5)", containers[0].ConsoleLogMaxBytes, containers[0].ConsoleLogMaxFiles, 8<<20)
 	}

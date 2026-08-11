@@ -465,7 +465,7 @@ mod tests {
         let expected = vec![b'x'; STDIN_WINDOW + 29];
         let server_expected = expected.clone();
         let server = mock_server(&path, move |mut stream, request| {
-            assert_eq!(request["args"], json!(["exec", "demo", "cat"]));
+            assert_eq!(request["args"], json!(["exec", "demo@main", "cat"]));
             assert_eq!(request["stdin"], true);
             assert_eq!(request["request_id"].as_str().unwrap().len(), 32);
             let mut received = Vec::new();
@@ -484,7 +484,7 @@ mod tests {
         });
         let result = Client::new(&path)
             .command_with_options(
-                ["exec", "demo", "cat"],
+                ["exec", "demo@main", "cat"],
                 CommandOptions {
                     input: Some(expected),
                     ..Default::default()

@@ -331,7 +331,7 @@ Commands:
   unpause TARGET...               Resume branches (Docker alias)
   kill [OPTIONS] TARGET...        Send a signal to branch init processes
   stop [OPTIONS] TARGET...        Stop branches with TERM then KILL
-  branch rm TARGET...             Destroy one or more non-main branches
+  branch rm TARGET...             Destroy one or more branches
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
@@ -345,8 +345,9 @@ Commands:
   daemon requests [OPTIONS]        List durable mutation requests
   daemon request inspect|resolve   Inspect or resolve an interrupted mutation
 
-Selectors use CONTAINER@BRANCH. Omitting @BRANCH selects main. Forked branches
-run immediately unless --paused is set; omitting DEST generates a branch ID.
+Branch selectors and fork destinations must use CONTAINER@BRANCH. Forked
+branches run immediately unless --paused is set; omitting DEST generates a
+branch ID.
 `)
 }
 
@@ -367,7 +368,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
-			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER[@BRANCH] FILE",
+			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
@@ -377,13 +378,13 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 	}
 	if len(args) == 3 && args[2] == "--help" {
 		usage := map[string]string{
-			"container pause":   "Usage: ttc container pause CONTAINER [CONTAINER...]",
-			"container unpause": "Usage: ttc container unpause CONTAINER [CONTAINER...]",
-			"container top":     "Usage: ttc container top CONTAINER [PS OPTIONS]",
+			"container pause":   "Usage: ttc container pause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"container unpause": "Usage: ttc container unpause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"container top":     "Usage: ttc container top CONTAINER@BRANCH [PS OPTIONS]",
 			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
 			"branch rm":         "Usage: ttc branch rm TARGET [TARGET...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
-			"port ls":           "Usage: ttc port ls [--json] CONTAINER[@BRANCH]",
+			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"exec wait":         "Usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID",
 		}
@@ -2163,7 +2164,7 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc attach [-i|--no-stdin] [--takeover] [--no-stdout] [--no-stderr] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttc attach [-i|--no-stdin] [--takeover] [--no-stdout] [--no-stderr] [--exec EXEC_ID] [--detach-keys KEYS] CONTAINER@BRANCH")
 	}
 	if *interactive && *noStdin {
 		return errors.New("--interactive and --no-stdin cannot be used together")
@@ -2266,7 +2267,7 @@ func runLogs(args []string, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc logs [-f] [--exec EXEC_ID] [--tail all|N] [--since TIME] [--until TIME] [-t] [--details] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttc logs [-f] [--exec EXEC_ID] [--tail all|N] [--since TIME] [--until TIME] [-t] [--details] CONTAINER@BRANCH")
 	}
 	tail := -1
 	if parsed, err := strconv.Atoi(*tailValue); err == nil && parsed >= 0 {
@@ -2340,7 +2341,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	usingProcess := *processPath != ""
 	if (!usingProcess && fs.NArg() < 2) || (usingProcess && fs.NArg() != 1) {
-		return errors.New("usage: ttc exec [OPTIONS] CONTAINER[@BRANCH] COMMAND [ARG...] | ttc exec [OPTIONS] --process FILE CONTAINER[@BRANCH]")
+		return errors.New("usage: ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND [ARG...] | ttc exec [OPTIONS] --process FILE CONTAINER@BRANCH")
 	}
 	if usingProcess && (len(env) != 0 || *cwd != "" || *user != "" || len(additionalGIDs) != 0 || len(capabilities) != 0 || *terminal) {
 		return errors.New("--process cannot be combined with --env, --workdir, --user, --additional-gids, --cap, or --tty")
@@ -2421,7 +2422,7 @@ func runExecList(args []string, stdout, stderr io.Writer, backend backend) error
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc exec ls [--json] CONTAINER[@BRANCH]")
+		return errors.New("usage: ttc exec ls [--json] CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -2451,7 +2452,7 @@ func runExecWait(args []string, stdout, stderr io.Writer, backend backend) error
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc exec wait CONTAINER[@BRANCH]:EXEC_ID")
+		return errors.New("usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID")
 	}
 	target, err := parseExecSelector(fs.Arg(0))
 	if err != nil {
@@ -2475,7 +2476,7 @@ func runExecKill(args []string, stdout, stderr io.Writer, backend backend) error
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc exec kill [--signal SIGNAL] CONTAINER[@BRANCH]:EXEC_ID")
+		return errors.New("usage: ttc exec kill [--signal SIGNAL] CONTAINER@BRANCH:EXEC_ID")
 	}
 	target, err := parseExecSelector(fs.Arg(0))
 	if err != nil {
@@ -3847,7 +3848,7 @@ func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
 		args = args[1:]
 	}
 	if len(args) < 1 {
-		return errors.New("usage: ttc top [--json] CONTAINER[@BRANCH] [PS OPTIONS]")
+		return errors.New("usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]")
 	}
 	target, err := parseSelector(args[0])
 	if err != nil {
@@ -3890,14 +3891,30 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	destinationValues := fs.Args()[1:]
 	if len(destinationValues) == 0 {
-		destinationValues = []string{"fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")}
+		generated := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+		if *targetNode != "" {
+			destinationValues = []string{generated + "@" + defaultBranchID}
+		} else {
+			destinationValues = []string{source.container + "@" + generated}
+		}
 	}
 	if *targetNode != "" {
 		distributed, ok := backend.(distributedForkBackend)
 		if !ok {
 			return errors.New("this backend does not support distributed forks")
 		}
-		targets, err := distributed.forkRemoteMany(source, *targetNode, destinationValues, *paused)
+		targetContainers := make([]string, len(destinationValues))
+		for i, value := range destinationValues {
+			target, err := parseSelector(value)
+			if err != nil {
+				return fmt.Errorf("invalid destination %q: %w", value, err)
+			}
+			if target.branch != defaultBranchID {
+				return fmt.Errorf("remote fork destination %q must name the new family's initial @%s branch", value, defaultBranchID)
+			}
+			targetContainers[i] = target.container
+		}
+		targets, err := distributed.forkRemoteMany(source, *targetNode, targetContainers, *paused)
 		if err != nil {
 			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, strings.Join(destinationValues, ", "), err)
 		}
@@ -4266,9 +4283,6 @@ func runBranch(args []string, stdout io.Writer, backend backend) error {
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)
 		}
-		if target.branch == defaultBranchID {
-			return fmt.Errorf("cannot remove main branch with 'branch rm'")
-		}
 		if err := backend.destroy(target); err != nil {
 			return fmt.Errorf("removing %s: %w", target, err)
 		}
@@ -4321,7 +4335,7 @@ func runPort(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 		if fs.NArg() != 1 {
-			return errors.New("usage: ttc port ls [--json] CONTAINER[@BRANCH]")
+			return errors.New("usage: ttc port ls [--json] CONTAINER@BRANCH")
 		}
 		value := fs.Arg(0)
 		target, err := parseSelector(value)
@@ -4332,15 +4346,13 @@ func runPort(args []string, stdout, stderr io.Writer, backend backend) error {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(value, "@") {
-			filtered := bindings[:0]
-			for _, binding := range bindings {
-				if binding.Branch() == target.branch {
-					filtered = append(filtered, binding)
-				}
+		filtered := bindings[:0]
+		for _, binding := range bindings {
+			if binding.Branch() == target.branch {
+				filtered = append(filtered, binding)
 			}
-			bindings = filtered
 		}
+		bindings = filtered
 		if *jsonOutput {
 			encoder := json.NewEncoder(stdout)
 			encoder.SetIndent("", "  ")
@@ -4383,6 +4395,9 @@ func parseSelector(value string) (selector, error) {
 	if value == "" {
 		return selector{}, errors.New("selector must not be empty")
 	}
+	if strings.Count(value, "@") == 0 {
+		return selector{}, fmt.Errorf("branch selector %q must be CONTAINER@BRANCH (for example, %s@%s)", value, value, defaultBranchID)
+	}
 	if strings.Count(value, "@") > 1 {
 		return selector{}, errors.New("selector contains multiple '@' separators")
 	}
@@ -4390,14 +4405,10 @@ func parseSelector(value string) (selector, error) {
 	if parts[0] == "" {
 		return selector{}, errors.New("container name must not be empty")
 	}
-	branch := defaultBranchID
-	if len(parts) == 2 {
-		if parts[1] == "" {
-			return selector{}, errors.New("branch name must not be empty")
-		}
-		branch = parts[1]
+	if parts[1] == "" {
+		return selector{}, errors.New("branch name must not be empty")
 	}
-	return selector{container: parts[0], branch: branch}, nil
+	return selector{container: parts[0], branch: parts[1]}, nil
 }
 
 type execSelector struct {
@@ -4408,7 +4419,7 @@ type execSelector struct {
 func parseExecSelector(value string) (execSelector, error) {
 	separator := strings.LastIndexByte(value, ':')
 	if separator <= 0 || separator == len(value)-1 {
-		return execSelector{}, errors.New("exec selector must be CONTAINER[@BRANCH]:EXEC_ID")
+		return execSelector{}, errors.New("exec selector must be CONTAINER@BRANCH:EXEC_ID")
 	}
 	target, err := parseSelector(value[:separator])
 	if err != nil {
@@ -4430,12 +4441,6 @@ func (s execSelector) String() string {
 }
 
 func parseDestination(containerID, value string) (selector, error) {
-	if !strings.Contains(value, "@") {
-		if value == "" {
-			return selector{}, errors.New("branch name must not be empty")
-		}
-		return selector{container: containerID, branch: value}, nil
-	}
 	destination, err := parseSelector(value)
 	if err != nil {
 		return selector{}, err
@@ -8625,6 +8630,18 @@ func (b *runtimeBackend) destroy(target selector) error {
 		return err
 	}
 	target = resolved
+	remaining := 0
+	for _, branch := range info.Branches {
+		if branch.State != "deleted" {
+			remaining++
+		}
+	}
+	if remaining == 1 {
+		// Removing the family's final branch also removes the now-empty family.
+		// Named volumes remain independently managed, matching a normal rm
+		// without --volumes.
+		return b.remove(target.container, true, false)
+	}
 	destroyRuntime := func() error {
 		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
 			return nil

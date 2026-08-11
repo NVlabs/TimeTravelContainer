@@ -89,15 +89,15 @@ ttc run -d --name "$CONTAINER" -v "$VOLUME:/data" "$BUSYBOX_IMAGE" \
 
 # A directory copied to a new destination uses that path exactly. The helper is
 # donated as an executable FD, so this operation does not depend on guest tar.
-ttc cp "$HOST_SOURCE" "$CONTAINER:/tmp/import"
-ttc exec "$CONTAINER" sh -c '
+ttc cp "$HOST_SOURCE" "$CONTAINER@main:/tmp/import"
+ttc exec "$CONTAINER@main" sh -c '
   test "$(cat /tmp/import/nested/value)" = binary
   test "$(readlink /tmp/import/symbolic)" = nested/value
   test /tmp/import/nested/value -ef /tmp/import/hard
   test "$(stat -c %a /tmp/import/nested/value)" = 640
 '
 
-ttc fork "$CONTAINER" child >/dev/null
+ttc fork "$CONTAINER@main" "$CONTAINER@child" >/dev/null
 printf 'parent\n' >"$TTC_E2E_ROOT/parent"
 printf 'child\n' >"$TTC_E2E_ROOT/child"
 ttc cp "$TTC_E2E_ROOT/parent" "$CONTAINER@main:/data/branch"

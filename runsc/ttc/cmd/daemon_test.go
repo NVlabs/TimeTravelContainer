@@ -432,14 +432,14 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 	}{
 		{[]string{"attach", "-i", "demo"}, true},
 		{[]string{"container", "attach", "-i", "demo"}, true},
-		{[]string{"exec", "-dit", "demo", "sh"}, true},
+		{[]string{"exec", "-dit", "demo@main", "sh"}, true},
 		{[]string{"run", "--interactive", "alpine"}, true},
 		{[]string{"start", "-ai", "demo"}, true},
-		{[]string{"cp", "-", "demo:/tmp"}, true},
-		{[]string{"cp", "local", "demo:/tmp"}, false},
-		{[]string{"cp", "demo:/tmp", "-"}, false},
+		{[]string{"cp", "-", "demo@main:/tmp"}, true},
+		{[]string{"cp", "local", "demo@main:/tmp"}, false},
+		{[]string{"cp", "demo@main:/tmp", "-"}, false},
 		{[]string{"exec", "ls", "demo"}, false},
-		{[]string{"exec", "demo", "true"}, false},
+		{[]string{"exec", "demo@main", "true"}, false},
 		{[]string{"logs", "-f", "demo"}, false},
 	} {
 		if got := daemonCommandUsesStdin(test.args); got != test.want {
@@ -459,8 +459,8 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"image", "rm", "alpine"}, true},
 		{[]string{"image", "pull", "alpine"}, true},
 		{[]string{"branch", "remove", "demo"}, true},
-		{[]string{"port", "publish", "demo", "8080:80"}, true},
-		{[]string{"port", "unpublish", "demo", "8080:80"}, true},
+		{[]string{"port", "publish", "demo@main", "8080:80"}, true},
+		{[]string{"port", "unpublish", "demo@main", "8080:80"}, true},
 		{[]string{"port", "ls", "demo"}, false},
 		{[]string{"run", "-d", "alpine"}, true},
 		{[]string{"run", "--detach=false", "alpine"}, false},
@@ -468,13 +468,13 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"start", "demo"}, true},
 		{[]string{"start", "-ai", "demo"}, false},
 		{[]string{"start", "--attach=false", "demo"}, true},
-		{[]string{"cp", "local", "demo:/tmp"}, true},
-		{[]string{"cp", "demo:/tmp", "local"}, true},
-		{[]string{"checkpoint", "demo", "/tmp/demo.ttc"}, true},
+		{[]string{"cp", "local", "demo@main:/tmp"}, true},
+		{[]string{"cp", "demo@main:/tmp", "local"}, true},
+		{[]string{"checkpoint", "demo@main", "/tmp/demo.ttc"}, true},
 		{[]string{"restore", "--name", "recovered", "/tmp/demo.ttc"}, true},
-		{[]string{"exec", "-d", "demo", "true"}, false},
-		{[]string{"logs", "-f", "demo"}, false},
-		{[]string{"wait", "demo"}, false},
+		{[]string{"exec", "-d", "demo@main", "true"}, false},
+		{[]string{"logs", "-f", "demo@main"}, false},
+		{[]string{"wait", "demo@main"}, false},
 	} {
 		if got := daemonCommandNeedsMutationLock(test.args); got != test.want {
 			t.Errorf("daemonCommandNeedsMutationLock(%q)=%t, want %t", test.args, got, test.want)
@@ -487,16 +487,16 @@ func TestDaemonCommandNeedsMutationJournal(t *testing.T) {
 		args []string
 		want bool
 	}{
-		{[]string{"cp", "local", "demo:/tmp"}, true},
-		{[]string{"cp", "-", "demo:/tmp"}, true},
-		{[]string{"cp", "demo:/tmp", "local"}, false},
-		{[]string{"cp", "demo:/tmp", "-"}, false},
-		{[]string{"fork", "demo", "child"}, true},
-		{[]string{"checkpoint", "demo", "/tmp/demo.ttc"}, false},
+		{[]string{"cp", "local", "demo@main:/tmp"}, true},
+		{[]string{"cp", "-", "demo@main:/tmp"}, true},
+		{[]string{"cp", "demo@main:/tmp", "local"}, false},
+		{[]string{"cp", "demo@main:/tmp", "-"}, false},
+		{[]string{"fork", "demo@main", "demo@child"}, true},
+		{[]string{"checkpoint", "demo@main", "/tmp/demo.ttc"}, false},
 		{[]string{"restore", "--name", "recovered", "/tmp/demo.ttc"}, true},
 		{[]string{"pull", "alpine"}, false},
 		{[]string{"image", "pull", "alpine"}, false},
-		{[]string{"logs", "demo"}, false},
+		{[]string{"logs", "demo@main"}, false},
 	} {
 		if got := daemonCommandNeedsMutationJournal(test.args); got != test.want {
 			t.Errorf("daemonCommandNeedsMutationJournal(%q)=%t, want %t", test.args, got, test.want)

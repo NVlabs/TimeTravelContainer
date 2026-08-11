@@ -85,7 +85,7 @@ func TestDaemonEventIncludesOutputRetentionSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &daemonServer{}
-	event := DaemonEvent{Type: "container", Action: "logs", Subject: "demo"}
+	event := DaemonEvent{Type: "container", Action: "logs", Subject: "demo@main"}
 	server.enrichConsoleRetentionEvent(root, &event)
 	if event.Attributes["output_evicted_bytes"] != "99" || event.Attributes["output_evicted_generations"] != "3" {
 		t.Fatalf("retention event attributes=%v", event.Attributes)

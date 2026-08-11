@@ -241,11 +241,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	if peer == nil {
 		return selector{}, fmt.Errorf("cluster target node %q is not configured", targetNode)
 	}
-	targetSelector, err := parseSelector(targetContainer)
-	if err != nil {
-		return selector{}, fmt.Errorf("target container: %w", err)
-	}
-	if targetSelector.container != targetContainer || targetSelector.branch != defaultBranchID {
+	if targetContainer == "" || strings.Contains(targetContainer, "@") {
 		return selector{}, fmt.Errorf("target container %q must not include a branch", targetContainer)
 	}
 	resolved, sourceInfo, err := b.resolveSelector(source)
@@ -416,11 +412,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	}
 	seenTargets := make(map[string]struct{}, len(targetContainers))
 	for _, targetContainer := range targetContainers {
-		targetSelector, err := parseSelector(targetContainer)
-		if err != nil {
-			return nil, fmt.Errorf("target container %q: %w", targetContainer, err)
-		}
-		if targetSelector.container != targetContainer || targetSelector.branch != defaultBranchID {
+		if targetContainer == "" || strings.Contains(targetContainer, "@") {
 			return nil, fmt.Errorf("target container %q must not include a branch", targetContainer)
 		}
 		if _, ok := seenTargets[targetContainer]; ok {

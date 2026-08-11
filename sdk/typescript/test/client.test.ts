@@ -76,7 +76,7 @@ test("command streams flow-controlled stdin and preserves status", async () => {
   const input = Buffer.alloc((1 << 20) + 23, 120);
   await withServer(
     (socket, request, rest) => {
-      assert.deepEqual(request.args, ["exec", "demo", "cat"]);
+      assert.deepEqual(request.args, ["exec", "demo@main", "cat"]);
       assert.equal(request.stdin, true);
       assert.equal((request.request_id as string).length, 32);
       let receive = rest;
@@ -108,7 +108,7 @@ test("command streams flow-controlled stdin and preserves status", async () => {
       consume();
     },
     async (path) => {
-      const result = await new Client(path).command(["exec", "demo", "cat"], { input });
+      const result = await new Client(path).command(["exec", "demo@main", "cat"], { input });
       assert.equal(result.status, 9);
       assert.equal(result.stderrText(), "failed\n");
       assert.throws(() => result.check(), CommandFailed);

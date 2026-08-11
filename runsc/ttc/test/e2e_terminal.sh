@@ -105,12 +105,12 @@ while [ "$i" -le 5 ]; do
 done
 
 ttc run -dit --name "$NAME" "$BUSYBOX_IMAGE" sh >/dev/null
-ttc fork "$NAME" "$NAME@child" >/dev/null
+ttc fork "$NAME@main" "$NAME@child" >/dev/null
 
 {
   sleep 1
   printf "echo parent-terminal-marker\r\020\021"
-} | run_pty "$TTC_E2E_ROOT/parent.typescript" "attach -i $NAME" >"$TTC_E2E_ROOT/parent.out"
+} | run_pty "$TTC_E2E_ROOT/parent.typescript" "attach -i $NAME@main" >"$TTC_E2E_ROOT/parent.out"
 {
   sleep 1
   printf "echo child-terminal-marker\r\020\021"
@@ -122,7 +122,7 @@ run_pty "$TTC_E2E_ROOT/exec.typescript" \
   "exec -it $NAME@child sh -c 'test -t 0 && test -t 1 && test -t 2 && stty -a >/dev/null && echo term:\$TERM && echo tty-exec-ok'" \
   >"$TTC_E2E_ROOT/exec.out"
 
-ttc logs "$NAME" >"$TTC_E2E_ROOT/parent.logs"
+ttc logs "$NAME@main" >"$TTC_E2E_ROOT/parent.logs"
 ttc logs "$NAME@child" >"$TTC_E2E_ROOT/child.logs"
 ttc ls --tree >"$TTC_E2E_ROOT/tree.out"
 

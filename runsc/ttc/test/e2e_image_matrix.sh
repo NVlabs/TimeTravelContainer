@@ -214,22 +214,22 @@ ttc start --attach "$BUSYBOX_PREFIX"
   fail "exited-container inspect did not expose exit state"
 ATTACH_STDOUT="$TTC_E2E_ROOT/attach.stdout"
 ATTACH_STDERR="$TTC_E2E_ROOT/attach.stderr"
-ttc attach --no-stderr "$PREFIX-busybox" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+ttc attach --no-stderr "$PREFIX-busybox@main" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
 grep -qx 'busybox-ok' "$ATTACH_STDOUT" || fail "stdout-only attach omitted stdout"
 [ -z "$(sed '/^ttc: warning:/d' "$ATTACH_STDERR")" ] || fail "stdout-only attach leaked stderr"
-ttc attach --no-stdout "$PREFIX-busybox" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+ttc attach --no-stdout "$PREFIX-busybox@main" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
 [ ! -s "$ATTACH_STDOUT" ] || fail "stderr-only attach leaked stdout"
 [ "$(sed '/^ttc: warning:/d' "$ATTACH_STDERR")" = busybox-err ] || fail "stderr-only attach omitted stderr"
 
 ttc run --name "$ATTACH_INPUT" --detach --interactive "$BUSYBOX_IMAGE" sh -c \
   'IFS= read -r value; test "$value" = stdin-ok; echo hidden-stdout; echo hidden-stderr >&2' >/dev/null
-printf 'stdin-ok\n' | ttc attach --interactive --no-stdout --no-stderr "$ATTACH_INPUT" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
+printf 'stdin-ok\n' | ttc attach --interactive --no-stdout --no-stderr "$ATTACH_INPUT@main" >"$ATTACH_STDOUT" 2>"$ATTACH_STDERR"
 [ ! -s "$ATTACH_STDOUT" ] || fail "stdin-only attach leaked stdout"
 [ -z "$(sed '/^ttc: warning:/d' "$ATTACH_STDERR")" ] || fail "stdin-only attach leaked stderr"
 [ "$(ttc inspect -f '{{.State.ExitCode}}' "$ATTACH_INPUT")" = 0 ] || fail "stdin-only attach did not deliver input"
 ttc rm "$ATTACH_INPUT"
 ttc container restart --time 1 "$PREFIX-busybox"
-[ "$(ttc container wait "$PREFIX-busybox")" = "0" ] ||
+[ "$(ttc container wait "$PREFIX-busybox@main")" = "0" ] ||
   fail "restart/wait did not preserve the BusyBox command exit status"
 ttc rm "$BUSYBOX_ID"
 ttc image inspect "$BUSYBOX_IMAGE" |
@@ -251,7 +251,7 @@ ttc container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
 MULTI_STARTED=$(ttc container start "$MULTI_A" "$MULTI_B")
 echo "$MULTI_STARTED" | grep -qx "$MULTI_A" || fail "multi-start omitted $MULTI_A"
 echo "$MULTI_STARTED" | grep -qx "$MULTI_B" || fail "multi-start omitted $MULTI_B"
-MULTI_WAIT=$(ttc wait "$MULTI_A" "$MULTI_B")
+MULTI_WAIT=$(ttc wait "$MULTI_A@main" "$MULTI_B@main")
 [ "$MULTI_WAIT" = "$(printf '3\n4')" ] || fail "multi-wait returned: $MULTI_WAIT"
 ttc container rm "$MULTI_A" "$MULTI_B"
 
@@ -269,11 +269,11 @@ while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
 done
 [ "$(ttc inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
   fail "inspect did not retain host network mode"
-if ttc fork "$HOSTNET" "$HOSTNET@rejected" >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
+if ttc fork "$HOSTNET@main" "$HOSTNET@rejected" >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
   fail "host-network container was incorrectly forked"
 fi
-ttc exec "$HOSTNET" true || fail "host-network source did not resume after rejected fork"
-ttc stop --time 1 "$HOSTNET"
+ttc exec "$HOSTNET@main" true || fail "host-network source did not resume after rejected fork"
+ttc stop --time 1 "$HOSTNET@main"
 ttc rm "$HOSTNET"
 
 echo "== rootless virtual NIC, NAT, publication, and live fork =="
@@ -312,7 +312,7 @@ while [ "$VNET_RESPONSE" != parent ]; do
 done
 [ "$(ttc inspect -f '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIP}}:{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostPort}}' "$VNET")" = "127.0.0.1:$PUBLISHED_PORT" ] ||
   fail "inspect omitted the persisted TTC port binding"
-ttc fork "$VNET" "$VNET@child" >/dev/null
+ttc fork "$VNET@main" "$VNET@child" >/dev/null
 ttc exec "$VNET@child" sh -c 'echo child >/www/index.html'
 [ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published host port switched away from the source branch after fork"
@@ -323,7 +323,7 @@ ttc port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
   fail "dynamically published child port did not reach the forked branch"
 ttc port ls "$VNET@child" | grep -q "127.0.0.1:$CHILD_PUBLISHED_PORT" ||
   fail "branch port listing omitted the dynamically published child port"
-ttc fork "$VNET" "$VNET@second" >/dev/null
+ttc fork "$VNET@main" "$VNET@second" >/dev/null
 ttc fork "$VNET@child" "$VNET@grandchild" >/dev/null
 ttc_daemon_crash
 ttc_daemon_start
@@ -340,7 +340,7 @@ ttc branch rm "$VNET@child"
 if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
   fail "deleted child branch left its published port reachable"
 fi
-if ttc port ls --json "$VNET" | grep -q '"branch_id": "child"'; then
+if ttc port ls --json "$VNET@main" | grep -q '"branch_id": "child"'; then
   fail "deleted child branch retained published-port metadata"
 fi
 ttc rm --force "$VNET"
@@ -390,30 +390,30 @@ while True:
     signal.pause()
 "
 deadline=$(( $(date +%s) + 15 ))
-until ttc logs "$PIDS_LIMIT" | grep -q pids-ready; do
+until ttc logs "$PIDS_LIMIT@main" | grep -q pids-ready; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "PID-limited container did not reach its cap"
   sleep 1
 done
 [ "$(ttc inspect -f "{{.HostConfig.PidsLimit}}" "$PIDS_LIMIT")" = 3 ] ||
   fail "inspect did not retain --pids-limit"
-if ttc exec "$PIDS_LIMIT" true >/dev/null 2>&1; then
+if ttc exec "$PIDS_LIMIT@main" true >/dev/null 2>&1; then
   fail "exec bypassed a full PID limit"
 fi
-ttc fork "$PIDS_LIMIT" "$PIDS_LIMIT@child"
+ttc fork "$PIDS_LIMIT@main" "$PIDS_LIMIT@child"
 if ttc exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "live-forked child lost its full PID limit"
 fi
-ttc kill --signal SIGUSR1 "$PIDS_LIMIT" >/dev/null
+ttc kill --signal SIGUSR1 "$PIDS_LIMIT@main" >/dev/null
 deadline=$(( $(date +%s) + 15 ))
-until ttc logs "$PIDS_LIMIT" | grep -q pids-released; do
+until ttc logs "$PIDS_LIMIT@main" | grep -q pids-released; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "parent branch did not release a PID slot"
   sleep 1
 done
-ttc exec "$PIDS_LIMIT" true
+ttc exec "$PIDS_LIMIT@main" true
 if ttc exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "parent PID release leaked into the child branch"
 fi
-ttc stop --time 1 "$PIDS_LIMIT@child" "$PIDS_LIMIT"
+ttc stop --time 1 "$PIDS_LIMIT@child" "$PIDS_LIMIT@main"
 ttc branch rm "$PIDS_LIMIT@child"
 ttc rm "$PIDS_LIMIT"
 
@@ -432,13 +432,13 @@ echo "== persisted stop signal and timeout policy =="
 ttc run --name "$STOP_POLICY" --detach --stop-signal SIGUSR1 --stop-timeout 3 \
   "$ALPINE_IMAGE" sh -c "trap \"exit 42\" USR1; echo stop-policy-ready; while :; do sleep 0.05; done"
 deadline=$(( $(date +%s) + 15 ))
-until ttc logs "$STOP_POLICY" | grep -q stop-policy-ready; do
+until ttc logs "$STOP_POLICY@main" | grep -q stop-policy-ready; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "custom-stop container did not become ready"
   sleep 1
 done
 [ "$(ttc inspect -f '{{.Config.StopSignal}}|{{.HostConfig.StopTimeout}}' "$STOP_POLICY")" = "SIGUSR1|3" ] ||
   fail "inspect did not retain custom stop policy"
-ttc stop "$STOP_POLICY"
+ttc stop "$STOP_POLICY@main"
 [ "$(ttc inspect -f '{{.State.ExitCode}}' "$STOP_POLICY")" = 42 ] ||
   fail "ttc stop did not deliver the configured SIGUSR1"
 ttc rm "$STOP_POLICY"
@@ -452,7 +452,7 @@ STRESS_LOG_STDERR="$TTC_E2E_ROOT/console-stress-log.stderr"
 ttc run --name "$CONSOLE_STRESS" "$PYTHON_IMAGE" python3 -c \
   'import sys; n=262144; sys.stdout.buffer.write(b"A"*n+b"\n"); sys.stdout.buffer.flush(); sys.stderr.buffer.write(b"B"*n+b"\n"); sys.stderr.buffer.flush()' \
   >"$STRESS_RUN_STDOUT" 2>"$STRESS_RUN_STDERR"
-ttc logs "$CONSOLE_STRESS" >"$STRESS_LOG_STDOUT" 2>"$STRESS_LOG_STDERR"
+ttc logs "$CONSOLE_STRESS@main" >"$STRESS_LOG_STDOUT" 2>"$STRESS_LOG_STDERR"
 
 EXPECTED_A=$( \
   { head -c "$STRESS_BYTES" /dev/zero | tr '\0' A; printf '\n'; } | \
@@ -474,12 +474,12 @@ ttc rm "$CONSOLE_STRESS"
 
 echo "== bounded log retention accounting =="
 ttc run --name "$RETENTION" --detach --log-opt max-size=128 --log-opt max-file=1 "$PYTHON_IMAGE" python3 -c 'import sys,time; [(sys.stdout.write("X"*96+"\n"),sys.stdout.flush(),time.sleep(0.02)) for _ in range(8)]' >/dev/null
-ttc wait "$RETENTION" >/dev/null
+ttc wait "$RETENTION@main" >/dev/null
 RETENTION_INSPECT="$TTC_E2E_ROOT/retention-inspect.json"
 ttc inspect "$RETENTION" >"$RETENTION_INSPECT"
 grep -Eq '"evicted_bytes": [1-9][0-9]*' "$RETENTION_INSPECT" || fail "inspect omitted evicted output bytes"
 grep -Eq '"evicted_generations": [1-9][0-9]*' "$RETENTION_INSPECT" || fail "inspect omitted evicted output generations"
-ttc logs "$RETENTION" >/dev/null
+ttc logs "$RETENTION@main" >/dev/null
 RETENTION_EVENTS="$TTC_E2E_ROOT/retention-events.jsonl"
 ttc events --json --filter action=logs >"$RETENTION_EVENTS"
 grep -q "\"subject\":\"$RETENTION\"" "$RETENTION_EVENTS" || fail "events omitted retention log subject"
@@ -491,7 +491,7 @@ ttc create --name "$NOLOG" --log-driver none "$BUSYBOX_IMAGE" sh -c "echo hidden
 [ "$(ttc inspect -f '{{.HostConfig.LogConfig.Type}}' "$NOLOG")" = "none" ] ||
   fail "inspect omitted the none log driver"
 ttc start "$NOLOG" >/dev/null
-if ttc logs "$NOLOG" >"$TTC_E2E_ROOT/nolog.out" 2>"$TTC_E2E_ROOT/nolog.err"; then
+if ttc logs "$NOLOG@main" >"$TTC_E2E_ROOT/nolog.out" 2>"$TTC_E2E_ROOT/nolog.err"; then
   fail "logs accepted a container configured with the none log driver"
 fi
 grep -q "does not support reading" "$TTC_E2E_ROOT/nolog.err" ||
@@ -528,7 +528,7 @@ LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
   fail "detached container was not addressable by ID prefix"
 
 deadline=$(( $(date +%s) + 15 ))
-while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
+while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached init did not produce console output"
   sleep 1
 done
@@ -544,7 +544,7 @@ ttc_daemon_start
   fail "restarted ttcd did not reconcile the running container"
 ttc daemon status | grep -q '"version":4' || fail "ttcd did not restart"
 deadline=$(( $(date +%s) + 15 ))
-while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
+while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
   sleep 1
 done
@@ -559,7 +559,7 @@ OLD_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE")
 kill -KILL "$OLD_SIDECAR_PID"
 deadline=$(( $(date +%s) + 15 ))
 while :; do
-  ttc logs --tail 10 "$LIFECYCLE" >/dev/null 2>&1 || true
+  ttc logs --tail 10 "$LIFECYCLE@main" >/dev/null 2>&1 || true
   NEW_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE" 2>/dev/null || true)
   if [ -n "$NEW_SIDECAR_PID" ] && [ "$NEW_SIDECAR_PID" != "$OLD_SIDECAR_PID" ] && kill -0 "$NEW_SIDECAR_PID" 2>/dev/null; then
     break
@@ -568,32 +568,32 @@ while :; do
   sleep 1
 done
 deadline=$(( $(date +%s) + 15 ))
-while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q "tick:"; do
+while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q "tick:"; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after sidecar replacement"
   sleep 1
 done
 
 ttc container restart --force --time 2 "$LIFECYCLE"
 deadline=$(( $(date +%s) + 15 ))
-while ! ttc logs --tail 10 "$LIFECYCLE" 2>/dev/null | grep -q 'tick:'; do
+while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "restarted detached init did not produce console output"
   sleep 1
 done
 
-ttc exec "$LIFECYCLE" grep -qx "$LIFECYCLE" /etc/hostname ||
+ttc exec "$LIFECYCLE@main" grep -qx "$LIFECYCLE" /etc/hostname ||
   fail "restarted container did not retain /etc/hostname"
-ttc exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" ||
+ttc exec "$LIFECYCLE@main" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" ||
   fail "restarted container did not retain generated network files"
 
-EXEC_GROUPS=$(ttc exec --user 123:456 --additional-gids 4242 --additional-gids 4243 "$LIFECYCLE" /bin/busybox id)
+EXEC_GROUPS=$(ttc exec --user 123:456 --additional-gids 4242 --additional-gids 4243 "$LIFECYCLE@main" /bin/busybox id)
 echo "$EXEC_GROUPS" | grep -q "4242,4243" || fail "exec supplementary groups missing: $EXEC_GROUPS"
-ttc exec --cap CAP_SYS_ADMIN "$LIFECYCLE" sh -c \
+ttc exec --cap CAP_SYS_ADMIN "$LIFECYCLE@main" sh -c \
   'set -- $(grep ^CapEff: /proc/self/status); value=$2; [ $((0x$value & 0x200000)) -ne 0 ]'
 PROCESS_JSON="$TTC_E2E_ROOT/process.json"
 printf '%s\n' \
   '{"terminal":false,"user":{"uid":123,"gid":456,"additionalGids":[4342,4343]},"args":["sh","-c","id; echo mark:$MARK"],"env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","MARK=process-ok"],"cwd":"/"}' \
   >"$PROCESS_JSON"
-PROCESS_OUTPUT=$(ttc exec --process "$PROCESS_JSON" "$LIFECYCLE")
+PROCESS_OUTPUT=$(ttc exec --process "$PROCESS_JSON" "$LIFECYCLE@main")
 echo "$PROCESS_OUTPUT" | grep -q 'groups=4342,4343' || fail "process JSON supplementary groups missing: $PROCESS_OUTPUT"
 echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environment missing: $PROCESS_OUTPUT"
 
@@ -602,61 +602,61 @@ echo "$PROCESS_OUTPUT" | grep -q 'mark:process-ok' || fail "process JSON environ
   fail "inspect omitted json-file retention policy"
 [ "$(ttc inspect -f '{{index .HostConfig.GroupAdd 0}}|{{index .HostConfig.CapAdd 0}}|{{index .HostConfig.CapDrop 0}}' "$LIFECYCLE")" = "4242|SYS_PTRACE|NET_RAW" ] ||
   fail "inspect omitted supplementary groups or capability changes"
-[ "$(ttc exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] ||
+[ "$(ttc exec "$LIFECYCLE@main" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] ||
   fail "restarted container did not retain /dev/shm size"
 [ "$(ttc inspect -f "{{.HostConfig.ReadonlyRootfs}}" "$LIFECYCLE")" = true ] || fail "inspect omitted read-only rootfs policy"
 [ "$(ttc inspect -f "{{index .HostConfig.ExtraHosts 0}}|{{index .HostConfig.ExtraHosts 1}}|{{index .HostConfig.Dns 0}}|{{index .HostConfig.DnsSearch 0}}|{{index .HostConfig.DnsOptions 0}}" "$LIFECYCLE")" = "ttc.local:192.0.2.10|v6.local:2001:db8::10|203.0.113.53|example.test|ndots:2" ] ||
   fail "inspect omitted Docker network configuration"
 
-if ttc exec "$LIFECYCLE" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&1; then
+if ttc exec "$LIFECYCLE@main" sh -c "echo forbidden >/root-forbidden" >/dev/null 2>&1; then
   fail "read-only root filesystem accepted a parent write"
 fi
-[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "parent state tmpfs was not initialized"
-[ "$(ttc exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
-[ "$(ttc exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "managed overlay did not retain the parent copy-up"
+[ "$(ttc exec "$LIFECYCLE@main" cat /state/value)" = "parent" ] || fail "parent state tmpfs was not initialized"
+[ "$(ttc exec "$LIFECYCLE@main" cat /scratch/value)" = "scratch-parent" ] || fail "parent tmpfs was not initialized"
+[ "$(ttc exec "$LIFECYCLE@main" cat /cow-host/value)" = "parent" ] || fail "managed overlay did not retain the parent copy-up"
 [ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "managed overlay modified its host lower"
-[ "$(ttc exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-readonly-two" ] || fail "second read-only host bind was not readable"
-[ "$(ttc exec "$LIFECYCLE" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
-ttc exec "$LIFECYCLE" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
+[ "$(ttc exec "$LIFECYCLE@main" cat /host-fixture-two/value)" = "host-readonly-two" ] || fail "second read-only host bind was not readable"
+[ "$(ttc exec "$LIFECYCLE@main" stat -c %a /scratch)" = "700" ] || fail "tmpfs mode was not applied"
+ttc exec "$LIFECYCLE@main" sh -c "test -r /alt-proc/self/status && test -r /alt-sys/kernel" ||
   fail "additional procfs/sysfs mounts were not readable"
 for path in /repeat-proc/1/status /nested/views/proc/self/status /repeat-sys/kernel /nested/views/sys/kernel; do
-  ttc exec "$LIFECYCLE" test -r "$path" || fail "nested or repeated pseudo-filesystem path $path was not readable"
+  ttc exec "$LIFECYCLE@main" test -r "$path" || fail "nested or repeated pseudo-filesystem path $path was not readable"
 done
-ttc exec "$LIFECYCLE" grep -Eq " /host-fixture ro(,| )" /proc/self/mountinfo || fail "read-only host bind lost its remount flag"
-ttc exec "$LIFECYCLE" awk '$5 == "/nested/views/proc" { split($6, options, ","); for (i in options) seen[options[i]] = 1; exit !(seen["ro"] && seen["nosuid"] && seen["nodev"] && seen["noexec"]) } END { if (!seen["ro"]) exit 1 }' /proc/self/mountinfo || fail "nested procfs mount flags were not retained"
-[ "$(ttc exec "$LIFECYCLE" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"
-if ttc exec "$LIFECYCLE" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
+ttc exec "$LIFECYCLE@main" grep -Eq " /host-fixture ro(,| )" /proc/self/mountinfo || fail "read-only host bind lost its remount flag"
+ttc exec "$LIFECYCLE@main" awk '$5 == "/nested/views/proc" { split($6, options, ","); for (i in options) seen[options[i]] = 1; exit !(seen["ro"] && seen["nosuid"] && seen["nodev"] && seen["noexec"]) } END { if (!seen["ro"]) exit 1 }' /proc/self/mountinfo || fail "nested procfs mount flags were not retained"
+[ "$(ttc exec "$LIFECYCLE@main" cat /host-fixture/value)" = "host-readonly" ] || fail "read-only host bind was not readable"
+if ttc exec "$LIFECYCLE@main" sh -c 'echo forbidden >/host-fixture/value' >/dev/null 2>&1; then
   fail "read-only host bind accepted a write"
 fi
 echo "== attached exec transactional fork rejection =="
-ttc exec "$LIFECYCLE" rm -f /state/attached-exec-ready /state/attached-exec-release
-ttc exec "$LIFECYCLE" sh -c \
+ttc exec "$LIFECYCLE@main" rm -f /state/attached-exec-ready /state/attached-exec-release
+ttc exec "$LIFECYCLE@main" sh -c \
   'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done' \
   >"$TTC_E2E_ROOT/attached-exec.out" 2>"$TTC_E2E_ROOT/attached-exec.err" &
 ATTACHED_EXEC_HOST_PID=$!
 deadline=$(( $(date +%s) + 15 ))
-while ! ttc exec "$LIFECYCLE" test -e /state/attached-exec-ready >/dev/null 2>&1; do
+while ! ttc exec "$LIFECYCLE@main" test -e /state/attached-exec-ready >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
   sleep 1
 done
-if ttc fork "$LIFECYCLE" "$LIFECYCLE@attached-rejected" >"$TTC_E2E_ROOT/attached-fork.out" 2>"$TTC_E2E_ROOT/attached-fork.err"; then
+if ttc fork "$LIFECYCLE@main" "$LIFECYCLE@attached-rejected" >"$TTC_E2E_ROOT/attached-fork.out" 2>"$TTC_E2E_ROOT/attached-fork.err"; then
   fail "live fork accepted an attached exec with imported host stdio"
 fi
 grep -Eq '\*host.fileDescription' "$TTC_E2E_ROOT/attached-fork.out" "$TTC_E2E_ROOT/attached-fork.err" ||
   fail "attached-exec rejection did not identify its imported host resource"
-ttc exec "$LIFECYCLE" touch /state/attached-exec-release
+ttc exec "$LIFECYCLE@main" touch /state/attached-exec-release
 wait "$ATTACHED_EXEC_HOST_PID" || fail "attached exec did not exit successfully"
 
-ttc fork "$LIFECYCLE_PREFIX" "$LIFECYCLE_PREFIX@child"
+ttc fork "$LIFECYCLE_PREFIX@main" "$LIFECYCLE_PREFIX@child"
 echo host-mutated >"$HOST_FIXTURE/value"
 echo host-mutated-two >"$HOST_FIXTURE_TWO/value"
-[ "$(ttc exec "$LIFECYCLE" cat /host-fixture/value)" = "host-mutated" ] || fail "parent did not observe host-side mutation"
+[ "$(ttc exec "$LIFECYCLE@main" cat /host-fixture/value)" = "host-mutated" ] || fail "parent did not observe host-side mutation"
 [ "$(ttc exec "$LIFECYCLE@child" cat /host-fixture/value)" = "host-mutated" ] || fail "child did not observe shared host-side mutation"
-[ "$(ttc exec "$LIFECYCLE" cat /host-fixture-two/value)" = "host-mutated-two" ] || fail "parent did not observe second host mutation"
+[ "$(ttc exec "$LIFECYCLE@main" cat /host-fixture-two/value)" = "host-mutated-two" ] || fail "parent did not observe second host mutation"
 [ "$(ttc exec "$LIFECYCLE@child" cat /host-fixture-two/value)" = "host-mutated-two" ] || fail "child did not observe second shared host mutation"
-[ "$(ttc exec "$LIFECYCLE" sh -c "ulimit -n")" = 256 ] || fail "parent exec did not inherit RLIMIT_NOFILE"
-[ "$(ttc exec "$LIFECYCLE" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "parent branch lost /dev/shm size"
-ttc exec "$LIFECYCLE" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "parent exec lost configured groups or capabilities"
+[ "$(ttc exec "$LIFECYCLE@main" sh -c "ulimit -n")" = 256 ] || fail "parent exec did not inherit RLIMIT_NOFILE"
+[ "$(ttc exec "$LIFECYCLE@main" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "parent branch lost /dev/shm size"
+ttc exec "$LIFECYCLE@main" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "parent exec lost configured groups or capabilities"
 [ "$(ttc exec "$LIFECYCLE@child" sh -c "ulimit -n")" = 256 ] || fail "live-forked child exec did not inherit RLIMIT_NOFILE"
 [ "$(ttc exec "$LIFECYCLE@child" sh -c 'df -k /dev/shm | tail -n 1 | xargs | cut -d" " -f2')" = 32768 ] || fail "live-forked child lost /dev/shm size"
 ttc exec "$LIFECYCLE@child" sh -c 'id -G | grep -qw 4242; set -- $(grep ^CapEff: /proc/self/status); [ $((0x$2 & 0x80000)) -ne 0 ]; [ $((0x$2 & 0x2000)) -eq 0 ]' || fail "child exec lost configured groups or capabilities"
@@ -664,7 +664,7 @@ for path in /repeat-proc/1/status /nested/views/proc/self/status /repeat-sys/ker
   ttc exec "$LIFECYCLE@child" test -r "$path" || fail "live-forked child lost pseudo-filesystem path $path"
 done
 
-ttc exec "$LIFECYCLE" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf" || fail "parent branch lost generated network files"
+ttc exec "$LIFECYCLE@main" sh -c "grep -Eq \"^192\.0\.2\.10[[:space:]]+ttc\.local$\" /etc/hosts; grep -qx \"nameserver 203.0.113.53\" /etc/resolv.conf" || fail "parent branch lost generated network files"
 ttc exec "$LIFECYCLE@child" sh -c "grep -Eq \"^2001:db8::10[[:space:]]+v6\.local$\" /etc/hosts; grep -qx \"search example.test\" /etc/resolv.conf; grep -qx \"options ndots:2\" /etc/resolv.conf" || fail "live-forked child lost generated network files"
 
 RUNNING_INSPECT=$(ttc inspect -f '{{.State.Status}}|{{.Config.Image}}|{{len .TTC.Branches}}' "$LIFECYCLE")
@@ -707,28 +707,28 @@ esac
 
 ttc exec "$LIFECYCLE@child" sh -c 'echo child >/state/value'
 ttc exec "$LIFECYCLE@child" sh -c "echo child >/cow-host/value; echo child-created >/cow-host/child-only"
-[ "$(ttc exec "$LIFECYCLE" cat /cow-host/value)" = "parent" ] || fail "child managed-overlay write leaked into parent"
+[ "$(ttc exec "$LIFECYCLE@main" cat /cow-host/value)" = "parent" ] || fail "child managed-overlay write leaked into parent"
 [ "$(ttc exec "$LIFECYCLE@child" cat /cow-host/value)" = "child" ] || fail "child managed-overlay copy-up was not retained"
 [ "$(cat "$HOST_COW_FIXTURE/value")" = "host-cow-lower" ] || fail "child managed-overlay write reached the host lower"
-[ "$(ttc exec "$LIFECYCLE" cat /state/value)" = "parent" ] || fail "child write leaked into parent state tmpfs"
+[ "$(ttc exec "$LIFECYCLE@main" cat /state/value)" = "parent" ] || fail "child write leaked into parent state tmpfs"
 [ "$(ttc exec "$LIFECYCLE@child" cat /state/value)" = "child" ] || fail "child state-tmpfs write was not retained"
 
 if ttc exec "$LIFECYCLE@child" sh -c "echo forbidden >/child-root-forbidden" >/dev/null 2>&1; then
   fail "read-only root filesystem accepted a child write"
 fi
 ttc exec "$LIFECYCLE@child" sh -c "echo scratch-child >/scratch/value"
-[ "$(ttc exec "$LIFECYCLE" cat /scratch/value)" = "scratch-parent" ] || fail "child write leaked into parent tmpfs"
+[ "$(ttc exec "$LIFECYCLE@main" cat /scratch/value)" = "scratch-parent" ] || fail "child write leaked into parent tmpfs"
 [ "$(ttc exec "$LIFECYCLE@child" cat /scratch/value)" = "scratch-child" ] || fail "child tmpfs write was not retained"
 
-ttc pause "$LIFECYCLE_PREFIX" "$LIFECYCLE_ID@child"
+ttc pause "$LIFECYCLE_PREFIX@main" "$LIFECYCLE_ID@child"
 PAUSED_INSPECT=$(ttc inspect -f '{{range .TTC.Branches}}{{.Metadata.ID}}={{.Metadata.State}} {{end}}' "$LIFECYCLE")
 echo "$PAUSED_INSPECT" | grep -q 'main=paused' || fail "inspect did not report paused main branch: $PAUSED_INSPECT"
 echo "$PAUSED_INSPECT" | grep -q 'child=paused' || fail "inspect did not report paused child branch: $PAUSED_INSPECT"
-ttc unpause "$LIFECYCLE" "$LIFECYCLE@child"
+ttc unpause "$LIFECYCLE@main" "$LIFECYCLE@child"
 ttc ps --all
-ttc top "$LIFECYCLE"
+ttc top "$LIFECYCLE@main"
 ttc ls --tree
-ttc logs --tail 2 "$LIFECYCLE"
+ttc logs --tail 2 "$LIFECYCLE@main"
 ttc logs --tail 2 "$LIFECYCLE@child"
 TIMESTAMPED_LOGS=$(ttc logs --timestamps --details --since 24h --until 0s "$LIFECYCLE@child")
 echo "$TIMESTAMPED_LOGS" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ FROM_FILE=lifecycle,suite=lifecycle tick:" || fail "timestamped detailed logs omitted attributes: $TIMESTAMPED_LOGS"
@@ -753,10 +753,10 @@ grep -q "retained by immutable lineage" "$TTC_E2E_ROOT/lineage-reuse.err" ||
   fail "branch ID reuse rejection lacked a lineage diagnostic"
 
 echo "== branch-native detached exec bookkeeping =="
-EXEC_SELECTOR=$(ttc exec --detach "$LIFECYCLE" sh -c 'exec sleep 300')
+EXEC_SELECTOR=$(ttc exec --detach "$LIFECYCLE@main" sh -c 'exec sleep 300')
 EXEC_ID=${EXEC_SELECTOR##*:}
 [ -n "$EXEC_ID" ] || fail "detached exec did not return a session ID"
-ttc fork "$LIFECYCLE" "$LIFECYCLE@process-child" >/dev/null
+ttc fork "$LIFECYCLE@main" "$LIFECYCLE@process-child" >/dev/null
 ttc fork "$LIFECYCLE@process-child" "$LIFECYCLE@process-grandchild" >/dev/null
 for branch in main process-child process-grandchild; do
   SESSION_JSON=$(ttc exec ls --json "$LIFECYCLE@$branch")
@@ -787,12 +787,12 @@ EVENT_UNTIL=$(( $(date +%s) + 3 ))
 ttc events --follow --json --since 0s --until "$EVENT_UNTIL" --filter action=pause >"$EVENT_FOLLOW" &
 EVENT_FOLLOW_PID=$!
 sleep 1
-ttc pause "$LIFECYCLE"
-ttc resume "$LIFECYCLE"
+ttc pause "$LIFECYCLE@main"
+ttc resume "$LIFECYCLE@main"
 wait "$EVENT_FOLLOW_PID" || fail "events follower failed"
 grep -q '"type":"branch".*"action":"pause"' "$EVENT_FOLLOW" || fail "events follower missed a new pause event"
 
-ttc stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE"
+ttc stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE@main"
 [ "$(ttc inspect -f '{{.State.Status}}|{{.State.Running}}' "$LIFECYCLE")" = "exited|false" ] ||
   fail "inspect did not report the stopped family as exited"
 ttc branch rm "$LIFECYCLE@grandchild"
@@ -800,7 +800,7 @@ ttc rm "$LIFECYCLE_ID"
 
 echo "== intentional daemon stop terminates managed containers =="
 ttc run --detach --name "$DAEMON_STOP" "$BUSYBOX_IMAGE" sleep 300 >/dev/null
-ttc fork "$DAEMON_STOP" "$DAEMON_STOP@child" >/dev/null
+ttc fork "$DAEMON_STOP@main" "$DAEMON_STOP@child" >/dev/null
 ttc pause "$DAEMON_STOP@child" >/dev/null
 ttc daemon stop
 if ttc daemon status >/dev/null 2>&1; then

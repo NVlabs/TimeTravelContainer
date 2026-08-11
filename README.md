@@ -82,6 +82,7 @@ and kernel objects rather than the amount of resident application memory.
 - Fork a branch into a running or initially paused peer.
 - Fork any branch again; the CLI can display creation provenance as a tree,
   but those edges impose no ownership or lifecycle hierarchy.
+- Delete any branch, including `main`, without deleting its peers.
 - Save one live or paused branch to a checkpoint file and restore it later as
   an independent container.
 - Preserve process trees, threads, memory, credentials, timers, signals,
@@ -379,20 +380,22 @@ Create an interactive background container:
 
 ```sh
 ttc run -dit --name demo alpine:3.20 sh
-ttc exec -it demo sh
+ttc exec -it demo@main sh
 ```
 
 Fork the running container:
 
 ```sh
-ttc fork demo demo@test-a
-ttc fork --paused demo demo@test-b
+ttc fork demo@main demo@test-a
+ttc fork --paused demo@main demo@test-b
 ttc ls --tree
 ttc resume demo@test-b
 ```
 
-A branch selector has the form `CONTAINER@BRANCH`. Omitting `@BRANCH` selects
-`main`.
+A branch selector always has the full form `CONTAINER@BRANCH`; TTC does not
+implicitly select `main`. Container-family operations such as `ttc inspect`
+and `ttc rm` continue to take a container name because they do not select a
+branch.
 
 Run different work in each branch:
 
@@ -446,7 +449,7 @@ ttc attach -i demo@test-b
 Stop and remove the family:
 
 ```sh
-ttc stop demo
+ttc stop demo@main
 ttc rm --force demo
 ```
 
@@ -494,9 +497,9 @@ curl http://127.0.0.1:8080/
 Publish a different host port for a fork:
 
 ```sh
-ttc fork web web@test
+ttc fork web@main web@test
 ttc port publish web@test 127.0.0.1:8081:80
-ttc port ls web
+ttc port ls web@test
 ```
 
 ## How live fork works

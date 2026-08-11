@@ -54,7 +54,7 @@ func runCheckpoint(args []string, stdout io.Writer, b backend) error {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER[@BRANCH] FILE")
+		return errors.New("usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE")
 	}
 	if *compression != "none" && *compression != "flate-best-speed" {
 		return fmt.Errorf("unsupported checkpoint compression %q", *compression)

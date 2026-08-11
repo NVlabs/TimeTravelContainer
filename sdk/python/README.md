@@ -37,7 +37,7 @@ print(ttc.ping())
 ttc.pull("alpine:3.20").check()
 ttc.run("alpine:3.20", ["sleep", "infinity"],
         options=["-d", "--name", "demo"]).check()
-ttc.fork("demo", "demo@experiment").check()
+ttc.fork("demo@main", "demo@experiment").check()
 ttc.dehydrate("demo@experiment").check()
 ttc.rehydrate("demo@experiment").check()
 
@@ -53,7 +53,7 @@ result.check()
 waiting for a convenience method:
 
 ```python
-result = ttc.command(["port", "ls", "--json", "demo"])
+result = ttc.command(["port", "ls", "--json", "demo@main"])
 if result.ok:
     print(result.json())
 else:

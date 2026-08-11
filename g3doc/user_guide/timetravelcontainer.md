@@ -258,15 +258,15 @@ Start a persistent detached container:
 ttc run -dit --name web alpine:3.20 sh
 ttc ps
 ttc inspect web
-ttc logs web
+ttc logs web@main
 ```
 
 Container IDs are 64 hexadecimal characters. A unique ID prefix or the assigned
-name may be used in later commands. The main branch is selected when no branch
-suffix is present:
+name may be used as the container part of a selector. Branch-targeting commands
+always require the branch suffix:
 
 ```text
-web       means web@main
+web@main  selects branch main in family web
 web@test  selects branch test in family web
 ```
 
@@ -281,13 +281,13 @@ source, writes the reason to stderr, and exits nonzero. Create a running child
 branch directly:
 
 ```shell
-ttc fork web web@test-a
+ttc fork web@main web@test-a
 ```
 
 Or create it paused so no child instruction executes before inspection:
 
 ```shell
-ttc fork --paused web web@test-b
+ttc fork --paused web@main web@test-b
 ttc resume web@test-b
 ```
 
@@ -306,6 +306,9 @@ ttc kill --signal TERM web@test-a
 ttc wait web@test-a
 ttc branch rm web@test-a
 ```
+
+`branch rm` also accepts `web@main`; `main` is an ordinary branch name and its
+removal does not remove surviving peers.
 
 `ttc rm web` removes the whole family and requires all live branches to be
 stopped unless `--force` is used.
@@ -343,14 +346,14 @@ identity and negotiated capabilities.
 From node A, create one child on node B:
 
 ```shell
-ttc fork --target node-b web remote-web
+ttc fork --target node-b web@main remote-web@main
 ```
 
 Create several siblings from one source pause and one metadata capture by
 listing all destinations in a single command:
 
 ```shell
-ttc fork --target node-b web candidate-a candidate-b candidate-c
+ttc fork --target node-b web@main candidate-a@main candidate-b@main candidate-c@main
 ```
 
 Each child has an independent filesystem branch and memory dependency. A
@@ -510,14 +513,14 @@ ttc logs --follow --tail 100 web@test-b
 container selector:
 
 ```shell
-ttc cp ./fixtures web:/tmp/fixtures
+ttc cp ./fixtures web@main:/tmp/fixtures
 ttc cp ./fixtures/. web@test-b:/tmp/fixtures
 ttc cp web@test-b:/tmp/report.json ./report.json
 ttc cp -a web@test-b:/var/lib/app ./saved-state
 ttc cp -L web@test-b:/tmp/latest ./resolved-latest
 ```
 
-The selector is `CONTAINER[@BRANCH]:PATH`; omitting `@BRANCH` selects `main`.
+The selector is `CONTAINER@BRANCH:PATH`; the branch component is mandatory.
 A relative container path is interpreted from `/`. As with Docker, copying a
 directory to an existing directory nests its basename, while copying it to a
 nonexistent path creates exactly that path. A trailing `/.` copies only the
@@ -734,14 +737,13 @@ Add or remove a listener on any existing live branch without restarting it:
 ```shell
 ttc port publish web@main 127.0.0.1:8081:80
 ttc port publish web@child 127.0.0.1:8082:80
-ttc port ls web
+ttc port ls web@main
 ttc port ls --json web@child
 ttc port unpublish web@child 127.0.0.1:8082:80
 ```
 
-Omitting `@BRANCH` from `publish` or `unpublish` selects `main`. For `port ls`,
-an unqualified container lists every branch, while a qualified selector filters
-one branch. Dynamically published listeners are persistent and reconciled after
+`publish`, `unpublish`, and `port ls` all require a full branch selector.
+Dynamically published listeners are persistent and reconciled after
 `ttcd` restarts. Docker-compatible `.HostConfig.PortBindings` continues to
 show only `main`; the complete branch-aware list is available through
 `ttc port ls --json` and `.TTC.container.published_ports` in `ttc inspect`.

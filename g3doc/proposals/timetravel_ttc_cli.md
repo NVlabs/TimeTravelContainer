@@ -311,7 +311,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] Docker-style `ttc container` aliases for run, create, start, attach,
       logs, exec, inspect, rm, ls/ps, top, pause/unpause, kill, stop, wait, and
       restart.
-- [x] `ttc wait [--condition not-running] CONTAINER[@BRANCH]...` starts all
+- [x] `ttc wait [--condition not-running] CONTAINER@BRANCH...` starts all
       waits concurrently, prints Docker exit codes in argument order, and
       retains branch-aware wait semantics.
 - [x] `ttc restart CONTAINER...` for created, exited, running, or paused base
@@ -320,11 +320,11 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       reconstructed. Live descendants require explicit `--force`; restart
       quiesces and snapshots main before teardown, then seeds the replacement
       sandbox from that snapshot.
-- [x] `ttc stop CONTAINER[@BRANCH]` with TERM, timeout, then KILL semantics.
-- [x] `ttc kill CONTAINER[@BRANCH] [SIGNAL]`.
+- [x] `ttc stop CONTAINER@BRANCH` with TERM, timeout, then KILL semantics.
+- [x] `ttc kill CONTAINER@BRANCH [SIGNAL]`.
 - [x] Initial `ttc rm CONTAINER`: remove stopped/created family metadata,
       reject a live family unless `--force` is given, and require `branch rm`
-      for an individual non-main branch.
+      for an individual branch.
 - [x] Finalize removal policy: `branch rm` retains immutable lineage tombstones;
       unforced family removal rejects any live family; forced family removal tears
       down main and all descendants and deletes the container-local lineage record.
@@ -336,7 +336,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       family/branch tree, fork timing, and observational process lists for
       every running or paused branch. Ordinary inspect remains observational and
       does not pause branches or perform live-fork validation.
-- [x] Initial `ttc logs CONTAINER[@BRANCH]` and `logs -f`, preserving separate
+- [x] Initial `ttc logs CONTAINER@BRANCH` and `logs -f`, preserving separate
       stdout/stderr streams and backed by branch-local persistent console logs.
 - [x] Add Docker-compatible `logs --tail all|N`, including global logical-line
       ordering across the retained and active log generations and `--tail 0 -f`.
@@ -350,7 +350,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] Add Docker-style label and environment selectors with persisted,
       deterministic attributes for `logs --details`.
 - [x] Initial `ttc ps [-a|-q]` flat family/branch view and branch-qualified
-      `ttc top [--json] CONTAINER[@BRANCH]` process listing.
+      `ttc top [--json] CONTAINER@BRANCH` process listing.
 - [x] Add Docker-style `ps --filter/-f` for name, ID, status, ancestor image,
       managed volume, and branch, with OR within one filter key and AND across
       keys. Add Go-template and line-delimited JSON formatting, `--latest/-l`,
@@ -377,8 +377,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 - [x] `ttc fork SOURCE [DESTINATION]`, for example `ttc fork web@main
       web@test-a`.
 - [x] Support `--paused`, defaulting according to a documented policy.
-- [x] `ttc pause CONTAINER[@BRANCH]`.
-- [x] `ttc resume CONTAINER[@BRANCH]` and Docker-compatible top-level and
+- [x] `ttc pause CONTAINER@BRANCH`.
+- [x] `ttc resume CONTAINER@BRANCH` and Docker-compatible top-level and
       `ttc container unpause` aliases.
 - [x] `ttc branch rm CONTAINER@BRANCH` or an unambiguous equivalent.
 - [x] Initial `ttc ls --tree` compact Unicode lineage and lifecycle-state
@@ -398,7 +398,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ### Exec
 
-- [x] Initial `ttc exec [OPTIONS] CONTAINER[@BRANCH] COMMAND...` selecting a
+- [x] Initial `ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND...` selecting a
       live branch through `runsc exec --branch`.
 - [x] Support environment, cwd, and UID/GID overrides in the initial CLI.
 - [x] Add supplementary groups, capabilities, and an OCI process JSON input to
@@ -418,10 +418,10 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 
 ### Attach and detach
 
-- [x] Initial non-TTY `ttc attach CONTAINER[@BRANCH]` for the init console,
+- [x] Initial non-TTY `ttc attach CONTAINER@BRANCH` for the init console,
       with stdout/stderr streaming, optional `-i`, and exit-status forwarding.
-- [x] `ttc attach --exec EXEC_ID CONTAINER[@BRANCH]` and
-      `ttc logs --exec EXEC_ID CONTAINER[@BRANCH]` for managed exec sessions.
+- [x] `ttc attach --exec EXEC_ID CONTAINER@BRANCH` and
+      `ttc logs --exec EXEC_ID CONTAINER@BRANCH` for managed exec sessions.
 - [x] Support output-only and combined attachment by default/with `-i`, plus
       stdin-only, stdout-only, and stderr-only selection through `--no-stdin`,
       `--no-stdout`, and `--no-stderr`. Unselected output is still drained so

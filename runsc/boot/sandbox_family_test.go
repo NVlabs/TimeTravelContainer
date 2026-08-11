@@ -22,11 +22,13 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -336,11 +338,15 @@ func TestReplaceLoaderBranchPreservesPeerIdentity(t *testing.T) {
 	if got := family.LoaderBranchID(); got != "experiment-b" {
 		t.Fatalf("loader branch=%q, want experiment-b", got)
 	}
-	infos := family.List()
-	if len(infos) != 1 || infos[0].ID != "experiment-b" || infos[0].ParentID != "experiment-a" {
-		t.Fatalf("branch identity changed during loader replacement: %+v", infos)
+	family.mu.Lock()
+	restored := family.branches["experiment-b"]
+	_, retainedMain := family.branches[DefaultBranchID]
+	branchCount := len(family.branches)
+	family.mu.Unlock()
+	if branchCount != 1 || restored == nil || restored.parentID != "experiment-a" {
+		t.Fatalf("branch identity changed during loader replacement: count=%d branch=%+v", branchCount, restored)
 	}
-	if _, ok := family.branches[DefaultBranchID]; ok {
+	if retainedMain {
 		t.Fatal("cold loader replacement implicitly woke or renamed main")
 	}
 }
@@ -809,13 +815,25 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	if err := family.Resume("great-grandchild"); err != nil {
 		t.Fatalf("Resume great-grandchild after ancestor destroy: %v", err)
 	}
-	family.DestroyNonLoaderBranches()
-	if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
-		t.Fatalf("List after destroy: %+v", got)
+	if err := family.Destroy(DefaultBranchID); err != nil {
+		t.Fatalf("Destroy loader branch while peer remains: %v", err)
+	}
+	if got := family.LoaderBranchID(); got != "great-grandchild" {
+		t.Fatalf("loader branch after deleting main=%q, want great-grandchild", got)
+	}
+	if got := family.List(); len(got) != 1 || got[0].ID != "great-grandchild" {
+		t.Fatalf("List after deleting main: %+v", got)
+	}
+	if err := family.Destroy("great-grandchild"); err == nil {
+		t.Fatal("destroying the final family branch succeeded without family removal")
 	}
 
-	parent.Pause()
-	parent.Release()
+	family.mu.Lock()
+	remaining := family.branches["great-grandchild"].k
+	family.mu.Unlock()
+	remaining.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	remaining.WaitExited()
+	remaining.Release()
 }
 
 func TestSandboxFamilyForkMany(t *testing.T) {

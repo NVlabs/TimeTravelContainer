@@ -159,7 +159,7 @@ const (
 	// ContMgrRehydrateBranch reconstructs one dehydrated branch.
 	ContMgrRehydrateBranch = "containerManager.RehydrateBranch"
 
-	// ContMgrDestroyBranch destroys one non-default in-memory branch.
+	// ContMgrDestroyBranch destroys one in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
 
 	// ContMgrBranchProcesses lists processes in one in-memory branch.
@@ -1215,7 +1215,7 @@ func (cm *containerManager) RehydrateBranch(args *BranchArgs, _ *struct{}) error
 	return cm.l.family.Rehydrate(args.ID)
 }
 
-// DestroyBranch destroys one non-default branch.
+// DestroyBranch destroys one branch.
 func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Destroy(args.ID)
 }

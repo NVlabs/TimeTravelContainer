@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["sleep", "infinity"],
         &["-d", "--name", "demo"],
     )?.check()?;
-    ttc.fork("demo", "demo@experiment", false)?.check()?;
+    ttc.fork("demo@main", "demo@experiment", false)?.check()?;
     ttc.dehydrate("demo@experiment")?.check()?;
     ttc.rehydrate("demo@experiment")?.check()?;
 

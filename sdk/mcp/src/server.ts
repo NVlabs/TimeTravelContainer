@@ -71,7 +71,7 @@ export function createServer(client = new Client()): McpServer {
     "ttc_inspect",
     {
       description: "Inspect a TTC container or branch.",
-      inputSchema: { target: z.string().describe("Container or container@branch") },
+      inputSchema: { target: z.string().describe("Full container@branch selector") },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ target }) => jsonResponse(await client.inspect(target)),
@@ -116,7 +116,7 @@ export function createServer(client = new Client()): McpServer {
     {
       description: "Run a non-interactive command in an existing TTC branch.",
       inputSchema: {
-        target: z.string().describe("Container or container@branch"),
+        target: z.string().describe("Full container@branch selector"),
         command: z.array(z.string()).min(1),
         stdin: z.string().optional(),
       },
@@ -131,7 +131,7 @@ export function createServer(client = new Client()): McpServer {
     {
       description: "Live-fork a running TTC container branch.",
       inputSchema: {
-        source: z.string().describe("Source container or container@branch"),
+        source: z.string().describe("Full source container@branch selector"),
         destination: z.string().describe("New container@branch name"),
         paused: z.boolean().default(false),
       },

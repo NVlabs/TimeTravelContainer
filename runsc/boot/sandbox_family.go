@@ -1904,7 +1904,7 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 		f.mu.Unlock()
 		k.WaitExited()
 		f.mu.Lock()
-		if b.k != k || b.state == BranchDehydrating || b.state == BranchDehydrated || b.state == BranchRehydrating {
+		if f.loaderBranchID != b.id || b.k != k || b.state == BranchDehydrating || b.state == BranchDehydrated || b.state == BranchRehydrating {
 			f.mu.Unlock()
 			continue
 		}
@@ -1914,11 +1914,10 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 	}
 }
 
-// Destroy destroys a non-default branch and removes it from the family.
+// Destroy destroys a branch and removes it from the family. If id currently
+// occupies the loader bookkeeping role, that role moves to an established
+// peer first. This role transfer has no guest-visible or lineage semantics.
 func (f *SandboxFamily) Destroy(id string) error {
-	if id == f.LoaderBranchID() {
-		return fmt.Errorf("branch %q is currently owned by the OCI loader", id)
-	}
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
 	b, err := f.branch(id)
@@ -1933,6 +1932,37 @@ func (f *SandboxFamily) Destroy(id string) error {
 		b.opMu.Unlock()
 		return fmt.Errorf("branch %q is %s", id, state)
 	}
+	var loaderKernel *kernel.Kernel
+	var loaderWatchdog *watchdog.Watchdog
+	loaderChanged := id == f.loaderBranchID
+	if loaderChanged {
+		var replacement *sandboxBranch
+		ids := make([]string, 0, len(f.branches)-1)
+		for candidateID, candidate := range f.branches {
+			if candidateID == id || candidate.state == BranchCreating || candidate.state == BranchDestroying || candidate.state == BranchFailed {
+				continue
+			}
+			ids = append(ids, candidateID)
+		}
+		sort.Strings(ids)
+		// Prefer an already-hydrated peer so Loader.k remains useful to legacy
+		// branch-unaware teardown paths. A dehydrated peer is still a valid
+		// owner when no process-backed peer exists.
+		for _, candidateID := range ids {
+			candidate := f.branches[candidateID]
+			if replacement == nil || (replacement.k == nil && candidate.k != nil) {
+				replacement = candidate
+			}
+		}
+		if replacement == nil {
+			f.mu.Unlock()
+			b.opMu.Unlock()
+			return fmt.Errorf("branch %q is the last branch in its container family", id)
+		}
+		f.loaderBranchID = replacement.id
+		loaderKernel = replacement.k
+		loaderWatchdog = replacement.watchdog
+	}
 	b.state = BranchDestroying
 	image := b.dehydration
 	if image != nil {
@@ -1944,6 +1974,9 @@ func (f *SandboxFamily) Destroy(id string) error {
 	}
 	dog := b.watchdog
 	f.mu.Unlock()
+	if loaderChanged && f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
+	}
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
