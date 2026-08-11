@@ -164,6 +164,23 @@ func TestWriteTree(t *testing.T) {
 	}
 }
 
+func TestStoppedStateIsExposedAsExited(t *testing.T) {
+	container := ttcbundle.ContainerInfo{
+		ID: "legacy", Name: "legacy", State: "stopped",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "stopped"}},
+	}
+	inspected := buildInspectInfo(container, nil, nil, "")
+	if got := inspected.State.Status; got != "exited" {
+		t.Fatalf("inspect state=%q, want exited", got)
+	}
+	if got := inspected.TTC.Container.State; got != "exited" {
+		t.Fatalf("persistent container state=%q, want exited", got)
+	}
+	if got := inspected.TTC.Container.Branches[0].State; got != "exited" {
+		t.Fatalf("persistent branch state=%q, want exited", got)
+	}
+}
+
 func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
 	b := &fakeBackend{families: []Family{
 		{ID: "web", State: "running", Branches: []Branch{
@@ -2827,6 +2844,21 @@ exit 2
 	}
 	if err := os.WriteFile(runsc+".stopped", nil, 0600); err != nil {
 		t.Fatalf("marking fake sandbox stopped: %v", err)
+	}
+	families, err = b.listFamilies()
+	if err != nil {
+		t.Fatalf("listFamilies after runtime stopped: %v", err)
+	}
+	mainState := ""
+	if len(families) == 1 {
+		for _, branch := range families[0].Branches {
+			if branch.ID == "main" {
+				mainState = branch.State
+			}
+		}
+	}
+	if len(families) != 1 || families[0].State != "exited" || mainState != "exited" {
+		t.Fatalf("stopped runtime leaked through TTC state: %+v", families)
 	}
 	if err := b.destroy(selector{container: "web", branch: "child"}); err != nil {
 		t.Errorf("destroy after sandbox exit: %v", err)

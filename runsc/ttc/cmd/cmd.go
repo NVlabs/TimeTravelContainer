@@ -6663,6 +6663,10 @@ func inspectMounts(spec *specs.Spec) ([]InspectMount, []string, map[string]struc
 }
 
 func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, family *Family, runtimeErr string) InspectInfo {
+	container.State = normalizeLifecycleState(container.State)
+	for i := range container.Branches {
+		container.Branches[i].State = normalizeLifecycleState(container.Branches[i].State)
+	}
 	state := container.State
 	if state == "" {
 		state = "created"
@@ -6676,9 +6680,7 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			}
 		}
 	}
-	if state == "stopped" {
-		state = "exited"
-	}
+	state = normalizeLifecycleState(state)
 	exitCode := 0
 	if container.ExitStatus != nil {
 		exitCode = *container.ExitStatus
@@ -7629,7 +7631,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
 			continue
 		}
-		state := container.State
+		state := normalizeLifecycleState(container.State)
 		if state == "" {
 			state = "created"
 		}
@@ -7710,6 +7712,10 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	families := make([]Family, 0, len(byID))
 	for _, family := range byID {
+		family.State = normalizeLifecycleState(family.State)
+		for i := range family.Branches {
+			family.Branches[i].State = normalizeLifecycleState(family.Branches[i].State)
+		}
 		enrichPersistentBranchDiagnostics(&family)
 		families = append(families, family)
 	}
@@ -7770,25 +7776,25 @@ func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
 		if state.ID == "" {
 			continue
 		}
-		family := Family{ID: state.ID, State: state.Status, SandboxPID: state.PID, Branches: []Branch{}}
+		family := Family{ID: state.ID, State: normalizeLifecycleState(state.Status), SandboxPID: state.PID, Branches: []Branch{}}
 		output, err := b.command("timetravel", state.ID, "branches")
 		if err != nil {
 			family.Error = err.Error()
-			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: state.Status})
+			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
 			families = append(families, family)
 			continue
 		}
 		var branches []runscBranchInfo
 		if err := json.Unmarshal(output, &branches); err != nil {
 			family.Error = fmt.Sprintf("decoding runsc branch list: %v", err)
-			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: state.Status})
+			family.Branches = append(family.Branches, Branch{ID: defaultBranchID, State: normalizeLifecycleState(state.Status)})
 			families = append(families, family)
 			continue
 		}
 		for _, branch := range branches {
 			family.Branches = append(family.Branches, branchView(branch))
 			if branch.ID == defaultBranchID {
-				family.State = branch.State
+				family.State = normalizeLifecycleState(branch.State)
 			}
 		}
 		sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
@@ -7884,9 +7890,19 @@ type runscBranchInfo struct {
 	} `json:"ForkMetrics"`
 }
 
+// normalizeLifecycleState keeps OCI's low-level "stopped" spelling out of
+// TTC's public state model. Like Docker, TTC exposes every terminal container
+// or branch as "exited", regardless of whether termination was requested.
+func normalizeLifecycleState(state string) string {
+	if state == "stopped" {
+		return "exited"
+	}
+	return state
+}
+
 func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
-		ID: info.ID, ParentID: info.ParentID, State: info.State, CreatedAt: info.CreatedAt, DeletedAt: info.DeletedAt,
+		ID: info.ID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt, DeletedAt: info.DeletedAt,
 		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 	}
 }
@@ -7926,7 +7942,7 @@ func branchView(info runscBranchInfo) Branch {
 	return Branch{
 		ID:               info.ID,
 		ParentID:         info.ParentID,
-		State:            info.State,
+		State:            normalizeLifecycleState(info.State),
 		CreatedAt:        info.CreatedAt,
 		InitPID:          info.InitPID,
 		InitState:        info.InitState,
