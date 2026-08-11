@@ -3,14 +3,14 @@
 ## Status
 
 Core implementation complete and enabled for both the ordinary writable
-container root and managed volumes. The persistent immutable metadata trie,
-opaque object repository, real `FICLONE` capability probe, explicit slow-copy
-policy, branch-generation first-write CoW engine, `ttcvol` Sentry filesystem,
-frozen live-fork transaction, donated-FD plumbing, and volume CLI are
-implemented. Every writable family receives a private rootfs-upper repository;
-stop/start and daemon shutdown/restart require no TTC serialization. Named and
-anonymous volumes, image `VOLUME`, initialization from image contents,
-`volume-nocopy`, inspect, `rm -v`, and stopped-branch `ttc cp` are supported.
+container root and managed volumes. Transactional metadata journals, in-memory
+inode and directory maps, the opaque object repository, real `FICLONE`
+capability probe, explicit slow-copy policy, branch-generation first-write CoW
+engine, `ttcvol` Sentry filesystem, frozen live-fork transaction, donated-FD
+plumbing, and volume CLI are implemented. Every writable family receives a
+private rootfs-upper repository. Named and anonymous volumes, image `VOLUME`,
+initialization from image contents, `volume-nocopy`, inspect, `rm -v`, and
+offline `ttc cp` are supported.
 
 Focused tests and a dedicated end-to-end suite cover namespace operations,
 hard links, symlinks, fallocate, open writable FDs across fork, recursive
@@ -96,10 +96,12 @@ volumes-v2/<volume-id>/
   volume.json
   branches/
     <branch-id>.json
-  nodes/
-    <immutable-node-id>
+  layers/
+    <layer-id>/
+      layer.json
+      journal
   objects/
-    <object-id>
+    <prefix>/<prefix>/<object-id>
   staging/
   lock
 ```
@@ -118,20 +120,22 @@ stored in opaque, randomly named objects opened relative to an already-open
 repository directory. This removes guest-controlled symlink traversal from the
 host access path.
 
-Branch records and immutable radix-tree nodes store:
+Branch records and journal transactions store:
 
-* **branch root**: branch ID, parent branch, root inode-table node, generation;
-* **virtual inode table**: virtual inode number to immutable inode version;
-* **directory node**: persistent name-to-virtual-inode map;
-* **inode version**: type, mode, virtual UID/GID, timestamps, link count,
+* **branch root**: branch ID, writable metadata layer, and data generation;
+* **metadata layer**: an immutable parent pointer plus one append-only,
+  checksummed journal;
+* **virtual inode table**: virtual inode number to branch-local inode metadata;
+* **directory map**: `(parent inode, name)` to virtual inode number;
+* **inode metadata**: type, mode, virtual UID/GID, timestamps, link count,
   size, generation, and regular-file object ID;
-* **object record**: host object ID, logical size, state, and reachability
-  metadata.
+* **object data**: the contents of one regular file under an opaque host name.
 
-A persistent radix tree or copy-on-write B-tree gives bounded lookup cost
-independent of fork depth. A chain of per-branch delta maps is not acceptable:
-deeply nested forks would make lookup and recovery proportional to ancestry
-depth.
+Opening a branch replays its layer chain once into process-local hash maps, so
+normal lookup is independent of fork depth. Fork seals the current writable
+layer and gives source and child fresh layers that share it. Background
+compaction flattens chains beyond a bounded threshold, and garbage collection
+removes unreachable layers and objects.
 
 Virtual inode numbers are stable and branch-observable. Directory entries refer
 to virtual inode numbers, while each branch's inode table resolves that number
@@ -145,10 +149,10 @@ While the source branch is frozen:
 1. finish or abort in-progress volume metadata transactions;
 2. invalidate writable host-file translations that could mutate a shared
    object without passing through the CoW gate;
-3. create a child branch-root record pointing to the same persistent
-   inode-table root;
-4. mark the referenced generation immutable/shared;
-5. commit the child root transaction;
+3. seal the source's writable metadata layer and create fresh source and child
+   layers that point to it;
+4. advance both data generations so either side's next file-data write clones;
+5. publish the source and child branch pointers;
 6. clone the Sentry filesystem object with the child's branch-root ID;
 7. resume the source after the rest of live fork succeeds.
 
@@ -163,13 +167,13 @@ it.
 
 ## Namespace and metadata CoW
 
-Directory and inode metadata nodes are immutable. A mutation path-copies only
-the persistent metadata nodes from the branch root to the changed entry.
+Each branch appends namespace and inode changes to its writable metadata
+journal and applies the same transaction to process-local hash maps.
 
 Examples:
 
-* create, unlink, rename, and link path-copy affected directory nodes;
-* chmod, chown, timestamps, and truncate create a new inode version;
+* create, unlink, rename, and link append affected directory-map operations;
+* chmod, chown, timestamps, and truncate append inode updates;
 * unlink does not copy file data;
 * deleting the last directory entry does not reclaim an object while an open
   file description or another branch still reaches the virtual inode;
@@ -240,12 +244,12 @@ state.
 
 ## Crash consistency and durability
 
-The current repository uses immutable content-addressed metadata nodes, atomic
-rename publication, directory `fsync`, and ordered object-before-root
-publication. Structural consistency is mandatory even when the Sentry or host
-crashes during first-write privatization. A checksummed WAL remains desirable
-for stronger diagnostics and complete fault injection, but is not required to
-avoid publishing a root that names a missing object.
+The current repository uses checksummed append-only metadata transactions,
+atomic branch-pointer publication, directory `fsync`, and ordered
+object-before-metadata publication. Recovery ignores a torn final journal
+record and truncates it before the next append. Structural consistency is
+mandatory even when the Sentry or host crashes during first-write
+privatization.
 
 The minimum ordering is:
 

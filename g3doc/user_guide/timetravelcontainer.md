@@ -314,10 +314,10 @@ not remove surviving peers. Use `-f` to remove a running or paused branch.
 stopped unless `--force` is used.
 
 Starting or restarting an exited branch does not require its peers to stop.
-TTC briefly preserves running and paused peers as process-free dehydration
-images, starts the selected branch without allowing its guest tasks to run,
-restores those peers into the new Sentry, and then resumes the selected branch.
-Each peer returns to its previous running or paused state.
+TTC starts only the selected branch in a short-lived paused bootstrap, imports
+that never-executed branch into the family's existing Sentry, and then resumes
+it. Running and paused peers remain in place throughout; TTC does not write or
+reload their memory, so their size does not determine start latency.
 
 ## Distributed live fork
 
@@ -577,10 +577,11 @@ directly. Acknowledged data writes use normal host page-cache semantics, and
 guest `fsync`/`fdatasync` propagate to backing files. TTC performs no rootfs
 export on stop and no rootfs import on start.
 
-Live fork publishes a new immutable metadata-tree root without walking the
-filesystem. Both branches initially reference the same opaque regular-file
-objects; the first write in either branch reflinks the affected file, after
-which the backing filesystem performs block/extent CoW. A read-only root
+Live fork seals the current metadata journal and publishes fresh source and
+child layers without walking the filesystem. Both branches initially reference
+the same opaque regular-file objects; the first write in either branch
+reflinks the affected file, after which the backing filesystem performs
+block/extent CoW. A read-only root
 (`--read-only`) has no writable upper. Restart recreates only the selected
 branch's process and kernel state; every branch retains its own filesystem
 state.
@@ -615,11 +616,11 @@ the image directory at its mount destination. Add `volume-nocopy` (or
 anonymous volumes automatically when no explicit mount overrides them.
 
 Writes go directly to opaque regular files beneath the TTC data root. On live
-fork, TTC duplicates only an immutable metadata-tree root. The first write to
-one shared regular file reflinks that file, after which the host filesystem
-performs extent CoW. Stop/start reopens the same repository; there is no tar
-export/import. `ttc rm -v` also removes anonymous volumes, while named volumes
-remain until `ttc volume rm`.
+fork, TTC creates only two small metadata layers and branch pointers. The
+first write to one shared regular file reflinks that file, after which the host
+filesystem performs extent CoW. Stop/start reopens the same repository; there
+is no tar export/import. `ttc rm -v` also removes anonymous volumes, while
+named volumes remain until `ttc volume rm`.
 
 The daemon requires `FICLONE` by default. On a host without reflinks, starting
 it with `--allow-slow-volume-copy` explicitly selects whole-file copying on

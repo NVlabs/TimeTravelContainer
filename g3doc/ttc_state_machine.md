@@ -46,11 +46,10 @@ performed branch by branch and are not transactional: an error after some
 branches have completed is reported without undoing those completed changes.
 
 Starting or restarting an exited branch preserves active peers. TTC briefly
-dehydrates those peers, starts the selected branch paused as a fresh runtime
-bootstrap, restores the peers beside it, and then resumes the new branch.
-Their pre-operation running or paused states are retained. This coordination
-is slower than an ordinary start in a process-free family, but no branch must
-be stopped or manually dehydrated first.
+starts only the selected branch in a temporary paused bootstrap, imports that
+never-executed branch into the family's existing Sentry, and then resumes it.
+Running and paused peers are neither serialized nor replaced, so the work is
+bounded by the new branch's bootstrap state rather than their memory size.
 
 If the branch used internally by runsc for process bookkeeping exits naturally,
 TTC transfers that bookkeeping role to another live branch. This internal role
