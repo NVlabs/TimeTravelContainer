@@ -1243,6 +1243,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
+	// Sparse roots describe this target runtime's own demand-page source. They
+	// must never be inherited when the source is itself a distributed child;
+	// Prepare will install a new root if this transaction uses sparse handoff.
+	target.DistributedSparseRepository = ""
+	target.DistributedSparseBranch = ""
 	target.NodeID = opts.NodeID
 	for i := range target.Volumes {
 		target.Volumes[i].Anonymous = false
