@@ -59,15 +59,14 @@ Dehydration writes and synchronizes all chunks, publishes the manifest last,
 and only then releases the Sentry and its memory. After publication, any node
 can rehydrate the branch even if the source process and source node have exited.
 
-The preferred placement is one active Sentry for each compatible global memory
-lineage on a node, with all local branches imported into it. That permits one
+Placement is one active Sentry for each `(global family ID, node ID)`, with all
+compatible branches of that family imported into it. The first remote branch
+creates the node-local family runtime; later remote forks reuse its control
+server and `MemoryFile` rather than spawning another Sentry. This permits one
 resident chunk installation to serve local sibling branches and preserves
-ordinary 4 KiB CoW between them. The current remote CLI instead creates each
-destination container family as its own sandbox, so separately named remote
-siblings on the same node use separate Sentries and share durable chunk files,
-but not resident pages. Cross-Sentry resident-page sharing is not required for
-correctness and remains a separate optimization if lineage consolidation is
-not possible.
+ordinary 4 KiB CoW between them. Incompatible imports fail instead of creating
+a second Sentry. Unrelated global families remain separate, and a cross-Sentry
+resident-page cache is outside the first implementation.
 
 A live remote fork must not wait for the complete memory image to be written.
 It therefore uses the existing page-granular TCP dependency as a bridge:

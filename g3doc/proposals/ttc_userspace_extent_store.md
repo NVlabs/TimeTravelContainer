@@ -100,6 +100,14 @@ Large snapshots use bounded shard directories rather than one unbounded
 directory. Reads and unlinks operate relative to retained directory
 descriptors, and directory synchronization batches consumption records.
 
+The first implementation chunks every referenced range from every
+`MemoryFile` captured by the existing dehydration/remote-fork traversal,
+including application anonymous memory and private resource `MemoryFile`s.
+Kernel object graphs remain in the existing metadata stream. Reconstructible
+clean caches may be omitted only by a later explicit optimization that proves
+the backing object and identity are durable; the initial conversion must not
+silently narrow the current packed snapshot's coverage.
+
 One chunk contains as many as 256 stable logical 4 KiB page slots, not
 necessarily one contiguous guest virtual-address interval. Its manifest entry
 records the logical coordinate, valid-slot bitmap, immutable content version,
@@ -187,6 +195,8 @@ type LogicalPageID struct {
 	Slot  uint8 // 0..255
 }
 
+type PageVersionID [16]byte
+
 type ChunkCoordinate struct {
 	MemoryLineageID [16]byte
 	Chunk           LogicalChunkID
@@ -197,7 +207,9 @@ type ChunkCoordinate struct {
 remote metadata clones, dehydration, and rehydration. `LogicalChunkID` names a
 stable group of 256 logical page slots. The immutable shared file is a
 **version** of that coordinate; its content-addressed `ChunkID` changes when
-any slot's bytes change.
+any slot's bytes change. `PageVersionID` distinguishes CoW incarnations of one
+logical page. It is preserved by fork and changes when a write must split a
+shared or snapshot-pinned page; a mutable page is sealed before publication.
 
 New pages receive monotonically allocated slots from a process-local open
 logical chunk; nodes use disjoint ID namespaces, so this requires no cross-node
@@ -220,7 +232,11 @@ direction are irrelevant.
 
 Each manifest maps logical page IDs to the guest/kernel objects and current
 `MemoryFile` offsets that use them. A shared chunk object carries a 256-bit
-valid-slot bitmap and one page-aligned payload slot for each valid logical page.
+valid-slot bitmap, a 256-bit zero-slot bitmap, and one page-aligned payload slot
+for each valid nonzero logical page. The first format is uncompressed and
+records the base page size, which is 4 KiB for its initial supported format. It
+hashes the format domain, page size, both bitmaps, and payload bytes in slot
+order; restore rejects a page-size or architecture mismatch.
 The all-resident/all-non-resident invariant applies to all slots valid in that
 chunk version; invalid slots require no backing page. The manifest mapping
 supplies the scatter/gather destinations needed to install those pages.
@@ -305,8 +321,15 @@ type BranchChunkSlot struct {
 individual writes may then CoW and dirty any subset at 4 KiB granularity.
 `ChunkNonResident` means none is installed. `ChunkLoading` and `ChunkEvicting`
 are private transactional states: guest execution cannot observe a partially
-loaded or partially removed chunk. Local fork and dehydration wait for, help,
-or cancel these transitions before taking their state snapshot.
+loaded or partially removed chunk. The branch mutation lock prevents fork from
+racing an eviction transition. Fork does not wait for network/disk loading: it
+atomically adds the child binding to the same immutable load transaction.
+Dehydration must settle loading before it can release the runtime.
+
+Here `resident` means installed in TTC's node-local `MemoryFile` and usable
+without consulting a live/shared origin. It does not promise that the host
+kernel has the bytes physically present in DRAM; ordinary host swapping remains
+below TTC and does not change this state machine.
 
 The permitted steady-state combinations are:
 
@@ -365,6 +388,11 @@ The normative rules are:
 5. An instance can be evicted only when no resident binding or in-flight I/O
    needs its pages. One branch becoming dirty does not evict clean base pages
    still used by another branch.
+6. Different chunk versions are canonicalized again by per-slot
+   `(LogicalPageID, PageVersionID)`. If only one page changed, installing the
+   newer chunk aliases the other 255 resident page references rather than
+   allocating another 1 MiB. The chunk transaction remains all-or-nothing even
+   when most slots are satisfied from the local canonical-page table.
 
 For example, after `A.1 -> B.2` and a local `B.2 -> B.3`, both B branches bind
 to the same target `MemoryFile` ranges and node chunk instance. If either
@@ -381,16 +409,42 @@ new work. Branches restored into separate Sentry processes do not currently
 share resident host pages merely because they reference the same NFS chunk;
 they each need a load unless a later cross-Sentry shared-page cache is added.
 
-Today one active local TTC family normally has one Sentry containing all of its
-live branches. Local fork and peer rehydration therefore use the same-Sentry
-path. Separate Sentries occur across nodes, between different local families,
-and for direct remote-fork destinations that TTC currently represents as new
-target container families. Two independent remote siblings placed on the same
-host under different target container names consequently share immutable NFS
-chunk objects but not resident `MemoryFile` pages. A future distributed runtime
-should preferentially place all compatible branches of one global memory
-lineage in one Sentry per node; a cross-Sentry page cache is an optional later
-optimization for placements that cannot be consolidated.
+The distributed implementation MUST maintain one active Sentry per
+`(global family ID, node ID)` and import every compatible branch of that family
+on the node into it. Local fork, peer rehydration, and repeated remote forks to
+the same node therefore use the same `MemoryFile` and canonical chunk/page
+tables. The first branch creates the node-local family runtime; later branches
+are imported through its control server without spawning another Sentry.
+Incompatible platform or family configuration is rejected rather than silently
+creating a second runtime. Unrelated global families retain separate Sentries.
+The current remote CLI's new-target-family behavior must be replaced as part of
+this work; a cross-Sentry page cache is not part of the first implementation.
+
+### Forking a branch with an upstream live origin
+
+A remote branch may be forked again before it has faulted all pages or before
+its source snapshot has been promoted to shared storage. This does not require
+materializing the branch first:
+
+* every live origin has a cluster-stable `OriginLeaseID` naming an immutable
+  chunk version and its provider;
+* a non-resident clean binding delegates that lease to the new consumer;
+* a resident binding is complete by invariant, so the current node can retain
+  and serve its exact fork-time page versions; and
+* a binding in `loading` is still identical to its immutable origin until its
+  atomic install. Fork joins or delegates the origin transaction without
+  exposing the staging pages.
+
+The target daemon registers the descendant as a consumer with the original
+provider when reachable, avoiding an A-to-B-to-C data relay. Delegation and
+consumer registration are idempotent and occur before the new branch is
+published. By default, if the provider cannot be contacted and no shared
+version exists, the fork fails without publishing the child. An explicit slow
+policy may first materialize the required chunks and retry; it is never an
+implicit latency surprise. A published branch whose last provider is later
+lost before durable promotion is stopped and marked failed when it next cannot
+resolve the dependency; TTC never substitutes zeroes or exposes partial chunk
+installation.
 
 ### Normative 4 KiB page-version state
 
@@ -593,8 +647,8 @@ subobjects.
 
 | Operation | Required transition and completion point |
 | --- | --- |
-| Local fork | Freeze the branch; settle each `loading/evicting` transaction; share resident 4 KiB page refs and non-resident origin descriptors; publish the child's chunk-map root; then resume. No chunks are written. |
-| Live remote fork | Freeze, create fork-time page refs at `L0`, durably publish the target dependency at `L1`, then resume. Chunk publication is background work and is never on the source-pause path. |
+| Local fork | Freeze the branch; share resident 4 KiB page refs and non-resident origin descriptors; join immutable `loading` transactions; serialize against `evicting`; publish the child's chunk-map root; then resume. No chunks are loaded or written. |
+| Live remote fork | Freeze; share or delegate clean non-resident origins, join immutable loads, and retain fork-time refs for resident versions at `L0`; durably publish the target dependency at `L1`, then resume. Chunk publication is background work and is never on the source-pause path. |
 | Network fault | Canonicalize the node chunk version, atomically elect one loader, request exactly that logical chunk, acquire source network leases, transfer and validate all bytes, install all pages for every joined local binding at `L4`, and acknowledge the chunk at `L5`; interrupted transfers install nothing. |
 | Source page write | CoW only the written 4 KiB page, then enqueue whole-chunk promotion after releasing memory locks. The application never waits for `L2` or `L3`. |
 | Source memory pressure | Queue promotion for live-only chunks in priority order. Reclaim a chunk's old page versions only at `L6`. |
@@ -1247,6 +1301,29 @@ branch observe another branch's private write.
   allocation and preserve them across local fork, remote metadata cloning,
   dehydration, and rehydration. Do not use capture-specific packed offsets as
   persistent identities.
+* Assign each Sentry incarnation a collision-resistant allocator domain and
+  allocate chunk IDs as `(allocator domain, monotonic sequence)`. Preserve
+  imported IDs, never reuse a logical page ID, and start a fresh allocator
+  domain after process-free rehydration so no synchronous per-allocation
+  cluster coordination is required.
+* Maintain logical-page and sealed-version mappings incrementally in a
+  persistent run-based map keyed by `MemoryFile` page index. Fork takes a
+  refcounted root in O(1) and manifest encoding walks that root after the source
+  resumes; no page/range scan is allowed in the source-pause interval. Reusing
+  a freed `MemoryFile` offset always allocates a new logical page ID.
+* Audit every mutation path that can change `MemoryFile` bytes, including PMA
+  write faults, kernel `MapInternal` writes, zeroing, truncation, tmpfs/shared
+  memory, and writes through aliases. Each path must split a shared/sealed page
+  version before modification or prove that the page is unique and mutable.
+* Replace the remote target's new-family sandbox creation with lookup-or-create
+  of the one `(global family, target node)` Sentry. Import later remote branches
+  into that Sentry and reject incompatible configuration.
+* Replace `ImportMemoryFileMetadataForRemote`'s empty-file/exact-offset clone
+  for subsequent imports with a merge plan. It resolves each source
+  `(LogicalPageID, PageVersionID)` to an existing canonical target range or a
+  newly allocated target range, then translates every restored `MemoryFile`
+  reference through that plan. Source backing offsets are never treated as
+  globally unique and may not overwrite an existing target allocation.
 * Implement shared-root chunk publication with temporary files, file sync,
   atomic rename, shard-directory sync, and manifest-last publication.
 * Implement `openat`/`unlinkat`, batched directory synchronization, bounded
@@ -1261,6 +1338,13 @@ branch observe another branch's private write.
   when immutable manifests and unexpired/recovered leases make it unreachable.
 * Keep 4 KiB resident and CoW accounting above the 1 MiB backend; loading one
   chunk installs all of its valid pages without merging their CoW identities.
+* Canonicalize sealed page versions independently of chunk versions. A
+  one-page difference between two resident chunk versions must consume one new
+  4 KiB page, not another 1 MiB of resident memory.
+* Implement idempotent live-origin delegation so an untouched non-resident
+  chunk can survive remote-fork chains without first loading on every
+  intermediate node. Never publish a descendant until every origin is durably
+  shared or registered with an available provider.
 * Exercise local and cross-host demand loading, concurrent prefetch, partial
   rehydration, redehydration, crash recovery, source-node loss after
   publication, and snapshot removal.
@@ -1269,6 +1353,26 @@ branch observe another branch's private write.
   full-chunk load, both see identical bytes, and a 4 KiB write by either sibling
   remains invisible to the other. Repeat with live and shared-file origins and
   with fault/fork/write races.
+* Test two direct `A.1 -> B.2` and `A.1 -> B.3` remote forks around source
+  writes and mapping changes. Assert one Sentry on B, exact reuse of unchanged
+  chunk and page-version identities, one new resident page for a one-page CoW,
+  stable mappings for downward stack growth, and no branch publication before
+  origin registration.
+* Model and test `A -> B -> C` while chunks are non-resident, loading,
+  resident-clean, and resident-dirty; inject provider loss and every ordering
+  of delegation, promotion, fault, cancellation, and acknowledgement.
+* Randomize allocation, free, backing-offset reuse, aliases, `mmap`/`munmap`,
+  `mprotect`, stack growth, tmpfs/shared-memory writes, truncate, fork, and
+  removal. Compare every branch byte-for-byte with a simple page model and
+  assert that no retired logical page ID reappears.
+* Import two independently diverged source allocator layouts into one nonempty
+  target `MemoryFile`, deliberately collide their source offsets, and verify
+  that restore translation preserves aliases, shares equal page versions, and
+  isolates different versions. Audit the state graph so no raw source
+  `MemoryFile` offset bypasses translation.
+* Measure source pause against resident size and fragmentation. Adding memory
+  pages or allocator ranges may increase background manifest work, but must not
+  make the root-snapshot portion of fork linear in either count.
 * Benchmark 1 MiB chunks against the historical 64 KiB loose-file and packed
   baselines on local ext4/XFS and the intended shared filesystem. Record inode
   use, metadata operations, network bytes, useful-page ratio, page-fault tail
