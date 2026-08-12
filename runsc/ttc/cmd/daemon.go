@@ -1229,6 +1229,8 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	unsafeNoHostIsolation := false
 	allowSlowVolumeCopy := false
 	daemonDataRoot := dataRoot()
+	daemonRoot := runtimeRoot()
+	daemonRunsc := runscPath()
 	clusterOpts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		switch {
@@ -1260,6 +1262,18 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		case strings.HasPrefix(args[0], "--data-root="):
 			daemonDataRoot = strings.TrimPrefix(args[0], "--data-root=")
 			args = args[1:]
+		case args[0] == "--root" && len(args) >= 2:
+			daemonRoot = args[1]
+			args = args[2:]
+		case strings.HasPrefix(args[0], "--root="):
+			daemonRoot = strings.TrimPrefix(args[0], "--root=")
+			args = args[1:]
+		case args[0] == "--runsc" && len(args) >= 2:
+			daemonRunsc = args[1]
+			args = args[2:]
+		case strings.HasPrefix(args[0], "--runsc="):
+			daemonRunsc = strings.TrimPrefix(args[0], "--runsc=")
+			args = args[1:]
 		default:
 			consumed, err := consumeDaemonClusterOption(args, &clusterOpts)
 			if err != nil {
@@ -1279,6 +1293,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	if daemonDataRoot == "" {
 		fmt.Fprintln(stderr, "ttcd: data root must not be empty")
+		return 2
+	}
+	if daemonRoot == "" || daemonRunsc == "" {
+		fmt.Fprintln(stderr, "ttcd: runsc state root and executable must not be empty")
 		return 2
 	}
 	runtimePlatform, err := normalizeRuntimePlatform(runtimePlatform)
@@ -1323,7 +1341,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
 		return 1
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
+	if err := serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
@@ -1625,11 +1643,11 @@ func secureDaemonDirectory(dir string) error {
 	return nil
 }
 
-func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
-	return serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, dataRoot, volumeCapability, nil, stdout, stderr)
+func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
+	return serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -1668,8 +1686,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
 		hostKernelRelease:     kernelCompatibility.release,
 		dataRoot:              dataRoot,
-		root:                  runtimeRoot(),
-		runsc:                 runscPath(),
+		root:                  root,
+		runsc:                 runsc,
 		clientExecutable:      siblingTTCExecutable(),
 		volumeCapability:      volumeCapability,
 		reconciled:            make(map[string]bool),
@@ -2429,7 +2447,7 @@ func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
 }
 
-func startDaemonProcess(socket, dataRoot, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
+func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -2438,11 +2456,11 @@ func startDaemonProcess(socket, dataRoot, runtimePlatform string, unsafeNoHostIs
 		return "", nil, fmt.Errorf("finding ttc executable: %w", err)
 	}
 	commandName := executable
-	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot, "--platform", runtimePlatform}
+	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
 	if sibling := filepath.Join(filepath.Dir(executable), "ttcd"); sibling != executable {
 		if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
 			commandName = sibling
-			commandArgs = []string{"--socket", socket, "--data-root", dataRoot, "--platform", runtimePlatform}
+			commandArgs = []string{"--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
 		}
 	}
 	if unsafeNoHostIsolation {
@@ -2614,7 +2632,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
-		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.runtimePlatform, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.root, opts.runsc, opts.runtimePlatform, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
