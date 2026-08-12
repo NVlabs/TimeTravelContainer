@@ -178,6 +178,14 @@ type DistributedForkExportArgs struct {
 	urpc.FilePayload
 	SessionID string
 	AllowCopy bool
+	Sparse    bool
+}
+
+// DistributedForkExportInfo identifies a sparse distributed memory manifest
+// and the filesystem branch captured at the same instant.
+type DistributedForkExportInfo struct {
+	Manifest         ttcchunk.ManifestID
+	FilesystemBranch string
 }
 
 // DistributedForkSessionStatus reports token-free session progress.
@@ -470,11 +478,14 @@ type SandboxFamily struct {
 }
 
 type distributedForkSession struct {
+	mu               sync.Mutex
 	source           string
 	address          string
 	filesystemBranch string
 	resources        vfs.LiveForkFilesystemResources
 	server           *ttcremote.TCPPageServer
+	sparseSnapshot   *pgalloc.RemoteSnapshot
+	memoryBindings   []pgalloc.CapturedPageBinding
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -718,12 +729,19 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	}
 	committed := false
 	var servers []*ttcremote.TCPPageServer
+	sessions := make([]*distributedForkSession, len(children))
 	defer func() {
 		if committed {
 			return
 		}
 		for _, server := range servers {
 			_ = server.Close()
+		}
+		for _, session := range sessions {
+			if session != nil && session.sparseSnapshot != nil {
+				_ = session.sparseSnapshot.Close()
+				session.sparseSnapshot = nil
+			}
 		}
 		_ = capture.Close()
 		_ = rollbackFilesystem()
@@ -736,8 +754,15 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		_ = resume()
 		return nil, fmt.Errorf("distributed capture returned %d snapshots for %d children", len(snapshots), len(children))
 	}
+	sparseSnapshots := capture.SparseSnapshots
+	if capture.SparseSnapshot != nil {
+		sparseSnapshots = []*pgalloc.RemoteSnapshot{capture.SparseSnapshot}
+	}
+	if len(sparseSnapshots) != len(children) {
+		_ = resume()
+		return nil, fmt.Errorf("distributed capture returned %d sparse snapshots for %d children", len(sparseSnapshots), len(children))
+	}
 	infos := make([]DistributedForkSessionInfo, len(children))
-	sessions := make([]*distributedForkSession, len(children))
 	for i, child := range children {
 		metadata, err := (&ttcremote.SessionMetadata{
 			FamilyID: familyID, SourceBranchID: sourceID, TargetBranchID: child.TargetBranchID,
@@ -790,6 +815,12 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		sessions[i] = &distributedForkSession{
 			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
 			resources: capture.FilesystemResources, server: server,
+			sparseSnapshot: sparseSnapshots[i], memoryBindings: capture.MemoryBindings,
+		}
+		if capture.SparseSnapshot != nil {
+			capture.SparseSnapshot = nil
+		} else {
+			capture.SparseSnapshots[i] = nil
 		}
 		infos[i] = DistributedForkSessionInfo{
 			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
@@ -851,17 +882,42 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 
 // ExportDistributedForkSnapshot persists a session's immutable page stream in
 // the exact packed layout consumed by distributed restore.
-func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExportArgs) error {
+func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExportArgs) (*DistributedForkExportInfo, error) {
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
-		return errors.New("distributed snapshot export requires a session and one destination")
+		return nil, errors.New("distributed snapshot export requires a session and one destination")
 	}
 	f.mu.Lock()
 	session := f.distributedSessions[args.SessionID]
 	f.mu.Unlock()
 	if session == nil {
-		return fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
+		return nil, fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
 	}
-	return session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
+	if !args.Sparse {
+		return nil, session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.sparseSnapshot == nil {
+		return nil, fmt.Errorf("distributed fork session %q sparse snapshot is unavailable", args.SessionID)
+	}
+	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
+	if err != nil {
+		return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
+	}
+	defer repository.Close()
+	objects, bindings, err := ttcchunk.ReadSnapshot(session.sparseSnapshot, session.memoryBindings)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := repository.Publish(objects, bindings)
+	if err != nil {
+		return nil, err
+	}
+	if err := session.sparseSnapshot.Close(); err != nil {
+		return nil, err
+	}
+	session.sparseSnapshot = nil
+	return &DistributedForkExportInfo{Manifest: manifest, FilesystemBranch: session.filesystemBranch}, nil
 }
 
 // DistributedForkSessionStatus returns progress without disclosing the bearer
@@ -892,7 +948,14 @@ func (f *SandboxFamily) CancelDistributedForkSession(id string) error {
 	if session == nil {
 		return nil
 	}
-	return errors.Join(session.server.Close(), removeDistributedFilesystemBranch(session.resources, session.filesystemBranch))
+	session.mu.Lock()
+	var sparseErr error
+	if session.sparseSnapshot != nil {
+		sparseErr = session.sparseSnapshot.Close()
+		session.sparseSnapshot = nil
+	}
+	session.mu.Unlock()
+	return errors.Join(session.server.Close(), sparseErr, removeDistributedFilesystemBranch(session.resources, session.filesystemBranch))
 }
 
 func removeDistributedFilesystemBranch(resources vfs.LiveForkFilesystemResources, branch string) error {
@@ -929,7 +992,14 @@ func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 	if session == nil {
 		return nil
 	}
-	return session.server.Close()
+	session.mu.Lock()
+	var sparseErr error
+	if session.sparseSnapshot != nil {
+		sparseErr = session.sparseSnapshot.Close()
+		session.sparseSnapshot = nil
+	}
+	session.mu.Unlock()
+	return errors.Join(session.server.Close(), sparseErr)
 }
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.

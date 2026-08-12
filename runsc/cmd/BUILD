@@ -69,6 +69,7 @@ go_library(
         "//pkg/sentry/control",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
+		"//pkg/sentry/ttcchunk",
         "//pkg/sentry/ttcremote",
         "//pkg/sentry/platform",
         "//pkg/state/pretty",

@@ -116,6 +116,11 @@ type RemoteSessionDescriptor struct {
 	// immutable packed memory stream. It is non-secret and remains valid after
 	// the source Sentry and page server exit.
 	SharedSnapshot string `json:"shared_snapshot,omitempty"`
+	// SparseRepository names a shared-data-root-relative TTC chunk repository;
+	// SparseManifest is the immutable memory graph to demand-load from it.
+	SparseRepository string `json:"sparse_repository,omitempty"`
+	SparseManifest   string `json:"sparse_manifest,omitempty"`
+	SparseBranch     string `json:"sparse_branch,omitempty"`
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
@@ -141,6 +146,26 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		clean := filepath.Clean(s.SharedSnapshot)
 		if filepath.IsAbs(s.SharedSnapshot) || clean != s.SharedSnapshot || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("invalid shared memory snapshot path %q", s.SharedSnapshot)
+		}
+	}
+	if (s.SparseRepository == "") != (s.SparseManifest == "") ||
+		(s.SparseRepository == "") != (s.SparseBranch == "") {
+		return errors.New("sparse repository, manifest, and branch must be specified together")
+	}
+	if s.SparseRepository != "" {
+		if s.SharedSnapshot != "" {
+			return errors.New("packed and sparse shared snapshots are mutually exclusive")
+		}
+		clean := filepath.Clean(s.SparseRepository)
+		if filepath.IsAbs(s.SparseRepository) || clean != s.SparseRepository || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("invalid sparse memory repository path %q", s.SparseRepository)
+		}
+		decoded, err := hex.DecodeString(s.SparseManifest)
+		if err != nil || len(decoded) != sha256.Size {
+			return errors.New("sparse memory manifest must be a SHA-256 hexadecimal ID")
+		}
+		if s.SparseBranch == "." || s.SparseBranch == ".." || strings.ContainsAny(s.SparseBranch, `/\\`) || strings.TrimSpace(s.SparseBranch) != s.SparseBranch {
+			return fmt.Errorf("invalid sparse memory branch %q", s.SparseBranch)
 		}
 	}
 	return nil

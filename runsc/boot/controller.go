@@ -1114,8 +1114,15 @@ func (cm *containerManager) ServeDistributedForkConnection(args *DistributedFork
 }
 
 // ExportDistributedForkSnapshot writes a durable shared-filesystem snapshot.
-func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkExportArgs, _ *struct{}) error {
-	return cm.l.family.ExportDistributedForkSnapshot(args)
+func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkExportArgs, out *DistributedForkExportInfo) error {
+	info, err := cm.l.family.ExportDistributedForkSnapshot(args)
+	if err != nil {
+		return err
+	}
+	if info != nil {
+		*out = *info
+	}
+	return nil
 }
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.

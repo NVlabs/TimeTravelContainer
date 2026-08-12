@@ -106,6 +106,35 @@ func TestRemoteSessionDescriptorSharedSnapshotPath(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorSparseRepository(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
+		SparseRepository: "containers/family/memory/chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+	}
+	if err := base.validate(negotiated); err != nil {
+		t.Fatalf("valid sparse repository: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.SparseManifest = "" },
+		func(d *RemoteSessionDescriptor) { d.SparseBranch = "" },
+		func(d *RemoteSessionDescriptor) { d.SparseBranch = "../remote" },
+		func(d *RemoteSessionDescriptor) { d.SparseManifest = "xyz" },
+		func(d *RemoteSessionDescriptor) { d.SparseRepository = "../chunks" },
+		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
+	} {
+		invalid := base
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted invalid sparse descriptor: %+v", invalid)
+		}
+	}
+}
+
 func testForkIdentity() ForkIdentity {
 	digest := "sha256:" + strings.Repeat("1", 64)
 	return ForkIdentity{

@@ -542,6 +542,44 @@ func (b *fakeDistributedBackend) forkRemoteMany(source selector, targetNode stri
 	return results, nil
 }
 
+func TestReleaseDistributedSparseRoot(t *testing.T) {
+	dataRoot := t.TempDir()
+	relative := filepath.Join("cluster", "memory-chunks")
+	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.Publish(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetBranch("remote-root", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{dataRoot: dataRoot}
+	info := ttcbundle.ContainerInfo{
+		DistributedSparseRepository: relative,
+		DistributedSparseBranch:     "remote-root",
+	}
+	if err := b.releaseDistributedSparseRoot(info); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.Branch("remote-root"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released branch remains: %v", err)
+	}
+	if err := b.releaseDistributedSparseRoot(ttcbundle.ContainerInfo{}); err != nil {
+		t.Fatalf("empty release is not idempotent: %v", err)
+	}
+}
+
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer

@@ -321,6 +321,8 @@ type ContainerInfo struct {
 	DistributedForkTransactionID string            `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string            `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool              `json:"distributed_fork_hidden,omitempty"`
+	DistributedSparseRepository string            `json:"distributed_sparse_repository,omitempty"`
+	DistributedSparseBranch     string            `json:"distributed_sparse_branch,omitempty"`
 	NodeID                       string            `json:"node_id,omitempty"`
 }
 
@@ -513,6 +515,54 @@ func ensureNetworkMountpoints(rootfs string) error {
 	}
 	if err := ownership.Write(manifestName, manifest); err != nil {
 		return fmt.Errorf("updating rootfs ownership for network mountpoints: %w", err)
+	}
+	return nil
+}
+
+// rehomeInternalMounts gives a distributed target its own copies of TTC's
+// generated bind-mounted files. Leaving these paths in the source container
+// directory would make the target unstartable after the source is removed.
+func rehomeInternalMounts(spec *specs.Spec, targetContainerDir string) error {
+	if spec == nil || spec.Annotations == nil {
+		return nil
+	}
+	encoded := spec.Annotations[InternalMountsAnnotation]
+	if encoded == "" {
+		return nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(encoded), &destinations); err != nil {
+		return fmt.Errorf("decoding TTC internal mounts: %w", err)
+	}
+	internal := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		internal[filepath.Clean(destination)] = struct{}{}
+	}
+	directory := filepath.Join(targetContainerDir, "internal-mounts")
+	for i := range spec.Mounts {
+		mount := &spec.Mounts[i]
+		if _, ok := internal[filepath.Clean(mount.Destination)]; !ok {
+			continue
+		}
+		info, err := os.Stat(mount.Source)
+		if err != nil {
+			return fmt.Errorf("reading TTC internal mount %q: %w", mount.Destination, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("TTC internal mount %q is not a regular file", mount.Destination)
+		}
+		contents, err := os.ReadFile(mount.Source)
+		if err != nil {
+			return fmt.Errorf("copying TTC internal mount %q: %w", mount.Destination, err)
+		}
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			return err
+		}
+		name := filepath.Join(directory, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
+		if err := os.WriteFile(name, contents, info.Mode().Perm()); err != nil {
+			return fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
+		}
+		mount.Source = name
 	}
 	return nil
 }
@@ -1129,6 +1179,10 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
+		return Prepared{}, err
+	}
+	if err := rehomeInternalMounts(spec, containerDir); err != nil {
+		_ = os.RemoveAll(containerDir)
 		return Prepared{}, err
 	}
 	memoryFilePath, err := createApplicationMemoryFile(containerDir)
@@ -2182,6 +2236,22 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 			info.Branches[i].State = state
 		}
 	}
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// UpdateDistributedForkSparseRoot records the shared sparse-memory root that
+// keeps a distributed target restorable until its demand loader has installed
+// every chunk. Passing empty values clears an already-released root.
+func (s Store) UpdateDistributedForkSparseRoot(transactionID, repository, branch string) error {
+	if (repository == "") != (branch == "") {
+		return errors.New("distributed sparse repository and branch must be specified together")
+	}
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return err
+	}
+	info.DistributedSparseRepository = repository
+	info.DistributedSparseBranch = branch
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 

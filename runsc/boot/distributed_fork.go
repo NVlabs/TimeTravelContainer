@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -58,6 +59,9 @@ type DistributedForkRestoreArgs struct {
 	// SharedSnapshot selects the first donated file as an immutable packed
 	// memory stream. Network connections are then used only to fetch metadata.
 	SharedSnapshot bool
+	// SparseManifest selects the first donated file as a TTC sparse chunk
+	// repository. Network connections are then used only to fetch metadata.
+	SparseManifest ttcchunk.ManifestID
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -88,11 +92,27 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 
 	files := args.FilePayload.Files
 	var sharedSnapshot *os.File
+	var sparseRepository *ttcchunk.MemoryRepository
+	sparse := args.SparseManifest != (ttcchunk.ManifestID{})
+	if sparse && args.SharedSnapshot {
+		return nil, errors.New("packed and sparse distributed snapshots are mutually exclusive")
+	}
 	if args.SharedSnapshot {
 		if len(files) == 0 {
 			return nil, errors.New("distributed target is missing its shared memory snapshot")
 		}
 		sharedSnapshot = files[0]
+		files = files[1:]
+	}
+	if sparse {
+		if len(files) == 0 {
+			return nil, errors.New("distributed target is missing its sparse memory repository")
+		}
+		var err error
+		sparseRepository, err = ttcchunk.OpenMemoryRepositoryFD(files[0])
+		if err != nil {
+			return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
+		}
 		files = files[1:]
 	}
 	var donated []net.Conn
@@ -116,7 +136,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 	}()
 	var pushConn net.Conn
-	if !args.SharedSnapshot && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {
 			return nil, errors.New("distributed reverse push requires a dedicated donated stream")
 		}
@@ -168,6 +188,10 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			return nil, fmt.Errorf("duplicating shared distributed snapshot: %w", err)
 		}
 		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, 64, args.MaxParallel)
+	} else if sparse {
+		if len(donated) != 0 {
+			return nil, fmt.Errorf("sparse distributed snapshot has %d unused page connections", len(donated))
+		}
 	} else if donatedMode {
 		var tcpReader *ttcremote.TCPRemoteReader
 		tcpReader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
@@ -181,9 +205,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err != nil {
 		return nil, err
 	}
-	readerOwned := true
+	readerOwned := reader != nil
 	defer func() {
-		if readerOwned {
+		if readerOwned && reader != nil {
 			_ = reader.Close()
 		}
 	}()
@@ -250,17 +274,23 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			return nil, fmt.Errorf("distributed target repositories use inconsistent branches %q and %q", filesystemBranch, donated.config.Branch)
 		}
 	}
-	readerOwned = false
 	targetMFOwned = false
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
-	child, err := kernel.LoadDistributedFork(l.k.SupervisorContext(), p, targetMF,
-		metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, reader,
-		kernel.DistributedForkLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
-			RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
-			DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
-			ConfigureNetwork: l.configureNetwork,
-		})
+	loadOpts := kernel.DistributedForkLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
+		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
+		ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
+	}
+	var child *kernel.Kernel
+	if sparse {
+		child, err = kernel.LoadSparseDistributedFork(l.k.SupervisorContext(), p, targetMF,
+			metadata.KernelMetadata, sparseRepository, args.SparseManifest, loadOpts)
+	} else {
+		readerOwned = false
+		child, err = kernel.LoadDistributedFork(l.k.SupervisorContext(), p, targetMF,
+			metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, reader, loadOpts)
+	}
 	if err != nil {
 		return nil, err
 	}

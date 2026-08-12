@@ -37,6 +37,36 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
 
+func TestRehomeInternalMountsSurviveSourceRemoval(t *testing.T) {
+	source := t.TempDir()
+	target := t.TempDir()
+	hostname := filepath.Join(source, "hostname")
+	if err := os.WriteFile(hostname, []byte("source-name\n"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	internal, err := json.Marshal([]string{"/etc/hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Annotations: map[string]string{InternalMountsAnnotation: string(internal)},
+		Mounts:      []specs.Mount{{Source: hostname, Destination: "/etc/hostname"}},
+	}
+	if err := rehomeInternalMounts(spec, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(spec.Mounts[0].Source)
+	if err != nil {
+		t.Fatalf("reading target-owned mount after source removal: %v", err)
+	}
+	if string(got) != "source-name\n" || !strings.HasPrefix(spec.Mounts[0].Source, target+string(filepath.Separator)) {
+		t.Fatalf("re-homed mount path=%q contents=%q", spec.Mounts[0].Source, got)
+	}
+}
+
 func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	imageDir := t.TempDir()
 	rootfs := filepath.Join(imageDir, "rootfs")

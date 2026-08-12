@@ -300,6 +300,7 @@ type DistributedForkLoadOptions struct {
 	DemandOnly                 bool
 	PrefetchBytes              uint64
 	PrefetchBehindBytes        uint64
+	OwnSparseRepository        bool
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
@@ -331,7 +332,12 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 
 	var pages *pgalloc.AsyncPagesFileLoad
 	if len(installation.Chunks) != 0 {
-		chunkReader, err := ttcchunk.NewChunkReader(repository, installation.Chunks)
+		var chunkReader *ttcchunk.ChunkReader
+		if opts.OwnSparseRepository {
+			chunkReader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
+		} else {
+			chunkReader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -349,6 +355,11 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 			return nil, err
 		}
 		pages.MemoryFilesDone()
+	}
+	if len(installation.Chunks) == 0 && opts.OwnSparseRepository {
+		if err := repository.Close(); err != nil {
+			return nil, err
+		}
 	}
 	pagesOwned := pages != nil
 	defer func() {

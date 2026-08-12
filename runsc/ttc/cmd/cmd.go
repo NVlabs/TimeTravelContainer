@@ -7325,6 +7325,9 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		}
 		break
 	}
+	if err := b.releaseDistributedSparseRoot(info); err != nil {
+		return fmt.Errorf("releasing distributed sparse memory: %w", err)
+	}
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -216,6 +217,43 @@ func (b *runtimeBackend) exportDistributedSnapshot(containerID, transactionID st
 	return relative, nil
 }
 
+func (b *runtimeBackend) exportDistributedSparse(containerID, transactionID string) (string, boot.DistributedForkExportInfo, error) {
+	if b.dataRoot == "" {
+		return "", boot.DistributedForkExportInfo{}, errors.New("distributed sparse export requires a TTC data root")
+	}
+	// Distributed roots must outlive the source container directory: the
+	// target may remain partially resident after the source family is removed.
+	// A cluster-level content-addressed repository also deduplicates identical
+	// chunks across source families and remote siblings.
+	relative := filepath.Join("cluster", "memory-chunks")
+	path := filepath.Join(b.dataRoot, relative)
+	repository, err := ttcchunk.OpenMemoryRepository(path)
+	if err != nil {
+		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("opening distributed sparse repository: %w", err)
+	}
+	defer repository.Close()
+	dir, err := os.Open(path)
+	if err != nil {
+		return "", boot.DistributedForkExportInfo{}, err
+	}
+	output, err := b.commandWithFiles([]*os.File{dir}, "timetravel", "--dehydration-memory-repository-fd=3", containerID, "distributed-export", transactionID)
+	_ = dir.Close()
+	if err != nil {
+		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("exporting distributed sparse memory: %w", err)
+	}
+	var info boot.DistributedForkExportInfo
+	if err := json.Unmarshal(output, &info); err != nil {
+		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("decoding distributed sparse manifest: %w", err)
+	}
+	if info.Manifest == (ttcchunk.ManifestID{}) || info.FilesystemBranch == "" {
+		return "", boot.DistributedForkExportInfo{}, errors.New("distributed sparse export returned incomplete identity")
+	}
+	if err := repository.SetBranch(info.FilesystemBranch, info.Manifest); err != nil {
+		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("rooting distributed sparse manifest: %w", err)
+	}
+	return relative, info, nil
+}
+
 func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, repositoryID string) (string, error) {
 	identity := struct {
 		ContainerID  string                    `json:"container_id"`
@@ -342,8 +380,10 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
 	sharedSnapshot := ""
+	sparseRepository := ""
+	var sparseExport boot.DistributedForkExportInfo
 	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
-		sharedSnapshot, err = b.exportDistributedSnapshot(source.container, transactionID)
+		sparseRepository, sparseExport, err = b.exportDistributedSparse(source.container, transactionID)
 		if err != nil {
 			return selector{}, err
 		}
@@ -351,6 +391,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	defer func() {
 		if !committed {
 			_ = os.Remove(filepath.Join(b.dataRoot, sharedSnapshot))
+			if sparseExport.FilesystemBranch != "" {
+				if repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, sparseRepository)); openErr == nil {
+					_ = repository.DeleteBranch(sparseExport.FilesystemBranch)
+					_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
+					_ = repository.Close()
+				}
+			}
 		}
 	}()
 	descriptor := cluster.RemoteSessionDescriptor{
@@ -358,6 +405,11 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
 		SharedSnapshot:   sharedSnapshot,
+		SparseRepository: sparseRepository,
+	}
+	if sparseExport.Manifest != (ttcchunk.ManifestID{}) {
+		descriptor.SparseManifest = sparseExport.Manifest.String()
+		descriptor.SparseBranch = sparseExport.FilesystemBranch
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -374,7 +426,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		tx = status
 	}
 	committed = true
-	if sharedSnapshot != "" {
+	if sharedSnapshot != "" || sparseRepository != "" {
 		if err := b.completeSharedDistributedFork(peer, source.container, transactionID, tx.Revision, relay); err != nil {
 			return selector{}, err
 		}
@@ -433,14 +485,16 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, err
 	}
 	type childState struct {
-		target         string
-		transaction    string
-		tx             *cluster.Transaction
-		relay          *distributedPageRelay
-		advertise      string
-		dataPlaneMax   uint64
-		captured       bool
-		sharedSnapshot string
+		target           string
+		transaction      string
+		tx               *cluster.Transaction
+		relay            *distributedPageRelay
+		advertise        string
+		dataPlaneMax     uint64
+		captured         bool
+		sharedSnapshot   string
+		sparseRepository string
+		sparseExport     boot.DistributedForkExportInfo
 	}
 	children := make([]childState, len(targetContainers))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -468,6 +522,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			}
 			if child.sharedSnapshot != "" {
 				_ = os.Remove(filepath.Join(b.dataRoot, child.sharedSnapshot))
+			}
+			if child.sparseExport.FilesystemBranch != "" {
+				if repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, child.sparseRepository)); openErr == nil {
+					_ = repository.DeleteBranch(child.sparseExport.FilesystemBranch)
+					_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
+					_ = repository.Close()
+				}
 			}
 		}
 	}()
@@ -577,7 +638,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
 		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
-			child.sharedSnapshot, err = b.exportDistributedSnapshot(source.container, child.transaction)
+			child.sparseRepository, child.sparseExport, err = b.exportDistributedSparse(source.container, child.transaction)
 			if err != nil {
 				return nil, fmt.Errorf("exporting snapshot for target %s: %w", child.target, err)
 			}
@@ -587,6 +648,11 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
 			SharedSnapshot:   child.sharedSnapshot,
+			SparseRepository: child.sparseRepository,
+		}
+		if child.sparseExport.Manifest != (ttcchunk.ManifestID{}) {
+			descriptors[i].SparseManifest = child.sparseExport.Manifest.String()
+			descriptors[i].SparseBranch = child.sparseExport.FilesystemBranch
 		}
 	}
 	prepareErrors := make([]error, len(children))
@@ -636,7 +702,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	results := make([]selector, len(children))
 	for i := range children {
 		child := &children[i]
-		if child.sharedSnapshot != "" {
+		if child.sharedSnapshot != "" || child.sparseRepository != "" {
 			if err := b.completeSharedDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay); err != nil {
 				return nil, fmt.Errorf("making target %s source-independent: %w", child.target, err)
 			}

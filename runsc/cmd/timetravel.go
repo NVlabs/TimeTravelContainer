@@ -31,6 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -352,16 +353,23 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		})
 		connection.Close()
 	case "distributed-export":
-		if t.distributedSnapshotFD < 0 {
-			util.Fatalf("--distributed-snapshot-fd is required")
+		sparse := t.dehydrationMemoryRepositoryFD >= 0
+		fd := t.distributedSnapshotFD
+		name := "distributed-memory-snapshot"
+		if sparse {
+			fd = t.dehydrationMemoryRepositoryFD
+			name = "distributed-memory-repository"
 		}
-		snapshot := os.NewFile(uintptr(t.distributedSnapshotFD), "distributed-memory-snapshot")
+		if fd < 0 {
+			util.Fatalf("a distributed snapshot or sparse repository FD is required")
+		}
+		snapshot := os.NewFile(uintptr(fd), name)
 		if snapshot == nil {
-			util.Fatalf("invalid distributed snapshot FD")
+			util.Fatalf("invalid distributed export FD")
 		}
-		err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
+		output, err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
-			AllowCopy: t.distributedSnapshotAllowCopy,
+			AllowCopy: t.distributedSnapshotAllowCopy, Sparse: sparse,
 		})
 		snapshot.Close()
 	case "distributed-status":
@@ -411,6 +419,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, snapshot)
 			defer snapshot.Close()
+		}
+		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
+			if t.dehydrationMemoryRepositoryFD < 0 {
+				util.Fatalf("--dehydration-memory-repository-fd is required for sparse distributed restore")
+			}
+			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-sparse-memory-repository")
+			if repository == nil {
+				util.Fatalf("invalid inherited distributed sparse repository FD")
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
+			defer repository.Close()
 		}
 		if t.distributedConnectionsCount < 0 || (t.distributedConnectionsCount != 0 && t.distributedConnectionsStartFD < 0) {
 			util.Fatalf("invalid inherited distributed connection range")
