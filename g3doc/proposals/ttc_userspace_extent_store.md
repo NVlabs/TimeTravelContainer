@@ -20,29 +20,93 @@ shared page references.
 
 ## Decision summary
 
-TTC should implement a logical database with these components:
+TTC should implement a logical database with these components, independently
+of which physical storage engine is selected:
 
 1. A small transactional metadata store containing immutable trees, branch
-   roots, memory manifests, active loader leases, and page-directory records.
-2. One data arena per storage shard containing fixed 4 KiB physical slots.
+   roots, memory manifests, active loader leases, and backend placement records
+   where applicable.
+2. A persistent chunk backend storing 4 KiB pages and larger coalesced objects.
 3. Stable `PageID` values that are independent of physical arena offsets.
 4. Persistent CoW trees mapping logical file or memory ranges to runs of
    `PageID` values.
 5. O(1) branch creation by sharing a tree root and advancing a branch data
    generation.
-6. Lock-free or read-mostly lookup through immutable roots and atomically
-   published page-directory entries.
-7. Reuse of free physical slots without requiring hole punching.
-8. Optional tail-fill compaction: move live tail pages into free lower slots,
-   redirect their stable `PageID` entries, wait for old readers, and truncate
-   the arena tail.
+6. Concurrent or read-mostly lookup through immutable roots; a custom backend
+   additionally uses atomically published page-directory entries.
+7. Reclamation without requiring hole punching: either immutable-file rewrite
+   and deletion in an embedded engine, or free-slot reuse in a custom arena.
+8. If a custom arena is necessary, optional tail-fill compaction: move live
+   tail pages into free lower slots, redirect their stable `PageID` entries,
+   wait for old readers, and truncate the arena tail.
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-A general-purpose database may be used for experiments, but the preferred
-production layout is a TTC-specific metadata checkpoint/WAL plus data arenas.
-Large payloads should not pass through a relational database's record and
-locking paths.
+The first implementation should use Pebble v2 behind a narrow backend
+interface and qualify it with TTC workloads. A TTC-specific metadata
+checkpoint/WAL plus data arenas remains the fallback, not the presumed
+production choice. Large payloads should not pass through a relational
+database's record and locking paths.
+
+## Existing storage-engine survey
+
+This problem overlaps embedded databases, but TTC adds several requirements
+that ordinary key/value stores do not provide by themselves: a fork must copy
+only a durable root, page identities must survive physical relocation, branch
+roots must remain named after restart, and a runtime mapping must not pin an
+embedded database transaction indefinitely.
+
+The candidates investigated in August 2026 are:
+
+| Candidate | Useful properties | Reason not to adopt as the complete design |
+| --- | --- | --- |
+| [Pebble v2](https://github.com/cockroachdb/pebble) | Maintained pure-Go engine; production use; concurrent reads and commit pipeline; synced batches, snapshots, WAL recovery, immutable files, compaction, and file deletion. Its v2 blob-file implementation can relocate live values while preserving logical blob handles. | TTC still needs its own immutable page maps, named roots, leases, and reachability. Value separation is exposed as an experimental policy and must be benchmarked separately from ordinary SST values. Values are read through Pebble rather than mapped directly into a guest. |
+| [Dolt Noms Block Store](https://github.com/dolthub/dolt/tree/main/go/store/nbs) | The closest semantic match: a content-addressed DAG, root-hash commit, immutable table files, optimistic writers, mark-and-sweep GC, and remote-oriented storage. | The package has one store root, broad Dolt/cloud/archive dependencies, compression code that complicates TTC's static build, and whole-live-set GC. Extracting its local subset would effectively create another fork for TTC to maintain. Its design remains valuable prior art. |
+| [Badger](https://github.com/dgraph-io/badger) | Mature pure-Go WiscKey engine with an LSM index, value log, concurrent ACID transactions, and segment rewriting. | Value-log reclamation is application-driven and can lag LSM version cleanup; prompt bounded shrink is difficult to guarantee. It also does not supply persistent branch roots. |
+| [gosqlite.org/blobstore](https://pkg.go.dev/gosqlite.org/blobstore) | Fixed-size chunks, sparse objects, incremental reads/writes, reference-counted CoW clones, versions, and SQLite incremental vacuum. | It was first released only recently, SQLite permits one writer, every chunk is a SQL row, and clone copies every chunk mapping. A local 64 MiB/4 KiB-chunk clone-and-delete microbenchmark took about 1.56 seconds, so it cannot implement TTC's O(1) fork. |
+| [libmdbx with mdbx-go](https://github.com/erigontech/mdbx-go) | Direct memory-mapped values, MVCC, CoW transactions, free-page reuse, configurable growth, and automatic tail truncation. | It is a C/cgo dependency, has one writer, and long-lived readers prevent retired-page reuse. Adopting it would compromise TTC's pure-Go static build and still would not provide durable branch roots. |
+| [bbolt](https://github.com/etcd-io/bbolt) | Small, stable, pure-Go, mmap-backed transactional B+tree. | It has one writer and explicitly cannot truncate its database to return interior free pages to the host filesystem. |
+| [go-storethehash](https://github.com/ipld/go-storethehash) | Append-oriented primary storage and an on-disk hash index aimed at block stores. | Its documented primary-store compaction/free-list work is incomplete, so TTC would inherit the unfinished part it is trying to avoid writing. |
+
+### Initial selection: Pebble behind a TTC interface
+
+Phase 0 should prototype Pebble v2 as the physical backend rather than import
+its `sstable/blob` subpackage directly. The latter exposes Pebble-specific
+object-storage and internal identifier types and is not an independent blob
+database API.
+
+TTC records remain explicit and versioned:
+
+* `data/<PageID>` stores an immutable page or coalesced page run;
+* `node/<NodeID>` stores an immutable page-map, inode-map, or directory node;
+* `root/<DomainID>/<RootID>` names a committed root; and
+* `state/...` stores allocator counters, leases, GC epochs, and format data.
+
+A fork inserts one new root record pointing at the same immutable nodes. It
+does not use a Pebble snapshot as the branch: Pebble snapshots are runtime read
+views, whereas a TTC branch must be a small, durable named object that survives
+daemon shutdown. A mutation allocates new data and nodes and atomically
+publishes the new root in one synced batch. Unreachable immutable keys are
+deleted after TTC's reachability and lease rules permit it; Pebble then
+reclaims their physical space through compaction and deletion of obsolete
+table or blob files.
+
+The first benchmark should compare two Pebble modes:
+
+1. ordinary 4 KiB values in SSTs, which uses only established Pebble paths;
+2. v2 value separation with 4 KiB values in blob files, which may reduce data
+   rewrite amplification but is still configured through Pebble's
+   `Experimental.ValueSeparationPolicy`.
+
+Do not ship value separation merely because its layout looks closer to TTC's
+arena. It must win the crash, steady-state space, write-amplification, random
+page-fault, fork, deletion, and foreground-latency tests below.
+
+Keep the backend boundary small enough that the custom arena described in this
+proposal can replace Pebble without changing branch metadata or guest-visible
+semantics. Implement the custom allocator, WAL, relocation journal, and epoch
+reclamation only if Pebble fails an explicit acceptance gate. This converts a
+large storage-engine implementation into a measured fallback.
 
 ## Requirements
 
@@ -104,8 +168,9 @@ type Slot uint64
 ```
 
 `PageID` is stable until the page becomes unreachable and passes an epoch
-grace period. It never encodes a host file offset. A page-directory record
-maps it to mutable physical placement:
+grace period. It never encodes a host file offset. Pebble represents it in the
+key of an immutable value. The fallback arena maps it to mutable physical
+placement through a page-directory record:
 
 ```go
 type PageLocation struct {
@@ -133,7 +198,11 @@ Page IDs are allocated monotonically within a domain epoch and are not reused
 quickly. This prevents an old reader or replayed WAL record from observing an
 unrelated page through an ABA collision.
 
-## Physical arenas
+## Fallback physical arenas
+
+This section and **Tail-fill compaction** specify the custom backend retained
+for use only if the Phase 0 Pebble qualification fails. They are not additional
+layers to put beneath Pebble.
 
 ### Base layout
 
@@ -609,12 +678,37 @@ branch observe another branch's private write.
 * Replay randomized fork/write/delete/load/relocate schedules against it.
 * Instrument current TTC workloads to collect page-write sizes, mmap ratios,
   dirty pages at fork, dehydration reuse, and expected compaction benefit.
-* Benchmark 1, 4, 8, and 16 arena shards and B+tree node sizes.
+* Define a small `ChunkBackend` contract for immutable put/get/delete, synced
+  batch publication, iteration, metrics, and explicit close/reopen.
+* Implement a Pebble v2 spike using ordinary 4 KiB SST values.
+* A/B it with Pebble v2 value separation, including forced garbage and blob
+  rewrites, without making the experimental policy part of TTC's format.
+* Benchmark a minimal custom arena only as the performance/control baseline,
+  including 1, 4, 8, and 16 shards and representative B+tree node sizes.
+* Measure binary size, build dependencies, startup/recovery time, steady-state
+  disk amplification, disk convergence after deletion, random page latency,
+  sequential throughput, write amplification, fsync batching, and p99 latency
+  during compaction.
 
-Exit criterion: invariants survive randomized crash points and defaults are
-chosen from measured workloads rather than assumption.
+Exit criterion: invariants survive randomized crash points and one backend is
+selected by recorded acceptance gates rather than architectural resemblance.
 
-### Phase 1: standalone extent engine
+### Phase 1A: standalone logical engine on Pebble
+
+* Implement immutable page-map nodes, branch roots, memory manifests, leases,
+  data generations, and reachability above `ChunkBackend`.
+* Commit new immutable records and the replacement named root in one synced
+  Pebble batch.
+* Add a background reclaimer that deletes unreachable records only after TTC
+  leases and epochs permit it, then lets Pebble compact obsolete files.
+* Repeat all crash injection, fork latency, churn, and disk-convergence tests
+  with realistic family sizes.
+
+Exit criterion: a standalone stress test runs billions of modeled operations,
+reopens after injected crashes, always reproduces committed roots, and meets
+the latency and amplification gates.
+
+### Phase 1B: custom backend, only if Phase 1A fails
 
 * Implement domain creation, dual superblocks, WAL, checkpoint, arena shards,
   stable page directory, free-range allocator, epochs, and checksums.
@@ -623,13 +717,13 @@ chosen from measured workloads rather than assumption.
 * Implement offline tail-fill compaction and recovery from every relocation
   boundary.
 
-Exit criterion: a standalone stress test runs billions of modeled operations,
-reopens after injected crashes, and always reproduces committed roots.
+Exit criterion: the same Phase 1A suite passes and the measured failure that
+required replacing Pebble is eliminated without regressing the other gates.
 
 ### Phase 2: dehydration page store
 
 * Export durable memory into extent manifests instead of packed files.
-* Rehydrate through an arena-backed asynchronous reader and active lease.
+* Rehydrate through a backend-backed asynchronous reader and active lease.
 * Batch page-consumption updates and reclaim pages after durable release.
 * Re-dehydrate by reusing unresolved ranges without draining them first.
 * Retain the existing packed format only behind a temporary development flag.
@@ -640,7 +734,7 @@ disk usage when few pages change, and every branch can become process-free.
 ### Phase 3: distributed memory integration
 
 * Publish shared-domain manifests to remote nodes.
-* Combine partial arena publication with the existing network reader where
+* Combine partial chunk publication with the existing network reader where
   useful.
 * Add writer fencing, disjoint allocator reservations, and remote lease
   recovery.
@@ -664,7 +758,9 @@ write cost is proportional to touched pages rather than guest file size.
 
 ### Phase 5: filesystem mappings and live fork
 
-* Implement arena-range translations and pin tracking.
+* Implement backing-range translations and pin tracking. With Pebble this may
+  require a TTC page-cache file or memory object rather than exposing Pebble's
+  internal table layout; with the fallback backend it uses arena ranges.
 * Cover shared/private mappings, dirty synchronization, truncate races, and
   write-fault CoW.
 * Integrate writable-translation invalidation into the atomic family fork.
@@ -771,7 +867,7 @@ Initial targets are:
   permits it;
 * metadata overhead below 1% of uniquely stored page bytes for large dense
   workloads;
-* no unbounded arena growth under a steady allocate/delete workload; and
+* no unbounded backend growth under a steady allocate/delete workload; and
 * configurable compaction that can be disabled with no correctness impact.
 
 Absolute throughput and latency gates should be set only after Phase 0 records
@@ -787,8 +883,10 @@ The replacement is ready to become TTC's default only when:
 * dehydrated and active branches share storage without assigning page
   ownership to one branch;
 * loaded memory pages are released incrementally from durable leases;
-* free middle slots are reused immediately and tail-fill compaction safely
-  reduces arena files using only copy and truncate;
+* deleted chunks are physically reclaimed and disk use converges using only
+  ordinary file creation, writing, renaming, deletion, and truncation; for the
+  fallback backend, free middle slots are reused immediately and tail-fill
+  compaction safely reduces arena files using only copy and truncate;
 * ordinary reads have no domain-global lock;
 * filesystem mmap coherence and fork isolation pass stress testing;
 * every injected crash recovers a valid committed root set; and
