@@ -100,13 +100,13 @@ Large snapshots use bounded shard directories rather than one unbounded
 directory. Reads and unlinks operate relative to retained directory
 descriptors, and directory synchronization batches consumption records.
 
-One chunk covers 1 MiB of the packed snapshot stream, not necessarily one
-contiguous guest virtual-address interval. Its manifest entry records stream
-offset, valid length for the final chunk, stable chunk ID, and checksum. The
-manifest already maps packed pages back into `MemoryFile` ranges. Loading reads
-the entire valid chunk, installs every contained page, and marks each 4 KiB page
-resident independently. Thus 1 MiB is the persistence, shared-filesystem, and
-prefetch unit; memory CoW and correctness remain 4 KiB.
+One chunk contains as many as 256 stable logical 4 KiB page slots, not
+necessarily one contiguous guest virtual-address interval. Its manifest entry
+records the logical coordinate, valid-slot bitmap, immutable content version,
+and checksum, plus scatter/gather mappings back to `MemoryFile` ranges. Loading
+reads the whole chunk and atomically installs every valid page. Thus 1 MiB is
+the persistence, shared-filesystem, network-fetch, and residency unit; memory
+CoW and correctness remain 4 KiB.
 
 The 1 MiB choice deliberately trades as much as 256-page read and residency
 amplification on a sparse access for 16 times fewer host files and metadata
@@ -174,26 +174,66 @@ GC tests before being advertised as supported.
 
 ### Chunk coordinates and alignment
 
-The authoritative chunk coordinate is `(MemoryImageID, StreamChunkIndex)`, not
-a guest virtual address. TTC already serializes used, page-aligned `MemoryFile`
-ranges into a packed page stream and records how each stream range maps back to
-`MemoryFile` offsets. Chunk `i` covers:
+Capture-specific packed-stream offsets are not stable chunk identities. They
+remain useful wire offsets in the current implementation, but inserting a new
+used page before a later capture can shift subsequent offsets and destroy chunk
+reuse. The replacement format adds stable logical allocation identities:
 
-```text
-[i * 1 MiB, min((i + 1) * 1 MiB, stream length))
+```go
+type LogicalChunkID [16]byte
+
+type LogicalPageID struct {
+	Chunk LogicalChunkID
+	Slot  uint8 // 0..255
+}
+
+type ChunkCoordinate struct {
+	MemoryLineageID [16]byte
+	Chunk           LogicalChunkID
+}
 ```
 
-The stream begins and ends on 4 KiB page boundaries, so every full chunk has
-exactly 256 page slots. A chunk may cross two packed `MemoryFile` regions; its
-manifest mapping supplies the scatter/gather descriptors needed to install the
-slots. Guest mappings, including a downward-growing stack, do not need to be
-1 MiB-aligned or contiguous. Stack growth after a fork allocates new pages in
-the writing branch and does not change the older snapshot stream.
+`MemoryLineageID` identifies a logical `MemoryFile` lineage across local forks,
+remote metadata clones, dehydration, and rehydration. `LogicalChunkID` names a
+stable group of 256 logical page slots. The immutable shared file is a
+**version** of that coordinate; its content-addressed `ChunkID` changes when
+any slot's bytes change.
 
-The same fixed 1 MiB unit is used for shared chunk files and live network
-fetches. One RPC may pipeline requests and responses for several chunks, but a
-chunk is the indivisible request, validation, installation, acknowledgement,
-and reclamation unit. The final chunk carries a page-aligned valid length.
+New pages receive monotonically allocated slots from a process-local open
+logical chunk; nodes use disjoint ID namespaces, so this requires no cross-node
+allocator. Local branches in one Sentry may share the small allocator lock and
+continue filling the same open chunk. Publication captures an immutable
+`(valid-slot bitmap, page-version vector)` without sealing the logical
+coordinate: later allocations may use previously invalid slots but create a
+different immutable content version. An already published version never
+changes, and logical page IDs are not reused within a family lifetime. A 4 KiB
+CoW write likewise creates a new content version for the same `LogicalPageID`;
+it does not change the logical chunk coordinate.
+
+Consequently, growing a stack downward by one page does not insert a page into
+an address-sorted stream and does not renumber anything. The new stack page
+gets the next process-local open slot, or starts one new chunk if the previous
+one is full or no open chunk exists. It does not consume a whole 1 MiB object:
+the next 255 page allocations can fill the remaining slots. Only versions that
+include the new logical page differ. Its guest virtual address and growth
+direction are irrelevant.
+
+Each manifest maps logical page IDs to the guest/kernel objects and current
+`MemoryFile` offsets that use them. A shared chunk object carries a 256-bit
+valid-slot bitmap and one page-aligned payload slot for each valid logical page.
+The all-resident/all-non-resident invariant applies to all slots valid in that
+chunk version; invalid slots require no backing page. The manifest mapping
+supplies the scatter/gather destinations needed to install those pages.
+
+Adding stable logical page IDs is new implementation work. The current remote
+format instead assigns packed stream offsets at capture time. The old format
+can be read during development, but it cannot be used as the persistent
+identity scheme for the shared-chunk design.
+
+The same fixed 256-slot, at-most-1-MiB unit is used for shared chunk files and
+live network fetches. One RPC may pipeline requests and responses for several
+chunks, but one chunk version is the indivisible request, validation,
+installation, acknowledgement, and reclamation unit.
 
 ### Normative local state
 
@@ -271,6 +311,65 @@ The permitted steady-state combinations are:
 No operation may leave one valid page resident and another non-resident in the
 same branch/node chunk slot.
 
+### Node-local sharing of a chunk version
+
+Residency belongs to one immutable chunk **version on a node**, not separately
+to every branch. Branch views bind their logical chunk coordinates to canonical
+node-local instances:
+
+```go
+type NodeChunkKey struct {
+	Coordinate ChunkCoordinate
+	Version    ChunkID
+}
+
+type NodeChunkInstance struct {
+	Key       NodeChunkKey
+	Residency ChunkResidency
+	Pages     [256]PageVersionRef
+	Bindings  uint32
+	Load      LoadID
+}
+
+type BranchChunkBinding struct {
+	Coordinate ChunkCoordinate
+	Base       *NodeChunkInstance
+	Current    [256]PageVersionRef
+	DirtyPages [4]uint64
+}
+```
+
+These types are schematic; durable manifests need not contain Go pointers.
+The normative rules are:
+
+1. A node canonicalizes `(coordinate, version)` before starting a load. All
+   local branch bindings that still name that exact version join the same load.
+2. `loading -> resident` installs all valid pages in the canonical instance in
+   one transaction. Every joined binding becomes usable at the same `L4`.
+3. A local fork shares the binding's current 4 KiB page-version references. It
+   does not create another 1 MiB allocation or loader.
+4. A write replaces only the writer's `Current[slot]` through ordinary 4 KiB
+   CoW and sets its dirty bit. Siblings continue to reference the canonical
+   page version. The immutable base instance is never modified.
+5. An instance can be evicted only when no resident binding or in-flight I/O
+   needs its pages. One branch becoming dirty does not evict clean base pages
+   still used by another branch.
+
+For example, after `A.1 -> B.2` and a local `B.2 -> B.3`, both B branches bind
+to the same target `MemoryFile` ranges and node chunk instance. If either
+branch faults first, one network/NFS read installs the complete chunk for both.
+A later write by B.2 CoWs only the affected 4 KiB page; B.3 keeps the fork-time
+page.
+
+The current TTC implementation already supplies the core mechanism for this
+specific same-Sentry case: `MemoryManager.Fork` shares its `MemoryFile`, the
+remote async loader is attached once to that `MemoryFile`, and private PMAs are
+made CoW by local fork. Current demand loading can still install subranges, so
+the canonical `NodeChunkInstance` and atomic 1 MiB residency transaction are
+new work. Branches restored into separate Sentry processes do not currently
+share resident host pages merely because they reference the same NFS chunk;
+they each need a load unless a later cross-Sentry shared-page cache is added.
+
 ### Normative 4 KiB page-version state
 
 A page version may simultaneously belong to local branches, fork snapshots,
@@ -306,7 +405,7 @@ under the chunk coordinate.
 ### Normative remote-consumer and object state
 
 A live fork snapshot groups the process-local 4 KiB page-version references by
-1 MiB stream coordinate:
+stable logical chunk coordinate:
 
 ```go
 type RemoteConsumerState uint8
@@ -439,7 +538,7 @@ The local state transitions themselves have these linearization points:
 When a local branch writes a 4 KiB page retained by a remote snapshot, ordinary
 CoW preserves the old `PageVersionRef`. The write-fault path performs no file or
 network I/O. After locks are released it queues the corresponding
-`(SnapshotID, StreamChunkIndex)` if at least one consumer still needs live data
+`(SnapshotID, ChunkCoordinate)` if at least one consumer still needs live data
 and no identical shared chunk has reached `L3`.
 
 The background publisher writes all valid pages in that 1 MiB snapshot chunk:
@@ -474,7 +573,7 @@ subobjects.
 | --- | --- |
 | Local fork | Freeze the branch; settle each `loading/evicting` transaction; share resident 4 KiB page refs and non-resident origin descriptors; publish the child's chunk-map root; then resume. No chunks are written. |
 | Live remote fork | Freeze, create fork-time page refs at `L0`, durably publish the target dependency at `L1`, then resume. Chunk publication is background work and is never on the source-pause path. |
-| Network fault | Atomically elect one loader, request exactly one stream chunk, acquire source network leases, transfer and validate all bytes, install all pages at `L4`, acknowledge the chunk at `L5`; interrupted transfers install nothing. |
+| Network fault | Canonicalize the node chunk version, atomically elect one loader, request exactly that logical chunk, acquire source network leases, transfer and validate all bytes, install all pages for every joined local binding at `L4`, and acknowledge the chunk at `L5`; interrupted transfers install nothing. |
 | Source page write | CoW only the written 4 KiB page, then enqueue whole-chunk promotion after releasing memory locks. The application never waits for `L2` or `L3`. |
 | Source memory pressure | Queue promotion for live-only chunks in priority order. Reclaim a chunk's old page versions only at `L6`. |
 | Dehydrate running/paused branch | Freeze and settle loaders. Reuse non-resident shared chunks; materialize live-only origins; write complete current contents for resident chunks. Publish a complete manifest at `L3`, replace runtime state with that manifest, then release branch pages. Outbound remote snapshots are promoted separately because they may contain older bytes. |
@@ -1122,6 +1221,10 @@ branch observe another branch's private write.
 
 * Define a versioned immutable manifest and 1 MiB loose-chunk format. Do not
   add Pebble to TTC's runtime dependency graph.
+* Add stable lineage, logical-chunk, and logical-page IDs to `MemoryFile`
+  allocation and preserve them across local fork, remote metadata cloning,
+  dehydration, and rehydration. Do not use capture-specific packed offsets as
+  persistent identities.
 * Implement shared-root chunk publication with temporary files, file sync,
   atomic rename, shard-directory sync, and manifest-last publication.
 * Implement `openat`/`unlinkat`, batched directory synchronization, bounded
@@ -1135,6 +1238,11 @@ branch observe another branch's private write.
 * Exercise local and cross-host demand loading, concurrent prefetch, partial
   rehydration, redehydration, crash recovery, source-node loss after
   publication, and snapshot removal.
+* Test `A.1 -> B.2 -> B.3` with B.2/B.3 forked both before and after their
+  inherited chunks load: either sibling's first fault performs one node-local
+  full-chunk load, both see identical bytes, and a 4 KiB write by either sibling
+  remains invisible to the other. Repeat with live and shared-file origins and
+  with fault/fork/write races.
 * Benchmark 1 MiB chunks against the historical 64 KiB loose-file and packed
   baselines on local ext4/XFS and the intended shared filesystem. Record inode
   use, metadata operations, network bytes, useful-page ratio, page-fault tail

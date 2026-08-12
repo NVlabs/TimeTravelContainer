@@ -42,9 +42,11 @@ Implementation progress:
 
 All cooperating `ttcd` instances use the same shared TTC data root. Durable
 memory is represented by immutable, content-addressed files containing up to
-1 MiB, or 256 base pages, from the packed snapshot stream. Immutable manifests
-map stream ranges to chunk IDs; branch records point to manifests without
-encoding branch ancestry. Memory CoW, residency, and correctness remain 4 KiB.
+1 MiB, or 256 stable logical base-page slots. Immutable manifests map logical
+chunk coordinates and page-version vectors to content IDs; branch records
+point to manifests without encoding branch ancestry. Memory CoW and correctness
+remain 4 KiB, while one node loads and evicts all valid slots of a version
+together.
 
 For an already-dehydrated branch, remote fork is metadata-only: the new branch
 references the same manifest, the destination acquires a loader lease, and it
@@ -64,9 +66,10 @@ It therefore uses the existing page-granular TCP dependency as a bridge:
    metadata, and resumes the source.
 2. Node B may start immediately and pull missing pages from A using the current
    race-tested transport.
-3. In parallel, A or B groups preserved snapshot pages into 1 MiB chunks,
+3. In parallel, A or B groups preserved snapshot pages by stable 1 MiB logical
+   chunk coordinate,
    hashes them, and publishes them atomically to the shared repository.
-4. Immutable progress generations redirect completed stream ranges to shared
+4. Immutable progress generations redirect completed coordinates to shared
    chunks. A target lookup chooses the newest committed generation; an
    in-flight TCP read and a newly published identical chunk are resolved
    idempotently.
