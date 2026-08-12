@@ -8079,6 +8079,17 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
+				// No process can fault the imported backing after the family
+				// runtime is gone. Persist the exited state first, then release
+				// the cluster root; a failure remains conservative and a later
+				// listing retries the idempotent cleanup.
+				if persistentFamilyProcessFree(reconciled) && reconciled.DistributedSparseBranch != "" {
+					if err := b.releaseDistributedSparseRoot(reconciled); err == nil {
+						if latest, err := store.LoadContainer(container.ID); err == nil {
+							reconciled = latest
+						}
+					}
+				}
 				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
 				family.Branches = persistentBranches(reconciled.Branches)

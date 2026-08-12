@@ -3722,6 +3722,80 @@ exit 2
 	}
 }
 
+func TestListFamiliesReleasesSparseRootAfterRuntimeLoss(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte(`#!/bin/sh
+if [ "$3" = "list" ]; then
+	echo '[]'
+	exit 0
+fi
+exit 2
+`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", "dead", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	relative := filepath.Join("cluster", "memory-chunks")
+	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.Publish(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetBranch("dead-root", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC()
+	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+		ID: "dead", Name: "dead", BundleDir: bundleDir, State: "running", CreatedAt: createdAt,
+		Branches:                     []ttcbundle.BranchInfo{{ID: "main", State: "running", CreatedAt: createdAt}},
+		DistributedForkTransactionID: "tx-dead", DistributedSparseRepository: relative,
+		DistributedSparseBranch: "dead-root",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "dead", "container.json"), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 1 || families[0].State != "exited" {
+		t.Fatalf("families after runtime loss = %+v", families)
+	}
+	info, err := b.containerStore().LoadContainer("dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.DistributedSparseRepository != "" || info.DistributedSparseBranch != "" {
+		t.Fatalf("dead runtime retained sparse root metadata: %+v", info)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.Branch("dead-root"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead runtime sparse root remains: %v", err)
+	}
+}
+
 func TestListFamiliesReconcilesDeadListedSandbox(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
