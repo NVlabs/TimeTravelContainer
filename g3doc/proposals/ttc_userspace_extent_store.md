@@ -235,6 +235,17 @@ live network fetches. One RPC may pipeline requests and responses for several
 chunks, but one chunk version is the indivisible request, validation,
 installation, acknowledgement, and reclamation unit.
 
+For two remote forks taken from one evolving source, the manifests share every
+unchanged `(ChunkCoordinate, ChunkID)` pair. A 4 KiB write preserves the
+coordinate but gives the affected chunk contents a new `ChunkID`; the older
+remote child retains the old version and the newer child names the new one. A
+new anonymous page occupies a previously invalid logical slot or a new logical
+chunk, so only that chunk version and the mapping metadata differ. Changes such
+as `mprotect`, unmapping an alias, or mapping another alias to an existing page
+can change branch mapping metadata without changing any immutable chunk bytes.
+If a modified chunk later has exactly the same valid bitmap and bytes as an
+existing version, content addressing permits reuse of that version.
+
 ### Normative local state
 
 State is represented with orthogonal enums rather than one product enum with
@@ -369,6 +380,17 @@ the canonical `NodeChunkInstance` and atomic 1 MiB residency transaction are
 new work. Branches restored into separate Sentry processes do not currently
 share resident host pages merely because they reference the same NFS chunk;
 they each need a load unless a later cross-Sentry shared-page cache is added.
+
+Today one active local TTC family normally has one Sentry containing all of its
+live branches. Local fork and peer rehydration therefore use the same-Sentry
+path. Separate Sentries occur across nodes, between different local families,
+and for direct remote-fork destinations that TTC currently represents as new
+target container families. Two independent remote siblings placed on the same
+host under different target container names consequently share immutable NFS
+chunk objects but not resident `MemoryFile` pages. A future distributed runtime
+should preferentially place all compatible branches of one global memory
+lineage in one Sentry per node; a cross-Sentry page cache is an optional later
+optimization for placements that cannot be consolidated.
 
 ### Normative 4 KiB page-version state
 
@@ -1229,6 +1251,10 @@ branch observe another branch's private write.
   atomic rename, shard-directory sync, and manifest-last publication.
 * Implement `openat`/`unlinkat`, batched directory synchronization, bounded
   descriptors, full-chunk loading, and checksums.
+* Replace the current subrange installation path with a per-runtime canonical
+  chunk table and transactional 1 MiB loading: all valid slots move together
+  from non-resident to loading to resident, concurrent faults join one load,
+  and no guest thread can observe a partially installed chunk.
 * Keep family-level chunk references outside branch ancestry so shared chunks
   survive until the last dehydrated manifest releases them.
 * Publish active-loader leases in the shared root. GC may unlink a chunk only
