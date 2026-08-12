@@ -17,6 +17,7 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -59,6 +60,13 @@ type DistributedForkRestoreArgs struct {
 	// SharedSnapshot selects the first donated file as an immutable packed
 	// memory stream. Network connections are then used only to fetch metadata.
 	SharedSnapshot bool
+	// SharedMetadata selects the first donated file as an immutable
+	// SessionMetadata envelope. This removes the source-process dependency for
+	// forks of dehydrated branches.
+	SharedMetadata bool
+	// DurableDehydration interprets SharedMetadata using the durable
+	// dehydration format and restores all captured private MemoryFiles.
+	DurableDehydration bool
 	// SparseManifest selects the first donated file as a TTC sparse chunk
 	// repository. Network connections are then used only to fetch metadata.
 	SparseManifest ttcchunk.ManifestID
@@ -74,7 +82,7 @@ type DistributedForkRestoreInfo struct {
 }
 
 func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
-	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || args.Address == "" {
+	if args == nil || args.SessionID == "" || args.FamilyID == "" || args.TargetBranchID == "" || (!args.SharedMetadata && args.Address == "") {
 		return nil, errors.New("distributed target restore is missing session, family, branch, or source address")
 	}
 	if args.MetadataBytes == 0 || args.MaxTransferBytes == 0 || args.MaxParallel <= 0 || args.Timeout <= 0 || args.RetryLimit < 0 || args.AckBatchPages <= 0 || args.AckInterval < 0 {
@@ -91,6 +99,14 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 
 	files := args.FilePayload.Files
+	var sharedMetadata *os.File
+	if args.SharedMetadata {
+		if len(files) == 0 {
+			return nil, errors.New("distributed target is missing its shared metadata")
+		}
+		sharedMetadata = files[0]
+		files = files[1:]
+	}
 	var sharedSnapshot *os.File
 	var sparseRepository *ttcchunk.MemoryRepository
 	sparse := args.SparseManifest != (ttcchunk.ManifestID{})
@@ -148,9 +164,21 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			}
 		}()
 	}
+	var metadata *ttcremote.SessionMetadata
+	var durableMetadata kernel.DurableDehydrationMetadata
 	var encoded []byte
 	var err error
-	if donatedMode {
+	if args.DurableDehydration {
+		if sharedMetadata == nil || !sparse {
+			return nil, errors.New("distributed durable dehydration requires shared metadata and sparse memory")
+		}
+		durableMetadata, err = kernel.ReadDurableDehydrationMetadata(sharedMetadata)
+		if err == nil && durableMetadata.SparseManifest != args.SparseManifest {
+			err = fmt.Errorf("durable dehydration manifest %s does not match requested %s", durableMetadata.SparseManifest, args.SparseManifest)
+		}
+	} else if sharedMetadata != nil {
+		encoded, err = io.ReadAll(io.LimitReader(sharedMetadata, int64(args.MetadataBytes)+1))
+	} else if donatedMode {
 		encoded, err = ttcremote.FetchTCPMetadataConn(l.k.SupervisorContext(), donated[0], args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
 		donated[0].Close()
 		donated = donated[1:]
@@ -160,18 +188,20 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	if err != nil {
 		return nil, fmt.Errorf("fetching distributed metadata: %w", err)
 	}
-	if uint64(len(encoded)) != args.MetadataBytes {
-		return nil, fmt.Errorf("distributed metadata size is %d, want %d", len(encoded), args.MetadataBytes)
-	}
-	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
-		MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-		MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
-		return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
+	if !args.DurableDehydration {
+		if uint64(len(encoded)) != args.MetadataBytes {
+			return nil, fmt.Errorf("distributed metadata size is %d, want %d", len(encoded), args.MetadataBytes)
+		}
+		metadata, err = ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
+			MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
+			MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
+			return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
+		}
 	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
 		MaxReadBytes: args.MaxTransferBytes, MaxRanges: pgalloc.PagesPerSparseChunk(), MaxParallel: args.MaxParallel,
@@ -237,14 +267,23 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	fdmap := restoreMnts.fdmap
 	mfmap := restoreMnts.mfmap
+	mfmapOwned := true
+	defer func() {
+		if mfmapOwned {
+			for _, mf := range mfmap {
+				mf.Destroy()
+			}
+		}
+	}()
 	mounter := l.newContainerMounter(&l.root)
 	if err := mounter.configureRestore(&restoreMnts); err != nil {
 		return nil, fmt.Errorf("configuring distributed target filesystems: %w", err)
 	}
-	if len(mfmap) != 0 {
+	if len(mfmap) != 0 && !args.DurableDehydration {
 		for _, mf := range mfmap {
 			mf.Destroy()
 		}
+		mfmapOwned = false
 		for _, hostFD := range fdmap {
 			_ = unix.Close(hostFD)
 		}
@@ -283,7 +322,28 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
 	}
 	var child *kernel.Kernel
-	if sparse {
+	if args.DurableDehydration {
+		memoryFiles := map[checkpoint.ResourceID]*pgalloc.MemoryFile{{}: targetMF}
+		for i := 1; i < len(durableMetadata.Memories); i++ {
+			resource := durableMetadata.Memories[i].ResourceID
+			mf := mfmap[resource]
+			if mf == nil {
+				return nil, fmt.Errorf("distributed dehydration target is missing private memory file %q", resource)
+			}
+			memoryFiles[resource] = mf
+		}
+		if len(mfmap) != len(memoryFiles)-1 {
+			return nil, fmt.Errorf("distributed dehydration target has %d unexpected private memory files", len(mfmap))
+		}
+		targetMFOwned = false // LoadSparseDurableDehydration consumes all files.
+		mfmapOwned = false    // LoadSparseDurableDehydration consumes all files.
+		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, durableMetadata,
+			memoryFiles, sparseRepository, kernel.DurableDehydrationLoadOptions{
+				Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+				RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
+				ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
+			})
+	} else if sparse {
 		child, err = kernel.LoadSparseDistributedFork(l.k.SupervisorContext(), p, targetMF,
 			metadata.KernelMetadata, sparseRepository, args.SparseManifest, loadOpts)
 	} else {
@@ -351,8 +411,10 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	old.Release()
 	childOwned = false
 	var remoteBytes uint64
-	for _, load := range metadata.LoadRanges {
-		remoteBytes += load.Target.Length()
+	if metadata != nil {
+		for _, load := range metadata.LoadRanges {
+			remoteBytes += load.Target.Length()
+		}
 	}
 	info := DistributedForkRestoreInfo{
 		SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID,

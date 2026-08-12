@@ -112,6 +112,13 @@ type RemoteSessionDescriptor struct {
 	MetadataBytes    uint64 `json:"metadata_bytes"`
 	StreamBytes      uint64 `json:"stream_bytes"`
 	MaxTransferBytes uint64 `json:"max_transfer_bytes"`
+	// SharedMetadata is a clean data-root-relative path containing the
+	// authenticated SessionMetadata envelope. It permits restoring a
+	// process-free dehydrated source without a source page server.
+	SharedMetadata string `json:"shared_metadata,omitempty"`
+	// DurableDehydration declares that SharedMetadata is a TTC dehydration
+	// envelope rather than a live-fork SessionMetadata envelope.
+	DurableDehydration bool `json:"durable_dehydration,omitempty"`
 	// SharedSnapshot is a clean repository-relative path containing the
 	// immutable packed memory stream. It is non-secret and remains valid after
 	// the source Sentry and page server exit.
@@ -124,14 +131,24 @@ type RemoteSessionDescriptor struct {
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
-	host, port, err := net.SplitHostPort(s.Address)
-	portNumber, portErr := strconv.ParseUint(port, 10, 16)
-	if err != nil || host == "" || portErr != nil || portNumber == 0 {
-		return fmt.Errorf("invalid remote page address %q", s.Address)
-	}
-	token, err := hex.DecodeString(s.SnapshotToken)
-	if err != nil || len(token) != 16 {
-		return errors.New("snapshot token must be 16 bytes encoded as hexadecimal")
+	if s.SharedMetadata == "" {
+		host, port, err := net.SplitHostPort(s.Address)
+		portNumber, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || host == "" || portErr != nil || portNumber == 0 {
+			return fmt.Errorf("invalid remote page address %q", s.Address)
+		}
+		token, err := hex.DecodeString(s.SnapshotToken)
+		if err != nil || len(token) != 16 {
+			return errors.New("snapshot token must be 16 bytes encoded as hexadecimal")
+		}
+	} else {
+		clean := filepath.Clean(s.SharedMetadata)
+		if filepath.IsAbs(s.SharedMetadata) || clean != s.SharedMetadata || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("invalid shared distributed metadata path %q", s.SharedMetadata)
+		}
+		if s.Address != "" || s.SnapshotToken != "" {
+			return errors.New("shared distributed metadata must not include a page-server address or token")
+		}
 	}
 	if s.MetadataBytes == 0 || s.StreamBytes == 0 {
 		return errors.New("remote session has an empty metadata or page stream")
@@ -156,6 +173,9 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if s.SharedSnapshot != "" {
 			return errors.New("packed and sparse shared snapshots are mutually exclusive")
 		}
+		if s.SharedMetadata == "" && s.Address == "" {
+			return errors.New("sparse memory restore has no metadata source")
+		}
 		clean := filepath.Clean(s.SparseRepository)
 		if filepath.IsAbs(s.SparseRepository) || clean != s.SparseRepository || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("invalid sparse memory repository path %q", s.SparseRepository)
@@ -167,6 +187,12 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if s.SparseBranch == "." || s.SparseBranch == ".." || strings.ContainsAny(s.SparseBranch, `/\\`) || strings.TrimSpace(s.SparseBranch) != s.SparseBranch {
 			return fmt.Errorf("invalid sparse memory branch %q", s.SparseBranch)
 		}
+	}
+	if s.SharedMetadata != "" && s.SparseRepository == "" {
+		return errors.New("shared distributed metadata requires a sparse memory repository")
+	}
+	if s.DurableDehydration && s.SharedMetadata == "" {
+		return errors.New("durable dehydration restore requires shared metadata")
 	}
 	return nil
 }

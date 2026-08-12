@@ -20,13 +20,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
+
+const maxEncodedChunkBytes = pgalloc.SparseChunkBytes + 1<<20
 
 var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
 
@@ -267,6 +271,82 @@ func (r *MemoryRepository) LoadManifest(id ManifestID) (Manifest, error) {
 		return Manifest{}, err
 	}
 	return DecodeManifest(data, &id)
+}
+
+// ImportManifest copies one immutable memory graph from source into r without
+// retaining the complete graph in memory. The transaction root protects each
+// object as it arrives from concurrent garbage collection. Existing objects
+// are verified and reused by PutObject.
+func (r *MemoryRepository) ImportManifest(source *MemoryRepository, id ManifestID) (ManifestID, error) {
+	if r == nil || source == nil {
+		return ManifestID{}, errors.New("TTC memory repository import has a nil repository")
+	}
+	manifest, err := source.LoadManifest(id)
+	if err != nil {
+		return ManifestID{}, fmt.Errorf("loading source memory manifest: %w", err)
+	}
+	manifestData, encodedID, err := EncodeManifest(manifest)
+	if err != nil {
+		return ManifestID{}, err
+	}
+	if encodedID != id {
+		return ManifestID{}, fmt.Errorf("source memory manifest encoded as %s, want %s", encodedID, id)
+	}
+	seen := make(map[ID]struct{})
+	objectIDs := make([]ID, 0, len(manifest.Runs))
+	logical := make(map[ID]pgalloc.LogicalChunkID)
+	for _, run := range manifest.Runs {
+		if previous, ok := logical[run.Object]; ok && previous != run.Logical {
+			return ManifestID{}, fmt.Errorf("memory object %s has inconsistent logical coordinates", run.Object)
+		}
+		logical[run.Object] = run.Logical
+		if _, ok := seen[run.Object]; !ok {
+			seen[run.Object] = struct{}{}
+			objectIDs = append(objectIDs, run.Object)
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rootFD != nil {
+		return ManifestID{}, errors.New("importing into a donated TTC memory repository is unsupported")
+	}
+	txnPath, err := r.beginTransaction(id, objectIDs)
+	if err != nil {
+		return ManifestID{}, fmt.Errorf("beginning memory import: %w", err)
+	}
+	keepTransaction := false
+	defer func() {
+		if !keepTransaction {
+			_ = os.Remove(txnPath)
+		}
+	}()
+	for _, objectID := range objectIDs {
+		file, err := source.chunks.Open(objectID)
+		if err != nil {
+			return ManifestID{}, fmt.Errorf("opening source memory object %s: %w", objectID, err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, maxEncodedChunkBytes+1))
+		closeErr := file.Close()
+		if readErr != nil || closeErr != nil {
+			return ManifestID{}, errors.Join(readErr, closeErr)
+		}
+		if len(data) > maxEncodedChunkBytes {
+			return ManifestID{}, fmt.Errorf("source memory object %s exceeds encoded size limit", objectID)
+		}
+		if err := r.chunks.PutObject(Object{ID: objectID, Logical: logical[objectID], Data: data}); err != nil {
+			return ManifestID{}, fmt.Errorf("importing memory object %s: %w", objectID, err)
+		}
+		if err := os.Chtimes(txnPath, time.Now(), time.Now()); err != nil {
+			return ManifestID{}, fmt.Errorf("refreshing memory import transaction: %w", err)
+		}
+	}
+	dir, path := r.manifestPath(id)
+	if err := publishImmutable(dir, r.manifestRoot, path, manifestData); err != nil {
+		return ManifestID{}, fmt.Errorf("publishing imported memory manifest %s: %w", id, err)
+	}
+	keepTransaction = true
+	return id, nil
 }
 
 func (r *MemoryRepository) branchPath(branch string) (string, error) {

@@ -36,7 +36,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -287,8 +289,19 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		return selector{}, err
 	}
 	source = resolved
+	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
+	if err != nil {
+		return selector{}, err
+	}
 	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
 		return selector{}, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
+	}
+	sourceInfo, err = b.containerStore().LoadContainer(source.container)
+	if err != nil {
+		return selector{}, fmt.Errorf("reloading promoted source metadata: %w", err)
+	}
+	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
+		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused)
 	}
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
@@ -409,6 +422,252 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	}
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
+}
+
+// forkRemoteDehydrated restores a process-free branch directly from its
+// durable kernel metadata and sparse memory graph. No source Sentry is
+// created, and the target is independent as soon as publication completes.
+func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode, targetContainer string, paused bool) (result selector, retErr error) {
+	transactionID, err := newDistributedTransactionID()
+	if err != nil {
+		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
+	}
+	rootfsDigest, err := distributedRootfsDigest(sourceInfo, source.branch, b.distributedSource.capabilities.RepositoryID)
+	if err != nil {
+		return selector{}, err
+	}
+	identity := cluster.ForkIdentity{
+		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
+		TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
+		TargetContainer: targetContainer, TargetBranch: transactionID,
+		ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
+		RepositoryID: b.distributedSource.capabilities.RepositoryID,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+	if err != nil {
+		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		status, statusErr := peer.Status(cleanupCtx, transactionID)
+		if statusErr == nil {
+			_, _ = peer.Cancel(cleanupCtx, transactionID, status.Revision)
+		} else {
+			_, _ = peer.Cancel(cleanupCtx, transactionID, tx.Revision)
+		}
+	}()
+
+	imageDir := filepath.Join(b.dataRoot, "containers", sourceInfo.ID, "memory", "dehydrated", hex.EncodeToString([]byte(source.branch)))
+	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
+	if err != nil {
+		return selector{}, fmt.Errorf("reading dehydrated source control state: %w", err)
+	}
+	var capture boot.BranchDehydrateInfo
+	if err := json.Unmarshal(controlData, &capture); err != nil {
+		return selector{}, fmt.Errorf("decoding dehydrated source control state: %w", err)
+	}
+	if capture.FilesystemBranch == "" || capture.SparseManifest == (ttcchunk.ManifestID{}) {
+		return selector{}, errors.New("dehydrated source has no sparse memory root")
+	}
+	encodedMetadata, err := os.ReadFile(filepath.Join(imageDir, "metadata.state"))
+	if err != nil {
+		return selector{}, fmt.Errorf("reading dehydrated source kernel metadata: %w", err)
+	}
+	metadataRelative := filepath.Join("cluster", "memory-metadata", transactionID+".state")
+	metadataPath := filepath.Join(b.dataRoot, metadataRelative)
+	if err := writeDurableDistributedFile(metadataPath, encodedMetadata); err != nil {
+		return selector{}, fmt.Errorf("publishing distributed metadata: %w", err)
+	}
+	defer os.Remove(metadataPath)
+
+	clusterRepositoryRelative := filepath.Join("cluster", "memory-chunks")
+	clusterRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, clusterRepositoryRelative))
+	if err != nil {
+		return selector{}, fmt.Errorf("opening cluster memory repository: %w", err)
+	}
+	defer clusterRepository.Close()
+	sourceRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, "containers", sourceInfo.ID, "memory", "chunks"))
+	if err != nil {
+		return selector{}, fmt.Errorf("opening dehydrated source memory repository: %w", err)
+	}
+	if _, err := clusterRepository.ImportManifest(sourceRepository, capture.SparseManifest); err != nil {
+		sourceRepository.Close()
+		return selector{}, fmt.Errorf("importing dehydrated source memory: %w", err)
+	}
+	if err := sourceRepository.Close(); err != nil {
+		return selector{}, err
+	}
+	childFilesystemBranch := ttcvolume.ScopedBranchID(sourceInfo.ID, transactionID)
+	if err := clusterRepository.SetBranch(childFilesystemBranch, capture.SparseManifest); err != nil {
+		return selector{}, fmt.Errorf("rooting remote sparse memory: %w", err)
+	}
+	sparseRootCommitted := false
+	defer func() {
+		if !sparseRootCommitted {
+			_ = clusterRepository.DeleteBranch(childFilesystemBranch)
+			_, _ = clusterRepository.CollectGarbage(ttcchunk.GCOptions{})
+		}
+	}()
+
+	filesystemForks, err := b.forkDehydratedDistributedFilesystems(sourceInfo.ID, capture.FilesystemBranch, childFilesystemBranch)
+	if err != nil {
+		return selector{}, err
+	}
+	defer func() {
+		if !committed {
+			for i := len(filesystemForks) - 1; i >= 0; i-- {
+				_ = filesystemForks[i].abort()
+			}
+		}
+	}()
+	manifest, err := clusterRepository.LoadManifest(capture.SparseManifest)
+	if err != nil {
+		return selector{}, err
+	}
+	var streamBytes uint64
+	for _, run := range manifest.Runs {
+		streamBytes += uint64(run.Pages) * 4096
+	}
+	descriptor := cluster.RemoteSessionDescriptor{
+		MetadataBytes: uint64(len(encodedMetadata)), StreamBytes: streamBytes,
+		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
+		SharedMetadata:   metadataRelative, SparseRepository: clusterRepositoryRelative,
+		SparseManifest: capture.SparseManifest.String(), SparseBranch: childFilesystemBranch,
+		DurableDehydration: true,
+	}
+	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
+	if err != nil {
+		return selector{}, fmt.Errorf("restoring dehydrated target node %s: %w", targetNode, err)
+	}
+	tx, err = peer.Publish(ctx, transactionID, tx.Revision, paused)
+	if err != nil {
+		status, statusErr := peer.Status(ctx, transactionID)
+		if statusErr != nil || (status.State != cluster.TransactionPublished && status.State != cluster.TransactionIndependent) {
+			return selector{}, fmt.Errorf("publishing dehydrated target node %s: %w", targetNode, err)
+		}
+		tx = status
+	}
+	for _, fork := range filesystemForks {
+		if err := fork.commit(); err != nil {
+			return selector{}, fmt.Errorf("committing distributed filesystem fork: %w", err)
+		}
+	}
+	sparseRootCommitted = true
+	committed = true
+	if tx.State != cluster.TransactionIndependent {
+		if _, err := peer.MarkIndependentWithMetrics(ctx, transactionID, tx.Revision, cluster.TransferMetrics{}); err != nil {
+			if status, statusErr := peer.Status(ctx, transactionID); statusErr != nil || status.State != cluster.TransactionIndependent {
+				return selector{}, fmt.Errorf("marking dehydrated target independent: %w", err)
+			}
+		}
+	}
+	return selector{container: targetContainer, branch: defaultBranchID}, nil
+}
+
+func writeDurableDistributedFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".metadata-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+type distributedFilesystemFork struct {
+	tx         *ttcvolume.ForkTransaction
+	repository *ttcvolume.Repository
+}
+
+func (f *distributedFilesystemFork) commit() error {
+	err := f.tx.Commit()
+	_ = f.repository.Close()
+	return err
+}
+
+func (f *distributedFilesystemFork) abort() error {
+	err := f.tx.Abort()
+	_ = f.repository.Close()
+	return err
+}
+
+func (b *runtimeBackend) forkDehydratedDistributedFilesystems(containerID, sourceBranch, childBranch string) ([]*distributedFilesystemFork, error) {
+	spec, err := b.containerStore().LoadSpec(containerID)
+	if err != nil {
+		return nil, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, err
+	}
+	transactions := make([]*distributedFilesystemFork, 0, len(configs))
+	seen := make(map[string]bool)
+	for _, config := range configs {
+		if seen[config.Path] {
+			continue
+		}
+		seen[config.Path] = true
+		dir, err := os.Open(config.Path)
+		if err != nil {
+			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+		}
+		repository, err := ttcvolume.OpenRepositoryFD(dir, ttcvolume.CopyMode(config.CopyMode))
+		_ = dir.Close()
+		if err != nil {
+			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+		}
+		tx, err := repository.BeginFork(sourceBranch, childBranch)
+		if err != nil {
+			repository.Close()
+			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+		}
+		// ForkTransaction retains its repository; close after Commit/Abort is not
+		// currently exposed, so keep the donated descriptor for transaction life.
+		transactions = append(transactions, &distributedFilesystemFork{tx: tx, repository: repository})
+	}
+	return transactions, nil
+}
+
+func abortFilesystemForks(transactions []*distributedFilesystemFork) error {
+	var result error
+	for i := len(transactions) - 1; i >= 0; i-- {
+		result = errors.Join(result, transactions[i].abort())
+	}
+	return result
 }
 
 // forkRemoteMany reserves multiple targets before pausing the source, then

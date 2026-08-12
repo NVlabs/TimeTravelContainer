@@ -135,6 +135,34 @@ func TestRemoteSessionDescriptorSparseRepository(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorSharedMetadata(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := RemoteSessionDescriptor{
+		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
+		SharedMetadata:   "cluster/memory-metadata/tx.state",
+		SparseRepository: "cluster/memory-chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+	}
+	if err := base.validate(negotiated); err != nil {
+		t.Fatalf("valid shared metadata descriptor: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "../metadata" },
+		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
+		func(d *RemoteSessionDescriptor) { d.Address = "127.0.0.1:1" },
+		func(d *RemoteSessionDescriptor) { d.SnapshotToken = strings.Repeat("11", 16) },
+		func(d *RemoteSessionDescriptor) { d.SparseRepository = "" },
+	} {
+		invalid := base
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted invalid shared metadata descriptor: %+v", invalid)
+		}
+	}
+}
+
 func testForkIdentity() ForkIdentity {
 	digest := "sha256:" + strings.Repeat("1", 64)
 	return ForkIdentity{

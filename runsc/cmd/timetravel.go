@@ -88,6 +88,7 @@ type TimeTravel struct {
 	distributedAdvertise          string
 	distributedMaxTransfer        uint64
 	distributedConfigFD           int
+	distributedMetadataFD         int
 	distributedExternal           bool
 	distributedConnectionFD       int
 	distributedConnectionsStartFD int
@@ -174,6 +175,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.distributedAdvertise, "distributed-advertise", "", "page server address advertised to the target")
 	f.Uint64Var(&t.distributedMaxTransfer, "distributed-max-transfer", 0, "maximum bytes in one remote page transfer")
 	f.IntVar(&t.distributedConfigFD, "distributed-config-fd", -1, "inherited FD containing a secret distributed restore request")
+	f.IntVar(&t.distributedMetadataFD, "distributed-metadata-fd", -1, "inherited immutable distributed restore metadata")
 	f.BoolVar(&t.distributedExternal, "distributed-external-listener", false, "ttcd owns and relays the page listener")
 	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
 	f.IntVar(&t.distributedConnectionsStartFD, "distributed-connections-start-fd", -1, "first inherited target page stream")
@@ -425,6 +427,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		if restoreArgs.SessionID != f.Arg(2) {
 			util.Fatalf("distributed restore session identity mismatch")
+		}
+		if restoreArgs.SharedMetadata {
+			if t.distributedMetadataFD < 0 {
+				util.Fatalf("--distributed-metadata-fd is required for shared distributed metadata")
+			}
+			metadata := os.NewFile(uintptr(t.distributedMetadataFD), "distributed-shared-metadata")
+			if metadata == nil {
+				util.Fatalf("invalid inherited distributed metadata FD")
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
+			defer metadata.Close()
 		}
 		if restoreArgs.SharedSnapshot {
 			if t.distributedSnapshotFD < 0 {

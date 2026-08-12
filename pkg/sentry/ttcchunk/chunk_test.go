@@ -367,6 +367,57 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryImportManifest(t *testing.T) {
+	source, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := testChunk()
+	pages := make([]SourcePage, len(chunk.Pages))
+	for i, page := range chunk.Pages {
+		pages[i] = SourcePage{Binding: pgalloc.CapturedPageBinding{
+			OldOffset: uint64(i) * hostarch.PageSize, References: 1,
+			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, Zero: page.Zero, Data: page.Data}
+	}
+	objects, bindings, err := Assemble(pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := source.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := destination.ImportManifest(source, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported != id {
+		t.Fatalf("imported manifest = %s, want %s", imported, id)
+	}
+	manifest, err := destination.LoadManifest(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(manifest.Expand(), bindings) {
+		t.Fatal("imported bindings differ from source")
+	}
+	for _, object := range objects {
+		if _, err := destination.chunks.Get(object.ID); err != nil {
+			t.Fatalf("imported object %s: %v", object.ID, err)
+		}
+	}
+	// Re-import must safely reuse immutable content.
+	if _, err := destination.ImportManifest(source, id); err != nil {
+		t.Fatalf("idempotent import: %v", err)
+	}
+}
+
 func TestInstallManifestRelocatesAndReadsWholeChunk(t *testing.T) {
 	repository, err := OpenMemoryRepository(t.TempDir())
 	if err != nil {

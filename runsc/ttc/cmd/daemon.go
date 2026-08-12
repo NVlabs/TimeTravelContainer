@@ -185,20 +185,24 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return err
 	}
-	tokenBytes, err := hex.DecodeString(session.SnapshotToken)
-	if err != nil || len(tokenBytes) != 16 {
-		return errors.New("invalid distributed snapshot token")
-	}
 	var token ttcremote.SnapshotToken
-	copy(token[:], tokenBytes)
+	if session.SharedMetadata == "" {
+		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
+		if err != nil || len(tokenBytes) != 16 {
+			return errors.New("invalid distributed snapshot token")
+		}
+		copy(token[:], tokenBytes)
+	}
 	restoreArgs := boot.DistributedForkRestoreArgs{
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
-		PushPolicy:     ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
-		SharedSnapshot: session.SharedSnapshot != "",
+		PushPolicy:         ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
+		SharedSnapshot:     session.SharedSnapshot != "",
+		SharedMetadata:     session.SharedMetadata != "",
+		DurableDehydration: session.DurableDehydration,
 	}
 	if session.SparseManifest != "" {
 		manifest, err := ttcchunk.ParseManifestID(session.SparseManifest)
@@ -256,6 +260,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return err
 		}
 		connectionCount := 1
+		if restoreArgs.SharedMetadata {
+			connectionCount = 0
+		}
 		if !restoreArgs.SharedSnapshot && restoreArgs.SparseManifest == (ttcchunk.ManifestID{}) {
 			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
 			if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
@@ -315,8 +322,27 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		files := []*os.File{reader}
 		connectionsStartFD := 4
+		var sharedMetadata *os.File
 		var sharedSnapshot *os.File
 		var sparseRepository *os.File
+		if restoreArgs.SharedMetadata {
+			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
+			sharedMetadata, err = os.Open(metadataPath)
+			if err != nil {
+				reader.Close()
+				return fmt.Errorf("opening shared distributed metadata: %w", err)
+			}
+			if stat, err := sharedMetadata.Stat(); err != nil || uint64(stat.Size()) != session.MetadataBytes {
+				sharedMetadata.Close()
+				reader.Close()
+				if err != nil {
+					return fmt.Errorf("stating shared distributed metadata: %w", err)
+				}
+				return fmt.Errorf("shared distributed metadata size is %d, want %d", stat.Size(), session.MetadataBytes)
+			}
+			files = append(files, sharedMetadata)
+			connectionsStartFD++
+		}
 		if restoreArgs.SharedSnapshot {
 			sharedPath := filepath.Join(r.backend.dataRoot, session.SharedSnapshot)
 			sharedSnapshot, err = os.Open(sharedPath)
@@ -356,8 +382,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		files = append(files, connectionFiles...)
 		commandArgs := []string{"timetravel", "--distributed-config-fd=3"}
+		if restoreArgs.SharedMetadata {
+			commandArgs = append(commandArgs, "--distributed-metadata-fd=4")
+		}
 		if restoreArgs.SharedSnapshot {
-			commandArgs = append(commandArgs, "--distributed-snapshot-fd=4")
+			commandArgs = append(commandArgs, "--distributed-snapshot-fd="+strconv.Itoa(connectionsStartFD-1))
 		}
 		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
 			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd="+strconv.Itoa(connectionsStartFD-1))
@@ -367,6 +396,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			info.ID, "distributed-restore", tx.Identity.TransactionID)
 		_, err = r.backend.commandWithFiles(files, commandArgs...)
 		reader.Close()
+		if sharedMetadata != nil {
+			sharedMetadata.Close()
+		}
 		if sharedSnapshot != nil {
 			sharedSnapshot.Close()
 		}
