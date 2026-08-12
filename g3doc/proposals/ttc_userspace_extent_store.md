@@ -2,10 +2,13 @@
 
 ## Status
 
-Design exploration. No storage-format or runtime changes described here are
-implemented yet. The unified mutable-filesystem store is postponed. The active
-first scope is a simple immutable 1 MiB-file backend for dehydrated and remotely
-forked memory. Pebble is not part of the implementation plan.
+Implementation in progress. Stable logical page and content-version IDs,
+branch-scoped PMA capture, the immutable 1 MiB loose-object codec, deterministic
+chunk assembly, compact manifests, and crash-safe family repository publication
+are implemented. The sparse target allocator importer, non-PMA owner audit,
+transactional all-pages-at-once loader, leases/GC, and ttcd integration remain
+in progress. The unified mutable-filesystem store is postponed. Pebble is not
+part of the implementation plan.
 
 This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
@@ -47,10 +50,11 @@ storage engine is selected:
 
 The first prototype is deliberately narrower: store each immutable 1 MiB
 dehydrated-memory transfer unit in an ordinary file in the cluster's shared TTC
-data root. Each chunk contains up to 256 consecutive 4 KiB pages from the
-packed memory stream. Put at most 1,024 chunks, or 1 GiB of dense payload, in
-each shard directory; retain directory descriptors; and use
-`openat`/`unlinkat` on the demand path.
+data root. Each chunk contains up to 256 stable logical 4 KiB page slots. The
+implemented repository uses the first two content-digest bytes for lazy shard
+directory creation, distributing objects across up to 65,536 shards without a
+mutable location index. Retained directory descriptors and `openat`/`unlinkat`
+on the demand path remain loader optimizations to implement and benchmark.
 
 A successful load reads the complete chunk, populates up to 256 independently
 CoW 4 KiB memory pages, and releases that manifest's reference. The chunk is
@@ -95,12 +99,15 @@ Phase 0 implements only loose 1 MiB chunk files. Pebble remains benchmarked
 prior art and is not included as an A/B runtime backend in this phase.
 
 Snapshot contents are written as immutable chunks before an immutable manifest
-is published. Interrupted unpublished construction can be removed as a unit.
-Large snapshots use bounded shard directories rather than one unbounded
-directory. Reads and unlinks operate relative to retained directory
-descriptors, and directory synchronization batches consumption records.
+is published. A branch pointer is atomically replaced only after its manifest
+and every referenced object are durable. The implemented compact manifest
+coalesces contiguous offsets, page IDs, version IDs, and equal reference counts
+within one object; a normal dense chunk therefore uses one mapping record
+rather than 256. Reads and unlinks operating relative to retained directory
+descriptors, batched consumption records, and recovery-time cleanup of
+unpublished construction remain to implement.
 
-The first implementation chunks every referenced range from every
+The completed backend must chunk every referenced range from every
 `MemoryFile` captured by the existing dehydration/remote-fork traversal,
 including application anonymous memory and private resource `MemoryFile`s.
 Kernel object graphs remain in the existing metadata stream. Reconstructible
@@ -118,16 +125,22 @@ PMA and kernel object that owns a `MemoryFile` range registers a binding:
 ```go
 type CapturedPageBinding struct {
 	ResourceID checkpoint.ResourceID
-	OldOffset uint64
-	Page      LogicalPageID
-	Version   PageVersionID
-	Chunk     ChunkID
-	Slot      uint8
+	OldOffset   uint64
+	StreamOffset uint64 // capture-local, not persistent identity
+	References uint64
+	Page        LogicalPageID
+	Version     PageVersionID
+	Chunk       LogicalChunkID
+	Slot        uint8
 }
 ```
 
-The immutable binding-map root is captured with the Kernel; background code
-may then group its referenced versions into chunk files. Restore first merges
+PMA-backed ranges are now captured and missing logical-page coverage fails
+closed. Explicit registration by all non-PMA owners remains required before
+the sparse path can replace allocator-wide export; until then the old backend
+remains active. Background code can read the exact pinned ranges after the
+source resumes, detect zero pages, and group referenced versions into chunk
+files without acknowledging source references prematurely. Restore first merges
 page versions into the node-local canonical store, builds an old-offset to
 target-offset relocation map, and applies that map to every saved reference.
 Allocator free-space/refcount metadata is reconstructed for the imported
