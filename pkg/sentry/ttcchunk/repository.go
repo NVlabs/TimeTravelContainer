@@ -322,6 +322,15 @@ func (r *MemoryRepository) ImportManifest(source *MemoryRepository, id ManifestI
 		}
 	}()
 	for _, objectID := range objectIDs {
+		// Content-addressed objects are immutable after PutObject publishes
+		// them. Once this import transaction roots the full object set, reuse
+		// a destination object without rereading and rewriting up to 1 MiB.
+		// Loaders verify the payload hash when they consume the object.
+		if err := r.chunks.Contains(objectID); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return ManifestID{}, fmt.Errorf("checking destination memory object %s: %w", objectID, err)
+		}
 		file, err := source.chunks.Open(objectID)
 		if err != nil {
 			return ManifestID{}, fmt.Errorf("opening source memory object %s: %w", objectID, err)

@@ -321,8 +321,8 @@ type ContainerInfo struct {
 	DistributedForkTransactionID string            `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string            `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool              `json:"distributed_fork_hidden,omitempty"`
-	DistributedSparseRepository string            `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch     string            `json:"distributed_sparse_branch,omitempty"`
+	DistributedSparseRepository  string            `json:"distributed_sparse_repository,omitempty"`
+	DistributedSparseBranch      string            `json:"distributed_sparse_branch,omitempty"`
 	NodeID                       string            `json:"node_id,omitempty"`
 }
 
@@ -2284,9 +2284,17 @@ func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
 	if info.DistributedForkTransactionID == "" {
 		return nil
 	}
-	path := filepath.Join(s.Root, "cluster", "memory-snapshots", info.DistributedForkTransactionID+".mem")
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("removing distributed memory snapshot: %w", err)
+	artifacts := []struct {
+		path string
+		name string
+	}{
+		{filepath.Join(s.Root, "cluster", "memory-snapshots", info.DistributedForkTransactionID+".mem"), "memory snapshot"},
+		{filepath.Join(s.Root, "cluster", "memory-metadata", info.DistributedForkTransactionID+".state"), "kernel metadata"},
+	}
+	for _, artifact := range artifacts {
+		if err := os.Remove(artifact.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing distributed %s: %w", artifact.name, err)
+		}
 	}
 	return nil
 }

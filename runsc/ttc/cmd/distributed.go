@@ -301,7 +301,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		return selector{}, fmt.Errorf("reloading promoted source metadata: %w", err)
 	}
 	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
-		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused)
+		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused, nil)
 	}
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
@@ -427,7 +427,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 // forkRemoteDehydrated restores a process-free branch directly from its
 // durable kernel metadata and sparse memory graph. No source Sentry is
 // created, and the target is independent as soon as publication completes.
-func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode, targetContainer string, paused bool) (result selector, retErr error) {
+func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode, targetContainer string, paused bool, committedTransaction *string) (result selector, retErr error) {
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
 		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -567,6 +567,9 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 				return selector{}, fmt.Errorf("marking dehydrated target independent: %w", err)
 			}
 		}
+	}
+	if committedTransaction != nil {
+		*committedTransaction = transactionID
 	}
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
 }
@@ -709,6 +712,50 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	source = resolved
 	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
 		return nil, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
+	}
+	sourceInfo, err = b.containerStore().LoadContainer(source.container)
+	if err != nil {
+		return nil, fmt.Errorf("reloading promoted source metadata: %w", err)
+	}
+	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
+	if err != nil {
+		return nil, err
+	}
+	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
+		results := make([]selector, 0, len(targetContainers))
+		transactions := make([]string, 0, len(targetContainers))
+		for _, targetContainer := range targetContainers {
+			var transactionID string
+			result, err := b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused, &transactionID)
+			if err == nil {
+				results = append(results, result)
+				transactions = append(transactions, transactionID)
+				continue
+			}
+			// Cold targets are already source-independent when the helper
+			// returns. Remove earlier siblings so the batch remains all-or-none
+			// from the caller's perspective.
+			var rollbackErr error
+			for i := len(transactions) - 1; i >= 0; i-- {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				status, statusErr := peer.Status(cleanupCtx, transactions[i])
+				if statusErr == nil {
+					_, cancelErr := peer.Cancel(cleanupCtx, transactions[i], status.Revision)
+					// Cancel of an independent transaction removes the runtime
+					// before the terminal-state transition is rejected.
+					if cancelErr != nil {
+						if _, verifyErr := b.containerStore().LoadContainer(results[i].container); verifyErr == nil {
+							rollbackErr = errors.Join(rollbackErr, cancelErr)
+						}
+					}
+				} else {
+					rollbackErr = errors.Join(rollbackErr, statusErr)
+				}
+				cleanupCancel()
+			}
+			return nil, errors.Join(fmt.Errorf("forking dehydrated target %s on node %s: %w", targetContainer, targetNode, err), rollbackErr)
+		}
+		return results, nil
 	}
 	rootfsDigest, err := distributedRootfsDigest(sourceInfo, source.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {

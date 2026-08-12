@@ -413,8 +413,96 @@ func TestMemoryRepositoryImportManifest(t *testing.T) {
 		}
 	}
 	// Re-import must safely reuse immutable content.
+	for _, object := range objects {
+		_, path := source.chunks.path(object.ID)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := destination.ImportManifest(source, id); err != nil {
-		t.Fatalf("idempotent import: %v", err)
+		t.Fatalf("idempotent import without source object reads: %v", err)
+	}
+}
+
+func TestMemoryRepositoryImportManifestConcurrentGarbageCollection(t *testing.T) {
+	source, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationRoot := t.TempDir()
+	destination, err := OpenMemoryRepository(destinationRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector, err := OpenMemoryRepository(destinationRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make import long enough for an independently-opened repository to run
+	// several collections while objects are arriving. The transaction written
+	// before the first object must protect the incomplete graph until SetBranch
+	// replaces it with a durable root.
+	const chunks = 16
+	allocator := testAllocator(40)
+	versionAllocator := testAllocator(80)
+	pages := make([]SourcePage, 0, chunks*PagesPerChunk)
+	for chunkIndex := 0; chunkIndex < chunks; chunkIndex++ {
+		logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: uint64(chunkIndex)}
+		for slot := 0; slot < PagesPerChunk; slot++ {
+			sequence := uint64(chunkIndex*PagesPerChunk + slot)
+			pages = append(pages, SourcePage{
+				Binding: pgalloc.CapturedPageBinding{
+					OldOffset: sequence * hostarch.PageSize, References: 1,
+					Page:    pgalloc.LogicalPageID{Allocator: allocator, Sequence: sequence},
+					Version: pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: sequence + 1},
+					Chunk:   logical, Slot: uint8(slot),
+				},
+				Data: bytes.Repeat([]byte{byte(chunkIndex + slot)}, hostarch.PageSize),
+			})
+		}
+	}
+	objects, bindings, err := Assemble(pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID, err := source.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	collectorErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				collectorErr <- nil
+				return
+			default:
+			}
+			if _, err := collector.CollectGarbage(GCOptions{}); err != nil {
+				collectorErr <- err
+				return
+			}
+		}
+	}()
+	imported, err := destination.ImportManifest(source, manifestID)
+	if err == nil {
+		err = destination.SetBranch("remote", imported)
+	}
+	close(stop)
+	if collectorResult := <-collectorErr; collectorResult != nil {
+		t.Fatal(collectorResult)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported != manifestID {
+		t.Fatalf("imported manifest = %s, want %s", imported, manifestID)
+	}
+	if err := destination.validateManifestObjects(manifestID); err != nil {
+		t.Fatalf("collector reclaimed an imported object: %v", err)
 	}
 }
 
