@@ -1484,11 +1484,23 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	return file.ReadAt(data, offset)
 }
 
+// CoWCallback is invoked after a repository mutation publishes a private data
+// object, but before the repository mutation lock is released. It allows a
+// filesystem client to drop descriptors and mappings of the formerly selected
+// object before garbage collection can consider that object unreachable.
+// Implementations must not reenter the Repository.
+type CoWCallback func()
+
 // OpenDataFile opens the host data object selected by branchID and ino.
 // Writable opens first pass through the branch-generation CoW gate. Callers
 // must close the returned descriptor and must revoke every writable descriptor
 // and mapping before BeginFork.
 func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*os.File, Inode, bool, error) {
+	return r.OpenDataFileWithCoW(branchID, ino, writable, nil)
+}
+
+// OpenDataFileWithCoW is OpenDataFile with notification of an object CoW.
+func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable bool, onCoW CoWCallback) (*os.File, Inode, bool, error) {
 	var (
 		file   *os.File
 		inode  Inode
@@ -1514,6 +1526,9 @@ func (r *Repository) OpenDataFile(branchID string, ino uint64, writable bool) (*
 			cloned, err = r.ensurePrivate(&branch, state, &inode)
 			if err != nil {
 				return err
+			}
+			if cloned && onCoW != nil {
+				onCoW()
 			}
 		}
 		flags := os.O_RDONLY
@@ -1642,6 +1657,11 @@ func (r *Repository) syncMetadataLocked() error {
 
 // Truncate applies the same first-writer CoW rule as WriteAt.
 func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, error) {
+	return r.TruncateWithCoW(branchID, ino, size, nil)
+}
+
+// TruncateWithCoW is Truncate with notification of an object CoW.
+func (r *Repository) TruncateWithCoW(branchID string, ino uint64, size int64, onCoW CoWCallback) (bool, error) {
 	if size < 0 {
 		return false, syscall.EINVAL
 	}
@@ -1662,6 +1682,9 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 		cloned, err = r.ensurePrivate(&branch, state, &inode)
 		if err != nil {
 			return err
+		}
+		if cloned && onCoW != nil {
+			onCoW()
 		}
 		file, err := r.openObject(inode.Object, os.O_WRONLY)
 		if err != nil {
@@ -1685,6 +1708,11 @@ func (r *Repository) Truncate(branchID string, ino uint64, size int64) (bool, er
 // currently exposed by gVisor's fallocate syscall is mode 0, which also grows
 // the logical file to offset+length.
 func (r *Repository) Allocate(branchID string, ino uint64, offset, length int64) (bool, error) {
+	return r.AllocateWithCoW(branchID, ino, offset, length, nil)
+}
+
+// AllocateWithCoW is Allocate with notification of an object CoW.
+func (r *Repository) AllocateWithCoW(branchID string, ino uint64, offset, length int64, onCoW CoWCallback) (bool, error) {
 	if offset < 0 || length <= 0 || offset > int64(^uint64(0)>>1)-length {
 		return false, syscall.EINVAL
 	}
@@ -1705,6 +1733,9 @@ func (r *Repository) Allocate(branchID string, ino uint64, offset, length int64)
 		cloned, err = r.ensurePrivate(&branch, state, &inode)
 		if err != nil {
 			return err
+		}
+		if cloned && onCoW != nil {
+			onCoW()
 		}
 		file, err := r.openObject(inode.Object, os.O_RDWR)
 		if err != nil {

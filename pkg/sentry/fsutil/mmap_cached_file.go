@@ -106,6 +106,23 @@ func (f *MmapCachedFile) ReplaceFD(fd int) error {
 	if fd < 0 {
 		return unix.EBADF
 	}
+	f.resetFD(fd)
+	return nil
+}
+
+// ResetFD discards every cached internal mapping and closes the backing file
+// descriptor without releasing the MmapCachedFile itself. A later ReplaceFD
+// may install a new backing descriptor. Branchable filesystems use this while
+// publishing a copy-on-write object transition so an unreachable old object
+// cannot remain pinned by a dormant mmap cache.
+//
+// The caller must ensure the same conditions as ReplaceFD and must prevent a
+// concurrent MapInternal until a new descriptor has been installed.
+func (f *MmapCachedFile) ResetFD() {
+	f.resetFD(-1)
+}
+
+func (f *MmapCachedFile) resetFD(fd int) {
 	f.mapsMu.Lock()
 	for chunkStart, m := range f.mappings {
 		f.unmapAndRemove(chunkStart, m)
@@ -115,7 +132,6 @@ func (f *MmapCachedFile) ReplaceFD(fd int) error {
 	if oldFD >= 0 {
 		unix.Close(oldFD)
 	}
-	return nil
 }
 
 func (f *MmapCachedFile) close() {

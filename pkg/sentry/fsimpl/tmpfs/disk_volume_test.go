@@ -15,11 +15,195 @@
 package tmpfs
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("mmap-cow-cache-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "mapped", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	const contents = "mapped object contents"
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, []byte(contents), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	before, err := repository.Inode(ttcvolume.MainBranch, ino)
+	if err != nil {
+		t.Fatalf("Inode before fork: %v", err)
+	}
+	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+
+	fs := &filesystem{
+		diskVolume:    &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+		liveForkFiles: make(map[*regularFile]struct{}),
+	}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	file.inode.nlink.Store(1)
+	file.size.Store(uint64(len(contents)))
+	file.diskMmap.SetFD(-1)
+	fs.liveForkFiles[file] = struct{}{}
+	defer func() {
+		file.invalidateDiskIO()
+		file.diskMmap.MappableRelease()
+	}()
+
+	// Model an ELF-header or ordinary read after the fork. This caches the
+	// still-shared object before the first mmap fault selects a private object.
+	file.diskIOMu.Lock()
+	cached, _, err := file.openDiskIOLocked(false, nil)
+	if err != nil {
+		file.diskIOMu.Unlock()
+		t.Fatalf("opening read cache: %v", err)
+	}
+	oldFD := int(cached.Fd())
+	if file.diskIOObject != before.Object {
+		file.diskIOMu.Unlock()
+		t.Fatalf("cached object=%q, want pre-CoW object %q", file.diskIOObject, before.Object)
+	}
+	file.diskIOMu.Unlock()
+
+	file.mapsMu.Lock()
+	err = file.ensureDiskMmapLocked()
+	file.mapsMu.Unlock()
+	if err != nil {
+		t.Fatalf("ensureDiskMmapLocked: %v", err)
+	}
+	after, err := repository.Inode(ttcvolume.MainBranch, ino)
+	if err != nil {
+		t.Fatalf("Inode after mmap CoW: %v", err)
+	}
+	if after.Object == before.Object {
+		t.Fatalf("mmap fault did not privatize shared object %q", before.Object)
+	}
+	file.diskIOMu.Lock()
+	if file.diskIOFile != nil || file.diskIOObject != "" {
+		file.diskIOMu.Unlock()
+		t.Fatalf("mmap CoW retained stale I/O cache: file=%v object=%q", file.diskIOFile, file.diskIOObject)
+	}
+	file.diskIOMu.Unlock()
+	if _, err := unix.FcntlInt(uintptr(oldFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("pre-CoW cached FD %d remains open: %v", oldFD, err)
+	}
+
+	if err := repository.RemoveBranch("child"); err != nil {
+		t.Fatalf("RemoveBranch(child): %v", err)
+	}
+	if err := repository.GarbageCollect(); err != nil {
+		t.Fatalf("GarbageCollect: %v", err)
+	}
+	oldPath := filepath.Join(repository.HostPath(), "objects", before.Object[:2], before.Object[2:4], before.Object)
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreachable pre-CoW object survived collection: %v", err)
+	}
+
+	file.diskIOMu.Lock()
+	current, _, err := file.openDiskIOLocked(false, nil)
+	if err != nil {
+		file.diskIOMu.Unlock()
+		t.Fatalf("opening current read cache: %v", err)
+	}
+	buf := make([]byte, len(contents))
+	n, readErr := current.ReadAt(buf, 0)
+	currentObject := file.diskIOObject
+	file.diskIOMu.Unlock()
+	if readErr != nil || n != len(buf) || string(buf) != contents {
+		t.Fatalf("reading current object: n=%d data=%q err=%v", n, buf, readErr)
+	}
+	if currentObject != after.Object {
+		t.Fatalf("current read cache object=%q, want %q", currentObject, after.Object)
+	}
+}
+
+func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("fork-mmap-cache-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "mapped", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, []byte("page"), 0); err != nil {
+		t.Fatal(err)
+	}
+	fs := &filesystem{diskVolume: &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch}}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.size.Store(4)
+	file.diskMmap.SetFD(-1)
+	ctx := contexttest.Context(t)
+	ms := &recordingMappingSpace{}
+	ar := hostarch.AddrRange{Start: 0x10000, End: 0x10000 + hostarch.PageSize}
+	if err := file.AddMapping(ctx, ms, ar, 0, false); err != nil {
+		t.Fatalf("AddMapping: %v", err)
+	}
+	file.mapsMu.Lock()
+	err = file.ensureDiskMmapLocked()
+	oldFD := file.diskMmap.FD()
+	file.mapsMu.Unlock()
+	if err != nil {
+		t.Fatalf("ensureDiskMmapLocked: %v", err)
+	}
+	if oldFD < 0 {
+		t.Fatal("mmap cache did not install a host FD")
+	}
+
+	file.prepareLiveFork()
+	if got := file.diskMmap.FD(); got != -1 {
+		t.Fatalf("prepareLiveFork retained mmap FD %d", got)
+	}
+	if _, err := unix.FcntlInt(uintptr(oldFD), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("prepareLiveFork left old mmap FD %d open: %v", oldFD, err)
+	}
+	if !ms.invalidated {
+		t.Fatal("prepareLiveFork did not invalidate the application mapping")
+	}
+	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	file.mapsMu.Lock()
+	err = file.ensureDiskMmapLocked()
+	file.mapsMu.Unlock()
+	if err != nil {
+		t.Fatalf("reinstalling mmap object after fork: %v", err)
+	}
+	if got := file.diskMmap.FD(); got < 0 {
+		t.Fatal("mmap cache did not install a new FD after fork")
+	}
+	file.RemoveMapping(ctx, ms, ar, 0, false)
+	file.diskMmap.MappableRelease()
+}
 
 func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
 	manager, err := ttcvolume.OpenManager(t.TempDir(), true)

@@ -95,11 +95,12 @@ type regularFile struct {
 
 	// diskIOFile caches the host object used by read(2)/write(2). Without this
 	// cache, every 64 KiB operation reopens the branch, traverses the immutable
-	// metadata trie, and reopens the same data object. diskIOMu is held across
-	// host I/O so a live fork or object CoW cannot close the descriptor while it
-	// is in use.
+	// metadata layer chain, and reopens the same data object. diskIOMu is held
+	// across host I/O so a live fork or object CoW cannot close the descriptor
+	// while it is in use.
 	diskIOMu       sync.Mutex `state:"nosave"`
 	diskIOFile     *os.File   `state:"nosave"`
+	diskIOObject   string     `state:"nosave"`
 	diskIOWritable bool       `state:"nosave"`
 
 	// diskMetadataDirty is set after data writes change branch-visible inode
@@ -179,6 +180,7 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 		rf.diskMmap.SetFD(-1)
 		rf.diskObject = ""
 		rf.diskIOFile = nil
+		rf.diskIOObject = ""
 		rf.diskIOWritable = false
 		// diskMmap is not serialized because its host FD and cached host
 		// mappings are runtime-local. Rebuild the mapping references that it
@@ -206,16 +208,21 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 // preserved: they contain application-owned modifications, such as dynamic
 // linker relocations, that are no longer represented by the tmpfs file.
 func (rf *regularFile) prepareLiveFork() {
-	if rf.inode.fs.diskVolume != nil {
-		rf.invalidateDiskIO()
-	}
 	rf.mapsMu.Lock()
+	if rf.inode.fs.diskVolume != nil {
+		rf.diskIOMu.Lock()
+		rf.invalidateDiskIOLocked()
+	}
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	if rf.inode.fs.diskVolume != nil {
-		// Force the source through the branch-generation CoW gate on its next
-		// mapping fault. The restored child starts with an empty diskObject via
-		// afterLoad.
+		// Close the old object before BeginFork advances the repository
+		// generation. Keeping only diskObject="" would leave the old mmap FD
+		// open until the next fault, allowing GC to unlink an object that is
+		// still pinned by this runtime cache. The restored child starts without
+		// a runtime-local mmap FD via afterLoad.
+		rf.diskMmap.ResetFD()
 		rf.diskObject = ""
+		rf.diskIOMu.Unlock()
 		rf.mapsMu.Unlock()
 		return
 	}
@@ -231,13 +238,23 @@ func (rf *regularFile) prepareLiveFork() {
 // ensureDiskMmapLocked opens a branch-private object and installs it as the
 // backing for future translations.
 //
-// Preconditions: rf.mapsMu is locked.
+// Preconditions: rf.mapsMu is locked. No application translation backed by
+// diskMmap may remain valid when diskObject is empty.
 func (rf *regularFile) ensureDiskMmapLocked() error {
 	if rf.diskObject != "" && rf.diskMmap.FD() >= 0 {
 		return nil
 	}
 	volume := rf.inode.fs.diskVolume
-	file, meta, _, err := volume.Repository.OpenDataFile(volume.Branch, rf.inode.ino, true)
+	rf.diskIOMu.Lock()
+	defer rf.diskIOMu.Unlock()
+	file, meta, _, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, true, func() {
+		// prepareLiveFork invalidated all application translations before the
+		// branch generation changed. Close both remaining host object caches
+		// while repository GC is excluded by the mutation lock.
+		rf.invalidateDiskIOLocked()
+		rf.diskMmap.ResetFD()
+		rf.diskObject = ""
+	})
 	if err != nil {
 		return err
 	}
@@ -261,44 +278,48 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 // upgraded through OpenDataFile on the first write so branch-generation CoW
 // remains lazy.
 //
-// Preconditions: rf.diskIOMu is locked.
-func (rf *regularFile) openDiskIOLocked(writable bool) (*os.File, bool, error) {
+// Preconditions: rf.diskIOMu is locked. If writable is true, rf.mapsMu must
+// precede diskIOMu and remain locked until onCoW returns.
+func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, bool, error) {
 	if rf.diskIOFile != nil && (!writable || rf.diskIOWritable) {
 		return rf.diskIOFile, false, nil
 	}
-	if rf.diskIOFile != nil {
-		_ = rf.diskIOFile.Close()
-		rf.diskIOFile = nil
-		rf.diskIOWritable = false
-	}
+	rf.invalidateDiskIOLocked()
 	volume := rf.inode.fs.diskVolume
-	file, _, cloned, err := volume.Repository.OpenDataFile(volume.Branch, rf.inode.ino, writable)
+	file, meta, cloned, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, writable, onCoW)
 	if err != nil {
 		return nil, false, err
 	}
 	rf.diskIOFile = file
+	rf.diskIOObject = meta.Object
 	rf.diskIOWritable = writable
 	return file, cloned, nil
 }
 
-func (rf *regularFile) invalidateDiskIO() {
-	rf.diskIOMu.Lock()
+// Preconditions: rf.diskIOMu is locked.
+func (rf *regularFile) invalidateDiskIOLocked() {
 	if rf.diskIOFile != nil {
 		_ = rf.diskIOFile.Close()
 		rf.diskIOFile = nil
 	}
+	rf.diskIOObject = ""
 	rf.diskIOWritable = false
+}
+
+func (rf *regularFile) invalidateDiskIO() {
+	rf.diskIOMu.Lock()
+	rf.invalidateDiskIOLocked()
 	rf.diskIOMu.Unlock()
 }
 
-// invalidateDiskObject revokes application translations after another write
-// path caused repository object CoW. The next fault lazily installs the new
-// object FD.
-func (rf *regularFile) invalidateDiskObject() {
-	rf.mapsMu.Lock()
+// resetDiskMmapLocked revokes application translations and drops the mmap
+// cache's host reference to an object that repository CoW made unreachable.
+//
+// Preconditions: rf.mapsMu is locked.
+func (rf *regularFile) resetDiskMmapLocked() {
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	rf.diskMmap.ResetFD()
 	rf.diskObject = ""
-	rf.mapsMu.Unlock()
 }
 
 // markDiskMetadataDirty defers repository metadata publication. The flag is
@@ -495,20 +516,23 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		} else if rf.seals&linux.F_SEAL_SHRINK != 0 {
 			return linuxerr.EPERM
 		}
-		cloned, err := rf.inode.fs.diskVolume.Repository.Truncate(rf.inode.fs.diskVolume.Branch, rf.inode.ino, int64(newSize))
+		rf.mapsMu.Lock()
+		rf.diskIOMu.Lock()
+		cloned, err := rf.inode.fs.diskVolume.Repository.TruncateWithCoW(
+			rf.inode.fs.diskVolume.Branch, rf.inode.ino, int64(newSize), func() {
+				rf.invalidateDiskIOLocked()
+				rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
+				rf.diskMmap.ResetFD()
+				rf.diskObject = ""
+			})
+		rf.diskIOMu.Unlock()
 		if err != nil {
+			rf.mapsMu.Unlock()
 			return err
 		}
 		rf.size.Store(newSize)
 		rf.inode.fs.adjustDiskBytes(oldSize, newSize)
-		if cloned {
-			rf.invalidateDiskIO()
-		}
-		rf.mapsMu.Lock()
-		if cloned {
-			rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
-			rf.diskObject = ""
-		} else if newSize < oldSize {
+		if !cloned && newSize < oldSize {
 			rf.mappings.Invalidate(memmap.MappableRange{offsetPageEnd(int64(newSize)), offsetPageEnd(int64(oldSize))}, memmap.InvalidateOpts{InvalidatePrivate: true})
 		}
 		rf.mapsMu.Unlock()
@@ -830,8 +854,15 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 	}
 	if f.inode.fs.diskVolume != nil {
 		oldSize := f.size.Load()
-		cloned, err := f.inode.fs.diskVolume.Repository.Allocate(
-			f.inode.fs.diskVolume.Branch, f.inode.ino, int64(offset), int64(length))
+		f.mapsMu.Lock()
+		f.diskIOMu.Lock()
+		_, err := f.inode.fs.diskVolume.Repository.AllocateWithCoW(
+			f.inode.fs.diskVolume.Branch, f.inode.ino, int64(offset), int64(length), func() {
+				f.invalidateDiskIOLocked()
+				f.resetDiskMmapLocked()
+			})
+		f.diskIOMu.Unlock()
+		f.mapsMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -839,10 +870,6 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 			f.size.Store(end)
 		}
 		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
-		if cloned {
-			f.invalidateDiskIO()
-			f.invalidateDiskObject()
-		}
 		f.inode.touchCMtimeLocked()
 		return f.inode.fs.persistDiskMetadata(&f.inode)
 	}
@@ -955,7 +982,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	if f.inode.fs.diskVolume != nil {
 		f.diskIOMu.Lock()
 		defer f.diskIOMu.Unlock()
-		file, _, err := f.openDiskIOLocked(false)
+		file, _, err := f.openDiskIOLocked(false, nil)
 		if err != nil {
 			return 0, err
 		}
@@ -1063,15 +1090,20 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 
 	if f.inode.fs.diskVolume != nil {
 		oldSize := f.size.Load()
+		// Object transitions always take mapsMu before diskIOMu. The CoW
+		// callback runs while repository GC is excluded, so it can revoke the
+		// old mmap backing before that object becomes collectible.
+		f.mapsMu.Lock()
 		f.diskIOMu.Lock()
-		defer f.diskIOMu.Unlock()
-		file, cloned, err := f.openDiskIOLocked(true)
+		file, _, err := f.openDiskIOLocked(true, func() {
+			f.resetDiskMmapLocked()
+		})
+		f.mapsMu.Unlock()
 		if err != nil {
+			f.diskIOMu.Unlock()
 			return 0, offset, err
 		}
-		if cloned {
-			f.invalidateDiskObject()
-		}
+		defer f.diskIOMu.Unlock()
 		const maxBounce = 64 << 10
 		buf := make([]byte, min(srclen, int64(maxBounce)))
 		var done int64
