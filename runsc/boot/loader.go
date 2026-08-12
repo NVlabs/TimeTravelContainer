@@ -1040,6 +1040,13 @@ func (l *Loader) configureNetwork(k *kernel.Kernel, s inet.Stack) error {
 		l.hostinetNetSNMPFile = nil
 		return nil
 	}
+	// Restored netstack state intentionally omits host-local packet-filter
+	// objects. Even network=none needs the canonical unmodified table set:
+	// live-fork containment validation distinguishes that from an incompletely
+	// restored stack.
+	if eps, ok := s.(*netstack.Stack); ok && eps.Stack.IPTables() == nil {
+		eps.Stack.SetIPTables(netfilter.DefaultLinuxTables(eps.Stack.Clock(), eps.Stack.InsecureRNG()))
+	}
 	if l.networkArgs == nil {
 		return nil
 	}

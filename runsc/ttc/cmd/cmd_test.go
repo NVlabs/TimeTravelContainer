@@ -567,6 +567,9 @@ func TestReleaseDistributedSparseRoot(t *testing.T) {
 	if err := b.releaseDistributedSparseRoot(info); err != nil {
 		t.Fatal(err)
 	}
+	if err := b.releaseDistributedSparseRoot(info); err != nil {
+		t.Fatalf("replaying release after branch deletion: %v", err)
+	}
 	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
 	if err != nil {
 		t.Fatal(err)

@@ -455,6 +455,9 @@ func (b *runtimeBackend) releaseDistributedSparseRoot(info ttcbundle.ContainerIn
 		return fmt.Errorf("opening distributed sparse repository: %w", err)
 	}
 	deletionErr := repository.DeleteBranch(info.DistributedSparseBranch)
+	if errors.Is(deletionErr, os.ErrNotExist) {
+		deletionErr = nil
+	}
 	if deletionErr == nil {
 		_, deletionErr = repository.CollectGarbage(ttcchunk.GCOptions{})
 	}
