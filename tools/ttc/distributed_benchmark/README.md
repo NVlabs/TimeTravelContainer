@@ -51,6 +51,10 @@ pass to a sparse prefix of the sequential or pseudo-random access stream. This
 makes it possible to measure prefetch waste without changing the fork-time
 resident set.
 
+`transfer_bytes` must be at least 1 MiB. TTC keeps resident CoW accounting at
+4 KiB, but a sparse memory chunk is the atomic network, validation, and demand
+load unit, so the transport cannot split one chunk into smaller requests.
+
 `fanout` defaults to one. Values greater than one exercise the coordinated
 sibling API: all target containers are captured from one source pause, then
 run and verify the same workload concurrently. The JSON record contains one

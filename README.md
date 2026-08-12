@@ -529,8 +529,12 @@ root. A dehydrated branch needs no guest process. When every active branch in a
 family is dehydrated, TTC also removes that family's Sentry and filesystem
 transport processes; `ttcd` can then stop without losing the family.
 
-Rehydration creates runtime processes on demand and reads memory pages lazily
-from immutable packed snapshots. Rehydrating one branch does not wake any
+Rehydration creates runtime processes on demand and reads memory lazily from
+immutable, content-addressed chunk files. Each file contains up to 1 MiB (256
+base pages); a fault loads all valid pages in that chunk atomically, while
+writes and copy-on-write sharing remain page-granular, normally 4 KiB. The
+memory repository needs only ordinary filesystem operations—it does not depend
+on reflinks or hole punching. Rehydrating one branch does not wake any
 other branch, and another dehydrated branch can later join the running family
 as an equal peer. The parent labels shown by `ttc ls --tree`
 record only which branch was forked to create another branch; they do not
@@ -540,13 +544,15 @@ the shared data root, so neither dehydration nor rehydration depends on a
 source-node process.
 
 Distributed forks use the cluster's shared TTC data root as a durable handoff.
-The source publishes an immutable packed memory snapshot, normally using
-filesystem reflinks, and can then release all process-local snapshot references
-immediately. The target reads pages from that snapshot only when needed and
-installs them into its own persistent memory backing. Once every required page
-is local, TTC deletes the handoff snapshot. This lets the source container and
-its node disappear without breaking the target; the TCP page-pull and push
-protocol remains available as an explicitly selected experimental policy.
+By default, a live fork can publish the target immediately and temporarily
+serve missing memory over the authenticated page channel while immutable 1 MiB
+chunks are placed in shared storage. The target switches to those chunks
+without changing guest-visible memory, after which the source process and node
+are no longer needed. Forking an already-dehydrated branch skips the live
+channel and shares its immutable manifest directly. Content addressing
+deduplicates identical chunks across branches, and garbage collection removes
+an object only after no branch root, active lease, or publication transaction
+can still reach it.
 
 Durable checkpointing is a separate, explicitly requested operation. It
 captures one selected branch's process, memory, filesystem, and supported

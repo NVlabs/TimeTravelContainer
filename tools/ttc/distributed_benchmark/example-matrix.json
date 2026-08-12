@@ -1,23 +1,23 @@
 {
   "cases": [
     {
-      "name": "local-sequential-64k",
+      "name": "local-sequential-1m",
       "workload": "sequential",
-      "transfer_bytes": 65536,
+      "transfer_bytes": 1048576,
       "prefetch": "sequential",
       "push": "dirty-orphan"
     },
     {
-      "name": "local-random-4k",
+      "name": "local-random-1m-chunks",
       "workload": "random",
-      "transfer_bytes": 4096,
+      "transfer_bytes": 1048576,
       "prefetch": "none",
       "push": "demand-only"
     },
     {
       "name": "wan-sequential-adaptive",
       "workload": "sequential",
-      "transfer_bytes": 65536,
+      "transfer_bytes": 1048576,
       "prefetch": "adaptive",
       "push": "dirty-orphan",
       "netem_device": "lo",
@@ -27,7 +27,7 @@
     {
       "name": "wan-eager-drain",
       "workload": "sequential",
-      "transfer_bytes": 262144,
+      "transfer_bytes": 1048576,
       "prefetch": "sequential",
       "push": "eager-drain",
       "netem_device": "lo",
@@ -39,7 +39,7 @@
       "fanout": 4,
       "memory_mib": 16,
       "workload": "sequential",
-      "transfer_bytes": 65536,
+      "transfer_bytes": 1048576,
       "prefetch": "adaptive",
       "push": "dirty-orphan",
       "netem_device": "lo",

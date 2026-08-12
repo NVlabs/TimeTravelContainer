@@ -2,13 +2,23 @@
 
 ## Status
 
-Implementation in progress. Stable logical page and content-version IDs,
-branch-scoped PMA capture, the immutable 1 MiB loose-object codec, deterministic
-chunk assembly, compact manifests, and crash-safe family repository publication
-are implemented. The sparse target allocator importer, non-PMA owner audit,
-transactional all-pages-at-once loader, leases/GC, and ttcd integration remain
-in progress. The unified mutable-filesystem store is postponed. Pebble is not
-part of the implementation plan.
+The memory-hydration prototype is implemented. It includes stable logical page
+and content-version IDs, branch-scoped capture of application and private
+`MemoryFile` owners, immutable 1 MiB loose objects, deterministic chunk
+assembly, compact manifests, transactional whole-chunk demand loading,
+page-granular resident CoW, durable roots and leases, crash-safe garbage
+collection, process-free dehydration, and live and cold distributed-fork
+integration. It has been exercised with local siblings, multiple live CoW
+versions of one logical chunk, daemon restart on either node, source loss after
+handoff, cold fan-out, and removal/GC.
+
+The unified mutable-filesystem store is postponed. Pebble is not part of the
+implementation plan. Two optimizations specified later remain future work:
+one shared Sentry for repeated imports of the same global family on a target
+node, and per-chunk consumption leases. Today each imported TTC container
+family gets its own Sentry, while its local branches share that Sentry; an
+active imported branch retains its complete manifest as reusable clean backing
+until it is stopped, dehydrated, or removed.
 
 This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
@@ -56,14 +66,15 @@ directory creation, distributing objects across up to 65,536 shards without a
 mutable location index. Retained directory descriptors and `openat`/`unlinkat`
 on the demand path remain loader optimizations to implement and benchmark.
 
-A successful load reads the complete chunk, populates up to 256 independently
-CoW 4 KiB memory pages, and releases that manifest's reference. The chunk is
-unlinked only after no dehydrated manifest or active loader lease references
-it. Chunk files are immutable and addressable by stable IDs, so another `ttcd`
-on the shared filesystem can load them without a source-process dependency.
-The existing packed-file backend remains only as a compatibility path while
-the chunk format is integrated. It is not the target design even on filesystems
-that support reflinks and hole punching.
+A successful load reads the complete chunk and populates up to 256
+independently CoW 4 KiB memory pages. The active branch currently retains its
+manifest as reusable clean backing; stopping, dehydrating, or removing it
+releases that root. A chunk is unlinked only after no branch root, active
+lease, or publication transaction references it. Chunk files are immutable
+and addressable by stable IDs, so another `ttcd` on the shared filesystem can
+load them without a source-process dependency. The old packed memory backend
+is retained for legacy restore and transport compatibility and no longer backs
+normal TTC dehydration or the default distributed handoff.
 
 Pebble experiments remain historical qualification only; no Pebble code or
 dependency is added to TTC now. Pebble is also not approved for rootfs or
@@ -103,9 +114,12 @@ is published. A branch pointer is atomically replaced only after its manifest
 and every referenced object are durable. The implemented compact manifest
 coalesces contiguous offsets, page IDs, version IDs, and equal reference counts
 within one object; a normal dense chunk therefore uses one mapping record
-rather than 256. Reads and unlinks operating relative to retained directory
-descriptors, batched consumption records, and recovery-time cleanup of
-unpublished construction remain to implement.
+rather than 256. Donated repository descriptors let an isolated Sentry load
+objects without reopening host paths. Publication transactions, renewable
+leases, quarantine-and-rescan garbage collection, and daemon reconciliation
+cover interrupted construction and ownership transfer. Retained shard
+directory descriptors and per-chunk consumption records remain optional
+performance and space optimizations.
 
 The completed backend must chunk every referenced range from every
 `MemoryFile` captured by the existing dehydration/remote-fork traversal,
@@ -1336,9 +1350,13 @@ Structural corruption fails closed for the affected domain. Recovery may
 retain unreachable data, but it must not free reachable data or make one
 branch observe another branch's private write.
 
-## Implementation plan
+## Implementation record and remaining plan
 
-### Immediate memory-hydration prototype
+### Memory-hydration prototype
+
+This checklist records both implemented foundations and remaining work. The
+status section above is authoritative; unchecked optimization and stress-test
+items remain specifications rather than claims of completion.
 
 * Define a versioned immutable manifest and 1 MiB loose-chunk format. Do not
   add Pebble to TTC's runtime dependency graph.

@@ -1,14 +1,14 @@
 # Distributed live fork with remote copy-on-read memory
 
-> **Planned storage replacement:**
-> [TTC userspace extent store](ttc_userspace_extent_store.md) describes the
-> family-level immutable 1 MiB chunk repository intended to replace
-> branch-specific packed snapshots and shared-filesystem reflink requirements.
-> Pebble is not part of that plan. This document continues to describe the
-> currently implemented transport and packed-snapshot design where explicitly
-> labelled.
+> **Current storage design:**
+> [TTC userspace extent store](ttc_userspace_extent_store.md) specifies the
+> implemented immutable 1 MiB loose-chunk repository. It replaces
+> branch-specific packed handoff snapshots and removes reflink and hole-punch
+> requirements from memory dehydration and distributed fork. Sections marked
+> historical remain here to explain the older baseline and its measurements.
 
-Status: design and implementation plan; implementation in progress.
+Status: sparse memory handoff implemented; continued qualification and the
+multi-import single-Sentry optimization remain in progress.
 
 Implementation progress:
 
@@ -37,8 +37,12 @@ Implementation progress:
 * Phase 7 durable shared-memory handoff, demand-only target materialization,
   source-independent filesystem repository lifetime, and dehydration
   integration: implemented and tested.
+* Phase 8 immutable 1 MiB chunk publication, stable page/version identities,
+  whole-chunk atomic demand loading, process-free sparse dehydration, cold
+  remote fork, live TCP-to-shared handoff, crash recovery, content-addressed
+  reuse, and reachability GC: implemented and tested.
 
-## Planned 1 MiB shared-chunk data plane
+## Implemented 1 MiB shared-chunk data plane
 
 All cooperating `ttcd` instances use the same shared TTC data root. Durable
 memory is represented by immutable, content-addressed files containing up to
@@ -48,25 +52,24 @@ point to manifests without encoding branch ancestry. Memory CoW and correctness
 remain 4 KiB, while one node loads and evicts all valid slots of a version
 together.
 
-For an already-dehydrated branch, remote fork is metadata-only: the new branch
-references the same manifest, the destination acquires a loader lease, and it
-reads 1 MiB chunks directly from the shared filesystem on demand. Loading a
-chunk installs every valid page. Consumption releases that manifest's
-reference, but physical unlink waits until no manifest or loader lease can
-still read the chunk.
+For an already-dehydrated branch, remote fork shares immutable objects: the
+cluster repository imports missing content by digest, publishes a new branch
+root, and the destination reads 1 MiB chunks directly from the shared
+filesystem on demand. Loading a chunk installs every valid page atomically.
+The active target currently retains its complete manifest as reusable clean
+backing; stop, dehydration, or removal releases it, and physical unlink waits
+until no root, lease, or publication transaction can still read the chunk.
 
 Dehydration writes and synchronizes all chunks, publishes the manifest last,
 and only then releases the Sentry and its memory. After publication, any node
 can rehydrate the branch even if the source process and source node have exited.
 
-Placement is one active Sentry for each `(global family ID, node ID)`, with all
-compatible branches of that family imported into it. The first remote branch
-creates the node-local family runtime; later remote forks reuse its control
-server and `MemoryFile` rather than spawning another Sentry. This permits one
-resident chunk installation to serve local sibling branches and preserves
-ordinary 4 KiB CoW between them. Incompatible imports fail instead of creating
-a second Sentry. Unrelated global families remain separate, and a cross-Sentry
-resident-page cache is outside the first implementation.
+The first imported target creates a node-local Sentry. Local forks of that
+target reuse its `MemoryFile`, so either sibling's first chunk fault benefits
+the other and later writes still CoW at 4 KiB. Reusing the same Sentry for
+separate remote-import operations belonging to one global family remains an
+optimization to implement; today those imports are separate TTC container
+families even when their immutable chunks deduplicate in shared storage.
 
 A live remote fork must not wait for the complete memory image to be written.
 It therefore uses the existing page-granular TCP dependency as a bridge:
@@ -100,24 +103,22 @@ classes, `L0`--`L8` transition points, source-write promotion, GC fencing, and
 operation timing rules are specified in
 [TTC userspace extent store](ttc_userspace_extent_store.md#chunk-coordinates-and-alignment).
 
-## Current packed-snapshot baseline
+## Historical packed-snapshot baseline
 
-TimeTravelContainer (TTC) can fork a branch running on node A into a new branch
-on node B without transferring the complete memory image before the target
-starts. The source briefly pauses to capture kernel metadata and establish
-copy-on-write (CoW) protection. It then publishes an immutable packed memory
-snapshot in the cluster's shared TTC data root, normally by reflinking the
-used ranges of its persistent memory backing. Node B reads pages from this
-snapshot on demand and installs them into its own persistent backing.
+The first durable implementation forked a branch on node A to node B without
+transferring the complete memory image before target startup. The source
+briefly paused to capture kernel metadata and establish copy-on-write (CoW),
+then published an immutable packed memory snapshot, normally by reflinking its
+persistent memory backing. This path has been superseded by loose chunks.
 
-The durable shared snapshot is the default data plane. After it has been
-published and the target metadata is committed, node A releases its in-process
+After that durable snapshot was published and target metadata was committed,
+node A released its in-process
 snapshot references immediately; source writes, source deletion, and source
 node shutdown require no page-level coordination with B. TTC deletes the
 shared snapshot after B has materialized every required page or after the
-target is removed. The original TCP pull/reverse-push protocol remains an
-explicit experimental policy for clusters without shared durable memory
-backing and for transport research.
+target was removed. The TCP pull/reverse-push protocol is now the temporary
+live bridge to the shared chunk repository and remains useful for transport
+research.
 
 Correctness remains page-granular, normally 4 KiB, but network transfers are
 configurable ranges such as 4 KiB, 64 KiB, or 2 MiB. Pull, prefetch, push, and
@@ -125,7 +126,7 @@ adaptive policies are deliberately configurable so that they can be evaluated
 under controlled network conditions and real workloads before TTC chooses
 production defaults.
 
-The default implementation assumes:
+That implementation assumed:
 
 * mutually trusted `ttcd` instances;
 * a common image store, TTC filesystem repository, and memory-snapshot

@@ -307,13 +307,13 @@ class Experiment:
 
 DEFAULT_CASE = {
     "name": "default",
-    "transfer_bytes": 65536,
+    "transfer_bytes": 1048576,
     "max_outstanding_bytes": 67108864,
     "max_parallel": 4,
     "ack_batch_pages": 256,
     "ack_interval": "1ms",
-    "prefetch": "sequential",
-    "push": "dirty-orphan",
+    "prefetch": "none",
+    "push": "demand-only",
     "workload": "sequential",
     "memory_mib": 64,
     "rounds": 2,
@@ -338,6 +338,11 @@ def load_cases(path):
     for supplied in cases:
         case = dict(DEFAULT_CASE)
         case.update(supplied)
+        if case["transfer_bytes"] < 1048576:
+            raise ValueError(
+                f"case {case['name']!r} transfer_bytes must be at least "
+                "1048576 for TTC's atomic sparse memory chunks"
+            )
         result.append(case)
     return result
 
