@@ -132,6 +132,19 @@ func unlinkRelative(rootFD int, path string) error {
 	return unix.Unlinkat(int(parent.Fd()), parts[len(parts)-1], 0)
 }
 
+func touchRelative(rootFD int, path string) error {
+	file, err := openFileRelative(rootFD, path, unix.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, _, errno := unix.Syscall6(unix.SYS_UTIMENSAT, file.Fd(), 0, 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func writeImmutableRelative(rootFD int, dirPath, finalName string, data []byte) error {
 	if _, err := mkdirRelative(rootFD, dirPath); err != nil {
 		return err
@@ -281,6 +294,9 @@ func (r *MemoryRepository) publishDonated(objects []Object, needed map[ID][]Stor
 	for _, object := range objects {
 		if err := r.chunks.PutObject(object); err != nil {
 			return ManifestID{}, fmt.Errorf("publishing donated memory object %s: %w", object.ID, err)
+		}
+		if err := touchRelative(int(r.rootFD.Fd()), txnPath); err != nil {
+			return ManifestID{}, fmt.Errorf("refreshing donated memory publication transaction: %w", err)
 		}
 	}
 	name := manifestID.String()
