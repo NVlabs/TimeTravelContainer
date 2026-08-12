@@ -34,6 +34,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
 )
@@ -49,6 +51,9 @@ type DehydrationCapture struct {
 	PrivateMemoryFiles  map[checkpoint.ResourceID]*pgalloc.MemoryFile
 	FilesystemResources vfs.LiveForkFilesystemResources
 	MemoryImages        []DurableDehydrationMemory
+	SparseBindings      []pgalloc.CapturedPageBinding
+	SparseSnapshot      *pgalloc.RemoteSnapshot
+	SparseManifest      ttcchunk.ManifestID
 
 	reservations []*pgalloc.RemoteSnapshot
 	emptyOwners  []*pgalloc.MemoryFile
@@ -74,6 +79,7 @@ type DurableDehydrationMetadata struct {
 	Version        int                        `json:"version"`
 	KernelMetadata []byte                     `json:"kernel_metadata"`
 	Memories       []DurableDehydrationMemory `json:"memories"`
+	SparseManifest ttcchunk.ManifestID        `json:"sparse_manifest,omitempty"`
 }
 
 const durableDehydrationVersion = 1
@@ -152,6 +158,10 @@ func (d *DehydrationCapture) Close() error {
 	var result error
 	for _, reservation := range d.reservations {
 		result = errors.Join(result, reservation.Close())
+	}
+	if d.SparseSnapshot != nil {
+		result = errors.Join(result, d.SparseSnapshot.Close())
+		d.SparseSnapshot = nil
 	}
 	for _, mf := range d.emptyOwners {
 		mf.Destroy()
@@ -317,7 +327,38 @@ func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
 	}
 	return DurableDehydrationMetadata{
 		Version: durableDehydrationVersion, KernelMetadata: append([]byte(nil), d.KernelMetadata...), Memories: memories,
+		SparseManifest: d.SparseManifest,
 	}
+}
+
+// PublishSparse persists the exact branch-reachable memory graph as immutable
+// 1 MiB objects and atomically installs branch as its durable root.
+func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository, branch string) (ttcchunk.ManifestID, error) {
+	if d == nil || d.consumed || d.SparseSnapshot == nil || repository == nil || branch == "" {
+		return ttcchunk.ManifestID{}, errors.New("sparse dehydration publication is unavailable")
+	}
+	objects, bindings, err := ttcchunk.ReadSnapshot(d.SparseSnapshot, d.SparseBindings)
+	if err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	manifest, err := repository.Publish(objects, bindings)
+	if err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	if err := repository.SetBranch(branch, manifest); err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	if err := d.SparseSnapshot.Close(); err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	d.SparseSnapshot = nil
+	d.SparseManifest = manifest
+	if d.metadataFile != nil {
+		if err := writeDehydrationMetadata(d.metadataFile, d.DurableMetadata()); err != nil {
+			return ttcchunk.ManifestID{}, fmt.Errorf("updating sparse dehydration metadata: %w", err)
+		}
+	}
+	return manifest, nil
 }
 
 // CaptureDehydration serializes Kernel metadata and pins each used allocator
@@ -420,9 +461,16 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		if err := buffered.Flush(); err != nil {
 			return fmt.Errorf("flushing dehydrated Kernel metadata: %w", err)
 		}
-		if _, err := memoryCapture.Bindings(); err != nil {
+		layout, err := memoryCapture.SnapshotLayout()
+		if err != nil {
 			return fmt.Errorf("resolving dehydration memory graph: %w", err)
 		}
+		sparseSnapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
+		if err != nil {
+			return fmt.Errorf("reserving sparse dehydration memory: %w", err)
+		}
+		image.SparseBindings = layout.Bindings
+		image.SparseSnapshot = sparseSnapshot
 		image.KernelMetadata = metadata.Bytes()
 		if image.metadataFile != nil {
 			if err := writeDehydrationMetadata(image.metadataFile, image.DurableMetadata()); err != nil {
@@ -627,6 +675,149 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
 		return nil, vfs.PrependErrMsg("VFS durable dehydration restore failed", err)
+	}
+	child.Pause()
+	return child, nil
+}
+
+// LoadSparseDurableDehydration reconstructs a paused Kernel from an immutable
+// sparse manifest. memoryFiles must contain the application MemoryFile under
+// the zero ResourceID and every private MemoryFile named by the manifest. The
+// function consumes all MemoryFiles on success and failure.
+func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, repository *ttcchunk.MemoryRepository, opts DurableDehydrationLoadOptions) (*Kernel, error) {
+	applicationID := checkpoint.ResourceID{}
+	application := memoryFiles[applicationID]
+	if p == nil || application == nil || repository == nil || opts.Clocks == nil || opts.BranchID == "" || len(image.KernelMetadata) == 0 || image.SparseManifest == (ttcchunk.ManifestID{}) {
+		for _, mf := range memoryFiles {
+			if mf != nil {
+				mf.Destroy()
+			}
+		}
+		return nil, errors.New("sparse durable dehydration load is missing required state")
+	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			for _, mf := range memoryFiles {
+				mf.Destroy()
+			}
+		}
+	}()
+	manifest, err := repository.LoadManifest(image.SparseManifest)
+	if err != nil {
+		return nil, fmt.Errorf("loading sparse dehydration manifest: %w", err)
+	}
+	installation, err := repository.InstallManifestSet(memoryFiles, manifest, usage.Anonymous, 0)
+	if err != nil {
+		return nil, fmt.Errorf("installing sparse dehydration manifest: %w", err)
+	}
+	installationCommitted := false
+	defer func() {
+		if !installationCommitted {
+			_ = installation.Abort()
+		}
+	}()
+
+	var pages *pgalloc.AsyncPagesFileLoad
+	if len(installation.Chunks) != 0 {
+		reader, err := ttcchunk.NewChunkReader(repository, installation.Chunks)
+		if err != nil {
+			return nil, err
+		}
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(reader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		rangesByFile := make(map[*pgalloc.MemoryFile][]pgalloc.RemoteLoadRange)
+		for _, chunk := range installation.Chunks {
+			rangesByFile[chunk.MemoryFile] = append(rangesByFile[chunk.MemoryFile], pgalloc.RemoteLoadRange{Target: chunk.Target, StreamOffset: chunk.StreamOffset})
+		}
+		for mf, ranges := range rangesByFile {
+			if err := mf.AttachSparseChunkPageLoad(pages, ranges, nil, nil); err != nil {
+				pages.Cancel()
+				_ = pages.Wait()
+				return nil, err
+			}
+		}
+		pages.MemoryFilesDone()
+	}
+	pagesOwned := pages != nil
+	defer func() {
+		if pagesOwned {
+			pages.Cancel()
+			_ = pages.Wait()
+		}
+	}()
+
+	child := &Kernel{Platform: p}
+	child.SetMemoryFile(application)
+	child.initRuntimeFields()
+	private := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(memoryFiles)-1)
+	for resource, mf := range memoryFiles {
+		if resource.Ok() {
+			private[resource] = mf
+		}
+	}
+	referenceTransaction := pgalloc.NewSparseReferenceTransaction()
+	loadValues := map[any]any{
+		pgalloc.CtxMemoryFile:             application,
+		pgalloc.CtxMemoryFileMap:          private,
+		pgalloc.CtxLiveForkClone:          true,
+		pgalloc.CtxSparseRelocation:       installation.Relocation,
+		pgalloc.CtxSparseRestoreRefs:      referenceTransaction,
+		vfs.CtxLiveForkChildBranchID:      opts.BranchID,
+		devutil.CtxDevGoferClientProvider: child,
+	}
+	if opts.FilesystemResources != nil {
+		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
+	}
+	if opts.RestoreFilesystemResources != nil {
+		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
+	}
+	if opts.RestoreFilesystemFDMap != nil {
+		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
+	}
+	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
+	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(image.KernelMetadata), 64<<10), child); err != nil {
+		referenceTransaction.Abort()
+		return nil, fmt.Errorf("loading sparse dehydrated Kernel metadata: %w", err)
+	}
+	if err := referenceTransaction.Commit(); err != nil {
+		return nil, err
+	}
+	if err := installation.Commit(); err != nil {
+		return nil, err
+	}
+	installationCommitted = true
+	consumed = true
+	if pages != nil {
+		child.remotePageLoad = pages
+		pagesOwned = false
+	}
+	if _, err := child.vdsoParams.access(); err != nil {
+		child.Release()
+		return nil, fmt.Errorf("materializing sparse dehydrated VDSO parameter page: %w", err)
+	}
+	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
+		child.Release()
+		return nil, err
+	}
+	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if opts.ConfigureNetwork == nil {
+			child.Release()
+			return nil, errors.New("sparse dehydrated network configurator was not provided")
+		}
+		rootNS.Stack().ResetConfig()
+		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("configuring sparse rehydrated network: %w", err)
+		}
+		rootNS.Stack().Restore()
+	}
+	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
+		child.Release()
+		return nil, vfs.PrependErrMsg("VFS sparse dehydration restore failed", err)
 	}
 	child.Pause()
 	return child, nil

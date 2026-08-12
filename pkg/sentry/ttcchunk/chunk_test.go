@@ -455,6 +455,95 @@ func TestInstallManifestRelocatesAndReadsWholeChunk(t *testing.T) {
 	}
 }
 
+func newChunkTestMemoryFile(t *testing.T, resource checkpoint.ResourceID) *pgalloc.MemoryFile {
+	t.Helper()
+	file, err := os.CreateTemp("", "ttc-chunk-memory-file-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		ResourceID: resource, DelayedEviction: pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround: true, DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mf
+}
+
+func TestInstallManifestSetUsesResourceMemoryFiles(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := []checkpoint.ResourceID{{}, {Path: "/private-tmpfs"}}
+	objects := make([]Object, 0, len(resources))
+	bindings := make([]StoredBinding, 0, len(resources))
+	files := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	for i, resource := range resources {
+		chunk := testChunk()
+		chunk.Logical.Allocator = testAllocator(byte(40 + i))
+		chunk.Logical.Sequence += uint64(i)
+		chunk.Pages = chunk.Pages[:1]
+		chunk.Pages[0].Data = bytes.Repeat([]byte{byte(0x70 + i)}, hostarch.PageSize)
+		data, object, err := Encode(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		objects = append(objects, Object{ID: object, Logical: chunk.Logical, Data: data})
+		bindings = append(bindings, StoredBinding{
+			Binding: pgalloc.CapturedPageBinding{
+				ResourceID: resource, OldOffset: 0, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)},
+				Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot,
+			},
+			Object: object,
+		})
+		mf := newChunkTestMemoryFile(t, resource)
+		defer mf.Destroy()
+		files[resource] = mf
+	}
+	manifestID, err := repository.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, err := repository.InstallManifestSet(files, manifest, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed.Chunks) != len(resources) {
+		t.Fatalf("installed %d chunks, want %d", len(installed.Chunks), len(resources))
+	}
+	for _, resource := range resources {
+		offset, ok := installed.Relocation.Page(resource, 0)
+		if !ok {
+			t.Fatalf("missing relocation for %s", resource)
+		}
+		found := false
+		for _, chunk := range installed.Chunks {
+			if chunk.ResourceID == resource {
+				found = true
+				if chunk.MemoryFile != files[resource] || offset < chunk.Target.Start || offset >= chunk.Target.End {
+					t.Fatalf("chunk for %s installed into wrong MemoryFile/range: %+v, offset=%#x", resource, chunk, offset)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no installed chunk for %s", resource)
+		}
+	}
+	if err := installed.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func publishLifecycleManifest(t *testing.T, repository *MemoryRepository, fill byte) ManifestID {
 	t.Helper()
 	chunk := testChunk()

@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -330,6 +331,82 @@ func TestDurableDehydrationLoadsPackedMemoryOnDemand(t *testing.T) {
 	parent.Release()
 }
 
+func TestDehydrationPublishesSparseBranchGraph(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	image, err := parent.CaptureDehydration(parent.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "sparse-dehydrated"})
+	if err != nil {
+		parent.Release()
+		t.Fatal(err)
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		image.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	manifestID, err := image.PublishSparse(repository, "sparse-dehydrated")
+	if err != nil {
+		image.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	if image.DurableMetadata().SparseManifest != manifestID {
+		t.Fatal("durable metadata did not record its sparse manifest")
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Runs) == 0 || len(manifest.Expand()) != len(image.SparseBindings) {
+		t.Fatalf("published manifest has %d runs/%d bindings, want %d bindings", len(manifest.Runs), len(manifest.Expand()), len(image.SparseBindings))
+	}
+	memoryFiles := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+	for _, run := range manifest.Runs {
+		if _, ok := memoryFiles[run.ResourceID]; ok {
+			continue
+		}
+		file, err := os.CreateTemp(t.TempDir(), "sparse-target-*.mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+			ResourceID: run.ResourceID, DiskBackedFile: true,
+			DisableIMAWorkAround: true, DisableMemoryAccounting: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		memoryFiles[run.ResourceID] = mf
+	}
+	var restored *kernel.Kernel
+	if err := parent.WithDehydrationFilesystemResources(parent.SupervisorContext(), "sparse-dehydrated", func(resources vfs.LiveForkFilesystemResources) error {
+		var err error
+		restored, err = kernel.LoadSparseDurableDehydration(parent.SupervisorContext(), parent.Platform, image.DurableMetadata(), memoryFiles, repository, kernel.DurableDehydrationLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), BranchID: "sparse-dehydrated", FilesystemResources: resources,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("LoadSparseDurableDehydration: %v", err)
+	}
+	if !restored.MemoryFile().IsAsyncLoading() {
+		t.Fatal("sparse dehydration memory was eagerly loaded")
+	}
+	if err := restored.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	restored.Release()
+	if err := image.Close(); err != nil {
+		t.Fatal(err)
+	}
+	parent.Release()
+}
+
 func TestLiveForkRemoteMemoryFileTCP(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -454,11 +531,31 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	}
 	parent.PipeMount().IncRef()
 	parent.SetHostMount(parent.PipeMount())
+	// Keep an allocator page that is deliberately unreachable from this branch.
+	// The legacy transport snapshot includes it, while the sparse snapshot must
+	// use the exact branch binding layout.
+	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+	if err != nil {
+		parent.Release()
+		t.Fatal(err)
+	}
 	parent.Pause()
 	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "sparse"})
 	if err != nil {
+		parent.MemoryFile().DecRef(orphan)
 		parent.Release()
 		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	parent.MemoryFile().DecRef(orphan)
+	if capture.SparseSnapshot == nil || capture.Snapshot == nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal("distributed capture omitted its sparse or legacy snapshot")
+	}
+	if sparseBytes, legacyBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes >= legacyBytes {
+		capture.Close()
+		parent.Release()
+		t.Fatalf("sparse snapshot bytes=%d, legacy bytes=%d; unreachable allocator page was not excluded", sparseBytes, legacyBytes)
 	}
 	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
 	if err != nil {
@@ -544,6 +641,17 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	}
 	if capture.Snapshot != nil || len(capture.Snapshots) != 2 {
 		t.Fatalf("capture snapshots: singular=%p siblings=%d", capture.Snapshot, len(capture.Snapshots))
+	}
+	if capture.SparseSnapshot != nil || len(capture.SparseSnapshots) != 2 {
+		t.Fatalf("sparse capture snapshots: singular=%p siblings=%d", capture.SparseSnapshot, len(capture.SparseSnapshots))
+	}
+	// This portion tests legacy sibling acknowledgement in isolation. Sparse
+	// consumers have independent reservations over the exact branch graph.
+	for i, snapshot := range capture.SparseSnapshots {
+		if err := snapshot.Close(); err != nil {
+			t.Fatal(err)
+		}
+		capture.SparseSnapshots[i] = nil
 	}
 	if len(capture.LoadRanges) == 0 || capture.LoadRanges[0].Target.Length() < hostarch.PageSize {
 		t.Fatal("capture has no remotely loadable page")

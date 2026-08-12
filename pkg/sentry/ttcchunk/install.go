@@ -15,12 +15,14 @@
 package ttcchunk
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
@@ -31,8 +33,48 @@ import (
 // offset in ChunkReader. Reused resident chunks are omitted.
 type InstalledChunk struct {
 	Object       ID
+	ResourceID   checkpoint.ResourceID
+	MemoryFile   *pgalloc.MemoryFile
 	Target       memmap.FileRange
 	StreamOffset uint64
+}
+
+// InstallSetResult is the process-local product of installing one manifest
+// across its application and private MemoryFiles.
+type InstallSetResult struct {
+	Relocation   *pgalloc.SparseRelocation
+	Chunks       []InstalledChunk
+	transactions []*pgalloc.SparseChunkInstallation
+	done         bool
+}
+
+// Commit retains every installed residency unit.
+func (r *InstallSetResult) Commit() error {
+	if r == nil || r.done {
+		return fmt.Errorf("sparse memory-file installation is unavailable")
+	}
+	r.done = true
+	for _, transaction := range r.transactions {
+		if err := transaction.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Abort releases all newly installed residency units. It is idempotent.
+func (r *InstallSetResult) Abort() error {
+	if r == nil || r.done {
+		return nil
+	}
+	r.done = true
+	var result error
+	for _, transaction := range r.transactions {
+		if err := transaction.Abort(); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
 }
 
 // InstallResult is the process-local product of installing a manifest.
@@ -55,6 +97,11 @@ func (r *InstallResult) Abort() error { return r.transaction.Abort() }
 func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
 	if mf == nil {
 		return InstallResult{}, fmt.Errorf("installing manifest into nil MemoryFile")
+	}
+	for _, run := range manifest.Runs {
+		if run.ResourceID != mf.ResourceID() {
+			return InstallResult{}, fmt.Errorf("manifest resource %s does not match destination MemoryFile %s", run.ResourceID, mf.ResourceID())
+		}
 	}
 	objects := make(map[ID]Chunk)
 	for _, run := range manifest.Runs {
@@ -127,7 +174,72 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 	sort.Slice(objectIDs, func(i, j int) bool { return objectIDs[i].String() < objectIDs[j].String() })
 	result := InstallResult{Relocation: relocation, Chunks: make([]InstalledChunk, len(objectIDs)), transaction: transaction}
 	for i, object := range objectIDs {
-		result.Chunks[i] = InstalledChunk{Object: object, Target: newRanges[pgalloc.SparseChunkObjectID(object)], StreamOffset: uint64(i) * pgalloc.SparseChunkBytes}
+		result.Chunks[i] = InstalledChunk{
+			Object: object, ResourceID: mf.ResourceID(), MemoryFile: mf,
+			Target: newRanges[pgalloc.SparseChunkObjectID(object)], StreamOffset: uint64(i) * pgalloc.SparseChunkBytes,
+		}
+	}
+	committed = true
+	return result, nil
+}
+
+// InstallManifestSet installs manifest into the MemoryFile selected by each
+// run's ResourceID. One immutable object may belong to only one MemoryFile.
+func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallSetResult, error) {
+	if len(memoryFiles) == 0 {
+		return InstallSetResult{}, errors.New("sparse manifest destination set is empty")
+	}
+	runsByResource := make(map[checkpoint.ResourceID][]ManifestRun)
+	objectResources := make(map[ID]checkpoint.ResourceID)
+	for _, run := range manifest.Runs {
+		mf, ok := memoryFiles[run.ResourceID]
+		if !ok || mf == nil {
+			return InstallSetResult{}, fmt.Errorf("manifest has no destination MemoryFile for %s", run.ResourceID)
+		}
+		if mf.ResourceID() != run.ResourceID {
+			return InstallSetResult{}, fmt.Errorf("destination MemoryFile %s does not match manifest resource %s", mf.ResourceID(), run.ResourceID)
+		}
+		if previous, ok := objectResources[run.Object]; ok && previous != run.ResourceID {
+			return InstallSetResult{}, fmt.Errorf("memory object %s spans resources %s and %s", run.Object, previous, run.ResourceID)
+		}
+		objectResources[run.Object] = run.ResourceID
+		runsByResource[run.ResourceID] = append(runsByResource[run.ResourceID], run)
+	}
+	resources := make([]checkpoint.ResourceID, 0, len(runsByResource))
+	for resource := range runsByResource {
+		resources = append(resources, resource)
+	}
+	sort.Slice(resources, func(i, j int) bool { return resources[i].String() < resources[j].String() })
+	result := InstallSetResult{Relocation: pgalloc.NewSparseRelocation()}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = result.Abort()
+		}
+	}()
+	for _, resource := range resources {
+		submanifest := Manifest{Runs: runsByResource[resource]}
+		installed, err := r.InstallManifest(memoryFiles[resource], submanifest, kind, memCgID)
+		if err != nil {
+			return InstallSetResult{}, err
+		}
+		result.transactions = append(result.transactions, installed.transaction)
+		result.Chunks = append(result.Chunks, installed.Chunks...)
+		for _, run := range submanifest.Runs {
+			for i := uint16(0); i < run.Pages; i++ {
+				old := run.OldOffset + uint64(i)*hostarch.PageSize
+				target, ok := installed.Relocation.Page(resource, old)
+				if !ok {
+					return InstallSetResult{}, fmt.Errorf("submanifest relocation omitted %s:%#x", resource, old)
+				}
+				if err := result.Relocation.Add(resource, old, target); err != nil {
+					return InstallSetResult{}, err
+				}
+			}
+		}
+	}
+	for i := range result.Chunks {
+		result.Chunks[i].StreamOffset = uint64(i) * pgalloc.SparseChunkBytes
 	}
 	committed = true
 	return result, nil

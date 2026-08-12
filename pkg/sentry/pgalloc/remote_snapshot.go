@@ -976,7 +976,7 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 	}
 	for i, loadRange := range ranges {
 		if loadRange.Target.Length() != SparseChunkBytes || !loadRange.Target.WellFormed() ||
-			!hostarch.IsPageAligned(loadRange.Target.Start) || loadRange.StreamOffset != uint64(i)*SparseChunkBytes {
+			!hostarch.IsPageAligned(loadRange.Target.Start) || loadRange.StreamOffset%SparseChunkBytes != 0 {
 			return fmt.Errorf("invalid sparse chunk load range %d: %+v", i, loadRange)
 		}
 		for j := 0; j < i; j++ {

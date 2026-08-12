@@ -57,6 +57,11 @@ type DistributedForkCapture struct {
 	MemoryBindings []pgalloc.CapturedPageBinding
 	Snapshot       *pgalloc.RemoteSnapshot
 	Snapshots      []*pgalloc.RemoteSnapshot
+	// SparseSnapshot pins exactly MemoryBindings. Snapshot is retained only for
+	// the legacy allocator-wide transport and must never be paired with sparse
+	// branch bindings, whose packed stream has a different layout.
+	SparseSnapshot  *pgalloc.RemoteSnapshot
+	SparseSnapshots []*pgalloc.RemoteSnapshot
 
 	// FilesystemResources contains process-local handles. A same-process target
 	// may use them directly; a remote ttcd reopens equivalent handles from its
@@ -68,10 +73,10 @@ type DistributedForkCapture struct {
 // reservations are released only after objects, manifest, and mutable branch
 // root are all durable.
 func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryRepository, branch string) (ttcchunk.ManifestID, error) {
-	if c == nil || repository == nil || branch == "" || c.Snapshot == nil || len(c.Snapshots) != 0 {
+	if c == nil || repository == nil || branch == "" || c.SparseSnapshot == nil || len(c.SparseSnapshots) != 0 {
 		return ttcchunk.ManifestID{}, fmt.Errorf("sparse publication requires one live snapshot and branch")
 	}
-	objects, bindings, err := ttcchunk.ReadSnapshot(c.Snapshot, c.MemoryBindings)
+	objects, bindings, err := ttcchunk.ReadSnapshot(c.SparseSnapshot, c.MemoryBindings)
 	if err != nil {
 		return ttcchunk.ManifestID{}, err
 	}
@@ -82,10 +87,10 @@ func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryReposi
 	if err := repository.SetBranch(branch, manifestID); err != nil {
 		return ttcchunk.ManifestID{}, err
 	}
-	if err := c.Snapshot.Close(); err != nil {
+	if err := c.SparseSnapshot.Close(); err != nil {
 		return ttcchunk.ManifestID{}, err
 	}
-	c.Snapshot = nil
+	c.SparseSnapshot = nil
 	return manifestID, nil
 }
 
@@ -103,6 +108,16 @@ func (c *DistributedForkCapture) Close() error {
 		if snapshot != nil {
 			result = errors.Join(result, snapshot.Close())
 			c.Snapshots[i] = nil
+		}
+	}
+	if c.SparseSnapshot != nil {
+		result = errors.Join(result, c.SparseSnapshot.Close())
+		c.SparseSnapshot = nil
+	}
+	for i, snapshot := range c.SparseSnapshots {
+		if snapshot != nil {
+			result = errors.Join(result, snapshot.Close())
+			c.SparseSnapshots[i] = nil
 		}
 	}
 	return result
@@ -218,6 +233,22 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
+		layout, err := memoryCapture.SnapshotLayout()
+		if err != nil {
+			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
+		}
+		sparseSnapshots, err := pgalloc.NewRemoteSnapshots(layout.Regions, len(childBranchIDs))
+		if err != nil {
+			return err
+		}
+		keepSparseSnapshots := false
+		defer func() {
+			if !keepSparseSnapshots {
+				for _, snapshot := range sparseSnapshots {
+					_ = snapshot.Close()
+				}
+			}
+		}()
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		k.filteringLiveForkDanglingEndpoints = true
@@ -227,10 +258,6 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 		if err := buffered.Flush(); err != nil {
 			return err
-		}
-		memoryBindings, err := memoryCapture.Bindings()
-		if err != nil {
-			return fmt.Errorf("resolving distributed-fork memory graph: %w", err)
 		}
 		// The state stream and remote snapshot refer to the fork-time VVAR
 		// page. resumeTimeLocked updates the source Timekeeper after this
@@ -246,14 +273,17 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		committed = true
 		capture = &DistributedForkCapture{
 			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
-			LoadRanges: loads, MemoryBindings: memoryBindings, FilesystemResources: fsResources,
+			LoadRanges: loads, MemoryBindings: layout.Bindings, FilesystemResources: fsResources,
 		}
 		if len(snapshots) == 1 {
 			capture.Snapshot = snapshots[0]
+			capture.SparseSnapshot = sparseSnapshots[0]
 		} else {
 			capture.Snapshots = snapshots
+			capture.SparseSnapshots = sparseSnapshots
 		}
 		keepSnapshots = true
+		keepSparseSnapshots = true
 		return nil
 	})
 	if err != nil {
