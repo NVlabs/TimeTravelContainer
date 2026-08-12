@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -2751,6 +2752,68 @@ func TestDehydrationNetworkArgs(t *testing.T) {
 	}
 	if _, err := dehydrationNetworkArgs(ttcbundle.ContainerInfo{NetworkMode: "host"}); err == nil {
 		t.Fatal("host network unexpectedly accepted for process-free restore")
+	}
+}
+
+func TestRetainRehydrationPageSource(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		branch    string
+		transient bool
+	}{
+		{name: "durable dehydration image", branch: "main"},
+		{name: "transient peer bootstrap", branch: "fresh", transient: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataRoot := t.TempDir()
+			containerID := "container-id"
+			memoryRoot := filepath.Join(dataRoot, "containers", containerID, "memory")
+			encodedBranch := hex.EncodeToString([]byte(test.branch))
+			sourceDir := filepath.Join(memoryRoot, "dehydrated", encodedBranch)
+			if test.transient {
+				sourceDir = filepath.Join(memoryRoot, ".fresh-start-test")
+			}
+			if err := os.MkdirAll(sourceDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			snapshotPath := filepath.Join(sourceDir, "memory-0000.snapshot")
+			if err := os.WriteFile(snapshotPath, []byte("lazy page data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			openSnapshot, err := os.Open(snapshotPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer openSnapshot.Close()
+
+			var stderr bytes.Buffer
+			b := &runtimeBackend{dataRoot: dataRoot, stderr: &stderr}
+			argument := sourceDir
+			if !test.transient {
+				argument = ""
+			}
+			b.retainRehydrationPageSource(containerID, test.branch, argument)
+			if stderr.Len() != 0 {
+				t.Fatalf("retaining page source warned: %s", stderr.String())
+			}
+			if _, err := os.Lstat(sourceDir); !os.IsNotExist(err) {
+				t.Fatalf("source directory still exists: %v", err)
+			}
+			destination := filepath.Join(memoryRoot, "active", encodedBranch, "dehydration-source", "memory-0000.snapshot")
+			if got, err := os.ReadFile(destination); err != nil || string(got) != "lazy page data" {
+				t.Fatalf("retained snapshot=(%q, %v)", got, err)
+			}
+			got, err := io.ReadAll(openSnapshot)
+			if err != nil || string(got) != "lazy page data" {
+				t.Fatalf("open snapshot after rename=(%q, %v)", got, err)
+			}
+
+			// The ownership transfer is idempotent after the source has moved.
+			b.retainRehydrationPageSource(containerID, test.branch, argument)
+			if stderr.Len() != 0 {
+				t.Fatalf("repeated retention warned: %s", stderr.String())
+			}
+		})
 	}
 }
 

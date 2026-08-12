@@ -8880,10 +8880,6 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	if err != nil || b.dataRoot == "" {
 		return err
 	}
-	imageDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch)))
-	if err := os.RemoveAll(imageDir); err != nil {
-		return fmt.Errorf("removing consumed dehydration image: %w", err)
-	}
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
 		return err
@@ -8897,6 +8893,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
 					return err
 				}
+				b.retainRehydrationPageSource(info.ID, target.branch, "")
 				if _, err := b.ensureConsoleDrain(target, false); err != nil {
 					return fmt.Errorf("reattaching init console: %w", err)
 				}
@@ -8919,6 +8916,52 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 	}
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
+}
+
+// retainRehydrationPageSource moves a durable dehydration image out of the
+// canonical dehydrated namespace after the restored branch is committed. A
+// cold restore faults private pages from its snapshot files on demand, so
+// those files may remain open for the lifetime of the loaders. Unlinking them
+// works on a local POSIX filesystem but causes NFS silly-renames that keep the
+// image directory non-empty. The active branch owns this source directory;
+// later dehydrate, stop, or removal reclaims the whole active directory after
+// the runtime has released its readers.
+//
+// Failure is a post-commit cleanup warning and must never roll back a live
+// branch or change its persistent state.
+func (b *runtimeBackend) retainRehydrationPageSource(containerID, branchID, sourceDir string) {
+	encodedBranch := hex.EncodeToString([]byte(branchID))
+	if sourceDir == "" {
+		sourceDir = filepath.Join(b.dataRoot, "containers", containerID, "memory", "dehydrated", encodedBranch)
+	}
+	if _, err := os.Lstat(sourceDir); os.IsNotExist(err) {
+		return
+	} else if err != nil {
+		if b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: checking consumed dehydration image for %s@%s: %v\n", containerID, branchID, err)
+		}
+		return
+	}
+	activeDir := filepath.Join(b.dataRoot, "containers", containerID, "memory", "active", encodedBranch)
+	if err := os.MkdirAll(activeDir, 0700); err != nil {
+		if b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
+		}
+		return
+	}
+	destination := filepath.Join(activeDir, "dehydration-source")
+	if err := os.Rename(sourceDir, destination); err != nil {
+		if b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
+		}
+		return
+	}
+	for _, directory := range []string{filepath.Dir(sourceDir), activeDir} {
+		if dir, err := os.Open(directory); err == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
+	}
 }
 
 func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
@@ -9049,10 +9092,10 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(imageDir); err != nil {
-		return fmt.Errorf("removing consumed dehydration image: %w", err)
-	}
+	// The live runtime and its persistent state are now committed. Failures in
+	// sidecar attachment or page-source bookkeeping must not delete it.
 	runtimeCreated = false
+	b.retainRehydrationPageSource(info.ID, target.branch, imageDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
@@ -9073,7 +9116,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	return nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, imageDir string, metadata *os.File, snapshots []*os.File) error {
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File) error {
 	activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
 	if err := os.RemoveAll(activeDir); err != nil {
 		return err
@@ -9157,9 +9200,9 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		keepTargets = false
 		return err
 	}
-	if err := os.RemoveAll(imageDir); err != nil {
-		return err
-	}
+	// Persistent state now names the live peer. Keep its on-demand snapshot
+	// readers reachable and do not roll the peer back for artifact bookkeeping.
+	b.retainRehydrationPageSource(info.ID, target.branch, sourceDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
