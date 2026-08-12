@@ -130,6 +130,20 @@ func (s *Store) Get(id ID) (Chunk, error) {
 	return Read(file, &id)
 }
 
+// Contains reports whether id has a regular immutable object file. Payload
+// integrity is verified by Get/Open when the object is actually consumed.
+func (s *Store) Contains(id ID) error {
+	_, path := s.path(id)
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("TTC memory chunk %s is not a regular file", id)
+	}
+	return nil
+}
+
 // Open returns the immutable encoded chunk after verifying its content ID.
 func (s *Store) Open(id ID) (*os.File, error) {
 	_, path := s.path(id)

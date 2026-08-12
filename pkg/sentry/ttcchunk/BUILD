@@ -11,6 +11,7 @@ go_library(
 		"assemble.go",
         "chunk.go",
 		"install.go",
+		"lifecycle.go",
 		"manifest.go",
 		"repository.go",
         "store.go",

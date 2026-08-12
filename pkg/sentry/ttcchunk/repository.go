@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
 var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
@@ -31,10 +33,14 @@ var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
 // pointers to manifests. Lease and transaction directories are created now so
 // later GC never needs to infer liveness from process-local reference counts.
 type MemoryRepository struct {
+	mu           sync.Mutex
 	root         string
 	chunks       *Store
 	manifestRoot string
 	branchRoot   string
+	leaseRoot    string
+	txnRoot      string
+	trashRoot    string
 }
 
 // OpenMemoryRepository opens or creates a family-level repository.
@@ -45,10 +51,13 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, fmt.Errorf("creating TTC memory repository: %w", err)
 	}
-	for _, name := range []string{"chunks", "manifests", "branches", "leases", "transactions"} {
+	for _, name := range []string{"chunks", "manifests", "branches", "leases", "transactions", "trash"} {
 		if err := os.MkdirAll(filepath.Join(root, name), 0700); err != nil {
 			return nil, fmt.Errorf("creating TTC memory repository %s directory: %w", name, err)
 		}
+	}
+	if err := recoverRepositoryTrash(root, time.Now(), DefaultTransactionTTL); err != nil {
+		return nil, fmt.Errorf("recovering interrupted TTC memory collection: %w", err)
 	}
 	if err := syncDirectory(root); err != nil {
 		return nil, fmt.Errorf("synchronizing TTC memory repository: %w", err)
@@ -62,6 +71,9 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 		chunks:       chunks,
 		manifestRoot: filepath.Join(root, "manifests"),
 		branchRoot:   filepath.Join(root, "branches"),
+		leaseRoot:    filepath.Join(root, "leases"),
+		txnRoot:      filepath.Join(root, "transactions"),
+		trashRoot:    filepath.Join(root, "trash"),
 	}, nil
 }
 
@@ -114,6 +126,8 @@ func publishImmutable(dir, parent, path string, data []byte) error {
 // Publish writes referenced chunks before atomically publishing their compact
 // immutable manifest. objects may omit already-published objects.
 func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (ManifestID, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	manifest, err := CompactBindings(bindings)
 	if err != nil {
 		return ManifestID{}, err
@@ -126,6 +140,20 @@ func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (
 	for _, binding := range bindings {
 		needed[binding.Object] = append(needed[binding.Object], binding)
 	}
+	objectIDs := make([]ID, 0, len(needed))
+	for id := range needed {
+		objectIDs = append(objectIDs, id)
+	}
+	txnPath, err := r.beginTransaction(manifestID, objectIDs)
+	if err != nil {
+		return ManifestID{}, fmt.Errorf("beginning memory publication: %w", err)
+	}
+	keepTransaction := false
+	defer func() {
+		if !keepTransaction {
+			_ = os.Remove(txnPath)
+		}
+	}()
 	provided := make(map[ID]Object, len(objects))
 	decoded := make(map[ID]Chunk, len(objects))
 	for _, object := range objects {
@@ -169,11 +197,15 @@ func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (
 		if err := r.chunks.PutObject(object); err != nil {
 			return ManifestID{}, fmt.Errorf("publishing memory object %s: %w", object.ID, err)
 		}
+		if err := os.Chtimes(txnPath, time.Now(), time.Now()); err != nil {
+			return ManifestID{}, fmt.Errorf("refreshing memory publication transaction: %w", err)
+		}
 	}
 	dir, path := r.manifestPath(manifestID)
 	if err := publishImmutable(dir, r.manifestRoot, path, manifestData); err != nil {
 		return ManifestID{}, fmt.Errorf("publishing memory manifest %s: %w", manifestID, err)
 	}
+	keepTransaction = true
 	return manifestID, nil
 }
 
@@ -215,14 +247,22 @@ func decodeBranchPointer(data []byte) (ManifestID, error) {
 }
 
 // SetBranch atomically points branch at an already-published manifest.
-func (r *MemoryRepository) SetBranch(branch string, id ManifestID) error {
-	if _, err := r.LoadManifest(id); err != nil {
-		return fmt.Errorf("branch manifest %s is unavailable: %w", id, err)
+func (r *MemoryRepository) SetBranch(branch string, id ManifestID) (retErr error) {
+	lease, err := r.AcquireLease(id, DefaultLeaseTTL)
+	if err != nil {
+		return fmt.Errorf("protecting branch manifest %s: %w", id, err)
 	}
+	defer func() {
+		if err := lease.Release(); err != nil && retErr == nil {
+			retErr = fmt.Errorf("releasing branch publication lease: %w", err)
+		}
+	}()
 	path, err := r.branchPath(branch)
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	tmp, err := os.CreateTemp(r.branchRoot, ".branch-")
 	if err != nil {
 		return err
@@ -242,7 +282,10 @@ func (r *MemoryRepository) SetBranch(branch string, id ManifestID) error {
 	if err := os.Rename(name, path); err != nil {
 		return err
 	}
-	return syncDirectory(r.branchRoot)
+	if err := syncDirectory(r.branchRoot); err != nil {
+		return err
+	}
+	return r.removeTransactionsFor(id)
 }
 
 // Branch returns the manifest currently named by branch.
@@ -268,6 +311,8 @@ func (r *MemoryRepository) Branch(branch string) (ManifestID, error) {
 // DeleteBranch durably removes a branch root. Immutable reclamation is a
 // separate manifest/lease tracing operation.
 func (r *MemoryRepository) DeleteBranch(branch string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	path, err := r.branchPath(branch)
 	if err != nil {
 		return err

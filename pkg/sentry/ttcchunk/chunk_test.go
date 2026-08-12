@@ -18,11 +18,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -450,5 +452,251 @@ func TestInstallManifestRelocatesAndReadsWholeChunk(t *testing.T) {
 	}
 	if err := reused.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func publishLifecycleManifest(t *testing.T, repository *MemoryRepository, fill byte) ManifestID {
+	t.Helper()
+	chunk := testChunk()
+	chunk.Pages[0].Data = bytes.Repeat([]byte{fill}, hostarch.PageSize)
+	data, object, err := Encode(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := StoredBinding{
+		Binding: pgalloc.CapturedPageBinding{
+			ResourceID: checkpoint.ResourceID{Path: "/memory"}, OldOffset: 0, References: 1,
+			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)},
+			Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot,
+		},
+		Object: object,
+	}
+	id, err := repository.Publish([]Object{{ID: object, Logical: chunk.Logical, Data: data}}, []StoredBinding{binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestRepositoryLeaseProtectsThenReclaimsManifest(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x31)
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := repository.AcquireLease(manifest, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.DeleteBranch("branch"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
+		t.Fatalf("GC with active lease = %+v, %v", got, err)
+	}
+	if err := lease.Renew(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
+		t.Fatalf("GC after lease release = %+v, %v", got, err)
+	}
+	if err := repository.validateManifestObjects(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reclaimed manifest remains available: %v", err)
+	}
+}
+
+func TestRepositoryPublicationTransactionExpires(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x32)
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
+		t.Fatalf("GC with publication transaction = %+v, %v", got, err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	entries, err := os.ReadDir(repository.txnRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := os.Chtimes(filepath.Join(repository.txnRoot, entry.Name()), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := repository.CollectGarbage(GCOptions{Now: time.Now(), TransactionTTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Chunks != 1 || got.Manifests != 1 || got.ExpiredTransactions != 1 {
+		t.Fatalf("expired transaction GC = %+v", got)
+	}
+	if err := repository.validateManifestObjects(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired publication remains available: %v", err)
+	}
+}
+
+func TestRepositoryExpiredLeaseDoesNotProtect(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x33)
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := repository.AcquireLease(manifest, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.DeleteBranch("branch"); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(lease.path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.CollectGarbage(GCOptions{Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Chunks != 1 || got.Manifests != 1 || got.ExpiredLeases != 1 {
+		t.Fatalf("expired lease GC = %+v", got)
+	}
+	if err := lease.Renew(); err == nil {
+		t.Fatal("renewed a lease after its manifest was reclaimed")
+	}
+}
+
+func TestRepositoryLeaseRenewConcurrentGarbageCollection(t *testing.T) {
+	root := t.TempDir()
+	owner, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, owner, 0x34)
+	if err := owner.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := owner.AcquireLease(manifest, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.DeleteBranch("branch"); err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 2)
+	go func() {
+		for i := 0; i < 100; i++ {
+			if err := lease.Renew(); err != nil {
+				errCh <- err
+				return
+			}
+		}
+		errCh <- nil
+	}()
+	go func() {
+		for i := 0; i < 100; i++ {
+			if got, err := collector.CollectGarbage(GCOptions{}); err != nil {
+				errCh <- err
+				return
+			} else if got.Chunks != 0 || got.Manifests != 0 {
+				errCh <- fmt.Errorf("collector reclaimed leased data: %+v", got)
+				return
+			}
+		}
+		errCh <- nil
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := collector.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
+		t.Fatalf("final GC = %+v, %v", got, err)
+	}
+}
+
+func TestRepositoryCorruptRootFailsClosed(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x35)
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	path, err := repository.branchPath("branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CollectGarbage(GCOptions{}); err == nil {
+		t.Fatal("GC accepted a corrupt durable root")
+	}
+	if err := repository.validateManifestObjects(manifest); err != nil {
+		t.Fatalf("fail-closed GC modified rooted data: %v", err)
+	}
+}
+
+func TestRepositoryOpenRecoversInterruptedCollection(t *testing.T) {
+	root := t.TempDir()
+	repository, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x36)
+	loaded, err := repository.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := loaded.Runs[0].Object
+	manifestDir, manifestPath := repository.manifestPath(manifest)
+	_, objectPath := repository.chunks.path(object)
+	quarantine := filepath.Join(repository.trashRoot, "interrupted")
+	if err := os.Mkdir(quarantine, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(manifestPath, filepath.Join(quarantine, "manifest-"+manifest.String())); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(objectPath, filepath.Join(quarantine, "chunk-"+object.String())); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * DefaultTransactionTTL)
+	if err := os.Chtimes(quarantine, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestDir); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.validateManifestObjects(manifest); err != nil {
+		t.Fatalf("recovered repository is incomplete: %v", err)
+	}
+	entries, err := os.ReadDir(recovered.trashRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("recovery left trash entries: %v", entries)
 	}
 }

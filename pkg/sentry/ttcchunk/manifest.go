@@ -43,6 +43,17 @@ type ManifestID [sha256.Size]byte
 // String returns the lowercase hexadecimal manifest content address.
 func (id ManifestID) String() string { return hex.EncodeToString(id[:]) }
 
+// ParseManifestID parses a manifest content address.
+func ParseManifestID(value string) (ManifestID, error) {
+	var id ManifestID
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(id) {
+		return id, fmt.Errorf("invalid TTC memory manifest ID %q", value)
+	}
+	copy(id[:], decoded)
+	return id, nil
+}
+
 // ManifestRun maps a contiguous source MemoryFile range and logical identity
 // run to slots in one immutable object.
 type ManifestRun struct {
