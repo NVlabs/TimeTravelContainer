@@ -249,14 +249,25 @@ func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.Resourc
 // records. Each ReadAt is transactional: it verifies the immutable object,
 // builds the complete record in private memory, then copies to the caller.
 type ChunkReader struct {
-	store   *Store
-	objects []ID
-	mu      sync.RWMutex
-	closed  bool
+	store    *Store
+	objects  []ID
+	mu       sync.RWMutex
+	closed   bool
+	ownStore bool
 }
 
 // NewChunkReader creates a virtual stream in installed-chunk order.
 func NewChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*ChunkReader, error) {
+	return newChunkReader(repository, installed, false)
+}
+
+// NewOwnedChunkReader is NewChunkReader but closes repository when the reader
+// closes. It is used for a repository directory donated to an isolated Sentry.
+func NewOwnedChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*ChunkReader, error) {
+	return newChunkReader(repository, installed, true)
+}
+
+func newChunkReader(repository *MemoryRepository, installed []InstalledChunk, ownStore bool) (*ChunkReader, error) {
 	if repository == nil {
 		return nil, fmt.Errorf("nil TTC memory repository")
 	}
@@ -267,15 +278,23 @@ func NewChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*
 		}
 		objects[i] = chunk.Object
 	}
-	return &ChunkReader{store: repository.chunks, objects: objects}, nil
+	return &ChunkReader{store: repository.chunks, objects: objects, ownStore: ownStore}, nil
 }
 
 // Close prevents future reads.
 func (r *ChunkReader) Close() error {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
 	r.closed = true
+	var err error
+	if r.ownStore {
+		err = r.store.closeRepository()
+	}
 	r.mu.Unlock()
-	return nil
+	return err
 }
 
 func (r *ChunkReader) decoded(index int) ([]byte, error) {

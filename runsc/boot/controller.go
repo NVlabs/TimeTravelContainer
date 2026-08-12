@@ -1209,8 +1209,15 @@ func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, out *Bran
 }
 
 // ExportDehydratedBranch writes process-independent packed memory streams.
-func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExportArgs, _ *struct{}) error {
-	return cm.l.family.ExportDehydration(args)
+func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExportArgs, out *BranchDehydrationExportInfo) error {
+	info, err := cm.l.family.ExportDehydration(args)
+	if err != nil {
+		return err
+	}
+	if info != nil {
+		*out = *info
+	}
+	return nil
 }
 
 // RehydrateBranch reconstructs one dehydrated branch.

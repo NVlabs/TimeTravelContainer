@@ -48,6 +48,7 @@ import (
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -8456,6 +8457,22 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			}
 			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
 		}
+		sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
+		if err != nil {
+			return nil, err
+		}
+		for i := range records {
+			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch); err != nil {
+				var cleanupErr error
+				for _, cleanupDestination := range destinations {
+					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
+				}
+				if cleanupErr != nil {
+					return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; cleaning batch branches: %v", records[i].ID, err, cleanupErr)
+				}
+				return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; batch branches were destroyed", records[i].ID, err)
+			}
+		}
 	}
 	for _, destination := range destinations {
 		target := selector{container: source.container, branch: destination}
@@ -8520,6 +8537,61 @@ func (b *runtimeBackend) prepareStop(target selector) error {
 		return err
 	}
 	_, err = b.command("timetravel", resolved.container, "prepare-stop", resolved.branch)
+	return err
+}
+
+// cloneSparseMemoryRoot gives a newly forked branch an independent durable
+// root for any chunks that its source still faults on demand. A branch that
+// has never been restored from sparse storage has no root to clone.
+func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBranch, targetFilesystemBranch string) error {
+	if b.dataRoot == "" || sourceFilesystemBranch == "" || targetFilesystemBranch == "" {
+		return nil
+	}
+	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
+	if _, err := os.Stat(repositoryPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	manifest, err := repository.Branch(sourceFilesystemBranch)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return repository.SetBranch(targetFilesystemBranch, manifest)
+}
+
+// releaseSparseMemoryRoot removes one branch's durable chunk reachability
+// only after its runtime has stopped using the on-demand loader, then reclaims
+// objects no surviving branch, lease, or publication transaction references.
+func (b *runtimeBackend) releaseSparseMemoryRoot(containerID, filesystemBranch string) error {
+	if b.dataRoot == "" || filesystemBranch == "" {
+		return nil
+	}
+	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
+	if _, err := os.Stat(repositoryPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	if err := repository.DeleteBranch(filesystemBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
 	return err
 }
 
@@ -8600,6 +8672,13 @@ func (b *runtimeBackend) discard(target selector) error {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
+		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 	}
 	if err := store.StopBranch(info.ID, target.branch, 128+int(linux.SIGKILL)); err != nil {
 		return err
@@ -8721,35 +8800,30 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		if len(capture.Memories) == 0 {
-			return errors.New("dehydration capture contains no memory images")
+		memoryRepositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		memoryRepository, err := ttcchunk.OpenMemoryRepository(memoryRepositoryPath)
+		if err != nil {
+			return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
 		}
-		snapshots := make([]*os.File, 0, len(capture.Memories))
-		for i := range capture.Memories {
-			path := filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i))
-			file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-			if err != nil {
-				for _, opened := range snapshots {
-					_ = opened.Close()
-				}
-				return fmt.Errorf("creating dehydration memory image %d: %w", i, err)
-			}
-			snapshots = append(snapshots, file)
+		defer memoryRepository.Close()
+		repositoryDir, err := os.Open(memoryRepositoryPath)
+		if err != nil {
+			return err
 		}
-		exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots))}
-		if b.allowSlowVolumeCopy {
-			exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
-		}
-		exportArgs = append(exportArgs, target.container, "dehydrate-export", target.branch)
-		_, exportErr := b.commandWithFiles(snapshots, exportArgs...)
-		for _, file := range snapshots {
-			if closeErr := file.Close(); exportErr == nil && closeErr != nil {
-				exportErr = closeErr
-			}
-		}
+		exportArgs := []string{"timetravel", "--dehydration-memory-repository-fd=3", target.container, "dehydrate-export", target.branch}
+		exportOutput, exportErr := b.commandWithFiles([]*os.File{repositoryDir}, exportArgs...)
+		_ = repositoryDir.Close()
 		if exportErr != nil {
 			return fmt.Errorf("persisting dehydration memory: %w", exportErr)
 		}
+		var exportInfo boot.BranchDehydrationExportInfo
+		if err := json.Unmarshal(exportOutput, &exportInfo); err != nil {
+			return fmt.Errorf("decoding sparse dehydration root: %w", err)
+		}
+		if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
+			return errors.New("sparse dehydration export returned an empty manifest ID")
+		}
+		capture.SparseManifest = exportInfo.Manifest
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
 		}
@@ -8918,14 +8992,11 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
 }
 
-// retainRehydrationPageSource moves a durable dehydration image out of the
-// canonical dehydrated namespace after the restored branch is committed. A
-// cold restore faults private pages from its snapshot files on demand, so
-// those files may remain open for the lifetime of the loaders. Unlinking them
-// works on a local POSIX filesystem but causes NFS silly-renames that keep the
-// image directory non-empty. The active branch owns this source directory;
-// later dehydrate, stop, or removal reclaims the whole active directory after
-// the runtime has released its readers.
+// retainRehydrationPageSource finalizes a consumed dehydration image after the
+// restored branch is committed. Sparse restores read immutable objects from
+// the family repository, so their per-branch control directory is removed.
+// Legacy packed restores retain their snapshot files under the active branch
+// because the on-demand readers may still have those files open.
 //
 // Failure is a post-commit cleanup warning and must never roll back a live
 // branch or change its persistent state.
@@ -8941,6 +9012,22 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID, branchID, sour
 			fmt.Fprintf(b.stderr, "ttc: warning: checking consumed dehydration image for %s@%s: %v\n", containerID, branchID, err)
 		}
 		return
+	}
+	if control, err := os.ReadFile(filepath.Join(sourceDir, "control.json")); err == nil {
+		var capture boot.BranchDehydrateInfo
+		if json.Unmarshal(control, &capture) == nil && capture.SparseManifest != (ttcchunk.ManifestID{}) {
+			if err := os.RemoveAll(sourceDir); err != nil {
+				if b.stderr != nil {
+					fmt.Fprintf(b.stderr, "ttc: warning: removing consumed sparse dehydration image for %s@%s: %v\n", containerID, branchID, err)
+				}
+				return
+			}
+			if dir, err := os.Open(filepath.Dir(sourceDir)); err == nil {
+				_ = dir.Sync()
+				_ = dir.Close()
+			}
+			return
+		}
 	}
 	activeDir := filepath.Join(b.dataRoot, "containers", containerID, "memory", "active", encodedBranch)
 	if err := os.MkdirAll(activeDir, 0700); err != nil {
@@ -8977,6 +9064,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
 		return errors.New("dehydration control state is incomplete")
 	}
+	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
 		return fmt.Errorf("opening dehydration metadata: %w", err)
@@ -8989,6 +9077,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		}
 	}()
 	for i := range capture.Memories {
+		if sparse {
+			break
+		}
 		file, err := os.Open(filepath.Join(imageDir, fmt.Sprintf("memory-%04d.snapshot", i)))
 		if err != nil {
 			return fmt.Errorf("opening dehydration memory image %d: %w", i, err)
@@ -9040,7 +9131,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse,
 	}
 	restoreArgs.NetworkArgs, err = dehydrationNetworkArgs(info)
 	if err != nil {
@@ -9064,12 +9155,22 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return err
 	}
 	files := []*os.File{configReader, metadata}
-	files = append(files, snapshots...)
-	commandArgs := []string{
-		"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4",
-		"--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)),
-		info.ID, "dehydrate-restore", target.branch,
+	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
+	if sparse {
+		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		repository, err := os.Open(repositoryPath)
+		if err != nil {
+			configReader.Close()
+			return fmt.Errorf("opening sparse dehydration repository: %w", err)
+		}
+		defer repository.Close()
+		files = append(files, repository)
+		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
+	} else {
+		files = append(files, snapshots...)
+		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
 	}
+	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
 	configReader.Close()
 	if err != nil {
@@ -9117,6 +9218,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 }
 
 func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File) error {
+	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
 	activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
 	if err := os.RemoveAll(activeDir); err != nil {
 		return err
@@ -9130,13 +9232,13 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 			_ = os.RemoveAll(activeDir)
 		}
 	}()
-	targets := make([]*os.File, 0, len(snapshots))
+	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
 		for _, file := range targets {
 			_ = file.Close()
 		}
 	}()
-	for i := range snapshots {
+	for i := range capture.Memories {
 		file, err := os.OpenFile(filepath.Join(activeDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
 			return fmt.Errorf("creating active dehydration memory %d: %w", i, err)
@@ -9149,7 +9251,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse,
 	}
 	networkArgs, err := dehydrationNetworkArgs(info)
 	if err != nil {
@@ -9174,15 +9276,27 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		return err
 	}
 	files := []*os.File{configReader, metadata}
-	files = append(files, snapshots...)
-	files = append(files, targets...)
+	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	targetStartFD := 5 + len(snapshots)
-	commandArgs := []string{
-		"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4",
-		"--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)),
-		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
-		info.ID, "dehydrate-restore", target.branch,
+	if sparse {
+		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		repository, err := os.Open(repositoryPath)
+		if err != nil {
+			configReader.Close()
+			return err
+		}
+		defer repository.Close()
+		files = append(files, repository)
+		targetStartFD = 6
+		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
+	} else {
+		files = append(files, snapshots...)
+		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
 	}
+	files = append(files, targets...)
+	commandArgs = append(commandArgs,
+		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
+		info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
 	configReader.Close()
 	if err != nil {
@@ -9339,6 +9453,12 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
+		if err := b.releaseSparseMemoryRoot(info.ID, recorded.FilesystemBranch); err != nil {
+			if portErr != nil {
+				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
+			}
+			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
+		}
 		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {
 			if portErr != nil {
 				return fmt.Errorf("reclaiming filesystems for %s: %w (stopping published ports also failed: %v)", target, err, portErr)

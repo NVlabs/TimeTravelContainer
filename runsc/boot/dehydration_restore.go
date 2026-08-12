@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -53,6 +54,9 @@ type DurableDehydrationRestoreArgs struct {
 	// UseDonatedMemoryFiles selects peer import into an already-running Sentry.
 	// Files then contains metadata, N snapshots, and N empty target files.
 	UseDonatedMemoryFiles bool
+	// Sparse uses Files as metadata, memory repository, and (for peer import)
+	// one empty target file per metadata MemoryFile.
+	Sparse bool
 }
 
 // DurableDehydrationRestoreInfo describes the newly installed runtime root.
@@ -89,8 +93,12 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if err != nil {
 		return nil, err
 	}
-	if got, want := len(args.FilePayload.Files)-1, len(metadata.Memories); got != want {
-		return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
+	if !args.Sparse {
+		if got, want := len(args.FilePayload.Files)-1, len(metadata.Memories); got != want {
+			return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
+		}
+	} else if len(args.FilePayload.Files) != 2 || metadata.SparseManifest == (ttcchunk.ManifestID{}) {
+		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
 	if l.distributedMemoryFile == nil {
 		return nil, errors.New("dehydration target has no reserved persistent application memory file")
@@ -128,6 +136,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 
 	loadMemories := make([]kernel.DurableDehydrationLoadMemory, len(metadata.Memories))
 	loadMemories[0].MemoryFile = mainMF
+	memoryFiles := map[checkpoint.ResourceID]*pgalloc.MemoryFile{{}: mainMF}
 	for i := 1; i < len(metadata.Memories); i++ {
 		resourceID := metadata.Memories[i].ResourceID
 		mf := restoreMnts.mfmap[resourceID]
@@ -139,6 +148,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 			return nil, fmt.Errorf("dehydration target is missing private memory file %q", resourceID)
 		}
 		loadMemories[i].MemoryFile = mf
+		memoryFiles[resourceID] = mf
 		delete(restoreMnts.mfmap, resourceID)
 	}
 	if len(restoreMnts.mfmap) != 0 {
@@ -152,6 +162,9 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		return nil, fmt.Errorf("dehydration target has %d unexpected private memory files", len(restoreMnts.mfmap))
 	}
 	for i := range loadMemories {
+		if args.Sparse {
+			continue
+		}
 		fd, err := unix.Dup(int(args.FilePayload.Files[i+1].Fd()))
 		if err != nil {
 			for j := 0; j < i; j++ {
@@ -175,13 +188,27 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
 	}
 	fdmapOwned = false // Kernel load and VFS CompleteRestore consume descriptors.
-	child, err := kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+	loadOptions := kernel.DurableDehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: restoreMnts.fdmap,
 		ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 			return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
 		},
-	})
+	}
+	var child *kernel.Kernel
+	if args.Sparse {
+		repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
+		if openErr != nil {
+			for _, mf := range memoryFiles {
+				mf.Destroy()
+			}
+			return nil, openErr
+		}
+		loadOptions.OwnSparseRepository = true
+		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
+	} else {
+		child, err = kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, loadOptions)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -235,8 +262,12 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		return nil, err
 	}
 	n := len(metadata.Memories)
-	if got, want := len(args.FilePayload.Files), 1+2*n; got != want {
-		return nil, fmt.Errorf("dehydration peer import got %d files, want %d", got, want)
+	wantFiles := 1 + 2*n
+	if args.Sparse {
+		wantFiles = 2 + n
+	}
+	if got := len(args.FilePayload.Files); got != wantFiles {
+		return nil, fmt.Errorf("dehydration peer import got %d files, want %d", got, wantFiles)
 	}
 	loadMemories := make([]kernel.DurableDehydrationLoadMemory, n)
 	cleanupMemories := func() {
@@ -250,13 +281,19 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 	}
 	for i := 0; i < n; i++ {
-		snapshotFD, err := unix.Dup(int(args.FilePayload.Files[1+i].Fd()))
-		if err != nil {
-			cleanupMemories()
-			return nil, err
+		if !args.Sparse {
+			snapshotFD, err := unix.Dup(int(args.FilePayload.Files[1+i].Fd()))
+			if err != nil {
+				cleanupMemories()
+				return nil, err
+			}
+			loadMemories[i].Reader = stateio.NewFDReader(int32(snapshotFD), 1<<20, 64, 4)
 		}
-		loadMemories[i].Reader = stateio.NewFDReader(int32(snapshotFD), 1<<20, 64, 4)
-		targetFD, err := unix.Dup(int(args.FilePayload.Files[1+n+i].Fd()))
+		targetStart := 1 + n
+		if args.Sparse {
+			targetStart = 2
+		}
+		targetFD, err := unix.Dup(int(args.FilePayload.Files[targetStart+i].Fd()))
 		if err != nil {
 			cleanupMemories()
 			return nil, err
@@ -279,16 +316,34 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 	}()
 	err = l.family.RestoreDurablePeer(args, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
-		consumed = true
 		// Branches in one Sentry share the platform. In particular, systrap's
 		// stub mapping and source subprocess are process-global; constructing a
 		// second platform here can collide with the active platform's mappings.
-		child, err := kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, kernel.DurableDehydrationLoadOptions{
+		loadOptions := kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
 			},
-		})
+		}
+		var child *kernel.Kernel
+		var err error
+		if args.Sparse {
+			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
+			if openErr != nil {
+				return nil, openErr
+			}
+			memoryFiles := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(loadMemories))
+			for i := range loadMemories {
+				memoryFiles[metadata.Memories[i].ResourceID] = loadMemories[i].MemoryFile
+				loadMemories[i].MemoryFile = nil
+			}
+			consumed = true
+			loadOptions.OwnSparseRepository = true
+			child, err = kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, repository, loadOptions)
+		} else {
+			consumed = true
+			child, err = kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, loadOptions)
+		}
 		if err != nil {
 			return nil, err
 		}

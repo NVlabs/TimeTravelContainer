@@ -2317,12 +2317,13 @@ func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.Branc
 	return &info, nil
 }
 
-// ExportDehydratedBranch persists one packed file per memory image.
-func (s *Sandbox) ExportDehydratedBranch(args *boot.BranchDehydrationExportArgs) error {
-	if err := s.call(boot.ContMgrExportDehydratedBranch, args, nil); err != nil {
-		return fmt.Errorf("exporting dehydrated branch %q: %w", args.ID, err)
+// ExportDehydratedBranch persists packed streams or a sparse memory root.
+func (s *Sandbox) ExportDehydratedBranch(args *boot.BranchDehydrationExportArgs) (*boot.BranchDehydrationExportInfo, error) {
+	var info boot.BranchDehydrationExportInfo
+	if err := s.call(boot.ContMgrExportDehydratedBranch, args, &info); err != nil {
+		return nil, fmt.Errorf("exporting dehydrated branch %q: %w", args.ID, err)
 	}
-	return nil
+	return &info, nil
 }
 
 // RehydrateBranch reconstructs one dehydrated branch.

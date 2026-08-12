@@ -78,6 +78,7 @@ type TimeTravel struct {
 	dehydrationSnapshotsStartFD   int
 	dehydrationSnapshotsCount     int
 	dehydrationSnapshotAllowCopy  bool
+	dehydrationMemoryRepositoryFD int
 	dehydrationTargetsStartFD     int
 	dehydrationTargetsCount       int
 	distributedSessionID          string
@@ -162,6 +163,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationSnapshotsStartFD, "dehydration-snapshots-start-fd", -1, "first inherited dehydration snapshot destination")
 	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
 	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
+	f.IntVar(&t.dehydrationMemoryRepositoryFD, "dehydration-memory-repository-fd", -1, "inherited sparse dehydration memory repository directory")
 	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
 	f.IntVar(&t.dehydrationTargetsCount, "dehydration-targets-count", 0, "number of inherited dehydration target memory files")
 	f.StringVar(&t.distributedSessionID, "distributed-session", "", "distributed fork transaction/session ID")
@@ -437,6 +439,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
 	case "dehydrate-export":
+		if t.dehydrationMemoryRepositoryFD >= 0 {
+			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-memory-repository")
+			if repository == nil {
+				util.Fatalf("invalid dehydration memory repository FD")
+			}
+			defer repository.Close()
+			output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
+				FilePayload: urpc.FilePayload{Files: []*os.File{repository}}, ID: f.Arg(2), Sparse: true,
+			})
+			break
+		}
 		if t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) {
 			util.Fatalf("invalid inherited dehydration snapshot range")
 		}
@@ -449,7 +462,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			files = append(files, file)
 			defer file.Close()
 		}
-		err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
+		_, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
 			FilePayload: urpc.FilePayload{Files: files},
 			ID:          f.Arg(2),
 			AllowCopy:   t.dehydrationSnapshotAllowCopy,
@@ -483,6 +496,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
 		defer metadata.Close()
+		if restoreArgs.Sparse {
+			if t.dehydrationMemoryRepositoryFD < 0 || t.dehydrationSnapshotsCount != 0 {
+				util.Fatalf("sparse dehydration restore requires a repository and no packed snapshots")
+			}
+			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-restore-memory-repository")
+			if repository == nil {
+				util.Fatalf("invalid dehydration memory repository FD")
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
+			defer repository.Close()
+		}
 		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
 			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-restore-snapshot-%d", i))
 			if file == nil {

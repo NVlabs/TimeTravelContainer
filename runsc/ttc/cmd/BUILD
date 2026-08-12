@@ -13,6 +13,7 @@ go_library(
         "//pkg/abi/linux",
 		"//pkg/hostarch",
 		"//pkg/sentry/pgalloc",
+		"//pkg/sentry/ttcchunk",
 		"//pkg/sentry/ttcremote",
 		"//pkg/ttcremote",
         "//pkg/ttcvolume",

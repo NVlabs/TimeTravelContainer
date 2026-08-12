@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
@@ -219,6 +220,7 @@ type BranchDehydrateInfo struct {
 	Resume           bool                          `json:"resume"`
 	ExecSessions     []ExecSessionInfo             `json:"exec_sessions,omitempty"`
 	FilesystemBranch string                        `json:"filesystem_branch"`
+	SparseManifest   ttcchunk.ManifestID           `json:"sparse_manifest,omitempty"`
 }
 
 // BranchDehydrationExportArgs donates packed snapshot destinations in the
@@ -227,6 +229,12 @@ type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
 	ID        string
 	AllowCopy bool
+	Sparse    bool
+}
+
+// BranchDehydrationExportInfo identifies a published sparse memory root.
+type BranchDehydrationExportInfo struct {
+	Manifest ttcchunk.ManifestID `json:"manifest"`
 }
 
 // BranchProcessesArgs selects a container inside one live branch.
@@ -1807,24 +1815,43 @@ func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error)
 
 // ExportDehydration writes all packed memory streams for an already
 // dehydrated branch.
-func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) error {
+func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*BranchDehydrationExportInfo, error) {
 	if args == nil || args.ID == "" {
-		return errors.New("dehydration export requires a branch ID")
+		return nil, errors.New("dehydration export requires a branch ID")
 	}
 	b, err := f.branch(args.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	b.opMu.Lock()
 	defer b.opMu.Unlock()
 	f.mu.Lock()
 	if b.state != BranchDehydrated || b.dehydration == nil || b.dehydration.image == nil {
 		f.mu.Unlock()
-		return fmt.Errorf("branch %q is not available for dehydration export", args.ID)
+		return nil, fmt.Errorf("branch %q is not available for dehydration export", args.ID)
 	}
 	image := b.dehydration.image
+	filesystemBranch := b.filesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = f.volumeBranchID(b.id)
+	}
 	f.mu.Unlock()
-	return image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
+	if !args.Sparse {
+		return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
+	}
+	if len(args.FilePayload.Files) != 1 {
+		return nil, fmt.Errorf("sparse dehydration export has %d repository descriptors, want 1", len(args.FilePayload.Files))
+	}
+	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
+	if err != nil {
+		return nil, fmt.Errorf("opening sparse memory repository: %w", err)
+	}
+	defer repository.Close()
+	manifest, err := image.PublishSparse(repository, filesystemBranch)
+	if err != nil {
+		return nil, err
+	}
+	return &BranchDehydrationExportInfo{Manifest: manifest}, nil
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its

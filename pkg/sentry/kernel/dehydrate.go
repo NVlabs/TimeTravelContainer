@@ -117,6 +117,7 @@ type DurableDehydrationLoadOptions struct {
 	ConfigureNetwork           func(*Kernel, inet.Stack) error
 	MaxReadBytes               uint64
 	MaxParallel                int
+	OwnSparseRepository        bool
 }
 
 // WithDehydrationFilesystemResources exposes an active branch's process-local
@@ -720,7 +721,12 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 
 	var pages *pgalloc.AsyncPagesFileLoad
 	if len(installation.Chunks) != 0 {
-		reader, err := ttcchunk.NewChunkReader(repository, installation.Chunks)
+		var reader *ttcchunk.ChunkReader
+		if opts.OwnSparseRepository {
+			reader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
+		} else {
+			reader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -740,6 +746,11 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 			}
 		}
 		pages.MemoryFilesDone()
+	}
+	if len(installation.Chunks) == 0 && opts.OwnSparseRepository {
+		if err := repository.Close(); err != nil {
+			return nil, err
+		}
 	}
 	pagesOwned := pages != nil
 	defer func() {

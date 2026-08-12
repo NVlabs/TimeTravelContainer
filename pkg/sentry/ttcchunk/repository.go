@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
@@ -41,6 +43,40 @@ type MemoryRepository struct {
 	leaseRoot    string
 	txnRoot      string
 	trashRoot    string
+	rootFD       *os.File
+}
+
+// OpenMemoryRepositoryFD opens a repository through an already-open directory
+// descriptor. The descriptor is duplicated, allowing an isolated Sentry to
+// use a ttcd-donated repository without resolving a host pathname.
+func OpenMemoryRepositoryFD(dir *os.File) (*MemoryRepository, error) {
+	if dir == nil {
+		return nil, errors.New("TTC memory repository directory is nil")
+	}
+	dup, err := unix.Dup(int(dir.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	owned := os.NewFile(uintptr(dup), "ttc-memory-repository")
+	repository, err := OpenMemoryRepository(fmt.Sprintf("/proc/self/fd/%d", dup))
+	if err != nil {
+		owned.Close()
+		return nil, err
+	}
+	repository.rootFD = owned
+	repository.chunks.repository = repository
+	return repository, nil
+}
+
+// Close releases a donated repository descriptor. Path-opened repositories
+// have no persistent descriptor and Close is a no-op.
+func (r *MemoryRepository) Close() error {
+	if r == nil || r.rootFD == nil {
+		return nil
+	}
+	err := r.rootFD.Close()
+	r.rootFD = nil
+	return err
 }
 
 // OpenMemoryRepository opens or creates a family-level repository.

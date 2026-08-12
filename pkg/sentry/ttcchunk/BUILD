@@ -18,6 +18,7 @@ go_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+		"@org_golang_x_sys//unix",
         "//pkg/hostarch",
 		"//pkg/sentry/checkpoint",
 		"//pkg/safemem",

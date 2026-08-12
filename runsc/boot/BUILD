@@ -121,6 +121,7 @@ go_library(
         "//pkg/sentry/state/stateipc",
         "//pkg/sentry/strace",
         "//pkg/sentry/time",
+		"//pkg/sentry/ttcchunk",
 		"//pkg/sentry/ttcremote",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",

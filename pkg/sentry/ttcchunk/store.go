@@ -24,7 +24,19 @@ import (
 
 // Store is an immutable content-addressed loose chunk store. The first two ID
 // bytes select a shard, avoiding a single huge host directory.
-type Store struct{ root string }
+type Store struct {
+	root       string
+	repository *MemoryRepository
+}
+
+func (s *Store) closeRepository() error {
+	if s == nil || s.repository == nil {
+		return nil
+	}
+	err := s.repository.Close()
+	s.repository = nil
+	return err
+}
 
 // OpenStore opens or creates a private loose chunk store.
 func OpenStore(root string) (*Store, error) {
