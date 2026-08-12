@@ -8,6 +8,7 @@ package(
 go_library(
     name = "ttcchunk",
     srcs = [
+		"assemble.go",
         "chunk.go",
         "store.go",
     ],

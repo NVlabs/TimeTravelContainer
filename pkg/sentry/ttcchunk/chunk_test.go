@@ -16,6 +16,7 @@ package ttcchunk
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"sync"
@@ -123,4 +124,53 @@ func TestStoreConcurrentIdempotentPutAndCorruption(t *testing.T) {
 	if _, err := store.Get(id); err == nil {
 		t.Fatal("Get accepted corrupted immutable chunk")
 	}
+}
+
+func TestAssembleSeparatesDivergedSlotVersions(t *testing.T) {
+	allocator := testAllocator(1)
+	logicalChunk := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 7}
+	pageAt := func(slot uint8, version uint64, fill byte) SourcePage {
+		return SourcePage{
+			Binding: pgalloc.CapturedPageBinding{
+				OldOffset:  uint64(version) * hostarch.PageSize,
+				References: 1,
+				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logicalChunk.Sequence*PagesPerChunk + uint64(slot)},
+				Version:    pgalloc.PageVersionID{Allocator: testAllocator(5), Sequence: version},
+				Chunk:      logicalChunk,
+				Slot:       slot,
+			},
+			Data: bytes.Repeat([]byte{fill}, hostarch.PageSize),
+		}
+	}
+	source := []SourcePage{
+		pageAt(3, 30, 0x30),
+		pageAt(3, 31, 0x31),
+		pageAt(9, 90, 0x90),
+	}
+	objects, bindings, err := Assemble(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 || len(bindings) != 3 {
+		t.Fatalf("Assemble produced %d objects and %d bindings, want 2 and 3", len(objects), len(bindings))
+	}
+	objectForVersion := make(map[uint64]ID)
+	for _, binding := range bindings {
+		objectForVersion[binding.Binding.Version.Sequence] = binding.Object
+	}
+	if objectForVersion[30] == objectForVersion[31] {
+		t.Fatal("two versions of one logical slot were packed into the same object")
+	}
+	if objectForVersion[90] != objectForVersion[30] {
+		t.Fatal("first-fit deterministic packing did not coalesce a non-conflicting slot")
+	}
+	for _, object := range objects {
+		if got := sha256ID(object.Data); got != object.ID {
+			t.Fatalf("object ID = %s, content hash = %s", object.ID, got)
+		}
+	}
+}
+
+func sha256ID(data []byte) ID {
+	return ID(sha256.Sum256(data))
 }
