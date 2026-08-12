@@ -44,6 +44,7 @@ const (
 type config struct {
 	Mode             string
 	Dir              string
+	SyncUpdates      bool
 	Pages            int
 	Branches         int
 	UpdatesPerBranch int
@@ -98,9 +99,13 @@ type report struct {
 	DivergedDisk         diskStats   `json:"diverged_disk"`
 	WarmReadLatency      latency     `json:"warm_page_lookup_latency"`
 	WarmReadOpsPerSec    float64     `json:"warm_page_lookups_per_sec"`
+	WarmDirectLatency    latency     `json:"warm_direct_data_get_latency"`
+	WarmDirectOpsPerSec  float64     `json:"warm_direct_data_gets_per_sec"`
 	RestartSeconds       float64     `json:"restart_seconds"`
 	ColdReadLatency      latency     `json:"cold_page_lookup_latency"`
 	ColdReadOpsPerSec    float64     `json:"cold_page_lookups_per_sec"`
+	ColdDirectLatency    latency     `json:"cold_direct_data_get_latency"`
+	ColdDirectOpsPerSec  float64     `json:"cold_direct_data_gets_per_sec"`
 	DeleteSeconds        float64     `json:"delete_branch_keys_seconds"`
 	AfterDeleteDisk      diskStats   `json:"after_delete_before_compact_disk"`
 	CompactSeconds       float64     `json:"compact_seconds"`
@@ -134,6 +139,7 @@ func main() {
 	cfg := config{}
 	flag.StringVar(&cfg.Mode, "mode", "sst", "sst or blob")
 	flag.StringVar(&cfg.Dir, "dir", "", "database directory")
+	flag.BoolVar(&cfg.SyncUpdates, "sync-updates", true, "sync every branch-update batch")
 	flag.IntVar(&cfg.Pages, "pages", 131072, "base 4 KiB pages")
 	flag.IntVar(&cfg.Branches, "branches", 4, "diverging branches")
 	flag.IntVar(&cfg.UpdatesPerBranch, "updates", 4096, "random updates per branch")
@@ -257,8 +263,12 @@ func run(cfg config) (*report, error) {
 				ib.Close()
 				return nil, err
 			}
+			writeOptions := pebble.NoSync
+			if cfg.SyncUpdates {
+				writeOptions = pebble.Sync
+			}
 			start := time.Now()
-			if err := ib.Commit(pebble.Sync); err != nil {
+			if err := ib.Commit(writeOptions); err != nil {
 				ib.Close()
 				return nil, err
 			}
@@ -286,6 +296,10 @@ func run(cfg config) (*report, error) {
 	if err != nil {
 		return nil, err
 	}
+	r.WarmDirectLatency, r.WarmDirectOpsPerSec, err = measureDirectReads(s.db, cfg.Pages, cfg.WarmReads, 600)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := s.close(); err != nil {
 		return nil, err
@@ -297,6 +311,20 @@ func run(cfg config) (*report, error) {
 		return nil, err
 	}
 	r.RestartSeconds = time.Since(t0).Seconds()
+	r.ColdDirectLatency, r.ColdDirectOpsPerSec, err = measureDirectReads(s.db, cfg.Pages, cfg.ColdReads, 800)
+	if err != nil {
+		return nil, err
+	}
+	// Drop caches again so the direct-data probe does not warm the subsequent
+	// full-tree lookup measurement.
+	if err := s.close(); err != nil {
+		return nil, err
+	}
+	dropCaches(cfg.Dir)
+	s, err = openStore(cfg)
+	if err != nil {
+		return nil, err
+	}
 	baseRoot, err = s.getRoot("main")
 	if err != nil {
 		return nil, err
@@ -362,9 +390,11 @@ func run(cfg config) (*report, error) {
 	r.EmptyDisk, _ = diskUsage(cfg.Dir)
 	r.Notes = []string{
 		"Each page lookup traverses three immutable 512-byte radix nodes and then reads one 4 KiB page.",
-		"Each branch update CoWs one page and three radix nodes; batches are durably synced.",
+		"Direct-data Get measurements isolate Pebble value lookup from the three-level TTC page-map traversal.",
+		"Each branch update CoWs one page and three radix nodes.",
 		"Fork latency is a synced write of one named root; it is independent of page count.",
 		"Branch deletion explicitly deletes all branch-private immutable objects, then forces compaction.",
+		fmt.Sprintf("Branch update batches use sync=%t.", cfg.SyncUpdates),
 	}
 	return r, nil
 }
@@ -563,6 +593,27 @@ func measureReads(s *store, roots []uint64, pages, count int, seed uint64) (late
 	}
 	d := time.Since(t0).Seconds()
 	return summarize(lats), float64(count) / d, nil
+}
+
+func measureDirectReads(g getter, pages, count int, seed uint64) (latency, float64, error) {
+	rng := rand.New(rand.NewPCG(seed, seed^0x517cc1b727220a95))
+	lats := make([]time.Duration, 0, count)
+	t0 := time.Now()
+	for i := 0; i < count; i++ {
+		start := time.Now()
+		v, closer, err := g.Get(pageKey(uint64(rng.IntN(pages) + 1)))
+		lats = append(lats, time.Since(start))
+		if err != nil {
+			return latency{}, 0, err
+		}
+		if len(v) != pageSize {
+			closer.Close()
+			return latency{}, 0, io.ErrUnexpectedEOF
+		}
+		closer.Close()
+	}
+	seconds := time.Since(t0).Seconds()
+	return summarize(lats), float64(count) / seconds, nil
 }
 
 func (s *store) deleteAlloc(branch string, a branchAlloc) error {

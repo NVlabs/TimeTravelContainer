@@ -114,6 +114,58 @@ partially visible referenced object. This covers process termination and WAL
 replay. It does not simulate lost writes, torn storage below the filesystem,
 power loss, or bugs in TTC's future reachability/lease protocol.
 
+## Raw host-file comparison
+
+The `raw` harness provides a deliberately weaker lower bound using one ordinary
+host file. A logical page is its byte offset, a read is one `pread`, and a write
+overwrites that offset. It has no immutable objects, branch sharing,
+reachability, atomic multi-object publication, checksums, or WAL recovery.
+Consequently, its numbers isolate costs but do not represent an alternative
+implementation of TTC semantics.
+
+Five raw and three Pebble runs were used for the sequential-build medians.
+Three raw runs were used for the write medians. Read figures compare the full
+size runs. “Direct Pebble” gets one 4 KiB data key and isolates the engine from
+TTC's proposed three-node page-map traversal. “TTC tree” gets those three
+512-byte nodes and then the data key.
+
+| Operation | Raw host file | Pebble SST | Relative result |
+| --- | ---: | ---: | --- |
+| Sequential 512 MiB build | 259.8 MiB/s | 96.5 MiB/s | 37.1% retained; 62.9% loss |
+| Unsynced random updates | 40,564 pages/s | 37,737 pages/s | 93.0% retained; 7.0% loss |
+| Durable random updates | 9,441 pages/s | 17,700--19,000 pages/s | Pebble is 1.9--2.0x faster |
+| Durable root publication, p50 | 1.003 ms | 1.011 ms | 0.8% latency overhead |
+| Durable root publication, p99 | 1.197 ms | 1.603 ms | 33.9% latency overhead |
+| Warm direct data read, p50 | 0.81 us | 5.12 us | 6.3x latency; 83.6% throughput loss |
+| Warm TTC-tree read, p50 | 0.81 us | 12.67 us | 15.7x latency; 94.0% throughput loss |
+| Cold direct data read, p50 | 643 us | 666 us | 3.5% latency; 6.9% throughput loss |
+| Cold TTC-tree read, p50 | 643 us | 752 us | 16.9% latency; 25.2% throughput loss |
+
+For the root comparison, the raw file is preallocated and appends one 8-byte
+root followed by `fdatasync`; Pebble inserts one named root key and synchronizes
+its preallocated WAL. The nearly identical medians show that device/filesystem
+sync latency dominates. Pebble's higher p99 remains relevant for fork latency.
+
+The durable random-write result is not a mistake. Direct in-place writes must
+flush scattered dirty pages at each durability boundary. Pebble first commits
+them sequentially to its WAL and moves them into final files later, making the
+foreground path about twice as fast here. Without synchronization, where this
+advantage is removed, the engine plus immutable-tree updates cost about 7% in
+throughput.
+
+Cached reads expose the largest abstraction cost. One direct Pebble value
+lookup is about 6.3 times the latency of one raw `pread`, and performing every
+page-map level through the database raises this to 15.7 times. TTC should
+therefore keep active page-map nodes in memory and avoid repeated database
+lookups on established mappings. Cold reads are much closer because host I/O
+dominates: one direct Pebble read costs 3.5% at the median, while the uncached
+four-lookup path costs 16.9%.
+
+A clean compacted 512 MiB base occupied 526.4 MiB in Pebble, 2.8% more than the
+raw file. Before compaction and WAL cleanup it occupied 575.1 MiB, 12.3% more.
+Overwrite churn and the WAL recycler can cause substantially larger temporary
+amplification, as described above.
+
 ## Conclusion and gate
 
 Pebble passes the first synthetic functional gate and is suitable for a

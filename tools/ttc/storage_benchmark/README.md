@@ -11,6 +11,9 @@ go run . --mode=sst --dir=/tmp/ttc-pebble-sst >sst.json
 go run . --mode=blob --dir=/tmp/ttc-pebble-blob >blob.json
 ```
 
+Add `--sync-updates=false` to measure the foreground update path without a
+durability barrier.
+
 Run complete-overwrite and compaction churn:
 
 ```shell
@@ -25,9 +28,15 @@ go run ./crash --mode=sst --rounds=100 --dir=/tmp/ttc-crash-sst
 go run ./crash --mode=blob --rounds=100 --dir=/tmp/ttc-crash-blob
 ```
 
+Run the intentionally weaker raw-host-file lower bound:
+
+```shell
+go run ./raw --dir=/tmp/ttc-raw >raw.json
+go run ./raw --dir=/tmp/ttc-raw-nosync --sync-updates=false >raw-nosync.json
+```
+
 The commands remove the supplied database directory before starting. Do not
 point `--dir` at data that must be retained.
 
 The August 2026 test method, environment, results, and limitations are in
 [`g3doc/benchmarks/ttc_pebble_qualification.md`](../../../g3doc/benchmarks/ttc_pebble_qualification.md).
-
