@@ -11,6 +11,7 @@ go_library(
 		"assemble.go",
         "chunk.go",
 		"manifest.go",
+		"repository.go",
         "store.go",
     ],
     visibility = ["//visibility:public"],

@@ -17,6 +17,7 @@ package ttcchunk
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -289,5 +290,66 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	data[len(data)-1] ^= 1
 	if _, err := DecodeManifest(data, &id); err == nil {
 		t.Fatal("corrupt manifest passed content-address verification")
+	}
+}
+
+func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := testChunk()
+	source := make([]SourcePage, len(chunk.Pages))
+	for i, page := range chunk.Pages {
+		source[i] = SourcePage{
+			Binding: pgalloc.CapturedPageBinding{
+				OldOffset:  uint64(i) * hostarch.PageSize,
+				References: 1,
+				Page:       pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+				Version:    page.Version,
+				Chunk:      chunk.Logical,
+				Slot:       page.Slot,
+			},
+			Zero: page.Zero,
+			Data: page.Data,
+		}
+	}
+	objects, bindings, err := Assemble(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID, err := repository.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := manifest.Expand(); !reflect.DeepEqual(got, bindings) {
+		t.Fatalf("published manifest bindings differ: got=%+v want=%+v", got, bindings)
+	}
+	const branch = "feature/one@remote"
+	if err := repository.SetBranch(branch, manifestID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.Branch(branch); err != nil || got != manifestID {
+		t.Fatalf("Branch = %s, %v; want %s", got, err, manifestID)
+	}
+	emptyID, err := repository.Publish(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetBranch(branch, emptyID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.Branch(branch); err != nil || got != emptyID {
+		t.Fatalf("replaced Branch = %s, %v; want %s", got, err, emptyID)
+	}
+	if err := repository.DeleteBranch(branch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Branch(branch); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted Branch error = %v, want not-exist", err)
 	}
 }
