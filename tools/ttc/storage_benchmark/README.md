@@ -46,7 +46,8 @@ Use `--layouts` to run a subset, for example
 `--layouts=raw,pebble-4k-values-64k-block`.
 
 Compare immutable 64 KiB memory-hydration units in a directly ingested Pebble
-SST with a packed file using read-then-hole-punch reclamation:
+SST, one ordinary file per unit with unlink-on-load reclamation, and a packed
+file using read-then-hole-punch reclamation:
 
 ```shell
 go run ./hydration --dir=/tmp/ttc-hydration >hydration.json

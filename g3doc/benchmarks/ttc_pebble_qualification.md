@@ -226,16 +226,26 @@ The measured conclusion is therefore narrower than “use 64 KiB everywhere”:
 
 ## Dehydrated-memory benchmark
 
-Pebble is a better fit for dehydrated memory than for a mutable filesystem:
-snapshot contents are immutable, loading naturally transfers a coalesced range,
-and a fully consumed per-branch store can be removed as a unit. The `hydration`
-harness compares this use with TTC's packed snapshot-file model.
+Dehydrated memory is immutable and read-then-discard, so it does not require a
+general mutable blob database. The `hydration` harness compares three models:
+
+* TTC's packed snapshot file with hole-punch reclamation;
+* one ordinary host file per 64 KiB transfer unit, unlinked after loading; and
+* one directly ingested Pebble SST containing 64 KiB values.
 
 The packed-file baseline writes a 256 MiB stream in 64 KiB units and uses one
 `pread` plus `FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE` for each randomly
 consumed unit. Every 128 punches are followed by `fdatasync`. The host used for
 this benchmark does not support `FICLONERANGE`, so this measures TTC's byte-copy
 export fallback rather than its faster reflink path.
+
+The loose-file baseline places at most 1,024 chunk files in each shard
+directory. It retains the shard directory descriptors and uses `openat` and
+`unlinkat`, avoiding repeated full-path traversal. Construction closes all
+chunk files and uses one `syncfs` before external publication. This is an
+optimistic but valid durability strategy; in production it may also flush
+unrelated dirty data on the same filesystem. Every 128 consumed chunks, the
+benchmark synchronizes the shard directories containing unlinks.
 
 The optimized Pebble path writes one sorted external SST directly and ingests
 it into a new per-snapshot database. It does not put snapshot bytes through a
@@ -246,39 +256,59 @@ its existing resident-page bitmap, and the database directory is deleted when
 the last unit is consumed. This avoids per-key tombstones and compaction.
 
 The table contains medians of three full 256 MiB runs on the machine described
-above. One of the three runs had an unrelated storage-latency outlier, which is
-retained in the median calculation.
+above. The loose layout used 4,096 chunk files across four shard directories;
+the packed layout used one data file and Pebble used seven host files.
 
-| Operation | Packed file + hole punch | Pebble ingested 64 KiB values | Pebble relative to file |
+| Operation | Packed + punch | Loose 64 KiB files | Pebble 64 KiB values |
 | --- | ---: | ---: | ---: |
-| Build and durably publish | 1,052 MiB/s | 875 MiB/s | 16.8% slower |
-| Allocated after build | 256.00 MiB | 256.20 MiB | 0.08% more |
-| Sequential cold load | 216.6 MiB/s | 280.9 MiB/s | 29.7% faster |
-| Warm random load | 123k units/s | 48.9k units/s | 60.4% slower |
-| Warm random load, p50 | 7.82 us | 18.98 us | 2.43x latency |
-| Cold random load | 1,766 units/s | 1,722 units/s | 2.5% slower |
-| Cold random load, p50 | 733 us | 746 us | 1.8% latency overhead |
-| 16-worker cold random load | 20.4k units/s | 17.8k units/s | 12.9% slower |
-| 16-worker cold random load, p50 | 778 us | 803 us | 3.2% latency overhead |
-| 16-worker cold random load, p99 | 1.78 ms | 1.86 ms | 4.1% latency overhead |
-| Random load and discard, total | 1,187 units/s | 1,080 units/s | 9.0% slower |
-| Delete fully consumed store | 0.067 ms | 14.9 ms | both negligible at lifecycle scale |
+| Build and durably publish | 1,137 MiB/s | 592 MiB/s | 943 MiB/s |
+| Allocated after build | 256.00 MiB | 256.00 MiB | 256.20 MiB |
+| Sequential cold load | 219.9 MiB/s | 69.2 MiB/s | 280.4 MiB/s |
+| Warm random load | 128k units/s | 77.3k units/s | 58.0k units/s |
+| Warm random load, p50 | 7.73 us | 12.53 us | 18.65 us |
+| Cold random load | 1,785 units/s | 1,715 units/s | 1,673 units/s |
+| Cold random load, p50 | 748 us | 769 us | 778 us |
+| 16-worker cold random load | 20.6k units/s | 19.2k units/s | 18.0k units/s |
+| 16-worker cold random load, p50 | 776 us | 795 us | 804 us |
+| 16-worker cold random load, p99 | 1.60 ms | 1.60 ms | 1.70 ms |
+| Random load and discard, total | 1,145 units/s | 1,095 units/s | 1,075 units/s |
+| Delete fully consumed store | 0.070 ms | 1.59 ms | 12.8 ms |
 
-Hole punching returned space proportionally: allocated snapshot bytes were
-192, 128, 64, and 0 MiB after consuming 25%, 50%, 75%, and 100%. The immutable
-Pebble store remained about 256 MiB at every intermediate point and returned
-all space only when its directory was deleted. A separately tested tombstone
-per loaded key was worse: no proportional space was returned, it added synced
-delete-WAL traffic, and it required later compaction. TTC should not use that
-policy.
+Pebble decisively outperformed loose files for serialized bulk operations. Its
+snapshot construction was 59% faster and its sequential iterator was 4.1
+times as fast. Thousands of file creates and one open/close pair per chunk are
+real costs even when directory descriptors are cached.
 
-The result is acceptable for a first **memory-hydration-only** prototype:
+Pebble did not win the demand-paging path. Loose files had 33% higher warm
+random throughput, 2.5% higher single-worker cold throughput, and 6.6% higher
+16-worker cold throughput. At 16 workers, both layouts exceed 1 GiB/s of
+64 KiB payload, so a parallel prefetcher removes the loose layout's serialized
+sequential-read weakness.
 
-* build throughput and space amplification are acceptable;
-* cold fault latency, including concurrent faults, is close to the packed file;
-* sequential drain is faster;
-* warm random lookup is materially slower but remains tens of microseconds; and
-* losing proportional disk reclamation is the principal semantic cost.
+Hole punching and loose-file unlinking returned space proportionally: about
+192, 128, 64, and 0 MiB remained after consuming 25%, 50%, 75%, and 100%. The
+immutable Pebble store remained about 256 MiB at every intermediate point and
+returned all space only when its directory was deleted. A separately tested
+tombstone per loaded key was worse: no proportional space was returned, it
+added synced delete-WAL traffic, and it required later compaction.
+
+The loose layout is therefore the preferred first memory-hydration prototype.
+It has no embedded-database dependency, maps naturally to remotely addressable
+chunks, supports prompt reclamation, and matches or beats Pebble on the lazy
+fault path. Pebble remains a useful alternative when serialized construction
+or full sequential restoration dominates. The backend boundary should retain
+both possibilities until real TTC integration and distributed-network tests
+are complete.
+
+This preference is provisional at larger memory sizes. The 256 MiB test uses
+4,096 chunk inodes; 16 GiB would use 262,144. Host inode limits, directory
+metadata, NFS metadata RPCs, backup/scanning tools, and removal storms may make
+loose files worse even when individual faults are fast. Conversely, TTC's own
+remote page service can address and transfer the chunk objects without exposing
+their host directory operations to the receiving node. Both cases need scaled
+tests. The benchmark also models one snapshot; a real family must release a
+branch reference and unlink a chunk only when no dehydrated manifest still
+references it.
 
 This does not qualify Pebble for mutable rootfs or volume data. It also does not
 yet include state restoration, copying loaded bytes into `MemoryFile`, real
@@ -288,15 +318,16 @@ acceptance tests.
 
 ## Conclusion and gate
 
-Pebble passes the first synthetic functional gate for a memory-hydration-only
-prototype. Its use as a mutable rootfs or managed-volume store is postponed.
-It is **not yet selected as TTC's general production storage format**.
+Pebble passes the synthetic functional gate for memory hydration, but the
+simpler loose-file backend is the better first integration candidate. Pebble's
+use as mutable rootfs or managed-volume storage remains postponed. It is **not
+selected as TTC's general production storage format**.
 
-For the first prototype, ordinary SST values are the safer default. Pebble's
-experimental blob mode has a real write-amplification advantage under complete
-overwrite churn, but loses branch-read latency and steady-state disk space on
-this test. It should remain an optional experiment until real TTC workloads
-show that its lower write amplification matters more.
+If the Pebble backend is integrated later, ordinary SST values are the safer
+default. Pebble's experimental blob mode has a real write-amplification
+advantage under complete overwrite churn, but loses branch-read latency and
+steady-state disk space on this test. It should remain an optional experiment
+until real TTC workloads show that its lower write amplification matters more.
 
 Before adoption, the next gate must integrate the backend with TTC and measure:
 
@@ -306,6 +337,8 @@ Before adoption, the next gate must integrate the backend with TTC and measure:
 3. databases, package installation, browser trees, and agent workspaces;
 4. many small storage domains, including the WAL-recycler disk reserve;
 5. slow disks, NFS/shared filesystems where supported, ENOSPC, injected I/O
-   failures, and power-cut recovery; and
-6. a simple custom arena baseline, so Pebble is chosen against a relevant
-   alternative rather than in isolation.
+   failures, and power-cut recovery;
+6. loose 64 KiB files over local ext4/XFS, shared NFS, and TTC's remote page
+   transport, including injected metadata and network latency; and
+7. a simple custom arena baseline, so any final backend is chosen against a
+   relevant alternative rather than in isolation.

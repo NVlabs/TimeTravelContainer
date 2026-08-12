@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Binary hydration compares 64 KiB read-then-discard snapshots in Pebble with
-// a packed host file whose consumed ranges are reclaimed by hole punching.
+// a packed host file whose consumed ranges are reclaimed by hole punching and
+// a directory of 64 KiB files that are unlinked after loading.
 package main
 
 import (
@@ -65,6 +66,8 @@ type result struct {
 	Build                      measurement    `json:"build"`
 	InitialCompaction          measurement    `json:"initial_compaction,omitempty"`
 	AllocatedAfterBuild        int64          `json:"allocated_after_build"`
+	RegularFilesAfterBuild     int            `json:"regular_files_after_build"`
+	DirectoriesAfterBuild      int            `json:"directories_after_build"`
 	SequentialColdRead         measurement    `json:"sequential_64k_cold_read"`
 	WarmRandomRead             measurement    `json:"warm_random_64k_read"`
 	ColdRandomRead             measurement    `json:"cold_random_64k_read"`
@@ -111,6 +114,11 @@ func main() {
 		fatalf("packed file: %v", err)
 	}
 	r.Results = append(r.Results, fileResult)
+	looseResult, err := runLooseFiles(filepath.Join(*dir, "loose"), *chunks, *readOps, *batch)
+	if err != nil {
+		fatalf("loose files: %v", err)
+	}
+	r.Results = append(r.Results, looseResult)
 	if *pebbleBuild != "ingest" && *pebbleBuild != "nowal" {
 		fatalf("invalid --pebble-build %q", *pebbleBuild)
 	}
@@ -149,6 +157,7 @@ func runFile(dir string, chunks, readOps, batch int) (result, error) {
 	}
 	r.Build = throughput(time.Since(t0), chunks)
 	r.AllocatedAfterBuild = allocated(dir)
+	r.RegularFilesAfterBuild, r.DirectoriesAfterBuild = entryCounts(dir)
 	if err := dropFileCache(f); err != nil {
 		return r, err
 	}
@@ -216,6 +225,91 @@ func runFile(dir string, chunks, readOps, batch int) (result, error) {
 	return r, nil
 }
 
+// runLooseFiles models the simplest object-like snapshot: one ordinary host
+// file for every 64 KiB transfer unit. Directories contain at most 1024 files
+// so large snapshots do not create one unbounded host directory. Snapshot
+// construction uses one syncfs after all files are closed; this is durable but
+// may flush unrelated dirty data on the same host filesystem.
+func runLooseFiles(dir string, chunks, readOps, batch int) (result, error) {
+	r := result{Layout: "loose-64k-files"}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return r, err
+	}
+	for shard := 0; shard <= (chunks-1)/1024; shard++ {
+		if err := os.Mkdir(filepath.Join(dir, looseShardName(shard)), 0700); err != nil {
+			return r, err
+		}
+	}
+	store, err := openLooseStore(dir, chunks)
+	if err != nil {
+		return r, err
+	}
+	defer func() {
+		if store != nil {
+			store.close()
+		}
+	}()
+	buf := make([]byte, chunkSize)
+	t0 := time.Now()
+	for i := 0; i < chunks; i++ {
+		fill(buf, uint64(i+1))
+		if err := store.create(i, buf); err != nil {
+			return r, err
+		}
+	}
+	if err := unix.Syncfs(int(store.shards[0].Fd())); err != nil {
+		return r, err
+	}
+	r.Build = throughput(time.Since(t0), chunks)
+	r.AllocatedAfterBuild = allocated(dir)
+	r.RegularFilesAfterBuild, r.DirectoriesAfterBuild = entryCounts(dir)
+	if err := store.dropCaches(chunks); err != nil {
+		return r, err
+	}
+	r.SequentialColdRead, err = looseSequentialRead(store, chunks)
+	if err != nil {
+		return r, err
+	}
+	r.WarmRandomRead, err = looseRandomRead(store, chunks, readOps, 101)
+	if err != nil {
+		return r, err
+	}
+	if err := store.dropCaches(chunks); err != nil {
+		return r, err
+	}
+	r.ColdRandomRead, err = looseRandomRead(store, chunks, readOps, 202)
+	if err != nil {
+		return r, err
+	}
+	if err := store.dropCaches(chunks); err != nil {
+		return r, err
+	}
+	r.ColdConcurrentRead, err = looseConcurrentRead(store, chunks, readOps, 16, 252)
+	if err != nil {
+		return r, err
+	}
+	if err := store.dropCaches(chunks); err != nil {
+		return r, err
+	}
+	r.RandomConsumeTotal, r.RandomConsumeReadLatency, r.DiscardBatchLatency, r.Reclamation, err = looseConsume(store, dir, chunks, batch)
+	if err != nil {
+		return r, err
+	}
+	r.AllocatedBeforeCompaction = allocated(dir)
+	r.AllocatedAfterCompaction = r.AllocatedBeforeCompaction
+	if err := store.close(); err != nil {
+		return r, err
+	}
+	store = nil
+	t0 = time.Now()
+	if err := os.RemoveAll(dir); err != nil {
+		return r, err
+	}
+	r.WholeStoreRemoval = measurement{Seconds: time.Since(t0).Seconds()}
+	r.AllocatedAfterStoreRemoval = allocated(dir)
+	return r, nil
+}
+
 func runPebble(dir string, chunks, readOps, batchN int, buildMode, discardMode string) (result, error) {
 	r := result{Layout: "pebble-64k-values-" + buildMode + "-" + discardMode}
 	if buildMode == "ingest" {
@@ -246,6 +340,7 @@ func runPebble(dir string, chunks, readOps, batchN int, buildMode, discardMode s
 		}
 		r.Build = throughput(time.Since(t0), chunks)
 		r.AllocatedAfterBuild = allocated(dir)
+		r.RegularFilesAfterBuild, r.DirectoriesAfterBuild = entryCounts(dir)
 		if err := closePebble(db, cache); err != nil {
 			return r, err
 		}
@@ -290,6 +385,7 @@ func runPebble(dir string, chunks, readOps, batchN int, buildMode, discardMode s
 		}
 		r.InitialCompaction = measurement{Seconds: time.Since(t0).Seconds()}
 		r.AllocatedAfterBuild = allocated(dir)
+		r.RegularFilesAfterBuild, r.DirectoriesAfterBuild = entryCounts(dir)
 		if err := closePebble(db, cache); err != nil {
 			return r, err
 		}
@@ -428,6 +524,17 @@ func pebbleSequentialRead(db *pebble.DB, chunks int) (measurement, error) {
 	return throughput(time.Since(t0), chunks), nil
 }
 
+func looseSequentialRead(store *looseStore, chunks int) (measurement, error) {
+	buf := make([]byte, chunkSize)
+	t0 := time.Now()
+	for i := 0; i < chunks; i++ {
+		if err := store.read(i, buf); err != nil {
+			return measurement{}, err
+		}
+	}
+	return throughput(time.Since(t0), chunks), nil
+}
+
 func fileRandomRead(f *os.File, chunks, ops int, seed uint64) (measurement, error) {
 	rng := rand.New(rand.NewPCG(seed, seed^99))
 	buf := make([]byte, chunkSize)
@@ -464,6 +571,21 @@ func pebbleRandomRead(db *pebble.DB, chunks, ops int, seed uint64) (measurement,
 	return opMeasurement(time.Since(t0), ops, lats), nil
 }
 
+func looseRandomRead(store *looseStore, chunks, ops int, seed uint64) (measurement, error) {
+	rng := rand.New(rand.NewPCG(seed, seed^99))
+	dst := make([]byte, chunkSize)
+	lats := make([]time.Duration, 0, ops)
+	t0 := time.Now()
+	for i := 0; i < ops; i++ {
+		start := time.Now()
+		if err := store.read(rng.IntN(chunks), dst); err != nil {
+			return measurement{}, err
+		}
+		lats = append(lats, time.Since(start))
+	}
+	return opMeasurement(time.Since(t0), ops, lats), nil
+}
+
 func fileConcurrentRead(f *os.File, chunks, ops, workers int, seed uint64) (measurement, error) {
 	return concurrentRead(chunks, ops, workers, seed, func(chunk int, dst []byte) error {
 		_, err := f.ReadAt(dst, int64(chunk*chunkSize))
@@ -482,6 +604,12 @@ func pebbleConcurrentRead(db *pebble.DB, chunks, ops, workers int, seed uint64) 
 			return io.ErrUnexpectedEOF
 		}
 		return closer.Close()
+	})
+}
+
+func looseConcurrentRead(store *looseStore, chunks, ops, workers int, seed uint64) (measurement, error) {
+	return concurrentRead(chunks, ops, workers, seed, func(chunk int, dst []byte) error {
+		return store.read(chunk, dst)
 	})
 }
 
@@ -634,6 +762,128 @@ func pebbleConsumeWhole(db *pebble.DB, dir string, chunks int) (measurement, lat
 	return opMeasurement(time.Since(t0), chunks, nil), summarize(reads), points, nil
 }
 
+func looseConsume(store *looseStore, dir string, chunks, batch int) (measurement, latency, latency, []reclaimPoint, error) {
+	order := rand.New(rand.NewPCG(303, 404)).Perm(chunks)
+	dst := make([]byte, chunkSize)
+	reads := make([]time.Duration, 0, chunks)
+	syncs := make([]time.Duration, 0, (chunks+batch-1)/batch)
+	dirtyShards := make(map[int]struct{})
+	var points []reclaimPoint
+	nextPoint := 25
+	t0 := time.Now()
+	for i, chunk := range order {
+		start := time.Now()
+		if err := store.read(chunk, dst); err != nil {
+			return measurement{}, latency{}, latency{}, nil, err
+		}
+		reads = append(reads, time.Since(start))
+		if err := store.unlink(chunk); err != nil {
+			return measurement{}, latency{}, latency{}, nil, err
+		}
+		dirtyShards[chunk/1024] = struct{}{}
+		if (i+1)%batch == 0 || i+1 == chunks {
+			start = time.Now()
+			for shard := range dirtyShards {
+				if err := store.shards[shard].Sync(); err != nil {
+					return measurement{}, latency{}, latency{}, nil, err
+				}
+			}
+			syncs = append(syncs, time.Since(start))
+			clear(dirtyShards)
+		}
+		percent := (i + 1) * 100 / chunks
+		if percent >= nextPoint {
+			points = append(points, reclaimPoint{ConsumedPercent: nextPoint, AllocatedBytes: allocated(dir)})
+			nextPoint += 25
+		}
+	}
+	return opMeasurement(time.Since(t0), chunks, nil), summarize(reads), summarize(syncs), points, nil
+}
+
+type looseStore struct {
+	shards []*os.File
+}
+
+func openLooseStore(dir string, chunks int) (*looseStore, error) {
+	s := &looseStore{}
+	for shard := 0; shard <= (chunks-1)/1024; shard++ {
+		f, err := os.Open(filepath.Join(dir, looseShardName(shard)))
+		if err != nil {
+			s.close()
+			return nil, err
+		}
+		s.shards = append(s.shards, f)
+	}
+	return s, nil
+}
+
+func (s *looseStore) close() error {
+	var firstErr error
+	for _, f := range s.shards {
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (s *looseStore) create(chunk int, src []byte) error {
+	fd, err := unix.Openat(int(s.shards[chunk/1024].Fd()), looseFileName(chunk), unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), looseFileName(chunk))
+	_, writeErr := f.Write(src)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func (s *looseStore) read(chunk int, dst []byte) error {
+	fd, err := unix.Openat(int(s.shards[chunk/1024].Fd()), looseFileName(chunk), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), looseFileName(chunk))
+	_, readErr := io.ReadFull(f, dst)
+	closeErr := f.Close()
+	if readErr != nil {
+		return readErr
+	}
+	return closeErr
+}
+
+func (s *looseStore) unlink(chunk int) error {
+	return unix.Unlinkat(int(s.shards[chunk/1024].Fd()), looseFileName(chunk), 0)
+}
+
+func (s *looseStore) dropCaches(chunks int) error {
+	for i := 0; i < chunks; i++ {
+		fd, err := unix.Openat(int(s.shards[i/1024].Fd()), looseFileName(i), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		if err := unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED); err != nil {
+			unix.Close(fd)
+			return err
+		}
+		if err := unix.Close(fd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func looseShardName(shard int) string {
+	return fmt.Sprintf("%08x", shard)
+}
+
+func looseFileName(chunk int) string {
+	return fmt.Sprintf("%016x.page", chunk)
+}
+
 func key(i int) []byte {
 	b := make([]byte, 9)
 	b[0] = 'p'
@@ -681,6 +931,21 @@ func allocated(dir string) int64 {
 		return nil
 	})
 	return total
+}
+
+func entryCounts(dir string) (files, directories int) {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			directories++
+		} else {
+			files++
+		}
+		return nil
+	})
+	return files, directories
 }
 
 func dropFileCache(f *os.File) error {

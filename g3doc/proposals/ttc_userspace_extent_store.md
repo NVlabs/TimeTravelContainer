@@ -4,7 +4,8 @@
 
 Design exploration. No storage-format or runtime changes described here are
 implemented yet. The unified mutable-filesystem store is postponed. The active
-first scope is an immutable Pebble backend for dehydrated memory only.
+first scope is a simple immutable 64 KiB-file backend for dehydrated memory;
+Pebble remains a measured alternative.
 
 This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
@@ -44,21 +45,25 @@ storage engine is selected:
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-The first prototype is deliberately narrower: use Pebble v2 only for immutable
-dehydrated-memory snapshots, behind a small backend interface. Build a sorted
-external SST and ingest it directly, read 64 KiB transfer units without
-mutating the database, track resident 4 KiB pages in TTC's loader, and delete
-the per-snapshot database as a unit after it is fully consumed. Do not issue a
-Pebble tombstone for every loaded unit.
+The first prototype is deliberately narrower: store each immutable 64 KiB
+dehydrated-memory transfer unit in an ordinary host file. Put at most 1,024
+chunk files in each shard directory, retain directory descriptors, and use
+`openat`/`unlinkat` on the demand path. A successful load populates sixteen
+independently CoW 4 KiB memory pages, releases that manifest's reference, and
+unlinks the chunk only after no dehydrated manifest references it. The chunk
+name also provides a natural object identifier for remote reads.
 
-Synthetic qualification makes this a reasonable integration candidate, not a
-production-format decision. Against a packed file on a host without reflinks,
-Pebble's median build was 16.8% slower, cold single-fault latency was 1.8%
-higher, 16-worker cold-fault median latency was 3.2% higher, and sequential
-loading was 29.7% faster. Its principal cost is delayed space reclamation: a
-partially consumed database retains the complete snapshot allocation until the
-last unit is consumed and the database is removed. The packed-file backend can
-continue to be preferred where reflinks and hole punching are available.
+Pebble v2 remains behind the same narrow backend interface as a measured
+alternative. Its optimized form builds one sorted external SST, ingests it
+directly, and stays immutable during loading. Against loose files, Pebble's
+median build was 59% faster and its serialized sequential load was 4.1 times
+as fast. Loose files were 2.5% faster for single-worker cold faults and 6.6%
+faster with 16 workers, while returning disk space after every unlink. Pebble
+retains the complete allocation until the final unit is consumed and the
+database is removed. This makes loose files a better first integration for
+lazy and distributed hydration, while Pebble remains attractive for bulk
+restore. The packed-file backend can continue to be preferred where reflinks
+and hole punching are available.
 
 Pebble is not approved for rootfs or managed-volume contents. In particular,
 representing a mutable 64 KiB extent as one Pebble value retained only 0.39% of
@@ -86,27 +91,31 @@ The candidates investigated in August 2026 are:
 | [bbolt](https://github.com/etcd-io/bbolt) | Small, stable, pure-Go, mmap-backed transactional B+tree. | It has one writer and explicitly cannot truncate its database to return interior free pages to the host filesystem. |
 | [go-storethehash](https://github.com/ipld/go-storethehash) | Append-oriented primary storage and an on-disk hash index aimed at block stores. | Its documented primary-store compaction/free-list work is incomplete, so TTC would inherit the unfinished part it is trying to avoid writing. |
 
-### Prototype candidate: Pebble for dehydrated memory
+### Memory hydration candidates
 
-Phase 0 may prototype Pebble v2 as the physical backend for immutable
-dehydrated memory. Snapshot construction uses Pebble's public `sstable.Writer`
-and `DB.Ingest` APIs so the bulk contents do not pass through the WAL and
-memtable. TTC publishes its snapshot metadata only after ingestion succeeds;
-an interrupted unpublished build can be removed as a unit.
+Phase 0 should implement the loose 64 KiB-file backend first. Snapshot contents
+are written into an unpublished staging directory, synchronized, and published
+through TTC metadata. Interrupted unpublished construction can be removed as a
+unit. Large snapshots use bounded shard directories rather than one unbounded
+directory. Reads and unlinks operate relative to retained directory
+descriptors, and directory synchronization can batch consumption records.
 
-Use a per-snapshot keyspace containing versioned metadata and sorted
-`page/<stream-offset>` records. Each data record contains one 64 KiB transfer
-unit. Loading a record populates sixteen independently CoW 4 KiB memory pages;
-64 KiB is an I/O unit, not a memory CoW boundary. TTC's existing resident-page
-bitmap prevents repeated loads. The database remains immutable while readable
-and is removed only when no unloaded page still depends on it. Partial loading
-does not create tombstones or compact the database.
+If Pebble is enabled, snapshot construction uses its public `sstable.Writer`
+and `DB.Ingest` APIs so bulk contents do not pass through the WAL and memtable.
+Use sorted `page/<stream-offset>` records containing one 64 KiB transfer unit.
+The database remains immutable while readable and is removed only when no
+unloaded page still depends on it. Partial loading must not create tombstones
+or compact the database.
+
+For both backends, 64 KiB is an I/O unit, not a memory CoW boundary. Loading a
+unit populates sixteen independently CoW 4 KiB memory pages. TTC's existing
+resident-page bitmap prevents repeated loads.
 
 The benchmark and its limitations are recorded in
 [`g3doc/benchmarks/ttc_pebble_qualification.md`](../benchmarks/ttc_pebble_qualification.md).
 Real integration must still test guest-fault latency, state restoration,
 shared pages across dehydrated branches, loader leases, daemon crashes, and a
-crash between SST construction and TTC metadata publication.
+crash between backend construction and TTC metadata publication.
 
 ### Deferred general page and extent store
 
@@ -242,8 +251,9 @@ unrelated page through an ABA collision.
 ## Fallback physical arenas
 
 This section and **Tail-fill compaction** specify the custom backend retained
-for use only if the Phase 0 Pebble qualification fails. They are not additional
-layers to put beneath Pebble.
+for a future unified mutable store if simpler backends fail its qualification.
+They are not additional layers beneath the loose-file or Pebble hydration
+backends.
 
 ### Base layout
 
@@ -712,7 +722,27 @@ branch observe another branch's private write.
 
 ## Implementation plan
 
-### Phase 0: model and measurements
+### Immediate memory-hydration prototype
+
+* Define a narrow immutable snapshot backend with publish, 64 KiB load,
+  consume, metrics, and whole-snapshot removal operations.
+* Implement sharded loose chunk files with `openat`, `unlinkat`, batched
+  directory synchronization, and bounded descriptors.
+* Keep family-level chunk references outside branch ancestry so shared chunks
+  survive until the last dehydrated manifest releases them.
+* Keep 4 KiB resident and CoW accounting above the backend.
+* Exercise local and remote demand loading, concurrent prefetch, partial
+  rehydration, redehydration, crash recovery, and snapshot removal.
+* Retain the directly ingested Pebble implementation as an A/B backend only if
+  integration measurements justify its dependency and delayed reclamation.
+
+Exit criterion: lifecycle and crash tests pass, disk usage falls with consumed
+loose chunks, and real guest fault and dehydration times meet recorded gates.
+
+The following phases apply only if TTC later resumes the deferred unified
+mutable-filesystem store.
+
+### Deferred Phase 0: model and measurements
 
 * Add a pure-Go reference model for roots, page IDs, locations, generations,
   leases, relocation, and crash recovery.
@@ -734,7 +764,7 @@ branch observe another branch's private write.
 Exit criterion: invariants survive randomized crash points and one backend is
 selected by recorded acceptance gates rather than architectural resemblance.
 
-### Phase 1A: standalone logical engine on Pebble
+### Deferred Phase 1A: standalone logical engine on Pebble
 
 * Implement immutable page-map nodes, branch roots, memory manifests, leases,
   data generations, and reachability above `ChunkBackend`.
@@ -749,7 +779,7 @@ Exit criterion: a standalone stress test runs billions of modeled operations,
 reopens after injected crashes, always reproduces committed roots, and meets
 the latency and amplification gates.
 
-### Phase 1B: custom backend, only if Phase 1A fails
+### Deferred Phase 1B: custom backend, only if Phase 1A fails
 
 * Implement domain creation, dual superblocks, WAL, checkpoint, arena shards,
   stable page directory, free-range allocator, epochs, and checksums.
@@ -761,7 +791,7 @@ the latency and amplification gates.
 Exit criterion: the same Phase 1A suite passes and the measured failure that
 required replacing Pebble is eliminated without regressing the other gates.
 
-### Phase 2: dehydration page store
+### Deferred Phase 2: shared dehydration page store
 
 * Export durable memory into extent manifests instead of packed files.
 * Rehydrate through a backend-backed asynchronous reader and active lease.
@@ -772,7 +802,7 @@ required replacing Pebble is eliminated without regressing the other gates.
 Exit criterion: repeated dehydrate/rehydrate cycles do not amplify memory or
 disk usage when few pages change, and every branch can become process-free.
 
-### Phase 3: distributed memory integration
+### Deferred Phase 3: distributed shared-store integration
 
 * Publish shared-domain manifests to remote nodes.
 * Combine partial chunk publication with the existing network reader where
@@ -785,7 +815,7 @@ Exit criterion: source deletion and source-node shutdown are safe after
 manifest commit, and remote demand reads require no branch-specific snapshot
 file.
 
-### Phase 4: filesystem buffered I/O
+### Deferred Phase 4: filesystem buffered I/O
 
 * Add a new regular-file data-root field while retaining virtual inode and
   directory metadata.
@@ -797,7 +827,7 @@ file.
 Exit criterion: syscall and application suites pass without mmap, and first
 write cost is proportional to touched pages rather than guest file size.
 
-### Phase 5: filesystem mappings and live fork
+### Deferred Phase 5: filesystem mappings and live fork
 
 * Implement backing-range translations and pin tracking. With Pebble this may
   require a TTC page-cache file or memory object rather than exposing Pebble's
@@ -811,7 +841,7 @@ write cost is proportional to touched pages rather than guest file size.
 Exit criterion: database-style mmap workloads remain coherent across fork,
 and no writable translation can bypass page privatization.
 
-### Phase 6: rootfs and volume cutover
+### Deferred Phase 6: rootfs and volume cutover
 
 * Move rootfs upper and managed volumes to the extent driver.
 * Run old/new differential tests and crash tests against identical traces.
@@ -822,7 +852,7 @@ and no writable translation can bypass page privatization.
 This is a pre-release storage-format replacement, not a promise of automatic
 migration from the development object format.
 
-### Phase 7: optimization
+### Deferred Phase 7: optimization
 
 * Tune run coalescing, cache sizes, WAL group commit, allocator shards, and
   compaction thresholds.
