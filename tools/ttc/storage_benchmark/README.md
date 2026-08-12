@@ -45,6 +45,18 @@ go run ./chunk64 --dir=/tmp/ttc-chunk64 >chunk64.json
 Use `--layouts` to run a subset, for example
 `--layouts=raw,pebble-4k-values-64k-block`.
 
+Compare immutable 64 KiB memory-hydration units in a directly ingested Pebble
+SST with a packed file using read-then-hole-punch reclamation:
+
+```shell
+go run ./hydration --dir=/tmp/ttc-hydration >hydration.json
+```
+
+The default uses whole-store Pebble deletion after complete consumption. Use
+`--pebble-discard=tombstone` to reproduce the rejected per-key deletion policy,
+or `--pebble-build=nowal` to compare memtable/flush construction with direct SST
+ingestion.
+
 The commands remove the supplied database directory before starting. Do not
 point `--dir` at data that must be retained.
 

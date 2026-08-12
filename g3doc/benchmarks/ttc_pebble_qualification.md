@@ -224,11 +224,73 @@ The measured conclusion is therefore narrower than “use 64 KiB everywhere”:
    access. Intermediate 16 KiB and 32 KiB targets should be measured with real
    TTC workloads before choosing the default.
 
+## Dehydrated-memory benchmark
+
+Pebble is a better fit for dehydrated memory than for a mutable filesystem:
+snapshot contents are immutable, loading naturally transfers a coalesced range,
+and a fully consumed per-branch store can be removed as a unit. The `hydration`
+harness compares this use with TTC's packed snapshot-file model.
+
+The packed-file baseline writes a 256 MiB stream in 64 KiB units and uses one
+`pread` plus `FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE` for each randomly
+consumed unit. Every 128 punches are followed by `fdatasync`. The host used for
+this benchmark does not support `FICLONERANGE`, so this measures TTC's byte-copy
+export fallback rather than its faster reflink path.
+
+The optimized Pebble path writes one sorted external SST directly and ingests
+it into a new per-snapshot database. It does not put snapshot bytes through a
+WAL or memtable: the database remains unpublished until the SST is finished and
+durably ingested, and an interrupted unpublished build can be discarded. Each
+key contains one 64 KiB transfer unit. Rehydration only reads; the loader keeps
+its existing resident-page bitmap, and the database directory is deleted when
+the last unit is consumed. This avoids per-key tombstones and compaction.
+
+The table contains medians of three full 256 MiB runs on the machine described
+above. One of the three runs had an unrelated storage-latency outlier, which is
+retained in the median calculation.
+
+| Operation | Packed file + hole punch | Pebble ingested 64 KiB values | Pebble relative to file |
+| --- | ---: | ---: | ---: |
+| Build and durably publish | 1,052 MiB/s | 875 MiB/s | 16.8% slower |
+| Allocated after build | 256.00 MiB | 256.20 MiB | 0.08% more |
+| Sequential cold load | 216.6 MiB/s | 280.9 MiB/s | 29.7% faster |
+| Warm random load | 123k units/s | 48.9k units/s | 60.4% slower |
+| Warm random load, p50 | 7.82 us | 18.98 us | 2.43x latency |
+| Cold random load | 1,766 units/s | 1,722 units/s | 2.5% slower |
+| Cold random load, p50 | 733 us | 746 us | 1.8% latency overhead |
+| 16-worker cold random load | 20.4k units/s | 17.8k units/s | 12.9% slower |
+| 16-worker cold random load, p50 | 778 us | 803 us | 3.2% latency overhead |
+| 16-worker cold random load, p99 | 1.78 ms | 1.86 ms | 4.1% latency overhead |
+| Random load and discard, total | 1,187 units/s | 1,080 units/s | 9.0% slower |
+| Delete fully consumed store | 0.067 ms | 14.9 ms | both negligible at lifecycle scale |
+
+Hole punching returned space proportionally: allocated snapshot bytes were
+192, 128, 64, and 0 MiB after consuming 25%, 50%, 75%, and 100%. The immutable
+Pebble store remained about 256 MiB at every intermediate point and returned
+all space only when its directory was deleted. A separately tested tombstone
+per loaded key was worse: no proportional space was returned, it added synced
+delete-WAL traffic, and it required later compaction. TTC should not use that
+policy.
+
+The result is acceptable for a first **memory-hydration-only** prototype:
+
+* build throughput and space amplification are acceptable;
+* cold fault latency, including concurrent faults, is close to the packed file;
+* sequential drain is faster;
+* warm random lookup is materially slower but remains tens of microseconds; and
+* losing proportional disk reclamation is the principal semantic cost.
+
+This does not qualify Pebble for mutable rootfs or volume data. It also does not
+yet include state restoration, copying loaded bytes into `MemoryFile`, real
+guest page faults, shared pages across several dehydrated branches, or a crash
+between SST construction and TTC metadata publication. Those remain integration
+acceptance tests.
+
 ## Conclusion and gate
 
-Pebble passes the first synthetic functional gate and is suitable for a
-throwaway or replaceable TTC backend prototype. It is **not yet selected as
-TTC's production storage format**.
+Pebble passes the first synthetic functional gate for a memory-hydration-only
+prototype. Its use as a mutable rootfs or managed-volume store is postponed.
+It is **not yet selected as TTC's general production storage format**.
 
 For the first prototype, ordinary SST values are the safer default. Pebble's
 experimental blob mode has a real write-amplification advantage under complete

@@ -2,26 +2,28 @@
 
 ## Status
 
-Concrete design and implementation plan. No storage-format or runtime changes
-described here are implemented yet.
+Design exploration. No storage-format or runtime changes described here are
+implemented yet. The unified mutable-filesystem store is postponed. The active
+first scope is an immutable Pebble backend for dehydrated memory only.
 
-This proposal replaces TTC's eventual dependence on host `FICLONE`,
+This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
-page and extent store. It is intended to serve both:
+page and extent store for:
 
 * persistent rootfs and managed-volume regular-file contents; and
 * durable, remotely readable, and demand-loaded container memory.
 
 The existing inode, directory, branch-root, and metadata-journal model remains
-useful. The principal filesystem change is replacing one opaque host file per
-guest regular file with a logical page map. The principal memory change is
-replacing one packed snapshot file per dehydrated branch with manifests and
-shared page references.
+useful. However, efficiently implementing mutable filesystem semantics over a
+general blob database has enough lookup, partial-write, reclamation, and crash
+consistency costs that TTC will not attempt it in the next implementation
+phase. Rootfs and volume storage retain their current design while benchmarks
+and profiles identify a concrete need for replacement.
 
 ## Decision summary
 
-TTC should implement a logical database with these components, independently
-of which physical storage engine is selected:
+The following is the deferred unified design, independently of which physical
+storage engine is selected:
 
 1. A small transactional metadata store containing immutable trees, branch
    roots, memory manifests, active loader leases, and backend placement records
@@ -42,13 +44,27 @@ of which physical storage engine is selected:
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-The first prototype should use Pebble v2 behind a narrow backend interface.
-Synthetic TTC-shaped qualification found it promising but also exposed
-read/write tradeoffs and a potentially material per-database WAL-recycling
-reserve. It is therefore a benchmark-qualified prototype candidate, not yet
-the selected production storage format. A TTC-specific metadata checkpoint/WAL
-plus data arenas remains the comparison and fallback. Large payloads should
-not pass through a relational database's record and locking paths.
+The first prototype is deliberately narrower: use Pebble v2 only for immutable
+dehydrated-memory snapshots, behind a small backend interface. Build a sorted
+external SST and ingest it directly, read 64 KiB transfer units without
+mutating the database, track resident 4 KiB pages in TTC's loader, and delete
+the per-snapshot database as a unit after it is fully consumed. Do not issue a
+Pebble tombstone for every loaded unit.
+
+Synthetic qualification makes this a reasonable integration candidate, not a
+production-format decision. Against a packed file on a host without reflinks,
+Pebble's median build was 16.8% slower, cold single-fault latency was 1.8%
+higher, 16-worker cold-fault median latency was 3.2% higher, and sequential
+loading was 29.7% faster. Its principal cost is delayed space reclamation: a
+partially consumed database retains the complete snapshot allocation until the
+last unit is consumed and the database is removed. The packed-file backend can
+continue to be preferred where reflinks and hole punching are available.
+
+Pebble is not approved for rootfs or managed-volume contents. In particular,
+representing a mutable 64 KiB extent as one Pebble value retained only 0.39% of
+raw-file unsynced random 4 KiB write throughput in the synthetic benchmark. A
+TTC-specific metadata checkpoint/WAL plus data arenas remains a future
+comparison if the filesystem store is revisited.
 
 ## Existing storage-engine survey
 
@@ -70,14 +86,32 @@ The candidates investigated in August 2026 are:
 | [bbolt](https://github.com/etcd-io/bbolt) | Small, stable, pure-Go, mmap-backed transactional B+tree. | It has one writer and explicitly cannot truncate its database to return interior free pages to the host filesystem. |
 | [go-storethehash](https://github.com/ipld/go-storethehash) | Append-oriented primary storage and an on-disk hash index aimed at block stores. | Its documented primary-store compaction/free-list work is incomplete, so TTC would inherit the unfinished part it is trying to avoid writing. |
 
-### Prototype candidate: Pebble behind a TTC interface
+### Prototype candidate: Pebble for dehydrated memory
 
-Phase 0 may prototype Pebble v2 as the physical backend rather than import
-its `sstable/blob` subpackage directly. The latter exposes Pebble-specific
-object-storage and internal identifier types and is not an independent blob
-database API.
+Phase 0 may prototype Pebble v2 as the physical backend for immutable
+dehydrated memory. Snapshot construction uses Pebble's public `sstable.Writer`
+and `DB.Ingest` APIs so the bulk contents do not pass through the WAL and
+memtable. TTC publishes its snapshot metadata only after ingestion succeeds;
+an interrupted unpublished build can be removed as a unit.
 
-TTC records remain explicit and versioned:
+Use a per-snapshot keyspace containing versioned metadata and sorted
+`page/<stream-offset>` records. Each data record contains one 64 KiB transfer
+unit. Loading a record populates sixteen independently CoW 4 KiB memory pages;
+64 KiB is an I/O unit, not a memory CoW boundary. TTC's existing resident-page
+bitmap prevents repeated loads. The database remains immutable while readable
+and is removed only when no unloaded page still depends on it. Partial loading
+does not create tombstones or compact the database.
+
+The benchmark and its limitations are recorded in
+[`g3doc/benchmarks/ttc_pebble_qualification.md`](../benchmarks/ttc_pebble_qualification.md).
+Real integration must still test guest-fault latency, state restoration,
+shared pages across dehydrated branches, loader leases, daemon crashes, and a
+crash between SST construction and TTC metadata publication.
+
+### Deferred general page and extent store
+
+If TTC later revisits a unified mutable store, its records remain explicit and
+versioned:
 
 * `data/<PageID>` stores an immutable page or coalesced page run;
 * `node/<NodeID>` stores an immutable page-map, inode-map, or directory node;
@@ -93,7 +127,7 @@ deleted after TTC's reachability and lease rules permit it; Pebble then
 reclaims their physical space through compaction and deletion of obsolete
 table or blob files.
 
-The first synthetic qualification compared two Pebble modes:
+The earlier general-store synthetic qualification compared two Pebble modes:
 
 1. ordinary 4 KiB values in SSTs, which uses only established Pebble paths;
 2. v2 value separation with 4 KiB values in blob files, which may reduce data
