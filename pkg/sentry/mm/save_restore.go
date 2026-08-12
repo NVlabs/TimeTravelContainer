@@ -99,16 +99,31 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
 	if pgalloc.SparseRelocationFromContext(ctx) != nil {
-		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); {
 			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
 			if !ok {
 				panic(fmt.Sprintf("sparse PMA restore has unsupported file %T", pseg.ValuePtr().file))
 			}
-			relocated, err := pgalloc.RelocateMemoryFileRange(ctx, mf, pseg.fileRange())
+			runs, err := pgalloc.SparseRelocationFromContext(ctx).Runs(mf.ResourceID(), pseg.fileRange())
 			if err != nil {
 				panic(fmt.Sprintf("relocating sparse PMA %v: %v", pseg.Range(), err))
 			}
-			pseg.ValuePtr().off = relocated.Start
+			// A PMA segment is allowed to split at restore time: each child
+			// retains identical mapping semantics but names one contiguous run
+			// in the family MemoryFile. This is required when adjacent source
+			// pages reuse independently resident sparse chunks.
+			current := pseg
+			for i, relocated := range runs {
+				if i+1 < len(runs) {
+					split := current.Start() + hostarch.Addr(relocated.Length())
+					left, right := mm.pmas.Split(current, split)
+					left.ValuePtr().off = relocated.Start
+					current = right
+				} else {
+					current.ValuePtr().off = relocated.Start
+				}
+			}
+			pseg = current.NextSegment()
 		}
 	}
 	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {

@@ -350,7 +350,7 @@ func TestDehydrationPublishesSparseBranchGraph(t *testing.T) {
 		parent.Release()
 		t.Fatal(err)
 	}
-	manifestID, err := image.PublishSparse(repository, "sparse-dehydrated")
+	manifestID, err := image.PublishSparse(repository)
 	if err != nil {
 		image.Close()
 		parent.Release()
@@ -563,7 +563,7 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 		parent.Release()
 		t.Fatal(err)
 	}
-	manifestID, err := capture.PublishSparse(repository, "sparse")
+	manifestID, err := capture.PublishSparse(repository)
 	if err != nil {
 		capture.Close()
 		parent.Release()

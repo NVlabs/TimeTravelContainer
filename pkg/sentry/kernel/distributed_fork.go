@@ -69,12 +69,12 @@ type DistributedForkCapture struct {
 	FilesystemResources vfs.LiveForkFilesystemResources
 }
 
-// PublishSparse durably publishes this capture as branch in repository. Page
-// reservations are released only after objects, manifest, and mutable branch
-// root are all durable.
-func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryRepository, branch string) (ttcchunk.ManifestID, error) {
-	if c == nil || repository == nil || branch == "" || c.SparseSnapshot == nil || len(c.SparseSnapshots) != 0 {
-		return ttcchunk.ManifestID{}, fmt.Errorf("sparse publication requires one live snapshot and branch")
+// PublishSparse durably publishes this capture in repository. Page
+// reservations are released only after all objects and the manifest are
+// durable; the coordinator subsequently installs the mutable branch root.
+func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryRepository) (ttcchunk.ManifestID, error) {
+	if c == nil || repository == nil || c.SparseSnapshot == nil || len(c.SparseSnapshots) != 0 {
+		return ttcchunk.ManifestID{}, fmt.Errorf("sparse publication requires one live snapshot")
 	}
 	objects, bindings, err := ttcchunk.ReadSnapshot(c.SparseSnapshot, c.MemoryBindings)
 	if err != nil {
@@ -82,9 +82,6 @@ func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryReposi
 	}
 	manifestID, err := repository.Publish(objects, bindings)
 	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	if err := repository.SetBranch(branch, manifestID); err != nil {
 		return ttcchunk.ManifestID{}, err
 	}
 	if err := c.SparseSnapshot.Close(); err != nil {

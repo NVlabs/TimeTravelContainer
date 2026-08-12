@@ -1831,10 +1831,6 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 		return nil, fmt.Errorf("branch %q is not available for dehydration export", args.ID)
 	}
 	image := b.dehydration.image
-	filesystemBranch := b.filesystemBranch
-	if filesystemBranch == "" {
-		filesystemBranch = f.volumeBranchID(b.id)
-	}
 	f.mu.Unlock()
 	if !args.Sparse {
 		return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
@@ -1847,7 +1843,7 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 		return nil, fmt.Errorf("opening sparse memory repository: %w", err)
 	}
 	defer repository.Close()
-	manifest, err := image.PublishSparse(repository, filesystemBranch)
+	manifest, err := image.PublishSparse(repository)
 	if err != nil {
 		return nil, err
 	}

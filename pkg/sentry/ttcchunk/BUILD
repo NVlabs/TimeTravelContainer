@@ -10,6 +10,7 @@ go_library(
     srcs = [
 		"assemble.go",
         "chunk.go",
+		"donated.go",
 		"install.go",
 		"lifecycle.go",
 		"manifest.go",

@@ -567,6 +567,40 @@ func publishLifecycleManifest(t *testing.T, repository *MemoryRepository, fill b
 	return id
 }
 
+func TestDonatedRepositoryPublishesAndReadsRelativeToFD(t *testing.T) {
+	root := t.TempDir()
+	owner, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	donated, err := OpenMemoryRepositoryFD(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, donated, 0x42)
+	loaded, err := donated.LoadManifest(manifest)
+	if err != nil || len(loaded.Runs) != 1 {
+		t.Fatalf("donated LoadManifest: runs=%d err=%v", len(loaded.Runs), err)
+	}
+	if _, err := donated.chunks.Get(loaded.Runs[0].Object); err != nil {
+		t.Fatalf("donated chunk Get: %v", err)
+	}
+	if err := donated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.SetBranch("branch", manifest); err != nil {
+		t.Fatalf("rooting donated publication: %v", err)
+	}
+	if got, err := owner.Branch("branch"); err != nil || got != manifest {
+		t.Fatalf("owner branch=(%v, %v), want %v", got, err, manifest)
+	}
+}
+
 func TestRepositoryLeaseProtectsThenReclaimsManifest(t *testing.T) {
 	repository, err := OpenMemoryRepository(t.TempDir())
 	if err != nil {

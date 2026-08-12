@@ -58,13 +58,16 @@ func OpenMemoryRepositoryFD(dir *os.File) (*MemoryRepository, error) {
 		return nil, err
 	}
 	owned := os.NewFile(uintptr(dup), "ttc-memory-repository")
-	repository, err := OpenMemoryRepository(fmt.Sprintf("/proc/self/fd/%d", dup))
-	if err != nil {
-		owned.Close()
-		return nil, err
+	repository := &MemoryRepository{rootFD: owned}
+	repository.chunks = &Store{repository: repository}
+	for _, name := range []string{"chunks", "manifests", "branches", "leases", "transactions", "trash"} {
+		opened, err := openDirRelative(dup, name)
+		if err != nil {
+			owned.Close()
+			return nil, fmt.Errorf("opening donated TTC memory repository %s directory: %w", name, err)
+		}
+		opened.Close()
 	}
-	repository.rootFD = owned
-	repository.chunks.repository = repository
 	return repository, nil
 }
 
@@ -180,6 +183,9 @@ func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (
 	for id := range needed {
 		objectIDs = append(objectIDs, id)
 	}
+	if r.rootFD != nil {
+		return r.publishDonated(objects, needed, objectIDs, manifestData, manifestID)
+	}
 	txnPath, err := r.beginTransaction(manifestID, objectIDs)
 	if err != nil {
 		return ManifestID{}, fmt.Errorf("beginning memory publication: %w", err)
@@ -247,6 +253,14 @@ func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (
 
 // LoadManifest verifies and loads an immutable manifest.
 func (r *MemoryRepository) LoadManifest(id ManifestID) (Manifest, error) {
+	if r.rootFD != nil {
+		name := id.String()
+		data, err := readFileRelative(int(r.rootFD.Fd()), "manifests/"+name[:4]+"/"+name+".manifest")
+		if err != nil {
+			return Manifest{}, err
+		}
+		return DecodeManifest(data, &id)
+	}
 	_, path := r.manifestPath(id)
 	data, err := os.ReadFile(path)
 	if err != nil {

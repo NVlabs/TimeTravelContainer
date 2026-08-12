@@ -8823,6 +8823,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
 			return errors.New("sparse dehydration export returned an empty manifest ID")
 		}
+		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
+			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
+		}
 		capture.SparseManifest = exportInfo.Manifest
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)

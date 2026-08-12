@@ -16,7 +16,6 @@ package pgalloc
 
 import (
 	"fmt"
-	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -228,9 +227,6 @@ func (r *SparseRelocation) Runs(resourceID checkpoint.ResourceID, old memmap.Fil
 // with a loader before restored state can access them.
 func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*SparseChunkInstallation, error) {
 	ordered := append([]SparseChunkInstall(nil), installs...)
-	sort.Slice(ordered, func(i, j int) bool {
-		return string(ordered[i].Object[:]) < string(ordered[j].Object[:])
-	})
 	newRanges := make(map[SparseChunkObjectID]memmap.FileRange)
 	installation := &SparseChunkInstallation{mf: f, newRanges: newRanges}
 	rollback := func() {

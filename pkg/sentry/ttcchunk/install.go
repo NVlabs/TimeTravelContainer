@@ -114,8 +114,26 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 		}
 		objects[run.Object] = chunk
 	}
+	objectIDs := make([]ID, 0, len(objects))
+	firstOldOffset := make(map[ID]uint64, len(objects))
+	for object := range objects {
+		objectIDs = append(objectIDs, object)
+		firstOldOffset[object] = ^uint64(0)
+	}
+	for _, run := range manifest.Runs {
+		if run.OldOffset < firstOldOffset[run.Object] {
+			firstOldOffset[run.Object] = run.OldOffset
+		}
+	}
+	sort.Slice(objectIDs, func(i, j int) bool {
+		if firstOldOffset[objectIDs[i]] != firstOldOffset[objectIDs[j]] {
+			return firstOldOffset[objectIDs[i]] < firstOldOffset[objectIDs[j]]
+		}
+		return objectIDs[i].String() < objectIDs[j].String()
+	})
 	installs := make([]pgalloc.SparseChunkInstall, 0, len(objects))
-	for object, chunk := range objects {
+	for _, object := range objectIDs {
+		chunk := objects[object]
 		pagesBySlot := make(map[uint8]Page, len(chunk.Pages))
 		for _, page := range chunk.Pages {
 			pagesBySlot[page.Slot] = page
@@ -167,7 +185,7 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 			}
 		}
 	}
-	objectIDs := make([]ID, 0, len(newRanges))
+	objectIDs = make([]ID, 0, len(newRanges))
 	for object := range newRanges {
 		objectIDs = append(objectIDs, ID(object))
 	}

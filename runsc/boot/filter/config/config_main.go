@@ -506,6 +506,13 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
+		unix.SYS_LINKAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(0),
+		},
 		archFstatAtSysNo(): seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},

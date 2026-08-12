@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
 // Store is an immutable content-addressed loose chunk store. The first two ID
@@ -88,6 +90,10 @@ func (s *Store) PutObject(object Object) error {
 		return fmt.Errorf("TTC memory object %s has logical coordinate %+v, want %+v", object.ID, decoded.Logical, object.Logical)
 	}
 	data, id := object.Data, object.ID
+	if s.repository != nil && s.repository.rootFD != nil {
+		name := id.String()
+		return writeImmutableRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4], name+".chunk", data)
+	}
 	dir, path := s.path(id)
 	if err := os.Mkdir(dir, 0700); err != nil {
 		if !errors.Is(err, os.ErrExist) {
@@ -133,6 +139,15 @@ func (s *Store) PutObject(object Object) error {
 
 // Get verifies and decodes id.
 func (s *Store) Get(id ID) (Chunk, error) {
+	if s.repository != nil && s.repository.rootFD != nil {
+		name := id.String()
+		file, err := openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
+		if err != nil {
+			return Chunk{}, err
+		}
+		defer file.Close()
+		return Read(file, &id)
+	}
 	_, path := s.path(id)
 	file, err := os.Open(path)
 	if err != nil {
@@ -145,6 +160,22 @@ func (s *Store) Get(id ID) (Chunk, error) {
 // Contains reports whether id has a regular immutable object file. Payload
 // integrity is verified by Get/Open when the object is actually consumed.
 func (s *Store) Contains(id ID) error {
+	if s.repository != nil && s.repository.rootFD != nil {
+		name := id.String()
+		file, err := openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("TTC memory chunk %s is not a regular file", id)
+		}
+		return nil
+	}
 	_, path := s.path(id)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -158,8 +189,15 @@ func (s *Store) Contains(id ID) error {
 
 // Open returns the immutable encoded chunk after verifying its content ID.
 func (s *Store) Open(id ID) (*os.File, error) {
-	_, path := s.path(id)
-	file, err := os.Open(path)
+	var file *os.File
+	var err error
+	if s.repository != nil && s.repository.rootFD != nil {
+		name := id.String()
+		file, err = openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
+	} else {
+		_, path := s.path(id)
+		file, err = os.Open(path)
+	}
 	if err != nil {
 		return nil, err
 	}

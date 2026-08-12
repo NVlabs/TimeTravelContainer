@@ -333,9 +333,10 @@ func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
 }
 
 // PublishSparse persists the exact branch-reachable memory graph as immutable
-// 1 MiB objects and atomically installs branch as its durable root.
-func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository, branch string) (ttcchunk.ManifestID, error) {
-	if d == nil || d.consumed || d.SparseSnapshot == nil || repository == nil || branch == "" {
+// 1 MiB objects. The coordinator installs the returned manifest as the durable
+// branch root after it has committed the corresponding control metadata.
+func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository) (ttcchunk.ManifestID, error) {
+	if d == nil || d.consumed || d.SparseSnapshot == nil || repository == nil {
 		return ttcchunk.ManifestID{}, errors.New("sparse dehydration publication is unavailable")
 	}
 	objects, bindings, err := ttcchunk.ReadSnapshot(d.SparseSnapshot, d.SparseBindings)
@@ -344,9 +345,6 @@ func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository
 	}
 	manifest, err := repository.Publish(objects, bindings)
 	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	if err := repository.SetBranch(branch, manifest); err != nil {
 		return ttcchunk.ManifestID{}, err
 	}
 	if err := d.SparseSnapshot.Close(); err != nil {
