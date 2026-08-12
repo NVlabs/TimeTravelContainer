@@ -1110,6 +1110,74 @@ func TestTCPPushPoliciesWithoutSourceWrites(t *testing.T) {
 	}
 }
 
+func TestTCPAtomicLogicalChunkEagerPush(t *testing.T) {
+	const pageCount = 2 * pgalloc.SparseChunkBytes / hostarch.PageSize
+	source, sourceFR, _ := newTCPTestMemoryFile(t, pageCount)
+	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyTCPTestMemoryFile(t)
+	if err := pgalloc.ImportMemoryFileMetadataForRemote(contexttest.Context(t), target, allocator); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		target.DecRef(sourceFR)
+		target.Destroy()
+	})
+	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 2)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := testSnapshotToken()
+	receiver, err := NewTCPPushReceiver(listener, token, pages, pgalloc.SparseChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- receiver.Serve() }()
+	sender, err := StartTCPPushSenderWithOpts(listener.Addr().String(), token, snapshot, TCPPushSenderOpts{
+		MaxPush: pgalloc.SparseChunkBytes, Timeout: time.Second, RetryLimit: 2,
+		Policy: TCPPushEagerDrain, ScanInterval: time.Millisecond, AtomicLogicalChunks: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for sender.BytesPushed() != sourceFR.Length() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if err := sender.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sender.BytesPushed(); got != sourceFR.Length() {
+		installed, skipped := receiver.Stats()
+		t.Fatalf("atomic sender pushed %d bytes, want %d; sender=%+v receiver=%d/%d snapshot=%+v loader=%+v", got, sourceFR.Length(), sender.Stats(), installed, skipped, snapshot.Stats(), pages.Stats())
+	}
+	if installed, skipped := receiver.Stats(); installed != sourceFR.Length() || skipped != 0 {
+		t.Fatalf("atomic receiver installed=%d skipped=%d", installed, skipped)
+	}
+	receiver.Close()
+	if err := <-receiverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTCPPushSkipsRangeOwnedByConcurrentPull(t *testing.T) {
 	source, sourceFR, _ := newTCPTestMemoryFile(t, 1)
 	allocator, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(contexttest.Context(t), source)

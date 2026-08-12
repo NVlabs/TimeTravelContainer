@@ -592,6 +592,9 @@ func TestLogicalChunkPushInstallsWholeChunkAtomically(t *testing.T) {
 	if result, err := pages.TryInstallRemotePagesState(0, want[:SparseChunkBytes]); err != nil || result != RemotePageInstallResolved {
 		t.Fatalf("repeated logical push result=%v err=%v, want resolved", result, err)
 	}
+	if result, err := pages.TryInstallRemotePagesState(SparseChunkBytes, want[SparseChunkBytes:]); err != nil || result != RemotePageInstallInstalled {
+		t.Fatalf("second logical push result=%v err=%v, want installed", result, err)
+	}
 }
 
 func TestRemoteSnapshotExpandsAtomicPushToLogicalChunk(t *testing.T) {

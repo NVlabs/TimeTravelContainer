@@ -2698,7 +2698,7 @@ func (aplUnloadedSetFunctions) ClearValue(ul *aplUnloadedInfo) {
 }
 
 func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, fr2 memmap.FileRange, ul2 aplUnloadedInfo) (aplUnloadedInfo, bool) {
-	if ul1.off+fr1.Length() != ul2.off {
+	if ul1.off+fr1.Length() != ul2.off || ul1.logicalChunk != ul2.logicalChunk {
 		return aplUnloadedInfo{}, false
 	}
 	if ul1.started || ul2.started || len(ul1.waiters) != 0 || len(ul2.waiters) != 0 {
@@ -2712,8 +2712,9 @@ func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, 
 
 func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, splitAt uint64) (aplUnloadedInfo, aplUnloadedInfo) {
 	ul2 := aplUnloadedInfo{
-		off:     ul.off + (splitAt - fr.Start),
-		started: ul.started,
+		off:          ul.off + (splitAt - fr.Start),
+		started:      ul.started,
+		logicalChunk: ul.logicalChunk,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be
