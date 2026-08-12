@@ -349,6 +349,9 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	if got, err := repository.Branch(branch); err != nil || got != manifestID {
 		t.Fatalf("Branch = %s, %v; want %s", got, err, manifestID)
 	}
+	if roots, err := repository.ListBranches(); err != nil || len(roots) != 1 || roots[branch] != manifestID {
+		t.Fatalf("ListBranches = %+v, %v; want %q=%s", roots, err, branch, manifestID)
+	}
 	emptyID, err := repository.Publish(nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -364,6 +367,9 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	}
 	if _, err := repository.Branch(branch); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("deleted Branch error = %v, want not-exist", err)
+	}
+	if roots, err := repository.ListBranches(); err != nil || len(roots) != 0 {
+		t.Fatalf("ListBranches after delete = %+v, %v; want empty", roots, err)
 	}
 }
 

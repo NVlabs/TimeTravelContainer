@@ -2247,6 +2247,10 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			}
 		}
 	}
+	// A crash can strand a cluster memory root between immutable publication
+	// and target metadata ownership. Reconcile only after runtime/container
+	// state has been refreshed, and fail conservatively inside the helper.
+	_ = backend.reconcileClusterSparseMemoryRoots()
 	s.reconciled[key] = true
 }
 

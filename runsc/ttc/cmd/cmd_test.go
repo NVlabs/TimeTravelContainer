@@ -583,6 +583,97 @@ func TestReleaseDistributedSparseRoot(t *testing.T) {
 	}
 }
 
+func TestReconcileClusterSparseMemoryRoots(t *testing.T) {
+	dataRoot := t.TempDir()
+	relative := filepath.Join("cluster", "memory-chunks")
+	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.Publish(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"referenced", "orphaned"} {
+		if err := repository.SetBranch(branch, manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	containerDir := filepath.Join(dataRoot, "containers", "container-id")
+	if err := os.MkdirAll(containerDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(dataRoot, "bundles", "container-id")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID:                          "container-id",
+		Name:                        "container",
+		BundleDir:                   bundleDir,
+		DistributedSparseRepository: relative,
+		DistributedSparseBranch:     "referenced",
+	}
+	encoded, err := json.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &runtimeBackend{dataRoot: dataRoot}
+	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := repository.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots["referenced"] != manifest {
+		t.Fatalf("roots after reconciliation = %+v, want referenced=%s", roots, manifest)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	info.DistributedSparseRepository = ""
+	info.DistributedSparseBranch = ""
+	encoded, err = json.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	roots, err = repository.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("roots after releasing final reference = %+v, want empty", roots)
+	}
+}
+
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer

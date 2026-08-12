@@ -1043,6 +1043,67 @@ func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, bra
 	}
 }
 
+// reconcileClusterSparseMemoryRoots removes branch pointers left behind when
+// a daemon dies after publishing a sparse handoff but before target metadata
+// records ownership. Container records are authoritative after Prepare;
+// nonterminal transaction identities protect the narrow pre-Prepare window.
+func (b *runtimeBackend) reconcileClusterSparseMemoryRoots() error {
+	if b == nil || b.dataRoot == "" {
+		return nil
+	}
+	const repositoryRelative = "cluster/memory-chunks"
+	repositoryPath := filepath.Join(b.dataRoot, repositoryRelative)
+	if _, err := os.Stat(repositoryPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+	if err != nil {
+		return err
+	}
+	defer repository.Close()
+	branches, err := repository.ListBranches()
+	if err != nil {
+		return err
+	}
+	keep := make(map[string]struct{})
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return err
+	}
+	for _, container := range containers {
+		if filepath.Clean(container.DistributedSparseRepository) == repositoryRelative && container.DistributedSparseBranch != "" {
+			keep[container.DistributedSparseBranch] = struct{}{}
+		}
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return err
+	}
+	records, err := transactions.List()
+	if err != nil {
+		return err
+	}
+	for i := range records {
+		if records[i].Terminal() {
+			continue
+		}
+		keep[ttcvolume.ScopedBranchID(records[i].Identity.SourceContainer, records[i].Identity.TransactionID)] = struct{}{}
+	}
+	for branch := range branches {
+		if _, ok := keep[branch]; ok {
+			continue
+		}
+		if err := repository.DeleteBranch(branch); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("removing orphaned cluster memory root %q: %w", branch, err)
+		}
+	}
+	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
+	return err
+}
+
 func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
 	defer relay.Close()
 	ticker := time.NewTicker(500 * time.Millisecond)

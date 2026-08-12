@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -445,6 +446,46 @@ func (r *MemoryRepository) Branch(branch string) (ManifestID, error) {
 		return ManifestID{}, fmt.Errorf("branch %q references unavailable manifest %s: %w", branch, id, err)
 	}
 	return id, nil
+}
+
+// ListBranches returns a detached snapshot of every durable branch root.
+// Donated repositories are intentionally excluded: lifecycle reconciliation
+// belongs to ttcd, which opens the shared repository by path.
+func (r *MemoryRepository) ListBranches() (map[string]ManifestID, error) {
+	if r == nil || r.rootFD != nil {
+		return nil, errors.New("listing a donated TTC memory repository is unsupported")
+	}
+	entries, err := os.ReadDir(r.branchRoot)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]ManifestID, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".branch-") {
+			continue
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".root") {
+			return nil, fmt.Errorf("unexpected TTC memory branch entry %q", entry.Name())
+		}
+		encoded := strings.TrimSuffix(entry.Name(), ".root")
+		decoded, err := hex.DecodeString(encoded)
+		if err != nil || len(decoded) == 0 {
+			return nil, fmt.Errorf("invalid TTC memory branch entry %q", entry.Name())
+		}
+		data, err := os.ReadFile(filepath.Join(r.branchRoot, entry.Name()))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		manifest, err := decodeBranchPointer(data)
+		if err != nil {
+			return nil, fmt.Errorf("reading TTC memory branch %q: %w", decoded, err)
+		}
+		result[string(decoded)] = manifest
+	}
+	return result, nil
 }
 
 // DeleteBranch durably removes a branch root. Immutable reclamation is a
