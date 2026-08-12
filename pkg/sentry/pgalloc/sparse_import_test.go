@@ -138,3 +138,33 @@ func TestSparseReferenceTransactionCommitAndAbort(t *testing.T) {
 		t.Fatal("released graph reference did not leave the cache reference")
 	}
 }
+
+func TestReclaimUnusedSparseChunks(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	install := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	resident, ok := mf.SparseChunkRange(install.Object)
+	if !ok {
+		t.Fatal("installed chunk is not resident")
+	}
+	page := install.Pages[0]
+	pageRange := memmap.FileRange{Start: resident.Start + uint64(page.Slot)*hostarch.PageSize, End: resident.Start + uint64(page.Slot+1)*hostarch.PageSize}
+	mf.IncRef(pageRange, 0)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 0 {
+		t.Fatalf("reclaimed %d chunks while a branch reference remained", got)
+	}
+	mf.DecRef(pageRange)
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d chunks, want 1", got)
+	}
+	if _, ok := mf.SparseChunkRange(install.Object); ok {
+		t.Fatal("reclaimed chunk remains in residency map")
+	}
+}

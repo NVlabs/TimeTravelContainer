@@ -2143,7 +2143,11 @@ func (f *SandboxFamily) Destroy(id string) error {
 	}
 	b.k.WaitExited()
 	b.controlOps.Wait()
+	familyMF := b.k.MemoryFile()
+	familyMF.IncOwner()
 	b.k.Release()
+	familyMF.ReclaimUnusedSparseChunks()
+	familyMF.Destroy()
 	if f.forgetFilesystemBranch != nil {
 		f.forgetFilesystemBranch(b.filesystemBranch)
 	}

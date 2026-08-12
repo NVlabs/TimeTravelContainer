@@ -316,3 +316,44 @@ func (f *MemoryFile) SparseChunkRange(object SparseChunkObjectID) (memmap.FileRa
 	chunk, ok := f.sparseChunks[object]
 	return chunk.Range, ok
 }
+
+// ReclaimUnusedSparseChunks releases residency units whose cache reference is
+// their only remaining reference. It returns the number of units released.
+// Reclamation is skipped while any sparse loader is attached: a loader may
+// still be filling a range on behalf of a branch that is concurrently exiting.
+func (f *MemoryFile) ReclaimUnusedSparseChunks() int {
+	f.sparseLoadMu.Lock()
+	defer f.sparseLoadMu.Unlock()
+	if loads := f.sparseAsyncLoads.Load(); loads != nil && len(*loads) != 0 {
+		return 0
+	}
+
+	var release []memmap.FileRange
+	f.mu.Lock()
+	for object, resident := range f.sparseChunks {
+		unique := true
+		f.forEachChunk(resident.Range, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			unfree := &f.unfreeSmall
+			if chunk.huge {
+				unfree = &f.unfreeHuge
+			}
+			unfree.VisitFullRange(chunkFR, func(ufseg unfreeIterator) bool {
+				if ufseg.ValuePtr().refs != 1 {
+					unique = false
+					return false
+				}
+				return true
+			})
+			return unique
+		})
+		if unique {
+			delete(f.sparseChunks, object)
+			release = append(release, resident.Range)
+		}
+	}
+	f.mu.Unlock()
+	for _, fr := range release {
+		f.DecRef(fr)
+	}
+	return len(release)
+}
