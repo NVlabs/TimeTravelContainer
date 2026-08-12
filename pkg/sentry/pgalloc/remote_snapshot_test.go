@@ -498,6 +498,66 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
+	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
+	target, targetFR := newRemoteTestMemoryFile(t, pageCount)
+	want := make([]byte, targetFR.Length())
+	for i := range want {
+		want[i] = byte(i*19 + 3)
+	}
+	reader := stateio.NewIOReader(bytes.NewReader(want), SparseChunkBytes, int(pageCount), 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := make([]RemoteLoadRange, pageCount)
+	for i := uint64(0); i < pageCount; i++ {
+		loads[i] = RemoteLoadRange{
+			Target:       memmap.FileRange{Start: targetFR.Start + i*hostarch.PageSize, End: targetFR.Start + (i+1)*hostarch.PageSize},
+			StreamOffset: i * hostarch.PageSize,
+		}
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	if got := target.AsyncLoadingMapUnit(); got != hostarch.PageSize {
+		t.Fatalf("logical chunk map unit=%d, want one page for discontiguous-safe mappings", got)
+	}
+	fault := memmap.FileRange{Start: targetFR.Start + 137*hostarch.PageSize, End: targetFR.Start + 138*hostarch.PageSize}
+	mapped, err := target.MapInternal(fault, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != hostarch.PageSize {
+		t.Fatalf("copy faulted page: n=%d err=%v", n, err)
+	}
+	wantStart := uint64(137) * hostarch.PageSize
+	if !bytes.Equal(got, want[wantStart:wantStart+hostarch.PageSize]) {
+		t.Fatal("logical chunk fault loaded incorrect data")
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != SparseChunkBytes || stats.BytesOutstanding != SparseChunkBytes {
+		t.Fatalf("logical chunk demand did not install the whole chunk: %+v", stats)
+	}
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != targetFR.Length() || stats.BytesOutstanding != 0 {
+		t.Fatalf("logical chunk drain did not install remaining chunks: %+v", stats)
+	}
+}
+
+func TestLogicalChunkDemandRejectsNarrowReader(t *testing.T) {
+	reader := stateio.NewIOReader(bytes.NewReader(make([]byte, SparseChunkBytes)), SparseChunkBytes-hostarch.PageSize, logicalPagesPerChunk, 1)
+	if _, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{LogicalChunkDemand: true}); err == nil {
+		t.Fatal("logical chunk demand accepted a sub-chunk reader")
+	}
+}
+
 func TestDemandOnlyRemotePageLoadSwitchesReaderAtQuiescence(t *testing.T) {
 	target, targetFR := newRemoteTestMemoryFile(t, 2)
 	firstData := bytes.Repeat([]byte{0x11}, int(targetFR.Length()))

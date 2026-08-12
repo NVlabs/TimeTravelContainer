@@ -174,7 +174,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
 	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
-		MaxReadBytes: args.MaxTransferBytes, MaxRanges: 64, MaxParallel: args.MaxParallel,
+		MaxReadBytes: args.MaxTransferBytes, MaxRanges: pgalloc.PagesPerSparseChunk(), MaxParallel: args.MaxParallel,
 		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
@@ -187,7 +187,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		if err != nil {
 			return nil, fmt.Errorf("duplicating shared distributed snapshot: %w", err)
 		}
-		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, 64, args.MaxParallel)
+		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
 	} else if sparse {
 		if len(donated) != 0 {
 			return nil, fmt.Errorf("sparse distributed snapshot has %d unused page connections", len(donated))
@@ -280,7 +280,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
-		ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
+		LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
 	}
 	var child *kernel.Kernel
 	if sparse {

@@ -63,7 +63,7 @@ func TestLegacyCapabilitiesReceiveDefaultPagingPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := negotiated.PagingPolicy.TransferBytes, uint64(64<<10); got != want {
+	if got, want := negotiated.PagingPolicy.TransferBytes, uint64(1<<20); got != want {
 		t.Fatalf("transfer bytes=%d, want %d", got, want)
 	}
 	if got, want := negotiated.PagingPolicy.PageSize, uint64(4096); got != want {

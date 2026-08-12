@@ -25,6 +25,10 @@ import (
 
 const SparseChunkBytes = logicalPagesPerChunk * hostarch.PageSize
 
+// PagesPerSparseChunk returns the number of base pages in one stable sparse
+// residency unit.
+func PagesPerSparseChunk() int { return logicalPagesPerChunk }
+
 // SparseChunkObjectID is the content address of one immutable TTC memory
 // chunk. pgalloc treats it as opaque to avoid depending on the chunk codec.
 type SparseChunkObjectID [32]byte

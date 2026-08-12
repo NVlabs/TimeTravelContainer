@@ -24,9 +24,9 @@ func TestPolicyValidate(t *testing.T) {
 	if err := p.Validate(); err != nil {
 		t.Fatalf("DefaultPolicy.Validate(): %v", err)
 	}
-	if p.PageSize != 4<<10 || p.TransferBytes != 64<<10 || p.Prefetch != PrefetchAdaptive ||
-		p.Push != PushDemandOnly || !p.Adaptive {
-		t.Fatalf("DefaultPolicy() = %+v, want adaptive 64 KiB demand-only policy", p)
+	if p.PageSize != 4<<10 || p.TransferBytes != 1<<20 || p.Prefetch != PrefetchNone ||
+		p.Push != PushDemandOnly || p.Adaptive {
+		t.Fatalf("DefaultPolicy() = %+v, want fixed 1 MiB logical-chunk demand policy", p)
 	}
 	for _, test := range []struct {
 		name   string
@@ -55,6 +55,7 @@ func TestPolicyValidate(t *testing.T) {
 func TestSimulateSequentialPrefetch(t *testing.T) {
 	p := DefaultPolicy()
 	p.TransferBytes = 16 << 10 // Four pages.
+	p.Prefetch = PrefetchAdaptive
 	result, err := SimulatePulls(SimulationConfig{
 		Pages:                   8,
 		Policy:                  p,
@@ -75,6 +76,7 @@ func TestSimulateSequentialPrefetch(t *testing.T) {
 func TestSimulateSparseAccess(t *testing.T) {
 	p := DefaultPolicy()
 	p.TransferBytes = 64 << 10 // Sixteen pages.
+	p.Prefetch = PrefetchAdaptive
 	result, err := SimulatePulls(SimulationConfig{
 		Pages:                   64,
 		Policy:                  p,

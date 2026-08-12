@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -1150,6 +1151,13 @@ type AsyncPagesFileLoad struct {
 	// demandOnly is true while unawaited pages must not be loaded. It may
 	// transition from true to false exactly once when Drain is called.
 	demandOnly atomic.Bool
+	drainOnce  sync.Once
+
+	// logicalChunkDemand makes every fault wait for all extant pages in the
+	// same stable logical 1 MiB chunk. The source stream must place each
+	// chunk's pages contiguously, and the reader must support one full chunk
+	// and up to one destination range per base page in a single operation.
+	logicalChunkDemand bool
 
 	// done is closed after the loader goroutine has stopped and ar has been
 	// closed.
@@ -1291,12 +1299,13 @@ func (apfl *AsyncPagesFileLoad) err() error {
 // asyncMemoryFileLoad holds async page loading state for a single MemoryFile.
 type asyncMemoryFileLoad struct {
 	// Immutable fields:
-	f            *MemoryFile
-	pf           *AsyncPagesFileLoad
-	df           stateio.DestinationFile
-	doneCallback func(error)
-	timeline     *timing.Timeline
-	sparse       bool
+	f             *MemoryFile
+	pf            *AsyncPagesFileLoad
+	df            stateio.DestinationFile
+	doneCallback  func(error)
+	timeline      *timing.Timeline
+	sparse        bool
+	logicalChunks map[LogicalChunkID]*logicalChunkLoad
 
 	// minUnloaded is the MemoryFile offset of the first unloaded byte.
 	minUnloaded atomicbitops.Uint64
@@ -1332,6 +1341,15 @@ type aplUnloadedInfo struct {
 
 	// waiters queues goroutines waiting for these pages to be loaded.
 	waiters []*aplWaiter
+
+	// logicalChunk is non-nil when this range participates in an atomic
+	// logical-chunk demand load.
+	logicalChunk *logicalChunkLoad
+}
+
+type logicalChunkLoad struct {
+	id     LogicalChunkID
+	ranges []RemoteLoadRange
 }
 
 type aplWaiter struct {
@@ -1379,6 +1397,10 @@ type aplOp struct {
 	// If tempRef is true, a temporary reference is held on pages in frs that
 	// should be dropped after completion.
 	tempRef bool
+
+	// logicalChunk prevents one operation from straddling logical residency
+	// units. nil is used by ordinary checkpoint and page-granular loaders.
+	logicalChunk *logicalChunkLoad
 }
 
 func (op *aplOp) off() int64 {
@@ -1400,6 +1422,10 @@ type AsyncPagesFileLoadOpts struct {
 	// bytes immediately preceding a demanded range. Combining this with
 	// PrefetchBytes implements a fixed window around a fault.
 	PrefetchBehindBytes uint64
+
+	// LogicalChunkDemand requires each demand read to install all extant pages
+	// in the same stable logical 1 MiB chunk atomically.
+	LogicalChunkDemand bool
 }
 
 // AsyncPagesFileLoadStats is a point-in-time view of a remote or checkpoint
@@ -1475,6 +1501,10 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		ar.Close()
 		return nil, fmt.Errorf("async page prefetch window behind=%d ahead=%d is not page-aligned", opts.PrefetchBehindBytes, opts.PrefetchBytes)
 	}
+	if opts.LogicalChunkDemand && (maxReadBytes < SparseChunkBytes || ar.MaxRanges() < logicalPagesPerChunk) {
+		ar.Close()
+		return nil, fmt.Errorf("logical chunk demand requires reader geometry of at least %d bytes and %d ranges, got %d and %d", SparseChunkBytes, logicalPagesPerChunk, maxReadBytes, ar.MaxRanges())
+	}
 	// Cap maxParallel due to the uint32 range of bitmap.Bitmap.
 	maxParallel := min(ar.MaxParallel(), 1<<30)
 	apfl := &AsyncPagesFileLoad{
@@ -1486,6 +1516,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		maxRanges:                  ar.MaxRanges(),
 		maxParallel:                maxParallel,
 		needsRegisterDestinationFD: ar.NeedRegisterDestinationFD(),
+		logicalChunkDemand:         opts.LogicalChunkDemand,
 		qavail:                     maxParallel,
 		opsBusy:                    bitmap.New(uint32(maxParallel)),
 		ops:                        make([]aplOp, maxParallel),
@@ -1564,6 +1595,35 @@ func (apfl *AsyncPagesFileLoad) ReaderGeometry() AsyncPagesReaderGeometry {
 
 // Drain enables background loading of every remaining page. It is idempotent.
 func (apfl *AsyncPagesFileLoad) Drain() {
+	if apfl.logicalChunkDemand {
+		apfl.drainOnce.Do(func() {
+			go func() {
+				type demand struct {
+					amfl  *asyncMemoryFileLoad
+					chunk *logicalChunkLoad
+				}
+				var demands []demand
+				apfl.amflsMu.Lock()
+				for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+					for _, chunk := range amfl.logicalChunks {
+						demands = append(demands, demand{amfl: amfl, chunk: chunk})
+					}
+				}
+				apfl.amflsMu.Unlock()
+				sort.Slice(demands, func(i, j int) bool {
+					return demands[i].chunk.ranges[0].StreamOffset < demands[j].chunk.ranges[0].StreamOffset
+				})
+				for _, item := range demands {
+					if err := item.amfl.awaitLoad(item.chunk.ranges[0].Target); err != nil {
+						break
+					}
+				}
+				apfl.demandOnly.Store(false)
+				apfl.lfStatus.Notify(aplLFPending)
+			}()
+		})
+		return
+	}
 	if apfl.demandOnly.Swap(false) {
 		apfl.lfStatus.Notify(aplLFPending)
 	}
@@ -1749,6 +1809,11 @@ func (f *MemoryFile) AsyncLoadingMapUnit() uint64 {
 	if amfl == nil || !amfl.pf.demandOnly.Load() {
 		return 0
 	}
+	if amfl.pf.logicalChunkDemand {
+		// Logical chunks may be physically discontiguous after CoW. Keep guest
+		// mappings page-sized even though the load barrier is chunk-sized.
+		return hostarch.PageSize
+	}
 	unit := hostarch.PageSize + amfl.pf.prefetchBehindBytes.Load() + amfl.pf.prefetchAheadBytes.Load()
 	if unit < hostarch.PageSize || unit&(unit-1) != 0 {
 		// mapAS alignment requires a power of two. Fall back to the correctness
@@ -1788,6 +1853,23 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	// loading requires page-aligned FileRanges.
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = hostarch.MustPageRoundUp(fr.End)
+	requested := fr
+	var logicalChunks []*logicalChunkLoad
+	if amfl.pf.logicalChunkDemand {
+		seen := make(map[LogicalChunkID]struct{})
+		for _, logical := range amfl.f.LogicalPageRanges(fr) {
+			for sequence, end := logical.First.Sequence, logical.First.Sequence+logical.Range.Length()/hostarch.PageSize; sequence < end; {
+				id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					if chunk := amfl.logicalChunks[id]; chunk != nil {
+						logicalChunks = append(logicalChunks, chunk)
+					}
+				}
+				sequence = min(end, (sequence/logicalPagesPerChunk+1)*logicalPagesPerChunk)
+			}
+		}
+	}
 
 	apfl := amfl.pf
 	apfl.mu.Lock()
@@ -1801,13 +1883,19 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.mu.Unlock()
 		return err
 	}
-	if amfl.sparse {
+	var waitRanges []memmap.FileRange
+	if len(logicalChunks) != 0 {
+		for _, chunk := range logicalChunks {
+			for _, load := range chunk.ranges {
+				waitRanges = append(waitRanges, load.Target)
+			}
+		}
+	} else if amfl.sparse {
 		// Sparse chunk residency is transactional at 1 MiB granularity. Expand
 		// an access to every complete unloaded chunk that it intersects before
 		// splitting the unloaded set or publishing any waiter. This ensures
 		// that no guest mapping can make only a subset of a chunk resident,
 		// even when the caller asks MapInternal for a single 4 KiB page.
-		requested := fr
 		first := true
 		seg := amfl.unloaded.FindSegment(requested.Start)
 		if !seg.Ok() {
@@ -1826,43 +1914,48 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			apfl.mu.Unlock()
 			return nil
 		}
+		waitRanges = append(waitRanges, fr)
+	} else {
+		waitRanges = append(waitRanges, fr)
 	}
 	w := aplWaiterPool.Get().(*aplWaiter)
 	defer aplWaiterPool.Put(w)
-	w.fr = fr
+	w.fr = requested
 	w.pending = 0
-	amfl.unloaded.MutateRange(fr, func(ulseg aplUnloadedIterator) bool {
-		ul := ulseg.ValuePtr()
-		ulFR := ulseg.Range()
-		ullen := ulFR.Length()
-		if len(ul.waiters) == 0 {
-			apfl.bytesWaited += ullen
-			if !ul.started {
-				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
-				behind, ahead := apfl.prefetchBehindBytes.Load(), apfl.prefetchAheadBytes.Load()
-				if apfl.demandOnly.Load() && (behind != 0 || ahead != 0) && apfl.prefetch.Len() < 4096 {
-					start := ulFR.Start - min(behind, ulFR.Start)
-					end := ulFR.End + min(ahead, ^uint64(0)-ulFR.End)
-					if start != ulFR.Start || end != ulFR.End {
-						apfl.prefetch.PushBack(aplFileRange{amfl, memmap.FileRange{Start: start, End: end}})
+	for _, waitRange := range waitRanges {
+		amfl.unloaded.MutateRange(waitRange, func(ulseg aplUnloadedIterator) bool {
+			ul := ulseg.ValuePtr()
+			ulFR := ulseg.Range()
+			ullen := ulFR.Length()
+			if len(ul.waiters) == 0 {
+				apfl.bytesWaited += ullen
+				if !ul.started {
+					apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+					behind, ahead := apfl.prefetchBehindBytes.Load(), apfl.prefetchAheadBytes.Load()
+					if !apfl.logicalChunkDemand && apfl.demandOnly.Load() && (behind != 0 || ahead != 0) && apfl.prefetch.Len() < 4096 {
+						start := ulFR.Start - min(behind, ulFR.Start)
+						end := ulFR.End + min(ahead, ^uint64(0)-ulFR.End)
+						if start != ulFR.Start || end != ulFR.End {
+							apfl.prefetch.PushBack(aplFileRange{amfl, memmap.FileRange{Start: start, End: end}})
+						}
 					}
 				}
+				if logAwaitedLoads {
+					log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
+				}
 			}
-			if logAwaitedLoads {
-				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
-			}
-		}
-		ul.waiters = append(ul.waiters, w)
-		w.pending += ullen
-		return true
-	})
+			ul.waiters = append(ul.waiters, w)
+			w.pending += ullen
+			return true
+		})
+	}
 	pending := w.pending != 0
 	if pending {
 		apfl.faults++
-		if apfl.haveLastFault && fr.Start == apfl.lastFaultEnd {
+		if apfl.haveLastFault && requested.Start == apfl.lastFaultEnd {
 			apfl.sequentialFaults++
 		}
-		apfl.lastFaultEnd = fr.End
+		apfl.lastFaultEnd = requested.End
 		apfl.haveLastFault = true
 		w.timeStart = gohacks.Nanotime()
 		if apfl.numWaiters == 0 {
@@ -1875,12 +1968,12 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	if pending {
 		apfl.lfStatus.Notify(aplLFPending)
 		if logAwaitedLoads {
-			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), fr, fr.Length())
+			log.Infof("MemoryFile(%p): awaitLoad goid %d start: %v (%d bytes)", amfl.f, goid.Get(), requested, requested.Length())
 		}
 		w.wakeup.WaitAndAckAll()
 		if logAwaitedLoads {
 			waitNS := gohacks.Nanotime() - w.timeStart
-			log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), fr, fr.Length())
+			log.Infof("MemoryFile(%p): awaitLoad goid %d waited %v: %v (%d bytes)", amfl.f, goid.Get(), time.Duration(waitNS), requested, requested.Length())
 		}
 	}
 	return apfl.err()
@@ -1921,7 +2014,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) uint64 {
 	for {
 		if apfl.curOp == nil {
 			id, err := apfl.opsBusy.FirstZero(0)
@@ -1936,7 +2029,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
-		n := apfl.combine(amfl, fr, off, tempRef)
+		n := apfl.combine(amfl, fr, off, tempRef, logicalChunk)
 		if n > 0 {
 			return n
 		}
@@ -1954,7 +2047,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 // Preconditions:
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool) uint64 {
+func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) uint64 {
 	op := apfl.curOp
 	if op.total != 0 {
 		if op.end != off {
@@ -1975,6 +2068,9 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			// by making tempRef per-FileRange, but it's very unlikely that an
 			// awaited load (tempRef=false) will happen to be followed by an
 			// unawaited load (tempRef=true) at the correct offset.
+			return 0
+		}
+		if op.logicalChunk != logicalChunk {
 			return 0
 		}
 	}
@@ -2017,6 +2113,7 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	if op.total == 0 {
 		op.end = off
 		op.amfl = amfl
+		op.logicalChunk = logicalChunk
 	}
 	op.end += n
 	op.total += n
@@ -2200,7 +2297,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// fr.amfl.awaitLoad() precondition), so they can't become
 				// waste (which would allow them to be racily released or
 				// recycled).
-				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */)
+				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */, ul.logicalChunk)
 				if n == 0 {
 					// Try again in the next iteration of the main loop, when
 					// we have space in the queue again.
@@ -2253,7 +2350,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					loadFR := ulFR.Intersect(prefetch.FileRange)
 					ulseg = amfl.unloaded.SplitBefore(ulseg, loadFR.Start)
 					ul = ulseg.ValuePtr()
-					n := apfl.enqueueRange(amfl, loadFR, ul.off, true /* tempRef */)
+					n := apfl.enqueueRange(amfl, loadFR, ul.off, true /* tempRef */, ul.logicalChunk)
 					if n == 0 {
 						break
 					}
@@ -2297,7 +2394,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 					// We need to take page references during reading to
 					// prevent pages from becoming waste due to concurrent
 					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */)
+					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */, ul.logicalChunk)
 					if n == 0 {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()

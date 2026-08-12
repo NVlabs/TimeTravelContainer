@@ -347,6 +347,7 @@ type DistributedForkLoadOptions struct {
 	DemandOnly                 bool
 	PrefetchBytes              uint64
 	PrefetchBehindBytes        uint64
+	LogicalChunkDemand         bool
 	OwnSparseRepository        bool
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
@@ -516,7 +517,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{
 		DemandOnly: opts.DemandOnly, PrefetchBytes: opts.PrefetchBytes,
-		PrefetchBehindBytes: opts.PrefetchBehindBytes,
+		PrefetchBehindBytes: opts.PrefetchBehindBytes, LogicalChunkDemand: opts.LogicalChunkDemand,
 	})
 	if err != nil {
 		targetMF.Destroy()

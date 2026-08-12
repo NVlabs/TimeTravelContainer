@@ -1519,6 +1519,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if err := opts.PagingPolicy.Validate(); err != nil {
 		return nil, fmt.Errorf("cluster paging policy: %w", err)
 	}
+	if opts.PagingPolicy.TransferBytes < pgalloc.SparseChunkBytes {
+		return nil, fmt.Errorf("cluster transfer size %d is smaller than TTC's %d-byte atomic memory chunk", opts.PagingPolicy.TransferBytes, pgalloc.SparseChunkBytes)
+	}
 	tlsConfig, err := cluster.LoadServerTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile)
 	if err != nil {
 		return nil, err

@@ -53,21 +53,20 @@ type Policy struct {
 	Adaptive            bool           `json:"adaptive"`
 }
 
-// DefaultPolicy returns the conservative policy selected by the distributed
-// benchmark. Adaptive prefetch starts with a 64 KiB window, grows to the
-// negotiated transport limit for adjacent faults, and shrinks to demand-only
-// loading for sparse random access.
+// DefaultPolicy uses the same 1 MiB unit as persistent sparse memory chunks.
+// A fault installs its complete stable logical chunk, so separate positional
+// prefetch is unnecessary in the default policy.
 func DefaultPolicy() Policy {
 	return Policy{
 		PageSize:            4 << 10,
-		TransferBytes:       64 << 10,
-		Prefetch:            PrefetchAdaptive,
+		TransferBytes:       1 << 20,
+		Prefetch:            PrefetchNone,
 		Push:                PushDemandOnly,
 		MaxOutstandingBytes: 64 << 20,
 		MaxConcurrency:      64,
 		AckInterval:         50 * time.Microsecond,
 		AckBatchPages:       256,
-		Adaptive:            true,
+		Adaptive:            false,
 	}
 }
 
