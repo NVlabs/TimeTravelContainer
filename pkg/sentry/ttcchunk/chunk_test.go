@@ -329,6 +329,14 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	if got := manifest.Expand(); !reflect.DeepEqual(got, bindings) {
 		t.Fatalf("published manifest bindings differ: got=%+v want=%+v", got, bindings)
 	}
+	if reusedID, err := repository.Publish(nil, bindings); err != nil || reusedID != manifestID {
+		t.Fatalf("reusing published objects = %s, %v; want %s", reusedID, err, manifestID)
+	}
+	badBindings := append([]StoredBinding(nil), bindings...)
+	badBindings[0].Binding.Version.Sequence++
+	if _, err := repository.Publish(nil, badBindings); err == nil {
+		t.Fatal("repository accepted a manifest binding absent from its object")
+	}
 	const branch = "feature/one@remote"
 	if err := repository.SetBranch(branch, manifestID); err != nil {
 		t.Fatal(err)

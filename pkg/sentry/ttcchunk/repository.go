@@ -114,42 +114,67 @@ func publishImmutable(dir, parent, path string, data []byte) error {
 // Publish writes referenced chunks before atomically publishing their compact
 // immutable manifest. objects may omit already-published objects.
 func (r *MemoryRepository) Publish(objects []Object, bindings []StoredBinding) (ManifestID, error) {
-	provided := make(map[ID]struct{}, len(objects))
-	for _, object := range objects {
-		if _, ok := provided[object.ID]; ok {
-			return ManifestID{}, fmt.Errorf("publication repeats memory object %s", object.ID)
-		}
-		if err := r.chunks.PutObject(object); err != nil {
-			return ManifestID{}, fmt.Errorf("publishing memory object %s: %w", object.ID, err)
-		}
-		provided[object.ID] = struct{}{}
-	}
-	verified := make(map[ID]struct{}, len(bindings))
-	for _, binding := range bindings {
-		if _, ok := provided[binding.Object]; ok {
-			continue
-		}
-		if _, ok := verified[binding.Object]; ok {
-			continue
-		}
-		if _, err := r.chunks.Get(binding.Object); err != nil {
-			return ManifestID{}, fmt.Errorf("manifest references unavailable memory object %s: %w", binding.Object, err)
-		}
-		verified[binding.Object] = struct{}{}
-	}
 	manifest, err := CompactBindings(bindings)
 	if err != nil {
 		return ManifestID{}, err
 	}
-	data, id, err := EncodeManifest(manifest)
+	manifestData, manifestID, err := EncodeManifest(manifest)
 	if err != nil {
 		return ManifestID{}, err
 	}
-	dir, path := r.manifestPath(id)
-	if err := publishImmutable(dir, r.manifestRoot, path, data); err != nil {
-		return ManifestID{}, fmt.Errorf("publishing memory manifest %s: %w", id, err)
+	needed := make(map[ID][]StoredBinding, len(bindings))
+	for _, binding := range bindings {
+		needed[binding.Object] = append(needed[binding.Object], binding)
 	}
-	return id, nil
+	provided := make(map[ID]Object, len(objects))
+	decoded := make(map[ID]Chunk, len(objects))
+	for _, object := range objects {
+		if _, ok := provided[object.ID]; ok {
+			return ManifestID{}, fmt.Errorf("publication repeats memory object %s", object.ID)
+		}
+		if _, ok := needed[object.ID]; !ok {
+			return ManifestID{}, fmt.Errorf("publication includes unreferenced memory object %s", object.ID)
+		}
+		chunk, err := Decode(object.Data, &object.ID)
+		if err != nil {
+			return ManifestID{}, fmt.Errorf("validating memory object %s: %w", object.ID, err)
+		}
+		if chunk.Logical != object.Logical {
+			return ManifestID{}, fmt.Errorf("memory object %s has logical coordinate %+v, want %+v", object.ID, chunk.Logical, object.Logical)
+		}
+		provided[object.ID] = object
+		decoded[object.ID] = chunk
+	}
+	for objectID, objectBindings := range needed {
+		chunk, ok := decoded[objectID]
+		if !ok {
+			var err error
+			chunk, err = r.chunks.Get(objectID)
+			if err != nil {
+				return ManifestID{}, fmt.Errorf("manifest references unavailable memory object %s: %w", objectID, err)
+			}
+		}
+		pages := make(map[uint8]Page, len(chunk.Pages))
+		for _, page := range chunk.Pages {
+			pages[page.Slot] = page
+		}
+		for _, binding := range objectBindings {
+			page, ok := pages[binding.Binding.Slot]
+			if chunk.Logical != binding.Binding.Chunk || !ok || page.Version != binding.Binding.Version {
+				return ManifestID{}, fmt.Errorf("memory object %s does not contain requested page version %+v at (%+v,%d)", objectID, binding.Binding.Version, binding.Binding.Chunk, binding.Binding.Slot)
+			}
+		}
+	}
+	for _, object := range objects {
+		if err := r.chunks.PutObject(object); err != nil {
+			return ManifestID{}, fmt.Errorf("publishing memory object %s: %w", object.ID, err)
+		}
+	}
+	dir, path := r.manifestPath(manifestID)
+	if err := publishImmutable(dir, r.manifestRoot, path, manifestData); err != nil {
+		return ManifestID{}, fmt.Errorf("publishing memory manifest %s: %w", manifestID, err)
+	}
+	return manifestID, nil
 }
 
 // LoadManifest verifies and loads an immutable manifest.
