@@ -166,6 +166,64 @@ raw file. Before compaction and WAL cleanup it occupied 575.1 MiB, 12.3% more.
 Overwrite churn and the WAL recycler can cause substantially larger temporary
 amplification, as described above.
 
+## 64 KiB block and extent experiment
+
+The `chunk64` harness tests two different meanings of 64 KiB storage:
+
+* **64 KiB value:** one Pebble key is the CoW extent. A guest 4 KiB read gets
+  and slices the whole value; a guest 4 KiB write gets, copies, modifies, and
+  sets the whole value.
+* **4 KiB values / 64 KiB SST block:** each page remains independently keyed,
+  but adjacent keys are physically packed into 64 KiB target SST blocks. A
+  cold lookup reads the containing SST block, while a write records only 4 KiB.
+
+For comparison, the current arrangement of 4 KiB values in 4 KiB target SST
+blocks and one raw host file were tested by the same process. The dataset was
+256 MiB of incompressible data, the Pebble cache was 128 MiB, random-write
+phases modified 4,096 pages in batches of 128, and cache-dropped reads used
+`FADV_DONTNEED`. The following are medians of three runs; raw sequential write
+was noisy (414--1,178 MiB/s), so its percentage comparisons are approximate.
+
+| Operation | Raw file | 64 KiB value | 4 KiB values / 64 KiB block | 4 KiB values / 4 KiB block |
+| --- | ---: | ---: | ---: | ---: |
+| Sequential durable write | 862 MiB/s | 108 MiB/s | 84.6 MiB/s | 124 MiB/s |
+| Sequential cold read | 219 MiB/s | 196 MiB/s | 213 MiB/s | 188 MiB/s |
+| Random 4 KiB warm read | 886k/s | 83.7k/s | 85.1k/s | 176k/s |
+| Random 4 KiB warm read, p50 | 1.02 us | 17.3 us | 17.1 us | 5.61 us |
+| Random 4 KiB cold read | 1,580/s | 1,356/s | 1,346/s | 1,347/s |
+| Random 4 KiB cold read, p50 | 618 us | 823 us | 832 us | 675 us |
+| Random 4 KiB unsynced write | 394k/s | 1.52k/s | 55.7k/s | 57.2k/s |
+| Random 4 KiB durable write | 31.6k/s | 1.12k/s | 19.3k/s | 19.4k/s |
+| 128-write durable commit, p50 | 3.31 ms | 63.1 ms | 6.06 ms | 6.08 ms |
+
+Relative to raw host I/O, the 64 KiB-value layout retained only 0.39% of
+unsynced and 3.6% of durable random-write throughput. This is the unavoidable
+16-times payload amplification plus read-modify-write and database overhead.
+It also consumed 538 MiB immediately after building a 256 MiB live set because
+the SST and recyclable WAL coexist. After the two 16 MiB guest-write phases it
+temporarily occupied 674--768 MiB before later compaction and WAL cleanup.
+This layout is not acceptable as TTC's general writable-filesystem format.
+
+Keeping 4 KiB values while raising only the SST block size avoids that failure.
+Its random-write results were essentially identical to the 4 KiB-block layout,
+and its sequential read was 13% faster than the 4 KiB-block layout and within
+3% of raw. However, warm random reads were 52% slower than 4 KiB blocks because
+each cache miss/admission handles a much larger block; cold p50 was 23% higher.
+It also did not improve sequential ingestion in this test.
+
+The measured conclusion is therefore narrower than “use 64 KiB everywhere”:
+
+1. Do not represent a writable 64 KiB extent as one Pebble value if 4 KiB
+   updates are common.
+2. Pebble can remain the only physical store by retaining 4 KiB values and
+   grouping sixteen adjacent keys under one logical pack/extent prefix.
+3. Range iteration over those keys provides a 64 KiB dehydration transfer;
+   after loading, the sixteen pages remain independently CoW.
+4. A 64 KiB SST block is an optional sequential/dehydration tuning, not a good
+   universal default. The 4 KiB target is substantially better for hot random
+   access. Intermediate 16 KiB and 32 KiB targets should be measured with real
+   TTC workloads before choosing the default.
+
 ## Conclusion and gate
 
 Pebble passes the first synthetic functional gate and is suitable for a

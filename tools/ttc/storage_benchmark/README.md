@@ -35,6 +35,16 @@ go run ./raw --dir=/tmp/ttc-raw >raw.json
 go run ./raw --dir=/tmp/ttc-raw-nosync --sync-updates=false >raw-nosync.json
 ```
 
+Compare raw storage with a single 64 KiB extent value, 4 KiB values in 64 KiB
+SST blocks, and 4 KiB values in 4 KiB SST blocks:
+
+```shell
+go run ./chunk64 --dir=/tmp/ttc-chunk64 >chunk64.json
+```
+
+Use `--layouts` to run a subset, for example
+`--layouts=raw,pebble-4k-values-64k-block`.
+
 The commands remove the supplied database directory before starting. Do not
 point `--dir` at data that must be retained.
 
