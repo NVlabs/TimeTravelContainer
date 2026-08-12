@@ -497,6 +497,57 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestSparseChunkDemandLoadsWholeResidencyUnit(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	target, targetFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*29 + 5)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	page := uint64(137)
+	pageFR := memmap.FileRange{Start: targetFR.Start + page*hostarch.PageSize, End: targetFR.Start + (page+1)*hostarch.PageSize}
+	loaded, err := target.MapInternal(pageFR, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), loaded); err != nil || n != hostarch.PageSize {
+		t.Fatalf("copy demanded sparse page: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want[page*hostarch.PageSize:(page+1)*hostarch.PageSize]) {
+		t.Fatal("demand-loaded sparse page differs from source")
+	}
+	if stats := snapshot.Stats(); stats.PagesOutstanding != 0 || stats.PagesReleased != pagesPerChunk {
+		t.Fatalf("sparse fault did not load one complete chunk: %+v", stats)
+	}
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); !stats.Done || stats.BytesOutstanding != 0 || stats.BytesLoaded != SparseChunkBytes {
+		t.Fatalf("sparse loader did not complete one whole chunk: %+v", stats)
+	}
+	if target.IsAsyncLoading() {
+		t.Fatal("target retained a sparse loader after its complete chunk loaded")
+	}
+}
+
 func TestRemoteSnapshotOutstandingStreamRanges(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 6)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})

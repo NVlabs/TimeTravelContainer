@@ -1720,6 +1720,32 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		apfl.mu.Unlock()
 		return err
 	}
+	if amfl.sparse {
+		// Sparse chunk residency is transactional at 1 MiB granularity. Expand
+		// an access to every complete unloaded chunk that it intersects before
+		// splitting the unloaded set or publishing any waiter. This ensures
+		// that no guest mapping can make only a subset of a chunk resident,
+		// even when the caller asks MapInternal for a single 4 KiB page.
+		requested := fr
+		first := true
+		seg := amfl.unloaded.FindSegment(requested.Start)
+		if !seg.Ok() {
+			seg = amfl.unloaded.LowerBoundSegment(requested.Start)
+		}
+		for ; seg.Ok() && seg.Start() < requested.End; seg = seg.NextSegment() {
+			if first || seg.Start() < fr.Start {
+				fr.Start = seg.Start()
+			}
+			if first || seg.End() > fr.End {
+				fr.End = seg.End()
+			}
+			first = false
+		}
+		if first {
+			apfl.mu.Unlock()
+			return nil
+		}
+	}
 	w := aplWaiterPool.Get().(*aplWaiter)
 	defer aplWaiterPool.Put(w)
 	w.fr = fr
