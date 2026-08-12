@@ -8732,9 +8732,40 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	execSessions, _ := b.execSessions(target)
 	dehydrated := false
 	captured := false
+	var stagingDir, finalDir string
+	finalPublished := false
+	sparseRootChanged := false
+	hadPreviousSparseRoot := false
+	var previousSparseRoot ttcchunk.ManifestID
+	var sparseRepositoryPath string
+	var sparseFilesystemBranch string
 	defer func() {
 		if dehydrated {
 			return
+		}
+		if sparseRootChanged {
+			if repository, openErr := ttcchunk.OpenMemoryRepository(sparseRepositoryPath); openErr == nil {
+				if hadPreviousSparseRoot {
+					openErr = repository.SetBranch(sparseFilesystemBranch, previousSparseRoot)
+				} else {
+					openErr = repository.DeleteBranch(sparseFilesystemBranch)
+					if errors.Is(openErr, os.ErrNotExist) {
+						openErr = nil
+					}
+				}
+				if openErr == nil {
+					_, openErr = repository.CollectGarbage(ttcchunk.GCOptions{})
+				}
+				_ = repository.Close()
+				if openErr != nil && b.stderr != nil {
+					fmt.Fprintf(b.stderr, "ttc: warning: rolling back sparse memory root for %s: %v\n", target, openErr)
+				}
+			} else if b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: opening sparse memory repository to roll back %s: %v\n", target, openErr)
+			}
+		}
+		if finalPublished {
+			_ = os.RemoveAll(finalDir)
 		}
 		if captured {
 			// Dehydration has already replaced the live Kernel. If durable export
@@ -8766,7 +8797,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return fmt.Errorf("stopping published ports before dehydration: %w", err)
 	}
 	var metadataFile *os.File
-	var stagingDir, finalDir string
 	if b.dataRoot != "" {
 		metadataDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated")
 		if err := os.MkdirAll(metadataDir, 0700); err != nil {
@@ -8800,13 +8830,19 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		memoryRepositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
-		memoryRepository, err := ttcchunk.OpenMemoryRepository(memoryRepositoryPath)
+		sparseRepositoryPath = filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		memoryRepository, err := ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
 		if err != nil {
 			return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
 		}
 		defer memoryRepository.Close()
-		repositoryDir, err := os.Open(memoryRepositoryPath)
+		previousSparseRoot, err = memoryRepository.Branch(capture.FilesystemBranch)
+		if err == nil {
+			hadPreviousSparseRoot = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("reading previous sparse dehydration branch root: %w", err)
+		}
+		repositoryDir, err := os.Open(sparseRepositoryPath)
 		if err != nil {
 			return err
 		}
@@ -8823,9 +8859,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
 			return errors.New("sparse dehydration export returned an empty manifest ID")
 		}
-		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
-			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
-		}
+		sparseFilesystemBranch = capture.FilesystemBranch
 		capture.SparseManifest = exportInfo.Manifest
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
@@ -8846,12 +8880,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return fmt.Errorf("publishing dehydration image: %w", err)
 		}
 		stagingDir = ""
+		finalPublished = true
 		if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
 			_ = dir.Sync()
 			_ = dir.Close()
 		}
+		sparseRootChanged = true
+		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
+			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
+		}
 	}
-	dehydrated = true
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
 	// transient statuses so rehydration can attach fresh followers.
@@ -8871,6 +8909,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return err
 		}
 	}
+	dehydrated = true
 	if b.dataRoot != "" {
 		activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
