@@ -465,12 +465,37 @@ func (s *Shm) MemoryFileRanges() []memmap.MemoryFileRange {
 // afterLoad is invoked by stateify.
 func (s *Shm) afterLoad(ctx goContext.Context) {
 	s.mf = pgalloc.MemoryFileFromContext(ctx)
+	if relocation := pgalloc.SparseRelocationFromContext(ctx); relocation != nil {
+		relocateSet := func(set *ShmFileRangeSet) error {
+			var relocated ShmFileRangeSet
+			for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+				runs, err := relocation.Runs(s.mf.ResourceID(), seg.FileRange())
+				if err != nil {
+					return err
+				}
+				logical := seg.Start()
+				for _, run := range runs {
+					mr := memmap.MappableRange{Start: logical, End: logical + run.Length()}
+					relocated.Insert(relocated.FindGap(mr.Start), mr, run.Start)
+					logical = mr.End
+				}
+			}
+			*set = relocated
+			return nil
+		}
+		if err := relocateSet(&s.data); err != nil {
+			panic(fmt.Sprintf("relocating SysV SHM data: %v", err))
+		}
+		if err := relocateSet(&s.cow); err != nil {
+			panic(fmt.Sprintf("relocating SysV SHM CoW metadata: %v", err))
+		}
+	}
 	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		return
 	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	for seg := s.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		s.mf.IncRef(seg.FileRange(), memCgID)
+		pgalloc.AcquireRestoreRef(ctx, s.mf, seg.FileRange(), memCgID)
 	}
 }
 

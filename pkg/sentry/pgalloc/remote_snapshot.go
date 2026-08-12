@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -960,6 +961,74 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 	amfl.minUnloaded.Store(minUnloaded)
 	amfl.lfDone = true
 	pages.mu.Unlock()
+	pages.lfStatus.Notify(aplLFPending)
+	return nil
+}
+
+// AttachSparseChunkPageLoad attaches another independent demand loader to an
+// existing family MemoryFile. Every target range must be exactly one 1 MiB
+// sparse residency unit. Unlike AttachRemotePageLoad, repeated calls coexist;
+// this permits a second remote branch to arrive while the first still has
+// non-resident chunks.
+func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges []RemoteLoadRange, doneCallback func(error), timeline *timing.Timeline) error {
+	if pages == nil || len(ranges) == 0 {
+		return errors.New("sparse chunk loader and ranges must be non-empty")
+	}
+	for i, loadRange := range ranges {
+		if loadRange.Target.Length() != SparseChunkBytes || !loadRange.Target.WellFormed() ||
+			!hostarch.IsPageAligned(loadRange.Target.Start) || loadRange.StreamOffset != uint64(i)*SparseChunkBytes {
+			return fmt.Errorf("invalid sparse chunk load range %d: %+v", i, loadRange)
+		}
+		for j := 0; j < i; j++ {
+			other := ranges[j].Target
+			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
+				return fmt.Errorf("sparse chunk target ranges %v and %v overlap", loadRange.Target, other)
+			}
+		}
+	}
+	fileSize := uint64(len(f.chunksLoad())) * chunkSize
+	var destination stateio.DestinationFile
+	if pages.ar.NeedRegisterDestinationFD() {
+		var err error
+		destination, err = pages.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
+		if err != nil {
+			return fmt.Errorf("registering sparse destination MemoryFile: %w", err)
+		}
+	}
+	amfl := &asyncMemoryFileLoad{
+		f: f, pf: pages, df: destination, doneCallback: doneCallback,
+		timeline: timeline.Fork(fmt.Sprintf("sparse-mf:%p", f)), sparse: true,
+	}
+	pages.amflsMu.Lock()
+	if err := pages.err(); err != nil {
+		pages.amflsMu.Unlock()
+		amfl.timeline.End()
+		return err
+	}
+	pages.amfls.PushBack(amfl)
+	pages.amflsMu.Unlock()
+
+	minUnloaded := uint64(math.MaxUint64)
+	pages.mu.Lock()
+	for _, loadRange := range ranges {
+		amfl.unloaded.InsertRange(loadRange.Target, aplUnloadedInfo{off: loadRange.StreamOffset})
+		if loadRange.Target.Start < minUnloaded {
+			minUnloaded = loadRange.Target.Start
+		}
+	}
+	amfl.minUnloaded.Store(minUnloaded)
+	amfl.lfDone = true
+	pages.mu.Unlock()
+
+	f.sparseLoadMu.Lock()
+	old := f.sparseAsyncLoads.Load()
+	next := make([]*asyncMemoryFileLoad, 0, 1)
+	if old != nil {
+		next = append(next, (*old)...)
+	}
+	next = append(next, amfl)
+	f.sparseAsyncLoads.Store(&next)
+	f.sparseLoadMu.Unlock()
 	pages.lfStatus.Notify(aplLFPending)
 	return nil
 }

@@ -151,6 +151,12 @@ type MemoryFile struct {
 	nextPageVersion  uint64
 	logicalPages     logicalPageSet
 
+	// sparseChunks maps immutable TTC chunk objects to their resident 1 MiB
+	// backing ranges. Each entry owns one reference on every page in Range;
+	// branch object graphs own additional references on valid slots. The map is
+	// runtime-local and protected by mu.
+	sparseChunks map[SparseChunkObjectID]sparseResidentChunk `state:"nosave"`
+
 	// subreleased maps hugepage-aligned file offsets to the number of
 	// sub-released small pages within the hugepage beginning at that offset.
 	// subreleased is protected by mu.
@@ -227,6 +233,12 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// sparseAsyncLoads contains independent immutable-chunk loaders attached
+	// by successive sparse branch imports. The pointed-to slice is immutable.
+	// sparseLoadMu serializes copy-on-write updates to the slice.
+	sparseLoadMu     sync.Mutex
+	sparseAsyncLoads atomic.Pointer[[]*asyncMemoryFileLoad]
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -238,6 +250,26 @@ type MemoryFile struct {
 	//
 	// chunks is protected by mu. chunks slices are immutable.
 	chunks atomic.Pointer[[]chunkInfo]
+}
+
+func (f *MemoryFile) removeSparseAsyncLoad(remove *asyncMemoryFileLoad) {
+	f.sparseLoadMu.Lock()
+	defer f.sparseLoadMu.Unlock()
+	old := f.sparseAsyncLoads.Load()
+	if old == nil {
+		return
+	}
+	next := make([]*asyncMemoryFileLoad, 0, len(*old))
+	for _, load := range *old {
+		if load != remove {
+			next = append(next, load)
+		}
+	}
+	if len(next) == 0 {
+		f.sparseAsyncLoads.Store(nil)
+	} else {
+		f.sparseAsyncLoads.Store(&next)
+	}
 }
 
 // NotifyRemoteCOW reports that a source mapping has stopped owning the given
@@ -759,6 +791,7 @@ func (f *MemoryFile) initFields() {
 	f.unfreeHuge.InsertRange(fullFR, unfreeInfo{})
 	f.subreleased = make(map[uint64]uint64)
 	f.evictable = make(map[EvictableMemoryUser]*evictableMemoryUserInfo)
+	f.sparseChunks = make(map[SparseChunkObjectID]sparseResidentChunk)
 	if _, err := rand.Read(f.logicalAllocator[:]); err != nil {
 		panic(fmt.Sprintf("generating MemoryFile logical allocator ID: %v", err))
 	}
@@ -1758,6 +1791,13 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 			return safemem.BlockSeq{}, err
 		}
 	}
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			if err := amfl.awaitLoad(fr); err != nil {
+				return safemem.BlockSeq{}, err
+			}
+		}
+	}
 
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
 	if chunks == 1 {
@@ -2120,6 +2160,13 @@ func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
 		if err := amfl.awaitLoad(fr); err != nil {
 			return -1, err
+		}
+	}
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			if err := amfl.awaitLoad(fr); err != nil {
+				return -1, err
+			}
 		}
 	}
 	return f.FD(), nil

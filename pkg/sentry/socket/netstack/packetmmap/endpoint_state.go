@@ -28,4 +28,12 @@ func (rb *ringBuffer) afterLoad(ctx context.Context) {
 		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, pgalloc.CtxMemoryFile))
 	}
 	rb.mf = mf
+	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, rb.mf, rb.data); err != nil {
+		panic(fmt.Sprintf("relocating packet mmap ring: %v", err))
+	} else {
+		rb.data = relocated
+	}
+	if rb.data.Length() != 0 && pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		pgalloc.AcquireRestoreRef(ctx, rb.mf, rb.data, pgalloc.MemoryCgroupIDFromContext(ctx))
+	}
 }

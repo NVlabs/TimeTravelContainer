@@ -82,6 +82,11 @@ type VDSOParamPage struct {
 // afterLoad is invoked by stateify.
 func (v *VDSOParamPage) afterLoad(ctx context.Context) {
 	v.mf = pgalloc.MemoryFileFromContext(ctx)
+	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, v.mf, v.fr); err != nil {
+		panic(fmt.Sprintf("relocating VDSO parameter page: %v", err))
+	} else {
+		v.fr = relocated
+	}
 }
 
 // NewVDSOParamPage returns a VDSOParamPage.

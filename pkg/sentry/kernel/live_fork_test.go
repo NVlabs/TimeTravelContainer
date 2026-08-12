@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
@@ -431,6 +432,58 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	}
 	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
 		t.Fatalf("draining distributed child: %v", err)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	parent.Unpause()
+	child.Unpause()
+	parent.Pause()
+	child.Pause()
+	child.Release()
+	parent.Release()
+}
+
+func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "sparse"})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	manifestID, err := capture.PublishSparse(repository, "sparse")
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	child, err := kernel.LoadSparseDistributedFork(parent.SupervisorContext(), parent.Platform, parent.MemoryFile(), capture.KernelMetadata, repository, manifestID, kernel.DistributedForkLoadOptions{
+		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "sparse", FilesystemResources: capture.FilesystemResources,
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LoadSparseDistributedFork: %v", err)
+	}
+	if child.MemoryFile() != parent.MemoryFile() {
+		t.Fatal("sparse child did not join the family MemoryFile")
+	}
+	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatalf("draining sparse child: %v", err)
 	}
 	if err := parent.StartPaused(); err != nil {
 		t.Fatal(err)

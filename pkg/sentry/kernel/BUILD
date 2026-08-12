@@ -421,6 +421,7 @@ go_library(
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
+		"//pkg/sentry/ttcchunk",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",
@@ -481,6 +482,7 @@ go_test(
 		"//pkg/sentry/state/stateio",
         "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
+		"//pkg/sentry/ttcchunk",
 		"//pkg/sentry/ttcremote",
     ],
 )

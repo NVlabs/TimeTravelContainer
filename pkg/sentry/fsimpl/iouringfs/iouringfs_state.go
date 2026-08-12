@@ -16,6 +16,7 @@ package iouringfs
 
 import (
 	"context"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
@@ -30,6 +31,18 @@ func (fd *FileDescription) beforeSave() {
 // afterLoad is invoked by stateify.
 func (fd *FileDescription) afterLoad(ctx context.Context) {
 	fd.mf = pgalloc.MemoryFileFromContext(ctx)
+	var err error
+	if fd.rbmf.fr, err = pgalloc.RelocateMemoryFileRange(ctx, fd.mf, fd.rbmf.fr); err != nil {
+		panic(fmt.Sprintf("relocating io_uring ring buffers: %v", err))
+	}
+	if fd.sqemf.fr, err = pgalloc.RelocateMemoryFileRange(ctx, fd.mf, fd.sqemf.fr); err != nil {
+		panic(fmt.Sprintf("relocating io_uring SQ entries: %v", err))
+	}
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+		pgalloc.AcquireRestoreRef(ctx, fd.mf, fd.rbmf.fr, memCgID)
+		pgalloc.AcquireRestoreRef(ctx, fd.mf, fd.sqemf.fr, memCgID)
+	}
 	// Remap shared buffers.
 	fd.remap = true
 	fd.runC = make(chan struct{}, 1)

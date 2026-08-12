@@ -16,8 +16,10 @@ package pgalloc
 
 import (
 	"context"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
 // contextID is this package's type for context.Context.Value keys.
@@ -55,6 +57,14 @@ const (
 	// for MemoryFile-backed objects use this to opt their ranges into sparse
 	// distributed-fork and dehydration images.
 	CtxMemoryRangeCapture
+
+	// CtxSparseRelocation maps serialized MemoryFile offsets to an existing
+	// family MemoryFile during sparse branch restore.
+	CtxSparseRelocation
+
+	// CtxSparseRestoreRefs stages restored object references until state load
+	// has completed successfully.
+	CtxSparseRestoreRefs
 )
 
 // IsLiveForkClone returns true if ctx is loading an in-memory live fork.
@@ -123,4 +133,34 @@ func MemoryRangeCaptureFromContext(ctx context.Context) *MemoryRangeCapture {
 		return v.(*MemoryRangeCapture)
 	}
 	return nil
+}
+
+// SparseRelocationFromContext returns the sparse restore relocation table.
+func SparseRelocationFromContext(ctx context.Context) *SparseRelocation {
+	if v := ctx.Value(CtxSparseRelocation); v != nil {
+		return v.(*SparseRelocation)
+	}
+	return nil
+}
+
+// RelocateMemoryFileRange relocates fr when sparse restore is active.
+func RelocateMemoryFileRange(ctx context.Context, mf *MemoryFile, fr memmap.FileRange) (memmap.FileRange, error) {
+	relocation := SparseRelocationFromContext(ctx)
+	if relocation == nil || fr.Length() == 0 {
+		return fr, nil
+	}
+	if mf == nil {
+		return memmap.FileRange{}, fmt.Errorf("cannot relocate range %v for a nil MemoryFile", fr)
+	}
+	return relocation.Range(mf.ResourceID(), fr)
+}
+
+// AcquireRestoreRef acquires or transactionally stages one restored owner
+// reference according to ctx.
+func AcquireRestoreRef(ctx context.Context, mf *MemoryFile, fr memmap.FileRange, memCgID uint32) {
+	if transaction, ok := ctx.Value(CtxSparseRestoreRefs).(*SparseReferenceTransaction); ok && transaction != nil {
+		transaction.Add(mf, fr, memCgID)
+		return
+	}
+	mf.IncRef(fr, memCgID)
 }

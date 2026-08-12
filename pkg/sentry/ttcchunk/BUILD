@@ -10,6 +10,7 @@ go_library(
     srcs = [
 		"assemble.go",
         "chunk.go",
+		"install.go",
 		"manifest.go",
 		"repository.go",
         "store.go",
@@ -17,8 +18,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/hostarch",
+		"//pkg/sentry/checkpoint",
 		"//pkg/safemem",
+		"//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+		"//pkg/sentry/state/stateio",
 		"//pkg/sentry/usage",
     ],
 )

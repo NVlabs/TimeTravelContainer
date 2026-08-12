@@ -15,6 +15,7 @@
 package fsutil
 
 import (
+	goContext "context"
 	"fmt"
 	"io"
 	"math"
@@ -34,6 +35,31 @@ import (
 
 // FileRangeSetFunctions implements segment.Functions for FileRangeSet.
 type FileRangeSetFunctions struct{}
+
+// RelocateFileRangeSet rewrites MemoryFile offsets after sparse restore while
+// preserving logical Mappable offsets. It splits segments when destination
+// pages are not adjacent.
+func RelocateFileRangeSet(ctx goContext.Context, mf *pgalloc.MemoryFile, set *FileRangeSet) error {
+	relocation := pgalloc.SparseRelocationFromContext(ctx)
+	if relocation == nil {
+		return nil
+	}
+	var relocated FileRangeSet
+	for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		runs, err := relocation.Runs(mf.ResourceID(), seg.FileRange())
+		if err != nil {
+			return err
+		}
+		logical := seg.Start()
+		for _, run := range runs {
+			mr := memmap.MappableRange{Start: logical, End: logical + run.Length()}
+			relocated.Insert(relocated.FindGap(mr.Start), mr, run.Start)
+			logical = mr.End
+		}
+	}
+	*set = relocated
+	return nil
+}
 
 // MinKey implements segment.Functions.MinKey.
 func (FileRangeSetFunctions) MinKey() uint64 {

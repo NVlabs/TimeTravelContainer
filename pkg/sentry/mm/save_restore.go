@@ -98,10 +98,27 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 		panic("MemoryManager restore context has no platform")
 	}
 	mm.mf = pgalloc.MemoryFileFromContext(ctx)
+	if pgalloc.SparseRelocationFromContext(ctx) != nil {
+		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+			if !ok {
+				panic(fmt.Sprintf("sparse PMA restore has unsupported file %T", pseg.ValuePtr().file))
+			}
+			relocated, err := pgalloc.RelocateMemoryFileRange(ctx, mf, pseg.fileRange())
+			if err != nil {
+				panic(fmt.Sprintf("relocating sparse PMA %v: %v", pseg.Range(), err))
+			}
+			pseg.ValuePtr().off = relocated.Start
+		}
+	}
 	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
 		memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 		for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
-			pseg.ValuePtr().file.IncRef(pseg.fileRange(), memCgID)
+			mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+			if !ok {
+				panic(fmt.Sprintf("restored PMA has unsupported file %T", pseg.ValuePtr().file))
+			}
+			pgalloc.AcquireRestoreRef(ctx, mf, pseg.fileRange(), memCgID)
 		}
 	}
 	mm.haveASIO = mm.p.SupportsAddressSpaceIO()
@@ -205,8 +222,13 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment)
 // afterLoad is invoked by stateify.
 func (m *SpecialMappable) afterLoad(ctx goContext.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
+	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, m.mf, m.fr); err != nil {
+		panic(fmt.Sprintf("relocating SpecialMappable %q: %v", m.name, err))
+	} else {
+		m.fr = relocated
+	}
 	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
-		m.mf.IncRef(m.fr, 0)
+		pgalloc.AcquireRestoreRef(ctx, m.mf, m.fr, 0)
 	}
 }
 

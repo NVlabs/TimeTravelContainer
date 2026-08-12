@@ -176,6 +176,12 @@ func (fs *filesystem) unregisterLiveForkFile(file *regularFile) {
 // afterLoad is invoked by stateify.
 func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	rf.inode.fs.registerLiveForkFile(rf)
+	if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, &rf.data); err != nil {
+		panic(fmt.Sprintf("relocating tmpfs file data: %v", err))
+	}
+	if err := fsutil.RelocateFileRangeSet(ctx, rf.inode.fs.mf, &rf.cow); err != nil {
+		panic(fmt.Sprintf("relocating tmpfs file CoW metadata: %v", err))
+	}
 	if rf.inode.fs.diskVolume != nil {
 		rf.diskMmap.SetFD(-1)
 		rf.diskObject = ""
@@ -199,7 +205,7 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 	}
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	for seg := rf.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		rf.inode.fs.mf.IncRef(seg.FileRange(), memCgID)
+		pgalloc.AcquireRestoreRef(ctx, rf.inode.fs.mf, seg.FileRange(), memCgID)
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
@@ -359,5 +360,95 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	}
 	if _, err := repository.Branch(branch); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("deleted Branch error = %v, want not-exist", err)
+	}
+}
+
+func TestInstallManifestRelocatesAndReadsWholeChunk(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := testChunk()
+	resource := checkpoint.ResourceID{Path: "/memory"}
+	source := make([]SourcePage, len(chunk.Pages))
+	for i, page := range chunk.Pages {
+		source[i] = SourcePage{
+			Binding: pgalloc.CapturedPageBinding{
+				ResourceID: resource, OldOffset: uint64(i) * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+				Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+			},
+			Zero: page.Zero, Data: page.Data,
+		}
+	}
+	objects, bindings, err := Assemble(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID, err := repository.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp("", "ttc-chunk-install-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		ResourceID: resource, DelayedEviction: pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround: true, DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	installed, err := repository.InstallManifest(mf, manifest, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed.Chunks) != 1 {
+		t.Fatalf("installed %d new chunks, want 1", len(installed.Chunks))
+	}
+	if err := installed.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewChunkReader(repository, installed.Chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := make([]byte, pgalloc.SparseChunkBytes)
+	if n, err := reader.ReadAt(decoded, 0); err != nil || n != len(decoded) {
+		t.Fatalf("ReadAt: n=%d err=%v", n, err)
+	}
+	for i, page := range chunk.Pages {
+		gotOffset, ok := installed.Relocation.Page(resource, uint64(i)*hostarch.PageSize)
+		wantOffset := installed.Chunks[0].Target.Start + uint64(page.Slot)*hostarch.PageSize
+		if !ok || gotOffset != wantOffset {
+			t.Fatalf("page %d relocation=(%#x,%t), want %#x", i, gotOffset, ok, wantOffset)
+		}
+		got := decoded[uint64(page.Slot)*hostarch.PageSize : (uint64(page.Slot)+1)*hostarch.PageSize]
+		if page.Zero {
+			if !bytes.Equal(got, make([]byte, hostarch.PageSize)) {
+				t.Fatalf("zero slot %d is nonzero", page.Slot)
+			}
+		} else if !bytes.Equal(got, page.Data) {
+			t.Fatalf("slot %d payload mismatch", page.Slot)
+		}
+	}
+	reused, err := repository.InstallManifest(mf, manifest, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reused.Chunks) != 0 {
+		t.Fatalf("reinstall allocated chunks: %+v", reused.Chunks)
+	}
+	if err := reused.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }

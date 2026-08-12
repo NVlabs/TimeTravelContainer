@@ -28,6 +28,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
 )
@@ -60,6 +62,31 @@ type DistributedForkCapture struct {
 	// may use them directly; a remote ttcd reopens equivalent handles from its
 	// shared repository before calling LoadDistributedFork.
 	FilesystemResources vfs.LiveForkFilesystemResources
+}
+
+// PublishSparse durably publishes this capture as branch in repository. Page
+// reservations are released only after objects, manifest, and mutable branch
+// root are all durable.
+func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryRepository, branch string) (ttcchunk.ManifestID, error) {
+	if c == nil || repository == nil || branch == "" || c.Snapshot == nil || len(c.Snapshots) != 0 {
+		return ttcchunk.ManifestID{}, fmt.Errorf("sparse publication requires one live snapshot and branch")
+	}
+	objects, bindings, err := ttcchunk.ReadSnapshot(c.Snapshot, c.MemoryBindings)
+	if err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	manifestID, err := repository.Publish(objects, bindings)
+	if err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	if err := repository.SetBranch(branch, manifestID); err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	if err := c.Snapshot.Close(); err != nil {
+		return ttcchunk.ManifestID{}, err
+	}
+	c.Snapshot = nil
+	return manifestID, nil
 }
 
 // Close cancels all outstanding remote pages.
@@ -250,6 +277,138 @@ type DistributedForkLoadOptions struct {
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
 	ConfigureNetwork func(*Kernel, inet.Stack) error
+}
+
+// LoadSparseDistributedFork restores a branch into an existing family
+// MemoryFile from a shared immutable chunk repository. Identical resident
+// objects are reused; missing objects are demand-loaded transactionally in
+// 1 MiB units.
+func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata []byte, repository *ttcchunk.MemoryRepository, manifestID ttcchunk.ManifestID, opts DistributedForkLoadOptions) (*Kernel, error) {
+	if p == nil || targetMF == nil || repository == nil || opts.Clocks == nil || opts.ChildBranchID == "" || len(kernelMetadata) == 0 {
+		return nil, fmt.Errorf("sparse distributed fork load is missing required target state")
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		return nil, fmt.Errorf("loading sparse branch manifest %s: %w", manifestID, err)
+	}
+	installation, err := repository.InstallManifest(targetMF, manifest, usage.Anonymous, 0)
+	if err != nil {
+		return nil, fmt.Errorf("installing sparse branch manifest: %w", err)
+	}
+	installationCommitted := false
+	defer func() {
+		if !installationCommitted {
+			_ = installation.Abort()
+		}
+	}()
+
+	var pages *pgalloc.AsyncPagesFileLoad
+	if len(installation.Chunks) != 0 {
+		chunkReader, err := ttcchunk.NewChunkReader(repository, installation.Chunks)
+		if err != nil {
+			return nil, err
+		}
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		loadRanges := make([]pgalloc.RemoteLoadRange, len(installation.Chunks))
+		for i, chunk := range installation.Chunks {
+			loadRanges[i] = pgalloc.RemoteLoadRange{Target: chunk.Target, StreamOffset: chunk.StreamOffset}
+		}
+		if err := targetMF.AttachSparseChunkPageLoad(pages, loadRanges, nil, nil); err != nil {
+			pages.Cancel()
+			_ = pages.Wait()
+			return nil, err
+		}
+		pages.MemoryFilesDone()
+	}
+	pagesOwned := pages != nil
+	defer func() {
+		if pagesOwned {
+			pages.Cancel()
+			_ = pages.Wait()
+		}
+	}()
+
+	targetMF.IncOwner()
+	childOwner := true
+	defer func() {
+		if childOwner {
+			targetMF.Destroy()
+		}
+	}()
+	child := &Kernel{Platform: p}
+	child.SetMemoryFile(targetMF)
+	child.initRuntimeFields()
+	referenceTransaction := pgalloc.NewSparseReferenceTransaction()
+	loadValues := map[any]any{
+		pgalloc.CtxMemoryFile:             targetMF,
+		pgalloc.CtxMemoryFileMap:          make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		pgalloc.CtxLiveForkClone:          true,
+		pgalloc.CtxSparseRelocation:       installation.Relocation,
+		pgalloc.CtxSparseRestoreRefs:      referenceTransaction,
+		vfs.CtxLiveForkChildBranchID:      opts.ChildBranchID,
+		devutil.CtxDevGoferClientProvider: child,
+	}
+	if opts.FilesystemResources != nil {
+		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
+	}
+	if opts.RestoreFilesystemResources != nil {
+		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
+	}
+	if opts.RestoreFilesystemFDMap != nil {
+		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
+	}
+	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
+	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
+		referenceTransaction.Abort()
+		return nil, fmt.Errorf("loading sparse distributed Kernel metadata: %w", err)
+	}
+	if err := referenceTransaction.Commit(); err != nil {
+		return nil, err
+	}
+	if err := installation.Commit(); err != nil {
+		return nil, err
+	}
+	installationCommitted = true
+	childOwner = false
+	if pages != nil {
+		child.remotePageLoad = pages
+		pagesOwned = false
+	}
+	if _, err := child.vdsoParams.access(); err != nil {
+		child.Release()
+		return nil, fmt.Errorf("materializing sparse distributed-fork VDSO parameter page: %w", err)
+	}
+	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
+		child.Release()
+		return nil, err
+	}
+	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if opts.ConfigureNetwork == nil {
+			child.Release()
+			return nil, fmt.Errorf("sparse distributed target network configurator was not provided")
+		}
+		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("configuring sparse distributed target network: %w", err)
+		}
+		rootNS.Stack().Restore()
+		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				child.Release()
+				return nil, fmt.Errorf("resetting sparse distributed child external network state: %w", err)
+			}
+		}
+	}
+	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
+		child.Release()
+		return nil, vfs.PrependErrMsg("VFS sparse distributed-fork restore failed", err)
+	}
+	child.Pause()
+	return child, nil
 }
 
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a

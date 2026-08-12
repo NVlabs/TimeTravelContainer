@@ -1270,6 +1270,7 @@ type asyncMemoryFileLoad struct {
 	df           stateio.DestinationFile
 	doneCallback func(error)
 	timeline     *timing.Timeline
+	sparse       bool
 
 	// minUnloaded is the MemoryFile offset of the first unloaded byte.
 	minUnloaded atomicbitops.Uint64
@@ -1611,7 +1612,13 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 				if amfl.unloaded.IsEmpty() {
 					amfl.minUnloaded.Store(math.MaxUint64)
 					apfl.amfls.Remove(amfl)
-					amfl.f.asyncPageLoad.Store(nil)
+					if !amfl.sparse {
+						amfl.f.asyncPageLoad.Store(nil)
+					} else {
+						amfl.f.removeSparseAsyncLoad(amfl)
+						apfl.demandOnly.Store(false)
+						apfl.lfStatus.Notify(aplLFPending)
+					}
 					amfl.timeline.End()
 					if amfl.doneCallback != nil {
 						amfl.doneCallback(nil)
@@ -1644,7 +1651,7 @@ func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 // IsAsyncLoading returns true if async page loading is in progress or has
 // failed permanently.
 func (f *MemoryFile) IsAsyncLoading() bool {
-	return f.asyncPageLoad.Load() != nil
+	return f.asyncPageLoad.Load() != nil || f.sparseAsyncLoads.Load() != nil
 }
 
 // AsyncLoadingMapUnit returns the maximum address-space mapping unit that
@@ -1654,6 +1661,9 @@ func (f *MemoryFile) IsAsyncLoading() bool {
 // prefetch window, while the async reader remains free to split or coalesce
 // network requests independently.
 func (f *MemoryFile) AsyncLoadingMapUnit() uint64 {
+	if loads := f.sparseAsyncLoads.Load(); loads != nil && len(*loads) != 0 {
+		return SparseChunkBytes
+	}
 	amfl := f.asyncPageLoad.Load()
 	if amfl == nil || !amfl.pf.demandOnly.Load() {
 		return 0
@@ -1672,6 +1682,13 @@ func (f *MemoryFile) AsyncLoadingMapUnit() uint64 {
 func (f *MemoryFile) AwaitLoadAll() error {
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
 		return amfl.awaitLoad(memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))})
+	}
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			if err := amfl.awaitLoad(memmap.FileRange{0, hostarch.PageRoundDown(uint64(math.MaxUint64))}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -2279,7 +2296,13 @@ func (apfl *AsyncPagesFileLoad) main() {
 				if amfl.unloaded.IsEmpty() {
 					amfl.minUnloaded.Store(math.MaxUint64)
 					apfl.amfls.Remove(amfl)
-					amfl.f.asyncPageLoad.Store(nil)
+					if !amfl.sparse {
+						amfl.f.asyncPageLoad.Store(nil)
+					} else {
+						amfl.f.removeSparseAsyncLoad(amfl)
+						apfl.demandOnly.Store(false)
+						apfl.lfStatus.Notify(aplLFPending)
+					}
 					amfl.timeline.End()
 					if amfl.doneCallback != nil {
 						amfl.doneCallback(nil)

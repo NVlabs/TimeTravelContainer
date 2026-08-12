@@ -16,6 +16,7 @@ package mm
 
 import (
 	"context"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
@@ -28,4 +29,12 @@ func (aio *AIOContext) afterLoad(context.Context) {
 // afterLoad is invoked by stateify.
 func (m *aioMappable) afterLoad(ctx context.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
+	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, m.mf, m.fr); err != nil {
+		panic(fmt.Sprintf("relocating AIO mapping: %v", err))
+	} else {
+		m.fr = relocated
+	}
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		pgalloc.AcquireRestoreRef(ctx, m.mf, m.fr, pgalloc.MemoryCgroupIDFromContext(ctx))
+	}
 }
