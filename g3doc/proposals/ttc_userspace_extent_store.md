@@ -1302,7 +1302,7 @@ branch observe another branch's private write.
   dehydration, and rehydration. Do not use capture-specific packed offsets as
   persistent identities.
 * Assign each Sentry incarnation a collision-resistant allocator domain and
-  allocate chunk IDs as `(allocator domain, monotonic sequence)`. Preserve
+  allocate page/chunk IDs as `(allocator domain, monotonic sequence)`. Preserve
   imported IDs, never reuse a logical page ID, and start a fresh allocator
   domain after process-free rehydration so no synchronous per-allocation
   cluster coordination is required.

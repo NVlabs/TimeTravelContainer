@@ -430,13 +430,16 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	collectUsed(&source.unfreeSmall)
 	collectUsed(&source.unfreeHuge)
 	if _, err := state.Save(ctx, &metadata, &memoryFileSaved{
-		unwasteSmall: &source.unwasteSmall,
-		unwasteHuge:  &source.unwasteHuge,
-		unfreeSmall:  &source.unfreeSmall,
-		unfreeHuge:   &source.unfreeHuge,
-		subreleased:  source.subreleased,
-		memAcct:      &source.memAcct,
-		chunks:       source.chunksLoad(),
+		unwasteSmall:     &source.unwasteSmall,
+		unwasteHuge:      &source.unwasteHuge,
+		unfreeSmall:      &source.unfreeSmall,
+		unfreeHuge:       &source.unfreeHuge,
+		logicalAllocator: source.logicalAllocator,
+		nextLogicalPage:  source.nextLogicalPage,
+		logicalPages:     &source.logicalPages,
+		subreleased:      source.subreleased,
+		memAcct:          &source.memAcct,
+		chunks:           source.chunksLoad(),
 	}); err != nil {
 		source.mu.Unlock()
 		return nil, nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
@@ -520,6 +523,14 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 	target.unwasteHuge.MoveFrom(saved.unwasteHuge)
 	target.unfreeSmall.MoveFrom(saved.unfreeSmall)
 	target.unfreeHuge.MoveFrom(saved.unfreeHuge)
+	if saved.logicalAllocator != (LogicalAllocatorID{}) {
+		target.logicalAllocator = saved.logicalAllocator
+		target.nextLogicalPage = saved.nextLogicalPage
+	}
+	if saved.logicalPages != nil {
+		target.logicalPages.MoveFrom(saved.logicalPages)
+	}
+	target.ensureLogicalPagesLocked()
 	target.subreleased = saved.subreleased
 	target.memAcct.MoveFrom(saved.memAcct)
 	target.knownCommittedBytes = knownCommitted

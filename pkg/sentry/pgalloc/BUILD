@@ -90,6 +90,23 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "logical_page_set",
+    out = "logical_page_set.go",
+    imports = {
+        "memmap": "gvisor.dev/gvisor/pkg/sentry/memmap",
+    },
+    package = "pgalloc",
+    prefix = "logicalPage",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "uint64",
+        "Range": "memmap.FileRange",
+        "Value": "logicalPageInfo",
+        "Functions": "logicalPageSetFunctions",
+    },
+)
+
+go_template_instance(
     name = "memacct_set",
     out = "memacct_set.go",
     consts = {
@@ -163,6 +180,7 @@ go_library(
         "debug.go",
         "evictable_range.go",
         "evictable_range_set.go",
+        "logical_page_set.go",
         "memacct_set.go",
         "memory_file_mutex.go",
         "pgalloc.go",
@@ -183,6 +201,7 @@ go_library(
         "//pkg/goid",
         "//pkg/hostarch",
         "//pkg/log",
+        "//pkg/rand",
         "//pkg/ringdeque",
         "//pkg/safemem",
         "//pkg/sentry/arch",

@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
@@ -137,6 +138,16 @@ type MemoryFile struct {
 	// unfreeSmall and unfreeHuge are protected by mu.
 	unfreeSmall unfreeSet
 	unfreeHuge  unfreeSet
+
+	// logicalPages maps used backing-file offsets to stable logical page IDs.
+	// Unlike backing-file offsets, IDs are never reused. Contiguous IDs are
+	// stored as runs, so ordinary multi-page allocations add one segment rather
+	// than one metadata object per page.
+	//
+	// logicalAllocator, nextLogicalPage, and logicalPages are protected by mu.
+	logicalAllocator LogicalAllocatorID
+	nextLogicalPage  uint64
+	logicalPages     logicalPageSet
 
 	// subreleased maps hugepage-aligned file offsets to the number of
 	// sub-released small pages within the hugepage beginning at that offset.
@@ -284,6 +295,84 @@ func (f *MemoryFile) chunksLoad() []chunkInfo {
 	return *f.chunks.Load()
 }
 
+// assignLogicalPagesLocked assigns fresh, never-reused identities to fr.
+//
+// Preconditions: f.mu must be locked and fr must contain newly allocated pages.
+func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange) {
+	pages := fr.Length() / hostarch.PageSize
+	if pages == 0 || pages > math.MaxUint64-f.nextLogicalPage {
+		panic(fmt.Sprintf("logical page sequence exhausted for allocation %v", fr))
+	}
+	f.logicalPages.InsertRange(fr, logicalPageInfo{
+		Allocator:     f.logicalAllocator,
+		FirstSequence: f.nextLogicalPage,
+	})
+	f.nextLogicalPage += pages
+}
+
+// ensureLogicalPagesLocked synthesizes identities when loading a checkpoint
+// written before logical-page metadata existed. New checkpoints always take
+// the fast path because logicalPages is already populated.
+//
+// Preconditions: f is not concurrently accessible, or f.mu is locked.
+func (f *MemoryFile) ensureLogicalPagesLocked() {
+	if f.logicalPages.FirstSegment().Ok() {
+		return
+	}
+	assignUsed := func(set *unfreeSet) {
+		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if seg.ValuePtr().refs != 0 {
+				f.assignLogicalPagesLocked(seg.Range())
+			}
+		}
+	}
+	assignUsed(&f.unfreeSmall)
+	assignUsed(&f.unfreeHuge)
+}
+
+// LogicalPageIDAt returns the stable identity of the allocated page beginning
+// at offset. It returns false for an unaligned or currently unallocated offset.
+func (f *MemoryFile) LogicalPageIDAt(offset uint64) (LogicalPageID, bool) {
+	if !hostarch.IsPageAligned(offset) {
+		return LogicalPageID{}, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seg := f.logicalPages.FindSegment(offset)
+	if !seg.Ok() {
+		return LogicalPageID{}, false
+	}
+	info := seg.ValuePtr()
+	return LogicalPageID{
+		Allocator: info.Allocator,
+		Sequence:  info.FirstSequence + (offset-seg.Start())/hostarch.PageSize,
+	}, true
+}
+
+// LogicalPageRanges returns the stable identity runs intersecting fr. The
+// returned slice is detached from f and remains valid after this call.
+func (f *MemoryFile) LogicalPageRanges(fr memmap.FileRange) []LogicalPageRange {
+	if !fr.WellFormed() || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
+		panic(fmt.Sprintf("invalid logical page range: %v", fr))
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ranges []LogicalPageRange
+	f.logicalPages.VisitRange(fr, func(seg logicalPageIterator) bool {
+		intersection := seg.Range().Intersect(fr)
+		info := seg.ValuePtr()
+		ranges = append(ranges, LogicalPageRange{
+			Range: intersection,
+			First: LogicalPageID{
+				Allocator: info.Allocator,
+				Sequence:  info.FirstSequence + (intersection.Start-seg.Start())/hostarch.PageSize,
+			},
+		})
+		return true
+	})
+	return ranges
+}
+
 // forEachChunk invokes fn on a sequence of chunks that collectively span all
 // bytes in fr. In each call, chunkFR is the subset of fr that falls within
 // chunk. If any call to f returns false, forEachChunk stops iteration and
@@ -315,6 +404,56 @@ type unfreeInfo struct {
 	// and zero for void, waste, releasing, and sub-released pages, as well as
 	// pages backed by a different page size.
 	refs uint64
+}
+
+// LogicalAllocatorID identifies one collision-resistant logical-page allocator
+// incarnation. Imported IDs retain their original allocator ID.
+//
+// +stateify savable
+type LogicalAllocatorID [16]byte
+
+// LogicalPageID is the stable identity of one allocated base page. It is
+// independent of the page's current MemoryFile offset.
+//
+// +stateify savable
+type LogicalPageID struct {
+	Allocator LogicalAllocatorID
+	Sequence  uint64
+}
+
+// LogicalChunkID identifies the group containing a logical page. TTC's first
+// sparse-memory format uses 256 base-page slots per chunk.
+//
+// +stateify savable
+type LogicalChunkID struct {
+	Allocator LogicalAllocatorID
+	Sequence  uint64
+}
+
+const logicalPagesPerChunk = 256
+
+// Chunk returns the stable logical chunk and slot containing id.
+func (id LogicalPageID) Chunk() (LogicalChunkID, uint8) {
+	return LogicalChunkID{
+		Allocator: id.Allocator,
+		Sequence:  id.Sequence / logicalPagesPerChunk,
+	}, uint8(id.Sequence % logicalPagesPerChunk)
+}
+
+// logicalPageInfo is the value type of MemoryFile.logicalPages. FirstSequence
+// is the sequence for the first page in the segment's range.
+//
+// +stateify savable
+type logicalPageInfo struct {
+	Allocator     LogicalAllocatorID
+	FirstSequence uint64
+}
+
+// LogicalPageRange describes a contiguous run of backing pages with contiguous
+// stable identities.
+type LogicalPageRange struct {
+	Range memmap.FileRange
+	First LogicalPageID
 }
 
 // memAcctInfo is the value type of MemoryFile.memAcct.
@@ -521,6 +660,10 @@ func (f *MemoryFile) initFields() {
 	f.unfreeHuge.InsertRange(fullFR, unfreeInfo{})
 	f.subreleased = make(map[uint64]uint64)
 	f.evictable = make(map[EvictableMemoryUser]*evictableMemoryUserInfo)
+	if _, err := rand.Read(f.logicalAllocator[:]); err != nil {
+		panic(fmt.Sprintf("generating MemoryFile logical allocator ID: %v", err))
+	}
+	f.nextLogicalPage = 0
 	chunks := []chunkInfo(nil)
 	f.chunks.Store(&chunks)
 }
@@ -902,6 +1045,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 				ma.wasteOrReleasing = false
 				return true
 			})
+			f.assignLogicalPagesLocked(fr)
 			return
 		}
 	}
@@ -950,6 +1094,7 @@ retryFree:
 		knownCommitted: false,
 		commitSeq:      f.commitSeq,
 	})
+	f.assignLogicalPagesLocked(fr)
 	return
 }
 
@@ -1291,6 +1436,7 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 			if uf.refs == 0 {
 				// Mark these pages as waste.
 				wasteFR := ufseg.Range()
+				f.logicalPages.RemoveRange(wasteFR)
 				unwaste.RemoveFullRange(wasteFR)
 				haveWaste = true
 				// Reclassify waste memory as System until it's recycled or
@@ -2100,6 +2246,34 @@ func (unfreeSetFunctions) Merge(_ memmap.FileRange, val1 unfreeInfo, _ memmap.Fi
 
 func (unfreeSetFunctions) Split(_ memmap.FileRange, val unfreeInfo, _ uint64) (unfreeInfo, unfreeInfo) {
 	return val, val
+}
+
+type logicalPageSetFunctions struct{}
+
+func (logicalPageSetFunctions) MinKey() uint64 {
+	return 0
+}
+
+func (logicalPageSetFunctions) MaxKey() uint64 {
+	return math.MaxUint64
+}
+
+func (logicalPageSetFunctions) ClearValue(val *logicalPageInfo) {
+	*val = logicalPageInfo{}
+}
+
+func (logicalPageSetFunctions) Merge(r1 memmap.FileRange, val1 logicalPageInfo, r2 memmap.FileRange, val2 logicalPageInfo) (logicalPageInfo, bool) {
+	if val1.Allocator != val2.Allocator {
+		return logicalPageInfo{}, false
+	}
+	want := val1.FirstSequence + r1.Length()/hostarch.PageSize
+	return val1, want == val2.FirstSequence && r1.End == r2.Start
+}
+
+func (logicalPageSetFunctions) Split(r memmap.FileRange, val logicalPageInfo, splitAt uint64) (logicalPageInfo, logicalPageInfo) {
+	right := val
+	right.FirstSequence += (splitAt - r.Start) / hostarch.PageSize
+	return val, right
 }
 
 type memAcctSetFunctions struct{}

@@ -70,6 +70,93 @@ func TestMemoryFileOwnerLifetime(t *testing.T) {
 	f.mu.Unlock()
 }
 
+func newLogicalPageTestMemoryFile() *MemoryFile {
+	f := &MemoryFile{
+		opts: MemoryFileOpts{DisableMemoryAccounting: true},
+	}
+	f.initFields()
+	chunks := []chunkInfo{{huge: false}}
+	f.chunks.Store(&chunks)
+	f.unfreeSmall.RemoveRange(memmap.FileRange{0, chunkSize})
+	return f
+}
+
+func TestLogicalPageIDsAllocationAndOffsetReuse(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	first, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 2 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id0, ok := f.LogicalPageIDAt(first.Start)
+	if !ok {
+		t.Fatal("first allocated page has no logical ID")
+	}
+	id1, ok := f.LogicalPageIDAt(first.Start + page)
+	if !ok {
+		t.Fatal("second allocated page has no logical ID")
+	}
+	if id0.Allocator != id1.Allocator || id1.Sequence != id0.Sequence+1 {
+		t.Fatalf("allocation IDs are not contiguous: first=%+v second=%+v", id0, id1)
+	}
+
+	f.IncRef(first, 0)
+	f.DecRef(first)
+	if got, ok := f.LogicalPageIDAt(first.Start); !ok || got != id0 {
+		t.Fatalf("ID changed while a reference remains: got=%+v ok=%v want=%+v", got, ok, id0)
+	}
+	f.DecRef(first)
+	if got, ok := f.LogicalPageIDAt(first.Start); ok {
+		t.Fatalf("released page retained logical ID %+v", got)
+	}
+
+	recycled, err := f.findAllocatableAndMarkUsed(&allocState{
+		length:     2 * page,
+		opts:       AllocOpts{Dir: BottomUp},
+		willCommit: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recycled != first {
+		t.Fatalf("recycled range=%v, want original range=%v", recycled, first)
+	}
+	recycledID, ok := f.LogicalPageIDAt(recycled.Start)
+	if !ok {
+		t.Fatal("recycled page has no logical ID")
+	}
+	if recycledID == id0 || recycledID.Sequence <= id1.Sequence {
+		t.Fatalf("recycled offset reused a retired identity: old=%+v new=%+v", id0, recycledID)
+	}
+	f.DecRef(recycled)
+}
+
+func TestLogicalPageChunkCoordinates(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: (logicalPagesPerChunk + 2) * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := f.LogicalPageIDAt(fr.Start)
+	lastInChunk, _ := f.LogicalPageIDAt(fr.Start + (logicalPagesPerChunk-1)*page)
+	firstNext, _ := f.LogicalPageIDAt(fr.Start + logicalPagesPerChunk*page)
+	chunk0, slot0 := first.Chunk()
+	chunkLast, slotLast := lastInChunk.Chunk()
+	chunk1, slot1 := firstNext.Chunk()
+	if chunk0 != chunkLast || slotLast != 255 {
+		t.Fatalf("first logical chunk boundary is wrong: first=(%+v,%d) last=(%+v,%d)", chunk0, slot0, chunkLast, slotLast)
+	}
+	if chunk1.Allocator != chunk0.Allocator || chunk1.Sequence != chunk0.Sequence+1 || slot1 != 0 {
+		t.Fatalf("next logical chunk boundary is wrong: first=(%+v,%d) next=(%+v,%d)", chunk0, slot0, chunk1, slot1)
+	}
+	f.DecRef(fr)
+}
+
 func TestFindAllocatable(t *testing.T) {
 	for _, test := range []struct {
 		name string

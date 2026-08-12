@@ -67,13 +67,16 @@ func (f *MemoryFile) ResourceID() checkpoint.ResourceID {
 //
 // +stateify savable
 type memoryFileSaved struct {
-	unwasteSmall *unwasteSet
-	unwasteHuge  *unwasteSet
-	unfreeSmall  *unfreeSet
-	unfreeHuge   *unfreeSet
-	subreleased  map[uint64]uint64
-	memAcct      *memAcctSet
-	chunks       []chunkInfo
+	unwasteSmall     *unwasteSet
+	unwasteHuge      *unwasteSet
+	unfreeSmall      *unfreeSet
+	unfreeHuge       *unfreeSet
+	logicalAllocator LogicalAllocatorID
+	nextLogicalPage  uint64
+	logicalPages     *logicalPageSet
+	subreleased      map[uint64]uint64
+	memAcct          *memAcctSet
+	chunks           []chunkInfo
 }
 
 // SaveOpts provides options to MemoryFile.SaveTo().
@@ -387,13 +390,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// Save metadata.
 	timeMetadataStart := gohacks.Nanotime()
 	if _, err := state.Save(ctx, w, &memoryFileSaved{
-		unwasteSmall: &f.unwasteSmall,
-		unwasteHuge:  &f.unwasteHuge,
-		unfreeSmall:  &f.unfreeSmall,
-		unfreeHuge:   &f.unfreeHuge,
-		subreleased:  f.subreleased,
-		memAcct:      &f.memAcct,
-		chunks:       f.chunksLoad(),
+		unwasteSmall:     &f.unwasteSmall,
+		unwasteHuge:      &f.unwasteHuge,
+		unfreeSmall:      &f.unfreeSmall,
+		unfreeHuge:       &f.unfreeHuge,
+		logicalAllocator: f.logicalAllocator,
+		nextLogicalPage:  f.nextLogicalPage,
+		logicalPages:     &f.logicalPages,
+		subreleased:      f.subreleased,
+		memAcct:          &f.memAcct,
+		chunks:           f.chunksLoad(),
 	}); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
@@ -943,6 +949,14 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	f.unwasteHuge.MoveFrom(mfs.unwasteHuge)
 	f.unfreeSmall.MoveFrom(mfs.unfreeSmall)
 	f.unfreeHuge.MoveFrom(mfs.unfreeHuge)
+	if mfs.logicalAllocator != (LogicalAllocatorID{}) {
+		f.logicalAllocator = mfs.logicalAllocator
+		f.nextLogicalPage = mfs.nextLogicalPage
+	}
+	if mfs.logicalPages != nil {
+		f.logicalPages.MoveFrom(mfs.logicalPages)
+	}
+	f.ensureLogicalPagesLocked()
 	f.subreleased = mfs.subreleased
 	f.memAcct.MoveFrom(mfs.memAcct)
 	chunks := mfs.chunks

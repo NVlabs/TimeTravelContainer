@@ -89,6 +89,28 @@ func newEmptyRemoteTestMemoryFile(t *testing.T) *MemoryFile {
 	return mf
 }
 
+func TestRemoteAllocatorMetadataPreservesLogicalPageIDs(t *testing.T) {
+	source, fr := newRemoteTestMemoryFile(t, 3)
+	want := source.LogicalPageRanges(fr)
+	if len(want) != 1 {
+		t.Fatalf("source logical ranges=%v, want one run", want)
+	}
+	metadata, _, _, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newEmptyRemoteTestMemoryFile(t)
+	defer target.Destroy()
+	if err := ImportMemoryFileMetadataForRemote(context.Background(), target, metadata); err != nil {
+		t.Fatal(err)
+	}
+	defer target.DecRef(fr)
+	got := target.LogicalPageRanges(fr)
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("imported logical ranges=%v, want=%v", got, want)
+	}
+}
+
 func fillRemoteTestRange(t *testing.T, mf *MemoryFile, fr memmap.FileRange, data []byte) {
 	t.Helper()
 	if uint64(len(data)) != fr.Length() {
