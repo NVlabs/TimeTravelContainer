@@ -79,6 +79,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -180,6 +181,12 @@ type Kernel struct {
 	// fork. It is canceled during Release, after users of mf have dropped their
 	// references and before mf itself is destroyed.
 	remotePageLoad *pgalloc.AsyncPagesFileLoad `state:"nosave"`
+	// remoteLoadRanges retain the packed-stream layout while remotePageLoad may
+	// be handed from a live source to shared sparse chunks.
+	remoteLoadRanges []pgalloc.RemoteLoadRange `state:"nosave"`
+	// remoteHandoffManifest makes daemon retries idempotent after a successful
+	// live-to-sparse reader switch.
+	remoteHandoffManifest ttcchunk.ManifestID `state:"nosave"`
 	// auxiliaryRemotePageLoads supply private MemoryFiles (for example tmpfs)
 	// restored from a process-free dehydration image. Application memory uses
 	// remotePageLoad so existing distributed-fork controls retain their meaning.
@@ -2427,6 +2434,8 @@ func (k *Kernel) Release() {
 		_ = k.remotePageLoad.Wait()
 		k.remotePageLoad = nil
 	}
+	k.remoteLoadRanges = nil
+	k.remoteHandoffManifest = ttcchunk.ManifestID{}
 	for _, load := range k.auxiliaryRemotePageLoads {
 		load.Cancel()
 		_ = load.Wait()

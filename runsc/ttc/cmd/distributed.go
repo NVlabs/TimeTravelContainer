@@ -379,37 +379,10 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
-	sharedSnapshot := ""
-	sparseRepository := ""
-	var sparseExport boot.DistributedForkExportInfo
-	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
-		sparseRepository, sparseExport, err = b.exportDistributedSparse(source.container, transactionID)
-		if err != nil {
-			return selector{}, err
-		}
-	}
-	defer func() {
-		if !committed {
-			_ = os.Remove(filepath.Join(b.dataRoot, sharedSnapshot))
-			if sparseExport.FilesystemBranch != "" {
-				if repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, sparseRepository)); openErr == nil {
-					_ = repository.DeleteBranch(sparseExport.FilesystemBranch)
-					_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
-					_ = repository.Close()
-				}
-			}
-		}
-	}()
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
-		SharedSnapshot:   sharedSnapshot,
-		SparseRepository: sparseRepository,
-	}
-	if sparseExport.Manifest != (ttcchunk.ManifestID{}) {
-		descriptor.SparseManifest = sparseExport.Manifest.String()
-		descriptor.SparseBranch = sparseExport.FilesystemBranch
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -426,15 +399,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		tx = status
 	}
 	committed = true
-	if sharedSnapshot != "" || sparseRepository != "" {
-		if err := b.completeSharedDistributedFork(peer, source.container, transactionID, tx.Revision, relay); err != nil {
-			return selector{}, err
-		}
+	monitorBackend := *b
+	monitorBackend.stdin = strings.NewReader("")
+	monitorBackend.stdout = io.Discard
+	monitorBackend.stderr = io.Discard
+	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
+		go monitorBackend.handoffDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	} else {
-		monitorBackend := *b
-		monitorBackend.stdin = strings.NewReader("")
-		monitorBackend.stdout = io.Discard
-		monitorBackend.stderr = io.Discard
 		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	}
 	return selector{container: targetContainer, branch: defaultBranchID}, nil
@@ -485,16 +456,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, err
 	}
 	type childState struct {
-		target           string
-		transaction      string
-		tx               *cluster.Transaction
-		relay            *distributedPageRelay
-		advertise        string
-		dataPlaneMax     uint64
-		captured         bool
-		sharedSnapshot   string
-		sparseRepository string
-		sparseExport     boot.DistributedForkExportInfo
+		target       string
+		transaction  string
+		tx           *cluster.Transaction
+		relay        *distributedPageRelay
+		advertise    string
+		dataPlaneMax uint64
+		captured     bool
 	}
 	children := make([]childState, len(targetContainers))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -519,16 +487,6 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			cleanupCancel()
 			if child.captured {
 				_, _ = b.command("timetravel", source.container, "distributed-cancel", child.transaction)
-			}
-			if child.sharedSnapshot != "" {
-				_ = os.Remove(filepath.Join(b.dataRoot, child.sharedSnapshot))
-			}
-			if child.sparseExport.FilesystemBranch != "" {
-				if repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, child.sparseRepository)); openErr == nil {
-					_ = repository.DeleteBranch(child.sparseExport.FilesystemBranch)
-					_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
-					_ = repository.Close()
-				}
 			}
 		}
 	}()
@@ -637,22 +595,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
-		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
-			child.sparseRepository, child.sparseExport, err = b.exportDistributedSparse(source.container, child.transaction)
-			if err != nil {
-				return nil, fmt.Errorf("exporting snapshot for target %s: %w", child.target, err)
-			}
-		}
 		descriptors[i] = cluster.RemoteSessionDescriptor{
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
-			SharedSnapshot:   child.sharedSnapshot,
-			SparseRepository: child.sparseRepository,
-		}
-		if child.sparseExport.Manifest != (ttcchunk.ManifestID{}) {
-			descriptors[i].SparseManifest = child.sparseExport.Manifest.String()
-			descriptors[i].SparseBranch = child.sparseExport.FilesystemBranch
 		}
 	}
 	prepareErrors := make([]error, len(children))
@@ -702,20 +648,118 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	results := make([]selector, len(children))
 	for i := range children {
 		child := &children[i]
-		if child.sharedSnapshot != "" || child.sparseRepository != "" {
-			if err := b.completeSharedDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay); err != nil {
-				return nil, fmt.Errorf("making target %s source-independent: %w", child.target, err)
-			}
+		monitorBackend := *b
+		monitorBackend.stdin = strings.NewReader("")
+		monitorBackend.stdout = io.Discard
+		monitorBackend.stderr = io.Discard
+		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
+			go monitorBackend.handoffDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
 		} else {
-			monitorBackend := *b
-			monitorBackend.stdin = strings.NewReader("")
-			monitorBackend.stdout = io.Discard
-			monitorBackend.stderr = io.Discard
 			go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
 		}
 		results[i] = selector{container: child.target, branch: defaultBranchID}
 	}
 	return results, nil
+}
+
+// handoffDistributedFork publishes fork-time pages after the target is visible,
+// then atomically redirects all remaining faults from TCP to shared chunks.
+// Failure before the target acknowledges the switch falls back to ordinary
+// live paging; it never invalidates an already-published target.
+func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	repositoryPath, export, err := b.exportDistributedSparse(sourceContainer, transactionID)
+	if err != nil {
+		b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
+		return
+	}
+	sparse := cluster.SparseHandoffDescriptor{
+		Repository: repositoryPath, Manifest: export.Manifest.String(), Branch: export.FilesystemBranch,
+	}
+	var tx *cluster.Transaction
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tx, err = peer.Handoff(ctx, transactionID, revision, sparse)
+		if err != nil {
+			if current, statusErr := peer.Status(ctx, transactionID); statusErr == nil {
+				tx = current
+				revision = current.Revision
+				switch current.State {
+				case cluster.TransactionDraining, cluster.TransactionIndependent:
+					if current.SparseHandoff != nil && *current.SparseHandoff == sparse {
+						err = nil
+					} else if current.State == cluster.TransactionIndependent {
+						// The target faulted every page from TCP before handoff.
+						cancel()
+						b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
+						_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+						relay.Close()
+						return
+					}
+				case cluster.TransactionCanceled, cluster.TransactionFailed:
+					cancel()
+					b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
+					_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+					relay.Close()
+					return
+				}
+			}
+		}
+		cancel()
+		if err == nil && tx != nil {
+			break
+		}
+		// Once publication succeeds, never delete its root merely because an
+		// RPC response or reader switch failed. The target may have completed
+		// the switch, and both the durable descriptor and Sentry operation are
+		// idempotent. Retain live paging and retry until target acknowledgement.
+		time.Sleep(500 * time.Millisecond)
+	}
+	if tx.State == cluster.TransactionIndependent {
+		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+		relay.Close()
+		return
+	}
+	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
+		// Retrying status/independence is safe; the target now has no source
+		// reads, while the source retains its snapshot until completion.
+		b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay)
+	}
+}
+
+func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, branch string) {
+	if repositoryPath == "" || branch == "" {
+		return
+	}
+	if repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, repositoryPath)); err == nil {
+		_ = repository.DeleteBranch(branch)
+		_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
+		_ = repository.Close()
+	}
+}
+
+func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	defer relay.Close()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		status, err := peer.Status(ctx, transactionID)
+		cancel()
+		if err == nil {
+			revision = status.Revision
+			switch status.State {
+			case cluster.TransactionIndependent:
+				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+				return
+			case cluster.TransactionCanceled, cluster.TransactionFailed:
+				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				return
+			}
+		}
+		if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, revision, relay); err == nil {
+			return
+		}
+	}
 }
 
 func (b *runtimeBackend) completeSharedDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) error {
@@ -827,6 +871,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		}
 		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
 			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
+				if tx.State == cluster.TransactionPublished && tx.SparseHandoff != nil {
+					txCopy := tx
+					go recoverTargetSparseHandoff(targetRuntime, runtime.controlPlane, &txCopy)
+				}
 				targetRuntime.monitorDependency(tx.Identity.TransactionID, info.ID)
 			}
 		}
@@ -842,7 +890,30 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		monitorBackend.stdin = strings.NewReader("")
 		monitorBackend.stdout = io.Discard
 		monitorBackend.stderr = io.Discard
-		go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
-			tx.Identity.TransactionID, tx.Revision, nil)
+		if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
+			if tx.State == cluster.TransactionDraining {
+				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
+					tx.Identity.TransactionID, tx.Revision, nil)
+			} else {
+				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
+					tx.Identity.TransactionID, tx.Revision, nil)
+			}
+		} else {
+			go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
+				tx.Identity.TransactionID, tx.Revision, nil)
+		}
 	}
+}
+
+func recoverTargetSparseHandoff(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
+	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.SparseHandoff == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err := targetRuntime.Handoff(ctx, tx, *tx.SparseHandoff)
+	cancel()
+	if err != nil {
+		return
+	}
+	_, _ = control.Store.Advance(tx.Identity.TransactionID, tx.Revision, cluster.TransactionDraining, "", control.Now())
 }

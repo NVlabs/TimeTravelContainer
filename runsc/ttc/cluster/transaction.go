@@ -134,6 +134,9 @@ type Transaction struct {
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`
+	// SparseHandoff is durable and non-secret, allowing either daemon to retry
+	// the live-to-shared reader transition after a control-plane restart.
+	SparseHandoff *SparseHandoffDescriptor `json:"sparse_handoff,omitempty"`
 }
 
 var transactionTransitions = map[TransactionState]map[TransactionState]bool{

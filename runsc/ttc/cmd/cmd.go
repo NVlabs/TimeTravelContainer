@@ -7298,6 +7298,9 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err != nil {
 		return err
 	}
+	if err := b.ensureDistributedSourceIndependent(info.ID, ""); err != nil {
+		return fmt.Errorf("settling remote branches before removing %q: %w", name, err)
+	}
 	if !force {
 		for _, branch := range info.Branches {
 			switch normalizeLifecycleState(branch.State) {
@@ -8606,6 +8609,9 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 	target = resolved
+	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
+		return fmt.Errorf("settling remote branches before stopping %s: %w", target, err)
+	}
 	if _, err := persistentBranchInfo(info, target.branch); err != nil {
 		return err
 	}
@@ -8730,6 +8736,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return err
 	}
 	target = resolved
+	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
+		return fmt.Errorf("settling remote branches before dehydrating %s: %w", target, err)
+	}
 	store := b.containerStore()
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
@@ -9413,6 +9422,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		return err
 	}
 	target = resolved
+	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
+		return fmt.Errorf("settling remote branches before removing %s: %w", target, err)
+	}
 	var recorded *ttcbundle.BranchInfo
 	for i := range info.Branches {
 		if info.Branches[i].ID == target.branch {

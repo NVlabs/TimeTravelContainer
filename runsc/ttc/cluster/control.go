@@ -186,6 +186,35 @@ type PrepareRequest struct {
 	Session  RemoteSessionDescriptor `json:"session"`
 }
 
+// SparseHandoffDescriptor identifies a non-secret shared-filesystem memory
+// snapshot that can replace a target's live source connection.
+type SparseHandoffDescriptor struct {
+	Repository string `json:"repository"`
+	Manifest   string `json:"manifest"`
+	Branch     string `json:"branch"`
+}
+
+func (d SparseHandoffDescriptor) validate() error {
+	clean := filepath.Clean(d.Repository)
+	if d.Repository == "" || filepath.IsAbs(d.Repository) || clean != d.Repository || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid sparse memory repository path %q", d.Repository)
+	}
+	decoded, err := hex.DecodeString(d.Manifest)
+	if err != nil || len(decoded) != sha256.Size {
+		return errors.New("sparse memory manifest must be a SHA-256 hexadecimal ID")
+	}
+	if d.Branch == "" || d.Branch == "." || d.Branch == ".." || strings.ContainsAny(d.Branch, `/\\`) || strings.TrimSpace(d.Branch) != d.Branch {
+		return fmt.Errorf("invalid sparse memory branch %q", d.Branch)
+	}
+	return nil
+}
+
+// HandoffRequest durably binds and installs a sparse replacement reader.
+type HandoffRequest struct {
+	Revision uint64                  `json:"revision"`
+	Sparse   SparseHandoffDescriptor `json:"sparse"`
+}
+
 // RevisionRequest advances a transaction without carrying new secret state.
 type RevisionRequest struct {
 	Revision uint64           `json:"revision"`
@@ -206,6 +235,7 @@ type TargetRuntime interface {
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
 	Publish(context.Context, *Transaction, bool) error
 	Drain(context.Context, *Transaction) error
+	Handoff(context.Context, *Transaction, SparseHandoffDescriptor) error
 	Cancel(context.Context, *Transaction) error
 	MarkIndependent(context.Context, *Transaction) error
 }
@@ -281,6 +311,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "drain" && r.Method == http.MethodPost {
 		c.drain(w, r, id, peer)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "handoff" && r.Method == http.MethodPost {
+		c.handoff(w, r, id, peer)
 		return
 	}
 	writeControlError(w, http.StatusNotFound, "unknown cluster endpoint")
@@ -501,6 +535,66 @@ func (c *ControlPlane) drain(w http.ResponseWriter, r *http.Request, id, peer st
 		operation = c.TargetRuntime.Drain
 	}
 	c.advanceRuntime(w, r, id, peer, TransactionPublished, TransactionDraining, operation)
+}
+
+func (c *ControlPlane) handoff(w http.ResponseWriter, r *http.Request, id, peer string) {
+	unlock := c.lockTransaction(id)
+	defer unlock()
+	if c.TargetRuntime == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
+		return
+	}
+	tx, err := c.Store.Load(id)
+	if err != nil {
+		writeControlError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if peer != tx.Identity.SourceNodeID {
+		writeControlError(w, http.StatusForbidden, "only the source node may hand off target memory")
+		return
+	}
+	var request HandoffRequest
+	if err := decodeControlJSON(r.Body, &request); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := request.Sparse.validate(); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if tx.SparseHandoff != nil && *tx.SparseHandoff != request.Sparse {
+		writeControlError(w, http.StatusConflict, "transaction is bound to another sparse handoff")
+		return
+	}
+	if tx.State == TransactionIndependent || tx.State == TransactionDraining {
+		if tx.SparseHandoff == nil {
+			writeControlError(w, http.StatusConflict, "transaction advanced without a sparse handoff")
+			return
+		}
+		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
+	if tx.State != TransactionPublished || tx.Revision != request.Revision {
+		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionPublished, request.Revision))
+		return
+	}
+	if tx.SparseHandoff == nil {
+		tx, err = c.Store.BindSparseHandoff(id, tx.Revision, request.Sparse, c.Now())
+		if err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+	}
+	if err := c.TargetRuntime.Handoff(r.Context(), tx, request.Sparse); err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	tx, err = c.Store.Advance(id, tx.Revision, TransactionDraining, "", c.Now())
+	if err != nil {
+		writeControlError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeControlJSON(w, http.StatusOK, tx)
 }
 
 func (c *ControlPlane) advanceRuntime(w http.ResponseWriter, r *http.Request, id, peer string, required, next TransactionState, operation func(context.Context, *Transaction) error) {
@@ -739,6 +833,21 @@ func (c *Client) MarkIndependentWithMetrics(ctx context.Context, id string, revi
 // Drain requests eager target materialization so the source may stop safely.
 func (c *Client) Drain(ctx context.Context, id string, revision uint64) (*Transaction, error) {
 	return c.advance(ctx, id, "drain", revision)
+}
+
+// Handoff replaces future live page pulls with a durable sparse manifest.
+func (c *Client) Handoff(ctx context.Context, id string, revision uint64, sparse SparseHandoffDescriptor) (*Transaction, error) {
+	if !transactionIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid transaction ID %q", id)
+	}
+	if err := sparse.validate(); err != nil {
+		return nil, err
+	}
+	var tx Transaction
+	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/handoff", HandoffRequest{Revision: revision, Sparse: sparse}, &tx); err != nil {
+		return nil, err
+	}
+	return &tx, nil
 }
 
 func (c *Client) advance(ctx context.Context, id, operation string, revision uint64) (*Transaction, error) {

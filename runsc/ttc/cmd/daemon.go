@@ -425,6 +425,33 @@ func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) 
 	return err
 }
 
+func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, sparse cluster.SparseHandoffDescriptor) error {
+	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	manifest, err := ttcchunk.ParseManifestID(sparse.Manifest)
+	if err != nil {
+		return fmt.Errorf("parsing distributed sparse manifest: %w", err)
+	}
+	if err := r.backend.containerStore().UpdateDistributedForkSparseRoot(tx.Identity.TransactionID, sparse.Repository, sparse.Branch); err != nil {
+		return fmt.Errorf("recording distributed sparse memory root: %w", err)
+	}
+	path := filepath.Join(r.backend.dataRoot, sparse.Repository)
+	directory, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening distributed sparse repository: %w", err)
+	}
+	defer directory.Close()
+	_, err = r.backend.commandWithFiles([]*os.File{directory},
+		"timetravel", "--dehydration-memory-repository-fd=3", "--distributed-session="+manifest.String(),
+		info.ID, "distributed-handoff", defaultBranchID)
+	if err != nil {
+		return fmt.Errorf("switching distributed target to sparse memory: %w", err)
+	}
+	return nil
+}
+
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
 	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
 	if err == nil {
@@ -920,6 +947,10 @@ func rejectActiveDaemonContainers(backend backend) error {
 }
 
 func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID string) error {
+	return drainSourceDependenciesMatching(backend, source, store, nodeID, "", "")
+}
+
+func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID, containerID, branchID string) error {
 	if backend == nil || source == nil || store == nil || nodeID == "" {
 		return nil
 	}
@@ -931,6 +962,12 @@ func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceR
 		tx := transactions[i]
 		if tx.Identity.SourceNodeID != nodeID || !tx.SourceNeeded ||
 			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+			continue
+		}
+		if containerID != "" && tx.Identity.SourceContainer != containerID {
+			continue
+		}
+		if branchID != "" && tx.Identity.SourceBranch != branchID {
 			continue
 		}
 		peer := source.peers[tx.Identity.TargetNodeID]
@@ -977,6 +1014,20 @@ func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceR
 		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
 	}
 	return nil
+}
+
+// ensureDistributedSourceIndependent prevents branch-destructive operations
+// from invalidating an already-published remote child. In the normal path the
+// asynchronous sparse handoff has already completed, so this is a no-op.
+func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchID string) error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" || b.dataRoot == "" {
+		return nil
+	}
+	store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return err
+	}
+	return drainSourceDependenciesMatching(b, b.distributedSource, store, b.nodeID, containerID, branchID)
 }
 
 func wireOptions(opts options) daemonWireOptions {

@@ -128,6 +128,9 @@ const (
 	// ContMgrDrainDistributedForkMemory makes a target source-independent.
 	ContMgrDrainDistributedForkMemory = "containerManager.DrainDistributedForkMemory"
 
+	// ContMgrHandoffDistributedForkMemory replaces live paging with sparse chunks.
+	ContMgrHandoffDistributedForkMemory = "containerManager.HandoffDistributedForkMemory"
+
 	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
 	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
 
@@ -1143,6 +1146,11 @@ func (cm *containerManager) SetDistributedForkPrefetchWindow(args *DistributedFo
 // DrainDistributedForkMemory eagerly loads all remote pages for one branch.
 func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDependencyArgs, _ *struct{}) error {
 	return cm.l.family.DrainDistributedForkMemory(args.BranchID)
+}
+
+// HandoffDistributedForkMemory atomically replaces the target page reader.
+func (cm *containerManager) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs, _ *struct{}) error {
+	return cm.l.family.HandoffDistributedForkMemory(args)
 }
 
 // DistributedForkSessionStatus returns token-free transfer progress.

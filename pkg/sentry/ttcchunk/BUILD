@@ -14,6 +14,7 @@ go_library(
 		"install.go",
 		"lifecycle.go",
 		"manifest.go",
+		"packed_reader.go",
 		"repository.go",
         "store.go",
     ],
@@ -38,6 +39,7 @@ go_test(
     deps = [
         "//pkg/hostarch",
 		"//pkg/sentry/checkpoint",
+		"//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
     ],
 )

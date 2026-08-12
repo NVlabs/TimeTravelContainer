@@ -1267,6 +1267,15 @@ type asyncPagesReaderSwitch struct {
 	done   chan error
 }
 
+// AsyncPagesReaderGeometry is the immutable queue shape required by a reader
+// handed to AsyncPagesFileLoad.SwitchReader.
+type AsyncPagesReaderGeometry struct {
+	MaxReadBytes               uint64
+	MaxRanges                  int
+	MaxParallel                int
+	NeedsRegisterDestinationFD bool
+}
+
 type aplFileRange struct {
 	amfl *asyncMemoryFileLoad
 	memmap.FileRange
@@ -1542,6 +1551,14 @@ func (apfl *AsyncPagesFileLoad) SwitchReader(replacement stateio.AsyncReader) er
 		default:
 			return errors.New("async page loader stopped during reader handoff")
 		}
+	}
+}
+
+// ReaderGeometry returns the queue shape required for a reader handoff.
+func (apfl *AsyncPagesFileLoad) ReaderGeometry() AsyncPagesReaderGeometry {
+	return AsyncPagesReaderGeometry{
+		MaxReadBytes: apfl.maxReadBytes, MaxRanges: apfl.maxRanges,
+		MaxParallel: apfl.maxParallel, NeedsRegisterDestinationFD: apfl.needsRegisterDestinationFD,
 	}
 }
 

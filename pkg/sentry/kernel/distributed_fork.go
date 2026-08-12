@@ -22,6 +22,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -62,6 +63,13 @@ type DistributedForkCapture struct {
 	// branch bindings, whose packed stream has a different layout.
 	SparseSnapshot  *pgalloc.RemoteSnapshot
 	SparseSnapshots []*pgalloc.RemoteSnapshot
+	// HandoffSnapshot mirrors the allocator-wide TCP stream exactly. It is a
+	// second fork-time reservation used to publish a reader-compatible sparse
+	// manifest after a live target is already visible. MemoryBindings remains
+	// branch-scoped; HandoffBindings describes this compatibility stream.
+	HandoffSnapshot  *pgalloc.RemoteSnapshot
+	HandoffSnapshots []*pgalloc.RemoteSnapshot
+	HandoffBindings  []pgalloc.CapturedPageBinding
 
 	// FilesystemResources contains process-local handles. A same-process target
 	// may use them directly; a remote ttcd reopens equivalent handles from its
@@ -115,6 +123,16 @@ func (c *DistributedForkCapture) Close() error {
 		if snapshot != nil {
 			result = errors.Join(result, snapshot.Close())
 			c.SparseSnapshots[i] = nil
+		}
+	}
+	if c.HandoffSnapshot != nil {
+		result = errors.Join(result, c.HandoffSnapshot.Close())
+		c.HandoffSnapshot = nil
+	}
+	for i, snapshot := range c.HandoffSnapshots {
+		if snapshot != nil {
+			result = errors.Join(result, snapshot.Close())
+			c.HandoffSnapshots[i] = nil
 		}
 	}
 	return result
@@ -246,6 +264,32 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
+		handoffSnapshots, err := pgalloc.NewRemoteSnapshots(regions, len(childBranchIDs))
+		if err != nil {
+			return err
+		}
+		keepHandoffSnapshots := false
+		defer func() {
+			if !keepHandoffSnapshots {
+				for _, snapshot := range handoffSnapshots {
+					_ = snapshot.Close()
+				}
+			}
+		}()
+		handoffBindings := make([]pgalloc.CapturedPageBinding, 0)
+		for _, load := range loads {
+			for old, stream := load.Target.Start, load.StreamOffset; old < load.Target.End; old, stream = old+hostarch.PageSize, stream+hostarch.PageSize {
+				page, version, ok := k.mf.LogicalPageVersionAt(old)
+				if !ok {
+					return fmt.Errorf("allocator-wide distributed page %#x has no logical identity", old)
+				}
+				chunk, slot := page.Chunk()
+				handoffBindings = append(handoffBindings, pgalloc.CapturedPageBinding{
+					ResourceID: k.mf.ResourceID(), OldOffset: old, StreamOffset: stream, References: 1,
+					Page: page, Version: version, Chunk: chunk, Slot: slot,
+				})
+			}
+		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		k.filteringLiveForkDanglingEndpoints = true
@@ -270,17 +314,20 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		committed = true
 		capture = &DistributedForkCapture{
 			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
-			LoadRanges: loads, MemoryBindings: layout.Bindings, FilesystemResources: fsResources,
+			LoadRanges: loads, MemoryBindings: layout.Bindings, HandoffBindings: handoffBindings, FilesystemResources: fsResources,
 		}
 		if len(snapshots) == 1 {
 			capture.Snapshot = snapshots[0]
 			capture.SparseSnapshot = sparseSnapshots[0]
+			capture.HandoffSnapshot = handoffSnapshots[0]
 		} else {
 			capture.Snapshots = snapshots
 			capture.SparseSnapshots = sparseSnapshots
+			capture.HandoffSnapshots = handoffSnapshots
 		}
 		keepSnapshots = true
 		keepSparseSnapshots = true
+		keepHandoffSnapshots = true
 		return nil
 	})
 	if err != nil {
@@ -522,6 +569,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		return nil, fmt.Errorf("loading distributed Kernel metadata: %w", err)
 	}
 	child.remotePageLoad = pages
+	child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), loadRanges...)
 	loaded = true
 	// The restored VVAR mapping still refers to its fork-time remote page, but
 	// privatizeLiveForkVDSOParamPage replaces that mapping with a new local
@@ -560,6 +608,38 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}
 	child.Pause()
 	return child, nil
+}
+
+// HandoffDistributedForkMemory replaces a live remote page source with an
+// immutable shared-filesystem manifest without eagerly faulting remaining
+// pages. repository ownership transfers to the loader.
+func (k *Kernel) HandoffDistributedForkMemory(repository *ttcchunk.MemoryRepository, manifest ttcchunk.ManifestID) error {
+	if k.remoteHandoffManifest != (ttcchunk.ManifestID{}) {
+		_ = repository.Close()
+		if k.remoteHandoffManifest == manifest {
+			return nil
+		}
+		return fmt.Errorf("distributed memory was already handed to manifest %s", k.remoteHandoffManifest)
+	}
+	if k.remotePageLoad == nil {
+		_ = repository.Close()
+		return fmt.Errorf("kernel has no active distributed remote-memory load")
+	}
+	geometry := k.remotePageLoad.ReaderGeometry()
+	if geometry.NeedsRegisterDestinationFD {
+		_ = repository.Close()
+		return errors.New("distributed memory handoff does not support registered destination files")
+	}
+	packed, err := ttcchunk.NewPackedManifestReader(repository, manifest, k.remoteLoadRanges)
+	if err != nil {
+		return err
+	}
+	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)
+	if err := k.remotePageLoad.SwitchReader(reader); err != nil {
+		return err
+	}
+	k.remoteHandoffManifest = manifest
+	return nil
 }
 
 // SetDistributedForkPrefetchWindow changes the active remote-memory prefetch

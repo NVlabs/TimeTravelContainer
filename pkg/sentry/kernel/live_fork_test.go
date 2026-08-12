@@ -525,6 +525,119 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	parent.Release()
 }
 
+func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+	if err != nil {
+		parent.Release()
+		t.Fatal(err)
+	}
+	parent.Pause()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "handoff"})
+	if err != nil {
+		parent.MemoryFile().DecRef(orphan)
+		parent.Release()
+		t.Fatalf("CaptureDistributedFork: %v", err)
+	}
+	parent.MemoryFile().DecRef(orphan)
+	if len(capture.HandoffBindings) <= len(capture.MemoryBindings) {
+		capture.Close()
+		parent.Release()
+		t.Fatalf("test setup did not create allocator-only pages: handoff=%d exact=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
+	}
+	repositoryDir := t.TempDir()
+	publisher, err := ttcchunk.OpenMemoryRepository(repositoryDir)
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	objects, bindings, err := ttcchunk.ReadSnapshot(capture.HandoffSnapshot, capture.HandoffBindings)
+	var manifest ttcchunk.ManifestID
+	if err == nil {
+		manifest, err = publisher.Publish(objects, bindings)
+		if err == nil {
+			if closeErr := capture.HandoffSnapshot.Close(); closeErr != nil {
+				err = closeErr
+			} else {
+				capture.HandoffSnapshot = nil
+			}
+		}
+	}
+	if closeErr := publisher.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	token := ttcremote.SnapshotToken{0x54, 0x54, 0x43, 4}
+	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, 256<<10)
+	if err != nil {
+		capture.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	capture.Snapshot = nil
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, 256<<10, 16, 4, 5*time.Second)
+	if err != nil {
+		server.Close()
+		parent.Release()
+		t.Fatal(err)
+	}
+	targetMF := newRemoteKernelMemoryFile(t)
+	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges,
+		&ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone},
+		kernel.DistributedForkLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "handoff",
+			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
+		})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LoadDistributedFork: %v", err)
+	}
+	repository, err := ttcchunk.OpenMemoryRepository(repositoryDir)
+	if err != nil {
+		child.Release()
+		parent.Release()
+		t.Fatal(err)
+	}
+	if err := child.HandoffDistributedForkMemory(repository, manifest); err != nil {
+		child.Release()
+		parent.Release()
+		t.Fatalf("HandoffDistributedForkMemory: %v", err)
+	}
+	// Retrying the same command after a lost daemon response is harmless.
+	retryRepository, err := ttcchunk.OpenMemoryRepository(repositoryDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.HandoffDistributedForkMemory(retryRepository, manifest); err != nil {
+		t.Fatalf("retrying HandoffDistributedForkMemory: %v", err)
+	}
+	child.DrainDistributedForkMemory()
+	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatalf("draining sparse handoff: %v", err)
+	}
+	child.Release()
+	parent.Release()
+}
+
 func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -653,6 +766,12 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 			t.Fatal(err)
 		}
 		capture.SparseSnapshots[i] = nil
+	}
+	for i, snapshot := range capture.HandoffSnapshots {
+		if err := snapshot.Close(); err != nil {
+			t.Fatal(err)
+		}
+		capture.HandoffSnapshots[i] = nil
 	}
 	if len(capture.LoadRanges) == 0 || capture.LoadRanges[0].Target.Length() < hostarch.PageSize {
 		t.Fatal("capture has no remotely loadable page")

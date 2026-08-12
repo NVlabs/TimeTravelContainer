@@ -2237,6 +2237,14 @@ func (s *Sandbox) DrainDistributedForkMemory(branchID string) error {
 	return nil
 }
 
+// HandoffDistributedForkMemory replaces a live source with a sparse manifest.
+func (s *Sandbox) HandoffDistributedForkMemory(args *boot.DistributedForkHandoffArgs) error {
+	if err := s.call(boot.ContMgrHandoffDistributedForkMemory, args, nil); err != nil {
+		return fmt.Errorf("handing off distributed fork memory for branch %q: %w", args.BranchID, err)
+	}
+	return nil
+}
+
 // DistributedForkSessionStatus returns remote-memory transfer progress.
 func (s *Sandbox) DistributedForkSessionStatus(id string) (boot.DistributedForkSessionStatus, error) {
 	var status boot.DistributedForkSessionStatus

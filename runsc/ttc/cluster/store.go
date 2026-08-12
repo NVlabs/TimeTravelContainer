@@ -212,6 +212,45 @@ func (s *Store) BindSession(id string, revision uint64, digest string, now time.
 	return tx, nil
 }
 
+// BindSparseHandoff durably records the immutable shared-memory identity
+// before the target reader is switched. It deliberately does not advance the
+// transaction so a crash can safely retry the idempotent runtime operation.
+func (s *Store) BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error) {
+	if err := sparse.validate(); err != nil {
+		return nil, err
+	}
+	path, err := s.path(id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := loadTransaction(path, id)
+	if err != nil {
+		return nil, err
+	}
+	if tx.SparseHandoff != nil {
+		if *tx.SparseHandoff != sparse {
+			return nil, fmt.Errorf("transaction %q is bound to another sparse handoff", id)
+		}
+		return tx, nil
+	}
+	if tx.Revision != revision || tx.State != TransactionPublished {
+		return nil, fmt.Errorf("transaction %q is %s revision %d, not published revision %d", id, tx.State, tx.Revision, revision)
+	}
+	copy := sparse
+	tx.SparseHandoff = &copy
+	tx.UpdatedAt = now
+	data, err := marshalTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.replace(path, data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
 // List returns all valid records ordered by transaction ID.
 func (s *Store) List() ([]Transaction, error) {
 	s.mu.Lock()
@@ -343,6 +382,11 @@ func loadTransaction(path, id string) (*Transaction, error) {
 	if tx.SessionDigest != "" {
 		if err := validateSHA256Digest(tx.SessionDigest); err != nil {
 			return nil, fmt.Errorf("transaction %q session digest: %w", id, err)
+		}
+	}
+	if tx.SparseHandoff != nil {
+		if err := tx.SparseHandoff.validate(); err != nil {
+			return nil, fmt.Errorf("transaction %q sparse handoff: %w", id, err)
 		}
 	}
 	if _, known := transactionTransitions[tx.State]; !known && !tx.Terminal() {

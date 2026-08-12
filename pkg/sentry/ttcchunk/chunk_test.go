@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -29,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
@@ -565,6 +567,31 @@ func publishLifecycleManifest(t *testing.T, repository *MemoryRepository, fill b
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestPackedManifestReaderPreservesDistributedStreamLayout(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x5a)
+	reader, err := NewPackedManifestReader(repository, manifest, []pgalloc.RemoteLoadRange{{
+		Target: memmap.FileRange{Start: 0, End: hostarch.PageSize}, StreamOffset: 2 * hostarch.PageSize,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got := make([]byte, hostarch.PageSize)
+	if n, err := reader.ReadAt(got, 2*hostarch.PageSize); err != nil || n != len(got) {
+		t.Fatalf("ReadAt: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, bytes.Repeat([]byte{0x5a}, len(got))) {
+		t.Fatal("packed reader returned incorrect page contents")
+	}
+	if _, err := reader.ReadAt(make([]byte, hostarch.PageSize), 0); !errors.Is(err, io.EOF) {
+		t.Fatalf("unmapped packed offset error=%v, want EOF", err)
+	}
 }
 
 func TestDonatedRepositoryPublishesAndReadsRelativeToFD(t *testing.T) {

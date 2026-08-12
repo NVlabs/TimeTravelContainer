@@ -37,6 +37,7 @@ type testTargetRuntime struct {
 	prepared    int
 	published   int
 	drained     int
+	handedOff   int
 	canceled    int
 	independent int
 }
@@ -61,6 +62,13 @@ func (r *testTargetRuntime) Drain(context.Context, *Transaction) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.drained++
+	return nil
+}
+
+func (r *testTargetRuntime) Handoff(context.Context, *Transaction, SparseHandoffDescriptor) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.handedOff++
 	return nil
 }
 
@@ -273,6 +281,75 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if runtime.prepared != 1 || runtime.published != 1 || runtime.drained != 1 || runtime.independent != 1 {
 		t.Fatalf("runtime calls: %+v", runtime)
+	}
+}
+
+func TestMutualTLSControlPlaneSparseHandoffIsDurableAndIdempotent(t *testing.T) {
+	files := newTestTLSFiles(t)
+	serverTLS, err := LoadServerTLSConfig(files.serverCert, files.serverKey, files.ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS, err := LoadClientTLSConfig(files.clientCert, files.clientKey, files.ca, "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &testTargetRuntime{}
+	now := time.Unix(4000, 0)
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		Now: func() time.Time { now = now.Add(time.Second); return now }, TargetRuntime: runtime,
+	}
+	server := httptest.NewUnstartedServer(control)
+	server.TLS = serverTLS
+	server.StartTLS()
+	defer server.Close()
+	client, err := NewClient(server.URL, clientTLS, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := RemoteSessionDescriptor{
+		Address: "10.0.0.1:12345", SnapshotToken: strings.Repeat("ab", 16),
+		MetadataBytes: 1 << 20, StreamBytes: 8 << 20, MaxTransferBytes: 64 << 10,
+	}
+	prepared, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sparse := SparseHandoffDescriptor{Repository: "cluster/memory-chunks", Manifest: strings.Repeat("12", 32), Branch: "branch-a"}
+	draining, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse)
+	if err != nil || draining.State != TransactionDraining || draining.SparseHandoff == nil || *draining.SparseHandoff != sparse {
+		t.Fatalf("handoff=%+v err=%v", draining, err)
+	}
+	reopened, err := OpenStore(store.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := reopened.Load(tx.Identity.TransactionID)
+	if err != nil || persisted.SparseHandoff == nil || *persisted.SparseHandoff != sparse {
+		t.Fatalf("persisted handoff=%+v err=%v", persisted, err)
+	}
+	// A replay with the pre-handoff revision models a lost HTTP response.
+	retried, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse)
+	if err != nil || retried.Revision != draining.Revision {
+		t.Fatalf("handoff retry=%+v err=%v", retried, err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.handedOff != 1 {
+		t.Fatalf("runtime handoff calls=%d, want 1", runtime.handedOff)
 	}
 }
 

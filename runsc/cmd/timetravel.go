@@ -119,6 +119,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-handoff <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
@@ -380,6 +381,22 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.SetDistributedForkPrefetchWindow(f.Arg(2), t.distributedPrefetchBehind, t.distributedPrefetchBytes)
 	case "distributed-drain":
 		err = cont.Sandbox.DrainDistributedForkMemory(f.Arg(2))
+	case "distributed-handoff":
+		if t.dehydrationMemoryRepositoryFD < 0 || t.distributedSessionID == "" {
+			util.Fatalf("--dehydration-memory-repository-fd and --distributed-session=<manifest> are required")
+		}
+		manifest, parseErr := ttcchunk.ParseManifestID(t.distributedSessionID)
+		if parseErr != nil {
+			util.Fatalf("parsing distributed sparse manifest: %v", parseErr)
+		}
+		repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-handoff-memory-repository")
+		if repository == nil {
+			util.Fatalf("invalid distributed handoff repository FD")
+		}
+		err = cont.Sandbox.HandoffDistributedForkMemory(&boot.DistributedForkHandoffArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{repository}}, BranchID: f.Arg(2), Manifest: manifest,
+		})
+		repository.Close()
 	case "distributed-cancel":
 		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
 	case "distributed-complete":

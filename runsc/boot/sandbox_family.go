@@ -204,6 +204,15 @@ type DistributedForkDependencyArgs struct {
 	PrefetchBehindBytes uint64
 }
 
+// DistributedForkHandoffArgs replaces a target's live network page source
+// with an immutable sparse manifest. FilePayload contains one repository
+// directory descriptor.
+type DistributedForkHandoffArgs struct {
+	urpc.FilePayload
+	BranchID string
+	Manifest ttcchunk.ManifestID
+}
+
 // BranchArgs selects an existing branch. An empty ID selects the default.
 type BranchArgs struct {
 	ID string
@@ -754,13 +763,13 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		_ = resume()
 		return nil, fmt.Errorf("distributed capture returned %d snapshots for %d children", len(snapshots), len(children))
 	}
-	sparseSnapshots := capture.SparseSnapshots
-	if capture.SparseSnapshot != nil {
-		sparseSnapshots = []*pgalloc.RemoteSnapshot{capture.SparseSnapshot}
+	handoffSnapshots := capture.HandoffSnapshots
+	if capture.HandoffSnapshot != nil {
+		handoffSnapshots = []*pgalloc.RemoteSnapshot{capture.HandoffSnapshot}
 	}
-	if len(sparseSnapshots) != len(children) {
+	if len(handoffSnapshots) != len(children) {
 		_ = resume()
-		return nil, fmt.Errorf("distributed capture returned %d sparse snapshots for %d children", len(sparseSnapshots), len(children))
+		return nil, fmt.Errorf("distributed capture returned %d handoff snapshots for %d children", len(handoffSnapshots), len(children))
 	}
 	infos := make([]DistributedForkSessionInfo, len(children))
 	for i, child := range children {
@@ -815,17 +824,23 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		sessions[i] = &distributedForkSession{
 			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
 			resources: capture.FilesystemResources, server: server,
-			sparseSnapshot: sparseSnapshots[i], memoryBindings: capture.MemoryBindings,
+			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.HandoffBindings,
 		}
-		if capture.SparseSnapshot != nil {
-			capture.SparseSnapshot = nil
+		if capture.HandoffSnapshot != nil {
+			capture.HandoffSnapshot = nil
 		} else {
-			capture.SparseSnapshots[i] = nil
+			capture.HandoffSnapshots[i] = nil
 		}
 		infos[i] = DistributedForkSessionInfo{
 			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
 			MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
 		}
+	}
+	// The legacy TCP and allocator-wide handoff snapshots have transferred to
+	// their servers/sessions. Close the now-unused exact branch snapshots.
+	if err := capture.Close(); err != nil {
+		_ = resume()
+		return nil, fmt.Errorf("closing unused distributed capture reservations: %w", err)
 	}
 	f.mu.Lock()
 	for _, child := range children {
@@ -913,10 +928,9 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if err != nil {
 		return nil, err
 	}
-	if err := session.sparseSnapshot.Close(); err != nil {
-		return nil, err
-	}
-	session.sparseSnapshot = nil
+	// Keep sparseSnapshot until distributed-complete. This makes publication
+	// retryable after a ttcd crash between repository publication and the
+	// target's durable handoff record.
 	return &DistributedForkExportInfo{Manifest: manifest, FilesystemBranch: session.filesystemBranch}, nil
 }
 
@@ -1031,6 +1045,24 @@ func (f *SandboxFamily) DrainDistributedForkMemory(branchID string) error {
 	defer release()
 	b.k.DrainDistributedForkMemory()
 	return nil
+}
+
+// HandoffDistributedForkMemory switches future faults from the live source to
+// a durable sparse manifest after all in-flight network reads quiesce.
+func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs) error {
+	if args == nil || args.BranchID == "" || args.Manifest == (ttcchunk.ManifestID{}) || len(args.FilePayload.Files) != 1 {
+		return errors.New("distributed fork handoff requires a branch, manifest, and one repository descriptor")
+	}
+	b, release, err := f.beginControl(args.BranchID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
+	if err != nil {
+		return fmt.Errorf("opening distributed handoff repository: %w", err)
+	}
+	return b.k.HandoffDistributedForkMemory(repository, args.Manifest)
 }
 
 // CloseDistributedForkSessions releases all remote dependencies during Sentry
