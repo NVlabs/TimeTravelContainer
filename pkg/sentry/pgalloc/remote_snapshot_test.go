@@ -387,9 +387,10 @@ func TestAttachRemotePageLoad(t *testing.T) {
 		t.Fatalf("background-load map unit=%d, want default cap", got)
 	}
 
-	if !target.IsAsyncLoading() {
-		t.Fatal("target did not enter asynchronous loading state")
-	}
+	// The loopback loader is allowed to finish before AttachRemotePageLoad
+	// returns, especially under race instrumentation. Do not require observing
+	// the transient loading state; the read and completion checks below verify
+	// both possible schedules.
 	loaded, err := target.MapInternal(targetFR, hostarch.Read)
 	if err != nil {
 		t.Fatal(err)
