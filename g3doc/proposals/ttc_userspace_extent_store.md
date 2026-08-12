@@ -42,11 +42,13 @@ of which physical storage engine is selected:
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-The first implementation should use Pebble v2 behind a narrow backend
-interface and qualify it with TTC workloads. A TTC-specific metadata
-checkpoint/WAL plus data arenas remains the fallback, not the presumed
-production choice. Large payloads should not pass through a relational
-database's record and locking paths.
+The first prototype should use Pebble v2 behind a narrow backend interface.
+Synthetic TTC-shaped qualification found it promising but also exposed
+read/write tradeoffs and a potentially material per-database WAL-recycling
+reserve. It is therefore a benchmark-qualified prototype candidate, not yet
+the selected production storage format. A TTC-specific metadata checkpoint/WAL
+plus data arenas remains the comparison and fallback. Large payloads should
+not pass through a relational database's record and locking paths.
 
 ## Existing storage-engine survey
 
@@ -68,9 +70,9 @@ The candidates investigated in August 2026 are:
 | [bbolt](https://github.com/etcd-io/bbolt) | Small, stable, pure-Go, mmap-backed transactional B+tree. | It has one writer and explicitly cannot truncate its database to return interior free pages to the host filesystem. |
 | [go-storethehash](https://github.com/ipld/go-storethehash) | Append-oriented primary storage and an on-disk hash index aimed at block stores. | Its documented primary-store compaction/free-list work is incomplete, so TTC would inherit the unfinished part it is trying to avoid writing. |
 
-### Initial selection: Pebble behind a TTC interface
+### Prototype candidate: Pebble behind a TTC interface
 
-Phase 0 should prototype Pebble v2 as the physical backend rather than import
+Phase 0 may prototype Pebble v2 as the physical backend rather than import
 its `sstable/blob` subpackage directly. The latter exposes Pebble-specific
 object-storage and internal identifier types and is not an independent blob
 database API.
@@ -91,16 +93,21 @@ deleted after TTC's reachability and lease rules permit it; Pebble then
 reclaims their physical space through compaction and deletion of obsolete
 table or blob files.
 
-The first benchmark should compare two Pebble modes:
+The first synthetic qualification compared two Pebble modes:
 
 1. ordinary 4 KiB values in SSTs, which uses only established Pebble paths;
 2. v2 value separation with 4 KiB values in blob files, which may reduce data
    rewrite amplification but is still configured through Pebble's
    `Experimental.ValueSeparationPolicy`.
 
-Do not ship value separation merely because its layout looks closer to TTC's
-arena. It must win the crash, steady-state space, write-amplification, random
-page-fault, fork, deletion, and foreground-latency tests below.
+The results are recorded in
+[`g3doc/benchmarks/ttc_pebble_qualification.md`](../benchmarks/ttc_pebble_qualification.md).
+Ordinary SST values won the branch-shaped read-latency and steady-space tests;
+experimental value separation reduced rewrite traffic and compaction time
+under full overwrite churn. Neither result justifies shipping value separation
+yet. Real TTC integration must still pass the crash, steady-state space,
+write-amplification, page-fault, fork, deletion, and foreground-latency tests
+below.
 
 Keep the backend boundary small enough that the custom arena described in this
 proposal can replace Pebble without changing branch metadata or guest-visible
