@@ -35,7 +35,10 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 )
@@ -671,6 +674,88 @@ func TestReconcileClusterSparseMemoryRoots(t *testing.T) {
 	}
 	if len(roots) != 0 {
 		t.Fatalf("roots after releasing final reference = %+v, want empty", roots)
+	}
+}
+
+func TestReconcileClusterSparseMemoryRootsProtectsNonterminalTransaction(t *testing.T) {
+	dataRoot := t.TempDir()
+	relative := filepath.Join("cluster", "memory-chunks")
+	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.Publish(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const transactionID = "tx-protected"
+	protected := ttcvolume.ScopedBranchID("source-id", transactionID)
+	for _, branch := range []string{protected, "orphaned"} {
+		if err := repository.SetBranch(branch, manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := cluster.OpenStore(filepath.Join(dataRoot, "cluster", "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("0", 64)
+	tx, err := cluster.NewTransaction(cluster.ForkIdentity{
+		TransactionID: transactionID, SourceNodeID: "node-a", TargetNodeID: "node-b",
+		SourceContainer: "source-id", SourceBranch: "main",
+		TargetContainer: "target", TargetBranch: transactionID,
+		ImageDigest: digest, RootfsDigest: digest, RepositoryID: "shared",
+	}, cluster.NegotiatedCapabilities{
+		Protocol: cluster.ControlProtocolVersion, BasePageSize: 4096,
+		MaxTransferSize: 2 << 20, PagingPolicy: ttcpolicy.DefaultPolicy(),
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(tx); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &runtimeBackend{dataRoot: dataRoot}
+	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots, err := repository.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[protected] != manifest {
+		t.Fatalf("roots with preparing transaction = %+v, want %q=%s", roots, protected, manifest)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Advance(transactionID, tx.Revision, cluster.TransactionCanceled, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	roots, err = repository.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("roots after terminal transaction = %+v, want empty", roots)
 	}
 }
 

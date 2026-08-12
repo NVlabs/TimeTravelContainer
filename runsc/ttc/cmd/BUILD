@@ -40,8 +40,10 @@ go_test(
     srcs = ["cmd_test.go", "cp_test.go", "daemon_test.go", "daemon_terminal_test.go", "events_test.go", "idempotency_test.go", "runtime_command_test.go"],
     library = ":cmd",
     deps = [
+		"//pkg/ttcremote",
         "//pkg/ttcvolume",
         "//runsc/specutils",
+		"//runsc/ttc/cluster",
         "//runsc/ttc/console",
         "@com_github_opencontainers_runtime_spec//specs-go",
     ],
