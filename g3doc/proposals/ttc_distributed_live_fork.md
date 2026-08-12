@@ -2,9 +2,11 @@
 
 > **Planned storage replacement:**
 > [TTC userspace extent store](ttc_userspace_extent_store.md) describes the
-> family-level page store intended to replace branch-specific packed snapshot
-> files and shared-filesystem reflink requirements. This document continues to
-> describe the implemented transport and snapshot design.
+> family-level immutable 1 MiB chunk repository intended to replace
+> branch-specific packed snapshots and shared-filesystem reflink requirements.
+> Pebble is not part of that plan. This document continues to describe the
+> currently implemented transport and packed-snapshot design where explicitly
+> labelled.
 
 Status: design and implementation plan; implementation in progress.
 
@@ -36,7 +38,53 @@ Implementation progress:
   source-independent filesystem repository lifetime, and dehydration
   integration: implemented and tested.
 
-## Summary
+## Planned 1 MiB shared-chunk data plane
+
+All cooperating `ttcd` instances use the same shared TTC data root. Durable
+memory is represented by immutable, content-addressed files containing up to
+1 MiB, or 256 base pages, from the packed snapshot stream. Immutable manifests
+map stream ranges to chunk IDs; branch records point to manifests without
+encoding branch ancestry. Memory CoW, residency, and correctness remain 4 KiB.
+
+For an already-dehydrated branch, remote fork is metadata-only: the new branch
+references the same manifest, the destination acquires a loader lease, and it
+reads 1 MiB chunks directly from the shared filesystem on demand. Loading a
+chunk installs every valid page. Consumption releases that manifest's
+reference, but physical unlink waits until no manifest or loader lease can
+still read the chunk.
+
+Dehydration writes and synchronizes all chunks, publishes the manifest last,
+and only then releases the Sentry and its memory. After publication, any node
+can rehydrate the branch even if the source process and source node have exited.
+
+A live remote fork must not wait for the complete memory image to be written.
+It therefore uses the existing page-granular TCP dependency as a bridge:
+
+1. Node A pauses, establishes the fork-time CoW snapshot, publishes target
+   metadata, and resumes the source.
+2. Node B may start immediately and pull missing pages from A using the current
+   race-tested transport.
+3. In parallel, A or B groups preserved snapshot pages into 1 MiB chunks,
+   hashes them, and publishes them atomically to the shared repository.
+4. Immutable progress generations redirect completed stream ranges to shared
+   chunks. A target lookup chooses the newest committed generation; an
+   in-flight TCP read and a newly published identical chunk are resolved
+   idempotently.
+5. After a complete durable manifest is committed and every target has switched
+   from the live dependency, A releases the remaining page-server references.
+
+This combines remote fork and dehydration without making snapshot construction
+part of the source pause. The shared filesystem becomes the durable ownership
+tier; TCP is temporary for live forks and unnecessary for forks of already
+dehydrated branches.
+
+The first format fixes the chunk load size at 1 MiB. It deliberately accepts up
+to 256-page read/residency amplification to reduce shared-filesystem inode and
+metadata pressure. Qualification must measure useful-page ratio, fault tail
+latency, shared-filesystem operations, and source-release time before the format
+is made stable. Pebble and remote SSTs are out of scope.
+
+## Current packed-snapshot baseline
 
 TimeTravelContainer (TTC) can fork a branch running on node A into a new branch
 on node B without transferring the complete memory image before the target

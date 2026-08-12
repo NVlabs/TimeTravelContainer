@@ -4,8 +4,8 @@
 
 Design exploration. No storage-format or runtime changes described here are
 implemented yet. The unified mutable-filesystem store is postponed. The active
-first scope is a simple immutable 64 KiB-file backend for dehydrated memory;
-Pebble remains a measured alternative.
+first scope is a simple immutable 1 MiB-file backend for dehydrated and remotely
+forked memory. Pebble is not part of the implementation plan.
 
 This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
@@ -45,31 +45,29 @@ storage engine is selected:
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-The first prototype is deliberately narrower: store each immutable 64 KiB
-dehydrated-memory transfer unit in an ordinary host file. Put at most 1,024
-chunk files in each shard directory, retain directory descriptors, and use
-`openat`/`unlinkat` on the demand path. A successful load populates sixteen
-independently CoW 4 KiB memory pages, releases that manifest's reference, and
-unlinks the chunk only after no dehydrated manifest references it. The chunk
-name also provides a natural object identifier for remote reads.
+The first prototype is deliberately narrower: store each immutable 1 MiB
+dehydrated-memory transfer unit in an ordinary file in the cluster's shared TTC
+data root. Each chunk contains up to 256 consecutive 4 KiB pages from the
+packed memory stream. Put at most 1,024 chunks, or 1 GiB of dense payload, in
+each shard directory; retain directory descriptors; and use
+`openat`/`unlinkat` on the demand path.
 
-Pebble v2 remains behind the same narrow backend interface as a measured
-alternative. Its optimized form builds one sorted external SST, ingests it
-directly, and stays immutable during loading. Against loose files, Pebble's
-median build was 59% faster and its serialized sequential load was 4.1 times
-as fast. Loose files were 2.5% faster for single-worker cold faults and 6.6%
-faster with 16 workers, while returning disk space after every unlink. Pebble
-retains the complete allocation until the final unit is consumed and the
-database is removed. This makes loose files a better first integration for
-lazy and distributed hydration, while Pebble remains attractive for bulk
-restore. The packed-file backend can continue to be preferred where reflinks
-and hole punching are available.
+A successful load reads the complete chunk, populates up to 256 independently
+CoW 4 KiB memory pages, and releases that manifest's reference. The chunk is
+unlinked only after no dehydrated manifest or active loader lease references
+it. Chunk files are immutable and addressable by stable IDs, so another `ttcd`
+on the shared filesystem can load them without a source-process dependency.
+The existing packed-file backend remains only as a compatibility path while
+the chunk format is integrated. It is not the target design even on filesystems
+that support reflinks and hole punching.
 
-Pebble is not approved for rootfs or managed-volume contents. In particular,
-representing a mutable 64 KiB extent as one Pebble value retained only 0.39% of
-raw-file unsynced random 4 KiB write throughput in the synthetic benchmark. A
-TTC-specific metadata checkpoint/WAL plus data arenas remains a future
-comparison if the filesystem store is revisited.
+Pebble experiments remain historical qualification only; no Pebble code or
+dependency is added to TTC now. Pebble is also not approved for rootfs or
+managed-volume contents. In particular, representing a mutable 64 KiB extent
+as one Pebble value retained only 0.39% of raw-file unsynced random 4 KiB write
+throughput in the synthetic benchmark. A TTC-specific metadata checkpoint/WAL
+plus data arenas remains a future comparison if the filesystem store is
+revisited.
 
 ## Existing storage-engine survey
 
@@ -91,25 +89,88 @@ The candidates investigated in August 2026 are:
 | [bbolt](https://github.com/etcd-io/bbolt) | Small, stable, pure-Go, mmap-backed transactional B+tree. | It has one writer and explicitly cannot truncate its database to return interior free pages to the host filesystem. |
 | [go-storethehash](https://github.com/ipld/go-storethehash) | Append-oriented primary storage and an on-disk hash index aimed at block stores. | Its documented primary-store compaction/free-list work is incomplete, so TTC would inherit the unfinished part it is trying to avoid writing. |
 
-### Memory hydration candidates
+### Selected memory hydration design
 
-Phase 0 should implement the loose 64 KiB-file backend first. Snapshot contents
-are written into an unpublished staging directory, synchronized, and published
-through TTC metadata. Interrupted unpublished construction can be removed as a
-unit. Large snapshots use bounded shard directories rather than one unbounded
+Phase 0 implements only loose 1 MiB chunk files. Pebble remains benchmarked
+prior art and is not included as an A/B runtime backend in this phase.
+
+Snapshot contents are written as immutable chunks before an immutable manifest
+is published. Interrupted unpublished construction can be removed as a unit.
+Large snapshots use bounded shard directories rather than one unbounded
 directory. Reads and unlinks operate relative to retained directory
-descriptors, and directory synchronization can batch consumption records.
+descriptors, and directory synchronization batches consumption records.
 
-If Pebble is enabled, snapshot construction uses its public `sstable.Writer`
-and `DB.Ingest` APIs so bulk contents do not pass through the WAL and memtable.
-Use sorted `page/<stream-offset>` records containing one 64 KiB transfer unit.
-The database remains immutable while readable and is removed only when no
-unloaded page still depends on it. Partial loading must not create tombstones
-or compact the database.
+One chunk covers 1 MiB of the packed snapshot stream, not necessarily one
+contiguous guest virtual-address interval. Its manifest entry records stream
+offset, valid length for the final chunk, stable chunk ID, and checksum. The
+manifest already maps packed pages back into `MemoryFile` ranges. Loading reads
+the entire valid chunk, installs every contained page, and marks each 4 KiB page
+resident independently. Thus 1 MiB is the persistence, shared-filesystem, and
+prefetch unit; memory CoW and correctness remain 4 KiB.
 
-For both backends, 64 KiB is an I/O unit, not a memory CoW boundary. Loading a
-unit populates sixteen independently CoW 4 KiB memory pages. TTC's existing
-resident-page bitmap prevents repeated loads.
+The 1 MiB choice deliberately trades as much as 256-page read and residency
+amplification on a sparse access for 16 times fewer host files and metadata
+operations than the measured 64 KiB layout. A 16 GiB dense snapshot uses
+16,384 chunk files rather than 262,144. This tradeoff must be validated with
+real lazy-rehydration and shared-filesystem workloads before the format is
+declared stable.
+
+The shared repository uses a family-level namespace; chunks never belong to a
+particular branch:
+
+```text
+memory-v2/<family-id>/
+  chunks/<shard>/<chunk-id>.chunk
+  manifests/<manifest-id>.manifest
+  branches/<branch-id>
+  leases/<node-id>/<loader-id>
+  transactions/<transaction-id>/
+```
+
+`branches/<branch-id>` is a small atomic pointer to an immutable manifest, not
+a parent/child lineage record. Manifests are the authoritative chunk roots.
+Loader leases protect chunks that a host may still read while a branch pointer
+is being consumed or replaced. Family GC traces all manifests and live or
+conservatively recovered leases; it does not rely on a chunk being owned by one
+branch or on an in-memory reference count surviving daemon failure.
+
+Rehydration atomically replaces the dehydrated branch pointer with a loader
+lease containing the manifest ID and a remaining-chunk bitmap. After all pages
+in a chunk are installed, the loader records that clear and synchronizes lease
+updates in bounded batches; until the clear is durable, GC conservatively keeps
+the chunk. A crash before the clear merely retains garbage and never loses
+required data.
+Redehydration reuses every still-unconsumed chunk and writes new chunks for the
+resident state, then publishes a new complete immutable manifest. This keeps
+consumption and reuse at the same 1 MiB boundary without assigning chunks to a
+branch.
+
+`chunk-id` is SHA-256 over a format-domain separator, valid payload length, and
+payload bytes; the first digest bytes select the shard. The digest provides
+idempotent multi-host publication, integrity checking, and opportunistic
+deduplication without a mutable chunk index. Hashing cost and contention remain
+part of the qualification benchmark.
+
+Publication order is data before references:
+
+1. Write each chunk to a transaction-local temporary name on the shared
+   filesystem, verify its length and checksum, and synchronize it.
+2. Atomically rename it into the immutable chunk namespace and synchronize the
+   shard directory. An existing identical ID is verified and reused; a
+   collision with different contents fails closed.
+3. Write and synchronize the immutable manifest only after every referenced
+   chunk is visible.
+4. Atomically publish or replace the branch pointer and synchronize its
+   directory.
+5. Mark the transaction complete. Recovery removes unpublished temporary data
+   and retains any chunk reachable from a manifest or lease.
+
+The required shared-filesystem contract is ordinary immutable-file behavior,
+atomic same-filesystem rename, durable file and directory synchronization, and
+coherent visibility after publication. TTC does not require reflink, hole
+punching, host OverlayFS, or a userspace database. NFS and other candidate
+filesystems must pass publication, cache-coherence, node-crash, and concurrent
+GC tests before being advertised as supported.
 
 The benchmark and its limitations are recorded in
 [`g3doc/benchmarks/ttc_pebble_qualification.md`](../benchmarks/ttc_pebble_qualification.md).
@@ -724,20 +785,29 @@ branch observe another branch's private write.
 
 ### Immediate memory-hydration prototype
 
-* Define a narrow immutable snapshot backend with publish, 64 KiB load,
-  consume, metrics, and whole-snapshot removal operations.
-* Implement sharded loose chunk files with `openat`, `unlinkat`, batched
-  directory synchronization, and bounded descriptors.
+* Define a versioned immutable manifest and 1 MiB loose-chunk format. Do not
+  add Pebble to TTC's runtime dependency graph.
+* Implement shared-root chunk publication with temporary files, file sync,
+  atomic rename, shard-directory sync, and manifest-last publication.
+* Implement `openat`/`unlinkat`, batched directory synchronization, bounded
+  descriptors, full-chunk loading, and checksums.
 * Keep family-level chunk references outside branch ancestry so shared chunks
   survive until the last dehydrated manifest releases them.
-* Keep 4 KiB resident and CoW accounting above the backend.
-* Exercise local and remote demand loading, concurrent prefetch, partial
-  rehydration, redehydration, crash recovery, and snapshot removal.
-* Retain the directly ingested Pebble implementation as an A/B backend only if
-  integration measurements justify its dependency and delayed reclamation.
+* Publish active-loader leases in the shared root. GC may unlink a chunk only
+  when immutable manifests and unexpired/recovered leases make it unreachable.
+* Keep 4 KiB resident and CoW accounting above the 1 MiB backend; loading one
+  chunk installs all of its valid pages without merging their CoW identities.
+* Exercise local and cross-host demand loading, concurrent prefetch, partial
+  rehydration, redehydration, crash recovery, source-node loss after
+  publication, and snapshot removal.
+* Benchmark 1 MiB chunks against the historical 64 KiB loose-file and packed
+  baselines on local ext4/XFS and the intended shared filesystem. Record inode
+  use, metadata operations, network bytes, useful-page ratio, page-fault tail
+  latency, and full dehydrate/rehydrate time.
 
 Exit criterion: lifecycle and crash tests pass, disk usage falls with consumed
-loose chunks, and real guest fault and dehydration times meet recorded gates.
+loose chunks, another host can rehydrate after the source process and node have
+exited, and real guest fault and dehydration times meet recorded gates.
 
 The following phases apply only if TTC later resumes the deferred unified
 mutable-filesystem store.
@@ -863,6 +933,32 @@ migration from the development object format.
   it harms tail latency.
 
 ## Test plan
+
+### 1 MiB shared-chunk qualification
+
+* Compare fixed 1 MiB chunks with historical 64 KiB chunks and the current
+  packed snapshot using dense sequential, sparse random, pointer-chasing,
+  browser, build, database, and agent workloads.
+* Measure dehydrate throughput, first-fault p50/p95/p99, useful 4 KiB pages per
+  loaded chunk, bytes read per demanded page, peak rehydration RSS, inode and
+  directory counts, metadata operations, and time until disk space is returned.
+* Repeat with 1, 4, 16, and 64 loader workers and multiple branches sharing the
+  same chunks.
+* Run the matrix on local ext4/XFS and the production shared filesystem, both
+  same-host and cross-host, with cold and warm client caches.
+* Verify atomic publication and visibility while killing the writer before and
+  after file sync, rename, directory sync, manifest publication, and branch
+  pointer replacement.
+* Race two hosts publishing the same digest, consuming the last two references,
+  renewing or expiring loader leases, running GC, and redehydrating a partially
+  loaded branch.
+* Disconnect and restart nodes, expire only fenced leases, and prove that GC
+  either conservatively leaks or deletes an unreachable chunk, never a
+  reachable one.
+
+Acceptance requires bounded metadata growth, no stale-cache reads, no required
+reflink or hole punching, cross-host recovery after source loss, and explicit
+useful-page and tail-latency limits derived from real workloads.
 
 ### Correctness and model tests
 

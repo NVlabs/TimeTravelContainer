@@ -9,6 +9,11 @@ durable commits, branch deletion, and crash recovery. It does not exercise the
 gVisor `MemoryFile`, guest page faults, VFS coherence, remote reads, or the
 eventual TTC reachability collector.
 
+The active implementation plan subsequently selected immutable **1 MiB loose
+chunk files on TTC's shared filesystem** and postponed Pebble entirely. The
+64 KiB loose-file and Pebble results below remain historical qualification
+data; they do not qualify or predict the new 1 MiB format.
+
 The harness is in `tools/ttc/storage_benchmark`. It intentionally lives in a
 small standalone Go module so that changing the candidate storage engine does
 not add it to the TTC runtime dependency graph.
@@ -292,23 +297,19 @@ returned all space only when its directory was deleted. A separately tested
 tombstone per loaded key was worse: no proportional space was returned, it
 added synced delete-WAL traffic, and it required later compaction.
 
-The loose layout is therefore the preferred first memory-hydration prototype.
-It has no embedded-database dependency, maps naturally to remotely addressable
-chunks, supports prompt reclamation, and matches or beats Pebble on the lazy
-fault path. Pebble remains a useful alternative when serialized construction
-or full sequential restoration dominates. The backend boundary should retain
-both possibilities until real TTC integration and distributed-network tests
-are complete.
+At the tested 64 KiB size, the loose layout was the preferable
+memory-hydration prototype. It has no embedded-database dependency, maps
+naturally to remotely addressable chunks, supports prompt reclamation, and
+matches or beats Pebble on the lazy fault path. Pebble performed better when
+serialized construction or full sequential restoration dominated.
 
-This preference is provisional at larger memory sizes. The 256 MiB test uses
-4,096 chunk inodes; 16 GiB would use 262,144. Host inode limits, directory
-metadata, NFS metadata RPCs, backup/scanning tools, and removal storms may make
-loose files worse even when individual faults are fast. Conversely, TTC's own
-remote page service can address and transfer the chunk objects without exposing
-their host directory operations to the receiving node. Both cases need scaled
-tests. The benchmark also models one snapshot; a real family must release a
-branch reference and unlink a chunk only when no dehydrated manifest still
-references it.
+This inode concern motivated the later 1 MiB decision. The 256 MiB test uses
+4,096 64 KiB chunk inodes; 16 GiB would use 262,144, whereas 1 MiB chunks use
+16,384. The new size may read and retain as many as 256 pages for one sparse
+fault, so it requires a new benchmark rather than extrapolation from this
+table. The benchmark also models one snapshot; a real family must release a
+manifest reference and unlink a chunk only when no dehydrated manifest or
+loader lease still references it.
 
 This does not qualify Pebble for mutable rootfs or volume data. It also does not
 yet include state restoration, copying loaded bytes into `MemoryFile`, real
@@ -318,16 +319,16 @@ acceptance tests.
 
 ## Conclusion and gate
 
-Pebble passes the synthetic functional gate for memory hydration, but the
-simpler loose-file backend is the better first integration candidate. Pebble's
-use as mutable rootfs or managed-volume storage remains postponed. It is **not
-selected as TTC's general production storage format**.
+Pebble passed this synthetic functional gate but is not in TTC's current
+implementation plan. TTC will first integrate 1 MiB loose chunk files for
+memory hydration and shared-filesystem remote fork. Pebble is not selected for
+memory, rootfs, or managed-volume storage.
 
-If the Pebble backend is integrated later, ordinary SST values are the safer
-default. Pebble's experimental blob mode has a real write-amplification
-advantage under complete overwrite churn, but loses branch-read latency and
-steady-state disk space on this test. It should remain an optional experiment
-until real TTC workloads show that its lower write amplification matters more.
+No Pebble integration work is planned. If that decision is revisited after the
+loose-chunk implementation is measured, ordinary SST values were the safer
+mode in this historical test. Pebble's experimental blob mode had a real
+write-amplification advantage under complete overwrite churn, but lost
+branch-read latency and steady-state disk space.
 
 Before adoption, the next gate must integrate the backend with TTC and measure:
 
@@ -338,7 +339,8 @@ Before adoption, the next gate must integrate the backend with TTC and measure:
 4. many small storage domains, including the WAL-recycler disk reserve;
 5. slow disks, NFS/shared filesystems where supported, ENOSPC, injected I/O
    failures, and power-cut recovery;
-6. loose 64 KiB files over local ext4/XFS, shared NFS, and TTC's remote page
-   transport, including injected metadata and network latency; and
+6. loose 1 MiB files over local ext4/XFS, shared NFS, and TTC's remote page
+   transport, including injected metadata and network latency, with the 64 KiB
+   results retained as a comparison; and
 7. a simple custom arena baseline, so any final backend is chosen against a
    relevant alternative rather than in isolation.
