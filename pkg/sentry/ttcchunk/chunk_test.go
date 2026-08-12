@@ -23,7 +23,9 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 func testAllocator(seed byte) pgalloc.LogicalAllocatorID {
@@ -173,4 +175,69 @@ func TestAssembleSeparatesDivergedSlotVersions(t *testing.T) {
 
 func sha256ID(data []byte) ID {
 	return ID(sha256.Sum256(data))
+}
+
+func TestReadSnapshotBuildsObjectsWithoutAcknowledging(t *testing.T) {
+	file, err := os.CreateTemp("", "ttc-chunk-snapshot-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.Anonymous,
+		Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.DecRef(fr)
+	firstPage := bytes.Repeat([]byte{0x7b}, hostarch.PageSize)
+	dst, err := mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := safemem.CopySeq(dst.TakeFirst64(hostarch.PageSize), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(firstPage))); err != nil || n != hostarch.PageSize {
+		t.Fatalf("writing source page: n=%d err=%v", n, err)
+	}
+	capture := pgalloc.NewMemoryRangeCapture()
+	if err := capture.Record(mf, fr); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := capture.SnapshotLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	objects, bindings, err := ReadSnapshot(snapshot, layout.Bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || len(bindings) != 2 {
+		t.Fatalf("ReadSnapshot produced %d objects and %d bindings", len(objects), len(bindings))
+	}
+	decoded, err := Decode(objects[0].Data, &objects[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Pages) != 2 || decoded.Pages[0].Zero || !bytes.Equal(decoded.Pages[0].Data, firstPage) || !decoded.Pages[1].Zero {
+		t.Fatalf("decoded snapshot pages = %+v", decoded.Pages)
+	}
+	if stats := snapshot.Stats(); stats.PagesReleased != 0 || stats.PagesOutstanding != 2 {
+		t.Fatalf("ReadSnapshot acknowledged source pages: %+v", stats)
+	}
 }

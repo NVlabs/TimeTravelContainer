@@ -59,47 +59,64 @@ func (s *Store) Put(chunk Chunk) (ID, error) {
 	if err != nil {
 		return ID{}, err
 	}
+	if err := s.PutObject(Object{ID: id, Logical: chunk.Logical, Data: data}); err != nil {
+		return ID{}, err
+	}
+	return id, nil
+}
+
+// PutObject durably publishes a pre-encoded object returned by Assemble or
+// ReadSnapshot. It validates both the content address and logical coordinate.
+func (s *Store) PutObject(object Object) error {
+	decoded, err := Decode(object.Data, &object.ID)
+	if err != nil {
+		return err
+	}
+	if decoded.Logical != object.Logical {
+		return fmt.Errorf("TTC memory object %s has logical coordinate %+v, want %+v", object.ID, decoded.Logical, object.Logical)
+	}
+	data, id := object.Data, object.ID
 	dir, path := s.path(id)
 	if err := os.Mkdir(dir, 0700); err != nil {
 		if !errors.Is(err, os.ErrExist) {
-			return ID{}, err
+			return err
 		}
 	} else if err := syncDirectory(s.root); err != nil {
-		return ID{}, fmt.Errorf("synchronizing TTC memory chunk root: %w", err)
+		return fmt.Errorf("synchronizing TTC memory chunk root: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".publish-")
 	if err != nil {
-		return ID{}, err
+		return err
 	}
 	tempName := tmp.Name()
 	defer os.Remove(tempName)
 	defer tmp.Close()
 	if err := tmp.Chmod(0600); err != nil {
-		return ID{}, err
+		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		return ID{}, err
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		return ID{}, err
+		return err
 	}
 	if err := os.Link(tempName, path); err != nil {
 		if !errors.Is(err, os.ErrExist) {
-			return ID{}, fmt.Errorf("publishing TTC memory chunk: %w", err)
+			return fmt.Errorf("publishing TTC memory chunk: %w", err)
 		}
 		existing, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return ID{}, fmt.Errorf("verifying existing TTC memory chunk: %w", readErr)
+			return fmt.Errorf("verifying existing TTC memory chunk: %w", readErr)
 		}
 		if !bytes.Equal(existing, data) {
-			return ID{}, fmt.Errorf("existing TTC memory chunk %s does not match its content address", id)
+			return fmt.Errorf("existing TTC memory chunk %s does not match its content address", id)
 		}
-		return id, nil
+		return nil
 	}
 	if err := syncDirectory(dir); err != nil {
-		return ID{}, fmt.Errorf("synchronizing TTC memory chunk shard: %w", err)
+		return fmt.Errorf("synchronizing TTC memory chunk shard: %w", err)
 	}
-	return id, nil
+	return nil
 }
 
 // Get verifies and decodes id.

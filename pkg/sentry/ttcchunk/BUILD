@@ -15,7 +15,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/hostarch",
+		"//pkg/safemem",
         "//pkg/sentry/pgalloc",
+		"//pkg/sentry/usage",
     ],
 )
 

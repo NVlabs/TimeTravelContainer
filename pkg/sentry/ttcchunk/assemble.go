@@ -17,6 +17,7 @@ package ttcchunk
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -151,4 +152,32 @@ func Assemble(source []SourcePage) ([]Object, []StoredBinding, error) {
 		}
 	}
 	return objects, stored, nil
+}
+
+// ReadSnapshot copies the branch-reachable pages described by bindings from
+// snapshot without acknowledging them, then assembles immutable objects. The
+// caller releases pages only after the objects and their manifest are durable.
+func ReadSnapshot(snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedPageBinding) ([]Object, []StoredBinding, error) {
+	if snapshot == nil {
+		return nil, nil, fmt.Errorf("memory snapshot is nil")
+	}
+	source := make([]SourcePage, len(bindings))
+	zeroPage := make([]byte, hostarch.PageSize)
+	for i, binding := range bindings {
+		data := make([]byte, hostarch.PageSize)
+		n, err := snapshot.CopyStreamAt(data, int64(binding.StreamOffset))
+		if err != nil || n != len(data) {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, nil, fmt.Errorf("reading captured page at stream offset %#x: %w", binding.StreamOffset, err)
+		}
+		source[i] = SourcePage{Binding: binding}
+		if bytes.Equal(data, zeroPage) {
+			source[i].Zero = true
+		} else {
+			source[i].Data = data
+		}
+	}
+	return Assemble(source)
 }
