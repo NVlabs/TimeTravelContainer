@@ -1038,12 +1038,23 @@ func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 		}
 	}
 
-	finalUsage, err := parent.MemoryFile().TotalUsage()
-	if err != nil {
-		t.Fatalf("final MemoryFile.TotalUsage: %v", err)
-	}
-	if finalUsage != baselineUsage {
-		t.Errorf("live branch page usage leaked: before=%d after=%d", baselineUsage, finalUsage)
+	// Kernel teardown can hand its last pages to MemoryFile's asynchronous
+	// releaser. Wait for that handoff rather than sampling a transient page;
+	// usage below the warm baseline is valid because parent-side lazy pages may
+	// also have become reclaimable.
+	deadline := time.Now().Add(time.Second)
+	for {
+		finalUsage, err := parent.MemoryFile().TotalUsage()
+		if err != nil {
+			t.Fatalf("final MemoryFile.TotalUsage: %v", err)
+		}
+		if finalUsage <= baselineUsage {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live branch page usage leaked: before=%d after=%d", baselineUsage, finalUsage)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	parent.Pause()
 	parent.Release()
