@@ -115,10 +115,12 @@ type RemoteRegionID uint32
 // RemoteSnapshotRegion describes an immutable fork-time MemoryFile range.
 // Range must be non-empty and base-page-aligned.
 type RemoteSnapshotRegion struct {
-	ID      RemoteRegionID
-	File    *MemoryFile
-	Range   memmap.FileRange
-	MemCgID uint32
+	ID             RemoteRegionID
+	File           *MemoryFile
+	Range          memmap.FileRange
+	MemCgID        uint32
+	LogicalChunk   LogicalChunkID
+	LogicalChunked bool
 }
 
 type remoteSnapshotRegion struct {
@@ -155,6 +157,7 @@ type RemoteSnapshot struct {
 	pushEnqueued  uint64
 	pushDropped   uint64
 	shared        *remoteSnapshotShared
+	logicalChunks []RemotePushHint
 }
 
 // remoteSnapshotShared owns the single set of MemoryFile references retained
@@ -371,7 +374,17 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 			shared:      shared,
 		}
 		var streamStart uint64
+		var chunkStart uint64
+		var previousChunk LogicalChunkID
+		chunked := len(regions) != 0 && regions[0].LogicalChunked
 		for i, region := range regions {
+			if region.LogicalChunked != chunked {
+				return nil, errors.New("remote snapshot mixes logical-chunk and ordinary regions")
+			}
+			if chunked && i != 0 && region.LogicalChunk != previousChunk {
+				s.logicalChunks = append(s.logicalChunks, RemotePushHint{StreamOffset: chunkStart, Length: streamStart - chunkStart})
+				chunkStart = streamStart
+			}
 			pages := region.Range.Length() / hostarch.PageSize
 			s.regions[i] = remoteSnapshotRegion{
 				RemoteSnapshotRegion: region,
@@ -379,6 +392,10 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 				released:             make([]uint64, (pages+63)/64),
 			}
 			streamStart += region.Range.Length()
+			previousChunk = region.LogicalChunk
+		}
+		if chunked {
+			s.logicalChunks = append(s.logicalChunks, RemotePushHint{StreamOffset: chunkStart, Length: streamStart - chunkStart})
 		}
 		snapshots[snapshotIndex] = s
 		shared.views[s] = struct{}{}
@@ -511,7 +528,10 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	loads := make([]RemoteLoadRange, 0, len(pieces))
 	var streamOffset uint64
 	for _, piece := range pieces {
-		regions = append(regions, RemoteSnapshotRegion{ID: RemoteRegionID(len(regions) + 1), File: source, Range: piece.range_})
+		regions = append(regions, RemoteSnapshotRegion{
+			ID: RemoteRegionID(len(regions) + 1), File: source, Range: piece.range_,
+			LogicalChunk: piece.chunk, LogicalChunked: true,
+		})
 		loads = append(loads, RemoteLoadRange{Target: piece.range_, StreamOffset: streamOffset})
 		streamOffset += piece.range_.Length()
 	}
@@ -665,6 +685,73 @@ func (s *RemoteSnapshot) OutstandingStreamRanges(maxRange uint64) ([]RemotePushH
 		}
 	}
 	return ranges, nil
+}
+
+// AtomicPushRanges expands candidates to complete logical chunks when this
+// snapshot uses chunk-atomic remote residency. A chunk that a concurrent pull
+// has partially or completely acknowledged is omitted; logical-chunk demand
+// guarantees such a pull resolves the complete chunk.
+func (s *RemoteSnapshot) AtomicPushRanges(candidates []RemotePushHint, maxRange uint64) ([]RemotePushHint, error) {
+	if maxRange < hostarch.PageSize || !hostarch.IsPageAligned(maxRange) {
+		return nil, fmt.Errorf("invalid atomic remote range limit %d", maxRange)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(candidates) == 0 {
+		return nil, nil
+	}
+	if len(s.logicalChunks) == 0 {
+		return candidates, nil
+	}
+	seen := make(map[uint64]struct{})
+	var result []RemotePushHint
+	for _, candidate := range candidates {
+		candidateEnd := candidate.StreamOffset + candidate.Length
+		if candidate.Length == 0 || candidateEnd < candidate.StreamOffset {
+			return nil, fmt.Errorf("invalid remote push candidate %+v", candidate)
+		}
+		for _, chunk := range s.logicalChunks {
+			chunkEnd := chunk.StreamOffset + chunk.Length
+			if candidate.StreamOffset >= chunkEnd || chunk.StreamOffset >= candidateEnd {
+				continue
+			}
+			if chunk.Length > maxRange {
+				return nil, fmt.Errorf("logical chunk push length %d exceeds limit %d", chunk.Length, maxRange)
+			}
+			if _, ok := seen[chunk.StreamOffset]; ok {
+				continue
+			}
+			seen[chunk.StreamOffset] = struct{}{}
+			if s.streamRangeOutstandingLocked(chunk) {
+				result = append(result, chunk)
+			}
+		}
+	}
+	return result, nil
+}
+
+// UsesAtomicPushChunks reports whether proactive pushes must preserve logical
+// chunk residency. The geometry is immutable after snapshot construction.
+func (s *RemoteSnapshot) UsesAtomicPushChunks() bool { return len(s.logicalChunks) != 0 }
+
+func (s *RemoteSnapshot) streamRangeOutstandingLocked(stream RemotePushHint) bool {
+	end := stream.StreamOffset + stream.Length
+	covered := uint64(0)
+	for i := range s.regions {
+		region := &s.regions[i]
+		regionEnd := region.streamStart + region.Range.Length()
+		if stream.StreamOffset >= regionEnd || region.streamStart >= end {
+			continue
+		}
+		start := max(stream.StreamOffset, region.streamStart)
+		stop := min(end, regionEnd)
+		relative := memmap.FileRange{Start: start - region.streamStart, End: stop - region.streamStart}
+		if region.anyReleased(relative) {
+			return false
+		}
+		covered += stop - start
+	}
+	return covered == stream.Length
 }
 
 // PushHints returns a bounded stream of advisory proactive-push candidates.

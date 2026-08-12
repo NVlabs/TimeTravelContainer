@@ -1704,6 +1704,102 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 			waiter.wakeup.Notify(1)
 		}
 	}()
+	if apfl.logicalChunkDemand {
+		for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
+			for _, chunk := range amfl.logicalChunks {
+				if len(chunk.ranges) == 0 {
+					continue
+				}
+				chunkStart := chunk.ranges[0].StreamOffset
+				chunkEnd := chunkStart
+				for _, load := range chunk.ranges {
+					if load.StreamOffset != chunkEnd {
+						return RemotePageInstallBusy, fmt.Errorf("logical chunk %+v has a non-contiguous stream", chunk.id)
+					}
+					chunkEnd += load.Target.Length()
+				}
+				if streamOffset != chunkStart || streamEnd != chunkEnd {
+					continue
+				}
+				amfl.f.mu.Lock()
+				apfl.mu.Lock()
+				present := 0
+				busy := false
+				for _, load := range chunk.ranges {
+					seg := amfl.unloaded.FindSegment(load.Target.Start)
+					if !seg.Ok() || load.Target.End > seg.End() {
+						continue
+					}
+					ul := seg.ValuePtr()
+					if ul.off+(load.Target.Start-seg.Start()) != load.StreamOffset || ul.logicalChunk != chunk {
+						continue
+					}
+					present++
+					busy = busy || ul.started
+				}
+				if present == 0 {
+					apfl.mu.Unlock()
+					amfl.f.mu.Unlock()
+					return RemotePageInstallResolved, nil
+				}
+				if present != len(chunk.ranges) || busy {
+					apfl.mu.Unlock()
+					amfl.f.mu.Unlock()
+					return RemotePageInstallBusy, nil
+				}
+				for _, load := range chunk.ranges {
+					seg := amfl.unloaded.FindSegment(load.Target.Start)
+					seg = amfl.unloaded.SplitBefore(seg, load.Target.Start)
+					seg = amfl.unloaded.SplitAfter(seg, load.Target.End)
+					ul := seg.ValuePtr()
+					dataStart := load.StreamOffset - streamOffset
+					dataEnd := dataStart + load.Target.Length()
+					copied := 0
+					amfl.f.forEachMappingSlice(seg.Range(), func(dst []byte) {
+						copied += copy(dst, data[dataStart+uint64(copied):dataEnd])
+					})
+					if uint64(copied) != load.Target.Length() {
+						apfl.mu.Unlock()
+						amfl.f.mu.Unlock()
+						return RemotePageInstallBusy, fmt.Errorf("pushed logical chunk copied %d bytes, want %d", copied, load.Target.Length())
+					}
+					for _, waiter := range ul.waiters {
+						waiter.pending -= load.Target.Length()
+						if waiter.pending == 0 {
+							wakeups = append(wakeups, waiter)
+							now := gohacks.Nanotime()
+							apfl.durWaitedTotal += time.Duration(now - waiter.timeStart)
+							apfl.numWaiters--
+							if apfl.numWaiters == 0 {
+								apfl.durWaitedOne += time.Duration(now - apfl.timeStartWaiters)
+								apfl.timeStartWaiters = math.MaxInt64
+							}
+						}
+					}
+					amfl.unloaded.Remove(seg)
+					apfl.bytesLoaded += load.Target.Length()
+				}
+				if amfl.lfDone {
+					if amfl.unloaded.IsEmpty() {
+						amfl.minUnloaded.Store(math.MaxUint64)
+						apfl.amfls.Remove(amfl)
+						amfl.f.asyncPageLoad.Store(nil)
+						amfl.timeline.End()
+						if amfl.doneCallback != nil {
+							amfl.doneCallback(nil)
+							amfl.doneCallback = nil
+						}
+					} else {
+						amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
+					}
+				}
+				apfl.mu.Unlock()
+				amfl.f.mu.Unlock()
+				return RemotePageInstallInstalled, nil
+			}
+		}
+		return RemotePageInstallBusy, fmt.Errorf("pushed range [%#x,%#x) is not one logical chunk", streamOffset, streamEnd)
+	}
 	for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
 		amfl.f.mu.Lock()
 		apfl.mu.Lock()

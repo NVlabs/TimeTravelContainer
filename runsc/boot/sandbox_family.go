@@ -812,6 +812,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 				MaxPush: maxTransferBytes, Timeout: 30 * time.Second, RetryLimit: 2,
 				RetryBackoff: 10 * time.Millisecond, Policy: pushPolicy,
 				RetainedHighWater: pushHighWater, ScanInterval: 10 * time.Millisecond,
+				AtomicLogicalChunks: true,
 			}); err != nil {
 				_ = resume()
 				return nil, fmt.Errorf("configuring distributed reverse push: %w", err)

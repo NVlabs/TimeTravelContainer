@@ -339,6 +339,9 @@ type TCPPushSenderOpts struct {
 	RetryLimit   int
 	RetryBackoff time.Duration
 	Policy       TCPPushPolicy
+	// AtomicLogicalChunks expands every proactive candidate to the complete
+	// extant 1 MiB logical chunk used by the target residency protocol.
+	AtomicLogicalChunks bool
 	// RetainedHighWater triggers a full outstanding-range scan in
 	// memory-pressure mode.
 	RetainedHighWater uint64
@@ -472,6 +475,13 @@ func (s *TCPPushSender) run(address string, token SnapshotToken, snapshot *pgall
 }
 
 func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token SnapshotToken, snapshot *pgalloc.RemoteSnapshot, opts TCPPushSenderOpts, ranges []pgalloc.RemotePushHint, requestID *uint32, allowDial bool) error {
+	var err error
+	if opts.AtomicLogicalChunks {
+		ranges, err = snapshot.AtomicPushRanges(ranges, opts.MaxPush)
+		if err != nil {
+			return err
+		}
+	}
 	for _, candidate := range ranges {
 		for off, remaining := candidate.StreamOffset, candidate.Length; remaining != 0; {
 			length := min(remaining, opts.MaxPush)
@@ -511,7 +521,7 @@ func (s *TCPPushSender) sendRanges(conn *net.Conn, address string, token Snapsho
 				// restore and a range owned by a concurrent pull. Refine it to
 				// page granularity so resolved pages can be acknowledged while
 				// genuinely busy pages remain conservatively pinned.
-				if length > hostarch.PageSize {
+				if length > hostarch.PageSize && !opts.AtomicLogicalChunks {
 					left := hostarch.PageRoundDown(length / 2)
 					if left == 0 {
 						left = hostarch.PageSize

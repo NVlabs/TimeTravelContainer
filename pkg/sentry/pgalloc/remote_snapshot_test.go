@@ -551,6 +551,79 @@ func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	}
 }
 
+func TestLogicalChunkPushInstallsWholeChunkAtomically(t *testing.T) {
+	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
+	target, targetFR := newRemoteTestMemoryFile(t, pageCount)
+	want := make([]byte, targetFR.Length())
+	for i := range want {
+		want[i] = byte(i*23 + 7)
+	}
+	reader := stateio.NewIOReader(bytes.NewReader(want), SparseChunkBytes, int(pageCount), 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := make([]RemoteLoadRange, pageCount)
+	for i := uint64(0); i < pageCount; i++ {
+		loads[i] = RemoteLoadRange{
+			Target:       memmap.FileRange{Start: targetFR.Start + i*hostarch.PageSize, End: targetFR.Start + (i+1)*hostarch.PageSize},
+			StreamOffset: i * hostarch.PageSize,
+		}
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	defer func() {
+		pages.Cancel()
+		_ = pages.Wait()
+	}()
+	if result, err := pages.TryInstallRemotePagesState(0, want[:hostarch.PageSize]); err == nil || result != RemotePageInstallBusy {
+		t.Fatalf("partial logical push result=%v err=%v, want busy error", result, err)
+	}
+	if result, err := pages.TryInstallRemotePagesState(0, want[:SparseChunkBytes]); err != nil || result != RemotePageInstallInstalled {
+		t.Fatalf("whole logical push result=%v err=%v, want installed", result, err)
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != SparseChunkBytes || stats.BytesOutstanding != SparseChunkBytes {
+		t.Fatalf("whole logical push stats: %+v", stats)
+	}
+	if result, err := pages.TryInstallRemotePagesState(0, want[:SparseChunkBytes]); err != nil || result != RemotePageInstallResolved {
+		t.Fatalf("repeated logical push result=%v err=%v, want resolved", result, err)
+	}
+}
+
+func TestRemoteSnapshotExpandsAtomicPushToLogicalChunk(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 4)
+	_, regions, _, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	ranges, err := snapshot.AtomicPushRanges([]RemotePushHint{{StreamOffset: hostarch.PageSize, Length: hostarch.PageSize}}, SparseChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 1 || ranges[0].StreamOffset != 0 || ranges[0].Length != sourceFR.Length() {
+		t.Fatalf("atomic push ranges=%+v, want complete %#x-byte logical chunk", ranges, sourceFR.Length())
+	}
+	if err := snapshot.AcknowledgeStreamRange(0, hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	ranges, err = snapshot.AtomicPushRanges([]RemotePushHint{{StreamOffset: hostarch.PageSize, Length: hostarch.PageSize}}, SparseChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 0 {
+		t.Fatalf("partially resolved chunk remained pushable: %+v", ranges)
+	}
+}
+
 func TestLogicalChunkDemandRejectsNarrowReader(t *testing.T) {
 	reader := stateio.NewIOReader(bytes.NewReader(make([]byte, SparseChunkBytes)), SparseChunkBytes-hostarch.PageSize, logicalPagesPerChunk, 1)
 	if _, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{LogicalChunkDemand: true}); err == nil {
