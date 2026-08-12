@@ -627,6 +627,87 @@ func TestRemoteSnapshotExpandsAtomicPushToLogicalChunk(t *testing.T) {
 	}
 }
 
+func TestLogicalChunkDemandSeparatesLiveCOWVersions(t *testing.T) {
+	source, original := newRemoteTestMemoryFile(t, logicalPagesPerChunk)
+	cow, err := source.Allocate(hostarch.PageSize, AllocOpts{
+		Kind: usage.Anonymous, Mode: AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.DecRef(cow)
+	originalPage := memmap.FileRange{Start: original.Start, End: original.Start + hostarch.PageSize}
+	if err := source.AdoptCOWIdentities(source, originalPage, cow); err != nil {
+		t.Fatal(err)
+	}
+	fillRemoteTestRange(t, source, original, bytes.Repeat([]byte{0x11}, int(original.Length())))
+	fillRemoteTestRange(t, source, cow, bytes.Repeat([]byte{0x22}, hostarch.PageSize))
+
+	metadata, regions, loads, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := make(map[uint32]uint64)
+	for _, region := range regions {
+		instances[region.LogicalChunkInstance] += region.Range.Length()
+	}
+	if len(instances) != 2 {
+		t.Fatalf("CoW logical slot produced %d chunk instances, want 2: %+v", len(instances), instances)
+	}
+	for instance, length := range instances {
+		if length > SparseChunkBytes {
+			t.Fatalf("logical chunk instance %d is %d bytes, exceeds %d", instance, length, SparseChunkBytes)
+		}
+	}
+	snapshot, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	target := newEmptyRemoteTestMemoryFile(t)
+	defer target.Destroy()
+	if err := ImportMemoryFileMetadataForRemote(context.Background(), target, metadata); err != nil {
+		t.Fatal(err)
+	}
+	defer target.DecRef(original)
+	defer target.DecRef(cow)
+	reader := NewLoopbackRemoteReader(snapshot, SparseChunkBytes, logicalPagesPerChunk, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	for _, test := range []struct {
+		name string
+		fr   memmap.FileRange
+		want byte
+	}{{"new CoW version", cow, 0x22}, {"retained sibling version", originalPage, 0x11}} {
+		mapped, err := target.MapInternal(test.fr, hostarch.Read)
+		if err != nil {
+			t.Fatalf("mapping %s: %v", test.name, err)
+		}
+		got := make([]byte, hostarch.PageSize)
+		if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != hostarch.PageSize {
+			t.Fatalf("reading %s: n=%d err=%v", test.name, n, err)
+		}
+		if !bytes.Equal(got, bytes.Repeat([]byte{test.want}, hostarch.PageSize)) {
+			t.Fatalf("%s loaded incorrect contents", test.name)
+		}
+	}
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != original.Length()+cow.Length() || stats.BytesOutstanding != 0 {
+		t.Fatalf("CoW chunk loader stats: %+v", stats)
+	}
+}
+
 func TestLogicalChunkDemandRejectsNarrowReader(t *testing.T) {
 	reader := stateio.NewIOReader(bytes.NewReader(make([]byte, SparseChunkBytes)), SparseChunkBytes-hostarch.PageSize, logicalPagesPerChunk, 1)
 	if _, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{LogicalChunkDemand: true}); err == nil {

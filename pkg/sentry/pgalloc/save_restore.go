@@ -1305,7 +1305,7 @@ type asyncMemoryFileLoad struct {
 	doneCallback  func(error)
 	timeline      *timing.Timeline
 	sparse        bool
-	logicalChunks map[LogicalChunkID]*logicalChunkLoad
+	logicalChunks []*logicalChunkLoad
 
 	// minUnloaded is the MemoryFile offset of the first unloaded byte.
 	minUnloaded atomicbitops.Uint64
@@ -1348,8 +1348,9 @@ type aplUnloadedInfo struct {
 }
 
 type logicalChunkLoad struct {
-	id     LogicalChunkID
-	ranges []RemoteLoadRange
+	id       LogicalChunkID
+	instance uint32
+	ranges   []RemoteLoadRange
 }
 
 type aplWaiter struct {
@@ -1950,22 +1951,6 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 	fr.Start = hostarch.PageRoundDown(fr.Start)
 	fr.End = hostarch.MustPageRoundUp(fr.End)
 	requested := fr
-	var logicalChunks []*logicalChunkLoad
-	if amfl.pf.logicalChunkDemand {
-		seen := make(map[LogicalChunkID]struct{})
-		for _, logical := range amfl.f.LogicalPageRanges(fr) {
-			for sequence, end := logical.First.Sequence, logical.First.Sequence+logical.Range.Length()/hostarch.PageSize; sequence < end; {
-				id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
-				if _, ok := seen[id]; !ok {
-					seen[id] = struct{}{}
-					if chunk := amfl.logicalChunks[id]; chunk != nil {
-						logicalChunks = append(logicalChunks, chunk)
-					}
-				}
-				sequence = min(end, (sequence/logicalPagesPerChunk+1)*logicalPagesPerChunk)
-			}
-		}
-	}
 
 	apfl := amfl.pf
 	apfl.mu.Lock()
@@ -1978,6 +1963,27 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 		// A previous error means that fr will never be loaded.
 		apfl.mu.Unlock()
 		return err
+	}
+	var logicalChunks []*logicalChunkLoad
+	if apfl.logicalChunkDemand {
+		// A logical slot can have several live CoW versions in one family
+		// MemoryFile. Select the exact chunk instance associated with the
+		// requested physical range instead of looking it up by logical ID.
+		seen := make(map[*logicalChunkLoad]struct{})
+		seg := amfl.unloaded.FindSegment(requested.Start)
+		if !seg.Ok() {
+			seg = amfl.unloaded.LowerBoundSegment(requested.Start)
+		}
+		for ; seg.Ok() && seg.Start() < requested.End; seg = seg.NextSegment() {
+			chunk := seg.ValuePtr().logicalChunk
+			if chunk == nil {
+				continue
+			}
+			if _, ok := seen[chunk]; !ok {
+				seen[chunk] = struct{}{}
+				logicalChunks = append(logicalChunks, chunk)
+			}
+		}
 	}
 	var waitRanges []memmap.FileRange
 	if len(logicalChunks) != 0 {

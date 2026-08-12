@@ -115,12 +115,13 @@ type RemoteRegionID uint32
 // RemoteSnapshotRegion describes an immutable fork-time MemoryFile range.
 // Range must be non-empty and base-page-aligned.
 type RemoteSnapshotRegion struct {
-	ID             RemoteRegionID
-	File           *MemoryFile
-	Range          memmap.FileRange
-	MemCgID        uint32
-	LogicalChunk   LogicalChunkID
-	LogicalChunked bool
+	ID                   RemoteRegionID
+	File                 *MemoryFile
+	Range                memmap.FileRange
+	MemCgID              uint32
+	LogicalChunk         LogicalChunkID
+	LogicalChunkInstance uint32
+	LogicalChunked       bool
 }
 
 type remoteSnapshotRegion struct {
@@ -381,7 +382,7 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 			if region.LogicalChunked != chunked {
 				return nil, errors.New("remote snapshot mixes logical-chunk and ordinary regions")
 			}
-			if chunked && i != 0 && region.LogicalChunk != previousChunk {
+			if chunked && i != 0 && (region.LogicalChunk != previousChunk || region.LogicalChunkInstance != regions[i-1].LogicalChunkInstance) {
 				s.logicalChunks = append(s.logicalChunks, RemotePushHint{StreamOffset: chunkStart, Length: streamStart - chunkStart})
 				chunkStart = streamStart
 			}
@@ -485,9 +486,10 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	// a remote target fetch and publish the complete logical 1 MiB residency
 	// unit with one vectored operation.
 	type logicalPiece struct {
-		chunk  LogicalChunkID
-		slot   uint8
-		range_ memmap.FileRange
+		chunk    LogicalChunkID
+		instance uint32
+		slot     uint8
+		range_   memmap.FileRange
 	}
 	var pieces []logicalPiece
 	for _, usedRange := range used {
@@ -519,8 +521,49 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 		if pieces[i].chunk.Sequence != pieces[j].chunk.Sequence {
 			return pieces[i].chunk.Sequence < pieces[j].chunk.Sequence
 		}
-		return pieces[i].slot < pieces[j].slot
+		if pieces[i].slot != pieces[j].slot {
+			return pieces[i].slot < pieces[j].slot
+		}
+		return pieces[i].range_.Start < pieces[j].range_.Start
 	})
+	// A MemoryFile can contain several CoW versions of the same logical page
+	// when sibling branches remain live. Partition these versions into distinct
+	// chunk instances, each containing at most one physical page for every
+	// logical slot. Instance boundaries remain contiguous in the packed stream,
+	// so each is independently fetched and installed with at most 1 MiB of I/O.
+	type chunkGroup struct {
+		instance uint32
+		used     [4]uint64
+	}
+	groups := make(map[LogicalChunkID]*chunkGroup)
+	grouped := make([]logicalPiece, 0, len(pieces))
+	for _, piece := range pieces {
+		group := groups[piece.chunk]
+		if group == nil {
+			group = &chunkGroup{}
+			groups[piece.chunk] = group
+		}
+		offset := piece.range_.Start
+		endSlot := uint16(piece.slot) + uint16(piece.range_.Length()/hostarch.PageSize)
+		for slot := uint16(piece.slot); slot < endSlot; {
+			if group.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+				group.instance++
+				group.used = [4]uint64{}
+			}
+			startSlot := slot
+			for slot < endSlot && group.used[slot/64]&(uint64(1)<<(slot%64)) == 0 {
+				group.used[slot/64] |= uint64(1) << (slot % 64)
+				slot++
+			}
+			length := uint64(slot-startSlot) * hostarch.PageSize
+			grouped = append(grouped, logicalPiece{
+				chunk: piece.chunk, instance: group.instance, slot: uint8(startSlot),
+				range_: memmap.FileRange{Start: offset, End: offset + length},
+			})
+			offset += length
+		}
+	}
+	pieces = grouped
 	if uint64(len(pieces)) > uint64(^RemoteRegionID(0)) {
 		return nil, nil, nil, fmt.Errorf("remote memory layout has %d logical pieces", len(pieces))
 	}
@@ -530,7 +573,7 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	for _, piece := range pieces {
 		regions = append(regions, RemoteSnapshotRegion{
 			ID: RemoteRegionID(len(regions) + 1), File: source, Range: piece.range_,
-			LogicalChunk: piece.chunk, LogicalChunked: true,
+			LogicalChunk: piece.chunk, LogicalChunkInstance: piece.instance, LogicalChunked: true,
 		})
 		loads = append(loads, RemoteLoadRange{Target: piece.range_, StreamOffset: streamOffset})
 		streamOffset += piece.range_.Length()
@@ -1055,8 +1098,13 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 		chunk *logicalChunkLoad
 	}
 	attached := make([]attachedRange, 0, len(ranges))
-	logicalChunks := make(map[LogicalChunkID]*logicalChunkLoad)
+	var logicalChunks []*logicalChunkLoad
 	if pages.logicalChunkDemand {
+		type chunkBuild struct {
+			chunk *logicalChunkLoad
+			used  [4]uint64
+		}
+		current := make(map[LogicalChunkID]*chunkBuild)
 		for _, load := range ranges {
 			cursor := load.Target.Start
 			for _, logical := range f.LogicalPageRanges(load.Target) {
@@ -1064,41 +1112,62 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 					return fmt.Errorf("logical chunk load range %v has a metadata gap at %#x", load.Target, cursor)
 				}
 				for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
-					slot := sequence % logicalPagesPerChunk
-					pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-slot)
-					length := pageCount * hostarch.PageSize
+					firstSlot := sequence % logicalPagesPerChunk
+					pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
 					id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
-					chunk := logicalChunks[id]
-					if chunk == nil {
-						chunk = &logicalChunkLoad{id: id}
-						logicalChunks[id] = chunk
+					remaining := pageCount
+					for remaining != 0 {
+						build := current[id]
+						if build == nil {
+							build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
+							current[id] = build
+							logicalChunks = append(logicalChunks, build.chunk)
+						}
+						slot := sequence % logicalPagesPerChunk
+						if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+							build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
+							current[id] = build
+							logicalChunks = append(logicalChunks, build.chunk)
+						}
+						startSlot := slot
+						var taken uint64
+						for taken < remaining {
+							currentSlot := startSlot + taken
+							if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
+								break
+							}
+							build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
+							taken++
+						}
+						length := taken * hostarch.PageSize
+						piece := RemoteLoadRange{
+							Target:       memmap.FileRange{Start: offset, End: offset + length},
+							StreamOffset: load.StreamOffset + offset - load.Target.Start,
+						}
+						build.chunk.ranges = append(build.chunk.ranges, piece)
+						attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
+						offset += length
+						sequence += taken
+						cursor += length
+						remaining -= taken
 					}
-					piece := RemoteLoadRange{
-						Target:       memmap.FileRange{Start: offset, End: offset + length},
-						StreamOffset: load.StreamOffset + offset - load.Target.Start,
-					}
-					chunk.ranges = append(chunk.ranges, piece)
-					attached = append(attached, attachedRange{load: piece, chunk: chunk})
-					offset += length
-					sequence += pageCount
-					cursor += length
 				}
 			}
 			if cursor != load.Target.End {
 				return fmt.Errorf("logical chunk metadata ends at %#x for load range %v", cursor, load.Target)
 			}
 		}
-		for id, chunk := range logicalChunks {
+		for _, chunk := range logicalChunks {
 			var previousEnd, bytes uint64
 			for i, load := range chunk.ranges {
 				if i != 0 && load.StreamOffset != previousEnd {
-					return fmt.Errorf("logical chunk %+v is not contiguous in the packed stream: %#x follows %#x", id, load.StreamOffset, previousEnd)
+					return fmt.Errorf("logical chunk %+v instance %d is not contiguous in the packed stream: %#x follows %#x", chunk.id, chunk.instance, load.StreamOffset, previousEnd)
 				}
 				previousEnd = load.StreamOffset + load.Target.Length()
 				bytes += load.Target.Length()
 			}
 			if bytes > SparseChunkBytes || len(chunk.ranges) > pages.maxRanges {
-				return fmt.Errorf("logical chunk %+v requires %d bytes and %d ranges; reader allows %d bytes and %d ranges", id, bytes, len(chunk.ranges), pages.maxReadBytes, pages.maxRanges)
+				return fmt.Errorf("logical chunk %+v instance %d requires %d bytes and %d ranges; reader allows %d bytes and %d ranges", chunk.id, chunk.instance, bytes, len(chunk.ranges), pages.maxReadBytes, pages.maxRanges)
 			}
 		}
 	} else {
