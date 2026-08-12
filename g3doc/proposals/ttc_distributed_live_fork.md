@@ -82,7 +82,11 @@ The first format fixes the chunk load size at 1 MiB. It deliberately accepts up
 to 256-page read/residency amplification to reduce shared-filesystem inode and
 metadata pressure. Qualification must measure useful-page ratio, fault tail
 latency, shared-filesystem operations, and source-release time before the format
-is made stable. Pebble and remote SSTs are out of scope.
+is made stable. Pebble and remote SSTs are out of scope. The normative chunk
+coordinates, residency/origin/promotion enums, local and cluster reference
+classes, `L0`--`L8` transition points, source-write promotion, GC fencing, and
+operation timing rules are specified in
+[TTC userspace extent store](ttc_userspace_extent_store.md#chunk-coordinates-and-alignment).
 
 ## Current packed-snapshot baseline
 

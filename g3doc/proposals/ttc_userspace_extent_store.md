@@ -172,6 +172,341 @@ punching, host OverlayFS, or a userspace database. NFS and other candidate
 filesystems must pass publication, cache-coherence, node-crash, and concurrent
 GC tests before being advertised as supported.
 
+### Chunk coordinates and alignment
+
+The authoritative chunk coordinate is `(MemoryImageID, StreamChunkIndex)`, not
+a guest virtual address. TTC already serializes used, page-aligned `MemoryFile`
+ranges into a packed page stream and records how each stream range maps back to
+`MemoryFile` offsets. Chunk `i` covers:
+
+```text
+[i * 1 MiB, min((i + 1) * 1 MiB, stream length))
+```
+
+The stream begins and ends on 4 KiB page boundaries, so every full chunk has
+exactly 256 page slots. A chunk may cross two packed `MemoryFile` regions; its
+manifest mapping supplies the scatter/gather descriptors needed to install the
+slots. Guest mappings, including a downward-growing stack, do not need to be
+1 MiB-aligned or contiguous. Stack growth after a fork allocates new pages in
+the writing branch and does not change the older snapshot stream.
+
+The same fixed 1 MiB unit is used for shared chunk files and live network
+fetches. One RPC may pipeline requests and responses for several chunks, but a
+chunk is the indivisible request, validation, installation, acknowledgement,
+and reclamation unit. The final chunk carries a page-aligned valid length.
+
+### Normative local state
+
+State is represented with orthogonal enums rather than one product enum with
+dozens of combinations:
+
+```go
+type ChunkResidency uint8
+
+const (
+	ChunkNonResident ChunkResidency = iota
+	ChunkLoading
+	ChunkResident
+	ChunkEvicting
+)
+
+type ChunkOrigin uint8
+
+const (
+	OriginNone ChunkOrigin = iota       // Resident and no reusable backing.
+	OriginLive                           // Fork-time pages on another process/node.
+	OriginShared                         // Immutable shared-filesystem chunk.
+	OriginDual                           // Both origins contain identical bytes.
+)
+
+type ChunkPromotion uint8
+
+const (
+	PromotionIdle ChunkPromotion = iota
+	PromotionQueued
+	PromotionCapturing
+	PromotionWriting
+	PromotionDataDurable
+	PromotionDescriptorDurable
+	PromotionRetiringLive
+	PromotionComplete
+	PromotionRetryable
+)
+```
+
+Each branch/node chunk slot contains at least:
+
+```go
+type BranchChunkSlot struct {
+	Residency       ChunkResidency
+	Origin          ChunkOrigin
+	Live            *LiveChunkRef
+	SharedChunkID   ChunkID
+	Generation      uint64
+	ValidPages      uint16 // 1..256
+	DirtyPages      [4]uint64
+	LoadTransaction LoadID
+}
+```
+
+`DirtyPages` is meaningful only while resident and is relative to
+`SharedChunkID`, if any. `ChunkResident` means all `ValidPages` are installed;
+individual writes may then CoW and dirty any subset at 4 KiB granularity.
+`ChunkNonResident` means none is installed. `ChunkLoading` and `ChunkEvicting`
+are private transactional states: guest execution cannot observe a partially
+loaded or partially removed chunk. Local fork and dehydration wait for, help,
+or cancel these transitions before taking their state snapshot.
+
+The permitted steady-state combinations are:
+
+| Residency | Origin | Meaning |
+| --- | --- | --- |
+| non-resident | live | Fetch the complete fork-time chunk from a source snapshot. |
+| non-resident | shared | Fetch the complete immutable file from the shared root. |
+| non-resident | dual | Either source is valid; one successful installation wins. |
+| resident | none | Current pages have no reusable complete shared backing. |
+| resident | shared | `DirtyPages == 0`; the shared chunk exactly matches memory. |
+| resident | live/dual | Temporary during remote reconstruction or handoff. |
+
+No operation may leave one valid page resident and another non-resident in the
+same branch/node chunk slot.
+
+### Normative 4 KiB page-version state
+
+A page version may simultaneously belong to local branches, fork snapshots,
+and active I/O, so one exclusive owner enum would be misleading. Its state is
+derived from three process-local reference classes:
+
+```go
+type PageVersionRefs struct {
+	BranchRefs   uint32 // PMAs/mappings for live local branches.
+	SnapshotRefs uint32 // Fork-time snapshots for remote consumers.
+	IORefs       uint32 // Network responses and chunk publishers in flight.
+}
+```
+
+| Derived page state | Predicate | Meaning |
+| --- | --- | --- |
+| live unique | `BranchRefs == 1 && SnapshotRefs == 0` | A write may use the ordinary unique-page fast path. |
+| live shared | `BranchRefs > 1 && SnapshotRefs == 0` | A local branch write performs 4 KiB CoW. |
+| live and snapshot-pinned | `BranchRefs > 0 && SnapshotRefs > 0` | A source write creates a new page version; the old version remains exact for remote consumers. |
+| snapshot-only | `BranchRefs == 0 && SnapshotRefs > 0` | No local branch uses the old version; promotion or remote acknowledgement can release it. |
+| I/O-only | `BranchRefs == 0 && SnapshotRefs == 0 && IORefs > 0` | A transfer already acquired it; final release waits for that operation. |
+| reclaimable | all three are zero | The `MemoryFile` may free the 4 KiB version. |
+
+On a source write, replacement of the branch's page reference and increment of
+the new page's reference are the 4 KiB CoW linearization point. The old version
+may become snapshot-only, but the containing `BranchChunkSlot` remains fully
+resident. After memory locks are released, the dirty bit is set for the source
+branch's chunk and the old snapshot chunk is queued for promotion. No single
+page is independently persisted or acknowledged: the local reference stays
+page-granular, while all cross-process actions group the 256 version references
+under the chunk coordinate.
+
+### Normative remote-consumer and object state
+
+A live fork snapshot groups the process-local 4 KiB page-version references by
+1 MiB stream coordinate:
+
+```go
+type RemoteConsumerState uint8
+
+const (
+	ConsumerNeedsLive RemoteConsumerState = iota
+	ConsumerNeedsEither
+	ConsumerNeedsShared
+	ConsumerLoadingLive
+	ConsumerLoadingShared
+	ConsumerResident
+	ConsumerCancelled
+)
+
+type LiveSnapshotChunk struct {
+	SnapshotID SnapshotID
+	Coordinate ChunkCoordinate
+	Pages      [256]PageVersionRef
+	Consumers  map[ConsumerID]RemoteConsumerState
+	Promotion  ChunkPromotion
+}
+```
+
+Every `PageVersionRef` pins the exact fork-time 4 KiB version, even if the
+source branch later writes that page. The array is an accounting group, not a
+1 MiB physical CoW object.
+
+Shared objects use the following lifecycle:
+
+```go
+type SharedObjectState uint8
+
+const (
+	ObjectAbsent SharedObjectState = iota
+	ObjectStaging
+	ObjectPublished
+	ObjectRetiring
+	ObjectTrash
+	ObjectDeleted
+	ObjectCorrupt
+)
+```
+
+`ObjectPublished` begins only after chunk file sync, atomic rename, and shard
+directory sync. `ObjectRetiring` is an internal GC decision while holding the
+family repository mutation lease. The deletion linearization point is atomic
+rename from `chunks/` to a transaction-specific `trash/` name followed by
+directory sync. No new manifest may begin referencing the object after that
+point. Final unlink from `trash/` is asynchronous. A correctly referenced or
+leased object never reaches `ObjectRetiring`; TTC does not rely on NFS
+`.nfs*` placeholders to make an incorrect deletion safe.
+
+### Reference classes
+
+TTC maintains two separate reference domains.
+
+**Process-local references** protect live host memory:
+
+1. branch PMA and mapping references to current 4 KiB pages;
+2. `PageVersionRef` references retained by each fork snapshot;
+3. network read leases acquired while copying a complete chunk response;
+4. publisher leases acquired while hashing and writing a complete chunk; and
+5. loader/install references held until an all-or-nothing installation commits.
+
+These references are managed under Sentry locks and disappear with the Sentry.
+A Sentry may exit only after every externally required page version has a
+durable shared replacement or its dependent branch has been cancelled.
+
+**Cluster references** protect shared chunk files across processes and nodes:
+
+1. immutable dehydrated-branch manifests;
+2. immutable live-handoff generations mapping promoted coordinates to chunks;
+3. active loader leases and their remaining-chunk bitmaps;
+4. publication transactions not yet incorporated into a manifest; and
+5. explicit soft cache pins, which are never required for correctness.
+
+The first four are GC roots. They are traced instead of summarized by a mutable
+numeric reference count, since a daemon crash could lose a count update. All
+root creation, root removal, and GC retirement for one family are serialized by
+a fenced family repository mutation lease. Failure may retain unreachable
+objects, but cannot remove a reachable object.
+
+The initial shared-filesystem implementation realizes this lease with one
+cross-host advisory lock file per family plus a monotonically increasing epoch
+in family metadata. Chunk data construction does not hold the lock. Publishing
+or removing branch roots, creating or finally removing loader leases, publishing
+handoff generations, and the complete GC trace-and-retire step do. A holder
+rechecks its epoch immediately before every metadata rename. Loader bitmap
+clears use atomic replacement outside the family lock because they only remove
+roots; a concurrent GC may observe the older conservative bitmap. Distributed
+mode starts only after two-daemon tests prove that the configured shared
+filesystem provides cross-host lock exclusion, lock release on process/node
+loss, coherent rename visibility, and durable directory synchronization.
+
+### Reference and transition points
+
+The following durable or locked events are the protocol's reference points:
+
+| Point | Event | What becomes legal afterward |
+| --- | --- | --- |
+| `L0` | Fork snapshot and its page references are published under Sentry locks. | Source execution may resume and write through 4 KiB CoW. |
+| `L1` | Target branch and live dependency are durably accepted. | The remote fork command may report success and B may fault pages. |
+| `L2` | Chunk file is synced, renamed into `chunks/`, and its directory is synced. | A later manifest may name the chunk; live refs still cannot be released. |
+| `L3` | Manifest or handoff generation naming the chunk is synced and published. | Consumers may switch from live to shared; the origin is `dual`. |
+| `L4` | A target atomically installs all valid pages and changes `loading` to `resident`. | Guest waiters may resume; the target may acknowledge the complete chunk. |
+| `L5` | Target acknowledgement or durable shared-origin switch is recorded. | That consumer no longer needs this live snapshot chunk. |
+| `L6` | Every consumer passed `L5` and all live I/O leases drained. | Source `PageVersionRef`s for the chunk may be released. |
+| `L7` | Loader-lease clears are durably synchronized. | GC no longer treats that loader as needing the installed chunks. |
+| `L8` | GC, under the fenced mutation lease, renames an unreachable chunk to `trash/` and syncs directories. | New roots cannot acquire it; asynchronous final unlink is safe. |
+
+Publishing bytes at `L2` is not sufficient to release live memory. Release is
+delayed until both discoverability (`L3`) and every consumer's transition
+(`L5`) are durable.
+
+The local state transitions themselves have these linearization points:
+
+| Transition | Linearization point | Failure rollback |
+| --- | --- | --- |
+| non-resident -> loading | CAS or chunk-map lock records a fresh `LoadID`. | The elected loader restores non-resident with the same origin and increments generation. |
+| loading -> resident | All pages and accounting are prepared, then one chunk-map update publishes them at `L4`. | Prepared pages are released without becoming visible. |
+| resident clean -> resident dirty | The 4 KiB page replacement and corresponding dirty-bit update occur under the branch chunk/PMA locks. | The write has not occurred if replacement fails. |
+| live -> dual | A handoff generation containing `ChunkID` is published at `L3`. | Keep live-only and retry; an unreferenced published chunk is later collected. |
+| dual -> shared | The consumer's durable origin switch or resident acknowledgement reaches `L5`. | Keep both origins; never discard live first. |
+| resident -> evicting | A frozen branch records an eviction transaction after loaders settle. | Restore resident and keep the old runtime state. |
+| evicting -> non-resident/shared | The new complete manifest is published and the branch/runtime pointer is atomically replaced. | Keep resident until publication succeeds. |
+| published -> retiring/trash | GC holds the family mutation lease, traces no roots, renames at `L8`, and syncs. | Before `L8`, restore published; after `L8`, only recovery/final unlink may act. |
+
+### Source writes and adjacent-page promotion
+
+When a local branch writes a 4 KiB page retained by a remote snapshot, ordinary
+CoW preserves the old `PageVersionRef`. The write-fault path performs no file or
+network I/O. After locks are released it queues the corresponding
+`(SnapshotID, StreamChunkIndex)` if at least one consumer still needs live data
+and no identical shared chunk has reached `L3`.
+
+The background publisher writes all valid pages in that 1 MiB snapshot chunk:
+
+1. Change `idle/retryable` to `queued`, coalescing duplicate dirty-page hints.
+2. Acquire publisher leases for all fork-time page versions and change to
+   `capturing`. Current source pages are not substituted for snapshot pages.
+3. If every consumer became resident meanwhile, cancel and release the leases.
+4. Otherwise hash and write the complete chunk, then pass `L2` and `L3`.
+5. Notify consumers that their origin is `dual`; network requests already in
+   flight remain valid because both sources contain identical bytes.
+6. After each consumer reaches `L5`, pass `L6` and mark promotion complete.
+
+Thus adjacent pages are written too, but asynchronously and only from the same
+fork-time snapshot. A dirty hint on any of the 256 pages promotes the complete
+chunk. Multiple remote children from the same capture share the promotion;
+children from different capture instants use different snapshot chunks and may
+produce different content IDs.
+
+`PromotionQueued` means eligible, not that the write must start immediately.
+The scheduler prioritizes a target demand for that chunk, source shutdown or
+dehydration, high snapshot-only memory, and repeated dirty hints. Under low
+pressure it may delay speculative publication long enough for the target to
+fetch and acknowledge the chunk directly, avoiding the disk write altogether.
+Once promotion enters `capturing`, however, its payload and network-visible
+unit are always the complete 1 MiB chunk; TTC does not create adjacent-page
+subobjects.
+
+### Operation timing rules
+
+| Operation | Required transition and completion point |
+| --- | --- |
+| Local fork | Freeze the branch; settle each `loading/evicting` transaction; share resident 4 KiB page refs and non-resident origin descriptors; publish the child's chunk-map root; then resume. No chunks are written. |
+| Live remote fork | Freeze, create fork-time page refs at `L0`, durably publish the target dependency at `L1`, then resume. Chunk publication is background work and is never on the source-pause path. |
+| Network fault | Atomically elect one loader, request exactly one stream chunk, acquire source network leases, transfer and validate all bytes, install all pages at `L4`, acknowledge the chunk at `L5`; interrupted transfers install nothing. |
+| Source page write | CoW only the written 4 KiB page, then enqueue whole-chunk promotion after releasing memory locks. The application never waits for `L2` or `L3`. |
+| Source memory pressure | Queue promotion for live-only chunks in priority order. Reclaim a chunk's old page versions only at `L6`. |
+| Dehydrate running/paused branch | Freeze and settle loaders. Reuse non-resident shared chunks; materialize live-only origins; write complete current contents for resident chunks. Publish a complete manifest at `L3`, replace runtime state with that manifest, then release branch pages. Outbound remote snapshots are promoted separately because they may contain older bytes. |
+| Stop/exited branch | Discard the branch's own current memory, but first promote every outbound remote snapshot through `L3` and move its consumers through `L5`, or explicitly cancel those consumers. Stop completes only when the Sentry can release those references at `L6`. |
+| Rehydrate | Before consuming the branch manifest, publish a loader lease covering all chunks. Restore with every slot non-resident/shared. Each fault commits a whole chunk at `L4`; batch lease clears reach `L7`. |
+| Redehydrate partially loaded branch | Reuse all non-resident shared chunks. Hash/write complete chunks for every resident slot, publish a new manifest, then remove the old loader lease. No half-old/half-new chunk merge exists. |
+| Fork dehydrated branch locally or remotely | Under the family mutation lease, publish another branch pointer to the same immutable manifest. The operation is metadata-only; the destination creates its own loader lease before consuming it. |
+| Remote fork of partially rehydrated branch | Reference clean resident/shared and non-resident/shared chunks directly. Create live snapshot chunks at `L0` only for resident chunks whose current contents lack an exact shared backing. |
+| Remove branch | Remove its manifest pointer or loader lease under the family mutation lease. Release process-local page refs after guest execution stops. GC may begin `L8` only after all other roots are traced. |
+| Unlink chunk | Only GC performs it, only for an unreferenced published object, and only at `L8`. Loading, rehydration, branch removal, and source shutdown merely remove their own roots; they never directly unlink shared data. |
+
+### Keeping useful shared chunks after rehydration
+
+After loading, the resident branch may retain `SharedChunkID` with a zero dirty
+bitmap as a clean-backing root. This consumes no additional space beyond the
+already published chunk and allows a later local or remote fork to reference it
+without consulting the process. On the first write to any page in the chunk,
+the branch marks that page dirty. Existing remote consumers keep their own
+manifest roots to the old chunk; the writing branch may drop its clean-backing
+root when policy no longer values it.
+
+This clean-backing root is an optimization, not a source of page correctness:
+the resident pages remain authoritative for the running branch. TTC may expose
+a retention policy such as `while-clean`, `cache`, or `eager-reclaim`, but it
+must represent the retained object as a real cluster root until it is released.
+
+A remote fork racing the first dirty write is serialized by the branch chunk
+lock. If the fork wins, it publishes the target manifest reference to the clean
+chunk before the source can drop its clean-backing root; the later write does
+not affect the target. If the write wins, the chunk is dirty and the fork takes
+fork-time `PageVersionRef`s at `L0`, using the live-to-shared promotion path.
+
 The benchmark and its limitations are recorded in
 [`g3doc/benchmarks/ttc_pebble_qualification.md`](../benchmarks/ttc_pebble_qualification.md).
 Real integration must still test guest-fault latency, state restoration,
