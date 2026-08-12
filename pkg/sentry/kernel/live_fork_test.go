@@ -455,6 +455,18 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	parent.SetHostMount(parent.PipeMount())
 	parent.Pause()
 	defer parent.Release()
+	// Simulate a page owned by another branch in the family-wide MemoryFile.
+	// The legacy allocator export includes it, but the branch-scoped binding
+	// graph must not.
+	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.MemoryFile().DecRef(orphan)
+	orphanPage, ok := parent.MemoryFile().LogicalPageIDAt(orphan.Start)
+	if !ok {
+		t.Fatal("orphan allocation has no logical page ID")
+	}
 	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{
 		ChildBranchIDs: []string{"remote-a", "remote-b"},
 	})
@@ -462,6 +474,21 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 		t.Fatalf("CaptureDistributedFork: %v", err)
 	}
 	defer capture.Close()
+	for _, binding := range capture.MemoryBindings {
+		if binding.Page == orphanPage {
+			t.Fatalf("branch-scoped capture included unrelated allocator page %+v", orphanPage)
+		}
+	}
+	legacyIncludedOrphan := false
+	for _, load := range capture.LoadRanges {
+		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
+			legacyIncludedOrphan = true
+			break
+		}
+	}
+	if !legacyIncludedOrphan {
+		t.Fatal("test setup failed: allocator-wide export did not include unrelated page")
+	}
 	if capture.Snapshot != nil || len(capture.Snapshots) != 2 {
 		t.Fatalf("capture snapshots: singular=%p siblings=%d", capture.Snapshot, len(capture.Snapshots))
 	}

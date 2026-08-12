@@ -180,6 +180,7 @@ go_library(
         "debug.go",
         "evictable_range.go",
         "evictable_range_set.go",
+		"logical_capture.go",
         "logical_page_set.go",
         "memacct_set.go",
         "memory_file_mutex.go",

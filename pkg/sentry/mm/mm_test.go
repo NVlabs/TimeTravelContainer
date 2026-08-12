@@ -221,6 +221,21 @@ func TestDistributedForkRemoteMemoryClone(t *testing.T) {
 	if parent.pmas.IsEmpty() || len(savedPMAs) == 0 {
 		t.Fatal("distributed source has no serializable PMAs")
 	}
+	capture := pgalloc.NewMemoryRangeCapture()
+	if err := parent.CaptureMemoryFileRanges(capture); err != nil {
+		t.Fatalf("CaptureMemoryFileRanges: %v", err)
+	}
+	bindings, err := capture.Bindings()
+	if err != nil {
+		t.Fatalf("capture.Bindings: %v", err)
+	}
+	wantCapturedPages := 0
+	for _, pma := range savedPMAs {
+		wantCapturedPages += int(pma.End-pma.Start) / hostarch.PageSize
+	}
+	if len(bindings) != wantCapturedPages {
+		t.Fatalf("captured %d PMA pages, want %d", len(bindings), wantCapturedPages)
+	}
 	parent.mf.MarkSavable()
 	var metadata bytes.Buffer
 	if _, err := state.Save(ctx, &metadata, parent); err != nil {

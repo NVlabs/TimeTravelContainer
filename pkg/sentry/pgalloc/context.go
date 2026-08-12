@@ -49,6 +49,12 @@ const (
 	// the complete target object graph's page references. Live-fork restore
 	// hooks must still run, but must not increment page references again.
 	CtxLiveForkRemoteMemoryClone
+
+	// CtxMemoryRangeCapture identifies the branch-scoped set of MemoryFile
+	// ranges referenced by the state graph currently being saved. Save hooks
+	// for MemoryFile-backed objects use this to opt their ranges into sparse
+	// distributed-fork and dehydration images.
+	CtxMemoryRangeCapture
 )
 
 // IsLiveForkClone returns true if ctx is loading an in-memory live fork.
@@ -106,6 +112,15 @@ func MemoryCgroupIDFromContext(ctx context.Context) uint32 {
 func MemoryFileMapFromContext(ctx context.Context) map[checkpoint.ResourceID]*MemoryFile {
 	if v := ctx.Value(CtxMemoryFileMap); v != nil {
 		return v.(map[checkpoint.ResourceID]*MemoryFile)
+	}
+	return nil
+}
+
+// MemoryRangeCaptureFromContext returns the branch-scoped memory capture used
+// by ctx, or nil when the caller is performing an ordinary checkpoint.
+func MemoryRangeCaptureFromContext(ctx context.Context) *MemoryRangeCapture {
+	if v := ctx.Value(CtxMemoryRangeCapture); v != nil {
+		return v.(*MemoryRangeCapture)
 	}
 	return nil
 }

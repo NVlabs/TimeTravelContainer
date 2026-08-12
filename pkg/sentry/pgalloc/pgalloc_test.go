@@ -157,6 +157,72 @@ func TestLogicalPageChunkCoordinates(t *testing.T) {
 	f.DecRef(fr)
 }
 
+func TestMemoryRangeCaptureCoalescesAndBindsPages(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 4 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := NewMemoryRangeCapture()
+	if err := capture.Record(f, memmap.FileRange{Start: fr.Start + page, End: fr.End}); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Record(f, memmap.FileRange{Start: fr.Start, End: fr.Start + 2*page}); err != nil {
+		t.Fatal(err)
+	}
+	ranges := capture.Ranges()
+	if len(ranges) != 1 || ranges[0].MemoryFile != f || ranges[0].Range != fr {
+		t.Fatalf("captured ranges = %+v, want one range %+v", ranges, fr)
+	}
+	bindings, err := capture.Bindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 4 {
+		t.Fatalf("got %d bindings, want 4", len(bindings))
+	}
+	for i, binding := range bindings {
+		pageID, versionID, ok := f.LogicalPageVersionAt(fr.Start + uint64(i)*page)
+		if !ok {
+			t.Fatalf("page %d has no identities", i)
+		}
+		chunkID, slot := pageID.Chunk()
+		if binding.OldOffset != fr.Start+uint64(i)*page || binding.Page != pageID || binding.Version != versionID || binding.Chunk != chunkID || binding.Slot != slot {
+			t.Fatalf("binding %d = %+v, want offset=%#x page=%+v version=%+v chunk=%+v slot=%d", i, binding, fr.Start+uint64(i)*page, pageID, versionID, chunkID, slot)
+		}
+		wantReferences := uint64(1)
+		if i == 1 {
+			wantReferences = 2
+		}
+		if binding.References != wantReferences {
+			t.Fatalf("binding %d has %d references, want %d", i, binding.References, wantReferences)
+		}
+	}
+	f.DecRef(fr)
+}
+
+func TestMemoryRangeCaptureRejectsRetiredPage(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := NewMemoryRangeCapture()
+	if err := capture.Record(f, fr); err != nil {
+		t.Fatal(err)
+	}
+	f.DecRef(fr)
+	if _, err := capture.Bindings(); err == nil {
+		t.Fatal("Bindings succeeded after the captured page was retired")
+	}
+}
+
 func TestAdoptCOWIdentitiesPreservesPageAndChangesVersion(t *testing.T) {
 	f := newLogicalPageTestMemoryFile()
 	source, err := f.findAllocatableAndMarkUsed(&allocState{

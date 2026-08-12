@@ -366,9 +366,11 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for dehydration: %w", err)
 		}
+		memoryCapture := pgalloc.NewMemoryRangeCapture()
 		saveCtx := context.WithValues(k.SupervisorContext(), map[any]any{
 			pgalloc.CtxMemoryFile:              k.mf,
 			pgalloc.CtxMemoryFileMap:           image.PrivateMemoryFiles,
+			pgalloc.CtxMemoryRangeCapture:      memoryCapture,
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: image.FilesystemResources,
 			vfs.CtxLiveForkChildBranchID:       opts.BranchID,
@@ -378,7 +380,9 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 			return fmt.Errorf("preparing VFS for dehydration: %w", err)
 		}
 		defer k.vfs.BeforeResume(saveCtx)
-		k.prepareMemoryManagersForDistributedFork()
+		if err := k.prepareMemoryManagersForDistributedFork(memoryCapture); err != nil {
+			return fmt.Errorf("capturing dehydration memory graph: %w", err)
+		}
 		k.mf.MarkSavable()
 		for _, mf := range image.PrivateMemoryFiles {
 			mf.MarkSavable()
@@ -403,6 +407,9 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		}
 		if err := buffered.Flush(); err != nil {
 			return fmt.Errorf("flushing dehydrated Kernel metadata: %w", err)
+		}
+		if _, err := memoryCapture.Bindings(); err != nil {
+			return fmt.Errorf("resolving dehydration memory graph: %w", err)
 		}
 		image.KernelMetadata = metadata.Bytes()
 		if image.metadataFile != nil {

@@ -127,6 +127,26 @@ func (mm *MemoryManager) savePmas() []pmaFlatSegment {
 	return saved[:len(saved):len(saved)]
 }
 
+// CaptureMemoryFileRanges records the MemoryFile ranges directly referenced
+// by mm's serialized PMAs. The Kernel must be paused while this runs.
+func (mm *MemoryManager) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	if capture == nil {
+		return fmt.Errorf("nil memory range capture")
+	}
+	mm.activeMu.RLock()
+	defer mm.activeMu.RUnlock()
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+		if !ok {
+			return fmt.Errorf("serializable PMA %v is backed by unsupported file %T", pseg.Range(), pseg.ValuePtr().file)
+		}
+		if err := capture.Record(mf, pseg.fileRange()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // loadPmas is invoked by stateify.
 func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment) {
 	if mm.liveForkPMAKey == 0 {

@@ -49,8 +49,12 @@ type DistributedForkCapture struct {
 	KernelMetadata    []byte
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
-	Snapshot          *pgalloc.RemoteSnapshot
-	Snapshots         []*pgalloc.RemoteSnapshot
+	// MemoryBindings is the branch-scoped page graph. AllocatorMetadata and
+	// LoadRanges remain allocator-wide until the sparse merge importer is
+	// connected; new transport code must use MemoryBindings instead.
+	MemoryBindings []pgalloc.CapturedPageBinding
+	Snapshot       *pgalloc.RemoteSnapshot
+	Snapshots      []*pgalloc.RemoteSnapshot
 
 	// FilesystemResources contains process-local handles. A same-process target
 	// may use them directly; a remote ttcd reopens equivalent handles from its
@@ -125,6 +129,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
+		memoryCapture := pgalloc.NewMemoryRangeCapture()
 		fsResources := make(vfs.LiveForkFilesystemResources)
 		fsTransactions := &vfs.LiveForkTransactions{}
 		committed := false
@@ -139,6 +144,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		saveCtx := context.WithValues(k.SupervisorContext(), map[any]any{
 			pgalloc.CtxMemoryFile:              k.mf,
 			pgalloc.CtxMemoryFileMap:           mfs,
+			pgalloc.CtxMemoryRangeCapture:      memoryCapture,
 			pgalloc.CtxLiveForkSource:          true,
 			vfs.CtxLiveForkFilesystemResources: fsResources,
 			vfs.CtxLiveForkChildBranchID:       childBranchIDs[0],
@@ -153,7 +159,9 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			return fmt.Errorf("distributed fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
-		k.prepareMemoryManagersForDistributedFork()
+		if err := k.prepareMemoryManagersForDistributedFork(memoryCapture); err != nil {
+			return fmt.Errorf("capturing distributed-fork memory graph: %w", err)
+		}
 		k.mf.MarkSavable()
 		allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
 		if err != nil {
@@ -181,6 +189,10 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		if err := buffered.Flush(); err != nil {
 			return err
 		}
+		memoryBindings, err := memoryCapture.Bindings()
+		if err != nil {
+			return fmt.Errorf("resolving distributed-fork memory graph: %w", err)
+		}
 		// The state stream and remote snapshot refer to the fork-time VVAR
 		// page. resumeTimeLocked updates the source Timekeeper after this
 		// callback returns, so first move the source onto a new parameter page.
@@ -195,7 +207,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		committed = true
 		capture = &DistributedForkCapture{
 			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
-			LoadRanges: loads, FilesystemResources: fsResources,
+			LoadRanges: loads, MemoryBindings: memoryBindings, FilesystemResources: fsResources,
 		}
 		if len(snapshots) == 1 {
 			capture.Snapshot = snapshots[0]
