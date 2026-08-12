@@ -10,6 +10,7 @@ go_library(
     srcs = [
 		"assemble.go",
         "chunk.go",
+		"manifest.go",
         "store.go",
     ],
     visibility = ["//visibility:public"],
@@ -28,6 +29,7 @@ go_test(
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",
+		"//pkg/sentry/checkpoint",
         "//pkg/sentry/pgalloc",
     ],
 )

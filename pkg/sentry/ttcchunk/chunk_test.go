@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -239,5 +240,54 @@ func TestReadSnapshotBuildsObjectsWithoutAcknowledging(t *testing.T) {
 	}
 	if stats := snapshot.Stats(); stats.PagesReleased != 0 || stats.PagesOutstanding != 2 {
 		t.Fatalf("ReadSnapshot acknowledged source pages: %+v", stats)
+	}
+}
+
+func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
+	allocator := testAllocator(11)
+	versionAllocator := testAllocator(22)
+	logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 9}
+	object := ID(sha256.Sum256([]byte("dense-object")))
+	stored := make([]StoredBinding, PagesPerChunk)
+	for i := range stored {
+		stored[i] = StoredBinding{
+			Binding: pgalloc.CapturedPageBinding{
+				OldOffset:  uint64(i) * hostarch.PageSize,
+				References: 2,
+				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(i)},
+				Version:    pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1000 + uint64(i)},
+				Chunk:      logical,
+				Slot:       uint8(i),
+			},
+			Object: object,
+		}
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Runs) != 1 || manifest.Runs[0].Pages != PagesPerChunk {
+		t.Fatalf("dense chunk compacted to %+v, want one 256-page run", manifest.Runs)
+	}
+	data, id, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) >= 512 {
+		t.Fatalf("one dense chunk manifest uses %d bytes, want less than 512", len(data))
+	}
+	decoded, err := DecodeManifest(data, &id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, manifest) {
+		t.Fatalf("decoded manifest = %+v, want %+v", decoded, manifest)
+	}
+	if expanded := decoded.Expand(); !reflect.DeepEqual(expanded, stored) {
+		t.Fatalf("expanded bindings differ from source")
+	}
+	data[len(data)-1] ^= 1
+	if _, err := DecodeManifest(data, &id); err == nil {
+		t.Fatal("corrupt manifest passed content-address verification")
 	}
 }
