@@ -200,6 +200,50 @@ func TestMemoryRangeCaptureCoalescesAndBindsPages(t *testing.T) {
 		if binding.References != wantReferences {
 			t.Fatalf("binding %d has %d references, want %d", i, binding.References, wantReferences)
 		}
+		if binding.StreamOffset != uint64(i)*page {
+			t.Fatalf("binding %d has stream offset %#x, want %#x", i, binding.StreamOffset, uint64(i)*page)
+		}
+	}
+	f.DecRef(fr)
+}
+
+func TestMemoryRangeCaptureSnapshotPinsOnlyCapturedPages(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 4 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedFR := memmap.FileRange{Start: fr.Start + page, End: fr.End - page}
+	capture := NewMemoryRangeCapture()
+	if err := capture.Record(f, capturedFR); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := capture.SnapshotLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Regions) != 1 || layout.Regions[0].Range != capturedFR || len(layout.Bindings) != 2 {
+		t.Fatalf("snapshot layout = %+v", layout)
+	}
+	snapshot, err := NewRemoteSnapshot(layout.Regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.HasUniqueRef(capturedFR) {
+		t.Fatal("captured pages remained uniquely referenced after snapshot")
+	}
+	uncaptured := memmap.FileRange{Start: fr.Start, End: fr.Start + page}
+	if !f.HasUniqueRef(uncaptured) {
+		t.Fatal("snapshot pinned an uncaptured sibling page")
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !f.HasUniqueRef(capturedFR) {
+		t.Fatal("closing snapshot did not release captured pages")
 	}
 	f.DecRef(fr)
 }

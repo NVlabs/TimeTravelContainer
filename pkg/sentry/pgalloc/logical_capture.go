@@ -35,11 +35,22 @@ type CapturedMemoryRange struct {
 type CapturedPageBinding struct {
 	ResourceID checkpoint.ResourceID
 	OldOffset  uint64
-	References uint64
-	Page       LogicalPageID
-	Version    PageVersionID
-	Chunk      LogicalChunkID
-	Slot       uint8
+	// StreamOffset is the byte offset of this page in SnapshotLayout's packed
+	// stream. It is transport-local and is not part of logical identity.
+	StreamOffset uint64
+	References   uint64
+	Page         LogicalPageID
+	Version      PageVersionID
+	Chunk        LogicalChunkID
+	Slot         uint8
+}
+
+// CapturedMemoryLayout is the exact branch-reachable byte layout pinned for a
+// remote fork or dehydration. Regions contain each physical source page once;
+// Bindings retain the number of serialized owners of that page.
+type CapturedMemoryLayout struct {
+	Regions  []RemoteSnapshotRegion
+	Bindings []CapturedPageBinding
 }
 
 type capturedReferencedRange struct {
@@ -154,6 +165,18 @@ func (c *MemoryRangeCapture) Ranges() []CapturedMemoryRange {
 // callers must keep the source Kernel paused until a snapshot pins the ranges.
 func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 	var result []CapturedPageBinding
+	streamRanges := make(map[*MemoryFile][]struct {
+		range_ memmap.FileRange
+		start  uint64
+	})
+	var nextStreamOffset uint64
+	for _, captured := range c.Ranges() {
+		streamRanges[captured.MemoryFile] = append(streamRanges[captured.MemoryFile], struct {
+			range_ memmap.FileRange
+			start  uint64
+		}{captured.Range, nextStreamOffset})
+		nextStreamOffset += captured.Range.Length()
+	}
 	for _, mf := range c.files {
 		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
 			capturedRange := referenced.range_
@@ -163,18 +186,31 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 					return nil, fmt.Errorf("captured MemoryFile range %v has no logical page at offset %#x", capturedRange, cursor)
 				}
 				for off := run.Range.Start; off < run.Range.End; off += hostarch.PageSize {
+					var streamOffset uint64
+					foundStreamRange := false
+					for _, streamRange := range streamRanges[mf] {
+						if streamRange.range_.Start <= off && off < streamRange.range_.End {
+							streamOffset = streamRange.start + off - streamRange.range_.Start
+							foundStreamRange = true
+							break
+						}
+					}
+					if !foundStreamRange {
+						return nil, fmt.Errorf("captured MemoryFile offset %#x has no packed stream range", off)
+					}
 					pageDelta := (off - run.Range.Start) / hostarch.PageSize
 					pageID := LogicalPageID{Allocator: run.First.Allocator, Sequence: run.First.Sequence + pageDelta}
 					versionID := PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + pageDelta}
 					chunkID, slot := pageID.Chunk()
 					result = append(result, CapturedPageBinding{
-						ResourceID: mf.ResourceID(),
-						OldOffset:  off,
-						References: referenced.references,
-						Page:       pageID,
-						Version:    versionID,
-						Chunk:      chunkID,
-						Slot:       slot,
+						ResourceID:   mf.ResourceID(),
+						OldOffset:    off,
+						StreamOffset: streamOffset,
+						References:   referenced.references,
+						Page:         pageID,
+						Version:      versionID,
+						Chunk:        chunkID,
+						Slot:         slot,
 					})
 				}
 				cursor = run.Range.End
@@ -185,4 +221,24 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 		}
 	}
 	return result, nil
+}
+
+// SnapshotLayout returns the regions and page bindings needed to pin exactly
+// this capture. It does not acquire references; pass Regions to
+// NewRemoteSnapshot or NewRemoteSnapshots while the source remains paused.
+func (c *MemoryRangeCapture) SnapshotLayout() (CapturedMemoryLayout, error) {
+	bindings, err := c.Bindings()
+	if err != nil {
+		return CapturedMemoryLayout{}, err
+	}
+	ranges := c.Ranges()
+	regions := make([]RemoteSnapshotRegion, len(ranges))
+	for i, captured := range ranges {
+		regions[i] = RemoteSnapshotRegion{
+			ID:    RemoteRegionID(i + 1),
+			File:  captured.MemoryFile,
+			Range: captured.Range,
+		}
+	}
+	return CapturedMemoryLayout{Regions: regions, Bindings: bindings}, nil
 }
