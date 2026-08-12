@@ -108,6 +108,38 @@ clean caches may be omitted only by a later explicit optimization that proves
 the backing object and identity are durable; the initial conversion must not
 silently narrow the current packed snapshot's coverage.
 
+“Referenced” is branch-specific, not equivalent to every allocated page in a
+family-wide `MemoryFile`. The existing
+`ExportMemoryFileMetadataForRemote` baseline walks allocator occupancy, so it
+also exports pages reachable only from sibling Kernels. That is not an
+authoritative source for sparse manifests. During state capture, every saved
+PMA and kernel object that owns a `MemoryFile` range registers a binding:
+
+```go
+type CapturedPageBinding struct {
+	ResourceID checkpoint.ResourceID
+	OldOffset uint64
+	Page      LogicalPageID
+	Version   PageVersionID
+	Chunk     ChunkID
+	Slot      uint8
+}
+```
+
+The immutable binding-map root is captured with the Kernel; background code
+may then group its referenced versions into chunk files. Restore first merges
+page versions into the node-local canonical store, builds an old-offset to
+target-offset relocation map, and applies that map to every saved reference.
+Allocator free-space/refcount metadata is reconstructed for the imported
+branch rather than copied wholesale from the source Sentry.
+
+One branch can legitimately retain two versions of the same logical page, for
+example when aliases diverge through private CoW. Consequently a chunk file is
+a transport/storage bundle for one page-version vector, not the sole value of
+a logical coordinate. A branch binding names the exact `(Page, Version,
+Chunk, Slot)` it requires; several chunk objects may cover the same logical
+coordinate. Node-local canonicalization still collapses equal page versions.
+
 One chunk contains as many as 256 stable logical 4 KiB page slots, not
 necessarily one contiguous guest virtual-address interval. Its manifest entry
 records the logical coordinate, valid-slot bitmap, immutable content version,
@@ -1315,6 +1347,11 @@ branch observe another branch's private write.
   write faults, kernel `MapInternal` writes, zeroing, truncation, tmpfs/shared
   memory, and writes through aliases. Each path must split a shared/sealed page
   version before modification or prove that the page is unique and mutable.
+* Add a state-capture range registrar to PMAs and every serialized kernel owner
+  of a `MemoryFile` range (special mappings, AIO, shared memory, VDSO, packet
+  rings, tmpfs/private files, and later supported devices). Reject capture if a
+  saved reference has no binding; never fall back silently to exporting all
+  family allocator occupancy.
 * Replace the remote target's new-family sandbox creation with lookup-or-create
   of the one `(global family, target node)` Sentry. Import later remote branches
   into that Sentry and reject incompatible configuration.
