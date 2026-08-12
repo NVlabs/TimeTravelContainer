@@ -73,6 +73,7 @@ type memoryFileSaved struct {
 	unfreeHuge       *unfreeSet
 	logicalAllocator LogicalAllocatorID
 	nextLogicalPage  uint64
+	nextPageVersion  uint64
 	logicalPages     *logicalPageSet
 	subreleased      map[uint64]uint64
 	memAcct          *memAcctSet
@@ -396,6 +397,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		unfreeHuge:       &f.unfreeHuge,
 		logicalAllocator: f.logicalAllocator,
 		nextLogicalPage:  f.nextLogicalPage,
+		nextPageVersion:  f.nextPageVersion,
 		logicalPages:     &f.logicalPages,
 		subreleased:      f.subreleased,
 		memAcct:          &f.memAcct,
@@ -952,6 +954,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	if mfs.logicalAllocator != (LogicalAllocatorID{}) {
 		f.logicalAllocator = mfs.logicalAllocator
 		f.nextLogicalPage = mfs.nextLogicalPage
+		f.nextPageVersion = mfs.nextPageVersion
 	}
 	if mfs.logicalPages != nil {
 		f.logicalPages.MoveFrom(mfs.logicalPages)

@@ -330,6 +330,19 @@ func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
 	}
 	defer child.DecUsers(ctx)
+	parentBefore := parent.pmas.FindSegment(addr)
+	childBefore := child.pmas.FindSegment(addr)
+	if !parentBefore.Ok() || !childBefore.Ok() {
+		t.Fatal("forked PMA missing")
+	}
+	parentID, parentVersion, ok := parent.mf.LogicalPageVersionAt(parentBefore.fileRange().Start)
+	if !ok {
+		t.Fatal("parent PMA has no logical page identity")
+	}
+	childID, childVersion, ok := child.mf.LogicalPageVersionAt(childBefore.fileRange().Start)
+	if !ok || childID != parentID || childVersion != parentVersion {
+		t.Fatalf("child did not initially share page version: parent=(%+v,%+v) child=(%+v,%+v,%v)", parentID, parentVersion, childID, childVersion, ok)
+	}
 
 	read := func(name string, memMgr *MemoryManager) string {
 		buf := make([]byte, len(initial))
@@ -345,6 +358,14 @@ func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 	childBytes := []byte("child--after--fork")
 	if n, err := child.CopyOut(ctx, addr, childBytes, usermem.IOOpts{}); err != nil || n != len(childBytes) {
 		t.Fatalf("child.CopyOut: n=%d err=%v", n, err)
+	}
+	childAfter := child.pmas.FindSegment(addr)
+	if !childAfter.Ok() {
+		t.Fatal("child PMA missing after CoW")
+	}
+	childID, childVersion, ok = child.mf.LogicalPageVersionAt(childAfter.fileRange().Start)
+	if !ok || childID != parentID || childVersion == parentVersion {
+		t.Fatalf("child CoW identities: parent=(%+v,%+v) child=(%+v,%+v,%v)", parentID, parentVersion, childID, childVersion, ok)
 	}
 	if got := read("parent", parent); got != string(initial) {
 		t.Errorf("child write changed parent: got %q, want %q", got, initial)

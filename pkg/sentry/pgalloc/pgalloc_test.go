@@ -157,6 +157,54 @@ func TestLogicalPageChunkCoordinates(t *testing.T) {
 	f.DecRef(fr)
 }
 
+func TestAdoptCOWIdentitiesPreservesPageAndChangesVersion(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	source, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 2 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 2 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, sourceVersion, ok := f.LogicalPageVersionAt(source.Start)
+	if !ok {
+		t.Fatal("source page has no identities")
+	}
+	transientTargetID, _, ok := f.LogicalPageVersionAt(target.Start)
+	if !ok {
+		t.Fatal("target page has no initial identities")
+	}
+	if err := f.AdoptCOWIdentities(f, source, target); err != nil {
+		t.Fatal(err)
+	}
+	targetID, targetVersion, ok := f.LogicalPageVersionAt(target.Start)
+	if !ok {
+		t.Fatal("target page has no adopted identities")
+	}
+	if targetID != sourceID {
+		t.Fatalf("CoW changed logical page ID: source=%+v target=%+v", sourceID, targetID)
+	}
+	if targetVersion == sourceVersion {
+		t.Fatalf("CoW retained content version: source=%+v target=%+v", sourceVersion, targetVersion)
+	}
+	if targetID == transientTargetID {
+		t.Fatalf("CoW retained target allocation's transient logical ID: %+v", targetID)
+	}
+	gotSourceID, gotSourceVersion, ok := f.LogicalPageVersionAt(source.Start)
+	if !ok || gotSourceID != sourceID || gotSourceVersion != sourceVersion {
+		t.Fatalf("CoW changed source identities: got=(%+v,%+v,%v) want=(%+v,%+v,true)", gotSourceID, gotSourceVersion, ok, sourceID, sourceVersion)
+	}
+	f.DecRef(target)
+	f.DecRef(source)
+}
+
 func TestFindAllocatable(t *testing.T) {
 	for _, test := range []struct {
 		name string

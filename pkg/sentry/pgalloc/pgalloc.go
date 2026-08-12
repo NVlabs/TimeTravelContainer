@@ -144,9 +144,11 @@ type MemoryFile struct {
 	// stored as runs, so ordinary multi-page allocations add one segment rather
 	// than one metadata object per page.
 	//
-	// logicalAllocator, nextLogicalPage, and logicalPages are protected by mu.
+	// logicalAllocator, nextLogicalPage, nextPageVersion, and logicalPages are
+	// protected by mu.
 	logicalAllocator LogicalAllocatorID
 	nextLogicalPage  uint64
+	nextPageVersion  uint64
 	logicalPages     logicalPageSet
 
 	// subreleased maps hugepage-aligned file offsets to the number of
@@ -300,14 +302,17 @@ func (f *MemoryFile) chunksLoad() []chunkInfo {
 // Preconditions: f.mu must be locked and fr must contain newly allocated pages.
 func (f *MemoryFile) assignLogicalPagesLocked(fr memmap.FileRange) {
 	pages := fr.Length() / hostarch.PageSize
-	if pages == 0 || pages > math.MaxUint64-f.nextLogicalPage {
+	if pages == 0 || pages > math.MaxUint64-f.nextLogicalPage || pages > math.MaxUint64-f.nextPageVersion {
 		panic(fmt.Sprintf("logical page sequence exhausted for allocation %v", fr))
 	}
 	f.logicalPages.InsertRange(fr, logicalPageInfo{
-		Allocator:     f.logicalAllocator,
-		FirstSequence: f.nextLogicalPage,
+		Allocator:            f.logicalAllocator,
+		FirstSequence:        f.nextLogicalPage,
+		VersionAllocator:     f.logicalAllocator,
+		FirstVersionSequence: f.nextPageVersion,
 	})
 	f.nextLogicalPage += pages
+	f.nextPageVersion += pages
 }
 
 // ensureLogicalPagesLocked synthesizes identities when loading a checkpoint
@@ -333,20 +338,31 @@ func (f *MemoryFile) ensureLogicalPagesLocked() {
 // LogicalPageIDAt returns the stable identity of the allocated page beginning
 // at offset. It returns false for an unaligned or currently unallocated offset.
 func (f *MemoryFile) LogicalPageIDAt(offset uint64) (LogicalPageID, bool) {
+	id, _, ok := f.LogicalPageVersionAt(offset)
+	return id, ok
+}
+
+// LogicalPageVersionAt returns the stable page and content-version identities
+// for the allocated page beginning at offset.
+func (f *MemoryFile) LogicalPageVersionAt(offset uint64) (LogicalPageID, PageVersionID, bool) {
 	if !hostarch.IsPageAligned(offset) {
-		return LogicalPageID{}, false
+		return LogicalPageID{}, PageVersionID{}, false
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	seg := f.logicalPages.FindSegment(offset)
 	if !seg.Ok() {
-		return LogicalPageID{}, false
+		return LogicalPageID{}, PageVersionID{}, false
 	}
 	info := seg.ValuePtr()
+	pageDelta := (offset - seg.Start()) / hostarch.PageSize
 	return LogicalPageID{
-		Allocator: info.Allocator,
-		Sequence:  info.FirstSequence + (offset-seg.Start())/hostarch.PageSize,
-	}, true
+			Allocator: info.Allocator,
+			Sequence:  info.FirstSequence + pageDelta,
+		}, PageVersionID{
+			Allocator: info.VersionAllocator,
+			Sequence:  info.FirstVersionSequence + pageDelta,
+		}, true
 }
 
 // LogicalPageRanges returns the stable identity runs intersecting fr. The
@@ -357,15 +373,86 @@ func (f *MemoryFile) LogicalPageRanges(fr memmap.FileRange) []LogicalPageRange {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.logicalPageRangesLocked(fr)
+}
+
+// AdoptCOWIdentities replaces the fresh logical identities on targetFR with
+// the logical page identities from sourceFR and fresh content-version IDs.
+// This makes a physical CoW copy another version of the same logical pages.
+// sourceFR and targetFR must have equal, non-zero, page-aligned lengths.
+//
+// The caller must retain references on sourceFR and targetFR for this call.
+func (f *MemoryFile) AdoptCOWIdentities(source *MemoryFile, sourceFR, targetFR memmap.FileRange) error {
+	if source == nil || !sourceFR.WellFormed() || !targetFR.WellFormed() ||
+		sourceFR.Length() == 0 || sourceFR.Length() != targetFR.Length() ||
+		!hostarch.IsPageAligned(sourceFR.Start) || !hostarch.IsPageAligned(sourceFR.End) ||
+		!hostarch.IsPageAligned(targetFR.Start) || !hostarch.IsPageAligned(targetFR.End) {
+		return fmt.Errorf("invalid CoW identity ranges: source=%v target=%v", sourceFR, targetFR)
+	}
+	sourceRuns := source.LogicalPageRanges(sourceFR)
+	cursor := sourceFR.Start
+	for _, run := range sourceRuns {
+		if run.Range.Start != cursor {
+			return fmt.Errorf("source CoW identity range %v has a gap at %#x", sourceFR, cursor)
+		}
+		cursor = run.Range.End
+	}
+	if cursor != sourceFR.End {
+		return fmt.Errorf("source CoW identity range %v ends at %#x", sourceFR, cursor)
+	}
+
+	pages := targetFR.Length() / hostarch.PageSize
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	targetRuns := f.logicalPageRangesLocked(targetFR)
+	cursor = targetFR.Start
+	for _, run := range targetRuns {
+		if run.Range.Start != cursor {
+			return fmt.Errorf("target CoW identity range %v has a gap at %#x", targetFR, cursor)
+		}
+		cursor = run.Range.End
+	}
+	if cursor != targetFR.End {
+		return fmt.Errorf("target CoW identity range %v ends at %#x", targetFR, cursor)
+	}
+	if pages > math.MaxUint64-f.nextPageVersion {
+		return fmt.Errorf("page version sequence exhausted for CoW range %v", targetFR)
+	}
+	f.logicalPages.RemoveFullRange(targetFR)
+	nextVersion := f.nextPageVersion
+	for _, run := range sourceRuns {
+		destStart := targetFR.Start + (run.Range.Start - sourceFR.Start)
+		dest := memmap.FileRange{Start: destStart, End: destStart + run.Range.Length()}
+		f.logicalPages.InsertRange(dest, logicalPageInfo{
+			Allocator:            run.First.Allocator,
+			FirstSequence:        run.First.Sequence,
+			VersionAllocator:     f.logicalAllocator,
+			FirstVersionSequence: nextVersion,
+		})
+		nextVersion += run.Range.Length() / hostarch.PageSize
+	}
+	f.nextPageVersion += pages
+	return nil
+}
+
+// logicalPageRangesLocked is LogicalPageRanges without locking.
+//
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) logicalPageRangesLocked(fr memmap.FileRange) []LogicalPageRange {
 	var ranges []LogicalPageRange
 	f.logicalPages.VisitRange(fr, func(seg logicalPageIterator) bool {
 		intersection := seg.Range().Intersect(fr)
 		info := seg.ValuePtr()
+		pageDelta := (intersection.Start - seg.Start()) / hostarch.PageSize
 		ranges = append(ranges, LogicalPageRange{
 			Range: intersection,
 			First: LogicalPageID{
 				Allocator: info.Allocator,
-				Sequence:  info.FirstSequence + (intersection.Start-seg.Start())/hostarch.PageSize,
+				Sequence:  info.FirstSequence + pageDelta,
+			},
+			FirstVersion: PageVersionID{
+				Allocator: info.VersionAllocator,
+				Sequence:  info.FirstVersionSequence + pageDelta,
 			},
 		})
 		return true
@@ -421,6 +508,15 @@ type LogicalPageID struct {
 	Sequence  uint64
 }
 
+// PageVersionID identifies one immutable content incarnation of a logical
+// page. A CoW split preserves LogicalPageID and assigns a new PageVersionID.
+//
+// +stateify savable
+type PageVersionID struct {
+	Allocator LogicalAllocatorID
+	Sequence  uint64
+}
+
 // LogicalChunkID identifies the group containing a logical page. TTC's first
 // sparse-memory format uses 256 base-page slots per chunk.
 //
@@ -445,15 +541,18 @@ func (id LogicalPageID) Chunk() (LogicalChunkID, uint8) {
 //
 // +stateify savable
 type logicalPageInfo struct {
-	Allocator     LogicalAllocatorID
-	FirstSequence uint64
+	Allocator            LogicalAllocatorID
+	FirstSequence        uint64
+	VersionAllocator     LogicalAllocatorID
+	FirstVersionSequence uint64
 }
 
 // LogicalPageRange describes a contiguous run of backing pages with contiguous
 // stable identities.
 type LogicalPageRange struct {
-	Range memmap.FileRange
-	First LogicalPageID
+	Range        memmap.FileRange
+	First        LogicalPageID
+	FirstVersion PageVersionID
 }
 
 // memAcctInfo is the value type of MemoryFile.memAcct.
@@ -664,6 +763,7 @@ func (f *MemoryFile) initFields() {
 		panic(fmt.Sprintf("generating MemoryFile logical allocator ID: %v", err))
 	}
 	f.nextLogicalPage = 0
+	f.nextPageVersion = 0
 	chunks := []chunkInfo(nil)
 	f.chunks.Store(&chunks)
 }
@@ -2263,16 +2363,20 @@ func (logicalPageSetFunctions) ClearValue(val *logicalPageInfo) {
 }
 
 func (logicalPageSetFunctions) Merge(r1 memmap.FileRange, val1 logicalPageInfo, r2 memmap.FileRange, val2 logicalPageInfo) (logicalPageInfo, bool) {
-	if val1.Allocator != val2.Allocator {
+	if val1.Allocator != val2.Allocator || val1.VersionAllocator != val2.VersionAllocator {
 		return logicalPageInfo{}, false
 	}
-	want := val1.FirstSequence + r1.Length()/hostarch.PageSize
-	return val1, want == val2.FirstSequence && r1.End == r2.Start
+	pages := r1.Length() / hostarch.PageSize
+	wantPage := val1.FirstSequence + pages
+	wantVersion := val1.FirstVersionSequence + pages
+	return val1, wantPage == val2.FirstSequence && wantVersion == val2.FirstVersionSequence && r1.End == r2.Start
 }
 
 func (logicalPageSetFunctions) Split(r memmap.FileRange, val logicalPageInfo, splitAt uint64) (logicalPageInfo, logicalPageInfo) {
 	right := val
-	right.FirstSequence += (splitAt - r.Start) / hostarch.PageSize
+	pages := (splitAt - r.Start) / hostarch.PageSize
+	right.FirstSequence += pages
+	right.FirstVersionSequence += pages
 	return val, right
 }
 

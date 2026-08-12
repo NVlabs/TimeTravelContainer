@@ -488,6 +488,12 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						pstart = pmaIterator{} // iterators invalidated
 					}
 					oldpma = pseg.ValuePtr()
+					if sourceMF, ok := oldpma.file.(*pgalloc.MemoryFile); ok {
+						if err := mm.mf.AdoptCOWIdentities(sourceMF, pseg.fileRange(), fr); err != nil {
+							mm.mf.DecRef(fr)
+							return pstart, pseg.PrevGap(), fmt.Errorf("adopting logical page identities during CoW: %w", err)
+						}
+					}
 					unmapAR = joinAddrRanges(unmapAR, copyAR)
 					pfdrs = appendPendingCOWFileDecRef(pfdrs, oldpma.file, pseg.fileRange())
 					oldpma.file = mm.mf

@@ -436,6 +436,7 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 		unfreeHuge:       &source.unfreeHuge,
 		logicalAllocator: source.logicalAllocator,
 		nextLogicalPage:  source.nextLogicalPage,
+		nextPageVersion:  source.nextPageVersion,
 		logicalPages:     &source.logicalPages,
 		subreleased:      source.subreleased,
 		memAcct:          &source.memAcct,
@@ -526,6 +527,7 @@ func ImportMemoryFileMetadataForRemote(ctx context.Context, target *MemoryFile, 
 	if saved.logicalAllocator != (LogicalAllocatorID{}) {
 		target.logicalAllocator = saved.logicalAllocator
 		target.nextLogicalPage = saved.nextLogicalPage
+		target.nextPageVersion = saved.nextPageVersion
 	}
 	if saved.logicalPages != nil {
 		target.logicalPages.MoveFrom(saved.logicalPages)
