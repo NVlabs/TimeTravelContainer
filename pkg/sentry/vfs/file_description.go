@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -342,6 +343,14 @@ func (fd *FileDescription) Impl() FileDescriptionImpl {
 // such as epoll interests, which must also pass validation.
 type LiveForkFileDescription interface {
 	ValidateLiveFork() (referenced []*FileDescription, err error)
+}
+
+// MemoryFileRangeCapturer is implemented by file descriptions whose saved
+// object graph directly owns application MemoryFile ranges independently of
+// resident PMAs. Implementations should use MemoryRangeCapture.RecordOwned so
+// alternate graph paths to the same object are deduplicated.
+type MemoryFileRangeCapturer interface {
+	CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error
 }
 
 // SyncOptions contains options for FileDescriptionImpl.Sync.

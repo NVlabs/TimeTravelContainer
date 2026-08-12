@@ -197,6 +197,7 @@ go_library(
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
+		"//pkg/sentry/pgalloc",
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/uniqueid",
         "//pkg/sync",

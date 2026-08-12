@@ -52,6 +52,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	epb "gvisor.dev/gvisor/pkg/sentry/socket/netstack/events_go_proto"
@@ -472,6 +473,32 @@ func (s *sock) ValidateLiveFork() ([]*vfs.FileDescription, error) {
 		return nil, err
 	}
 	return nil, nil
+}
+
+// CaptureMemoryFileRanges implements vfs.MemoryFileRangeCapturer.
+func (s *sock) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	mappable, ok := s.Endpoint.(stack.MappablePacketEndpoint)
+	if !ok {
+		return nil
+	}
+	packetEndpoint := mappable.GetPacketMMapEndpoint()
+	if packetEndpoint == nil {
+		return nil
+	}
+	endpoint, ok := packetEndpoint.(*packetmmap.Endpoint)
+	if !ok {
+		return fmt.Errorf("packet mmap endpoint has unexpected type %T", packetEndpoint)
+	}
+	for _, owned := range endpoint.MemoryFileRanges() {
+		mf, ok := owned.File.(*pgalloc.MemoryFile)
+		if !ok {
+			return fmt.Errorf("packet mmap endpoint owns unsupported memory file %T", owned.File)
+		}
+		if err := capture.RecordOwned(endpoint, mf, owned.Range); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // New creates a new endpoint socket.

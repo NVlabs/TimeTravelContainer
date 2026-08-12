@@ -143,6 +143,11 @@ func (m *SpecialMappable) FileRange() memmap.FileRange {
 	return m.fr
 }
 
+// MemoryFileRanges implements memmap.MemoryFileRangeProvider.
+func (m *SpecialMappable) MemoryFileRanges() []memmap.MemoryFileRange {
+	return []memmap.MemoryFileRange{{File: m.mf, Range: m.fr}}
+}
+
 // Length returns the length of the SpecialMappable.
 func (m *SpecialMappable) Length() uint64 {
 	return m.fr.Length()

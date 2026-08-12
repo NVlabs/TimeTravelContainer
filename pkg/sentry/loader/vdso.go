@@ -177,6 +177,26 @@ type VDSO struct {
 	phdrs []elf.ProgHeader `state:".([]elfProgHeader)"`
 }
 
+// CaptureMemoryFileRanges records the MemoryFile ownership held by the VDSO
+// mappings themselves, even when no task currently maps them.
+func (v *VDSO) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	for _, mappable := range []*mm.SpecialMappable{v.ParamPage, v.vdso} {
+		if mappable == nil {
+			continue
+		}
+		for _, owned := range mappable.MemoryFileRanges() {
+			mf, ok := owned.File.(*pgalloc.MemoryFile)
+			if !ok {
+				return fmt.Errorf("VDSO mapping owns unsupported memory file %T", owned.File)
+			}
+			if err := capture.RecordOwned(mappable, mf, owned.Range); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // PrepareVDSO validates the system VDSO and returns a VDSO, containing the
 // param page for updating by the kernel.
 func PrepareVDSO(mf *pgalloc.MemoryFile) (*VDSO, error) {

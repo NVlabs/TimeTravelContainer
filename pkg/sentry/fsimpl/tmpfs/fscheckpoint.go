@@ -36,6 +36,32 @@ func MemoryFileOf(vfsfs *vfs.Filesystem) *pgalloc.MemoryFile {
 	return nil
 }
 
+// CaptureMemoryFileRanges records all MemoryFile ranges directly owned by
+// regular files in vfsfs. The live-file registry includes unlinked-but-open
+// files, which remain part of the serialized object graph. Disk-backed TTC
+// volumes do not own regular-file contents in a MemoryFile.
+//
+// Preconditions: application tasks must be paused.
+func CaptureMemoryFileRanges(vfsfs *vfs.Filesystem, capture *pgalloc.MemoryRangeCapture) error {
+	fs, _ := vfsfs.Impl().(*filesystem)
+	if fs == nil || fs.diskVolume != nil {
+		return nil
+	}
+	fs.liveForkMu.Lock()
+	defer fs.liveForkMu.Unlock()
+	for file := range fs.liveForkFiles {
+		file.dataMu.RLock()
+		for seg := file.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+			if err := capture.RecordOwned(file, fs.mf, seg.FileRange()); err != nil {
+				file.dataMu.RUnlock()
+				return err
+			}
+		}
+		file.dataMu.RUnlock()
+	}
+	return nil
+}
+
 // FSCheckpointWrite serializes the given tmpfs filesystem to dst. The contents
 // of its regular files are not written to dst; instead, callers must
 // separately save and restore the contents of the filesystem's MemoryFile. If

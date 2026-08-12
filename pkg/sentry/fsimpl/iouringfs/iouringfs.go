@@ -219,6 +219,14 @@ func (fd *FileDescription) Release(ctx context.Context) {
 	fd.mf.DecRef(fd.sqemf.fr)
 }
 
+// CaptureMemoryFileRanges implements vfs.MemoryFileRangeCapturer.
+func (fd *FileDescription) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	if err := capture.RecordOwned(fd, fd.mf, fd.rbmf.fr); err != nil {
+		return err
+	}
+	return capture.RecordOwned(fd, fd.mf, fd.sqemf.fr)
+}
+
 // mapSharedBuffers caches internal mappings for the ring's shared memory
 // regions.
 func (fd *FileDescription) mapSharedBuffers() error {

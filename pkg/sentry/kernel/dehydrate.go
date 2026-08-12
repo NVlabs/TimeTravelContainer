@@ -383,6 +383,18 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		if err := k.prepareMemoryManagersForDistributedFork(memoryCapture); err != nil {
 			return fmt.Errorf("capturing dehydration memory graph: %w", err)
 		}
+		if err := k.captureFileDescriptionMemory(memoryCapture); err != nil {
+			return fmt.Errorf("capturing dehydration file memory graph: %w", err)
+		}
+		if err := k.captureSharedMemoryRanges(ctx, memoryCapture); err != nil {
+			return fmt.Errorf("capturing dehydration SysV SHM graph: %w", err)
+		}
+		if err := k.captureFilesystemMemory(ctx, memoryCapture); err != nil {
+			return fmt.Errorf("capturing dehydration filesystem memory graph: %w", err)
+		}
+		if err := k.captureKernelOwnedMemory(memoryCapture); err != nil {
+			return fmt.Errorf("capturing dehydration kernel memory graph: %w", err)
+		}
 		k.mf.MarkSavable()
 		for _, mf := range image.PrivateMemoryFiles {
 			mf.MarkSavable()

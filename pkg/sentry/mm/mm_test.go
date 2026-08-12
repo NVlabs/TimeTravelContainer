@@ -102,6 +102,48 @@ func newRemoteCloneMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 	return mf
 }
 
+func TestCaptureMemoryFileRangesIncludesUnfaultedAliasedMappableOwnerOnce(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mm := testMemoryManager(ctx, t)
+	defer mm.DecUsers(ctx)
+	fr, err := mm.mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mappable := NewSpecialMappable("[capture-test]", mm.mf, fr)
+	defer mappable.DecRef(ctx)
+	for i := 0; i < 2; i++ {
+		if _, err := mm.MMap(ctx, memmap.MMapOpts{
+			Length:          fr.Length(),
+			MappingIdentity: mappable,
+			Mappable:        mappable,
+			Perms:           hostarch.Read,
+			MaxPerms:        hostarch.Read,
+		}); err != nil {
+			t.Fatalf("MMap alias %d: %v", i, err)
+		}
+	}
+	if !mm.pmas.IsEmpty() {
+		t.Fatal("unfaulted special mappings unexpectedly have PMAs")
+	}
+	capture := pgalloc.NewMemoryRangeCapture()
+	if err := mm.CaptureMemoryFileRanges(capture); err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := capture.Bindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 2 {
+		t.Fatalf("captured %d pages, want 2", len(bindings))
+	}
+	for _, binding := range bindings {
+		if binding.References != 1 {
+			t.Fatalf("aliased Mappable page has %d captured references, want 1", binding.References)
+		}
+	}
+}
+
 func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)

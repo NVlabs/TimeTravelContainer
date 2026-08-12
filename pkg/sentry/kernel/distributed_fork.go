@@ -162,6 +162,18 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		if err := k.prepareMemoryManagersForDistributedFork(memoryCapture); err != nil {
 			return fmt.Errorf("capturing distributed-fork memory graph: %w", err)
 		}
+		if err := k.captureFileDescriptionMemory(memoryCapture); err != nil {
+			return fmt.Errorf("capturing distributed-fork file memory graph: %w", err)
+		}
+		if err := k.captureSharedMemoryRanges(ctx, memoryCapture); err != nil {
+			return fmt.Errorf("capturing distributed-fork SysV SHM graph: %w", err)
+		}
+		if err := k.captureFilesystemMemory(ctx, memoryCapture); err != nil {
+			return fmt.Errorf("capturing distributed-fork filesystem memory graph: %w", err)
+		}
+		if err := k.captureKernelOwnedMemory(memoryCapture); err != nil {
+			return fmt.Errorf("capturing distributed-fork kernel memory graph: %w", err)
+		}
 		k.mf.MarkSavable()
 		allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
 		if err != nil {

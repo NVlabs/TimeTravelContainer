@@ -329,6 +329,39 @@ func (r *Registry) PrepareLiveFork(ctx context.Context) {
 	}
 }
 
+// CaptureMemoryFileRanges records every SysV SHM segment serialized through
+// this registry, including segments that currently have no VMA/PMA.
+func (r *Registry) CaptureMemoryFileRanges(ctx context.Context, capture *pgalloc.MemoryRangeCapture) error {
+	var segments []*Shm
+	r.mu.Lock()
+	r.reg.ForAllObjects(func(o ipc.Mechanism) {
+		s := o.(*Shm)
+		if s.TryIncRef() {
+			segments = append(segments, s)
+		}
+	})
+	r.mu.Unlock()
+	var captureErr error
+	for _, s := range segments {
+		for _, owned := range s.MemoryFileRanges() {
+			if captureErr != nil {
+				break
+			}
+			mf, ok := owned.File.(*pgalloc.MemoryFile)
+			if !ok {
+				captureErr = fmt.Errorf("SysV SHM owns unsupported memory file %T", owned.File)
+				break
+			}
+			if err := capture.RecordOwned(s, mf, owned.Range); err != nil {
+				captureErr = err
+				break
+			}
+		}
+		s.DecRef(ctx)
+	}
+	return captureErr
+}
+
 // Shm represents a single shared memory segment.
 //
 // Shm segments are backed directly by an allocation from platform memory.
@@ -415,6 +448,18 @@ type Shm struct {
 	// in the registry and can no longer be attached. When the last user
 	// detaches from the segment, it is destroyed.
 	pendingDestruction bool
+}
+
+// MemoryFileRanges implements memmap.MemoryFileRangeProvider. The returned
+// ranges represent Shm's direct ownership, independently of mapped PMAs.
+func (s *Shm) MemoryFileRanges() []memmap.MemoryFileRange {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	ranges := make([]memmap.MemoryFileRange, 0, s.data.Span()/hostarch.PageSize)
+	for seg := s.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		ranges = append(ranges, memmap.MemoryFileRange{File: s.mf, Range: seg.FileRange()})
+	}
+	return ranges
 }
 
 // afterLoad is invoked by stateify.

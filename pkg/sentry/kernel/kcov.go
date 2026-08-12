@@ -71,6 +71,26 @@ type Kcov struct {
 	mappable *mm.SpecialMappable
 }
 
+// CaptureMemoryFileRanges records KCOV's mappable ownership independently of
+// whether the coverage area currently has a VMA.
+func (kcov *Kcov) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCapture) error {
+	kcov.mu.RLock()
+	defer kcov.mu.RUnlock()
+	if kcov.mappable == nil {
+		return nil
+	}
+	for _, owned := range kcov.mappable.MemoryFileRanges() {
+		mf, ok := owned.File.(*pgalloc.MemoryFile)
+		if !ok {
+			return fmt.Errorf("KCOV mapping owns unsupported memory file %T", owned.File)
+		}
+		if err := capture.RecordOwned(kcov.mappable, mf, owned.Range); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // NewKcov creates and returns a Kcov instance.
 func (k *Kernel) NewKcov() *Kcov {
 	return &Kcov{

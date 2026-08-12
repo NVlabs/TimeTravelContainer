@@ -63,6 +63,15 @@ type ringBuffer struct {
 	mf *pgalloc.MemoryFile `state:"nosave"`
 }
 
+func (rb *ringBuffer) memoryFileRange() (memmap.MemoryFileRange, bool) {
+	rb.dataMu.RLock()
+	defer rb.dataMu.RUnlock()
+	if rb.mf == nil || rb.data.Length() == 0 {
+		return memmap.MemoryFileRange{}, false
+	}
+	return memmap.MemoryFileRange{File: rb.mf, Range: rb.data}, true
+}
+
 // init initializes a PacketRingBuffer.
 //
 // The owning endpoint must be locked when calling this function.

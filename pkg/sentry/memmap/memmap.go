@@ -539,6 +539,21 @@ type File interface {
 	FD() int
 }
 
+// MemoryFileRange identifies one range whose ownership is serialized as part
+// of a Mappable. It is used by TTC branch-scoped sparse memory capture; it is
+// distinct from transient translations cached in PMAs.
+type MemoryFileRange struct {
+	File  File
+	Range FileRange
+}
+
+// MemoryFileRangeProvider is implemented by Mappables that directly own
+// MemoryFile ranges independently of any resident PMAs. Implementations must
+// return every owned range needed to restore the serialized object.
+type MemoryFileRangeProvider interface {
+	MemoryFileRanges() []MemoryFileRange
+}
+
 // DefaultMemoryType implements File.MemoryType() for implementations of File
 // backed by ordinary system memory.
 type DefaultMemoryType struct{}

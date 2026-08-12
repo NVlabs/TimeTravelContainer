@@ -133,6 +133,32 @@ func (mm *MemoryManager) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeCap
 	if capture == nil {
 		return fmt.Errorf("nil memory range capture")
 	}
+	// Mappables may own backing independently from PMAs. Record each serialized
+	// object once even if it is aliased by multiple VMAs.
+	mm.mappingMu.RLock()
+	for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
+		mappable := vseg.ValuePtr().mappable
+		if mappable == nil {
+			continue
+		}
+		provider, ok := mappable.(memmap.MemoryFileRangeProvider)
+		if !ok {
+			continue
+		}
+		for _, owned := range provider.MemoryFileRanges() {
+			mf, ok := owned.File.(*pgalloc.MemoryFile)
+			if !ok {
+				mm.mappingMu.RUnlock()
+				return fmt.Errorf("serialized Mappable %T owns unsupported memory file %T", mappable, owned.File)
+			}
+			if err := capture.RecordOwned(mappable, mf, owned.Range); err != nil {
+				mm.mappingMu.RUnlock()
+				return err
+			}
+		}
+	}
+	mm.mappingMu.RUnlock()
+
 	mm.activeMu.RLock()
 	defer mm.activeMu.RUnlock()
 	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {

@@ -16,6 +16,7 @@ package pgalloc
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -66,11 +67,20 @@ type capturedReferencedRange struct {
 type MemoryRangeCapture struct {
 	files  []*MemoryFile
 	ranges map[*MemoryFile][]memmap.FileRange
+	owners map[any]map[capturedOwnerRange]struct{}
+}
+
+type capturedOwnerRange struct {
+	file       *MemoryFile
+	start, end uint64
 }
 
 // NewMemoryRangeCapture creates an empty branch-scoped memory capture.
 func NewMemoryRangeCapture() *MemoryRangeCapture {
-	return &MemoryRangeCapture{ranges: make(map[*MemoryFile][]memmap.FileRange)}
+	return &MemoryRangeCapture{
+		ranges: make(map[*MemoryFile][]memmap.FileRange),
+		owners: make(map[any]map[capturedOwnerRange]struct{}),
+	}
 }
 
 // Record includes fr in the state graph's references to mf. Overlapping and
@@ -86,6 +96,30 @@ func (c *MemoryRangeCapture) Record(mf *MemoryFile, fr memmap.FileRange) error {
 		c.files = append(c.files, mf)
 	}
 	c.ranges[mf] = append(c.ranges[mf], fr)
+	return nil
+}
+
+// RecordOwned records a range directly owned by one serialized object. The
+// same object may be reached through several graph paths (for example a socket
+// FD and its mmap VMA); duplicate owner/range pairs count only once. Distinct
+// owners of the same pages continue to contribute distinct references.
+func (c *MemoryRangeCapture) RecordOwned(owner any, mf *MemoryFile, fr memmap.FileRange) error {
+	if owner == nil || !reflect.TypeOf(owner).Comparable() {
+		return fmt.Errorf("memory range owner %T is nil or not comparable", owner)
+	}
+	key := capturedOwnerRange{file: mf, start: fr.Start, end: fr.End}
+	ranges := c.owners[owner]
+	if ranges == nil {
+		ranges = make(map[capturedOwnerRange]struct{})
+		c.owners[owner] = ranges
+	}
+	if _, ok := ranges[key]; ok {
+		return nil
+	}
+	if err := c.Record(mf, fr); err != nil {
+		return err
+	}
+	ranges[key] = struct{}{}
 	return nil
 }
 

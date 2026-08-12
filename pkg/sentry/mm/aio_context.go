@@ -252,6 +252,11 @@ type aioMappable struct {
 	fr memmap.FileRange
 }
 
+// MemoryFileRanges implements memmap.MemoryFileRangeProvider.
+func (m *aioMappable) MemoryFileRanges() []memmap.MemoryFileRange {
+	return []memmap.MemoryFileRange{{File: m.mf, Range: m.fr}}
+}
+
 var aioRingBufferSize = uint64(hostarch.Addr(linux.AIORingSize).MustRoundUp())
 
 func newAIOMappable(ctx context.Context, mf *pgalloc.MemoryFile) (*aioMappable, error) {

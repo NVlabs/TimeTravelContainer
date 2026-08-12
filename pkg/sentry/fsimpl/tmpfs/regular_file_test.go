@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -73,6 +74,34 @@ func (ms *lockDetectingMappingSpace) Invalidate(_ hostarch.AddrRange, _ memmap.I
 func (ms *recordingMappingSpace) Invalidate(_ hostarch.AddrRange, opts memmap.InvalidateOpts) {
 	ms.invalidated = true
 	ms.opts = opts
+}
+
+func TestCaptureMemoryFileRangesIncludesUnmappedRegularFile(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+	data := make([]byte, hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("PWrite: n=%d err=%v", n, err)
+	}
+	capture := pgalloc.NewMemoryRangeCapture()
+	if err := CaptureMemoryFileRanges(fd.Mount().Filesystem(), capture); err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := capture.Bindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("captured %d pages, want 1", len(bindings))
+	}
+	if bindings[0].References != 1 {
+		t.Fatalf("captured %d references, want 1", bindings[0].References)
+	}
 }
 
 func TestPrepareLiveForkPreservesPrivatePMAs(t *testing.T) {

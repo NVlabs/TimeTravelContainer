@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -925,6 +926,75 @@ func (k *Kernel) prepareSharedMemoryForLiveFork(ctx context.Context) {
 	}
 }
 
+// captureSharedMemoryRanges records every SysV SHM registry reachable from
+// the Kernel state graph. RecordOwned deduplicates segments also reached via a
+// task VMA.
+func (k *Kernel) captureSharedMemoryRanges(ctx context.Context, capture *pgalloc.MemoryRangeCapture) error {
+	namespaces := make(map[*IPCNamespace]struct{})
+	if k.rootIPCNamespace != nil {
+		namespaces[k.rootIPCNamespace] = struct{}{}
+	}
+	k.tasks.mu.RLock()
+	for task := range k.tasks.Root.tids {
+		if task.ipcns != nil {
+			namespaces[task.ipcns] = struct{}{}
+		}
+	}
+	k.tasks.mu.RUnlock()
+	for ns := range namespaces {
+		if err := ns.shms.CaptureMemoryFileRanges(ctx, capture); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// captureFilesystemMemory records MemoryFile ownership held by serialized
+// filesystems independently of VMAs and file descriptions.
+func (k *Kernel) captureFilesystemMemory(ctx context.Context, capture *pgalloc.MemoryRangeCapture) error {
+	filesystems := k.vfs.GetFilesystems()
+	defer func() {
+		for _, fs := range filesystems {
+			fs.DecRef(ctx)
+		}
+	}()
+	for _, fs := range filesystems {
+		if err := tmpfs.CaptureMemoryFileRanges(fs, capture); err != nil {
+			return fmt.Errorf("capturing filesystem %T memory: %w", fs.Impl(), err)
+		}
+	}
+	return nil
+}
+
+// captureKernelOwnedMemory records MemoryFile ownership rooted directly in
+// Kernel and Task objects rather than mappings, descriptors, or filesystems.
+func (k *Kernel) captureKernelOwnedMemory(capture *pgalloc.MemoryRangeCapture) error {
+	if k.vdso != nil {
+		if err := k.vdso.CaptureMemoryFileRanges(capture); err != nil {
+			return fmt.Errorf("capturing VDSO memory: %w", err)
+		}
+	}
+	seenKcov := make(map[*Kcov]struct{})
+	k.tasks.mu.RLock()
+	for task := range k.tasks.Root.tids {
+		kcov := task.kcov
+		if kcov == nil {
+			continue
+		}
+		if _, ok := seenKcov[kcov]; ok {
+			continue
+		}
+		seenKcov[kcov] = struct{}{}
+	}
+	k.tasks.mu.RUnlock()
+	for kcov := range seenKcov {
+		if err := kcov.CaptureMemoryFileRanges(capture); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateLiveForkResources walks all descriptor-table roots and any
 // file-description edges exposed by vfs.LiveForkFileDescription. It runs
 // before VFS save hooks and before private mappings are transitioned to CoW.
@@ -1081,6 +1151,73 @@ func (k *Kernel) prepareMemoryManagersForDistributedFork(capture *pgalloc.Memory
 			if err := prepare(r.image.MemoryManager); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// captureFileDescriptionMemory records MemoryFile ranges owned by every file
+// description reachable from task FD tables, including recursively referenced
+// descriptions such as epoll interests. Shared descriptions are captured once.
+func (k *Kernel) captureFileDescriptionMemory(capture *pgalloc.MemoryRangeCapture) error {
+	type tableRoot struct {
+		pid   ThreadID
+		table *FDTable
+	}
+	var roots []tableRoot
+	k.tasks.mu.RLock()
+	for task, tid := range k.tasks.Root.tids {
+		if table := task.FDTable(); table != nil {
+			roots = append(roots, tableRoot{pid: tid, table: table})
+		}
+	}
+	k.tasks.mu.RUnlock()
+	sort.Slice(roots, func(i, j int) bool { return roots[i].pid < roots[j].pid })
+
+	visitedTables := make(map[*FDTable]struct{})
+	visitedFiles := make(map[*vfs.FileDescription]struct{})
+	var captureFile func(*vfs.FileDescription) error
+	captureFile = func(file *vfs.FileDescription) error {
+		if _, ok := visitedFiles[file]; ok {
+			return nil
+		}
+		visitedFiles[file] = struct{}{}
+		impl := file.Impl()
+		if capturer, ok := impl.(vfs.MemoryFileRangeCapturer); ok {
+			if err := capturer.CaptureMemoryFileRanges(capture); err != nil {
+				return fmt.Errorf("capturing file description %T memory: %w", impl, err)
+			}
+		}
+		if validator, ok := impl.(vfs.LiveForkFileDescription); ok {
+			referenced, err := validator.ValidateLiveFork()
+			if err != nil {
+				return fmt.Errorf("enumerating file description %T references: %w", impl, err)
+			}
+			for _, next := range referenced {
+				if err := captureFile(next); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	for _, root := range roots {
+		if _, ok := visitedTables[root.table]; ok {
+			continue
+		}
+		visitedTables[root.table] = struct{}{}
+		var captureErr error
+		root.table.mu.Lock()
+		root.table.ForEach(k.SupervisorContext(), func(_ int32, file *vfs.FileDescription, _ FDFlags) bool {
+			if err := captureFile(file); err != nil {
+				captureErr = err
+				return false
+			}
+			return true
+		})
+		root.table.mu.Unlock()
+		if captureErr != nil {
+			return captureErr
 		}
 	}
 	return nil

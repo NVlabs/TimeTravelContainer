@@ -365,6 +365,24 @@ func (*Endpoint) ValidateLiveForkMapping() error {
 	return fmt.Errorf("PACKET_MMAP rings do not yet have branch-local backing")
 }
 
+// MemoryFileRanges implements memmap.MemoryFileRangeProvider.
+func (m *Endpoint) MemoryFileRanges() []memmap.MemoryFileRange {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ranges []memmap.MemoryFileRange
+	if m.mode&rxRingBuffer != 0 {
+		if owned, ok := m.rxRingBuffer.memoryFileRange(); ok {
+			ranges = append(ranges, owned)
+		}
+	}
+	if m.mode&txRingBuffer != 0 {
+		if owned, ok := m.txRingBuffer.memoryFileRange(); ok {
+			ranges = append(ranges, owned)
+		}
+	}
+	return ranges
+}
+
 // Mapped returns whether the endpoint has been mapped.
 func (m *Endpoint) Mapped() bool {
 	return m.mapped.Load() != 0
