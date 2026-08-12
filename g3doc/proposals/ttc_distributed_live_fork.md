@@ -1,5 +1,11 @@
 # Distributed live fork with remote copy-on-read memory
 
+> **Planned storage replacement:**
+> [TTC userspace extent store](ttc_userspace_extent_store.md) describes the
+> family-level page store intended to replace branch-specific packed snapshot
+> files and shared-filesystem reflink requirements. This document continues to
+> describe the implemented transport and snapshot design.
+
 Status: design and implementation plan; implementation in progress.
 
 Implementation progress:

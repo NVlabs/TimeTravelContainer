@@ -1,5 +1,10 @@
 # TTC disk-backed managed volumes
 
+> **Planned successor:**
+> [TTC userspace extent store](ttc_userspace_extent_store.md) specifies a
+> page-granular replacement for the current reflink/whole-file object engine.
+> This document continues to describe the implementation that exists today.
+
 ## Status
 
 Core implementation complete and enabled for both the ordinary writable
