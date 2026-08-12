@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -494,6 +495,47 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 	if !source.HasUniqueRef(sourceFR) {
 		t.Fatal("drain did not release all source references")
+	}
+}
+
+func TestDemandOnlyRemotePageLoadSwitchesReaderAtQuiescence(t *testing.T) {
+	target, targetFR := newRemoteTestMemoryFile(t, 2)
+	firstData := bytes.Repeat([]byte{0x11}, int(targetFR.Length()))
+	secondData := bytes.Repeat([]byte{0x22}, int(targetFR.Length()))
+	first := stateio.NewIOReader(bytes.NewReader(firstData), hostarch.PageSize, 1, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(first, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	readPage := func(index uint64) byte {
+		fr := memmap.FileRange{Start: targetFR.Start + index*hostarch.PageSize, End: targetFR.Start + (index+1)*hostarch.PageSize}
+		blocks, err := target.MapInternal(fr, hostarch.Read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, hostarch.PageSize)
+		if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), blocks); err != nil || n != hostarch.PageSize {
+			t.Fatalf("reading page %d: n=%d err=%v", index, n, err)
+		}
+		return got[0]
+	}
+	if got := readPage(0); got != 0x11 {
+		t.Fatalf("first reader page=%#x, want %#x", got, 0x11)
+	}
+	replacement := stateio.NewIOReader(bytes.NewReader(secondData), hostarch.PageSize, 1, 1)
+	if err := pages.SwitchReader(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPage(1); got != 0x22 {
+		t.Fatalf("replacement reader page=%#x, want %#x", got, 0x22)
+	}
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
 	}
 }
 

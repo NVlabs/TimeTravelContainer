@@ -17,6 +17,7 @@ package pgalloc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1222,7 +1223,17 @@ type AsyncPagesFileLoad struct {
 	// maxReadBytes is hostarch.PageRoundDown(ar.MaxReadBytes()), cached to
 	// avoid interface method calls and recomputation. maxReadBytes is
 	// immutable.
-	maxReadBytes uint64
+	maxReadBytes               uint64
+	maxRanges                  int
+	maxParallel                int
+	needsRegisterDestinationFD bool
+
+	// readerSwitchMu serializes public reader handoffs. readerSwitchRequestMu
+	// protects readerSwitchRequest, which is consumed only by main after all
+	// reads submitted to the previous reader have completed.
+	readerSwitchMu        sync.Mutex
+	readerSwitchRequestMu sync.Mutex
+	readerSwitchRequest   *asyncPagesReaderSwitch
 
 	// qavail is unused capacity in ar.
 	qavail int
@@ -1248,7 +1259,13 @@ const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
 	aplLFCancel
+	aplLFSwitchReader
 )
+
+type asyncPagesReaderSwitch struct {
+	reader stateio.AsyncReader
+	done   chan error
+}
 
 type aplFileRange struct {
 	amfl *asyncMemoryFileLoad
@@ -1452,15 +1469,18 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 	// Cap maxParallel due to the uint32 range of bitmap.Bitmap.
 	maxParallel := min(ar.MaxParallel(), 1<<30)
 	apfl := &AsyncPagesFileLoad{
-		timeStartWaiters: math.MaxInt64,
-		timeline:         timeline.Fork("async page loading"),
-		doneCallback:     doneCallback,
-		ar:               ar,
-		maxReadBytes:     maxReadBytes,
-		qavail:           maxParallel,
-		opsBusy:          bitmap.New(uint32(maxParallel)),
-		ops:              make([]aplOp, maxParallel),
-		done:             make(chan struct{}),
+		timeStartWaiters:           math.MaxInt64,
+		timeline:                   timeline.Fork("async page loading"),
+		doneCallback:               doneCallback,
+		ar:                         ar,
+		maxReadBytes:               maxReadBytes,
+		maxRanges:                  ar.MaxRanges(),
+		maxParallel:                maxParallel,
+		needsRegisterDestinationFD: ar.NeedRegisterDestinationFD(),
+		qavail:                     maxParallel,
+		opsBusy:                    bitmap.New(uint32(maxParallel)),
+		ops:                        make([]aplOp, maxParallel),
+		done:                       make(chan struct{}),
 	}
 	apfl.prefetchAheadBytes.Store(opts.PrefetchBytes)
 	apfl.prefetchBehindBytes.Store(opts.PrefetchBehindBytes)
@@ -1479,6 +1499,50 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+// SwitchReader atomically replaces the backing page source without loading
+// the remaining pages. Reads already submitted to the old source complete
+// first; subsequent reads use replacement. This is used to hand a distributed
+// target from a live source Sentry to an immutable shared-filesystem image.
+// SwitchReader takes ownership of replacement even when it returns an error.
+func (apfl *AsyncPagesFileLoad) SwitchReader(replacement stateio.AsyncReader) error {
+	if replacement == nil {
+		return errors.New("replacement async page reader is nil")
+	}
+	if hostarch.PageRoundDown(replacement.MaxReadBytes()) != apfl.maxReadBytes ||
+		replacement.MaxRanges() != apfl.maxRanges || replacement.MaxParallel() != apfl.maxParallel ||
+		replacement.NeedRegisterDestinationFD() != apfl.needsRegisterDestinationFD {
+		_ = replacement.Close()
+		return fmt.Errorf("replacement async page reader geometry (%d,%d,%d,%t) differs from active geometry (%d,%d,%d,%t)",
+			hostarch.PageRoundDown(replacement.MaxReadBytes()), replacement.MaxRanges(), replacement.MaxParallel(), replacement.NeedRegisterDestinationFD(),
+			apfl.maxReadBytes, apfl.maxRanges, apfl.maxParallel, apfl.needsRegisterDestinationFD)
+	}
+	apfl.readerSwitchMu.Lock()
+	defer apfl.readerSwitchMu.Unlock()
+	request := &asyncPagesReaderSwitch{reader: replacement, done: make(chan error, 1)}
+	apfl.readerSwitchRequestMu.Lock()
+	select {
+	case <-apfl.done:
+		apfl.readerSwitchRequestMu.Unlock()
+		_ = replacement.Close()
+		return errors.New("async page loader has already stopped")
+	default:
+	}
+	apfl.readerSwitchRequest = request
+	apfl.readerSwitchRequestMu.Unlock()
+	apfl.lfStatus.Notify(aplLFSwitchReader)
+	select {
+	case err := <-request.done:
+		return err
+	case <-apfl.done:
+		select {
+		case err := <-request.done:
+			return err
+		default:
+			return errors.New("async page loader stopped during reader handoff")
+		}
+	}
 }
 
 // Drain enables background loading of every remaining page. It is idempotent.
@@ -1986,10 +2050,17 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if apfl.doneCallback != nil {
 			apfl.doneCallback(apfl.err())
 		}
+		apfl.readerSwitchRequestMu.Lock()
+		if request := apfl.readerSwitchRequest; request != nil {
+			apfl.readerSwitchRequest = nil
+			_ = request.reader.Close()
+			request.done <- errors.New("async page loader stopped before reader handoff")
+		}
+		apfl.readerSwitchRequestMu.Unlock()
 		close(apfl.done)
 	}()
 
-	maxParallel := apfl.ar.MaxParallel()
+	maxParallel := apfl.maxParallel
 	// Storage reused between main loop iterations:
 	var completions []stateio.Completion
 	var wakeups []*aplWaiter
@@ -2053,6 +2124,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}
 
 	memoryFilesDone := false
+	readerSwitchPending := false
 	for {
 		ev := apfl.lfStatus.Pending()
 		if ev&aplLFCancel != 0 {
@@ -2065,13 +2137,33 @@ func (apfl *AsyncPagesFileLoad) main() {
 			memoryFilesDone = true
 			apfl.lfStatus.Ack(aplLFDone)
 		}
+		if ev&aplLFSwitchReader != 0 {
+			readerSwitchPending = true
+		}
+		if readerSwitchPending && apfl.qavail == maxParallel && apfl.curOp == nil {
+			apfl.readerSwitchRequestMu.Lock()
+			request := apfl.readerSwitchRequest
+			apfl.readerSwitchRequest = nil
+			apfl.readerSwitchRequestMu.Unlock()
+			apfl.lfStatus.Ack(aplLFSwitchReader)
+			readerSwitchPending = false
+			if request != nil {
+				old := apfl.ar
+				apfl.ar = request.reader
+				if err := old.Close(); err != nil {
+					log.Warningf("Async page loading: closing replaced reader failed: %v", err)
+				}
+				request.done <- nil
+			}
+			continue
+		}
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
 		}
 		// Prioritize reading pages with waiters.
 		apfl.mu.Lock()
-		for apfl.canEnqueue() && !apfl.priority.Empty() {
+		for !readerSwitchPending && apfl.canEnqueue() && !apfl.priority.Empty() {
 			fr := apfl.priority.PopFront()
 			// All pages in apfl.priority have non-zero waiters and were split
 			// around fr by fr.amfl.awaitLoad(), and fr.amfl.unloaded never
@@ -2116,7 +2208,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		// Use spare queue slots for forward prefetches created by faults. The
 		// lock order matches background loading: amflsMu -> MemoryFile.mu ->
 		// apfl.mu. Awaited reads above remain strictly higher priority.
-		if apfl.canEnqueue() && apfl.demandOnly.Load() &&
+		if !readerSwitchPending && apfl.canEnqueue() && apfl.demandOnly.Load() &&
 			(apfl.prefetchBehindBytes.Load() != 0 || apfl.prefetchAheadBytes.Load() != 0) {
 			apfl.amflsMu.Lock()
 			for apfl.canEnqueue() {
@@ -2160,7 +2252,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.amflsMu.Unlock()
 		}
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() && !apfl.demandOnly.Load() {
+		if !readerSwitchPending && apfl.canEnqueue() && !apfl.demandOnly.Load() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -2212,11 +2304,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.amflsMu.Unlock()
 		}
 		// Flush pending op.
-		if apfl.curOp != nil {
+		if !readerSwitchPending && apfl.curOp != nil {
 			apfl.enqueueCurOp()
 		}
 
 		if apfl.qavail == maxParallel {
+			if readerSwitchPending {
+				continue
+			}
 			// We are out of work to do.
 			if memoryFilesDone && !apfl.demandOnly.Load() {
 				// Successfully completed all loading for all MemoryFiles.
@@ -2237,6 +2332,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				continue
 			}
 			if ev&aplLFDone != 0 {
+				continue
+			}
+			if ev&aplLFSwitchReader != 0 {
 				continue
 			}
 			panic(fmt.Sprintf("unknown events in lfStatus: %#x", ev))
