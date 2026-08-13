@@ -35,7 +35,9 @@ func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 	if _, err := fs.diskVolume.Repository.Branch(fs.diskVolume.Branch); err != nil {
 		return nil, err
 	}
+	fs.diskInodesMu.Lock()
 	fs.diskInodes = make(map[uint64]*inode)
+	fs.diskInodesMu.Unlock()
 	rootInode, err := fs.loadDiskInode(ttcvolume.RootInode, nil)
 	if err != nil {
 		return nil, err
@@ -53,12 +55,15 @@ func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 }
 
 func (fs *filesystem) loadDiskInode(ino uint64, parent *directory) (*inode, error) {
+	fs.diskInodesMu.Lock()
 	if inode, ok := fs.diskInodes[ino]; ok {
+		fs.diskInodesMu.Unlock()
 		if inode.isDir() {
 			return nil, fmt.Errorf("volume directory inode %d has multiple parents", ino)
 		}
 		return inode, nil
 	}
+	fs.diskInodesMu.Unlock()
 	meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 	if err != nil {
 		return nil, err
@@ -96,7 +101,9 @@ func (fs *filesystem) loadDiskInode(ino uint64, parent *directory) (*inode, erro
 	if meta.Type == "regular" {
 		fs.adjustDiskBytes(0, uint64(meta.Size))
 	}
+	fs.diskInodesMu.Lock()
 	fs.diskInodes[ino] = inode
+	fs.diskInodesMu.Unlock()
 	if dir, ok := inode.impl.(*directory); ok {
 		entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, ino)
 		if err != nil {
@@ -199,17 +206,19 @@ func (fs *filesystem) applyDiskMetadata(node *inode, meta ttcvolume.Inode) {
 	node.ctime.Store(meta.CtimeNsec)
 	node.mtime.Store(meta.MtimeNsec)
 	node.xattrs.SetRawXattrs(meta.Xattrs)
+	fs.diskInodesMu.Lock()
 	if fs.diskInodes == nil {
 		fs.diskInodes = make(map[uint64]*inode)
 	}
 	fs.diskInodes[meta.Number] = node
+	fs.diskInodesMu.Unlock()
 }
 
 func (fs *filesystem) rebuildDiskInodeCache() {
-	fs.diskInodes = make(map[uint64]*inode)
+	inodes := make(map[uint64]*inode)
 	var visit func(*dentry)
 	visit = func(d *dentry) {
-		fs.diskInodes[d.inode.ino] = d.inode
+		inodes[d.inode.ino] = d.inode
 		if dir, ok := d.inode.impl.(*directory); ok {
 			for _, child := range dir.childMap {
 				visit(child)
@@ -219,9 +228,23 @@ func (fs *filesystem) rebuildDiskInodeCache() {
 	visit(fs.root)
 	fs.liveForkMu.Lock()
 	for file := range fs.liveForkFiles {
-		fs.diskInodes[file.inode.ino] = &file.inode
+		inodes[file.inode.ino] = &file.inode
 	}
 	fs.liveForkMu.Unlock()
+	fs.diskInodesMu.Lock()
+	fs.diskInodes = inodes
+	fs.diskInodesMu.Unlock()
+}
+
+func (fs *filesystem) unregisterDiskInode(node *inode) {
+	if fs.diskVolume == nil {
+		return
+	}
+	fs.diskInodesMu.Lock()
+	if fs.diskInodes[node.ino] == node {
+		delete(fs.diskInodes, node.ino)
+	}
+	fs.diskInodesMu.Unlock()
 }
 
 // pruneDiskNamespaceForSave makes state serialization proportional to live
@@ -367,12 +390,12 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 	}
 	fs.liveForkMu.Unlock()
 
-	fs.mu.Lock()
+	fs.diskInodesMu.Lock()
 	inodes := make([]*inode, 0, len(fs.diskInodes))
 	for _, node := range fs.diskInodes {
 		inodes = append(inodes, node)
 	}
-	fs.mu.Unlock()
+	fs.diskInodesMu.Unlock()
 	type pendingMetadata struct {
 		inode      *inode
 		generation uint64

@@ -284,6 +284,58 @@ func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
 	}
 }
 
+func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("orphan-save-cache-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "temporary", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Unlink(ttcvolume.MainBranch, ttcvolume.RootInode, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := &filesystem{
+		diskVolume:    &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch},
+		diskInodes:    make(map[uint64]*inode),
+		liveForkFiles: make(map[*regularFile]struct{}),
+	}
+	fs.inodesUsed.Store(1)
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0600))
+	file.inode.nlink.Store(0)
+	file.inode.refs.InitRefs()
+	file.diskMmap.SetFD(-1)
+	file.diskMetadataDirty.Store(1)
+	file.inode.diskMetadataGeneration.Store(1)
+	fs.diskInodes[ino] = &file.inode
+	fs.liveForkFiles[file] = struct{}{}
+
+	file.inode.decRef(contexttest.Context(t))
+	if _, ok := fs.diskInodes[ino]; ok {
+		t.Fatal("reaped orphan remained in disk inode save cache")
+	}
+	if _, ok := fs.liveForkFiles[file]; ok {
+		t.Fatal("reaped orphan remained in live-fork file cache")
+	}
+	if _, err := repository.Inode(ttcvolume.MainBranch, ino); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reaped orphan repository lookup: %v", err)
+	}
+	if err := fs.flushDiskWriteMetadata(); err != nil {
+		t.Fatalf("save-time metadata flush after orphan reaping: %v", err)
+	}
+}
+
 func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
 	fs := &filesystem{diskVolume: &diskVolumeState{}}
 	newDir := func() *directory {

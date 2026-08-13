@@ -174,7 +174,8 @@ type filesystem struct {
 	// currently instantiated by paths, file descriptions, mappings, mounts, or
 	// watches. The repository owns the complete namespace; this cache is rebuilt
 	// after restore and is intentionally not serialized.
-	diskInodes map[uint64]*inode `state:"nosave"`
+	diskInodesMu sync.Mutex        `state:"nosave"`
+	diskInodes   map[uint64]*inode `state:"nosave"`
 
 	// diskSaveChildren temporarily holds the complete runtime namespace cache
 	// while state serialization sees only entries carrying live runtime state.
@@ -901,6 +902,14 @@ func (i *inode) tryIncRef() bool {
 func (i *inode) decRef(ctx context.Context) {
 	i.refs.DecRef(func() {
 		i.watches.HandleDeletion(ctx)
+		i.fs.unregisterDiskInode(i)
+		if regular, ok := i.impl.(*regularFile); ok {
+			// Remove a dead regular file from both save-time caches before its
+			// persistent orphan is reaped. Otherwise PrepareSave may race this
+			// callback, observe an inode whose repository record is already gone,
+			// and fail a live fork with ENOENT.
+			i.fs.unregisterLiveForkFile(regular)
+		}
 		if i.fs.diskVolume != nil && i.nlink.Load() == 0 {
 			if err := i.fs.diskVolume.Repository.ReapOrphan(i.fs.diskVolume.Branch, i.ino); err != nil {
 				log.Warningf("failed to reclaim TTC volume inode %d: %v", i.ino, err)
@@ -918,7 +927,6 @@ func (i *inode) decRef(ctx context.Context) {
 				impl.inode.fs.unaccountPages(1)
 			}
 		case *regularFile:
-			impl.inode.fs.unregisterLiveForkFile(impl)
 			if i.fs.diskVolume != nil {
 				impl.invalidateDiskIO()
 				i.fs.adjustDiskBytes(impl.size.Load(), 0)
