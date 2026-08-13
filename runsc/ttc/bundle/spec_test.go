@@ -15,6 +15,7 @@
 package bundle
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -64,6 +65,73 @@ func TestRehomeInternalMountsSurviveSourceRemoval(t *testing.T) {
 	}
 	if string(got) != "source-name\n" || !strings.HasPrefix(spec.Mounts[0].Source, target+string(filepath.Separator)) {
 		t.Fatalf("re-homed mount path=%q contents=%q", spec.Mounts[0].Source, got)
+	}
+}
+
+func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	now := time.Now().UTC()
+	for _, info := range []ContainerInfo{
+		{ID: "source-id", Name: "source", BundleDir: filepath.Join(root, "containers", "source-id", "bundle"), DistributedFamilyID: "global-family", State: "running", CreatedAt: now, Branches: []BranchInfo{{ID: "main", State: "running", CreatedAt: now}}},
+		{ID: "target-id", Name: "target", DistributedFamilyID: "global-family", DistributedForkNodeID: "node-b", NodeID: "node-b", State: "running", CreatedAt: now, BundleDir: filepath.Join(root, "containers", "target-id", "bundle"), Branches: []BranchInfo{{ID: "main", FilesystemBranch: "volume-main", State: "running", CreatedAt: now}}},
+	} {
+		dir := filepath.Join(root, "containers", info.ID)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepared, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+		SourceContainer: "source", TargetName: "target", TargetBranch: "tx-physical",
+		VisibleBranch: "second", TransactionID: "tx-import", NodeID: "node-b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Container.ID != "target-id" {
+		t.Fatalf("prepared container=%q, want existing target-id", prepared.Container.ID)
+	}
+	_, branch, peer, err := store.DistributedForkTargetBranch("tx-import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peer || branch.ID != "second" || branch.FilesystemBranch != ttcvolume.ScopedBranchID("source-id", "tx-physical") {
+		t.Fatalf("pending peer=%t branch=%+v", peer, branch)
+	}
+	if err := store.UpdateDistributedForkSparseRoot("tx-import", "cluster/memory-chunks", "memory-root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkTargetState("tx-import", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PublishDistributedForkTarget("tx-import"); err != nil {
+		t.Fatal(err)
+	}
+	info, branch, peer, err := store.DistributedForkTargetBranch("tx-import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peer || branch.State != "paused" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 {
+		t.Fatalf("published peer=%t branch=%+v family=%+v", peer, branch, info.Branches)
+	}
+	if err := store.RemoveDistributedForkTarget("tx-import"); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.LoadContainer("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining.Branches) != 1 || remaining.Branches[0].ID != "main" {
+		t.Fatalf("remaining branches=%+v, want main only", remaining.Branches)
 	}
 }
 

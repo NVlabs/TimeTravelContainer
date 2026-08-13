@@ -1224,17 +1224,18 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 }
 
 // AttachSparseChunkPageLoad attaches another independent demand loader to an
-// existing family MemoryFile. Every target range must be exactly one 1 MiB
-// sparse residency unit. Unlike AttachRemotePageLoad, repeated calls coexist;
-// this permits a second remote branch to arrive while the first still has
-// non-resident chunks.
+// existing family MemoryFile. Ranges may describe full durable chunks or
+// page-aligned pieces of a live packed stream; logicalChunkDemand groups all
+// pieces of one versioned chunk into a single atomic residency operation.
+// Unlike AttachRemotePageLoad, repeated calls coexist.
 func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges []RemoteLoadRange, doneCallback func(error), timeline *timing.Timeline) error {
 	if pages == nil || len(ranges) == 0 {
 		return errors.New("sparse chunk loader and ranges must be non-empty")
 	}
 	for i, loadRange := range ranges {
-		if loadRange.Target.Length() != SparseChunkBytes || !loadRange.Target.WellFormed() ||
-			!hostarch.IsPageAligned(loadRange.Target.Start) || loadRange.StreamOffset%SparseChunkBytes != 0 {
+		if !loadRange.Target.WellFormed() || loadRange.Target.Length() == 0 ||
+			!hostarch.IsPageAligned(loadRange.Target.Start) || !hostarch.IsPageAligned(loadRange.Target.End) ||
+			!hostarch.IsPageAligned(loadRange.StreamOffset) {
 			return fmt.Errorf("invalid sparse chunk load range %d: %+v", i, loadRange)
 		}
 		for j := 0; j < i; j++ {
@@ -1242,6 +1243,85 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
 				return fmt.Errorf("sparse chunk target ranges %v and %v overlap", loadRange.Target, other)
 			}
+		}
+	}
+	type attachedRange struct {
+		load  RemoteLoadRange
+		chunk *logicalChunkLoad
+	}
+	attached := make([]attachedRange, 0, len(ranges))
+	var logicalChunks []*logicalChunkLoad
+	if pages.logicalChunkDemand {
+		type chunkBuild struct {
+			chunk *logicalChunkLoad
+			used  [4]uint64
+		}
+		current := make(map[LogicalChunkID]*chunkBuild)
+		for _, load := range ranges {
+			cursor := load.Target.Start
+			for _, logical := range f.LogicalPageRanges(load.Target) {
+				if logical.Range.Start != cursor {
+					return fmt.Errorf("sparse logical chunk range %v has a metadata gap at %#x", load.Target, cursor)
+				}
+				for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
+					firstSlot := sequence % logicalPagesPerChunk
+					pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
+					id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
+					remaining := pageCount
+					for remaining != 0 {
+						build := current[id]
+						if build == nil {
+							build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
+							current[id] = build
+							logicalChunks = append(logicalChunks, build.chunk)
+						}
+						slot := sequence % logicalPagesPerChunk
+						if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+							build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
+							current[id] = build
+							logicalChunks = append(logicalChunks, build.chunk)
+						}
+						startSlot := slot
+						var taken uint64
+						for taken < remaining {
+							currentSlot := startSlot + taken
+							if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
+								break
+							}
+							build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
+							taken++
+						}
+						length := taken * hostarch.PageSize
+						piece := RemoteLoadRange{Target: memmap.FileRange{Start: offset, End: offset + length}, StreamOffset: load.StreamOffset + offset - load.Target.Start}
+						build.chunk.ranges = append(build.chunk.ranges, piece)
+						attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
+						offset += length
+						sequence += taken
+						cursor += length
+						remaining -= taken
+					}
+				}
+			}
+			if cursor != load.Target.End {
+				return fmt.Errorf("sparse logical metadata ends at %#x for %v", cursor, load.Target)
+			}
+		}
+		for _, chunk := range logicalChunks {
+			var previousEnd, bytes uint64
+			for i, load := range chunk.ranges {
+				if i != 0 && load.StreamOffset != previousEnd {
+					return fmt.Errorf("sparse logical chunk %+v instance %d is not contiguous in the packed stream", chunk.id, chunk.instance)
+				}
+				previousEnd = load.StreamOffset + load.Target.Length()
+				bytes += load.Target.Length()
+			}
+			if bytes > SparseChunkBytes || len(chunk.ranges) > pages.maxRanges {
+				return fmt.Errorf("sparse logical chunk %+v requires %d bytes and %d ranges", chunk.id, bytes, len(chunk.ranges))
+			}
+		}
+	} else {
+		for _, load := range ranges {
+			attached = append(attached, attachedRange{load: load})
 		}
 	}
 	fileSize := uint64(len(f.chunksLoad())) * chunkSize
@@ -1255,7 +1335,7 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 	}
 	amfl := &asyncMemoryFileLoad{
 		f: f, pf: pages, df: destination, doneCallback: doneCallback,
-		timeline: timeline.Fork(fmt.Sprintf("sparse-mf:%p", f)), sparse: true,
+		timeline: timeline.Fork(fmt.Sprintf("sparse-mf:%p", f)), sparse: true, logicalChunks: logicalChunks,
 	}
 	pages.amflsMu.Lock()
 	if err := pages.err(); err != nil {
@@ -1268,10 +1348,10 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 
 	minUnloaded := uint64(math.MaxUint64)
 	pages.mu.Lock()
-	for _, loadRange := range ranges {
-		amfl.unloaded.InsertRange(loadRange.Target, aplUnloadedInfo{off: loadRange.StreamOffset})
-		if loadRange.Target.Start < minUnloaded {
-			minUnloaded = loadRange.Target.Start
+	for _, item := range attached {
+		amfl.unloaded.InsertRange(item.load.Target, aplUnloadedInfo{off: item.load.StreamOffset, logicalChunk: item.chunk})
+		if item.load.Target.Start < minUnloaded {
+			minUnloaded = item.load.Target.Start
 		}
 	}
 	amfl.minUnloaded.Store(minUnloaded)

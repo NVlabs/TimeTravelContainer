@@ -3921,10 +3921,7 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 			if err != nil {
 				return fmt.Errorf("invalid destination %q: %w", value, err)
 			}
-			if target.branch != defaultBranchID {
-				return fmt.Errorf("remote fork destination %q must name the new family's initial @%s branch", value, defaultBranchID)
-			}
-			targetContainers[i] = target.container
+			targetContainers[i] = target.String()
 		}
 		targets, err := distributed.forkRemoteMany(source, *targetNode, targetContainers, *paused)
 		if err != nil {
@@ -8083,7 +8080,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				// runtime is gone. Persist the exited state first, then release
 				// the cluster root; a failure remains conservative and a later
 				// listing retries the idempotent cleanup.
-				if persistentFamilyProcessFree(reconciled) && reconciled.DistributedSparseBranch != "" {
+				if persistentFamilyProcessFree(reconciled) {
 					if err := b.releaseDistributedSparseRoot(reconciled); err == nil {
 						if latest, err := store.LoadContainer(container.ID); err == nil {
 							reconciled = latest
@@ -9521,6 +9518,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
+		if recorded.DistributedSparseRepository != "" || recorded.DistributedSparseBranch != "" {
+			if err := b.releaseSparseRoot(recorded.DistributedSparseRepository, recorded.DistributedSparseBranch); err != nil {
+				return fmt.Errorf("releasing distributed sparse memory for %s: %w", target, err)
+			}
+		}
 		if err := b.releaseSparseMemoryRoot(info.ID, recorded.FilesystemBranch); err != nil {
 			if portErr != nil {
 				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)

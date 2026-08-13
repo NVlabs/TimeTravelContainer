@@ -73,6 +73,14 @@ type DistributedForkRestoreArgs struct {
 	// SparseBranch identifies the durable retention root paired with
 	// SparseManifest. The Sentry advances its per-chunk consumption record.
 	SparseBranch string
+	// Peer imports the captured branch into an already-running SandboxFamily
+	// instead of replacing a newly-created placeholder kernel.
+	Peer bool
+	// VisibleBranchID is the target-local CLI branch name. TargetBranchID remains
+	// the immutable transaction identity recorded in captured kernel metadata.
+	VisibleBranchID string
+	// FilesystemBranch is the prepared target branch in each TTC repository.
+	FilesystemBranch string
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -90,6 +98,18 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	if args.MetadataBytes == 0 || args.MaxTransferBytes == 0 || args.MaxParallel <= 0 || args.Timeout <= 0 || args.RetryLimit < 0 || args.AckBatchPages <= 0 || args.AckInterval < 0 {
 		return nil, errors.New("distributed target restore has invalid transfer bounds")
+	}
+	if args.Peer {
+		if args.VisibleBranchID == "" || args.FilesystemBranch == "" {
+			return nil, errors.New("distributed peer restore is missing visible or filesystem branch identity")
+		}
+		l.mu.Lock()
+		state := l.state
+		l.mu.Unlock()
+		if state != started && state != restored {
+			return nil, fmt.Errorf("sandbox is %s, not available for distributed peer import", state)
+		}
+		return l.restoreDistributedForkPeer(args)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -133,6 +153,73 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
 		}
 		files = files[1:]
+	}
+	if args.DurableDehydration {
+		if sharedMetadata == nil || !sparse {
+			return nil, errors.New("distributed durable peer requires shared metadata and sparse memory")
+		}
+		metadataFD, err := unix.Dup(int(sharedMetadata.Fd()))
+		if err != nil {
+			return nil, err
+		}
+		metadataFile := os.NewFile(uintptr(metadataFD), "distributed-durable-peer-metadata")
+		durable, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
+		metadataFile.Close()
+		if err != nil {
+			return nil, err
+		}
+		if durable.SparseManifest != args.SparseManifest {
+			return nil, fmt.Errorf("durable peer manifest %s does not match requested %s", durable.SparseManifest, args.SparseManifest)
+		}
+		if got, want := len(files), len(durable.Memories)-1; got != want {
+			return nil, fmt.Errorf("distributed durable peer got %d private memory files, want %d", got, want)
+		}
+		private := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(files))
+		for i, file := range files {
+			resource := durable.Memories[i+1].ResourceID
+			mf, err := createEmptyPrivateMemoryFile(file, resource)
+			if err != nil {
+				for _, opened := range private {
+					opened.Destroy()
+				}
+				return nil, fmt.Errorf("creating distributed durable peer memory %q: %w", resource, err)
+			}
+			private[resource] = mf
+		}
+		consumed := false
+		defer func() {
+			if !consumed {
+				for _, mf := range private {
+					mf.Destroy()
+				}
+				_ = sparseRepository.Close()
+			}
+		}()
+		err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+			memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
+			memories[checkpoint.ResourceID{}] = source.MemoryFile()
+			for resource, mf := range private {
+				memories[resource] = mf
+			}
+			consumed = true
+			child, err := kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, durable, memories, sparseRepository, kernel.DurableDehydrationLoadOptions{
+				Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+				SparseBranch: args.SparseBranch, FilesystemResources: resources,
+				ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			for _, task := range child.TaskSet().Root.Tasks() {
+				task.RestoreContainerID(l.sandboxID)
+			}
+			child.RegisterContainerName(l.sandboxID, l.root.containerName)
+			return child, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DistributedForkRestoreInfo{SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID}, nil
 	}
 	var donated []net.Conn
 	donatedMode := len(files) != 0
@@ -354,7 +441,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	} else {
 		readerOwned = false
 		child, err = kernel.LoadDistributedFork(l.k.SupervisorContext(), p, targetMF,
-			metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, reader, loadOpts)
+			metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, metadata.MemoryBindings, reader, loadOpts)
 	}
 	if err != nil {
 		return nil, err
@@ -427,4 +514,185 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	}
 	l.distributedRestoreInfo = info
 	return &info, nil
+}
+
+// restoreDistributedForkPeer reconstructs a branch beside an active peer. It
+// deliberately reuses the peer's Platform and application MemoryFile, which is
+// what makes repeated imports of identical chunks share resident host pages in
+// one Sentry instead of allocating another sandbox process.
+func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+	files := args.FilePayload.Files
+	var sharedMetadata *os.File
+	if args.SharedMetadata {
+		if len(files) == 0 {
+			return nil, errors.New("distributed peer is missing shared metadata")
+		}
+		sharedMetadata, files = files[0], files[1:]
+	}
+	var sharedSnapshot *os.File
+	if args.SharedSnapshot {
+		if len(files) == 0 {
+			return nil, errors.New("distributed peer is missing shared memory")
+		}
+		sharedSnapshot, files = files[0], files[1:]
+	}
+	sparse := args.SparseManifest != (ttcchunk.ManifestID{})
+	if sparse && args.SharedSnapshot {
+		return nil, errors.New("packed and sparse distributed peer snapshots are mutually exclusive")
+	}
+	var sparseRepository *ttcchunk.MemoryRepository
+	if sparse {
+		if len(files) == 0 {
+			return nil, errors.New("distributed peer is missing sparse memory repository")
+		}
+		var err error
+		sparseRepository, err = ttcchunk.OpenMemoryRepositoryFD(files[0])
+		if err != nil {
+			return nil, fmt.Errorf("opening distributed peer sparse repository: %w", err)
+		}
+		files = files[1:]
+	}
+	var donated []net.Conn
+	for _, file := range files {
+		conn, err := ttcremote.NewDonatedTCPConn(file)
+		if err != nil {
+			for _, opened := range donated {
+				opened.Close()
+			}
+			if sparseRepository != nil {
+				sparseRepository.Close()
+			}
+			return nil, fmt.Errorf("opening donated distributed peer connection: %w", err)
+		}
+		donated = append(donated, conn)
+	}
+	donatedOwned := true
+	defer func() {
+		if donatedOwned {
+			for _, conn := range donated {
+				conn.Close()
+			}
+		}
+	}()
+	var pushConn net.Conn
+	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+		if len(donated) < 2 {
+			return nil, errors.New("distributed peer reverse push requires a dedicated donated stream")
+		}
+		pushConn = donated[len(donated)-1]
+		donated = donated[:len(donated)-1]
+		defer func() {
+			if pushConn != nil {
+				pushConn.Close()
+			}
+		}()
+	}
+	var encoded []byte
+	var err error
+	if sharedMetadata != nil {
+		encoded, err = io.ReadAll(io.LimitReader(sharedMetadata, int64(args.MetadataBytes)+1))
+	} else if len(donated) != 0 {
+		encoded, err = ttcremote.FetchTCPMetadataConn(l.k.SupervisorContext(), donated[0], args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
+		donated[0].Close()
+		donated = donated[1:]
+	} else {
+		encoded, err = ttcremote.FetchTCPMetadata(l.k.SupervisorContext(), args.Address, args.SnapshotToken, args.MaxTransferBytes, args.MetadataBytes, args.Timeout)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching distributed peer metadata: %w", err)
+	}
+	if uint64(len(encoded)) != args.MetadataBytes {
+		return nil, fmt.Errorf("distributed peer metadata size is %d, want %d", len(encoded), args.MetadataBytes)
+	}
+	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
+		MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
+		MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
+		return nil, fmt.Errorf("distributed peer metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
+	}
+	readerOpts := ttcremote.TCPRemoteReaderOpts{
+		MaxReadBytes: args.MaxTransferBytes, MaxRanges: pgalloc.PagesPerSparseChunk(), MaxParallel: args.MaxParallel,
+		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
+		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
+	}
+	var reader stateio.AsyncReader
+	if args.SharedSnapshot {
+		if len(donated) != 0 {
+			return nil, fmt.Errorf("shared distributed peer snapshot has %d unused connections", len(donated))
+		}
+		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
+		if err != nil {
+			return nil, err
+		}
+		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
+	} else if sparse {
+		if len(donated) != 0 {
+			return nil, fmt.Errorf("sparse distributed peer snapshot has %d unused connections", len(donated))
+		}
+	} else if len(donated) != 0 {
+		reader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
+		if err == nil {
+			donatedOwned = false
+		}
+	} else {
+		reader, err = ttcremote.NewTCPRemoteReaderWithOpts(args.Address, args.SnapshotToken, readerOpts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	readerOwned := reader != nil
+	defer func() {
+		if readerOwned && reader != nil {
+			_ = reader.Close()
+		}
+	}()
+	var child *kernel.Kernel
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		loadOpts := kernel.DistributedForkLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+			FilesystemResources: resources, DemandOnly: true,
+			PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
+			LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork,
+			OwnSparseRepository: sparse, SparseBranch: args.SparseBranch,
+		}
+		var loadErr error
+		if sparse {
+			child, loadErr = kernel.LoadSparseDistributedFork(source.SupervisorContext(), source.Platform, source.MemoryFile(), metadata.KernelMetadata, sparseRepository, args.SparseManifest, loadOpts)
+		} else {
+			readerOwned = false
+			child, loadErr = kernel.LoadDistributedFork(source.SupervisorContext(), source.Platform, source.MemoryFile(), metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, metadata.MemoryBindings, reader, loadOpts)
+		}
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		for _, task := range child.TaskSet().Root.Tasks() {
+			task.RestoreContainerID(l.sandboxID)
+		}
+		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		return child, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if pushConn != nil {
+		receiver, err := ttcremote.NewTCPPushStateSession(args.SnapshotToken, child.TryInstallRemotePagesState, args.MaxTransferBytes)
+		if err != nil {
+			return nil, err
+		}
+		conn := pushConn
+		pushConn = nil
+		go func() { _ = receiver.ServeStream(conn) }()
+	}
+	var remoteBytes uint64
+	for _, load := range metadata.LoadRanges {
+		remoteBytes += load.Target.Length()
+	}
+	return &DistributedForkRestoreInfo{
+		SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID,
+		RemotePages: remoteBytes / hostarch.PageSize, RemoteBytes: remoteBytes,
+	}, nil
 }

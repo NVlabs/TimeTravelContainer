@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	sessionMetadataVersion = 1
+	sessionMetadataVersion = 2
 	sessionMetadataHeader  = 32
 	sessionMetadataDigest  = sha256.Size
+	sessionBindingBytes    = 72
 )
 
 var sessionMetadataMagic = [4]byte{'T', 'T', 'C', 'M'}
@@ -44,6 +45,10 @@ type SessionMetadata struct {
 	KernelMetadata    []byte
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
+	// MemoryBindings describe allocator-wide page identities in the same packed
+	// stream as LoadRanges. They let an existing family relocate and reuse
+	// identical resident chunks without importing a second allocator.
+	MemoryBindings []pgalloc.CapturedPageBinding
 }
 
 // SessionMetadataLimits bounds allocations made while decoding an untrusted
@@ -63,7 +68,7 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 			return nil, errors.New("distributed branch identity exceeds 65535 bytes")
 		}
 	}
-	if uint64(len(m.KernelMetadata)) > uint64(^uint32(0)) || uint64(len(m.AllocatorMetadata)) > uint64(^uint32(0)) || uint64(len(m.LoadRanges)) > uint64(^uint32(0)) {
+	if uint64(len(m.KernelMetadata)) > uint64(^uint32(0)) || uint64(len(m.AllocatorMetadata)) > uint64(^uint32(0)) || uint64(len(m.LoadRanges)) > uint64(^uint32(0)) || uint64(len(m.MemoryBindings)) > uint64(^uint32(0)) {
 		return nil, errors.New("distributed metadata field exceeds protocol limit")
 	}
 	var body bytes.Buffer
@@ -85,6 +90,24 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 			}
 		}
 	}
+	for _, binding := range m.MemoryBindings {
+		if binding.ResourceID.Ok() || binding.References == 0 || binding.Page.Allocator == (pgalloc.LogicalAllocatorID{}) || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+			return nil, fmt.Errorf("invalid distributed memory binding %+v", binding)
+		}
+		for _, value := range []uint64{binding.OldOffset, binding.StreamOffset, binding.References} {
+			if err := binary.Write(&body, binary.BigEndian, value); err != nil {
+				return nil, err
+			}
+		}
+		body.Write(binding.Page.Allocator[:])
+		if err := binary.Write(&body, binary.BigEndian, binding.Page.Sequence); err != nil {
+			return nil, err
+		}
+		body.Write(binding.Version.Allocator[:])
+		if err := binary.Write(&body, binary.BigEndian, binding.Version.Sequence); err != nil {
+			return nil, err
+		}
+	}
 	encoded := make([]byte, sessionMetadataHeader+body.Len()+sessionMetadataDigest)
 	copy(encoded[:4], sessionMetadataMagic[:])
 	binary.BigEndian.PutUint16(encoded[4:6], sessionMetadataVersion)
@@ -92,6 +115,7 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 	binary.BigEndian.PutUint32(encoded[12:16], uint32(len(m.AllocatorMetadata)))
 	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(m.LoadRanges)))
 	binary.BigEndian.PutUint64(encoded[20:28], uint64(body.Len()))
+	binary.BigEndian.PutUint32(encoded[28:32], uint32(len(m.MemoryBindings)))
 	copy(encoded[sessionMetadataHeader:], body.Bytes())
 	digest := sha256.Sum256(encoded[:len(encoded)-sessionMetadataDigest])
 	copy(encoded[len(encoded)-sessionMetadataDigest:], digest[:])
@@ -106,14 +130,15 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 	if !bytes.Equal(encoded[:4], sessionMetadataMagic[:]) || binary.BigEndian.Uint16(encoded[4:6]) != sessionMetadataVersion {
 		return nil, errors.New("invalid distributed metadata magic or version")
 	}
-	if encoded[6] != 0 || encoded[7] != 0 || binary.BigEndian.Uint32(encoded[28:32]) != 0 {
+	if encoded[6] != 0 || encoded[7] != 0 {
 		return nil, errors.New("distributed metadata reserved fields are nonzero")
 	}
 	kernelLen := uint64(binary.BigEndian.Uint32(encoded[8:12]))
 	allocatorLen := uint64(binary.BigEndian.Uint32(encoded[12:16]))
 	rangeCount := binary.BigEndian.Uint32(encoded[16:20])
+	bindingCount := binary.BigEndian.Uint32(encoded[28:32])
 	bodyLen := binary.BigEndian.Uint64(encoded[20:28])
-	if kernelLen > limits.MaxKernelBytes || allocatorLen > limits.MaxAllocatorBytes || rangeCount > limits.MaxLoadRanges ||
+	if kernelLen > limits.MaxKernelBytes || allocatorLen > limits.MaxAllocatorBytes || rangeCount > limits.MaxLoadRanges || bindingCount > limits.MaxLoadRanges ||
 		bodyLen != uint64(len(encoded)-sessionMetadataHeader-sessionMetadataDigest) {
 		return nil, errors.New("distributed metadata fields exceed configured limits or size is inconsistent")
 	}
@@ -142,7 +167,7 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 	if m.TargetBranchID, err = readString(); err != nil {
 		return nil, err
 	}
-	if kernelLen+allocatorLen+uint64(rangeCount)*24 != uint64(r.Len()) {
+	if kernelLen+allocatorLen+uint64(rangeCount)*24+uint64(bindingCount)*sessionBindingBytes != uint64(r.Len()) {
 		return nil, errors.New("distributed metadata payload layout is inconsistent")
 	}
 	m.KernelMetadata = make([]byte, kernelLen)
@@ -165,6 +190,31 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 		if !m.LoadRanges[i].Target.WellFormed() || m.LoadRanges[i].Target.Length() == 0 {
 			return nil, errors.New("distributed metadata contains invalid load range")
 		}
+	}
+	m.MemoryBindings = make([]pgalloc.CapturedPageBinding, bindingCount)
+	for i := range m.MemoryBindings {
+		binding := &m.MemoryBindings[i]
+		for _, value := range []*uint64{&binding.OldOffset, &binding.StreamOffset, &binding.References} {
+			if err := binary.Read(r, binary.BigEndian, value); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := io.ReadFull(r, binding.Page.Allocator[:]); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &binding.Page.Sequence); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(r, binding.Version.Allocator[:]); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &binding.Version.Sequence); err != nil {
+			return nil, err
+		}
+		if binding.References == 0 || binding.Page.Allocator == (pgalloc.LogicalAllocatorID{}) || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+			return nil, errors.New("distributed metadata contains invalid memory binding")
+		}
+		binding.Chunk, binding.Slot = binding.Page.Chunk()
 	}
 	return m, nil
 }

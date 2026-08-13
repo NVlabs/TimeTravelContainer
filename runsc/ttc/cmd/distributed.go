@@ -273,7 +273,7 @@ func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, reposit
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error) {
+func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestination string, paused bool) (selector, error) {
 	if b.distributedSource == nil {
 		return selector{}, errors.New("ttcd is not configured for distributed forks")
 	}
@@ -281,9 +281,11 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	if peer == nil {
 		return selector{}, fmt.Errorf("cluster target node %q is not configured", targetNode)
 	}
-	if targetContainer == "" || strings.Contains(targetContainer, "@") {
-		return selector{}, fmt.Errorf("target container %q must not include a branch", targetContainer)
+	target, err := parseSelector(targetDestination)
+	if err != nil {
+		return selector{}, fmt.Errorf("invalid distributed destination %q: %w", targetDestination, err)
 	}
+	targetContainer := target.container
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return selector{}, err
@@ -301,7 +303,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		return selector{}, fmt.Errorf("reloading promoted source metadata: %w", err)
 	}
 	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
-		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused, nil)
+		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
 	}
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
@@ -315,7 +317,8 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
 		TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
 		TargetContainer: targetContainer, TargetBranch: transactionID,
-		ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
+		TargetVisibleBranch: target.branch,
+		ImageDigest:         sourceInfo.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -421,13 +424,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetContainer
 	} else {
 		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	}
-	return selector{container: targetContainer, branch: defaultBranchID}, nil
+	return target, nil
 }
 
 // forkRemoteDehydrated restores a process-free branch directly from its
 // durable kernel metadata and sparse memory graph. No source Sentry is
 // created, and the target is independent as soon as publication completes.
-func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode, targetContainer string, paused bool, committedTransaction *string) (result selector, retErr error) {
+func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
 		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -439,7 +442,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	identity := cluster.ForkIdentity{
 		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
 		TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
-		TargetContainer: targetContainer, TargetBranch: transactionID,
+		TargetContainer: target.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
 		ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID,
 	}
@@ -571,7 +574,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if committedTransaction != nil {
 		*committedTransaction = transactionID
 	}
-	return selector{container: targetContainer, branch: defaultBranchID}, nil
+	return target, nil
 }
 
 func writeDurableDistributedFile(path string, data []byte) error {
@@ -695,15 +698,18 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	if peer == nil {
 		return nil, fmt.Errorf("cluster target node %q is not configured", targetNode)
 	}
+	destinations := make([]selector, len(targetContainers))
 	seenTargets := make(map[string]struct{}, len(targetContainers))
-	for _, targetContainer := range targetContainers {
-		if targetContainer == "" || strings.Contains(targetContainer, "@") {
-			return nil, fmt.Errorf("target container %q must not include a branch", targetContainer)
+	for i, value := range targetContainers {
+		target, err := parseSelector(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid distributed destination %q: %w", value, err)
 		}
-		if _, ok := seenTargets[targetContainer]; ok {
-			return nil, fmt.Errorf("distributed fork repeats target container %q", targetContainer)
+		if _, ok := seenTargets[target.String()]; ok {
+			return nil, fmt.Errorf("distributed fork repeats target %q", target)
 		}
-		seenTargets[targetContainer] = struct{}{}
+		seenTargets[target.String()] = struct{}{}
+		destinations[i] = target
 	}
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
@@ -724,9 +730,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
 		results := make([]selector, 0, len(targetContainers))
 		transactions := make([]string, 0, len(targetContainers))
-		for _, targetContainer := range targetContainers {
+		for _, target := range destinations {
 			var transactionID string
-			result, err := b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, targetContainer, paused, &transactionID)
+			result, err := b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, &transactionID)
 			if err == nil {
 				results = append(results, result)
 				transactions = append(transactions, transactionID)
@@ -753,7 +759,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 				}
 				cleanupCancel()
 			}
-			return nil, errors.Join(fmt.Errorf("forking dehydrated target %s on node %s: %w", targetContainer, targetNode, err), rollbackErr)
+			return nil, errors.Join(fmt.Errorf("forking dehydrated target %s on node %s: %w", target, targetNode, err), rollbackErr)
 		}
 		return results, nil
 	}
@@ -762,7 +768,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, err
 	}
 	type childState struct {
-		target       string
+		target       selector
 		transaction  string
 		tx           *cluster.Transaction
 		relay        *distributedPageRelay
@@ -799,7 +805,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 
 	var commonPolicy *ttcpolicy.Policy
 	var commonDataPlaneMax uint64
-	for i, targetContainer := range targetContainers {
+	for i, target := range destinations {
 		transactionID, err := newDistributedTransactionID()
 		if err != nil {
 			return nil, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -807,13 +813,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		identity := cluster.ForkIdentity{
 			TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
 			TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
-			TargetContainer: targetContainer, TargetBranch: transactionID,
+			TargetContainer: target.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
 			ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 			RepositoryID: b.distributedSource.capabilities.RepositoryID,
 		}
 		tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
 		if err != nil {
-			return nil, fmt.Errorf("reserving target %s on node %s: %w", targetContainer, targetNode, err)
+			return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
 		}
 		dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
 		if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
@@ -824,11 +830,11 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			commonPolicy = &policy
 			commonDataPlaneMax = dataPlaneMax
 		} else if *commonPolicy != tx.Negotiated.PagingPolicy || commonDataPlaneMax != dataPlaneMax {
-			return nil, fmt.Errorf("target %s negotiated a different paging policy within one sibling batch", targetContainer)
+			return nil, fmt.Errorf("target %s negotiated a different paging policy within one sibling batch", target)
 		}
 		listener, err := net.Listen("tcp", b.distributedSource.pageListen)
 		if err != nil {
-			return nil, fmt.Errorf("opening distributed page listener for %s: %w", targetContainer, err)
+			return nil, fmt.Errorf("opening distributed page listener for %s: %w", target, err)
 		}
 		advertise, err := resolveDistributedAdvertiseAddress(b.distributedSource.pageAdvertise, listener.Addr().String())
 		if err != nil {
@@ -840,7 +846,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		relayBackend.stdout = io.Discard
 		relayBackend.stderr = io.Discard
 		children[i] = childState{
-			target: targetContainer, transaction: transactionID, tx: tx,
+			target: target, transaction: transactionID, tx: tx,
 			relay:     newDistributedPageRelay(listener, &relayBackend, source.container, transactionID),
 			advertise: advertise, dataPlaneMax: dataPlaneMax,
 		}
@@ -963,7 +969,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		} else {
 			go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
 		}
-		results[i] = selector{container: child.target, branch: defaultBranchID}
+		results[i] = child.target
 	}
 	return results, nil
 }
@@ -1076,6 +1082,16 @@ func (b *runtimeBackend) reconcileClusterSparseMemoryRoots() error {
 	for _, container := range containers {
 		if filepath.Clean(container.DistributedSparseRepository) == repositoryRelative && container.DistributedSparseBranch != "" {
 			keep[container.DistributedSparseBranch] = struct{}{}
+		}
+		for _, branch := range container.Branches {
+			if filepath.Clean(branch.DistributedSparseRepository) == repositoryRelative && branch.DistributedSparseBranch != "" {
+				keep[branch.DistributedSparseBranch] = struct{}{}
+			}
+		}
+		for _, pending := range container.DistributedForkImports {
+			if filepath.Clean(pending.SparseRepository) == repositoryRelative && pending.SparseBranch != "" {
+				keep[pending.SparseBranch] = struct{}{}
+			}
 		}
 	}
 	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))

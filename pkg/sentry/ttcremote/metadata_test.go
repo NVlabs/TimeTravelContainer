@@ -24,6 +24,12 @@ import (
 )
 
 func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
+	var allocator pgalloc.LogicalAllocatorID
+	allocator[0] = 1
+	var versionAllocator pgalloc.LogicalAllocatorID
+	versionAllocator[0] = 2
+	page := pgalloc.LogicalPageID{Allocator: allocator, Sequence: 7}
+	chunk, slot := page.Chunk()
 	want := &SessionMetadata{
 		FamilyID:          "family-1",
 		SourceBranchID:    "main",
@@ -34,6 +40,10 @@ func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
 			{Target: memmap.FileRange{Start: 0x1000, End: 0x9000}, StreamOffset: 0},
 			{Target: memmap.FileRange{Start: 0x20000, End: 0x24000}, StreamOffset: 0x8000},
 		},
+		MemoryBindings: []pgalloc.CapturedPageBinding{{
+			OldOffset: 0x2000, StreamOffset: 0x1000, References: 2, Page: page,
+			Version: pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 9}, Chunk: chunk, Slot: slot,
+		}},
 	}
 	encoded, err := want.MarshalBinary()
 	if err != nil {

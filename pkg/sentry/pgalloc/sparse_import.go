@@ -15,13 +15,114 @@
 package pgalloc
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
+
+// InstallRemoteBindings installs or reuses live-transport chunks identified
+// by stable logical page versions. Unlike durable object IDs, these keys do
+// not claim to hash page contents; their domain prefix keeps the two identity
+// schemes distinct. The returned ranges read directly from the capture's
+// packed TCP stream.
+func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind usage.MemoryKind, memCgID uint32) (*SparseChunkInstallation, *SparseRelocation, []RemoteLoadRange, error) {
+	byChunk := make(map[LogicalChunkID][]CapturedPageBinding)
+	for _, binding := range bindings {
+		chunk, slot := binding.Page.Chunk()
+		if binding.ResourceID.Ok() || binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 {
+			return nil, nil, nil, fmt.Errorf("invalid live sparse binding %+v", binding)
+		}
+		byChunk[chunk] = append(byChunk[chunk], binding)
+	}
+	chunks := make([]LogicalChunkID, 0, len(byChunk))
+	for chunk := range byChunk {
+		chunks = append(chunks, chunk)
+	}
+	sort.Slice(chunks, func(i, j int) bool {
+		if chunks[i].Allocator != chunks[j].Allocator {
+			return string(chunks[i].Allocator[:]) < string(chunks[j].Allocator[:])
+		}
+		return chunks[i].Sequence < chunks[j].Sequence
+	})
+	installs := make([]SparseChunkInstall, 0, len(chunks))
+	objectBindings := make(map[SparseChunkObjectID][]CapturedPageBinding, len(chunks))
+	for _, chunk := range chunks {
+		pages := byChunk[chunk]
+		sort.Slice(pages, func(i, j int) bool { return pages[i].Slot < pages[j].Slot })
+		hash := sha256.New()
+		hash.Write([]byte("ttc-live-page-versions-v1\x00"))
+		hash.Write(chunk.Allocator[:])
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], chunk.Sequence)
+		hash.Write(encoded[:])
+		install := SparseChunkInstall{Logical: chunk, Kind: kind, MemCgID: memCgID}
+		for i, binding := range pages {
+			if i != 0 && pages[i-1].Slot == binding.Slot {
+				return nil, nil, nil, fmt.Errorf("live sparse chunk repeats slot %d", binding.Slot)
+			}
+			hash.Write([]byte{binding.Slot})
+			hash.Write(binding.Page.Allocator[:])
+			binary.BigEndian.PutUint64(encoded[:], binding.Page.Sequence)
+			hash.Write(encoded[:])
+			hash.Write(binding.Version.Allocator[:])
+			binary.BigEndian.PutUint64(encoded[:], binding.Version.Sequence)
+			hash.Write(encoded[:])
+			install.Pages = append(install.Pages, SparseChunkPage{Slot: binding.Slot, Page: binding.Page, Version: binding.Version, References: binding.References})
+		}
+		copy(install.Object[:], hash.Sum(nil))
+		installs = append(installs, install)
+		objectBindings[install.Object] = pages
+	}
+	transaction, err := f.InstallSparseChunks(installs)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = transaction.Abort()
+		}
+	}()
+	relocation := NewSparseRelocation()
+	newRanges := transaction.NewRanges()
+	var loads []RemoteLoadRange
+	for _, install := range installs {
+		resident, ok := f.SparseChunkRange(install.Object)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("installed live chunk %x has no resident range", install.Object)
+		}
+		_, isNew := newRanges[install.Object]
+		for _, binding := range objectBindings[install.Object] {
+			target := resident.Start + uint64(binding.Slot)*hostarch.PageSize
+			if err := relocation.Add(binding.ResourceID, binding.OldOffset, target); err != nil {
+				return nil, nil, nil, err
+			}
+			if isNew {
+				loads = append(loads, RemoteLoadRange{Target: memmap.FileRange{Start: target, End: target + hostarch.PageSize}, StreamOffset: binding.StreamOffset})
+			}
+		}
+	}
+	sort.Slice(loads, func(i, j int) bool { return loads[i].Target.Start < loads[j].Target.Start })
+	coalesced := loads[:0]
+	for _, load := range loads {
+		if len(coalesced) != 0 {
+			last := &coalesced[len(coalesced)-1]
+			if last.Target.End == load.Target.Start && last.StreamOffset+last.Target.Length() == load.StreamOffset {
+				last.Target.End = load.Target.End
+				continue
+			}
+		}
+		coalesced = append(coalesced, load)
+	}
+	committed = true
+	return transaction, relocation, coalesced, nil
+}
 
 const SparseChunkBytes = logicalPagesPerChunk * hostarch.PageSize
 

@@ -489,14 +489,14 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	capture.Snapshot = nil // ownership transferred to server
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve() }()
-	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, 256<<10, 16, 4, 5*time.Second)
+	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ownedReader := &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}
 	targetMF := newRemoteKernelMemoryFile(t)
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, ownedReader,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, ownedReader,
 		kernel.DistributedForkLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "remote",
 			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
@@ -593,7 +593,7 @@ func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 	capture.Snapshot = nil
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve() }()
-	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, 256<<10, 16, 4, 5*time.Second)
+	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4, 5*time.Second)
 	if err != nil {
 		server.Close()
 		parent.Release()
@@ -601,7 +601,7 @@ func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 	}
 	targetMF := newRemoteKernelMemoryFile(t)
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings,
 		&ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone},
 		kernel.DistributedForkLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "handoff",
@@ -815,12 +815,12 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 		platformOwner.PipeMount().IncRef()
 		platformOwner.SetHostMount(platformOwner.PipeMount())
 		targetMF := newRemoteKernelMemoryFile(t)
-		reader, err := ttcremote.NewTCPRemoteReader(address, token, 256<<10, 16, 4, 5*time.Second)
+		reader, err := ttcremote.NewTCPRemoteReader(address, token, pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4, 5*time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
 		child, err := kernel.LoadDistributedFork(platformOwner.SupervisorContext(), platformOwner.Platform, targetMF,
-			session.KernelMetadata, session.AllocatorMetadata, session.LoadRanges, reader,
+			session.KernelMetadata, session.AllocatorMetadata, session.LoadRanges, session.MemoryBindings, reader,
 			kernel.DistributedForkLoadOptions{
 				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: session.TargetBranchID,
 				FilesystemResources: make(vfs.LiveForkFilesystemResources), DemandOnly: true,
@@ -854,7 +854,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 	}
 	envelope, err := (&ttcremote.SessionMetadata{
 		FamilyID: "kernel-subprocess", SourceBranchID: "main", TargetBranchID: "subprocess",
-		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges,
+		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges, MemoryBindings: capture.HandoffBindings,
 	}).MarshalBinary()
 	if err != nil {
 		t.Fatal(err)

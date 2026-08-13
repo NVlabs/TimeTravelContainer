@@ -232,6 +232,7 @@ type DistributedForkOptions struct {
 	SourceContainer string
 	TargetName      string
 	TargetBranch    string
+	VisibleBranch   string
 	TransactionID   string
 	NodeID          string
 }
@@ -241,13 +242,27 @@ type BranchInfo struct {
 	ID string `json:"id"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
-	ParentID         string    `json:"parent_id,omitempty"`
-	FilesystemBranch string    `json:"filesystem_branch,omitempty"`
+	ParentID                     string    `json:"parent_id,omitempty"`
+	FilesystemBranch             string    `json:"filesystem_branch,omitempty"`
+	DistributedForkTransactionID string    `json:"distributed_fork_transaction_id,omitempty"`
+	DistributedSparseRepository  string    `json:"distributed_sparse_repository,omitempty"`
+	DistributedSparseBranch      string    `json:"distributed_sparse_branch,omitempty"`
+	State                        string    `json:"state"`
+	ForkTotalNS                  int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS             int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS                 int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt                    time.Time `json:"created_at"`
+}
+
+// DistributedForkImport is a reserved but not yet visible branch imported
+// into an already-running target family.
+type DistributedForkImport struct {
+	BranchID         string    `json:"branch_id"`
+	FilesystemBranch string    `json:"filesystem_branch"`
 	State            string    `json:"state"`
-	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+	SparseRepository string    `json:"sparse_repository,omitempty"`
+	SparseBranch     string    `json:"sparse_branch,omitempty"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
@@ -270,60 +285,62 @@ func (p PortBinding) Branch() string {
 
 // ContainerInfo is the persistent configuration needed to start a container.
 type ContainerInfo struct {
-	ID                           string            `json:"id"`
-	Name                         string            `json:"name"`
-	Reference                    string            `json:"reference"`
-	Digest                       string            `json:"digest"`
-	ImageSize                    int64             `json:"image_size,omitempty"`
-	LeaseID                      string            `json:"lease_id,omitempty"`
-	Platform                     string            `json:"platform"`
-	BundleDir                    string            `json:"bundle_dir"`
-	RootFS                       string            `json:"rootfs"`
-	Branches                     []BranchInfo      `json:"branches,omitempty"`
-	NetworkMode                  string            `json:"network_mode,omitempty"`
-	NetworkNAT                   bool              `json:"network_nat,omitempty"`
-	NetworkIP                    string            `json:"network_ip,omitempty"`
-	NetworkMAC                   string            `json:"network_mac,omitempty"`
-	PublishedPorts               []PortBinding     `json:"published_ports,omitempty"`
-	LogDriver                    string            `json:"log_driver,omitempty"`
-	LogOptions                   map[string]string `json:"log_options,omitempty"`
-	LogAttributes                map[string]string `json:"log_attributes,omitempty"`
-	ConsoleLogMaxBytes           int64             `json:"console_log_max_bytes,omitempty"`
-	ConsoleLogMaxFiles           int               `json:"console_log_max_files,omitempty"`
-	Terminal                     bool              `json:"terminal,omitempty"`
-	OpenStdin                    bool              `json:"open_stdin,omitempty"`
-	AutoRemove                   bool              `json:"auto_remove,omitempty"`
-	StopSignal                   string            `json:"stop_signal,omitempty"`
-	StopTimeout                  *int              `json:"stop_timeout,omitempty"`
-	PidsLimit                    *int64            `json:"pids_limit,omitempty"`
-	MemoryLimit                  *int64            `json:"memory_limit,omitempty"`
-	NanoCPUs                     *int64            `json:"nano_cpus,omitempty"`
-	CPUShares                    *uint64           `json:"cpu_shares,omitempty"`
-	CPUPeriod                    *uint64           `json:"cpu_period,omitempty"`
-	CPUQuota                     *int64            `json:"cpu_quota,omitempty"`
-	ShmSize                      *int64            `json:"shm_size,omitempty"`
-	GroupAdd                     []string          `json:"group_add,omitempty"`
-	CapAdd                       []string          `json:"cap_add,omitempty"`
-	CapDrop                      []string          `json:"cap_drop,omitempty"`
-	Ulimits                      []Ulimit          `json:"ulimits,omitempty"`
-	ExtraHosts                   []string          `json:"extra_hosts,omitempty"`
-	DNS                          []string          `json:"dns,omitempty"`
-	DNSSearch                    []string          `json:"dns_search,omitempty"`
-	DNSOptions                   []string          `json:"dns_options,omitempty"`
-	Volumes                      []ManagedVolume   `json:"volumes,omitempty"`
-	RootfsUpperID                string            `json:"rootfs_upper_id,omitempty"`
-	RootfsUpperCopyMode          string            `json:"rootfs_upper_copy_mode,omitempty"`
-	State                        string            `json:"state"`
-	ExitStatus                   *int              `json:"exit_status,omitempty"`
-	CreatedAt                    time.Time         `json:"created_at"`
-	StartedAt                    *time.Time        `json:"started_at,omitempty"`
-	ExitedAt                     *time.Time        `json:"exited_at,omitempty"`
-	DistributedForkTransactionID string            `json:"distributed_fork_transaction_id,omitempty"`
-	DistributedForkNodeID        string            `json:"distributed_fork_node_id,omitempty"`
-	DistributedForkHidden        bool              `json:"distributed_fork_hidden,omitempty"`
-	DistributedSparseRepository  string            `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch      string            `json:"distributed_sparse_branch,omitempty"`
-	NodeID                       string            `json:"node_id,omitempty"`
+	ID                           string                           `json:"id"`
+	Name                         string                           `json:"name"`
+	Reference                    string                           `json:"reference"`
+	Digest                       string                           `json:"digest"`
+	ImageSize                    int64                            `json:"image_size,omitempty"`
+	LeaseID                      string                           `json:"lease_id,omitempty"`
+	Platform                     string                           `json:"platform"`
+	BundleDir                    string                           `json:"bundle_dir"`
+	RootFS                       string                           `json:"rootfs"`
+	Branches                     []BranchInfo                     `json:"branches,omitempty"`
+	NetworkMode                  string                           `json:"network_mode,omitempty"`
+	NetworkNAT                   bool                             `json:"network_nat,omitempty"`
+	NetworkIP                    string                           `json:"network_ip,omitempty"`
+	NetworkMAC                   string                           `json:"network_mac,omitempty"`
+	PublishedPorts               []PortBinding                    `json:"published_ports,omitempty"`
+	LogDriver                    string                           `json:"log_driver,omitempty"`
+	LogOptions                   map[string]string                `json:"log_options,omitempty"`
+	LogAttributes                map[string]string                `json:"log_attributes,omitempty"`
+	ConsoleLogMaxBytes           int64                            `json:"console_log_max_bytes,omitempty"`
+	ConsoleLogMaxFiles           int                              `json:"console_log_max_files,omitempty"`
+	Terminal                     bool                             `json:"terminal,omitempty"`
+	OpenStdin                    bool                             `json:"open_stdin,omitempty"`
+	AutoRemove                   bool                             `json:"auto_remove,omitempty"`
+	StopSignal                   string                           `json:"stop_signal,omitempty"`
+	StopTimeout                  *int                             `json:"stop_timeout,omitempty"`
+	PidsLimit                    *int64                           `json:"pids_limit,omitempty"`
+	MemoryLimit                  *int64                           `json:"memory_limit,omitempty"`
+	NanoCPUs                     *int64                           `json:"nano_cpus,omitempty"`
+	CPUShares                    *uint64                          `json:"cpu_shares,omitempty"`
+	CPUPeriod                    *uint64                          `json:"cpu_period,omitempty"`
+	CPUQuota                     *int64                           `json:"cpu_quota,omitempty"`
+	ShmSize                      *int64                           `json:"shm_size,omitempty"`
+	GroupAdd                     []string                         `json:"group_add,omitempty"`
+	CapAdd                       []string                         `json:"cap_add,omitempty"`
+	CapDrop                      []string                         `json:"cap_drop,omitempty"`
+	Ulimits                      []Ulimit                         `json:"ulimits,omitempty"`
+	ExtraHosts                   []string                         `json:"extra_hosts,omitempty"`
+	DNS                          []string                         `json:"dns,omitempty"`
+	DNSSearch                    []string                         `json:"dns_search,omitempty"`
+	DNSOptions                   []string                         `json:"dns_options,omitempty"`
+	Volumes                      []ManagedVolume                  `json:"volumes,omitempty"`
+	RootfsUpperID                string                           `json:"rootfs_upper_id,omitempty"`
+	RootfsUpperCopyMode          string                           `json:"rootfs_upper_copy_mode,omitempty"`
+	State                        string                           `json:"state"`
+	ExitStatus                   *int                             `json:"exit_status,omitempty"`
+	CreatedAt                    time.Time                        `json:"created_at"`
+	StartedAt                    *time.Time                       `json:"started_at,omitempty"`
+	ExitedAt                     *time.Time                       `json:"exited_at,omitempty"`
+	DistributedForkTransactionID string                           `json:"distributed_fork_transaction_id,omitempty"`
+	DistributedForkNodeID        string                           `json:"distributed_fork_node_id,omitempty"`
+	DistributedForkHidden        bool                             `json:"distributed_fork_hidden,omitempty"`
+	DistributedSparseRepository  string                           `json:"distributed_sparse_repository,omitempty"`
+	DistributedSparseBranch      string                           `json:"distributed_sparse_branch,omitempty"`
+	DistributedFamilyID          string                           `json:"distributed_family_id,omitempty"`
+	DistributedForkImports       map[string]DistributedForkImport `json:"distributed_fork_imports,omitempty"`
+	NodeID                       string                           `json:"node_id,omitempty"`
 }
 
 func cloneIntPointer(value *int) *int {
@@ -1122,6 +1139,12 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err := validateObjectName("target branch", opts.TargetBranch); err != nil {
 		return Prepared{}, err
 	}
+	if opts.VisibleBranch == "" {
+		opts.VisibleBranch = "main"
+	}
+	if err := validateObjectName("visible target branch", opts.VisibleBranch); err != nil {
+		return Prepared{}, err
+	}
 	if err := validateObjectName("distributed fork transaction", opts.TransactionID); err != nil {
 		return Prepared{}, err
 	}
@@ -1140,14 +1163,63 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err != nil {
 		return Prepared{}, err
 	}
+	globalFamilyID := source.DistributedFamilyID
+	if globalFamilyID == "" {
+		globalFamilyID = source.ID
+	}
 	containers, err := s.listContainers(true)
 	if err != nil {
 		return Prepared{}, err
 	}
-	for _, existing := range containers {
-		if existing.Name == opts.TargetName || existing.ID == opts.TargetName {
-			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.TargetName, existing.ID)
+	var existingTarget *ContainerInfo
+	for i := range containers {
+		if containers[i].Name == opts.TargetName || containers[i].ID == opts.TargetName {
+			if existingTarget != nil {
+				return Prepared{}, fmt.Errorf("container name %q is ambiguous", opts.TargetName)
+			}
+			existingTarget = &containers[i]
 		}
+	}
+	if existingTarget != nil {
+		existing := *existingTarget
+		if existing.NodeID != "" && existing.NodeID != opts.NodeID {
+			return Prepared{}, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, existing.NodeID)
+		}
+		existingFamilyID := existing.DistributedFamilyID
+		if existingFamilyID == "" {
+			existingFamilyID = existing.ID
+		}
+		if existingFamilyID != globalFamilyID {
+			return Prepared{}, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
+		}
+		for _, branch := range existing.Branches {
+			if branch.ID == opts.VisibleBranch {
+				return Prepared{}, fmt.Errorf("branch %s@%s already exists", existing.Name, opts.VisibleBranch)
+			}
+		}
+		if existing.DistributedForkImports == nil {
+			existing.DistributedForkImports = make(map[string]DistributedForkImport)
+		}
+		if _, ok := existing.DistributedForkImports[opts.TransactionID]; ok {
+			return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
+		}
+		for _, pending := range existing.DistributedForkImports {
+			if pending.BranchID == opts.VisibleBranch {
+				return Prepared{}, fmt.Errorf("branch %s@%s is already being imported", existing.Name, opts.VisibleBranch)
+			}
+		}
+		now := time.Now().UTC()
+		existing.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
+			BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
+			State: "created", CreatedAt: now,
+		}
+		if err := writeJSON(filepath.Join(s.Root, "containers", existing.ID, "container.json"), &existing); err != nil {
+			return Prepared{}, err
+		}
+		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
+	}
+	if opts.VisibleBranch != "main" {
+		return Prepared{}, fmt.Errorf("new distributed target family %q must start with @main", opts.TargetName)
 	}
 	spec, err := s.LoadSpec(source.ID)
 	if err != nil {
@@ -1248,6 +1320,8 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	// Prepare will install a new root if this transaction uses sparse handoff.
 	target.DistributedSparseRepository = ""
 	target.DistributedSparseBranch = ""
+	target.DistributedFamilyID = globalFamilyID
+	target.DistributedForkImports = nil
 	target.NodeID = opts.NodeID
 	for i := range target.Volumes {
 		target.Volumes[i].Anonymous = false
@@ -1989,7 +2063,17 @@ func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, e
 	}
 	var found *ContainerInfo
 	for i := range containers {
-		if containers[i].DistributedForkTransactionID != transactionID {
+		matches := containers[i].DistributedForkTransactionID == transactionID
+		if _, ok := containers[i].DistributedForkImports[transactionID]; ok {
+			matches = true
+		}
+		for _, branch := range containers[i].Branches {
+			if branch.DistributedForkTransactionID == transactionID {
+				matches = true
+				break
+			}
+		}
+		if !matches {
 			continue
 		}
 		if found != nil {
@@ -2218,10 +2302,35 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	if !info.DistributedForkHidden {
-		return info, nil
+	if info.DistributedForkTransactionID == transactionID {
+		if !info.DistributedForkHidden {
+			return info, nil
+		}
+		info.DistributedForkHidden = false
+	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
+		for _, branch := range info.Branches {
+			if branch.ID == pending.BranchID {
+				return ContainerInfo{}, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+			}
+		}
+		info.Branches = append(info.Branches, BranchInfo{
+			ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
+			State: pending.State, CreatedAt: pending.CreatedAt,
+			DistributedForkTransactionID: transactionID,
+			DistributedSparseRepository:  pending.SparseRepository,
+			DistributedSparseBranch:      pending.SparseBranch,
+		})
+		delete(info.DistributedForkImports, transactionID)
+		recomputeContainerState(&info)
+	} else {
+		// An idempotent retry after publication finds the branch marker.
+		for _, branch := range info.Branches {
+			if branch.DistributedForkTransactionID == transactionID {
+				return info, nil
+			}
+		}
+		return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q has no pending target", transactionID)
 	}
-	info.DistributedForkHidden = false
 	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
 		return ContainerInfo{}, err
 	}
@@ -2235,11 +2344,28 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 	if err != nil {
 		return err
 	}
-	info.State = state
-	for i := range info.Branches {
-		if info.Branches[i].ID == "main" {
-			info.Branches[i].State = state
+	if info.DistributedForkTransactionID == transactionID {
+		info.State = state
+		for i := range info.Branches {
+			if info.Branches[i].ID == "main" {
+				info.Branches[i].State = state
+			}
 		}
+	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
+		pending.State = state
+		info.DistributedForkImports[transactionID] = pending
+	} else {
+		found := false
+		for i := range info.Branches {
+			if info.Branches[i].DistributedForkTransactionID == transactionID {
+				info.Branches[i].State = state
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+		}
+		recomputeContainerState(&info)
 	}
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
@@ -2255,21 +2381,88 @@ func (s Store) UpdateDistributedForkSparseRoot(transactionID, repository, branch
 	if err != nil {
 		return err
 	}
-	info.DistributedSparseRepository = repository
-	info.DistributedSparseBranch = branch
+	if info.DistributedForkTransactionID == transactionID {
+		info.DistributedSparseRepository = repository
+		info.DistributedSparseBranch = branch
+	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
+		pending.SparseRepository = repository
+		pending.SparseBranch = branch
+		info.DistributedForkImports[transactionID] = pending
+	} else {
+		found := false
+		for i := range info.Branches {
+			if info.Branches[i].DistributedForkTransactionID == transactionID {
+				info.Branches[i].DistributedSparseRepository = repository
+				info.Branches[i].DistributedSparseBranch = branch
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+		}
+	}
 	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// DistributedForkTargetBranch resolves the branch associated with a target
+// transaction. peer is true when it was imported into an existing family.
+func (s Store) DistributedForkTargetBranch(transactionID string) (info ContainerInfo, branch BranchInfo, peer bool, err error) {
+	info, err = s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return ContainerInfo{}, BranchInfo{}, false, err
+	}
+	if info.DistributedForkTransactionID == transactionID {
+		for _, candidate := range info.Branches {
+			if candidate.ID == "main" {
+				candidate.DistributedForkTransactionID = transactionID
+				candidate.DistributedSparseRepository = info.DistributedSparseRepository
+				candidate.DistributedSparseBranch = info.DistributedSparseBranch
+				return info, candidate, false, nil
+			}
+		}
+		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no main branch")
+	}
+	if pending, ok := info.DistributedForkImports[transactionID]; ok {
+		return info, BranchInfo{
+			ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
+			State: pending.State, CreatedAt: pending.CreatedAt,
+			DistributedForkTransactionID: transactionID,
+			DistributedSparseRepository:  pending.SparseRepository,
+			DistributedSparseBranch:      pending.SparseBranch,
+		}, true, nil
+	}
+	for _, candidate := range info.Branches {
+		if candidate.DistributedForkTransactionID == transactionID {
+			return info, candidate, true, nil
+		}
+	}
+	return ContainerInfo{}, BranchInfo{}, false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 }
 
 // RemoveDistributedForkTarget removes a transaction target and its image
 // lease. Borrowed source-family repositories live outside the target directory
 // and are deliberately retained.
 func (s Store) RemoveDistributedForkTarget(transactionID string) error {
-	info, err := s.LoadDistributedForkTarget(transactionID)
+	info, branch, peer, err := s.DistributedForkTargetBranch(transactionID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if peer {
+		if err := s.RemoveBranchFilesystems(info.ID, branch); err != nil {
+			return err
+		}
+		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+			return err
+		}
+		if _, pending := info.DistributedForkImports[transactionID]; pending {
+			delete(info.DistributedForkImports, transactionID)
+			recomputeContainerState(&info)
+			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		}
+		return s.RemoveBranchRecord(info.ID, branch.ID)
 	}
 	if info.LeaseID != "" {
 		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {

@@ -11,7 +11,8 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__", "//runsc/ttcd:__pkg__"],
     deps = [
         "//pkg/abi/linux",
-		"//pkg/hostarch",
+        "//pkg/hostarch",
+		"//pkg/sentry/kernel",
 		"//pkg/sentry/pgalloc",
 		"//pkg/sentry/ttcchunk",
 		"//pkg/sentry/ttcremote",

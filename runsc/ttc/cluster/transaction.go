@@ -50,9 +50,21 @@ type ForkIdentity struct {
 	SourceBranch    string `json:"source_branch"`
 	TargetContainer string `json:"target_container"`
 	TargetBranch    string `json:"target_branch"`
-	ImageDigest     string `json:"image_digest"`
-	RootfsDigest    string `json:"rootfs_digest"`
-	RepositoryID    string `json:"repository_id"`
+	// TargetVisibleBranch is the user-facing branch name on the target. Empty
+	// is the legacy spelling of main. TargetBranch remains the transaction-
+	// unique filesystem/state identity embedded in captured metadata.
+	TargetVisibleBranch string `json:"target_visible_branch,omitempty"`
+	ImageDigest         string `json:"image_digest"`
+	RootfsDigest        string `json:"rootfs_digest"`
+	RepositoryID        string `json:"repository_id"`
+}
+
+// VisibleTargetBranch returns the external target-family branch identity.
+func (i ForkIdentity) VisibleTargetBranch() string {
+	if i.TargetVisibleBranch == "" {
+		return "main"
+	}
+	return i.TargetVisibleBranch
 }
 
 // TransferMetrics is the final token-free source-side accounting captured

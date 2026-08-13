@@ -371,10 +371,25 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 	if args == nil || args.ID == "" || load == nil {
 		return errors.New("durable peer restore is missing arguments")
 	}
+	return f.restorePeer(args.ID, args.ParentID, args.FilesystemBranch, args.Resume, args.ExecSessions, load)
+}
+
+// RestoreDistributedPeer imports a remotely captured branch into the existing
+// Sentry and application MemoryFile. BranchID is the user-visible identity;
+// filesystemBranch is the globally unique repository branch prepared by the
+// source transaction.
+func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+	if branchID == "" || filesystemBranch == "" || load == nil {
+		return errors.New("distributed peer restore is missing branch, filesystem, or loader")
+	}
+	return f.restorePeer(branchID, "", filesystemBranch, false, nil, load)
+}
+
+func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	f.mu.Lock()
-	if _, ok := f.branches[args.ID]; ok {
+	if _, ok := f.branches[id]; ok {
 		f.mu.Unlock()
-		return fmt.Errorf("branch %q already exists in the runtime", args.ID)
+		return fmt.Errorf("branch %q already exists in the runtime", id)
 	}
 	ids := make([]string, 0, len(f.branches))
 	for id, branch := range f.branches {
@@ -410,7 +425,7 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 		}()
 	}
 	var child *kernel.Kernel
-	if err := source.k.WithDehydrationFilesystemResources(source.k.SupervisorContext(), args.FilesystemBranch, func(resources vfs.LiveForkFilesystemResources) error {
+	if err := source.k.WithDehydrationFilesystemResources(source.k.SupervisorContext(), filesystemBranch, func(resources vfs.LiveForkFilesystemResources) error {
 		var err error
 		child, err = load(source.k, resources)
 		return err
@@ -422,7 +437,7 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 		return err
 	}
 	newSessions := make(map[string]*execSession)
-	for _, info := range args.ExecSessions {
+	for _, info := range sessions {
 		if info.State != ExecSessionRunning {
 			continue
 		}
@@ -447,7 +462,7 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 		child.Release()
 	}
 	state := BranchPaused
-	if args.Resume {
+	if resume {
 		child.Unpause()
 		if err := control.PostResume(child, nil); err != nil {
 			cleanupChild()
@@ -456,20 +471,20 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 		state = kernelBranchState(child)
 	}
 	f.mu.Lock()
-	if _, ok := f.branches[args.ID]; ok {
+	if _, ok := f.branches[id]; ok {
 		f.mu.Unlock()
 		cleanupChild()
-		return fmt.Errorf("branch %q appeared during dehydration restore", args.ID)
+		return fmt.Errorf("branch %q appeared during peer restore", id)
 	}
 	b := &sandboxBranch{
-		id: args.ID, parentID: args.ParentID, filesystemBranch: args.FilesystemBranch,
+		id: id, parentID: parentID, filesystemBranch: filesystemBranch,
 		k: child, watchdog: dog, state: state, createdAt: time.Now().UTC(), execSessions: newSessions,
 	}
-	f.branches[args.ID] = b
+	f.branches[id] = b
 	f.stateChanged.Broadcast()
 	f.mu.Unlock()
 	for id, session := range newSessions {
-		f.watchExecSession(args.ID, id, session)
+		f.watchExecSession(b.id, id, session)
 	}
 	return nil
 }

@@ -80,6 +80,62 @@ func TestInstallSparseChunksReusesResidentObject(t *testing.T) {
 	}
 }
 
+func TestInstallRemoteBindingsReusesPageVersionChunk(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	var allocator LogicalAllocatorID
+	allocator[0] = 3
+	bindings := make([]CapturedPageBinding, 2)
+	for i := range bindings {
+		page := LogicalPageID{Allocator: allocator, Sequence: uint64(40 + i)}
+		chunk, slot := page.Chunk()
+		bindings[i] = CapturedPageBinding{
+			OldOffset: uint64(i) * hostarch.PageSize, StreamOffset: uint64(i) * hostarch.PageSize,
+			References: 1, Page: page, Version: PageVersionID{Allocator: allocator, Sequence: uint64(80 + i)},
+			Chunk: chunk, Slot: slot,
+		}
+	}
+	first, relocation, loads, err := mf.InstallRemoteBindings(bindings, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loads) != 1 || loads[0].Target.Length() != 2*hostarch.PageSize {
+		t.Fatalf("first load ranges=%+v", loads)
+	}
+	firstOffset, ok := relocation.Page(checkpoint.ResourceID{}, 0)
+	if !ok {
+		t.Fatal("first relocation is missing")
+	}
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	second, secondRelocation, loads, err := mf.InstallRemoteBindings(bindings, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loads) != 0 {
+		t.Fatalf("reused version requested reads: %+v", loads)
+	}
+	if secondOffset, ok := secondRelocation.Page(checkpoint.ResourceID{}, 0); !ok || secondOffset != firstOffset {
+		t.Fatalf("reused relocation=(%#x,%t), want %#x", secondOffset, ok, firstOffset)
+	}
+	if err := second.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	changed := append([]CapturedPageBinding(nil), bindings...)
+	changed[0].Version.Sequence++
+	third, _, loads, err := mf.InstallRemoteBindings(changed, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loads) == 0 {
+		t.Fatal("changed page version reused stale resident chunk")
+	}
+	if err := third.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSparseRelocationSplitsDiscontiguousDestination(t *testing.T) {
 	resource := checkpoint.ResourceID{Path: "/tmpfs"}
 	relocation := NewSparseRelocation()

@@ -524,7 +524,7 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a
 // remote page reader. It consumes targetMF and reader on both success and
 // failure.
-func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata, allocatorMetadata []byte, loadRanges []pgalloc.RemoteLoadRange, reader stateio.AsyncReader, opts DistributedForkLoadOptions) (*Kernel, error) {
+func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata, allocatorMetadata []byte, loadRanges []pgalloc.RemoteLoadRange, bindings []pgalloc.CapturedPageBinding, reader stateio.AsyncReader, opts DistributedForkLoadOptions) (*Kernel, error) {
 	if p == nil || targetMF == nil || reader == nil || opts.Clocks == nil || opts.ChildBranchID == "" {
 		if reader != nil {
 			_ = reader.Close()
@@ -533,6 +533,9 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 			targetMF.Destroy()
 		}
 		return nil, fmt.Errorf("distributed fork load is missing required target state")
+	}
+	if len(bindings) != 0 {
+		return loadRelocatedDistributedFork(p, targetMF, kernelMetadata, loadRanges, bindings, reader, opts)
 	}
 	if err := pgalloc.ImportMemoryFileMetadataForRemote(ctx, targetMF, allocatorMetadata); err != nil {
 		_ = reader.Close()
@@ -635,6 +638,121 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	return child, nil
 }
 
+func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata []byte, packedLoadRanges []pgalloc.RemoteLoadRange, bindings []pgalloc.CapturedPageBinding, reader stateio.AsyncReader, opts DistributedForkLoadOptions) (*Kernel, error) {
+	installation, relocation, loadRanges, err := targetMF.InstallRemoteBindings(bindings, usage.Anonymous, 0)
+	if err != nil {
+		_ = reader.Close()
+		return nil, fmt.Errorf("installing live distributed memory chunks: %w", err)
+	}
+	installationCommitted := false
+	defer func() {
+		if !installationCommitted {
+			_ = installation.Abort()
+		}
+	}()
+	var pages *pgalloc.AsyncPagesFileLoad
+	if len(loadRanges) != 0 {
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{
+			DemandOnly: opts.DemandOnly, PrefetchBytes: opts.PrefetchBytes,
+			PrefetchBehindBytes: opts.PrefetchBehindBytes, LogicalChunkDemand: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := targetMF.AttachSparseChunkPageLoad(pages, loadRanges, nil, nil); err != nil {
+			pages.Cancel()
+			_ = pages.Wait()
+			return nil, err
+		}
+		pages.MemoryFilesDone()
+	} else if err := reader.Close(); err != nil {
+		return nil, err
+	}
+	pagesOwned := pages != nil
+	defer func() {
+		if pagesOwned {
+			pages.Cancel()
+			_ = pages.Wait()
+		}
+	}()
+	targetMF.IncOwner()
+	childOwner := true
+	defer func() {
+		if childOwner {
+			targetMF.Destroy()
+		}
+	}()
+	child := &Kernel{Platform: p}
+	child.SetMemoryFile(targetMF)
+	child.initRuntimeFields()
+	references := pgalloc.NewSparseReferenceTransaction()
+	loadValues := map[any]any{
+		pgalloc.CtxMemoryFile: targetMF, pgalloc.CtxMemoryFileMap: make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		pgalloc.CtxLiveForkClone: true, pgalloc.CtxSparseRelocation: relocation,
+		pgalloc.CtxSparseRestoreRefs: references, vfs.CtxLiveForkChildBranchID: opts.ChildBranchID,
+		devutil.CtxDevGoferClientProvider: child,
+	}
+	if opts.FilesystemResources != nil {
+		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
+	}
+	if opts.RestoreFilesystemResources != nil {
+		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
+	}
+	if opts.RestoreFilesystemFDMap != nil {
+		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
+	}
+	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
+	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
+		references.Abort()
+		return nil, fmt.Errorf("loading relocated distributed Kernel metadata: %w", err)
+	}
+	if err := references.Commit(); err != nil {
+		return nil, err
+	}
+	if err := installation.Commit(); err != nil {
+		return nil, err
+	}
+	installationCommitted = true
+	childOwner = false
+	if pages != nil {
+		child.remotePageLoad = pages
+		child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), packedLoadRanges...)
+		pagesOwned = false
+	}
+	if _, err := child.vdsoParams.access(); err != nil {
+		child.Release()
+		return nil, fmt.Errorf("materializing relocated distributed VDSO parameter page: %w", err)
+	}
+	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
+		child.Release()
+		return nil, err
+	}
+	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		if opts.ConfigureNetwork == nil {
+			child.Release()
+			return nil, errors.New("relocated distributed target network configurator was not provided")
+		}
+		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("configuring relocated distributed target network: %w", err)
+		}
+		rootNS.Stack().Restore()
+		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				child.Release()
+				return nil, fmt.Errorf("resetting relocated distributed child network: %w", err)
+			}
+		}
+	}
+	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
+		child.Release()
+		return nil, vfs.PrependErrMsg("VFS relocated distributed-fork restore failed", err)
+	}
+	child.Pause()
+	return child, nil
+}
+
 // HandoffDistributedForkMemory replaces a live remote page source with an
 // immutable shared-filesystem manifest without eagerly faulting remaining
 // pages. repository ownership transfers to the loader.
@@ -649,6 +767,14 @@ func (k *Kernel) HandoffDistributedForkMemory(repository *ttcchunk.MemoryReposit
 	if k.remotePageLoad == nil {
 		_ = repository.Close()
 		return fmt.Errorf("kernel has no active distributed remote-memory load")
+	}
+	if stats := k.remotePageLoad.Stats(); stats.Done {
+		_ = repository.Close()
+		if stats.Error != "" {
+			return fmt.Errorf("distributed memory load stopped before handoff: %s", stats.Error)
+		}
+		k.remoteHandoffManifest = manifest
+		return nil
 	}
 	geometry := k.remotePageLoad.ReaderGeometry()
 	if geometry.NeedsRegisterDestinationFD {

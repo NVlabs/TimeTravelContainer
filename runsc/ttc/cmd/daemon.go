@@ -41,6 +41,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
@@ -167,21 +168,32 @@ type daemonTargetRuntime struct {
 	store   *cluster.Store
 	done    <-chan struct{}
 	watch   sync.Map
+	locks   sync.Map
+}
+
+func (r *daemonTargetRuntime) lockTarget(name string) func() {
+	value, _ := r.locks.LoadOrStore(name, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction) error {
 	if r == nil || r.backend == nil || tx == nil {
 		return errors.New("distributed target runtime is unavailable")
 	}
+	defer r.lockTarget(tx.Identity.TargetContainer)()
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
-		TargetBranch: tx.Identity.TargetBranch, TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
+		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
+		TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
 	})
 	return err
 }
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
-	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
@@ -196,6 +208,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	restoreArgs := boot.DistributedForkRestoreArgs{
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
+		Peer: peer, VisibleBranchID: targetBranch.ID, FilesystemBranch: targetBranch.FilesystemBranch,
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
@@ -210,6 +223,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return fmt.Errorf("parsing distributed sparse manifest: %w", err)
 		}
 		restoreArgs.SparseManifest = manifest
+		restoreArgs.SparseBranch = session.SparseBranch
 		if err := r.backend.containerStore().UpdateDistributedForkSparseRoot(tx.Identity.TransactionID, session.SparseRepository, session.SparseBranch); err != nil {
 			return fmt.Errorf("recording distributed sparse memory root: %w", err)
 		}
@@ -231,6 +245,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
 			return fmt.Errorf("decoding target runtime state: %w", err)
 		}
+	} else if peer {
+		return fmt.Errorf("distributed peer target runtime is unavailable: %w", stateErr)
 	} else {
 		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", info.BundleDir, info.ID)
 		if err != nil {
@@ -241,7 +257,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		runtimeState.Status = "created"
 	}
-	if runtimeState.Status == "created" {
+	if peer && runtimeState.Status != "running" {
+		return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
+	}
+	if runtimeState.Status == "created" || peer {
 		encoded, err := json.Marshal(&restoreArgs)
 		if err != nil {
 			return err
@@ -325,6 +344,17 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		var sharedMetadata *os.File
 		var sharedSnapshot *os.File
 		var sparseRepository *os.File
+		var durableTargets []*os.File
+		durableActiveDir := ""
+		keepDurableTargets := false
+		defer func() {
+			for _, file := range durableTargets {
+				_ = file.Close()
+			}
+			if durableActiveDir != "" && !keepDurableTargets {
+				_ = os.RemoveAll(durableActiveDir)
+			}
+		}()
 		if restoreArgs.SharedMetadata {
 			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
 			sharedMetadata, err = os.Open(metadataPath)
@@ -380,6 +410,35 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			files = append(files, sparseRepository)
 			connectionsStartFD++
 		}
+		if peer && restoreArgs.DurableDehydration {
+			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
+			metadataFile, err := os.Open(metadataPath)
+			if err != nil {
+				return fmt.Errorf("opening durable peer metadata: %w", err)
+			}
+			durable, readErr := kernel.ReadDurableDehydrationMetadata(metadataFile)
+			metadataFile.Close()
+			if readErr != nil {
+				return fmt.Errorf("reading durable peer metadata: %w", readErr)
+			}
+			durableActiveDir = filepath.Join(r.backend.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(targetBranch.ID)))
+			if err := os.RemoveAll(durableActiveDir); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(durableActiveDir, 0700); err != nil {
+				return err
+			}
+			for i := 1; i < len(durable.Memories); i++ {
+				file, err := os.OpenFile(filepath.Join(durableActiveDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+				if err != nil {
+					return fmt.Errorf("creating durable distributed peer memory %d: %w", i, err)
+				}
+				pgalloc.IMAWorkAroundForMemFile(file.Fd())
+				durableTargets = append(durableTargets, file)
+			}
+			files = append(files, durableTargets...)
+			connectionsStartFD += len(durableTargets)
+		}
 		files = append(files, connectionFiles...)
 		commandArgs := []string{"timetravel", "--distributed-config-fd=3"}
 		if restoreArgs.SharedMetadata {
@@ -411,12 +470,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err != nil {
 			return err
 		}
-		status, err := r.backend.runConfiguredCommandWithArgs(configured, "start", info.ID)
-		if err != nil {
-			return fmt.Errorf("starting paused distributed target: %w", err)
-		}
-		if status != 0 {
-			return fmt.Errorf("starting paused distributed target exited with status %d", status)
+		keepDurableTargets = true
+		if !peer {
+			status, err := r.backend.runConfiguredCommandWithArgs(configured, "start", info.ID)
+			if err != nil {
+				return fmt.Errorf("starting paused distributed target: %w", err)
+			}
+			if status != 0 {
+				return fmt.Errorf("starting paused distributed target exited with status %d", status)
+			}
 		}
 	} else if runtimeState.Status != "running" {
 		return fmt.Errorf("distributed target runtime is unexpectedly %q", runtimeState.Status)
@@ -425,12 +487,13 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 }
 
 func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction, paused bool) error {
-	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
-	if !paused && info.State != "running" {
-		if _, err := r.backend.command("timetravel", info.ID, "resume", defaultBranchID); err != nil {
+	if !paused && branch.State != "running" {
+		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
 			return fmt.Errorf("resuming distributed target: %w", err)
 		}
 		if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "running"); err != nil {
@@ -441,7 +504,7 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	if err != nil {
 		return err
 	}
-	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: defaultBranchID}, true); err != nil {
+	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
 		return fmt.Errorf("starting distributed target console drain: %w", err)
 	}
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
@@ -449,16 +512,17 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 }
 
 func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) error {
-	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
-	_, err = r.backend.command("timetravel", info.ID, "distributed-drain", defaultBranchID)
+	_, err = r.backend.command("timetravel", info.ID, "distributed-drain", branch.ID)
 	return err
 }
 
 func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, sparse cluster.SparseHandoffDescriptor) error {
-	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
@@ -477,7 +541,7 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 	defer directory.Close()
 	_, err = r.backend.commandWithFiles([]*os.File{directory},
 		"timetravel", "--dehydration-memory-repository-fd=3", "--distributed-session="+manifest.String(),
-		info.ID, "distributed-handoff", defaultBranchID)
+		info.ID, "distributed-handoff", branch.ID)
 	if err != nil {
 		return fmt.Errorf("switching distributed target to sparse memory: %w", err)
 	}
@@ -485,10 +549,15 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 }
 
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
-	info, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID)
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, branch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err == nil {
-		_, _ = r.backend.command("delete", "--force", info.ID)
-		if releaseErr := r.backend.releaseDistributedSparseRoot(info); releaseErr != nil {
+		if peer {
+			_, _ = r.backend.command("timetravel", info.ID, "destroy", branch.ID)
+		} else {
+			_, _ = r.backend.command("delete", "--force", info.ID)
+		}
+		if releaseErr := r.backend.releaseDistributedSparseRootTransaction(tx.Identity.TransactionID); releaseErr != nil {
 			return releaseErr
 		}
 	}
@@ -499,21 +568,55 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 // loader has installed every chunk, or after the target runtime is gone. It is
 // idempotent so recovery may repeat it after any crash boundary.
 func (b *runtimeBackend) releaseDistributedSparseRoot(info ttcbundle.ContainerInfo) error {
-	if info.DistributedSparseRepository == "" && info.DistributedSparseBranch == "" {
+	var result error
+	if info.DistributedSparseRepository != "" || info.DistributedSparseBranch != "" {
+		result = errors.Join(result, b.releaseSparseRoot(info.DistributedSparseRepository, info.DistributedSparseBranch))
+		if result == nil && info.DistributedForkTransactionID != "" {
+			result = errors.Join(result, b.containerStore().UpdateDistributedForkSparseRoot(info.DistributedForkTransactionID, "", ""))
+		}
+	}
+	for _, branch := range info.Branches {
+		if branch.DistributedSparseRepository == "" && branch.DistributedSparseBranch == "" {
+			continue
+		}
+		if err := b.releaseSparseRoot(branch.DistributedSparseRepository, branch.DistributedSparseBranch); err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		if branch.DistributedForkTransactionID != "" {
+			result = errors.Join(result, b.containerStore().UpdateDistributedForkSparseRoot(branch.DistributedForkTransactionID, "", ""))
+		}
+	}
+	return result
+}
+
+func (b *runtimeBackend) releaseDistributedSparseRootTransaction(transactionID string) error {
+	_, branch, _, err := b.containerStore().DistributedForkTargetBranch(transactionID)
+	if err != nil {
+		return err
+	}
+	if branch.DistributedSparseRepository == "" && branch.DistributedSparseBranch == "" {
 		return nil
 	}
-	if info.DistributedSparseRepository == "" || info.DistributedSparseBranch == "" {
+	if err := b.releaseSparseRoot(branch.DistributedSparseRepository, branch.DistributedSparseBranch); err != nil {
+		return err
+	}
+	return b.containerStore().UpdateDistributedForkSparseRoot(transactionID, "", "")
+}
+
+func (b *runtimeBackend) releaseSparseRoot(repositoryPath, branch string) error {
+	if repositoryPath == "" || branch == "" {
 		return errors.New("distributed sparse memory root is incomplete")
 	}
-	clean := filepath.Clean(info.DistributedSparseRepository)
-	if filepath.IsAbs(clean) || clean == "." || clean != info.DistributedSparseRepository || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("invalid distributed sparse repository %q", info.DistributedSparseRepository)
+	clean := filepath.Clean(repositoryPath)
+	if filepath.IsAbs(clean) || clean == "." || clean != repositoryPath || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid distributed sparse repository %q", repositoryPath)
 	}
 	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, clean))
 	if err != nil {
 		return fmt.Errorf("opening distributed sparse repository: %w", err)
 	}
-	deletionErr := repository.DeleteBranch(info.DistributedSparseBranch)
+	deletionErr := repository.DeleteBranch(branch)
 	if errors.Is(deletionErr, os.ErrNotExist) {
 		deletionErr = nil
 	}
@@ -523,11 +626,6 @@ func (b *runtimeBackend) releaseDistributedSparseRoot(info ttcbundle.ContainerIn
 	closeErr := repository.Close()
 	if deletionErr != nil || closeErr != nil {
 		return errors.Join(deletionErr, closeErr)
-	}
-	if info.DistributedForkTransactionID != "" {
-		if err := b.containerStore().UpdateDistributedForkSparseRoot(info.DistributedForkTransactionID, "", ""); err != nil {
-			return fmt.Errorf("clearing distributed sparse memory root: %w", err)
-		}
 	}
 	return nil
 }
@@ -685,10 +783,11 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
 				continue
 			}
+			targetBranch := tx.Identity.VisibleTargetBranch()
 			if adaptive == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
 				adaptive = newAdaptivePrefetchController(tx.Negotiated.PagingPolicy)
 			}
-			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", defaultBranchID)
+			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", targetBranch)
 			if statusErr != nil {
 				failedPolls++
 				if failedPolls < 3 {
@@ -713,7 +812,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 						"timetravel",
 						"--distributed-prefetch-bytes", strconv.FormatUint(ahead, 10),
 						"--distributed-prefetch-behind-bytes", strconv.FormatUint(behind, 10),
-						containerID, "distributed-prefetch", defaultBranchID,
+						containerID, "distributed-prefetch", targetBranch,
 					)
 				}
 			}
@@ -731,11 +830,11 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			// The target MemoryFile now contains every page, so the immutable
 			// shared snapshot no longer owns storage for this branch.
 			_ = os.Remove(filepath.Join(r.backend.dataRoot, distributedSnapshotRelativePath(transactionID)))
-			if info, err := r.backend.containerStore().LoadDistributedForkTarget(transactionID); err == nil {
+			if _, err := r.backend.containerStore().LoadDistributedForkTarget(transactionID); err == nil {
 				// A cleanup failure is deliberately non-fatal: retaining a root is
 				// safe and startup recovery will retry it. Invalidating an already
 				// independent, running target would be incorrect.
-				_ = r.backend.releaseDistributedSparseRoot(info)
+				_ = r.backend.releaseDistributedSparseRootTransaction(transactionID)
 			}
 			return
 		}
@@ -1814,8 +1913,43 @@ func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{
 		if _, err := (ttcbundle.Store{Root: dataRoot}).GarbageCollectRepositories(); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
 		}
+		if err := collectSparseMemoryRepositories(dataRoot); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)
+		}
 		timer.Reset(repositoryMaintenanceInterval)
 	}
+}
+
+func collectSparseMemoryRepositories(dataRoot string) error {
+	paths := []string{filepath.Join(dataRoot, "cluster", "memory-chunks")}
+	containersRoot := filepath.Join(dataRoot, "containers")
+	entries, err := os.ReadDir(containersRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			paths = append(paths, filepath.Join(containersRoot, entry.Name(), "memory", "chunks"))
+		}
+	}
+	var result error
+	for _, path := range paths {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		repository, err := ttcchunk.OpenMemoryRepository(path)
+		if err == nil {
+			_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
+		}
+		if repository != nil {
+			err = errors.Join(err, repository.Close())
+		}
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 func checkDaemonPeer(conn net.Conn) error {
