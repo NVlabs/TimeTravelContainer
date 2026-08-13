@@ -1,675 +1,230 @@
 # TimeTravelContainer
 
-<img src="assets/ttc-logo.png" alt="TimeTravelContainer logo" width="180">
+<img src="assets/ttc-logo.png" alt="TimeTravelContainer logo" width="160">
 
-TimeTravelContainer (TTC) is a lightweight, rootless Linux container manager
-that can **fork an entire running container** into independent branches.
+TimeTravelContainer (TTC) is a rootless Linux container runtime with **live
+forking** support. A fork turns one running container into two or more
+independent branches with the same uninterrupted processes, filesystem, and
+supported OS resources, including internal network sockets. This lets an LLM
+agent associate its token context with an equally forkable sandbox context,
+enabling time-traveling retrospection and parallel subagent exploration.
 
-Each branch receives its own processes, memory view, writable filesystem,
-internal networking, and supported kernel resources. Memory and files remain
-shared through copy-on-write until either branch modifies them, so a fork does
-not copy all container RAM or create a checkpoint image.
+Powered by [gVisor](https://github.com/google/gvisor)'s userspace Linux kernel,
+TTC provides this flexibility without hardware virtualization. Unlike
+microVM-based platforms such as
+[CubeSandbox](https://github.com/TencentCloud/CubeSandbox),
+[forkd](https://github.com/deeplethe/forkd), and
+[AgentENV](https://github.com/kvcache-ai/AgentENV), TTC does **not** require
+KVM, Linux kernel patches, root privileges, or special kernel modules. It runs
+rootlessly on Linux 3.17+ and can itself run inside another sandbox, such as a
+Docker container, bubblewrap, or a virtual machine. This makes TTC a portable
+foundation for agent harnesses.
 
-TTC is forked from [Google's gVisor](https://github.com/google/gvisor) and
-builds on its userspace Linux runtime.
+![An agent forks one initialized TTC sandbox into parallel subagent branches, then combines their summaries](assets/ttc-agent-flow.svg)
 
-Compared with microVM-based solutions such as
-[forkd](https://github.com/deeplethe/forkd) and
-[AgentENV](https://github.com/kvcache-ai/AgentENV), TTC does not require
-hardware virtualization support such as KVM, root privileges, or special
-kernel modules. It supports Linux 3.17+ and can run nested inside Docker
-containers and other virtual machines. TTC is distributed as just two static
-Linux binaries, `ttc` and `ttcd`, with no Docker or containerd daemon,
-system-wide installation, or CRIU setup required.
+The same primitive supports speculative tool use, parallel coding attempts,
+reproducible agent evaluation and training rollouts with more stable credit
+assignment, integration testing, and debugging—without replaying expensive
+environment setup.
 
-```text
-demo@main
-├── demo@test-a
-│   └── demo@test-a-2
-└── demo@test-b
+TTC provides basic isolation and cross-node scaling, but is not intended to be
+a complete agent guardrail. During inference, it can run inside a guardrail
+such as [OpenShell](https://github.com/NVIDIA/OpenShell); during training, it
+can run beneath a large-scale environment orchestrator such as
+[NeMo Gym](https://github.com/NVIDIA-NeMo/gym).
+
+TTC is designed for efficiency. Memory and writable storage are
+**copy-on-write** (CoW) by default:
+
+- **Fork:** branches share 4 KiB memory pages and files until one writes to
+  them. Sharing is transparent and all branches continue independently.
+- **Pause/resume:** pause a branch to save CPU while keeping its memory
+  resident for a fast resume.
+- **Dehydrate/rehydrate:** dehydrate a branch to free its CPU and memory, then
+  rehydrate it later with its processes and CoW relationships intact.
+- **Remote fork/migration:** fork a branch to another TTC node and start it
+  without first transferring all of its memory. Missing memory is fetched on
+  demand over the network or from shared storage.
+
+## Get Started
+
+TTC is delivered as two static Linux binaries with no runtime dependencies.
+`ttc` is the CLI client and `ttcd` is the server daemon.
+
+\<Download instruction TBA, do not remove this yet\>
+
+```console
+$ ttc daemon start
+ttcd started
+$ ttc run -itd --network=ttc --nat -v /home:/home:ro \
+    --name myapp ubuntu:26.04
+$ ttc ps -a
+CONTAINER  BRANCH  IMAGE         STATE    CREATED    PARENT
+myapp      main    ubuntu:26.04  running  1 day ago  -
 ```
 
-Install the latest static release:
+`ttc` uses familiar Docker-style commands and pulls standard OCI images
+directly from Docker Hub and other registries. TTC adds branch-aware commands
+such as `fork`, `pause`, `resume`, `dehydrate`, and `rehydrate`.
+
+## Usage
+
+Type `ttc --help` or `ttc <subcommand> --help` for complete command usage.
+Existing branches are always addressed as `CONTAINER@BRANCH`; `main` is an
+ordinary branch and can be forked or removed like any other.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gzz2000/TimeTravelOS/master/install.sh | sh
+# Start a prepared environment and fork two possible futures.
+ttc run -dit --name agent ubuntu:26.04 bash
+ttc exec agent@main sh -lc 'apt-get update && apt-get install -y git'
+ttc fork agent@main approach-a
+ttc fork agent@main approach-b
+
+# Work in each branch and inspect the branch tree.
+ttc exec -it agent@approach-a bash
+ttc exec -it agent@approach-b bash
+ttc ls --tree
+
+# Suspend cheaply, or release memory for longer idle periods.
+ttc pause agent@approach-a
+ttc resume agent@approach-a
+ttc dehydrate agent@approach-b
+ttc rehydrate agent@approach-b
+
+# Remove one branch without affecting its peers.
+ttc rm -f agent@approach-a
 ```
 
-## Why TimeTravelContainer?
+Common workflows include:
 
-Containers are usually treated as disposable machines: when a workload needs
-another possible future, it starts another container and repeats everything
-that led to the present. TTC makes the present itself forkable.
+| Task | Command |
+| --- | --- |
+| Pull and list images | `ttc pull IMAGE`, `ttc images` |
+| Run and inspect | `ttc run`, `ttc ps`, `ttc inspect`, `ttc top` |
+| Interact | `ttc exec`, `ttc attach`, `ttc logs`, `ttc cp` |
+| Manage branches | `ttc fork`, `ttc pause`, `ttc resume`, `ttc rm` |
+| Persist live state | `ttc dehydrate`, `ttc rehydrate`, `ttc checkpoint`, `ttc restore` |
+| Manage networking | `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
+| Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 
-1. Start an unmodified Docker or OCI image.
-2. Initialize its applications, tools, services, and data once.
-3. Fork the whole running environment at the decision point.
-4. Explore a different action, test, or mutation in each branch.
-5. Keep the useful outcomes and discard the rest.
+The [end-user guide](g3doc/user_guide/timetravelcontainer.md) covers daemon
+operation, networking, volumes, host mounts, checkpoints, remote forks, shell
+completion, and recovery in detail.
 
-This model is particularly useful for agentic AI. A coding agent may spend
-minutes cloning a repository, installing dependencies, indexing source,
-starting databases, and building a project before it can attempt a change.
-With TTC, that warmed environment can become the root of a branch tree:
+## SDKs and agent integration
 
-- **Parallel exploration:** give coding agents, planners, or tree-search nodes
-  the same live starting state, then explore different implementations or
-  action sequences in independent branches.
-- **Speculation and rollback:** preserve warm milestones and fork before risky
-  tool calls, upgrades, or migrations; keep promising outcomes and discard the
-  rest without replaying the task from the beginning.
-- **Evaluation and training:** run candidate agents or policies from an
-  identical prepared state. Branching training rollouts from a shared prefix
-  reduces environment variance, enables direct counterfactual comparison, and
-  can support more stable credit assignment.
+The `ttcx` SDKs talk directly to a running `ttcd`; applications do not need to
+spawn or parse the `ttc` CLI. Each SDK returns structured stdout, stderr, and
+exit status and provides helpers for run, exec, fork, pause, resume, stop, and
+remove.
 
-The same primitive accelerates integration testing, state-space exploration,
-fault injection, fuzzing, interactive debugging, and any workflow that needs
-many independent variations of one live starting state.
+- [Python](sdk/python/README.md)
+- [TypeScript](sdk/typescript/README.md)
+- [Rust](sdk/rust/README.md)
+- [MCP server](sdk/mcp/README.md) for coding agents and MCP clients
+- [Local daemon protocol](sdk/PROTOCOL.md) for additional language bindings
 
-At the instant of a fork, guest-visible details such as process IDs, threads,
-open-file offsets, clocks, signals, and internal connections are preserved in
-both branches. Fork cost is driven mainly by the number of processes, mappings,
-and kernel objects rather than the amount of resident application memory.
+For example, Python agents can branch a sandbox directly:
 
-## Features
+```python
+from ttcx import Client
 
-### Live container branching
-
-- Pause and resume a running branch.
-- Dehydrate a branch to durable storage, release its guest runtime state, and
-  rehydrate it later in the same family.
-- Fork a branch into a running or initially paused peer.
-- Fork any branch again; the CLI can display creation provenance as a tree,
-  but those edges impose no ownership or lifecycle hierarchy.
-- Delete any branch, including `main`, without deleting its peers.
-- Save one live or paused branch to a checkpoint file and restore it later as
-  an independent container.
-- Preserve process trees, threads, memory, credentials, timers, signals,
-  internal pipes, internal sockets, and supported IPC resources.
-- Share memory page-by-page until one branch writes.
-- Fork one or more live siblings onto another configured TTC cluster node;
-  target memory is populated on demand from a durable shared snapshot instead
-  of transferring the container's complete RAM over the network.
-- Share disk-backed files through filesystem copy-on-write.
-- Show ancestry and branch state with `ttc ls --tree`.
-- Validate a fork while the source is paused. If a resource cannot be copied
-  safely, TTC resumes the source and reports the reason without creating a
-  partial child.
-
-### Familiar container workflow
-
-The `ttc` command provides a Docker-like interface:
-
-- Images: `pull`, `images`, `image inspect`, and `rmi`
-- Lifecycle: `run`, `create`, `start`, `stop`, `restart`, `wait`, `kill`,
-  and `rm`
-- Interaction: `exec`, `attach`, `logs`, and `cp`
-- Inspection: `inspect`, `ps`, `top`, and `events`
-- Branching: `fork`, `pause`, `resume`, `dehydrate`, `rehydrate`, `checkpoint`,
-  `restore`, branch-targeted `rm`, and `ls --tree`
-- Storage: `volume create`, `volume ls`, `volume inspect`, and `volume rm`
-- Shell completion for Bash, Zsh, and Fish
-
-Common Docker-style run options are supported, including environment
-variables, labels, entrypoints, working directories, users, capabilities,
-ulimits, read-only roots, tmpfs, volumes, host binds, DNS settings, network
-mode, published ports, and CPU or memory limits.
-
-TTC is self-contained: it pulls images directly from OCI and Docker registries
-and does not require a Docker or containerd daemon.
-
-### Rootless images and containers
-
-- Pull and fully prepare images using familiar names such as `alpine:3.20`.
-- Select image tags and digests; multi-architecture manifests automatically
-  resolve to the daemon host's native architecture.
-- Use Docker configuration files and credential helpers for authenticated
-  registries.
-- See human-readable download, reuse, and extraction progress.
-- Run images containing arbitrary users without subordinate UID/GID ranges or
-  `newuidmap`/`newgidmap`.
-- Use image workflows that rely on `sudo`, `su`, or SUID/SGID programs; their
-  credentials exist only inside TTC's virtual Linux environment and do not
-  grant host root.
-
-### Persistent copy-on-write storage
-
-Every writable container family has a persistent disk-backed layer over its
-immutable image. A fork gives the child its own view of that layer without
-eagerly copying every file. On the first write to a shared file, TTC creates a
-reflink and lets the host filesystem copy only the modified extents.
-
-TTC also supports:
-
-- Managed persistent volumes
-- Container-local tmpfs mounts
-- `/proc`, restricted read-only `/sys`, `/dev`, `/dev/shm`, and private
-  terminal mounts
-- Read-only views of host files and directories
-- Persistent, branch-local writable views over host paths
-- Detached copies of host files and directories
-- File copying to or from running, paused, and fully stopped containers
-
-```sh
-ttc volume create cache
-ttc run -d --name app -v cache:/var/cache/app \
-  alpine:3.20 sleep 600
-ttc volume inspect cache
+ttc = Client()
+ttc.fork("agent@main", "candidate").check()
+result = ttc.exec("agent@candidate", ["sh", "-lc", "make test"])
+result.check()
+print(result.stdout_text())
 ```
 
-Host paths use familiar Docker-style syntax with TTC isolation semantics:
+## Features and Requirements
 
-```sh
-# A live, read-only view of the host path.
-ttc run --rm -v /host/input:/input:ro alpine:3.20 cat /input/file
+TTC includes:
 
-# A persistent private writable view. Guest writes never modify /host/work.
-ttc run -d --name work -v /host/work:/work alpine:3.20 sleep 600
+- Direct OCI image pulls and Docker-style image, container, volume, log, exec,
+  attach, copy, port-forwarding, and lifecycle commands.
+- Full-branch pause, resume, fork, dehydration, rehydration, checkpoint, and
+  restore.
+- Copy-on-write process memory, tmpfs, internal IPC and sockets, and persistent
+  writable filesystems.
+- Rootless userspace networking with isolated virtual NICs, outbound NAT,
+  published TCP ports, and configurable IP and MAC addresses.
+- Read-only host mounts, branch-private writable views of host paths, tmpfs,
+  and managed persistent volumes.
+- Optional multi-node live fork using authenticated TTC peers, a shared TTC
+  data root, common image content, and a page-transfer network.
 
-# Copy once, then run without any dependency on /host/template.
-ttc run -d --name imported -v /host/template:/work:copy \
-  alpine:3.20 sleep 600
-```
+Unlike [CRIU](https://github.com/checkpoint-restore/criu) or a
+[Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, a
+TTC live fork does not save the container's memory to a checkpoint first.
+Durable storage is used only for explicitly requested operations such as
+dehydration and checkpointing, or when a remote branch must no longer depend
+on a source node. When one branch is dehydrated, TTC initially writes only the
+memory that must become durable for that branch; CoW-shared pages can remain
+resident and are saved lazily if an active peer later writes them.
 
-For an ordinary writable bind, the host path remains a live read-only lower
-layer: host changes to files that the container has not copied up may become
-visible. Use `:copy` when the container must see a fixed, fully private initial
-copy. In both writable forms, stop/start preserves changes and live fork gives
-each branch an independent copy-on-write view.
+Host requirements are deliberately small:
 
-### Rootless virtual networking
+- Linux 3.17 or newer on x86-64 or ARM64. Linux 4.14.77+ is recommended for
+  full network performance.
+- An unprivileged user namespace for normal rootless isolation. No subordinate
+  UID/GID ranges or `newuidmap` helpers are required. Trusted environments that
+  prohibit user namespaces can explicitly use `--unsafe-no-host-isolation`.
+- A data root on a filesystem with reflink support for efficient persistent
+  file CoW. `--allow-slow-volume-copy` enables a compatible whole-file-copy
+  fallback.
+- A delegated cgroup v2 subtree only when hard host CPU or memory limits are
+  requested.
 
-`--network ttc` gives the container a virtual Ethernet interface managed
-entirely in userspace. It does not require a TAP device, host bridge, CNI,
-iptables, or `CAP_NET_ADMIN`.
+KVM is optional, not required. Docker, containerd, CRIU, and a privileged
+system-wide installation are not runtime dependencies.
 
-- `--nat` enables outbound IPv4 TCP and UDP access.
-- `-p` and `--publish` expose container TCP ports on the host.
-- `--ip` and `--mac-address` customize the virtual interface.
-- `ttc port publish`, `port ls`, and `port unpublish` update forwarding for an
-  existing branch without restarting it.
-- Internal loopback and virtual-network connections are copied during a fork.
-- The source keeps its external connections. The child starts with those
-  external connections disconnected and receives no published host ports until
-  ports are assigned to it.
+## Current Limitations
 
-The default network mode is an isolated, loopback-only network.
-`--network host` is available for ordinary container execution but cannot be
-live-forked.
+See [Current Limitations](g3doc/user_guide/ttc_limitations.md).
 
-### Interactive use and recovery
+## Development
 
-- Foreground, detached, stdin-attached, and `-it` containers
-- Interactive and detached `exec` sessions
-- Detach and later reattach with terminal resize and job-control support
-- Client `TERM` propagation
-- Persistent timestamped logs
-- A per-user `ttcd` service that owns containers, ports, logs, and events
-- Crash reconciliation and idempotent management requests
-- A `--direct` recovery mode for bypassing the daemon when necessary
+### Build Locally
 
-## Security and intended use
-
-TTC is currently intended for trusted development, integration testing,
-state-space exploration, and similar workloads. It has not yet undergone the
-security review required to serve as a production boundary for hostile or
-multi-tenant workloads.
-
-Normal rootless mode retains gVisor's userspace-kernel boundary and host
-isolation layers. TTC changes must not create new host escapes or unintended
-privilege-escalation paths, and security-relevant relaxations must remain
-explicit and fail closed.
-
-Branches in the same container family share one runtime process. They are
-independent experiment states, but they are not security or failure boundaries
-from one another.
-
-`--unsafe-no-host-isolation` is an explicit compatibility mode for trusted
-workloads on machines that prohibit unprivileged user namespaces. It removes
-important host defense-in-depth and should never be used for an untrusted
-image.
-
-See the
-[security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
-for the detailed threat model and current audit results.
-
-## Requirements
-
-TTC currently targets Linux on x86-64 and ARM64.
-
-### User namespaces
-
-Normal rootless mode requires an unprivileged user namespace:
-
-```sh
-unshare -Ur /bin/true
-```
-
-No subordinate IDs or `uidmap` helpers are required. `ttc daemon start`
-performs its own preflight and reports a diagnostic if the host kernel or an
-LSM policy prevents rootless operation.
-
-If user namespaces cannot be enabled and every workload is trusted:
-
-```sh
-ttc daemon start --unsafe-no-host-isolation
-```
-
-The daemon uses one isolation mode for its entire lifetime. Stop it before
-changing modes.
-
-### Runtime platform
-
-TTC uses gVisor's `systrap` execution platform by default. It requires no
-hardware virtualization support and is the portable choice for nested and
-legacy environments:
-
-```sh
-ttc daemon start
-```
-
-On a host with usable KVM, select gVisor's KVM platform for every container
-owned by that daemon:
-
-```sh
-test -r /dev/kvm && test -w /dev/kvm
-ttc daemon start --platform=kvm
-```
-
-The daemon validates `/dev/kvm` during startup and reports the selected
-`runtime_platform` in `ttc daemon status`. The setting belongs to the daemon;
-`run` and `create` do not select an execution platform or emulate a different
-CPU architecture. Stop the daemon before changing platforms.
-
-### Reflink storage
-
-By default, the TTC data root must reside on a filesystem with working
-`FICLONE` support, such as a suitably configured XFS or Btrfs filesystem.
-Daemon status reports the selected storage mode:
-
-```sh
-ttc daemon status
-```
-
-For functional testing on a filesystem without reflinks, explicitly allow
-whole-file copying:
-
-```sh
-ttc daemon start --allow-slow-volume-copy
-```
-
-This fallback preserves behavior but can make the first write to a shared
-large file substantially slower.
-
-### Resource limits
-
-Hard CPU and memory limits require a writable delegated cgroup v2 subtree.
-TTC reports an error rather than silently ignoring an unavailable hard limit.
-Container process-count limits do not require host cgroup delegation.
-
-## Build and install
-
-### Docker-based build
-
-Docker is needed only for this build method. It is not needed to run TTC.
-
-From the repository root:
+The standard build uses Docker only as a reproducible build environment:
 
 ```sh
 mkdir -p bin
-make copy TARGETS="runsc/ttc runsc/ttcd" \
-  DESTINATION="$PWD/bin"
+make copy TARGETS="runsc/ttc runsc/ttcd" DESTINATION="$PWD/bin"
 ```
 
-This produces:
-
-```text
-bin/ttc
-bin/ttcd
-```
-
-Keep the two binaries together. `ttcd` contains both the TTC control service
-and the userspace container runtime. You can run them directly from `bin`, add
-that directory to `PATH`, or install both in a per-user directory:
-
-```sh
-mkdir -p "$HOME/.local/bin"
-install -m 0755 bin/ttc bin/ttcd "$HOME/.local/bin/"
-```
-
-### Direct Bazel build
-
-Install the native dependencies listed in
-[`images/default/Dockerfile`](images/default/Dockerfile), use the Bazel version
-from [`.bazelversion`](.bazelversion), and run:
+The resulting `bin/ttc` and `bin/ttcd` files can be run in place or copied to
+any directory in `PATH`. A native Bazel build is also available:
 
 ```sh
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
 ```
 
-The binaries are written beneath `bazel-bin/runsc/`.
+See the [end-user guide](g3doc/user_guide/timetravelcontainer.md#compile) for
+native build prerequisites and installation options.
 
-No privileged system-wide installation is required. See the [complete user
-guide](g3doc/user_guide/timetravelcontainer.md) for native build dependencies
-and installation layouts.
+### Testing
 
-## Quick start
-
-The following examples assume `ttc` and `ttcd` are available in `PATH`.
-Prefix commands with `./bin/` if you are running directly from a build.
-
-Start the per-user daemon:
-
-```sh
-ttc daemon start
-ttc daemon status
-```
-
-To use the optional KVM runtime on a host that exposes `/dev/kvm`, start it as
-`ttc daemon start --platform=kvm` instead.
-
-Pull and run an image:
-
-```sh
-ttc pull alpine:3.20
-ttc run --rm alpine:3.20 uname -a
-```
-
-Create an interactive background container:
-
-```sh
-ttc run -dit --name demo alpine:3.20 sh
-ttc exec -it demo@main sh
-```
-
-Fork the running container:
-
-```sh
-ttc fork demo@main test-a
-ttc fork --paused demo@main test-b
-ttc ls --tree
-ttc resume demo@test-b
-```
-
-A selector for an existing branch always has the full form
-`CONTAINER@BRANCH`; TTC does not implicitly select `main`. A local `ttc fork`
-destination is only the new branch name because it necessarily remains in the
-source family. Container-family operations such as `ttc inspect` and `ttc rm`
-continue to take a container name because they do not select a branch.
-
-Run different work in each branch:
-
-```sh
-ttc exec demo@test-a sh -c 'echo child-a >/tmp/result'
-ttc exec demo@test-b sh -c 'echo child-b >/tmp/result'
-
-ttc exec demo@test-a cat /tmp/result
-ttc exec demo@test-b cat /tmp/result
-```
-
-The two branches now have different memory, process, and filesystem states
-while retaining the same initial container history.
-
-Save a branch to a durable checkpoint and restore it as a new, unrelated
-container:
-
-```sh
-ttc checkpoint demo@test-a demo-test-a.ttc
-ttc restore --name recovered demo-test-a.ttc
-```
-
-Pause and resume a branch:
-
-```sh
-ttc pause demo@test-a
-ttc resume demo@test-a
-```
-
-Move a branch's private runtime state to durable storage, then bring it back
-without removing its recorded creation provenance:
-
-```sh
-ttc dehydrate demo@test-a
-ttc rehydrate demo@test-a
-```
-
-Copy files between the host and a running, paused, or fully stopped branch:
-
-```sh
-ttc cp ./test-input demo@test-a:/tmp/input
-ttc cp demo@test-a:/tmp/result ./result-a
-```
-
-Attach to a branch's init console and detach with Ctrl-P, Ctrl-Q:
-
-```sh
-ttc attach -i demo@test-b
-```
-
-Stop and remove the family:
-
-```sh
-ttc stop demo@main
-ttc rm --force demo
-```
-
-Daemon shutdown never guesses what to do with active branches. Stop them, or
-choose an explicit shutdown policy:
-
-```sh
-ttc daemon stop
-ttc daemon stop --dehydrate-all
-ttc daemon stop --stop-all
-```
-
-## SDKs and agent integration
-
-Applications can connect directly to `ttcd` without invoking the `ttc` CLI.
-The `ttcx` bindings expose TTC commands as structured results with separate
-stdout, stderr, and exit status:
-
-- [Python SDK](sdk/python/README.md)
-- [TypeScript SDK](sdk/typescript/README.md)
-- [Rust SDK](sdk/rust/README.md)
-- [MCP server for coding agents and MCP clients](sdk/mcp/README.md)
-
-All bindings include lifecycle conveniences such as run, exec, fork, pause,
-resume, stop, and remove, plus a raw command method covering the complete
-non-interactive TTC interface. See the [local API protocol](sdk/PROTOCOL.md)
-when implementing another language binding.
-
-## Networking example
-
-Start nginx with outbound access, a chosen virtual address, and a published
-host port:
-
-```sh
-ttc run -d --name web \
-  --network ttc --nat \
-  --ip 10.23.4.15 \
-  --mac-address 02:aa:bb:cc:dd:ee \
-  -p 127.0.0.1:8080:80 \
-  nginx:1.27-alpine
-
-curl http://127.0.0.1:8080/
-```
-
-Publish a different host port for a fork:
-
-```sh
-ttc fork web@main test
-ttc port publish web@test 127.0.0.1:8081:80
-ttc port ls web@test
-```
-
-## How live fork works
-
-TTC groups a container and all of its branches into a container family.
-When `ttc fork` is requested, TTC:
-
-1. Pauses the selected source branch.
-2. Checks whether its current resources can be copied safely.
-3. Creates a child view of its process, memory, filesystem, and internal
-   network state.
-4. Configures copy-on-write sharing.
-5. Resumes the source and, unless requested otherwise, the child.
-
-Application memory is shared at page granularity. Writable disk files are
-shared through reflinks and become physically distinct as filesystem blocks
-are modified. The operation does not use a virtual machine or write a
-checkpoint containing all container memory.
-
-For implementation details, see the
-[live-fork design](g3doc/proposals/timetravel_live_fork.md).
-
-Dehydration is family-preserving hibernation. TTC writes a branch's guest
-kernel, tasks, memory, internal resources, and filesystem identity to its data
-root. A dehydrated branch needs no guest process. When every active branch in a
-family is dehydrated, TTC also removes that family's Sentry and filesystem
-transport processes; `ttcd` can then stop without losing the family.
-
-Rehydration creates runtime processes on demand and reads memory lazily from
-immutable, content-addressed chunk files. Each file contains up to 1 MiB (256
-base pages); a fault loads all valid pages in that chunk atomically, while
-writes and copy-on-write sharing remain page-granular, normally 4 KiB. The
-memory repository needs only ordinary filesystem operations—it does not depend
-on reflinks or hole punching. Rehydrating one branch does not wake any
-other branch, and another dehydrated branch can later join the running family
-as an equal peer. The parent labels shown by `ttc ls --tree`
-record only which branch was forked to create another branch; they do not
-control memory ownership, deletion order, or rehydration. This also composes
-with distributed fork: TTC first makes any remotely sourced pages durable in
-the shared data root, so neither dehydration nor rehydration depends on a
-source-node process.
-
-Distributed forks use the cluster's shared TTC data root as a durable handoff.
-By default, a live fork can publish the target immediately and temporarily
-serve missing memory over the authenticated page channel while immutable 1 MiB
-chunks are placed in shared storage. The target switches to those chunks
-without changing guest-visible memory, after which the source process and node
-are no longer needed. Forking an already-dehydrated branch skips the live
-channel and shares its immutable manifest directly. Content addressing
-deduplicates identical chunks across branches, and garbage collection removes
-an object only after no branch root, active lease, or publication transaction
-can still reach it.
-
-The first destination on a node names both its target family and branch;
-subsequent destinations can add branches to that same node-local family:
-
-```sh
-ttc fork --target node-b app@main remote@main
-ttc fork --target node-b app@main remote@candidate
-```
-
-Those target branches share one local runtime process and reuse matching
-resident memory chunks while retaining independent process and filesystem
-state.
-
-Durable checkpointing is a separate, explicitly requested operation. It
-captures one selected branch's process, memory, filesystem, and supported
-runtime state in a file. The immutable OCI image is identified by its exact
-digest instead of being copied into the checkpoint. Restoring creates a new
-container family with no ancestry or mutable storage shared with the source.
-
-## Current limitations
-
-- TTC is not yet a production security boundary for hostile workloads.
-- On Linux 3.17 through 4.14.76, `ttcd` automatically disables host GSO.
-  Network performance, especially for large payloads, will be reduced.
-- Active branches in one family share a Sentry process, so a runtime failure
-  can affect those active peers. Fully dehydrated families are process-free.
-- Dehydration images belong to TTC's managed data root and are not portable
-  standalone archives. Use a checkpoint when a single exportable file is
-  required.
-- Fork duration depends on the number of processes, mappings, and resources.
-  It is not universally constant time.
-- Some resources connected directly to the host or another container cannot be
-  duplicated safely. TTC may reject the fork and report the resource that
-  blocked it.
-- The source keeps established external network connections during a fork.
-  The child starts with external connections disconnected and without
-  published host ports.
-- Virtual networking and published ports currently support IPv4; published
-  ports currently support TCP.
-- Stopping a branch retains its filesystem, configuration, logs, and identity
-  but discards its former live process and memory state. It can be started
-  fresh with `ttc start CONTAINER@BRANCH`.
-- Read-only host binds remain shared live views during a fork. Ordinary
-  writable host mounts also retain a live read-only host lower, while each
-  branch has an independent persistent upper. A `:copy` mount is fully detached
-  from its source after creation. Durable checkpoints capture host-backed
-  content into the checkpoint.
-- A managed volume cannot be attached writable to unrelated container families
-  at the same time.
-- TTC does not yet implement the Docker Engine API, Compose, Swarm, general
-  device or accelerator passthrough, or Docker named networks.
-- Containers run the image variant matching the daemon host's OS and CPU
-  architecture; TTC does not provide cross-architecture CPU emulation. Image
-  signature, attestation, and content-trust policy are not yet implemented.
-- Cross-node live fork currently requires mutually authenticated `ttcd` peers,
-  a common TTC repository and image content, and a reachable page-transfer
-  network. A durable checkpoint remains the portable option for unrelated TTC
-  installations or offline transfer.
-- Checkpoint restore requires the exact recorded image digest to be available
-  in the destination TTC image store and currently requires a compatible TTC
-  build.
-- Creating a durable checkpoint requires the selected branch to be eligible
-  for live fork, because TTC first makes a short-lived private branch before
-  writing the archive.
-- `--unsafe-no-host-isolation` is suitable only for trusted workloads.
-
-The authoritative compatibility check is the `ttc fork` operation itself. It
-pauses and validates the source atomically, then either creates the child or
-resumes the unchanged source and returns a nonzero status.
-
-The complete resource matrix and performance measurements are available in
-the [audit](g3doc/proposals/timetravel_ttc_audit.md).
-
-## Documentation
-
-- [End-user guide](g3doc/user_guide/timetravelcontainer.md)
-- [Branch state machine](g3doc/ttc_state_machine.md)
-- [Performance and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
-- [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
-- [Distributed live-fork development and test plan](g3doc/proposals/ttc_distributed_live_fork.md)
-- [Disk-backed storage design](g3doc/proposals/ttc_disk_backed_volumes.md)
-- [Product and CLI roadmap](g3doc/proposals/timetravel_ttc_cli.md)
-- [End-to-end test guide](runsc/ttc/test/README.md)
-- [Upstream gVisor documentation](https://gvisor.dev/docs/)
-
-## Development and testing
-
-Run the focused TTC tests through the Docker build wrapper:
+Run the focused TTC unit and integration tests with:
 
 ```sh
 make test TARGETS="//runsc/ttc/cmd:cmd_test //runsc/boot:boot_test \
-  //pkg/sentry/mm:mm_test //pkg/sentry/fsimpl/tmpfs:tmpfs_test \
-  //pkg/ttcvolume:ttcvolume_test"
+  //pkg/sentry/mm:mm_test //pkg/ttcvolume:ttcvolume_test"
 ```
 
-The public-image end-to-end matrix covers BusyBox, Alpine, Python, nginx,
-Redis, image lifecycle, exec, logs, filesystems, volumes, pause/resume,
-recursive fork, daemon recovery, and rootless networking. See the
-[TTC test guide](runsc/ttc/test/README.md) for commands and additional suites.
+The [end-to-end test guide](runsc/ttc/test/README.md) covers public images,
+networking, interactive sessions, filesystems, live fork, dehydration,
+recovery, and nested execution.
+
+### Development Docs
+
+- [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
+- [Branch state machine](g3doc/ttc_state_machine.md)
+- [Distributed live-fork plan](g3doc/proposals/ttc_distributed_live_fork.md)
+- [Disk-backed storage design](g3doc/proposals/ttc_disk_backed_volumes.md)
+- [Security, performance, and compatibility audit](g3doc/proposals/timetravel_ttc_audit.md)
+- [Upstream gVisor documentation](https://gvisor.dev/docs/)
 
 ## License
 
-This repository is licensed under the [Apache License 2.0](LICENSE).
-
-## Relationship to gVisor
-
-TimeTravelContainer would not exist without gVisor. TTC retains gVisor's
-userspace Linux kernel, OCI runtime, filesystem and networking implementations,
-build system, tests, documentation, and copyright notices, and extends them
-with live container branching and the TTC container-management interface.
-
-Changes specific to TTC should be developed and reported against the
-[TimeTravelContainer repository](https://github.com/gzz2000/TimeTravelContainer).
-General gVisor usage, architecture, security reporting, and upstream
-contribution information is available from the
-[gVisor project](https://github.com/google/gvisor) and
-[gvisor.dev](https://gvisor.dev/).
-
-Google and the gVisor project are not responsible for or affiliated with the
-TimeTravelContainer-specific modifications.
+TimeTravelContainer is licensed under the [Apache License 2.0](LICENSE).
