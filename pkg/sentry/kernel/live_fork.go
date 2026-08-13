@@ -413,9 +413,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			mm.CtxLiveForkPMASnapshots:           pmaSnapshots,
 		})
 		metadataStarted := time.Now()
-		k.filteringLiveForkDanglingEndpoints = true
+		k.filteringBranchDanglingEndpoints = true
 		defer func() {
-			k.filteringLiveForkDanglingEndpoints = false
+			k.filteringBranchDanglingEndpoints = false
 		}()
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
@@ -668,9 +668,9 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 		defer clearSnapshots()
 		k.mf.MarkSavable()
 
-		k.filteringLiveForkDanglingEndpoints = true
+		k.filteringBranchDanglingEndpoints = true
 		defer func() {
-			k.filteringLiveForkDanglingEndpoints = false
+			k.filteringBranchDanglingEndpoints = false
 		}()
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
 		if _, err := state.Save(saveCtx, buffered, k); err != nil {

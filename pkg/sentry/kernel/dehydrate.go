@@ -440,6 +440,14 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		}
 		var metadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
+		// tcpip's dangling endpoint registry is process-global. In a
+		// multi-branch Sentry, serialize only endpoints owned by this Kernel's
+		// network stack. Otherwise a closed socket from a peer branch can pull
+		// that branch's Task, Kernel, and active Timekeeper into this image.
+		k.filteringBranchDanglingEndpoints = true
+		defer func() {
+			k.filteringBranchDanglingEndpoints = false
+		}()
 		if _, err := state.Save(saveCtx, buffered, k); err != nil {
 			return fmt.Errorf("saving dehydrated Kernel metadata: %w", err)
 		}

@@ -292,8 +292,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
-		k.filteringLiveForkDanglingEndpoints = true
-		defer func() { k.filteringLiveForkDanglingEndpoints = false }()
+		k.filteringBranchDanglingEndpoints = true
+		defer func() { k.filteringBranchDanglingEndpoints = false }()
 		if _, err := state.Save(saveCtx, buffered, k); err != nil {
 			return fmt.Errorf("saving distributed Kernel metadata: %w", err)
 		}

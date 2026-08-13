@@ -335,11 +335,11 @@ type Kernel struct {
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 
-	// filteringLiveForkDanglingEndpoints is true only while LiveFork streams
-	// this Kernel's state. tcpip's dangling endpoint registry is process-global,
-	// so a multi-Kernel Sentry must select endpoints belonging to this branch.
+	// filteringBranchDanglingEndpoints is true while serializing one branch's
+	// state. tcpip's dangling endpoint registry is process-global, so a
+	// multi-Kernel Sentry must select endpoints belonging to this branch.
 	// Protected by extMu.
-	filteringLiveForkDanglingEndpoints bool `state:"nosave"`
+	filteringBranchDanglingEndpoints bool `state:"nosave"`
 
 	// sockets records all network sockets in the system. Protected by extMu.
 	sockets map[*vfs.FileDescription]*SocketRecord

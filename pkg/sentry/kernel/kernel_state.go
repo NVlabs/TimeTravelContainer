@@ -29,7 +29,7 @@ func (ts *TaskSet) afterLoad(_ context.Context) {
 // saveDanglingEndpoints is invoked by stateify.
 func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
 	endpoints := tcpip.GetDanglingEndpoints()
-	if !k.filteringLiveForkDanglingEndpoints {
+	if !k.filteringBranchDanglingEndpoints {
 		return endpoints
 	}
 	if k.rootNetworkNamespace == nil || k.rootNetworkNamespace.Stack() == nil {
