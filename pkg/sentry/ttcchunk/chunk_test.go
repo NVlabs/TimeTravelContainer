@@ -806,6 +806,140 @@ func TestRepositoryLeaseProtectsThenReclaimsManifest(t *testing.T) {
 	}
 }
 
+func TestRepositoryConsumptionReclaimsInstalledChunk(t *testing.T) {
+	root := t.TempDir()
+	repository, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x71)
+	loaded, err := repository.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := loaded.Runs[0].Object
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.MarkConsumed("branch", manifest, []ID{object}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.MarkConsumed("branch", manifest, []ID{object}); err != nil {
+		t.Fatalf("idempotent consumption update: %v", err)
+	}
+	result, err := repository.CollectGarbage(GCOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Chunks != 1 || result.Manifests != 0 {
+		t.Fatalf("consumption GC = %+v, want one chunk and retained manifest", result)
+	}
+	if _, err := repository.LoadManifest(manifest); err != nil {
+		t.Fatalf("consumption reclaimed branch manifest: %v", err)
+	}
+	if err := repository.chunks.Contains(object); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("consumed object remains: %v", err)
+	}
+
+	// A new root replaces the old consumption generation conservatively.
+	newManifest := publishLifecycleManifest(t, repository, 0x72)
+	if err := repository.SetBranch("branch", newManifest); err != nil {
+		t.Fatal(err)
+	}
+	newLoaded, err := repository.LoadManifest(newManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 {
+		t.Fatalf("replacement root lost unconsumed object: %+v, %v", got, err)
+	}
+	if err := repository.chunks.Contains(newLoaded.Runs[0].Object); err != nil {
+		t.Fatalf("replacement object unavailable: %v", err)
+	}
+}
+
+func TestDonatedRepositoryRecordsConsumption(t *testing.T) {
+	root := t.TempDir()
+	owner, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, owner, 0x73)
+	loaded, err := owner.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	donated, err := OpenMemoryRepositoryFD(dir)
+	dir.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := donated.MarkConsumed("branch", manifest, []ID{loaded.Runs[0].Object}); err != nil {
+		t.Fatal(err)
+	}
+	if err := donated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := owner.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 {
+		t.Fatalf("donated consumption GC = %+v, %v", got, err)
+	}
+}
+
+func TestConsumptionTrackerWaitsForRestoreCommit(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x74)
+	loaded, err := repository.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := loaded.Runs[0].Object
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewOwnedConsumingChunkReader(repository, []InstalledChunk{{
+		Object: object, Target: memmap.FileRange{Start: 0, End: pgalloc.SparseChunkBytes}, StreamOffset: 0,
+	}}, "branch", manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.RangeLoaded(0, pgalloc.SparseChunkBytes)
+	time.Sleep(150 * time.Millisecond)
+	record, err := repository.readConsumption("branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Objects) != 0 {
+		t.Fatalf("uncommitted restore recorded consumption: %+v", record.Objects)
+	}
+	reader.ActivateConsumption(nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		record, err = repository.readConsumption("branch")
+		if err == nil {
+			if _, ok := record.Objects[object]; ok {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("committed consumption was not persisted: %+v, %v", record, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRepositoryPublicationTransactionExpires(t *testing.T) {
 	repository, err := OpenMemoryRepository(t.TempDir())
 	if err != nil {

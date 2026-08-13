@@ -1158,6 +1158,10 @@ type AsyncPagesFileLoad struct {
 	// chunk's pages contiguously, and the reader must support one full chunk
 	// and up to one destination range per base page in a single operation.
 	logicalChunkDemand bool
+	// rangeLoaded is called after a successful read has been copied into all
+	// destination MemoryFile ranges and those ranges have left unloaded state.
+	// It must not block the loader goroutine.
+	rangeLoaded func(streamOffset, length uint64)
 
 	// done is closed after the loader goroutine has stopped and ar has been
 	// closed.
@@ -1427,6 +1431,11 @@ type AsyncPagesFileLoadOpts struct {
 	// LogicalChunkDemand requires each demand read to install all extant pages
 	// in the same stable logical 1 MiB chunk atomically.
 	LogicalChunkDemand bool
+
+	// RangeLoaded observes successfully installed pages-file ranges. It is
+	// used by TTC sparse backing reclamation; failures must be handled by the
+	// observer and do not invalidate resident memory.
+	RangeLoaded func(streamOffset, length uint64)
 }
 
 // AsyncPagesFileLoadStats is a point-in-time view of a remote or checkpoint
@@ -1518,6 +1527,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		maxParallel:                maxParallel,
 		needsRegisterDestinationFD: ar.NeedRegisterDestinationFD(),
 		logicalChunkDemand:         opts.LogicalChunkDemand,
+		rangeLoaded:                opts.RangeLoaded,
 		qavail:                     maxParallel,
 		opsBusy:                    bitmap.New(uint32(maxParallel)),
 		ops:                        make([]aplOp, maxParallel),
@@ -1696,6 +1706,11 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 	if streamEnd < streamOffset {
 		return RemotePageInstallBusy, fmt.Errorf("pushed remote range overflows: off=%d len=%d", streamOffset, length)
 	}
+	defer func() {
+		if result == RemotePageInstallInstalled && apfl.rangeLoaded != nil {
+			apfl.rangeLoaded(streamOffset, length)
+		}
+	}()
 	var wakeups []*aplWaiter
 	anyPending := false
 	apfl.amflsMu.Lock()
@@ -2281,6 +2296,11 @@ func (apfl *AsyncPagesFileLoad) main() {
 	var completions []stateio.Completion
 	var wakeups []*aplWaiter
 	var decRefs []aplFileRange
+	type completedRange struct {
+		offset uint64
+		length uint64
+	}
+	var loadedCallbacks []completedRange
 
 	dropDelayedDecRefs := func() {
 		if len(decRefs) != 0 {
@@ -2591,6 +2611,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 				return
 			}
 			apfl.bytesLoaded += op.total
+			if apfl.rangeLoaded != nil {
+				loadedCallbacks = append(loadedCallbacks, completedRange{offset: uint64(op.off()), length: op.total})
+			}
 			amfl := op.amfl
 			haveWaiters := false
 			now := int64(0)
@@ -2655,6 +2678,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		apfl.amflsMu.Unlock()
+		for _, loaded := range loadedCallbacks {
+			apfl.rangeLoaded(loaded.offset, loaded.length)
+		}
+		loadedCallbacks = loadedCallbacks[:0]
 		for _, w := range wakeups {
 			w.wakeup.Notify(1)
 		}

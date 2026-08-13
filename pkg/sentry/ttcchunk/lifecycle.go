@@ -425,6 +425,8 @@ type repositoryRoots struct {
 	manifests         map[ManifestID]struct{}
 	requiredManifests map[ManifestID]struct{}
 	pendingManifests  map[ManifestID]struct{}
+	fullManifests     map[ManifestID]struct{}
+	branchConsumption map[ManifestID][]map[ID]struct{}
 	objects           map[ID]struct{}
 }
 
@@ -432,7 +434,8 @@ func newRepositoryRoots() repositoryRoots {
 	return repositoryRoots{
 		manifests: make(map[ManifestID]struct{}), requiredManifests: make(map[ManifestID]struct{}),
 		pendingManifests: make(map[ManifestID]struct{}),
-		objects:          make(map[ID]struct{}),
+		fullManifests:    make(map[ManifestID]struct{}), branchConsumption: make(map[ManifestID][]map[ID]struct{}),
+		objects: make(map[ID]struct{}),
 	}
 }
 
@@ -453,6 +456,7 @@ func staleTemporary(entry os.DirEntry, prefix string, now time.Time, ttl time.Du
 func (r *MemoryRepository) scanRoots(now time.Time, transactionTTL time.Duration) (repositoryRoots, []string, error) {
 	roots := newRepositoryRoots()
 	var expired []string
+	activeConsumption := make(map[string]struct{})
 	branches, err := os.ReadDir(r.branchRoot)
 	if err != nil {
 		return roots, nil, err
@@ -482,6 +486,45 @@ func (r *MemoryRepository) scanRoots(now time.Time, transactionTTL time.Duration
 		}
 		roots.manifests[id] = struct{}{}
 		roots.requiredManifests[id] = struct{}{}
+		branchNameBytes, err := hex.DecodeString(strings.TrimSuffix(entry.Name(), ".root"))
+		if err != nil || len(branchNameBytes) == 0 {
+			return roots, nil, fmt.Errorf("invalid TTC memory branch entry %q", entry.Name())
+		}
+		consumed, err := r.readConsumption(string(branchNameBytes))
+		if err != nil {
+			return roots, nil, fmt.Errorf("reading branch consumption %q: %w", branchNameBytes, err)
+		}
+		if consumed.Manifest != (ManifestID{}) && consumed.Manifest != id {
+			return roots, nil, fmt.Errorf("branch %q consumption references manifest %s, want %s", branchNameBytes, consumed.Manifest, id)
+		}
+		roots.branchConsumption[id] = append(roots.branchConsumption[id], consumed.Objects)
+		activeConsumption[hex.EncodeToString(branchNameBytes)+".consumed"] = struct{}{}
+	}
+	consumptions, err := os.ReadDir(r.consumedRoot)
+	if err != nil {
+		return roots, nil, err
+	}
+	for _, entry := range consumptions {
+		path := filepath.Join(r.consumedRoot, entry.Name())
+		if strings.HasPrefix(entry.Name(), ".consume-") || strings.HasPrefix(entry.Name(), ".txn-") {
+			if stale, staleErr := staleTemporary(entry, strings.SplitN(entry.Name(), "-", 2)[0]+"-", now, transactionTTL); staleErr != nil {
+				return roots, nil, staleErr
+			} else if stale {
+				expired = append(expired, path)
+			}
+			continue
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".consumed") {
+			return roots, nil, fmt.Errorf("unexpected TTC memory consumption entry %q", entry.Name())
+		}
+		encoded := strings.TrimSuffix(entry.Name(), ".consumed")
+		decoded, decodeErr := hex.DecodeString(encoded)
+		if decodeErr != nil || len(decoded) == 0 || hex.EncodeToString(decoded) != encoded {
+			return roots, nil, fmt.Errorf("invalid TTC memory consumption entry %q", entry.Name())
+		}
+		if _, ok := activeConsumption[entry.Name()]; !ok {
+			expired = append(expired, path)
+		}
 	}
 	leases, err := os.ReadDir(r.leaseRoot)
 	if err != nil {
@@ -524,6 +567,7 @@ func (r *MemoryRepository) scanRoots(now time.Time, transactionTTL time.Duration
 		}
 		roots.manifests[id] = struct{}{}
 		roots.requiredManifests[id] = struct{}{}
+		roots.fullManifests[id] = struct{}{}
 	}
 	transactions, err := os.ReadDir(r.txnRoot)
 	if err != nil {
@@ -566,6 +610,7 @@ func (r *MemoryRepository) scanRoots(now time.Time, transactionTTL time.Duration
 		}
 		roots.manifests[txn.Manifest] = struct{}{}
 		roots.pendingManifests[txn.Manifest] = struct{}{}
+		roots.fullManifests[txn.Manifest] = struct{}{}
 		for _, object := range txn.Objects {
 			roots.objects[object] = struct{}{}
 		}
@@ -586,8 +631,27 @@ func (r *MemoryRepository) traceRoots(roots repositoryRoots) error {
 			}
 			return fmt.Errorf("rooted memory manifest %s is unavailable: %w", id, err)
 		}
+		if _, full := roots.fullManifests[id]; full {
+			for _, run := range manifest.Runs {
+				roots.objects[run.Object] = struct{}{}
+			}
+			continue
+		}
+		manifestObjects := make(map[ID]struct{}, len(manifest.Runs))
 		for _, run := range manifest.Runs {
-			roots.objects[run.Object] = struct{}{}
+			manifestObjects[run.Object] = struct{}{}
+		}
+		for _, consumed := range roots.branchConsumption[id] {
+			for object := range consumed {
+				if _, ok := manifestObjects[object]; !ok {
+					return fmt.Errorf("memory consumption for manifest %s names unrelated object %s", id, object)
+				}
+			}
+			for _, run := range manifest.Runs {
+				if _, done := consumed[run.Object]; !done {
+					roots.objects[run.Object] = struct{}{}
+				}
+			}
 		}
 	}
 	return nil
@@ -796,8 +860,25 @@ func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 				continue
 			}
 		}
-		if err := r.validateManifestObjects(id); err != nil {
+		manifest, err := r.LoadManifest(id)
+		if err != nil {
 			return GCResult{}, fmt.Errorf("validating rooted memory manifest %s after collection: %w", id, err)
+		}
+		if _, full := latest.fullManifests[id]; full {
+			if err := r.validateManifestObjects(id); err != nil {
+				return GCResult{}, fmt.Errorf("validating rooted memory manifest %s after collection: %w", id, err)
+			}
+			continue
+		}
+		for _, consumed := range latest.branchConsumption[id] {
+			for _, run := range manifest.Runs {
+				if _, done := consumed[run.Object]; done {
+					continue
+				}
+				if err := r.chunks.Contains(run.Object); err != nil {
+					return GCResult{}, fmt.Errorf("validating retained memory object %s for manifest %s after collection: %w", run.Object, id, err)
+				}
+			}
 		}
 	}
 	result := GCResult{}

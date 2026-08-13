@@ -370,9 +370,12 @@ func TestAttachRemotePageLoad(t *testing.T) {
 	}
 	reader := NewLoopbackRemoteReader(snapshot, 2*hostarch.PageSize, 4, 2)
 	loaderDone := make(chan error, 1)
-	pages, err := StartAsyncPagesFileLoad(reader, func(err error) {
+	loadedRange := make(chan [2]uint64, 8)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, func(err error) {
 		loaderDone <- err
-	}, nil)
+	}, nil, AsyncPagesFileLoadOpts{RangeLoaded: func(offset, length uint64) {
+		loadedRange <- [2]uint64{offset, length}
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,6 +404,25 @@ func TestAttachRemotePageLoad(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("asynchronously loaded target data differs from source snapshot")
+	}
+	var callbackBytes uint64
+	callbackOffsets := make(map[uint64]uint64)
+	for callbackBytes < sourceFR.Length() {
+		select {
+		case loaded := <-loadedRange:
+			if loaded[1] == 0 || loaded[0]+loaded[1] > sourceFR.Length() {
+				t.Fatalf("invalid loaded callback = %v", loaded)
+			}
+			callbackOffsets[loaded[0]] = loaded[1]
+			callbackBytes += loaded[1]
+		case <-time.After(5 * time.Second):
+			t.Fatal("loaded callback timed out")
+		}
+	}
+	for offset := uint64(0); offset < sourceFR.Length(); offset += callbackOffsets[offset] {
+		if callbackOffsets[offset] == 0 {
+			t.Fatalf("loaded callbacks are not contiguous: %+v", callbackOffsets)
+		}
 	}
 	select {
 	case err := <-memoryFileDone:

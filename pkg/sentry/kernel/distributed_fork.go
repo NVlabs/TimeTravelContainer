@@ -349,6 +349,9 @@ type DistributedForkLoadOptions struct {
 	PrefetchBehindBytes        uint64
 	LogicalChunkDemand         bool
 	OwnSparseRepository        bool
+	// SparseBranch names the durable root whose objects may be released after
+	// their complete residency units are installed.
+	SparseBranch string
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
@@ -379,9 +382,17 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 	}()
 
 	var pages *pgalloc.AsyncPagesFileLoad
+	var chunkReader *ttcchunk.ChunkReader
+	consumptionActivated := false
+	defer func() {
+		if chunkReader != nil && !consumptionActivated {
+			chunkReader.AbortConsumption()
+		}
+	}()
 	if len(installation.Chunks) != 0 {
-		var chunkReader *ttcchunk.ChunkReader
-		if opts.OwnSparseRepository {
+		if opts.OwnSparseRepository && opts.SparseBranch != "" {
+			chunkReader, err = ttcchunk.NewOwnedConsumingChunkReader(repository, installation.Chunks, opts.SparseBranch, manifestID)
+		} else if opts.OwnSparseRepository {
 			chunkReader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
 		} else {
 			chunkReader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
@@ -389,8 +400,9 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 		if err != nil {
 			return nil, err
 		}
-		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true, RangeLoaded: chunkReader.RangeLoaded})
 		if err != nil {
+			chunkReader.AbortConsumption()
 			return nil, err
 		}
 		loadRanges := make([]pgalloc.RemoteLoadRange, len(installation.Chunks))
@@ -404,14 +416,18 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 		}
 		pages.MemoryFilesDone()
 	}
-	if len(installation.Chunks) == 0 && opts.OwnSparseRepository {
-		if err := repository.Close(); err != nil {
-			return nil, err
+	repositoryOwned := len(installation.Chunks) == 0 && opts.OwnSparseRepository
+	defer func() {
+		if repositoryOwned {
+			_ = repository.Close()
 		}
-	}
+	}()
 	pagesOwned := pages != nil
 	defer func() {
 		if pagesOwned {
+			if chunkReader != nil {
+				chunkReader.AbortConsumption()
+			}
 			pages.Cancel()
 			_ = pages.Wait()
 		}
@@ -492,6 +508,14 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
 		return nil, vfs.PrependErrMsg("VFS sparse distributed-fork restore failed", err)
+	}
+	if chunkReader != nil {
+		chunkReader.ActivateConsumption(installation.ResidentObjects())
+		consumptionActivated = true
+	} else if opts.SparseBranch != "" {
+		// Every object was already resident in this family MemoryFile. This
+		// update is advisory reclamation: failure only retains backing.
+		_ = repository.MarkConsumed(opts.SparseBranch, manifestID, installation.Objects)
 	}
 	child.Pause()
 	return child, nil

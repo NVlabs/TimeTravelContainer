@@ -45,6 +45,7 @@ type MemoryRepository struct {
 	chunks       *Store
 	manifestRoot string
 	branchRoot   string
+	consumedRoot string
 	leaseRoot    string
 	txnRoot      string
 	trashRoot    string
@@ -65,7 +66,7 @@ func OpenMemoryRepositoryFD(dir *os.File) (*MemoryRepository, error) {
 	owned := os.NewFile(uintptr(dup), "ttc-memory-repository")
 	repository := &MemoryRepository{rootFD: owned}
 	repository.chunks = &Store{repository: repository}
-	for _, name := range []string{"chunks", "manifests", "branches", "leases", "transactions", "trash"} {
+	for _, name := range []string{"chunks", "manifests", "branches", "consumed", "leases", "transactions", "trash"} {
 		opened, err := openDirRelative(dup, name)
 		if err != nil {
 			owned.Close()
@@ -95,7 +96,7 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, fmt.Errorf("creating TTC memory repository: %w", err)
 	}
-	for _, name := range []string{"chunks", "manifests", "branches", "leases", "transactions", "trash"} {
+	for _, name := range []string{"chunks", "manifests", "branches", "consumed", "leases", "transactions", "trash"} {
 		if err := os.MkdirAll(filepath.Join(root, name), 0700); err != nil {
 			return nil, fmt.Errorf("creating TTC memory repository %s directory: %w", name, err)
 		}
@@ -115,6 +116,7 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 		chunks:       chunks,
 		manifestRoot: filepath.Join(root, "manifests"),
 		branchRoot:   filepath.Join(root, "branches"),
+		consumedRoot: filepath.Join(root, "consumed"),
 		leaseRoot:    filepath.Join(root, "leases"),
 		txnRoot:      filepath.Join(root, "transactions"),
 		trashRoot:    filepath.Join(root, "trash"),
@@ -366,6 +368,21 @@ func (r *MemoryRepository) branchPath(branch string) (string, error) {
 	return filepath.Join(r.branchRoot, hex.EncodeToString([]byte(branch))+".root"), nil
 }
 
+func (r *MemoryRepository) branchRelativePath(branch string) (string, error) {
+	path, err := r.branchPath(branch)
+	if err != nil {
+		return "", err
+	}
+	return "branches/" + filepath.Base(path), nil
+}
+
+func (r *MemoryRepository) consumedPath(branch string) (string, error) {
+	if branch == "" || len(branch) > 4096 {
+		return "", fmt.Errorf("invalid TTC memory branch ID %q", branch)
+	}
+	return filepath.Join(r.consumedRoot, hex.EncodeToString([]byte(branch))+".consumed"), nil
+}
+
 func encodeBranchPointer(id ManifestID) []byte {
 	data := append([]byte(nil), branchPointerMagic[:]...)
 	data = append(data, id[:]...)
@@ -403,6 +420,19 @@ func (r *MemoryRepository) SetBranch(branch string, id ManifestID) (retErr error
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A consumption record is specific to both branch and manifest. Remove it
+	// before replacing the root: either crash ordering conservatively retains
+	// the complete old or new manifest.
+	consumedPath, err := r.consumedPath(branch)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(consumedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := syncDirectory(r.consumedRoot); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(r.branchRoot, ".branch-")
 	if err != nil {
 		return err
@@ -434,7 +464,16 @@ func (r *MemoryRepository) Branch(branch string) (ManifestID, error) {
 	if err != nil {
 		return ManifestID{}, err
 	}
-	data, err := os.ReadFile(path)
+	var data []byte
+	if r.rootFD != nil {
+		relative, err := r.branchRelativePath(branch)
+		if err != nil {
+			return ManifestID{}, err
+		}
+		data, err = readFileRelative(int(r.rootFD.Fd()), relative)
+	} else {
+		data, err = os.ReadFile(path)
+	}
 	if err != nil {
 		return ManifestID{}, err
 	}
@@ -500,5 +539,15 @@ func (r *MemoryRepository) DeleteBranch(branch string) error {
 	if err := os.Remove(path); err != nil {
 		return err
 	}
-	return syncDirectory(r.branchRoot)
+	if err := syncDirectory(r.branchRoot); err != nil {
+		return err
+	}
+	consumed, err := r.consumedPath(branch)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(consumed); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(r.consumedRoot)
 }

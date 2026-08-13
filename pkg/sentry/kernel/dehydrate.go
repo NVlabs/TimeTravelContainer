@@ -118,6 +118,8 @@ type DurableDehydrationLoadOptions struct {
 	MaxReadBytes               uint64
 	MaxParallel                int
 	OwnSparseRepository        bool
+	// SparseBranch names the durable retention root for per-chunk reclamation.
+	SparseBranch string
 }
 
 // WithDehydrationFilesystemResources exposes an active branch's process-local
@@ -718,18 +720,27 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 	}()
 
 	var pages *pgalloc.AsyncPagesFileLoad
+	var chunkReader *ttcchunk.ChunkReader
+	consumptionActivated := false
+	defer func() {
+		if chunkReader != nil && !consumptionActivated {
+			chunkReader.AbortConsumption()
+		}
+	}()
 	if len(installation.Chunks) != 0 {
-		var reader *ttcchunk.ChunkReader
-		if opts.OwnSparseRepository {
-			reader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
+		if opts.OwnSparseRepository && opts.SparseBranch != "" {
+			chunkReader, err = ttcchunk.NewOwnedConsumingChunkReader(repository, installation.Chunks, opts.SparseBranch, image.SparseManifest)
+		} else if opts.OwnSparseRepository {
+			chunkReader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
 		} else {
-			reader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
+			chunkReader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
 		}
 		if err != nil {
 			return nil, err
 		}
-		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(reader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true, RangeLoaded: chunkReader.RangeLoaded})
 		if err != nil {
+			chunkReader.AbortConsumption()
 			return nil, err
 		}
 		rangesByFile := make(map[*pgalloc.MemoryFile][]pgalloc.RemoteLoadRange)
@@ -745,11 +756,12 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		}
 		pages.MemoryFilesDone()
 	}
-	if len(installation.Chunks) == 0 && opts.OwnSparseRepository {
-		if err := repository.Close(); err != nil {
-			return nil, err
+	repositoryOwned := len(installation.Chunks) == 0 && opts.OwnSparseRepository
+	defer func() {
+		if repositoryOwned {
+			_ = repository.Close()
 		}
-	}
+	}()
 	pagesOwned := pages != nil
 	defer func() {
 		if pagesOwned {
@@ -827,6 +839,12 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
 		return nil, vfs.PrependErrMsg("VFS sparse dehydration restore failed", err)
+	}
+	if chunkReader != nil {
+		chunkReader.ActivateConsumption(installation.ResidentObjects())
+		consumptionActivated = true
+	} else if opts.SparseBranch != "" {
+		_ = repository.MarkConsumed(opts.SparseBranch, image.SparseManifest, installation.Objects)
 	}
 	child.Pause()
 	return child, nil

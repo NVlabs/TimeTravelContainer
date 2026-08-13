@@ -7,7 +7,9 @@ package(
 
 go_library(
     name = "ttcchunk",
-    srcs = [
+	 srcs = [
+		"consumption.go",
+		"consumption_tracker.go",
 		"assemble.go",
         "chunk.go",
 		"donated.go",
@@ -22,6 +24,7 @@ go_library(
     deps = [
 		"@org_golang_x_sys//unix",
         "//pkg/hostarch",
+		"//pkg/log",
 		"//pkg/sentry/checkpoint",
 		"//pkg/safemem",
 		"//pkg/sentry/memmap",

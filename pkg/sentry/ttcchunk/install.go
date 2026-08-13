@@ -44,8 +44,18 @@ type InstalledChunk struct {
 type InstallSetResult struct {
 	Relocation   *pgalloc.SparseRelocation
 	Chunks       []InstalledChunk
+	Objects      []ID
 	transactions []*pgalloc.SparseChunkInstallation
 	done         bool
+}
+
+// ResidentObjects returns manifest objects that were already resident before
+// this installation and therefore need no backing read for the restored graph.
+func (r *InstallSetResult) ResidentObjects() []ID {
+	if r == nil {
+		return nil
+	}
+	return residentObjects(r.Objects, r.Chunks)
 }
 
 // Commit retains every installed residency unit.
@@ -81,7 +91,30 @@ func (r *InstallSetResult) Abort() error {
 type InstallResult struct {
 	Relocation  *pgalloc.SparseRelocation
 	Chunks      []InstalledChunk
+	Objects     []ID
 	transaction *pgalloc.SparseChunkInstallation
+}
+
+// ResidentObjects is the single-MemoryFile form of InstallSetResult.ResidentObjects.
+func (r *InstallResult) ResidentObjects() []ID {
+	if r == nil {
+		return nil
+	}
+	return residentObjects(r.Objects, r.Chunks)
+}
+
+func residentObjects(objects []ID, chunks []InstalledChunk) []ID {
+	missing := make(map[ID]struct{}, len(chunks))
+	for _, chunk := range chunks {
+		missing[chunk.Object] = struct{}{}
+	}
+	result := make([]ID, 0, len(objects)-len(missing))
+	for _, object := range objects {
+		if _, ok := missing[object]; !ok {
+			result = append(result, object)
+		}
+	}
+	return result
 }
 
 // Commit transfers installed page references to a successfully restored graph.
@@ -190,7 +223,12 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 		objectIDs = append(objectIDs, ID(object))
 	}
 	sort.Slice(objectIDs, func(i, j int) bool { return objectIDs[i].String() < objectIDs[j].String() })
-	result := InstallResult{Relocation: relocation, Chunks: make([]InstalledChunk, len(objectIDs)), transaction: transaction}
+	allObjects := make([]ID, 0, len(objects))
+	for object := range objects {
+		allObjects = append(allObjects, object)
+	}
+	sort.Slice(allObjects, func(i, j int) bool { return allObjects[i].String() < allObjects[j].String() })
+	result := InstallResult{Relocation: relocation, Chunks: make([]InstalledChunk, len(objectIDs)), Objects: allObjects, transaction: transaction}
 	for i, object := range objectIDs {
 		result.Chunks[i] = InstalledChunk{
 			Object: object, ResourceID: mf.ResourceID(), MemoryFile: mf,
@@ -243,6 +281,7 @@ func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.Resourc
 		}
 		result.transactions = append(result.transactions, installed.transaction)
 		result.Chunks = append(result.Chunks, installed.Chunks...)
+		result.Objects = append(result.Objects, installed.Objects...)
 		for _, run := range submanifest.Runs {
 			for i := uint16(0); i < run.Pages; i++ {
 				old := run.OldOffset + uint64(i)*hostarch.PageSize
@@ -259,6 +298,7 @@ func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.Resourc
 	for i := range result.Chunks {
 		result.Chunks[i].StreamOffset = uint64(i) * pgalloc.SparseChunkBytes
 	}
+	sort.Slice(result.Objects, func(i, j int) bool { return result.Objects[i].String() < result.Objects[j].String() })
 	committed = true
 	return result, nil
 }
@@ -267,11 +307,12 @@ func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.Resourc
 // records. Each ReadAt is transactional: it verifies the immutable object,
 // builds the complete record in private memory, then copies to the caller.
 type ChunkReader struct {
-	store    *Store
-	objects  []ID
-	mu       sync.RWMutex
-	closed   bool
-	ownStore bool
+	store       *Store
+	objects     []ID
+	mu          sync.RWMutex
+	closed      bool
+	ownStore    bool
+	consumption *ConsumptionTracker
 }
 
 // NewChunkReader creates a virtual stream in installed-chunk order.
@@ -283,6 +324,46 @@ func NewChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*
 // closes. It is used for a repository directory donated to an isolated Sentry.
 func NewOwnedChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*ChunkReader, error) {
 	return newChunkReader(repository, installed, true)
+}
+
+// NewOwnedConsumingChunkReader creates a reader that records successfully
+// installed objects against branch after ActivateConsumption. Until then,
+// completions are buffered so a failed restore leaves its durable image intact.
+func NewOwnedConsumingChunkReader(repository *MemoryRepository, installed []InstalledChunk, branch string, manifest ManifestID) (*ChunkReader, error) {
+	reader, err := newChunkReader(repository, installed, true)
+	if err != nil {
+		return nil, err
+	}
+	tracker, err := newConsumptionTracker(repository, branch, manifest, reader.objects)
+	if err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+	reader.consumption = tracker
+	return reader, nil
+}
+
+// ActivateConsumption commits buffered completions and marks already-resident
+// objects consumed. It must be called only after restored graph references are
+// committed.
+func (r *ChunkReader) ActivateConsumption(alreadyResident []ID) {
+	if r != nil && r.consumption != nil {
+		r.consumption.Activate(alreadyResident)
+	}
+}
+
+// AbortConsumption prevents buffered completions from changing durable roots.
+func (r *ChunkReader) AbortConsumption() {
+	if r != nil && r.consumption != nil {
+		r.consumption.Abort()
+	}
+}
+
+// RangeLoaded records a pages-file range after atomic MemoryFile installation.
+func (r *ChunkReader) RangeLoaded(offset, length uint64) {
+	if r != nil && r.consumption != nil {
+		r.consumption.Record(offset, length)
+	}
 }
 
 func newChunkReader(repository *MemoryRepository, installed []InstalledChunk, ownStore bool) (*ChunkReader, error) {
@@ -309,7 +390,11 @@ func (r *ChunkReader) Close() error {
 	r.closed = true
 	var err error
 	if r.ownStore {
-		err = r.store.closeRepository()
+		if r.consumption != nil {
+			r.consumption.ReaderClosed()
+		} else {
+			err = r.store.closeRepository()
+		}
 	}
 	r.mu.Unlock()
 	return err

@@ -70,6 +70,9 @@ type DistributedForkRestoreArgs struct {
 	// SparseManifest selects the first donated file as a TTC sparse chunk
 	// repository. Network connections are then used only to fetch metadata.
 	SparseManifest ttcchunk.ManifestID
+	// SparseBranch identifies the durable retention root paired with
+	// SparseManifest. The Sentry advances its per-chunk consumption record.
+	SparseBranch string
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -320,6 +323,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
 		LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
+		SparseBranch: args.SparseBranch,
 	}
 	var child *kernel.Kernel
 	if args.DurableDehydration {
@@ -340,6 +344,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, durableMetadata,
 			memoryFiles, sparseRepository, kernel.DurableDehydrationLoadOptions{
 				Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+				SparseBranch:               args.SparseBranch,
 				RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 				ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
 			})
