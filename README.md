@@ -554,6 +554,18 @@ deduplicates identical chunks across branches, and garbage collection removes
 an object only after no branch root, active lease, or publication transaction
 can still reach it.
 
+The first destination on a node names both its target family and branch;
+subsequent destinations can add branches to that same node-local family:
+
+```sh
+ttc fork --target node-b app@main remote@main
+ttc fork --target node-b app@main remote@candidate
+```
+
+Those target branches share one local runtime process and reuse matching
+resident memory chunks while retaining independent process and filesystem
+state.
+
 Durable checkpointing is a separate, explicitly requested operation. It
 captures one selected branch's process, memory, filesystem, and supported
 runtime state in a file. The immutable OCI image is identified by its exact

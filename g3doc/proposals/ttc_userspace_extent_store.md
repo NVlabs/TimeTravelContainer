@@ -13,12 +13,11 @@ versions of one logical chunk, daemon restart on either node, source loss after
 handoff, cold fan-out, and removal/GC.
 
 The unified mutable-filesystem store is postponed. Pebble is not part of the
-implementation plan. Two optimizations specified later remain future work:
-one shared Sentry for repeated imports of the same global family on a target
-node, and per-chunk consumption leases. Today each imported TTC container
-family gets its own Sentry, while its local branches share that Sentry; an
-active imported branch retains its complete manifest as reusable clean backing
-until it is stopped, dehydrated, or removed.
+implementation plan. Repeated imports of the same global family now share one
+node-local Sentry and application `MemoryFile`; stable page/version bindings
+reuse matching resident chunks and relocate diverged allocator layouts.
+Branch-scoped consumption sidecars release each durable chunk after successful
+installation rather than retaining a complete manifest until branch teardown.
 
 This proposal evaluates replacing TTC's eventual dependence on host `FICLONE`,
 filesystem extent CoW, and whole-snapshot lifetime with a userspace-managed
@@ -67,10 +66,10 @@ mutable location index. Retained directory descriptors and `openat`/`unlinkat`
 on the demand path remain loader optimizations to implement and benchmark.
 
 A successful load reads the complete chunk and populates up to 256
-independently CoW 4 KiB memory pages. The active branch currently retains its
-manifest as reusable clean backing; stopping, dehydrating, or removing it
-releases that root. A chunk is unlinked only after no branch root, active
-lease, or publication transaction references it. Chunk files are immutable
+independently CoW 4 KiB memory pages. Successful installs are accumulated into
+checksummed, monotonic branch-consumption sidecars. Garbage collection treats
+only the unconsumed portion of branch manifests as live, while active leases
+and publication transactions remain complete roots. Chunk files are immutable
 and addressable by stable IDs, so another `ttcd` on the shared filesystem can
 load them without a source-process dependency. The old packed memory backend
 is retained for legacy restore and transport compatibility and no longer backs
@@ -116,10 +115,10 @@ coalesces contiguous offsets, page IDs, version IDs, and equal reference counts
 within one object; a normal dense chunk therefore uses one mapping record
 rather than 256. Donated repository descriptors let an isolated Sentry load
 objects without reopening host paths. Publication transactions, renewable
-leases, quarantine-and-rescan garbage collection, and daemon reconciliation
-cover interrupted construction and ownership transfer. Retained shard
-directory descriptors and per-chunk consumption records remain optional
-performance and space optimizations.
+leases, branch-scoped per-chunk consumption records, quarantine-and-rescan
+garbage collection, and daemon reconciliation cover interrupted construction
+and ownership transfer. Retained shard directory descriptors remain an
+optional demand-path optimization to benchmark.
 
 The completed backend must chunk every referenced range from every
 `MemoryFile` captured by the existing dehydration/remote-fork traversal,

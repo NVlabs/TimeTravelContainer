@@ -7,8 +7,9 @@
 > requirements from memory dehydration and distributed fork. Sections marked
 > historical remain here to explain the older baseline and its measurements.
 
-Status: sparse memory handoff implemented; continued qualification and the
-multi-import single-Sentry optimization remain in progress.
+Status: sparse memory handoff, repeated same-family imports into one target
+Sentry, and per-chunk durable-backing reclamation are implemented. Continued
+qualification on real multi-node shared filesystems remains in progress.
 
 Implementation progress:
 
@@ -41,6 +42,9 @@ Implementation progress:
   whole-chunk atomic demand loading, process-free sparse dehydration, cold
   remote fork, live TCP-to-shared handoff, crash recovery, content-addressed
   reuse, and reachability GC: implemented and tested.
+* Phase 9 repeated imports of one global family into a node-local Sentry,
+  version-aware resident-chunk reuse, branch-scoped consumption records, and
+  per-chunk durable reclamation: implemented and tested.
 
 ## Implemented 1 MiB shared-chunk data plane
 
@@ -56,20 +60,24 @@ For an already-dehydrated branch, remote fork shares immutable objects: the
 cluster repository imports missing content by digest, publishes a new branch
 root, and the destination reads 1 MiB chunks directly from the shared
 filesystem on demand. Loading a chunk installs every valid page atomically.
-The active target currently retains its complete manifest as reusable clean
-backing; stop, dehydration, or removal releases it, and physical unlink waits
-until no root, lease, or publication transaction can still read the chunk.
+After a chunk is installed, the target durably marks that branch's backing as
+consumed in bounded batches. Garbage collection may then unlink the object as
+soon as no other unconsumed branch root, lease, or publication transaction can
+still read it; unrelated chunks in the same manifest are unaffected.
 
 Dehydration writes and synchronizes all chunks, publishes the manifest last,
 and only then releases the Sentry and its memory. After publication, any node
 can rehydrate the branch even if the source process and source node have exited.
 
-The first imported target creates a node-local Sentry. Local forks of that
-target reuse its `MemoryFile`, so either sibling's first chunk fault benefits
-the other and later writes still CoW at 4 KiB. Reusing the same Sentry for
-separate remote-import operations belonging to one global family remains an
-optimization to implement; today those imports are separate TTC container
-families even when their immutable chunks deduplicate in shared storage.
+The first imported target creates a node-local Sentry. Later remote-import
+operations for the same global family and target container enter that Sentry
+as peer branches and reuse its application `MemoryFile`. Stable page/version
+bindings reuse an already resident physical 1 MiB chunk when contents match;
+changed versions allocate a distinct chunk and state offsets are relocated.
+Thus either peer's first matching chunk fault benefits the other, while later
+writes still CoW at 4 KiB. Import transactions remain independently named,
+published, cancelled, and garbage-collected even though their visible branches
+share a runtime.
 
 A live remote fork must not wait for the complete memory image to be written.
 It therefore uses the existing page-granular TCP dependency as a bridge:
