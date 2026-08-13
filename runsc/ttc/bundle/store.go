@@ -59,6 +59,11 @@ const promotedRepositoryDir = "repositories"
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
 	Root string
+	// TransientRoot, when non-empty, holds short-lived OCI bundles. Keeping
+	// these outside Root matters when Root is NFS: runsc's gofer retains the
+	// bundle config descriptor for its lifetime, so unlinking an NFS-backed
+	// bundle would leave a .nfs placeholder until the container exits.
+	TransientRoot string
 }
 
 // RemoveObsoleteApplicationMemoryFiles removes pathname-backed live memory
@@ -183,7 +188,14 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if spec.Root != nil && !filepath.IsAbs(spec.Root.Path) {
 		spec.Root.Path = filepath.Join(info.BundleDir, spec.Root.Path)
 	}
-	temp, err := os.MkdirTemp(filepath.Dir(info.BundleDir), ".branch-start-*")
+	tempParent := filepath.Dir(info.BundleDir)
+	if s.TransientRoot != "" {
+		tempParent = s.TransientRoot
+		if err := os.MkdirAll(tempParent, 0700); err != nil {
+			return "", nil, fmt.Errorf("creating transient bundle root: %w", err)
+		}
+	}
+	temp, err := os.MkdirTemp(tempParent, ".branch-start-*")
 	if err != nil {
 		return "", nil, err
 	}

@@ -4822,7 +4822,11 @@ func environmentHasKey(env []string, key string) bool {
 }
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
-	return ttcbundle.Store{Root: b.dataRoot}
+	store := ttcbundle.Store{Root: b.dataRoot}
+	if b.root != "" {
+		store.TransientRoot = filepath.Join(b.root, "ttc-transient-bundles")
+	}
+	return store
 }
 
 func (b *runtimeBackend) imageProgress() ttcimages.ProgressFunc {
@@ -9216,6 +9220,10 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err != nil {
 		return fmt.Errorf("installing dehydration image: %w", err)
 	}
+	// commandWithFiles has transferred the metadata to the Sentry. Close our
+	// source descriptor before sparse cleanup; otherwise NFS must silly-rename
+	// metadata.state and RemoveAll observes a transient non-empty directory.
+	_ = metadata.Close()
 	status, err = b.runConfiguredCommandWithArgs(configured, "start", info.ID)
 	if err != nil {
 		return fmt.Errorf("starting dehydration runtime: %w", err)
@@ -9330,6 +9338,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
 	}
+	_ = metadata.Close()
 	state := "paused"
 	if capture.Resume {
 		state = "running"

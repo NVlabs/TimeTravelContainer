@@ -1608,15 +1608,15 @@ func (r *Repository) syncMetadataLocked() error {
 		for _, name := range names {
 			file, err := r.openFile(name, os.O_RDONLY, 0)
 			if err != nil {
-				return err
+				return fmt.Errorf("opening dirty repository file %q: %w", name, err)
 			}
 			err = file.Sync()
 			closeErr := file.Close()
 			if err != nil {
-				return err
+				return fmt.Errorf("syncing dirty repository file %q: %w", name, err)
 			}
 			if closeErr != nil {
-				return closeErr
+				return fmt.Errorf("closing dirty repository file %q: %w", name, closeErr)
 			}
 		}
 		return nil
@@ -1626,7 +1626,7 @@ func (r *Repository) syncMetadataLocked() error {
 			continue
 		}
 		if err := r.syncDirectory(name); err != nil {
-			return err
+			return fmt.Errorf("syncing dirty repository directory %q: %w", name, err)
 		}
 	}
 	if err := syncFiles(rootDirty); err != nil {

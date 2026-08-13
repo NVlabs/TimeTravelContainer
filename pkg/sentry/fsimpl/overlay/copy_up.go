@@ -410,6 +410,16 @@ func (d *dentry) copyXattrsLocked(ctx context.Context) error {
 		value, err := vfsObj.GetXattrAt(ctx, d.fs.creds, lowerPop, &vfs.GetXattrOptions{Name: name, Size: 0})
 		if err != nil {
 			ctx.Infof("failed to copy up %q xattr because GetXattrAt failed: %v", name, err)
+			// Some host filesystems expose kernel-managed attributes in
+			// listxattr(2) that the Sentry intentionally does not implement.
+			// NFSv4's system.nfs4_acl is one example: gofer can enumerate it,
+			// but rejects reading the system.* namespace with EOPNOTSUPP.
+			// Optional attributes must not make an otherwise ordinary overlay
+			// copy-up fail. Security capabilities remain mandatory because
+			// silently dropping them changes executable privilege semantics.
+			if linuxerr.Equals(linuxerr.EOPNOTSUPP, err) && !mustCopyXattr(name) {
+				continue
+			}
 			return err
 		}
 

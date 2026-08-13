@@ -1230,7 +1230,8 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 
 func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	root := t.TempDir()
-	store := Store{Root: root}
+	transientRoot := t.TempDir()
+	store := Store{Root: root, TransientRoot: transientRoot}
 	containerDir := filepath.Join(root, "containers", "demo")
 	bundleDir := filepath.Join(containerDir, "bundle")
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
@@ -1267,6 +1268,9 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 		t.Fatalf("PrepareBranchStartBundle: %v", err)
 	}
 	defer cleanup()
+	if filepath.Dir(temp) != transientRoot {
+		t.Fatalf("branch bundle directory=%q, want parent %q", temp, transientRoot)
+	}
 	data, err := os.ReadFile(filepath.Join(temp, "config.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -1297,6 +1301,9 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 		t.Fatalf("PrepareTransientBranchStartBundle: %v", err)
 	}
 	defer transientCleanup()
+	if filepath.Dir(transient) != transientRoot {
+		t.Fatalf("transient bundle directory=%q, want parent %q", transient, transientRoot)
+	}
 	data, err = os.ReadFile(filepath.Join(transient, "config.json"))
 	if err != nil {
 		t.Fatal(err)
