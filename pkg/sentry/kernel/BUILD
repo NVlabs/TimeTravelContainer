@@ -466,6 +466,7 @@ go_test(
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
+        "//pkg/state",
         "//pkg/sync",
     ],
 )

@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -433,7 +435,7 @@ func (t *Timekeeper) BootTime() ktime.Time {
 // timekeeperClock is a ktime.SampledClock that reads time from a
 // kernel.Timekeeper-managed clock.
 //
-// +stateify savable
+// +stateify type
 type timekeeperClock struct {
 	tk *Timekeeper
 	c  sentrytime.ClockID
@@ -444,6 +446,35 @@ type timekeeperClock struct {
 	// Implements waiter.Waitable. (We have no ability to detect
 	// discontinuities from external changes to CLOCK_REALTIME).
 	ktime.NoClockEvents `state:"nosave"`
+}
+
+// StateSave canonicalizes tc to the Kernel being saved. A live-fork branch
+// must never retain a clock reference into another branch: traversing such a
+// reference would serialize an actively updating foreign Timekeeper, and a
+// restore would leave this clock dependent on the wrong Kernel.
+//
+// Keep both existing state slots so this remains compatible with checkpoints
+// written by the generated saver.
+func (tc *timekeeperClock) StateSave(s state.Sink) {
+	tk := tc.tk
+	if k, ok := s.Context().Value(CtxKernel).(*Kernel); ok && k != nil && k.timekeeper != nil {
+		tk = k.timekeeper
+	}
+	s.Save(0, &tk)
+	s.Save(1, &tc.c)
+}
+
+// StateLoad restores the existing field format, then canonicalizes the clock
+// after the containing Kernel's fields have been decoded. This also repairs an
+// older image containing a stale cross-branch Timekeeper reference.
+func (tc *timekeeperClock) StateLoad(ctx context.Context, s state.Source) {
+	s.Load(0, &tc.tk)
+	s.Load(1, &tc.c)
+	s.AfterLoad(func() {
+		if k, ok := ctx.Value(CtxKernel).(*Kernel); ok && k != nil && k.timekeeper != nil {
+			tc.tk = k.timekeeper
+		}
+	})
 }
 
 // Now implements ktime.Clock.Now.

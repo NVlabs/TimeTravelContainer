@@ -735,8 +735,15 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	defer fdnotifier.Resume()
 
 	// Stop time.
+	// A Kernel created with StartPaused already owns a persistent time pause
+	// that must survive this temporary save critical section. This also repairs
+	// older paused branches whose updater was accidentally restarted by a prior
+	// nested quiesce.
+	resumeTime := !k.timePausedByStartPaused
 	k.pauseTimeLocked(ctx)
-	defer k.resumeTimeLocked(ctx)
+	if resumeTime {
+		defer k.resumeTimeLocked(ctx)
+	}
 
 	// Evict all evictable MemoryFile allocations.
 	k.mf.StartEvictions()

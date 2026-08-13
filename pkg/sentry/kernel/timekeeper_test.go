@@ -15,6 +15,8 @@
 package kernel
 
 import (
+	"bytes"
+	"context"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -23,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 // mockClocks is a sentrytime.Clocks that simply returns the times in the
@@ -66,6 +69,30 @@ func stateTestTimekeeper(tb testing.TB) *Timekeeper {
 	t, params := stateTestClocklessTimekeeper(tb)
 	t.SetClocks(sentrytime.NewCalibratedClocks(), params)
 	return t
+}
+
+func TestTimekeeperClockStateCanonicalizesKernel(t *testing.T) {
+	canonical := &Timekeeper{}
+	foreign := stateTestTimekeeper(t)
+	defer foreign.Destroy()
+	k := &Kernel{timekeeper: canonical}
+	ctx := context.WithValue(context.Background(), CtxKernel, k)
+
+	source := &timekeeperClock{tk: foreign, c: sentrytime.Monotonic}
+	var image bytes.Buffer
+	if _, err := state.Save(ctx, &image, source); err != nil {
+		t.Fatalf("saving clock with active foreign Timekeeper: %v", err)
+	}
+	var restored timekeeperClock
+	if _, err := state.Load(ctx, bytes.NewReader(image.Bytes()), &restored); err != nil {
+		t.Fatalf("loading clock: %v", err)
+	}
+	if restored.tk != canonical {
+		t.Fatalf("restored clock Timekeeper=%p, want current Kernel Timekeeper %p", restored.tk, canonical)
+	}
+	if restored.c != sentrytime.Monotonic {
+		t.Fatalf("restored clock ID=%v, want monotonic", restored.c)
+	}
 }
 
 // TestTimekeeperMonotonicZero tests that monotonic time starts at zero.
