@@ -23,9 +23,8 @@ foundation for agent harnesses.
 ![An agent forks one initialized TTC sandbox into parallel subagent branches, then combines their summaries](assets/ttc-agent-flow.svg)
 
 The same primitive supports speculative tool use, parallel coding attempts,
-reproducible agent evaluation and training rollouts with more stable credit
-assignment, integration testing, and debugging—without replaying expensive
-environment setup.
+integration testing, and debugging—without replaying expensive environment
+setup.
 
 TTC provides basic isolation and cross-node scaling, but is not intended to be
 a complete agent guardrail. During inference, it can run inside a guardrail
