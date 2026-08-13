@@ -493,6 +493,12 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 			child.Release()
 			return nil, fmt.Errorf("sparse distributed target network configurator was not provided")
 		}
+		// Network devices and routes are target-local runtime state. As in the
+		// ordinary checkpoint restore path, discard the saved configuration before
+		// recreating it. This is also required for repeated imports: state fields
+		// such as netstack's NIC map are intentionally not serialized and may be nil
+		// in a newly loaded peer.
+		rootNS.Stack().ResetConfig()
 		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
 			child.Release()
 			return nil, fmt.Errorf("configuring sparse distributed target network: %w", err)
@@ -618,6 +624,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 			child.Release()
 			return nil, fmt.Errorf("distributed target network configurator was not provided")
 		}
+		rootNS.Stack().ResetConfig()
 		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
 			child.Release()
 			return nil, fmt.Errorf("configuring distributed target network: %w", err)
@@ -733,6 +740,7 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 			child.Release()
 			return nil, errors.New("relocated distributed target network configurator was not provided")
 		}
+		rootNS.Stack().ResetConfig()
 		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
 			child.Release()
 			return nil, fmt.Errorf("configuring relocated distributed target network: %w", err)

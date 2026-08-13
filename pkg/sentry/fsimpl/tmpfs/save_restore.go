@@ -172,6 +172,9 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			if childBranch == "" {
 				return fmt.Errorf("live-fork child branch ID was not provided for TTC volume")
 			}
+			if _, err := repository.Branch(childBranch); err != nil {
+				return fmt.Errorf("TTC volume child branch %q was not prepared: %w", childBranch, err)
+			}
 			fs.diskVolume.Repository = repository
 			fs.diskVolume.Branch = childBranch
 			fs.rebuildDiskInodeCache()

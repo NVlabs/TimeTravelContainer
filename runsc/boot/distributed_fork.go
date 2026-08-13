@@ -521,6 +521,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 // what makes repeated imports of identical chunks share resident host pages in
 // one Sentry instead of allocating another sandbox process.
 func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+	if args.DurableDehydration {
+		return l.restoreDistributedDurablePeer(args)
+	}
 	files := args.FilePayload.Files
 	var sharedMetadata *os.File
 	if args.SharedMetadata {
@@ -653,7 +656,10 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	var child *kernel.Kernel
 	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		loadOpts := kernel.DistributedForkLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+			// ChildBranchID selects the prepared persistent filesystem branch
+			// during an in-Sentry restore. TargetBranchID is the immutable remote
+			// transaction identity and is deliberately not a repository branch.
+			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.FilesystemBranch,
 			FilesystemResources: resources, DemandOnly: true,
 			PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
 			LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork,
@@ -695,4 +701,90 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID,
 		RemotePages: remoteBytes / hostarch.PageSize, RemoteBytes: remoteBytes,
 	}, nil
+}
+
+// restoreDistributedDurablePeer imports a process-free sparse dehydration
+// image into an existing family. Durable metadata is not a SessionMetadata
+// envelope, so it must be dispatched before the live transport decoder.
+func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+	files := args.FilePayload.Files
+	if !args.SharedMetadata || len(files) == 0 || args.SparseManifest == (ttcchunk.ManifestID{}) {
+		return nil, errors.New("distributed durable peer requires shared metadata and sparse memory")
+	}
+	sharedMetadata, files := files[0], files[1:]
+	if len(files) == 0 {
+		return nil, errors.New("distributed durable peer is missing sparse memory repository")
+	}
+	sparseRepository, err := ttcchunk.OpenMemoryRepositoryFD(files[0])
+	if err != nil {
+		return nil, fmt.Errorf("opening distributed durable peer sparse repository: %w", err)
+	}
+	files = files[1:]
+	metadataFD, err := unix.Dup(int(sharedMetadata.Fd()))
+	if err != nil {
+		sparseRepository.Close()
+		return nil, err
+	}
+	metadataFile := os.NewFile(uintptr(metadataFD), "distributed-durable-peer-metadata")
+	durable, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
+	metadataFile.Close()
+	if err != nil {
+		sparseRepository.Close()
+		return nil, err
+	}
+	if durable.SparseManifest != args.SparseManifest {
+		sparseRepository.Close()
+		return nil, fmt.Errorf("durable peer manifest %s does not match requested %s", durable.SparseManifest, args.SparseManifest)
+	}
+	if got, want := len(files), len(durable.Memories)-1; got != want {
+		sparseRepository.Close()
+		return nil, fmt.Errorf("distributed durable peer got %d private memory files, want %d", got, want)
+	}
+	private := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(files))
+	for i, file := range files {
+		resource := durable.Memories[i+1].ResourceID
+		mf, err := createEmptyPrivateMemoryFile(file, resource)
+		if err != nil {
+			for _, opened := range private {
+				opened.Destroy()
+			}
+			sparseRepository.Close()
+			return nil, fmt.Errorf("creating distributed durable peer memory %q: %w", resource, err)
+		}
+		private[resource] = mf
+	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			for _, mf := range private {
+				mf.Destroy()
+			}
+			_ = sparseRepository.Close()
+		}
+	}()
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
+		memories[checkpoint.ResourceID{}] = source.MemoryFile()
+		for resource, mf := range private {
+			memories[resource] = mf
+		}
+		consumed = true
+		child, err := kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, durable, memories, sparseRepository, kernel.DurableDehydrationLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			SparseBranch: args.SparseBranch, FilesystemResources: resources,
+			ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, task := range child.TaskSet().Root.Tasks() {
+			task.RestoreContainerID(l.sandboxID)
+		}
+		child.RegisterContainerName(l.sandboxID, l.root.containerName)
+		return child, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DistributedForkRestoreInfo{SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID}, nil
 }

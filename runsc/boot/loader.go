@@ -926,12 +926,7 @@ func New(args Args) (*Loader, error) {
 		LoaderWatchdog:                 l.watchdog,
 		VolumeBranchScope:              l.sandboxID,
 		ConfigureNetwork:               l.configureNetwork,
-		OnLoaderKernelChanged: func(k *kernel.Kernel, dog *watchdog.Watchdog) {
-			l.mu.Lock()
-			l.k = k
-			l.watchdog = dog
-			l.mu.Unlock()
-		},
+		OnLoaderKernelChanged:          l.setLoaderKernel,
 		ForgetFilesystemBranch: func(branch string) {
 			for _, volume := range l.ttcVolumeRepositories {
 				volume.repository.ForgetBranch(branch)
@@ -1026,6 +1021,23 @@ func New(args Args) (*Loader, error) {
 
 	keepTTCVolumeRepositories = true
 	return l, nil
+}
+
+// setLoaderKernel transfers Loader's runtime bookkeeping role to k. The OCI
+// control plane keys the sandbox init process by the immutable sandbox ID,
+// while TTC may move this role to any surviving branch. Both views must follow
+// the same Kernel; otherwise `state` observes the exited init thread group of a
+// removed branch and rejects later remote imports into a healthy family.
+func (l *Loader) setLoaderKernel(k *kernel.Kernel, dog *watchdog.Watchdog) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.k = k
+	l.watchdog = dog
+	if k != nil {
+		if init := l.processes[execID{cid: l.sandboxID}]; init != nil {
+			init.tg = k.GlobalInit()
+		}
+	}
 }
 
 // ConfigureNetwork implements inet.NetworkArgs.ConfigureNetwork.

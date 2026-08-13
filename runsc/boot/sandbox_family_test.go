@@ -59,6 +59,55 @@ func TestRemoveDistributedFilesystemBranchDeduplicatesResources(t *testing.T) {
 	}
 }
 
+func TestLoaderKernelTransferRetargetsOCIInit(t *testing.T) {
+	old, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot old Kernel: %v", err)
+	}
+	old.PipeMount().IncRef()
+	old.SetHostMount(old.PipeMount())
+	old.Pause()
+	if err := old.StartPaused(); err != nil {
+		t.Fatalf("Start old Kernel: %v", err)
+	}
+	old.Unpause()
+	defer func() {
+		old.Pause()
+		old.Release()
+	}()
+	replacement, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot replacement Kernel: %v", err)
+	}
+	replacement.PipeMount().IncRef()
+	replacement.SetHostMount(replacement.PipeMount())
+	replacement.Pause()
+	if err := replacement.StartPaused(); err != nil {
+		t.Fatalf("Start replacement Kernel: %v", err)
+	}
+	replacement.Unpause()
+	defer func() {
+		replacement.Pause()
+		replacement.Release()
+	}()
+
+	const sandboxID = "sandbox"
+	l := &Loader{
+		k:         old,
+		sandboxID: sandboxID,
+		processes: map[execID]*execProcess{
+			{cid: sandboxID}: {tg: old.GlobalInit()},
+		},
+	}
+	l.setLoaderKernel(replacement, nil)
+	if got := l.k; got != replacement {
+		t.Fatalf("Loader Kernel=%p, want replacement %p", got, replacement)
+	}
+	if got := l.processes[execID{cid: sandboxID}].tg; got != replacement.GlobalInit() {
+		t.Fatalf("OCI init thread group=%p, want replacement %p", got, replacement.GlobalInit())
+	}
+}
+
 func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

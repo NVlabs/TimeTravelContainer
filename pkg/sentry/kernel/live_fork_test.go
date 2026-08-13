@@ -525,6 +525,53 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	parent.Release()
 }
 
+func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchIDs: []string{"remote-one", "remote-two"}})
+	if err != nil {
+		parent.Release()
+		t.Fatal(err)
+	}
+	targetMF := newRemoteKernelMemoryFile(t)
+	children := make([]*kernel.Kernel, 0, 2)
+	for i, id := range []string{"remote-one", "remote-two"} {
+		reader := pgalloc.NewLoopbackRemoteReader(capture.Snapshots[i], pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4)
+		capture.Snapshots[i] = nil
+		child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
+			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, reader,
+			kernel.DistributedForkLoadOptions{
+				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: id,
+				FilesystemResources: capture.FilesystemResources, DemandOnly: true,
+			})
+		if err != nil {
+			t.Fatalf("import %d: %v", i, err)
+		}
+		if child.MemoryFile() != targetMF {
+			t.Fatalf("import %d used a different family MemoryFile", i)
+		}
+		if err := child.MemoryFile().AwaitLoadAll(); err != nil {
+			t.Fatal(err)
+		}
+		if err := child.StartPaused(); err != nil {
+			t.Fatal(err)
+		}
+		children = append(children, child)
+	}
+	if err := parent.StartPaused(); err != nil {
+		t.Fatal(err)
+	}
+	for _, child := range children {
+		child.Release()
+	}
+	parent.Release()
+}
+
 func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
