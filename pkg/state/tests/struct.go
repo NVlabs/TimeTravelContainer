@@ -109,3 +109,9 @@ type multiName struct {
 	x, y    int64
 	z       int32
 }
+
+// +stateify savable
+type boundaryRoot struct {
+	value int64
+	peer  *boundaryRoot
+}

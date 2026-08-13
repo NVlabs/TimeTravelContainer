@@ -16,14 +16,32 @@ package kernel
 
 import (
 	"context"
+	"io"
 
 	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
 // afterLoad is invoked by stateify.
 func (ts *TaskSet) afterLoad(_ context.Context) {
 	ts.zeroLiveTasksCond.L = &ts.mu
+}
+
+// saveStateGraph serializes exactly one Kernel. A Sentry process may contain
+// multiple TTC branches, while a few upstream registries remain process-wide.
+// Filter branch-owned registry entries and reject any future path that reaches
+// a peer Kernel instead of silently combining both branches in one image.
+//
+// Preconditions: k.extMu must be locked.
+func (k *Kernel) saveStateGraph(ctx context.Context, w io.Writer) (state.Stats, error) {
+	k.filteringBranchDanglingEndpoints = true
+	defer func() {
+		k.filteringBranchDanglingEndpoints = false
+	}()
+	return state.SaveWithOptions(ctx, w, k, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	})
 }
 
 // saveDanglingEndpoints is invoked by stateify.

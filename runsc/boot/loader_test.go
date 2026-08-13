@@ -1388,11 +1388,15 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	}
 	liveForkTestMMReadContext(t, ctx, parentTask, readonlyMapAddr, "host-data")
 
-	childInfo, err := l.family.Fork(&ForkBranchArgs{ID: "child"})
+	// Use the batch path so the primary child is serialized once more to seed
+	// its sibling. This catches missing save/resume lifecycle pairing on the
+	// primary (in particular, TCP beforeSave freezes endpoint packet queues).
+	childInfos, err := l.family.ForkMany(&ForkBranchesArgs{IDs: []string{"child", "batch-sibling"}})
 	parentTCPClient.EventUnregister(&transientNetworkWaiter)
 	if err != nil {
 		t.Fatalf("forking live loader: %v", err)
 	}
+	childInfo := childInfos[0]
 	if got, want := childInfo.State, BranchRunning; got != want {
 		t.Errorf("child state after fork: got %q, want %q", got, want)
 	}

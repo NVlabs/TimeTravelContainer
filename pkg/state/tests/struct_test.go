@@ -15,8 +15,12 @@
 package tests
 
 import (
+	"bytes"
+	"context"
 	"math/rand"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 func TestEmptyStruct(t *testing.T) {
@@ -103,4 +107,23 @@ func TestMultiNameFields(t *testing.T) {
 	runTestCases(t, false, "multi-name-field", []any{
 		multiName{b: "foo", c: "bar", x: 10, y: 20, z: -30},
 	})
+}
+
+func TestRejectMultipleRootObjects(t *testing.T) {
+	root := &boundaryRoot{value: 1}
+	root.peer = &boundaryRoot{value: 2}
+	var image bytes.Buffer
+	if _, err := state.SaveWithOptions(context.Background(), &image, root, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	}); err == nil {
+		t.Fatal("SaveWithOptions unexpectedly accepted a distinct root object")
+	}
+
+	root.peer = root
+	image.Reset()
+	if _, err := state.SaveWithOptions(context.Background(), &image, root, state.SaveOptions{
+		RejectMultipleRootObjects: true,
+	}); err != nil {
+		t.Fatalf("SaveWithOptions rejected a reference to the root itself: %v", err)
+	}
 }

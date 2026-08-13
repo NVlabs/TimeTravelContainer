@@ -87,21 +87,40 @@ func (e *ErrState) Unwrap() error {
 	return e.err
 }
 
+// SaveOptions controls additional object-graph invariants enforced by Save.
+type SaveOptions struct {
+	// RejectMultipleRootObjects rejects references to an object whose type is
+	// the same as the root object but whose address differs from the root. This
+	// is useful when the root represents an isolation boundary, such as a
+	// sentry Kernel: accidentally reaching a peer root must fail instead of
+	// silently folding both object graphs into one image.
+	RejectMultipleRootObjects bool
+}
+
 // Save saves the given object state.
 func Save(ctx context.Context, w io.Writer, rootPtr any) (Stats, error) {
+	return SaveWithOptions(ctx, w, rootPtr, SaveOptions{})
+}
+
+// SaveWithOptions saves the given object state while enforcing opts.
+func SaveWithOptions(ctx context.Context, w io.Writer, rootPtr any, opts SaveOptions) (Stats, error) {
+	root := reflect.ValueOf(rootPtr).Elem()
 	// Create the encoding state.
 	es := encodeState{
-		ctx:            ctx,
-		w:              wire.Writer{Writer: w},
-		types:          makeTypeEncodeDatabase(),
-		zeroValues:     make(map[reflect.Type]*objectEncodeState),
-		pending:        make(map[objectID]*objectEncodeState),
-		encodedStructs: make(map[reflect.Value]*wire.Struct),
+		ctx:                       ctx,
+		w:                         wire.Writer{Writer: w},
+		types:                     makeTypeEncodeDatabase(),
+		zeroValues:                make(map[reflect.Type]*objectEncodeState),
+		pending:                   make(map[objectID]*objectEncodeState),
+		encodedStructs:            make(map[reflect.Value]*wire.Struct),
+		rootAddr:                  root.Addr().Pointer(),
+		rootType:                  root.Type(),
+		rejectMultipleRootObjects: opts.RejectMultipleRootObjects,
 	}
 
 	// Perform the encoding.
 	err := safely(func() {
-		es.Save(reflect.ValueOf(rootPtr).Elem())
+		es.Save(root)
 	})
 	return es.stats, err
 }

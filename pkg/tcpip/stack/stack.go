@@ -2151,11 +2151,9 @@ func (s *Stack) Restore() {
 		e.Restore(s)
 	}
 
-	// Make sure all the endpoints are loaded correctly before resuming the
-	// protocol level background workers.
-	tcpip.AsyncLoading.Wait()
-
-	// Now restore any protocol level background workers.
+	// Restore protocol-level background workers. Protocol implementations wait
+	// for their own endpoint reconstruction, which keeps concurrent TTC branch
+	// restores independent.
 	for _, p := range s.transportProtocols {
 		p.proto.Restore()
 	}

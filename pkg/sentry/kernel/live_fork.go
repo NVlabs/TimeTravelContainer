@@ -413,10 +413,6 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			mm.CtxLiveForkPMASnapshots:           pmaSnapshots,
 		})
 		metadataStarted := time.Now()
-		k.filteringBranchDanglingEndpoints = true
-		defer func() {
-			k.filteringBranchDanglingEndpoints = false
-		}()
 		if err := streamLiveForkState(saveCtx, loadCtx, k, child); err != nil {
 			return err
 		}
@@ -645,6 +641,15 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 	var metadata bytes.Buffer
 	var snapshots mm.LiveForkPMASnapshots
 	err := k.quiescePausedAnd(k.SupervisorContext(), func() error {
+		// Endpoint beforeSave hooks freeze packet queues and register them for
+		// resumption. Pair the metadata-only save with the same stack lifecycle
+		// used by LiveFork and Kernel.SaveTo; otherwise the primary batch child
+		// retains frozen endpoints while only the decoded siblings are thawed.
+		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+			stack := rootNS.Stack()
+			stack.Pause()
+			defer stack.Resume()
+		}
 		k.prepareSharedMemoryForLiveFork(k.SupervisorContext())
 
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
@@ -668,12 +673,8 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 		defer clearSnapshots()
 		k.mf.MarkSavable()
 
-		k.filteringBranchDanglingEndpoints = true
-		defer func() {
-			k.filteringBranchDanglingEndpoints = false
-		}()
 		buffered := bufio.NewWriterSize(&metadata, 64<<10)
-		if _, err := state.Save(saveCtx, buffered, k); err != nil {
+		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
 			return fmt.Errorf("saving live-fork metadata: %w", err)
 		}
 		if err := buffered.Flush(); err != nil {
@@ -1230,7 +1231,7 @@ func streamLiveForkState(saveCtx, loadCtx context.Context, parent, child *Kernel
 	saveErrCh := make(chan error, 1)
 	go func() {
 		bufferedWriter := bufio.NewWriterSize(writer, 64<<10)
-		_, err := state.Save(saveCtx, bufferedWriter, parent)
+		_, err := parent.saveStateGraph(saveCtx, bufferedWriter)
 		if err == nil {
 			err = bufferedWriter.Flush()
 		}

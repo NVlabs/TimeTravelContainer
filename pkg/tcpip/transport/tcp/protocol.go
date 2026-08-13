@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
@@ -89,6 +90,11 @@ const (
 type protocol struct {
 	stack *stack.Stack
 
+	// restore coordinates endpoint reconstruction for this protocol instance.
+	// It must be per-stack: TTC may restore multiple branch stacks concurrently
+	// in one Sentry process (for example, a batch live fork).
+	restore restoreCoordinator `state:"nosave"`
+
 	mu                         protocolRWMutex `state:"nosave"`
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
@@ -119,6 +125,13 @@ type protocol struct {
 	// freshly drawn from the secure RNG on restore.
 	seqnumSecret   [16]byte `state:"nosave"`
 	tsOffsetSecret [16]byte `state:"nosave"`
+}
+
+type restoreCoordinator struct {
+	connected  sync.WaitGroup
+	listening  sync.WaitGroup
+	connecting sync.WaitGroup
+	async      sync.WaitGroup
 }
 
 // Number returns the tcp protocol number.
@@ -528,6 +541,7 @@ func (p *protocol) Resume() {
 
 // Restore implements stack.TransportProtocol.Restore.
 func (p *protocol) Restore() {
+	p.restore.async.Wait()
 	p.dispatcher.start()
 }
 

@@ -2930,7 +2930,3 @@ func DeleteDanglingEndpoint(e Endpoint) {
 	delete(danglingEndpoints, e)
 	danglingEndpointsMu.Unlock()
 }
-
-// AsyncLoading is the global barrier for asynchronous endpoint loading
-// activities.
-var AsyncLoading sync.WaitGroup

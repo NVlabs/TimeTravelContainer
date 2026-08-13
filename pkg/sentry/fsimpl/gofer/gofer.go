@@ -153,10 +153,12 @@ type dentryCache struct {
 	// mu protects the below fields.
 	mu sync.Mutex `state:"nosave"`
 	// dentries contains all dentries with 0 references. Due to race conditions,
-	// it may also contain dentries with non-zero references.
-	dentries dentryList
+	// it may also contain dentries with non-zero references. Cache membership
+	// is intentionally not saved: entries are reconstructible, and a configured
+	// global cache may momentarily contain dentries from another TTC branch.
+	dentries dentryList `state:"nosave"`
 	// dentriesLen is the number of dentries in dentries.
-	dentriesLen uint64
+	dentriesLen uint64 `state:"nosave"`
 }
 
 // SetDentryCacheSize sets the size of the global gofer dentry cache.

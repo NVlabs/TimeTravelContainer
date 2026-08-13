@@ -100,15 +100,6 @@ func (e *Endpoint) saveState() EndpointState {
 	return e.EndpointState()
 }
 
-// Endpoint loading must be done in the following ordering by their state, to
-// avoid dangling connecting w/o listening peer, and to avoid conflicts in port
-// reservation.
-var connectedLoading sync.WaitGroup
-var listenLoading sync.WaitGroup
-var connectingLoading sync.WaitGroup
-
-// Bound endpoint loading happens last.
-
 // loadState is invoked by stateify.
 func (e *Endpoint) loadState(_ context.Context, epState EndpointState) {
 	// This is to ensure that the loading wait groups include all applicable
@@ -116,13 +107,13 @@ func (e *Endpoint) loadState(_ context.Context, epState EndpointState) {
 	// For restore purposes we treat all endpoints with state after
 	// StateEstablished and before StateClosed like connected endpoint.
 	if epState.connected() {
-		connectedLoading.Add(1)
+		e.protocol.restore.connected.Add(1)
 	}
 	switch {
 	case epState == StateListen:
-		listenLoading.Add(1)
+		e.protocol.restore.listening.Add(1)
 	case epState.connecting():
-		connectingLoading.Add(1)
+		e.protocol.restore.connecting.Add(1)
 	}
 	// Directly update the state here rather than using e.setEndpointState
 	// as the endpoint is still being loaded and the stack reference is not
@@ -152,8 +143,8 @@ func (e *Endpoint) closeEndpointAtRestore() {
 	}
 
 	if epState.handshake() {
-		connectedLoading.Wait()
-		listenLoading.Wait()
+		e.protocol.restore.connected.Wait()
+		e.protocol.restore.listening.Wait()
 	}
 
 	// Put the endpoint in the error state and do cleanup. Do not
@@ -169,9 +160,9 @@ func (e *Endpoint) closeEndpointAtRestore() {
 	tcpip.DeleteDanglingEndpoint(e)
 
 	if epState.connected() {
-		connectedLoading.Done()
+		e.protocol.restore.connected.Done()
 	} else {
-		connectingLoading.Done()
+		e.protocol.restore.connecting.Done()
 	}
 }
 
@@ -257,7 +248,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			log.Warningf("TCP endpoint connect failed for connected endpoint with ID: %+v err: %v", id, err)
 			e.mu.Unlock()
 			e.Close()
-			connectedLoading.Done()
+			e.protocol.restore.connected.Done()
 			return
 		}
 		e.state.Store(e.origEndpointState)
@@ -278,11 +269,11 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		}
 		e.mu.Unlock()
 		e.requeueOnRestore()
-		connectedLoading.Done()
+		e.protocol.restore.connected.Done()
 	case epState == StateListen:
-		tcpip.AsyncLoading.Add(1)
+		e.protocol.restore.async.Add(1)
 		go func() {
-			connectedLoading.Wait()
+			e.protocol.restore.connected.Wait()
 			e.LockUser()
 			// All endpoints will be moved to initial state after
 			// restore. Set endpoint to its originial listen state.
@@ -292,29 +283,29 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			e.listenCtx = newListenContext(e.stack, e.protocol, e, rcvWnd, e.ops.GetV6Only(), e.NetProto)
 			e.UnlockUser()
 			e.requeueOnRestore()
-			listenLoading.Done()
-			tcpip.AsyncLoading.Done()
+			e.protocol.restore.listening.Done()
+			e.protocol.restore.async.Done()
 		}()
 	case epState == StateConnecting:
 		// Initial SYN hasn't been sent yet so initiate a connect.
-		tcpip.AsyncLoading.Add(1)
+		e.protocol.restore.async.Add(1)
 		go func() {
-			connectedLoading.Wait()
-			listenLoading.Wait()
+			e.protocol.restore.connected.Wait()
+			e.protocol.restore.listening.Wait()
 			bind()
 			err := e.Connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.TransportEndpointInfo.ID.RemotePort})
 			if _, ok := err.(*tcpip.ErrConnectStarted); !ok {
 				log.Warningf("TCP endpoint connect failed for connecting endpoint with ID: %+v err: %v", id, err)
 				e.Close()
 			}
-			connectingLoading.Done()
-			tcpip.AsyncLoading.Done()
+			e.protocol.restore.connecting.Done()
+			e.protocol.restore.async.Done()
 		}()
 	case epState == StateSynSent || epState == StateSynRecv:
-		tcpip.AsyncLoading.Add(1)
+		e.protocol.restore.async.Add(1)
 		go func() {
-			connectedLoading.Wait()
-			listenLoading.Wait()
+			e.protocol.restore.connected.Wait()
+			e.protocol.restore.listening.Wait()
 			// Initial SYN has been sent/received so we should bind the
 			// ports start the retransmit timer for the SYNs and let it
 			// naturally complete the connection.
@@ -326,8 +317,8 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 				e.mu.Unlock()
 				log.Warningf("FindRoute failed when restoring endpoint w/ ID: %+v err: %v", id, err)
 				e.Close()
-				connectingLoading.Done()
-				tcpip.AsyncLoading.Done()
+				e.protocol.restore.connecting.Done()
+				e.protocol.restore.async.Done()
 				return
 			}
 			e.route = r
@@ -336,19 +327,19 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 				panic(fmt.Sprintf("newBackOffTimer(_, %s, %s, _) failed: %s", InitialRTO, MaxRTO, err))
 			}
 			e.h.retransmitTimer = timer
-			connectingLoading.Done()
-			tcpip.AsyncLoading.Done()
+			e.protocol.restore.connecting.Done()
+			e.protocol.restore.async.Done()
 			e.mu.Unlock()
 			e.requeueOnRestore()
 		}()
 	case epState == StateBound:
-		tcpip.AsyncLoading.Add(1)
+		e.protocol.restore.async.Add(1)
 		go func() {
-			connectedLoading.Wait()
-			listenLoading.Wait()
-			connectingLoading.Wait()
+			e.protocol.restore.connected.Wait()
+			e.protocol.restore.listening.Wait()
+			e.protocol.restore.connecting.Wait()
 			bind()
-			tcpip.AsyncLoading.Done()
+			e.protocol.restore.async.Done()
 		}()
 	case epState == StateClose:
 		e.isPortReserved = false

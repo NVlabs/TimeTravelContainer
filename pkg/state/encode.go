@@ -105,6 +105,13 @@ type encodeState struct {
 
 	// stats tracks time data.
 	stats Stats
+
+	// rootAddr and rootType identify the object-graph root. If
+	// rejectMultipleRootObjects is true, discovering a distinct object of the
+	// root type is an isolation-boundary violation.
+	rootAddr                  uintptr
+	rootType                  reflect.Type
+	rejectMultipleRootObjects bool
 }
 
 // isSameSizeParent returns true if child is a field value or element within
@@ -234,6 +241,9 @@ func (es *encodeState) resolve(obj reflect.Value, ref *wire.Ref) {
 	// If not a map, then the object must be a pointer.
 	if obj.Kind() != reflect.Ptr {
 		Failf("attempt to record non-map and non-pointer object %#v", obj)
+	}
+	if es.rejectMultipleRootObjects && obj.Type().Elem() == es.rootType && addr != es.rootAddr {
+		Failf("object graph crossed root boundary: root is %s at %#x, reached distinct %s at %#x", es.rootType, es.rootAddr, obj.Type().Elem(), addr)
 	}
 
 	obj = obj.Elem() // Value from here.
