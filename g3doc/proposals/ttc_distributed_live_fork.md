@@ -79,6 +79,13 @@ writes still CoW at 4 KiB. Import transactions remain independently named,
 published, cancelled, and garbage-collected even though their visible branches
 share a runtime.
 
+Lazy readers are resources of the node-local family, even though a Kernel owns
+their cancellation handle while it is alive. Removing that branch transfers
+the handle to a surviving peer that uses the same `MemoryFile`; it does not
+materialize or copy unresolved pages. Dehydration is the durability boundary:
+it faults the dehydrating branch's exact retained graph while the family
+readers are alive, then publishes its chunks before releasing the Kernel.
+
 A live remote fork must not wait for the complete memory image to be written.
 It therefore uses the existing page-granular TCP dependency as a bridge:
 
@@ -209,11 +216,13 @@ target already owns.
 4. **Durable repository lifetime:** writable filesystem repositories are
    promoted outside source-container metadata before target reservation and
    are garbage-collected only after no container spec references them.
-5. **Dehydration drains dependencies:** dehydration materializes any remaining
+5. **Peer removal transfers lazy-reader ownership:** removing one imported
+   branch does not cancel a reader still needed by a peer sharing its
+   `MemoryFile`, and does not eagerly copy the peer's pages.
+6. **Dehydration drains dependencies:** dehydration materializes any remaining
    snapshot-backed pages before releasing the target Kernel graph. Rehydration
-   retains the target's actual repository branch identity, even though a
-   distributed target is presented as visible branch `main`.
-6. **Idempotent recovery:** repeated reserve, publish, dependency polling,
+   retains the branch's actual repository identity.
+7. **Idempotent recovery:** repeated reserve, publish, dependency polling,
    cancellation, and cleanup cannot publish two targets or delete a referenced
    snapshot/repository.
 

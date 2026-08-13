@@ -844,3 +844,21 @@ func (k *Kernel) DrainDistributedForkMemory() {
 		k.remotePageLoad.Drain()
 	}
 }
+
+// TransferDistributedForkMemorySources moves ownership of unresolved remote
+// readers to a surviving peer Kernel. The readers are already attached to the
+// shared MemoryFiles, so transferring lifecycle ownership requires no page
+// copy and keeps branch removal independent of resident-memory size.
+func (k *Kernel) TransferDistributedForkMemorySources(target *Kernel) {
+	if target == nil || target == k {
+		return
+	}
+	if k.remotePageLoad != nil {
+		target.auxiliaryRemotePageLoads = append(target.auxiliaryRemotePageLoads, k.remotePageLoad)
+		k.remotePageLoad = nil
+	}
+	target.auxiliaryRemotePageLoads = append(target.auxiliaryRemotePageLoads, k.auxiliaryRemotePageLoads...)
+	k.auxiliaryRemotePageLoads = nil
+	k.remoteLoadRanges = nil
+	k.remoteHandoffManifest = ttcchunk.ManifestID{}
+}

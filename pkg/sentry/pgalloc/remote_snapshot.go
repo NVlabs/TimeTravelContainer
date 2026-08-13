@@ -1438,6 +1438,53 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 	return written, nil
 }
 
+// EnsureResident faults every page retained by s into its MemoryFile without
+// copying page bytes. A dehydration capture uses this before releasing its
+// Kernel because pages shared with another imported branch may be owned by
+// that branch's asynchronous loader rather than by the capture's loader. Once
+// resident, snapshot references keep the pages valid until they are persisted
+// and evicted.
+func (s *RemoteSnapshot) EnsureResident() error {
+	if s == nil {
+		return errors.New("remote snapshot is nil")
+	}
+	type region struct {
+		id     RemoteRegionID
+		length uint64
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("remote snapshot is closed")
+	}
+	regions := make([]region, len(s.regions))
+	for i := range s.regions {
+		regions[i] = region{id: s.regions[i].ID, length: s.regions[i].Range.Length()}
+	}
+	s.mu.Unlock()
+
+	for _, region := range regions {
+		for start := uint64(0); start < region.length; {
+			length := min(uint64(SparseChunkBytes), region.length-start)
+			relative := memmap.FileRange{Start: start, End: start + length}
+			lease, err := s.AcquireRegion(region.id, relative)
+			if err != nil {
+				return err
+			}
+			blocks, mapErr := lease.File().MapInternal(lease.Range(), hostarch.Read)
+			lease.Close()
+			if mapErr != nil {
+				return mapErr
+			}
+			if got := blocks.NumBytes(); got != length {
+				return fmt.Errorf("materialized snapshot range has %d bytes, want %d", got, length)
+			}
+			start += length
+		}
+	}
+	return nil
+}
+
 // AcknowledgeStreamRange releases source snapshot references for an aligned
 // packed-stream range after the target has installed it. Duplicate and
 // overlapping acknowledgements are idempotent.

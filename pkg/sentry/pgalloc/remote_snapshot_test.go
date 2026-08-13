@@ -521,6 +521,49 @@ func TestDemandOnlyRemotePageLoad(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotEnsureResidentBeforeLoaderCancellation(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	target, targetFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*17 + 3)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	sourceSnapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(sourceSnapshot, hostarch.PageSize, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	capture, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: targetFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Close()
+	if err := capture.EnsureResident(); err != nil {
+		t.Fatalf("EnsureResident: %v", err)
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+
+	got := make([]byte, len(want))
+	if n, err := capture.CopyStreamAt(got, 0); err != nil || n != len(got) {
+		t.Fatalf("CopyStreamAt after loader cancellation: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("materialized snapshot bytes differ")
+	}
+}
+
 func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
 	target, targetFR := newRemoteTestMemoryFile(t, pageCount)

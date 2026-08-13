@@ -374,22 +374,6 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 	if opts.BranchID == "" {
 		return nil, errors.New("dehydration capture requires a filesystem branch ID")
 	}
-	// A remote target must become source-independent before its Kernel graph can
-	// be released. This also makes every byte available to the local persistent
-	// backing file before SyncAndDropCache runs.
-	loads := make([]*pgalloc.AsyncPagesFileLoad, 0, len(k.auxiliaryRemotePageLoads)+1)
-	if k.remotePageLoad != nil {
-		loads = append(loads, k.remotePageLoad)
-	}
-	loads = append(loads, k.auxiliaryRemotePageLoads...)
-	for _, load := range loads {
-		load.Drain()
-	}
-	for _, load := range loads {
-		if err := load.Wait(); err != nil {
-			return nil, fmt.Errorf("materializing remote memory before dehydration: %w", err)
-		}
-	}
 	k.tasks.waitForExternalStop()
 	k.ReceiveTaskStates()
 	image := &DehydrationCapture{

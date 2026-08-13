@@ -555,13 +555,19 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		if child.MemoryFile() != targetMF {
 			t.Fatalf("import %d used a different family MemoryFile", i)
 		}
-		if err := child.MemoryFile().AwaitLoadAll(); err != nil {
-			t.Fatal(err)
-		}
 		if err := child.StartPaused(); err != nil {
 			t.Fatal(err)
 		}
 		children = append(children, child)
+	}
+	// The second import reused the first import's still-unresolved physical
+	// chunks and therefore has no reader of its own for those chunks. Transfer
+	// the owning import's readers before release, as SandboxFamily.Destroy does.
+	children[0].TransferDistributedForkMemorySources(children[1])
+	children[0].Release()
+	children = children[1:]
+	if err := children[0].MemoryFile().AwaitLoadAll(); err != nil {
+		t.Fatal(err)
 	}
 	if err := parent.StartPaused(); err != nil {
 		t.Fatal(err)

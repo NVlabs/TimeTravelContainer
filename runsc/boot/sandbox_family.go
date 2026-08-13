@@ -1835,6 +1835,22 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		return err
 	}
 	metadataOwned = true
+	// A branch imported into an existing family can reuse ranges whose lazy
+	// loader belongs to a peer Kernel. Materialize the exact captured graph
+	// while every such loader is still alive; releasing k first would cancel its
+	// loader and could leave the later sparse export unable to read a page.
+	if err := image.SparseSnapshot.EnsureResident(); err != nil {
+		_ = image.Close()
+		if wasRunning {
+			k.Unpause()
+			_ = control.PostResume(k, nil)
+		}
+		f.mu.Lock()
+		b.state = kernelBranchState(k)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("materializing branch memory before dehydration: %w", err)
+	}
 	if b.watchdog != nil {
 		b.watchdog.Stop()
 	}
@@ -2154,6 +2170,19 @@ func (f *SandboxFamily) Destroy(id string) error {
 		b.opMu.Unlock()
 		return fmt.Errorf("branch %q is %s", id, state)
 	}
+	// Stable page/version chunks reused by another imported branch may still be
+	// supplied by this branch's lazy reader. Transfer lifecycle ownership to a
+	// surviving peer instead of materializing memory on the removal path.
+	var remoteSourceTarget *kernel.Kernel
+	if b.k != nil {
+		familyMF := b.k.MemoryFile()
+		for candidateID, candidate := range f.branches {
+			if candidateID != id && candidate.k != nil && candidate.k.MemoryFile() == familyMF {
+				remoteSourceTarget = candidate.k
+				break
+			}
+		}
+	}
 	var loaderKernel *kernel.Kernel
 	var loaderWatchdog *watchdog.Watchdog
 	loaderChanged := id == f.loaderBranchID
@@ -2240,6 +2269,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 	if dog != nil {
 		dog.Stop()
 	}
+	b.k.TransferDistributedForkMemorySources(remoteSourceTarget)
 	b.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 	if paused {
 		b.k.Unpause()
