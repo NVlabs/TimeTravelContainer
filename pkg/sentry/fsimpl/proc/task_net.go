@@ -80,15 +80,15 @@ func (fs *filesystem) newTaskNetDir(ctx context.Context, task *kernel.Task) kern
 			"psched": fs.newInode(ctx, root, 0444, newStaticFile(psched)),
 			"ptype":  fs.newInode(ctx, root, 0444, newStaticFile(ptype)),
 			"route":  fs.newInode(ctx, root, 0444, &netRouteData{stack: stack}),
-			"tcp":    fs.newInode(ctx, root, 0444, &netTCPData{kernel: k}),
-			"udp":    fs.newInode(ctx, root, 0444, &netUDPData{kernel: k}),
-			"unix":   fs.newInode(ctx, root, 0444, &netUnixData{kernel: k}),
+			"tcp":    fs.newInode(ctx, root, 0444, &netTCPData{branchKernelRef: newBranchKernelRef(k)}),
+			"udp":    fs.newInode(ctx, root, 0444, &netUDPData{branchKernelRef: newBranchKernelRef(k)}),
+			"unix":   fs.newInode(ctx, root, 0444, &netUnixData{branchKernelRef: newBranchKernelRef(k)}),
 		}
 
 		if stack.SupportsIPv6() {
 			contents["if_inet6"] = fs.newInode(ctx, root, 0444, &ifinet6{stack: stack})
 			contents["ipv6_route"] = fs.newInode(ctx, root, 0444, newStaticFile(""))
-			contents["tcp6"] = fs.newInode(ctx, root, 0444, &netTCP6Data{kernel: k})
+			contents["tcp6"] = fs.newInode(ctx, root, 0444, &netTCP6Data{branchKernelRef: newBranchKernelRef(k)})
 			contents["udp6"] = fs.newInode(ctx, root, 0444, newStaticFile(upd6))
 		}
 	}
@@ -206,7 +206,7 @@ func (n *netDevData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 type netUnixData struct {
 	kernfs.DynamicBytesFile
 
-	kernel *kernel.Kernel
+	branchKernelRef
 }
 
 var _ dynamicInode = (*netUnixData)(nil)
@@ -214,7 +214,7 @@ var _ dynamicInode = (*netUnixData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (n *netUnixData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("Num       RefCount Protocol Flags    Type St Inode Path\n")
-	for _, se := range n.kernel.ListSockets() {
+	for _, se := range n.k.ListSockets() {
 		s := se.Sock
 		if !s.TryIncRef() {
 			// Racing with socket destruction, this is ok.
@@ -478,14 +478,14 @@ func commonGenerateTCP(ctx context.Context, buf *bytes.Buffer, k *kernel.Kernel,
 type netTCPData struct {
 	kernfs.DynamicBytesFile
 
-	kernel *kernel.Kernel
+	branchKernelRef
 }
 
 var _ dynamicInode = (*netTCPData)(nil)
 
 func (d *netTCPData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     \n")
-	return commonGenerateTCP(ctx, buf, d.kernel, linux.AF_INET)
+	return commonGenerateTCP(ctx, buf, d.k, linux.AF_INET)
 }
 
 // netTCP6Data implements vfs.DynamicBytesSource for /proc/net/tcp6.
@@ -494,14 +494,14 @@ func (d *netTCPData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 type netTCP6Data struct {
 	kernfs.DynamicBytesFile
 
-	kernel *kernel.Kernel
+	branchKernelRef
 }
 
 var _ dynamicInode = (*netTCP6Data)(nil)
 
 func (d *netTCP6Data) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
-	return commonGenerateTCP(ctx, buf, d.kernel, linux.AF_INET6)
+	return commonGenerateTCP(ctx, buf, d.k, linux.AF_INET6)
 }
 
 // netUDPData implements vfs.DynamicBytesSource for /proc/net/udp.
@@ -510,7 +510,7 @@ func (d *netTCP6Data) Generate(ctx context.Context, buf *bytes.Buffer) error {
 type netUDPData struct {
 	kernfs.DynamicBytesFile
 
-	kernel *kernel.Kernel
+	branchKernelRef
 }
 
 var _ dynamicInode = (*netUDPData)(nil)
@@ -524,7 +524,7 @@ func (d *netUDPData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 	buf.WriteString("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             \n")
 
-	for _, se := range d.kernel.ListSockets() {
+	for _, se := range d.k.ListSockets() {
 		s := se.Sock
 		if !s.TryIncRef() {
 			// Racing with socket destruction, this is ok.

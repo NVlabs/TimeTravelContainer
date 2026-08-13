@@ -71,6 +71,7 @@ declare_rwmutex(
 go_library(
     name = "proc",
     srcs = [
+		"branch_kernel.go",
         "checkpoint.go",
         "dentries_mutex.go",
         "fd_dir_inode_refs.go",
@@ -112,6 +113,7 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/pipe",
         "//pkg/sentry/kernel/version",
+		"//pkg/state",
         "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/mm",
