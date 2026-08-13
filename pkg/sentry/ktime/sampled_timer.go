@@ -15,9 +15,11 @@
 package ktime
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -25,7 +27,7 @@ import (
 // SampledTimer implements Timer using a goroutine that reads a SampledClock
 // whenever an expiration is expected to have occurred.
 //
-// +stateify savable
+// +stateify type
 type SampledTimer struct {
 	// clock is the time source. clock is protected by mu and clockSeq.
 	clockSeq sync.SeqCount `state:"nosave"`
@@ -56,6 +58,33 @@ type SampledTimer struct {
 	// event. It is also closed by SampledTimer.Destroy to instruct the
 	// goroutine to exit.
 	events chan struct{} `state:"nosave"`
+}
+
+// StateSave implements state.SaverLoader.StateSave. State serialization may
+// encounter a timer that is reachable from the object graph but not yet
+// discoverable by Kernel.pauseTimeLocked's task-table walk. Snapshot mutable
+// fields under mu so a concurrent tick cannot race with the encoder.
+func (t *SampledTimer) StateSave(s state.Sink) {
+	t.mu.Lock()
+	clock := t.clock
+	listener := t.listener
+	setting := t.setting
+	pauseState := t.pauseState
+	t.mu.Unlock()
+
+	s.Save(0, &clock)
+	s.Save(1, &listener)
+	s.Save(2, &setting)
+	s.Save(3, &pauseState)
+}
+
+// StateLoad implements state.SaverLoader.StateLoad. A restored SampledTimer
+// has no host timer resources until Resume lazily calls init.
+func (t *SampledTimer) StateLoad(_ context.Context, s state.Source) {
+	s.Load(0, &t.clock)
+	s.Load(1, &t.listener)
+	s.Load(2, &t.setting)
+	s.Load(3, &t.pauseState)
 }
 
 type timerPauseState uint8
