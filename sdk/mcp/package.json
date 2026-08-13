@@ -18,7 +18,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/gzz2000/TimeTravelOS.git",
+    "url": "https://github.com/gzz2000/TimeTravelContainer.git",
     "directory": "sdk/mcp"
   },
   "scripts": {

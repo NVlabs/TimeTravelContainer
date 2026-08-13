@@ -74,6 +74,9 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     await client.connect(transport);
     const listed = await client.listTools();
     assert(listed.tools.some((tool) => tool.name === "ttc_fork"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_fork_many"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_checkpoint"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_restore"));
     assert(listed.tools.some((tool) => tool.name === "ttc_command"));
 
     const status = await client.callTool({ name: "ttc_status", arguments: {} });
@@ -87,6 +90,52 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     assert.match((command.content[0] as { text: string }).text, /ran:ls --json/);
     assert.deepEqual(mock.requests[1].args, ["ls", "--json"]);
     assert.equal(mock.requests[1].options, undefined);
+
+    await client.callTool({
+      name: "ttc_fork_many",
+      arguments: {
+        source: "demo@main",
+        destinations: ["remote@one", "remote@two"],
+        paused: true,
+        targetNode: "node-b",
+      },
+    });
+    assert.deepEqual(mock.requests[2].args, [
+      "fork",
+      "--paused",
+      "--target",
+      "node-b",
+      "demo@main",
+      "remote@one",
+      "remote@two",
+    ]);
+
+    await client.callTool({
+      name: "ttc_checkpoint",
+      arguments: {
+        target: "demo@main",
+        file: "/tmp/demo.ttc",
+        compression: "none",
+      },
+    });
+    assert.deepEqual(mock.requests[3].args, [
+      "checkpoint",
+      "--compression",
+      "none",
+      "demo@main",
+      "/tmp/demo.ttc",
+    ]);
+
+    await client.callTool({
+      name: "ttc_stop",
+      arguments: { target: "demo@main", timeoutSeconds: 12 },
+    });
+    assert.deepEqual(mock.requests[4].args, [
+      "stop",
+      "--time",
+      "12",
+      "demo@main",
+    ]);
   } finally {
     await client.close();
     await new Promise<void>((resolveClose) => mock.server.close(() => resolveClose()));

@@ -243,6 +243,10 @@ impl Client {
         self.command(args)
     }
 
+    pub fn start(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["start", target])
+    }
+
     pub fn exec(&self, target: &str, command: &[&str]) -> Result<CommandResult, Error> {
         let mut args = vec!["exec", target];
         args.extend_from_slice(command);
@@ -262,6 +266,35 @@ impl Client {
         }
     }
 
+    pub fn fork_many(
+        &self,
+        source: &str,
+        destinations: &[&str],
+        paused: bool,
+        target_node: Option<&str>,
+    ) -> Result<CommandResult, Error> {
+        if destinations.is_empty() {
+            return Err(Error::InvalidArguments(
+                "destinations must not be empty".to_owned(),
+            ));
+        }
+        let mut args = vec!["fork".to_owned()];
+        if paused {
+            args.push("--paused".to_owned());
+        }
+        if let Some(target_node) = target_node {
+            args.push("--target".to_owned());
+            args.push(target_node.to_owned());
+        }
+        args.push(source.to_owned());
+        args.extend(
+            destinations
+                .iter()
+                .map(|destination| (*destination).to_owned()),
+        );
+        self.command(args)
+    }
+
     pub fn pause(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["pause", target])
     }
@@ -278,8 +311,67 @@ impl Client {
         self.command(["rehydrate", target])
     }
 
+    pub fn checkpoint(
+        &self,
+        target: &str,
+        file: impl AsRef<Path>,
+        compression: &str,
+    ) -> Result<CommandResult, Error> {
+        let file = absolute_path(file.as_ref())?;
+        self.command([
+            "checkpoint".to_owned(),
+            "--compression".to_owned(),
+            compression.to_owned(),
+            target.to_owned(),
+            file.to_string_lossy().into_owned(),
+        ])
+    }
+
+    pub fn restore(
+        &self,
+        file: impl AsRef<Path>,
+        name: Option<&str>,
+    ) -> Result<CommandResult, Error> {
+        let file = absolute_path(file.as_ref())?;
+        let mut args = vec!["restore".to_owned()];
+        if let Some(name) = name {
+            args.extend(["--name".to_owned(), name.to_owned()]);
+        }
+        args.push(file.to_string_lossy().into_owned());
+        self.command(args)
+    }
+
     pub fn stop(&self, target: &str) -> Result<CommandResult, Error> {
-        self.command(["stop", target])
+        self.timed_lifecycle_command("stop", target, None)
+    }
+
+    pub fn stop_with_timeout(
+        &self,
+        target: &str,
+        timeout_seconds: i64,
+    ) -> Result<CommandResult, Error> {
+        self.timed_lifecycle_command("stop", target, Some(timeout_seconds))
+    }
+
+    pub fn restart(
+        &self,
+        target: &str,
+        timeout_seconds: Option<i64>,
+    ) -> Result<CommandResult, Error> {
+        self.timed_lifecycle_command("restart", target, timeout_seconds)
+    }
+
+    pub fn kill(&self, target: &str, signal: Option<&str>) -> Result<CommandResult, Error> {
+        let mut args = vec!["kill".to_owned()];
+        if let Some(signal) = signal {
+            args.extend(["--signal".to_owned(), signal.to_owned()]);
+        }
+        args.push(target.to_owned());
+        self.command(args)
+    }
+
+    pub fn wait(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["wait", target])
     }
 
     pub fn remove(&self, target: &str, force: bool) -> Result<CommandResult, Error> {
@@ -288,6 +380,20 @@ impl Client {
         } else {
             self.command(["rm", target])
         }
+    }
+
+    fn timed_lifecycle_command(
+        &self,
+        command: &str,
+        target: &str,
+        timeout_seconds: Option<i64>,
+    ) -> Result<CommandResult, Error> {
+        let mut args = vec![command.to_owned()];
+        if let Some(timeout) = timeout_seconds {
+            args.extend(["--time".to_owned(), timeout.to_string()]);
+        }
+        args.push(target.to_owned());
+        self.command(args)
     }
 
     fn exchange(
@@ -369,6 +475,14 @@ fn checked_json(result: CommandResult) -> Result<Value, Error> {
         )));
     }
     Ok(result.json()?)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, Error> {
+    if path.is_absolute() {
+        Ok(path.to_owned())
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
 }
 
 fn random_request_id() -> Result<String, Error> {
@@ -494,6 +608,62 @@ mod tests {
         assert_eq!(result.status, 11);
         assert_eq!(result.stderr_text(), "failed\n");
         assert_eq!(result.check().unwrap_err().result.status, 11);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn batch_remote_fork_uses_current_cli_shape() {
+        let path = temporary_socket("fork-many");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!([
+                    "fork",
+                    "--paused",
+                    "--target",
+                    "node-b",
+                    "demo@main",
+                    "remote@one",
+                    "remote@two"
+                ])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .fork_many(
+                "demo@main",
+                &["remote@one", "remote@two"],
+                true,
+                Some("node-b"),
+            )
+            .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_normalizes_daemon_host_path() {
+        let path = temporary_socket("checkpoint");
+        let expected = env::current_dir().unwrap().join("state.ttc");
+        let server = mock_server(&path, move |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!([
+                    "checkpoint",
+                    "--compression",
+                    "none",
+                    "demo@main",
+                    expected.to_string_lossy()
+                ])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .checkpoint("demo@main", "state.ttc", "none")
+            .unwrap();
+        assert!(result.ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for TimeTravelContainer"
 license = "Apache-2.0"
-repository = "https://github.com/gzz2000/TimeTravelOS"
+repository = "https://github.com/gzz2000/TimeTravelContainer"
 keywords = ["container", "gvisor", "sandbox"]
 categories = ["api-bindings"]
 

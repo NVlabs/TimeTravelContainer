@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
@@ -122,4 +122,48 @@ test("default socket environment precedence", () => {
     "/run/a/ttcd.sock",
   );
   assert.equal(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/b" }), "/run/b/ttc/ttcd.sock");
+});
+
+test("batch remote fork uses the current CLI shape", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "fork",
+        "--paused",
+        "--target",
+        "node-b",
+        "demo@main",
+        "remote@one",
+        "remote@two",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      const result = await new Client(path).forkMany(
+        "demo@main",
+        ["remote@one", "remote@two"],
+        { paused: true, targetNode: "node-b" },
+      );
+      assert.equal(result.ok, true);
+    },
+  );
+});
+
+test("checkpoint normalizes the daemon-host path", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual((request.args as string[]).slice(0, 4), [
+        "checkpoint",
+        "--compression",
+        "none",
+        "demo@main",
+      ]);
+      assert.equal((request.args as string[])[4], resolve("state.ttc"));
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      const result = await new Client(path).checkpoint("demo@main", "state.ttc", "none");
+      assert.equal(result.ok, true);
+    },
+  );
 });

@@ -138,14 +138,40 @@ class Client:
     def run(self, image: str, command: Sequence[str] = (), *, options: Sequence[str] = ()) -> Result:
         return self.command(["run", *options, image, *command])
 
+    def start(self, target: str) -> Result:
+        return self.command(["start", target])
+
     def exec(self, target: str, command: Sequence[str], *, input: bytes | str | None = None) -> Result:
         return self.command(["exec", target, *command], input=input)
 
-    def fork(self, source: str, destination: str, *, paused: bool = False) -> Result:
+    def fork(
+        self,
+        source: str,
+        destination: str,
+        *,
+        paused: bool = False,
+        target_node: str | None = None,
+    ) -> Result:
+        return self.fork_many(
+            source, [destination], paused=paused, target_node=target_node
+        )
+
+    def fork_many(
+        self,
+        source: str,
+        destinations: Sequence[str],
+        *,
+        paused: bool = False,
+        target_node: str | None = None,
+    ) -> Result:
+        if not destinations:
+            raise ValueError("destinations must not be empty")
         args = ["fork"]
         if paused:
             args.append("--paused")
-        return self.command([*args, source, destination])
+        if target_node is not None:
+            args.extend(["--target", target_node])
+        return self.command([*args, source, *destinations])
 
     def pause(self, target: str) -> Result:
         return self.command(["pause", target])
@@ -159,8 +185,41 @@ class Client:
     def rehydrate(self, target: str) -> Result:
         return self.command(["rehydrate", target])
 
-    def stop(self, target: str) -> Result:
-        return self.command(["stop", target])
+    def checkpoint(
+        self,
+        target: str,
+        file: str | os.PathLike[str],
+        *,
+        compression: str = "flate-best-speed",
+    ) -> Result:
+        destination = str(Path(file).expanduser().resolve())
+        return self.command(
+            ["checkpoint", "--compression", compression, target, destination]
+        )
+
+    def restore(
+        self, file: str | os.PathLike[str], *, name: str | None = None
+    ) -> Result:
+        source = str(Path(file).expanduser().resolve())
+        return self.command(["restore", *(["--name", name] if name else []), source])
+
+    def stop(self, target: str, *, timeout: int | None = None) -> Result:
+        return self.command(
+            ["stop", *(["--time", str(timeout)] if timeout is not None else []), target]
+        )
+
+    def restart(self, target: str, *, timeout: int | None = None) -> Result:
+        return self.command(
+            ["restart", *(["--time", str(timeout)] if timeout is not None else []), target]
+        )
+
+    def kill(self, target: str, *, signal: str | int | None = None) -> Result:
+        return self.command(
+            ["kill", *(["--signal", str(signal)] if signal is not None else []), target]
+        )
+
+    def wait(self, target: str) -> Result:
+        return self.command(["wait", target], timeout=None)
 
     def remove(self, target: str, *, force: bool = False) -> Result:
         return self.command(["rm", *(["--force"] if force else []), target])

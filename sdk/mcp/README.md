@@ -37,14 +37,21 @@ The environment entry is optional when the host inherits the same
 
 ## Tools
 
-The server provides `ttc_status`, `ttc_list`, `ttc_inspect`, `ttc_pull`,
-`ttc_run`, `ttc_exec`, `ttc_fork`, `ttc_pause`, `ttc_resume`, `ttc_dehydrate`,
-`ttc_rehydrate`, `ttc_stop`, and
-`ttc_remove`. `ttc_command` provides the rest of TTC's non-interactive command
-surface.
+The server provides tools for daemon status, listing and inspection, image
+pull, run/start/exec, local or remote single and batch fork, pause/resume,
+dehydrate/rehydrate, checkpoint/restore, stop/restart, signal, wait, and
+removal. Tool names use the `ttc_` prefix, for example `ttc_fork_many` and
+`ttc_checkpoint`. `ttc_command` provides the rest of TTC's non-interactive
+command surface.
+
+Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
+`ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
+take longer.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
-errors. Interactive TTY sessions remain available through the CLI.
+errors. Interactive TTY sessions remain available through the CLI. Checkpoint
+paths refer to the `ttcd` host; use absolute paths when the MCP process and
+daemon have different working directories.
 
 ## Test
 

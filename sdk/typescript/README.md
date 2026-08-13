@@ -33,10 +33,26 @@ console.log(result.stdoutText());
 result.check();
 ```
 
-Use `client.command(["port", "ls", "--json", "demo@main"])` for any
+The convenience API covers run, start, exec, local and remote batch fork,
+pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
+removal. A coordinated remote fan-out uses one source pause:
+
+```ts
+(await ttc.forkMany(
+  "demo@main",
+  ["remote@candidate-a", "remote@candidate-b"],
+  { targetNode: "node-b" },
+)).check();
+```
+
+Use `client.command(["port", "ls", "--json", "demo@main"])` for any other
 non-interactive TTC command. Results keep stdout, stderr, and exit status
 separate. Pass `input` for stdin and an explicit `requestId` when deliberately
 retrying the same mutation.
+
+`checkpoint()` and `restore()` make file paths absolute before sending them to
+the daemon. Use absolute host paths in raw file-oriented commands because
+`ttcd` does not share the client process's working directory.
 
 Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or construct
 `new Client({socketPath: "/path/to/ttcd.sock"})`.

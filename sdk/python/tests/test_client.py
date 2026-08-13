@@ -125,6 +125,57 @@ class ClientTest(unittest.TestCase):
             "/run/b/ttc/ttcd.sock",
         )
 
+    def test_batch_remote_fork_uses_current_cli_shape(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                [
+                    "fork",
+                    "--paused",
+                    "--target",
+                    "node-b",
+                    "demo@main",
+                    "remote@one",
+                    "remote@two",
+                ],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                result = Client(daemon.path).fork_many(
+                    "demo@main",
+                    ["remote@one", "remote@two"],
+                    paused=True,
+                    target_node="node-b",
+                )
+                self.assertTrue(result.ok)
+            finally:
+                daemon.close()
+
+    def test_checkpoint_normalizes_daemon_host_path(self):
+        def handler(conn, request):
+            self.assertEqual(request["args"][:4], [
+                "checkpoint",
+                "--compression",
+                "none",
+                "demo@main",
+            ])
+            self.assertEqual(request["args"][4], str(Path("state.ttc").resolve()))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                self.assertTrue(
+                    Client(daemon.path)
+                    .checkpoint("demo@main", "state.ttc", compression="none")
+                    .ok
+                )
+            finally:
+                daemon.close()
+
 
 if __name__ == "__main__":
     unittest.main()

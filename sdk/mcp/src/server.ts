@@ -132,21 +132,43 @@ export function createServer(client = new Client()): McpServer {
       description: "Live-fork a running TTC container branch.",
       inputSchema: {
         source: z.string().describe("Full source container@branch selector"),
-        destination: z.string().describe("New branch name in the source family"),
+        destination: z
+          .string()
+          .describe("Local branch name, or remote container@branch selector"),
         paused: z.boolean().default(false),
+        targetNode: z.string().optional().describe("Configured remote TTC node"),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ source, destination, paused }) =>
-      commandResponse(await client.fork(source, destination, paused)),
+    async ({ source, destination, paused, targetNode }) =>
+      commandResponse(
+        await client.fork(source, destination, { paused, targetNode }),
+      ),
+  );
+
+  server.registerTool(
+    "ttc_fork_many",
+    {
+      description: "Fork several sibling branches from one coordinated source pause.",
+      inputSchema: {
+        source: z.string().describe("Full source container@branch selector"),
+        destinations: z.array(z.string()).min(1),
+        paused: z.boolean().default(false),
+        targetNode: z.string().optional().describe("Configured remote TTC node"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ source, destinations, paused, targetNode }) =>
+      commandResponse(
+        await client.forkMany(source, destinations, { paused, targetNode }),
+      ),
   );
 
   for (const [name, description] of [
     ["pause", "Pause a running TTC branch."],
     ["resume", "Resume a paused TTC branch."],
-    ["dehydrate", "Persist and evict a TTC branch's private runtime state."],
+    ["dehydrate", "Persist a TTC branch's complete live state and release its runtime."],
     ["rehydrate", "Restore a dehydrated TTC branch."],
-    ["stop", "Stop a TTC container branch."],
   ] as const) {
     server.registerTool(
       `ttc_${name}`,
@@ -158,6 +180,99 @@ export function createServer(client = new Client()): McpServer {
       async ({ target }) => commandResponse(await client[name](target)),
     );
   }
+
+  server.registerTool(
+    "ttc_start",
+    {
+      description: "Start a created or exited TTC branch.",
+      inputSchema: { target: z.string().describe("Full container@branch selector") },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target }) => commandResponse(await client.start(target)),
+  );
+
+  server.registerTool(
+    "ttc_stop",
+    {
+      description: "Stop one TTC branch, or every branch in a family.",
+      inputSchema: {
+        target: z.string().describe("Container family or full container@branch selector"),
+        timeoutSeconds: z.number().int().min(-1).optional(),
+      },
+      annotations: { destructiveHint: true, idempotentHint: true },
+    },
+    async ({ target, timeoutSeconds }) =>
+      commandResponse(await client.stop(target, timeoutSeconds)),
+  );
+
+  server.registerTool(
+    "ttc_restart",
+    {
+      description: "Stop and start a TTC branch with fresh process state.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        timeoutSeconds: z.number().int().min(-1).optional(),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target, timeoutSeconds }) =>
+      commandResponse(await client.restart(target, timeoutSeconds)),
+  );
+
+  server.registerTool(
+    "ttc_kill",
+    {
+      description: "Send a signal to a TTC branch's init process.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        signal: z.union([z.string(), z.number().int()]).optional(),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target, signal }) => commandResponse(await client.kill(target, signal)),
+  );
+
+  server.registerTool(
+    "ttc_wait",
+    {
+      description: "Wait for a TTC branch to stop and return its exit status.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        timeoutMs: z.number().int().positive().optional(),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ target, timeoutMs }) =>
+      commandResponse(await client.wait(target, { timeoutMs })),
+  );
+
+  server.registerTool(
+    "ttc_checkpoint",
+    {
+      description: "Export one live or paused branch to a checkpoint file on the daemon host.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        file: z.string().describe("Path on the daemon host"),
+        compression: z.enum(["none", "flate-best-speed"]).default("flate-best-speed"),
+      },
+      annotations: { destructiveHint: true, openWorldHint: true },
+    },
+    async ({ target, file, compression }) =>
+      commandResponse(await client.checkpoint(target, file, compression)),
+  );
+
+  server.registerTool(
+    "ttc_restore",
+    {
+      description: "Restore a checkpoint as a new unrelated TTC container family.",
+      inputSchema: {
+        file: z.string().describe("Checkpoint path on the daemon host"),
+        name: z.string().optional(),
+      },
+      annotations: { destructiveHint: true, openWorldHint: true },
+    },
+    async ({ file, name }) => commandResponse(await client.restore(file, name)),
+  );
 
   server.registerTool(
     "ttc_remove",
@@ -184,12 +299,18 @@ export function createServer(client = new Client()): McpServer {
           .string()
           .optional()
           .describe("Reuse only to retry the exact same mutating request"),
+        timeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Override the SDK's 30-second operation timeout"),
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    async ({ args, stdin, requestId }) =>
+    async ({ args, stdin, requestId, timeoutMs }) =>
       commandResponse(
-        await client.command(args, { input: stdin, requestId }),
+        await client.command(args, { input: stdin, requestId, timeoutMs }),
       ),
   );
 

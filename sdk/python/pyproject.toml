@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gzz2000/TimeTravelOS"
+Homepage = "https://github.com/gzz2000/TimeTravelContainer"
 
 [tool.setuptools.packages.find]
 where = ["src"]

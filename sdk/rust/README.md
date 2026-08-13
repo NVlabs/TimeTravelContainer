@@ -38,10 +38,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Client::command` accepts every non-interactive TTC command. Use
+The convenience API covers run, start, exec, local and remote batch fork,
+pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
+removal. A coordinated remote fan-out looks like:
+
+```rust
+ttc.fork_many(
+    "demo@main",
+    &["remote@candidate-a", "remote@candidate-b"],
+    false,
+    Some("node-b"),
+)?.check()?;
+```
+
+`Client::command` accepts every other non-interactive TTC command. Use
 `command_with_options` for stdin, a timeout override, or an explicit request ID
 for an intentional idempotent retry. `CommandResult` preserves raw stdout,
 stderr, and exit status.
+
+`checkpoint()` and `restore()` make file paths absolute before sending them to
+the daemon. Use absolute host paths in raw file-oriented commands because
+`ttcd` does not share the client process's working directory.
 
 Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or use
 `Client::new("/path/to/ttcd.sock")`.

@@ -49,8 +49,20 @@ print(result.stdout_text())
 result.check()
 ```
 
-`Client.command([...])` exposes every non-interactive TTC command without
-waiting for a convenience method:
+The convenience API covers run, start, exec, local and remote batch fork,
+pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
+removal. For example, one source pause can create several remote branches in
+the same target family:
+
+```python
+ttc.fork_many(
+    "demo@main",
+    ["remote@candidate-a", "remote@candidate-b"],
+    target_node="node-b",
+).check()
+```
+
+`Client.command([...])` exposes every other non-interactive TTC command:
 
 ```python
 result = ttc.command(["port", "ls", "--json", "demo@main"])
@@ -63,6 +75,11 @@ else:
 Pass `input=b"..."` to stream stdin. Reuse an explicit `request_id` only when
 deliberately retrying the same mutation. Interactive TTY attachment remains a
 CLI feature.
+
+`checkpoint()` and `restore()` convert local paths to absolute paths before
+sending them to `ttcd`. Other raw commands that name host files should likewise
+use absolute paths because the daemon does not share the SDK process's current
+working directory.
 
 Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR` as for the CLI, or pass
 `Client("/path/to/ttcd.sock")`.

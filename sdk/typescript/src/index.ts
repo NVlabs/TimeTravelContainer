@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createConnection, type Socket } from "node:net";
 
@@ -73,6 +73,11 @@ export interface CommandOptions {
   requestId?: string;
   timeoutMs?: number;
   check?: boolean;
+}
+
+export interface ForkOptions {
+  paused?: boolean;
+  targetNode?: string;
 }
 
 export function defaultSocketPath(
@@ -165,6 +170,10 @@ export class Client {
     return this.command(["run", ...options, image, ...command]);
   }
 
+  start(target: string): Promise<Result> {
+    return this.command(["start", target]);
+  }
+
   exec(
     target: string,
     command: readonly string[],
@@ -173,8 +182,31 @@ export class Client {
     return this.command(["exec", target, ...command], options);
   }
 
-  fork(source: string, destination: string, paused = false): Promise<Result> {
-    return this.command(["fork", ...(paused ? ["--paused"] : []), source, destination]);
+  fork(
+    source: string,
+    destination: string,
+    options: boolean | ForkOptions = {},
+  ): Promise<Result> {
+    const normalized =
+      typeof options === "boolean" ? { paused: options } : options;
+    return this.forkMany(source, [destination], normalized);
+  }
+
+  forkMany(
+    source: string,
+    destinations: readonly string[],
+    options: ForkOptions = {},
+  ): Promise<Result> {
+    if (destinations.length === 0) {
+      throw new RangeError("destinations must not be empty");
+    }
+    return this.command([
+      "fork",
+      ...(options.paused ? ["--paused"] : []),
+      ...(options.targetNode ? ["--target", options.targetNode] : []),
+      source,
+      ...destinations,
+    ]);
   }
 
   pause(target: string): Promise<Result> {
@@ -193,8 +225,50 @@ export class Client {
     return this.command(["rehydrate", target]);
   }
 
-  stop(target: string): Promise<Result> {
-    return this.command(["stop", target]);
+  checkpoint(
+    target: string,
+    file: string,
+    compression: "none" | "flate-best-speed" = "flate-best-speed",
+  ): Promise<Result> {
+    return this.command([
+      "checkpoint",
+      "--compression",
+      compression,
+      target,
+      resolve(file),
+    ]);
+  }
+
+  restore(file: string, name?: string): Promise<Result> {
+    return this.command(["restore", ...(name ? ["--name", name] : []), resolve(file)]);
+  }
+
+  stop(target: string, timeoutSeconds?: number): Promise<Result> {
+    return this.command([
+      "stop",
+      ...(timeoutSeconds === undefined ? [] : ["--time", String(timeoutSeconds)]),
+      target,
+    ]);
+  }
+
+  restart(target: string, timeoutSeconds?: number): Promise<Result> {
+    return this.command([
+      "restart",
+      ...(timeoutSeconds === undefined ? [] : ["--time", String(timeoutSeconds)]),
+      target,
+    ]);
+  }
+
+  kill(target: string, signal?: string | number): Promise<Result> {
+    return this.command([
+      "kill",
+      ...(signal === undefined ? [] : ["--signal", String(signal)]),
+      target,
+    ]);
+  }
+
+  wait(target: string, options: Pick<CommandOptions, "timeoutMs"> = {}): Promise<Result> {
+    return this.command(["wait", target], options);
   }
 
   remove(target: string, force = false): Promise<Result> {
