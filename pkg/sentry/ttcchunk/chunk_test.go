@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -1000,6 +1001,51 @@ func TestRepositoryExpiredLeaseDoesNotProtect(t *testing.T) {
 	}
 	if err := lease.Renew(); err == nil {
 		t.Fatal("renewed a lease after its manifest was reclaimed")
+	}
+}
+
+func TestRepositoryGarbageCollectionWaitsForDemandReader(t *testing.T) {
+	root := t.TempDir()
+	readerRepository, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, readerRepository, 0x35)
+	if err := readerRepository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := readerRepository.DeleteBranch("branch"); err != nil {
+		t.Fatal(err)
+	}
+
+	readLock, err := readerRepository.lockGarbageCollection(unix.LOCK_SH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := collector.CollectGarbage(GCOptions{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("garbage collection completed while a demand-reader lock was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := unlockGarbageCollection(readLock); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("garbage collection did not continue after demand-reader unlock")
 	}
 }
 

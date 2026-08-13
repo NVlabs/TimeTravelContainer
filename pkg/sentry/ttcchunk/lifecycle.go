@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -709,6 +711,11 @@ func immutableFiles(root, suffix, kind string, now time.Time, ttl time.Duration)
 func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	gcLock, err := r.lockGarbageCollection(unix.LOCK_EX)
+	if err != nil {
+		return GCResult{}, fmt.Errorf("locking TTC memory repository for garbage collection: %w", err)
+	}
+	defer unlockGarbageCollection(gcLock)
 	now := opts.Now
 	if now.IsZero() {
 		now = time.Now()

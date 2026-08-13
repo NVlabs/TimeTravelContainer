@@ -21,6 +21,7 @@ import (
 	"sort"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -424,6 +425,11 @@ func (r *ChunkReader) ReadAt(dst []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("negative TTC memory chunk offset")
 	}
+	readLock, err := r.store.repository.lockGarbageCollection(unix.LOCK_SH)
+	if err != nil {
+		return 0, fmt.Errorf("locking TTC memory chunks for reading: %w", err)
+	}
+	defer unlockGarbageCollection(readLock)
 	total := uint64(len(r.objects)) * pgalloc.SparseChunkBytes
 	if uint64(off) >= total {
 		return 0, io.EOF

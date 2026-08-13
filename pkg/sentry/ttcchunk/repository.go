@@ -33,6 +33,8 @@ import (
 
 const maxEncodedChunkBytes = pgalloc.SparseChunkBytes + 1<<20
 
+const garbageCollectionLockName = ".gc.lock"
+
 var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
 
 // MemoryRepository is one family-level shared memory namespace. Immutable
@@ -66,6 +68,12 @@ func OpenMemoryRepositoryFD(dir *os.File) (*MemoryRepository, error) {
 	owned := os.NewFile(uintptr(dup), "ttc-memory-repository")
 	repository := &MemoryRepository{rootFD: owned}
 	repository.chunks = &Store{repository: repository}
+	lock, err := openFileRelative(dup, garbageCollectionLockName, unix.O_RDONLY, 0)
+	if err != nil {
+		owned.Close()
+		return nil, fmt.Errorf("opening donated TTC memory repository garbage-collection lock: %w", err)
+	}
+	lock.Close()
 	for _, name := range []string{"chunks", "manifests", "branches", "consumed", "leases", "transactions", "trash"} {
 		opened, err := openDirRelative(dup, name)
 		if err != nil {
@@ -101,6 +109,13 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 			return nil, fmt.Errorf("creating TTC memory repository %s directory: %w", name, err)
 		}
 	}
+	lock, err := os.OpenFile(filepath.Join(root, garbageCollectionLockName), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("creating TTC memory repository garbage-collection lock: %w", err)
+	}
+	if err := lock.Close(); err != nil {
+		return nil, fmt.Errorf("closing TTC memory repository garbage-collection lock: %w", err)
+	}
 	if err := recoverRepositoryTrash(root, time.Now(), DefaultTransactionTTL); err != nil {
 		return nil, fmt.Errorf("recovering interrupted TTC memory collection: %w", err)
 	}
@@ -111,7 +126,7 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MemoryRepository{
+	repository := &MemoryRepository{
 		root:         root,
 		chunks:       chunks,
 		manifestRoot: filepath.Join(root, "manifests"),
@@ -120,7 +135,45 @@ func OpenMemoryRepository(root string) (*MemoryRepository, error) {
 		leaseRoot:    filepath.Join(root, "leases"),
 		txnRoot:      filepath.Join(root, "transactions"),
 		trashRoot:    filepath.Join(root, "trash"),
-	}, nil
+	}
+	chunks.repository = repository
+	return repository, nil
+}
+
+// lockGarbageCollection coordinates demand reads with collection across every
+// process and host that opens the repository. NFSv4 carries flock locks through
+// its network lock manager, so an exclusive collector cannot silly-rename an
+// object while a remote or local Sentry still has it open for a demand read.
+func (r *MemoryRepository) lockGarbageCollection(operation int) (*os.File, error) {
+	var lock *os.File
+	var err error
+	flags := unix.O_RDONLY
+	if operation&unix.LOCK_EX != 0 {
+		// Linux (including the NFS client) requires a writable descriptor for
+		// an exclusive flock, returning EBADF for O_RDONLY.
+		flags = unix.O_RDWR
+	}
+	if r.rootFD != nil {
+		lock, err = openFileRelative(int(r.rootFD.Fd()), garbageCollectionLockName, flags, 0)
+	} else {
+		lock, err = os.OpenFile(filepath.Join(r.root, garbageCollectionLockName), flags, 0)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(lock.Fd()), operation); err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func unlockGarbageCollection(lock *os.File) error {
+	if lock == nil {
+		return nil
+	}
+	err := unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	return errors.Join(err, lock.Close())
 }
 
 func (r *MemoryRepository) manifestPath(id ManifestID) (dir, path string) {
