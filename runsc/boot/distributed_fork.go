@@ -332,11 +332,11 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 	}()
 	if l.distributedMemoryFile == nil {
-		return nil, errors.New("distributed target has no reserved persistent application memory file")
+		return nil, errors.New("distributed target has no reserved application memory file")
 	}
-	persistentMemoryFile := l.distributedMemoryFile
+	reservedMemoryFile := l.distributedMemoryFile
 	l.distributedMemoryFile = nil
-	targetMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, persistentMemoryFile, true)
+	targetMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 	if err != nil {
 		return nil, fmt.Errorf("creating distributed target memory file: %w", err)
 	}

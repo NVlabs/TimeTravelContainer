@@ -255,9 +255,9 @@ type Loader struct {
 	distributedRestoreSessionID string
 	distributedRestoreInfo      DistributedForkRestoreInfo
 	distributedPushReceiver     *ttcremote.TCPPushReceiver
-	// distributedMemoryFile is the empty persistent application-memory file
+	// distributedMemoryFile is an empty anonymous application-memory file
 	// reserved by a distributed target's bootstrap Kernel. Ownership transfers
-	// to the restored Kernel in restoreDistributedFork.
+	// to the restored Kernel in restoreDistributedFork or dehydration restore.
 	distributedMemoryFile *os.File
 
 	// sandboxID is the ID for the whole sandbox.
@@ -516,10 +516,6 @@ type Args struct {
 	// TTCVolumeFDs are ordered according to
 	// specutils.TTCVolumeRepositories(Args.Spec).
 	TTCVolumeFDs []int
-	// TTCMemoryFileFD is a persistent sparse application MemoryFile. Values less
-	// than 1 retain the ordinary anonymous memfd behavior. Donated FDs are always
-	// greater than 2; this also preserves the zero value of Args.
-	TTCMemoryFileFD int
 	// MountTarOnExitFDs and ready FDs are ordered by MountTarOnExitPaths.
 	MountTarOnExitFDs      []int
 	MountTarOnExitReadyFDs []int
@@ -785,19 +781,17 @@ func New(args Args) (*Loader, error) {
 		IOUringEnabled:      args.Conf.IOUring,
 	}
 
-	// Create memory file.
-	memoryFileFD := args.TTCMemoryFileFD
+	// Distributed and cold-dehydration targets need an unused MemoryFile backing
+	// that survives their bootstrap Kernel. Keep it anonymous: durable page data
+	// belongs in TTC's immutable chunk repository, never in the live allocator.
 	if specutils.TTCDistributedTarget(args.Spec) {
-		if memoryFileFD <= 0 {
-			return nil, errors.New("distributed target requires a persistent application memory file")
+		fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
+		if err != nil {
+			return nil, fmt.Errorf("creating reserved application memory file: %w", err)
 		}
-		l.distributedMemoryFile = os.NewFile(uintptr(memoryFileFD), "ttc-distributed-application-memory")
-		if l.distributedMemoryFile == nil {
-			return nil, fmt.Errorf("invalid distributed application memory FD %d", memoryFileFD)
-		}
-		memoryFileFD = -1
+		l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
 	}
-	mf, err := createMemoryFileFromFD(args.Conf.AppHugePages, args.HostTHP, memoryFileFD)
+	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1255,26 +1249,12 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 }
 
 func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
-	return createMemoryFileFromFD(appHugePages, hostTHP, -1)
-}
-
-func createMemoryFileFromFD(appHugePages bool, hostTHP HostTHP, persistentFD int) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
-	var memfile *os.File
-	if persistentFD > 0 {
-		memfile = os.NewFile(uintptr(persistentFD), "ttc-application-memory")
-		if memfile == nil {
-			return nil, fmt.Errorf("invalid TTC application memory FD %d", persistentFD)
-		}
-	} else {
-		memfd, err := memutil.CreateMemFD(memfileName, 0)
-		if err != nil {
-			return nil, fmt.Errorf("error creating memfd: %w", err)
-		}
-		memfile = os.NewFile(uintptr(memfd), memfileName)
+	memfd, err := memutil.CreateMemFD(memfileName, 0)
+	if err != nil {
+		return nil, fmt.Errorf("error creating memfd: %w", err)
 	}
-
-	return createMemoryFileFromFile(appHugePages, hostTHP, memfile, persistentFD > 0)
+	return createMemoryFileFromFile(appHugePages, hostTHP, os.NewFile(uintptr(memfd), memfileName), false)
 }
 
 func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {

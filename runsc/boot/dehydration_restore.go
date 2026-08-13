@@ -101,11 +101,11 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
 	if l.distributedMemoryFile == nil {
-		return nil, errors.New("dehydration target has no reserved persistent application memory file")
+		return nil, errors.New("dehydration target has no reserved application memory file")
 	}
-	persistentMemoryFile := l.distributedMemoryFile
+	reservedMemoryFile := l.distributedMemoryFile
 	l.distributedMemoryFile = nil
-	mainMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, persistentMemoryFile, true)
+	mainMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 	if err != nil {
 		return nil, fmt.Errorf("creating dehydration application memory file: %w", err)
 	}

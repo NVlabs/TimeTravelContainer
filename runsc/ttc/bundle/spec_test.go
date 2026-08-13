@@ -1292,8 +1292,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 		t.Fatalf("root path=%+v", got.Root)
 	}
 
-	transientMemory := filepath.Join(root, "bootstrap.mem")
-	transient, transientCleanup, err := store.PrepareTransientBranchStartBundle("demo", "child", "fs-child", transientMemory)
+	transient, transientCleanup, err := store.PrepareTransientBranchStartBundle("demo", "child", "fs-child")
 	if err != nil {
 		t.Fatalf("PrepareTransientBranchStartBundle: %v", err)
 	}
@@ -1306,8 +1305,8 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Annotations[specutils.AnnotationTTCMemoryFile] != transientMemory {
-		t.Fatalf("transient memory annotation=%q, want %q", got.Annotations[specutils.AnnotationTTCMemoryFile], transientMemory)
+	if _, ok := got.Annotations[specutils.AnnotationTTCMemoryFile]; ok {
+		t.Fatalf("transient bundle retained obsolete memory-file annotation: %q", got.Annotations[specutils.AnnotationTTCMemoryFile])
 	}
 	if got.Annotations[specutils.AnnotationTTCInitialStartPaused] != "true" {
 		t.Fatalf("transient start-paused annotation=%q", got.Annotations[specutils.AnnotationTTCInitialStartPaused])
@@ -1779,6 +1778,41 @@ func TestPruneImageRoots(t *testing.T) {
 		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
 	); err != nil || removed != 0 {
 		t.Errorf("second pruneImageRoots = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
+func TestRemoveObsoleteApplicationMemoryFiles(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	legacy := filepath.Join(root, "containers", "legacy", "memory", "application.mem")
+	keep := filepath.Join(root, "containers", "legacy", "memory", "chunks", "keep")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(keep), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("obsolete live memory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("durable chunk"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.RemoveObsoleteApplicationMemoryFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed %d obsolete files, want 1", removed)
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete application memory remains: %v", err)
+	}
+	if data, err := os.ReadFile(keep); err != nil || string(data) != "durable chunk" {
+		t.Fatalf("durable chunk changed: data=%q err=%v", data, err)
+	}
+	if removed, err := store.RemoveObsoleteApplicationMemoryFiles(); err != nil || removed != 0 {
+		t.Fatalf("second cleanup=(%d, %v), want (0, nil)", removed, err)
 	}
 }
 

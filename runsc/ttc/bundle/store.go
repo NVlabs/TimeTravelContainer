@@ -61,6 +61,44 @@ type Store struct {
 	Root string
 }
 
+// RemoveObsoleteApplicationMemoryFiles removes pathname-backed live memory
+// allocators created by TTC versions predating sparse dehydration. Current
+// runtimes use anonymous memfds; durable page contents live exclusively in the
+// family memory-chunk repository. Unlinking is safe even if an older Sentry
+// still has the file open, since its descriptor remains valid until it exits.
+func (s Store) RemoveObsoleteApplicationMemoryFiles() (int, error) {
+	containersRoot := filepath.Join(s.Root, "containers")
+	entries, err := os.ReadDir(containersRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(containersRoot, entry.Name(), "memory", "application.mem")
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return removed, fmt.Errorf("checking obsolete application memory for %s: %w", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() {
+			return removed, fmt.Errorf("obsolete application memory path for %s is not a regular file", entry.Name())
+		}
+		if err := os.Remove(path); err != nil {
+			return removed, fmt.Errorf("removing obsolete application memory for %s: %w", entry.Name(), err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
 // branch from its persistent filesystem pointer without changing its visible
 // branch identity. The canonical container bundle is never modified.
@@ -68,36 +106,31 @@ func (s Store) PrepareBranchStartBundle(name, branchID, filesystemBranch string,
 	if branchID == "" || filesystemBranch == "" {
 		return "", nil, errors.New("branch start identity and filesystem branch are required")
 	}
-	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, startPaused, "")
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, startPaused)
 }
 
 // PrepareTransientBranchStartBundle creates a paused branch-start bundle whose
-// application MemoryFile is private to a short-lived bootstrap Sentry. TTC uses
-// this to construct a fresh branch beside an existing live family without
-// allowing the bootstrap Sentry to allocate from the family's active memory
-// file.
-func (s Store) PrepareTransientBranchStartBundle(name, branchID, filesystemBranch, memoryFile string) (string, func(), error) {
-	if branchID == "" || filesystemBranch == "" || memoryFile == "" {
-		return "", nil, errors.New("transient branch start identity, filesystem branch, and memory file are required")
+// anonymous application MemoryFile is private to a short-lived bootstrap
+// Sentry. TTC uses this to construct a fresh branch beside an existing family.
+func (s Store) PrepareTransientBranchStartBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+	if branchID == "" || filesystemBranch == "" {
+		return "", nil, errors.New("transient branch start identity and filesystem branch are required")
 	}
-	if !filepath.IsAbs(memoryFile) || filepath.Clean(memoryFile) != memoryFile {
-		return "", nil, fmt.Errorf("transient memory file path %q must be absolute and clean", memoryFile)
-	}
-	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, true, memoryFile)
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, false, true)
 }
 
 // PrepareDehydrationRestoreBundle creates a short-lived OCI bundle that tells
-// runsc to reserve the persistent application MemoryFile for cold restore and
+// runsc to reserve an anonymous application MemoryFile for cold restore and
 // opens every TTC-managed repository at filesystemBranch. The canonical
 // container bundle is never modified.
 func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (string, func(), error) {
 	if filesystemBranch == "" {
 		return "", nil, errors.New("dehydration restore filesystem branch is empty")
 	}
-	return s.prepareBranchBundle(name, "", filesystemBranch, true, false, "")
+	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
-func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool, memoryFile string) (string, func(), error) {
+func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return "", nil, err
@@ -109,9 +142,7 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
-	if memoryFile != "" {
-		spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFile
-	}
+	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
 		return "", nil, err
@@ -775,10 +806,6 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.resolveWritableHostMounts(containerDir, &opts); err != nil {
 		return Prepared{}, err
 	}
-	opts.SpecOptions.MemoryFilePath, err = createApplicationMemoryFile(containerDir)
-	if err != nil {
-		return Prepared{}, err
-	}
 	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
@@ -1022,11 +1049,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
-	memoryFilePath, err := createApplicationMemoryFile(containerDir)
-	if err != nil {
-		return Prepared{}, err
-	}
-	spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFilePath
+	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
 	if len(repositories) == 0 {
 		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
@@ -1257,12 +1280,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		_ = os.RemoveAll(containerDir)
 		return Prepared{}, err
 	}
-	memoryFilePath, err := createApplicationMemoryFile(containerDir)
-	if err != nil {
-		_ = os.RemoveAll(containerDir)
-		return Prepared{}, err
-	}
-	spec.Annotations[specutils.AnnotationTTCMemoryFile] = memoryFilePath
+	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
 	keep := false
 	leaseID := ""
@@ -1936,22 +1954,6 @@ func randomObjectID(kind string, size int) (string, error) {
 		return "", fmt.Errorf("generating %s ID: %w", kind, err)
 	}
 	return hex.EncodeToString(data), nil
-}
-
-func createApplicationMemoryFile(containerDir string) (string, error) {
-	memoryDir := filepath.Join(containerDir, "memory")
-	if err := os.Mkdir(memoryDir, 0700); err != nil {
-		return "", fmt.Errorf("creating persistent memory directory: %w", err)
-	}
-	path := filepath.Join(memoryDir, "application.mem")
-	memoryFile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return "", fmt.Errorf("creating persistent application memory file: %w", err)
-	}
-	if err := memoryFile.Close(); err != nil {
-		return "", fmt.Errorf("closing persistent application memory file: %w", err)
-	}
-	return path, nil
 }
 
 func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {

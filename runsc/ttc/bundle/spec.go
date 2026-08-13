@@ -127,10 +127,7 @@ type SpecOptions struct {
 	// exposed in the guest namespace.
 	RootfsUpperRepositoryPath string
 	RootfsUpperCopyMode       string
-	// MemoryFilePath identifies the persistent sparse application-memory file
-	// donated to the Sentry. It is runtime-internal and guest-invisible.
-	MemoryFilePath string
-	Ulimits        []Ulimit
+	Ulimits                   []Ulimit
 }
 
 // ManagedVolume is one persistent TTC volume attachment. RepositoryPath is
@@ -890,12 +887,6 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			return nil, fmt.Errorf("encoding TTC volume repositories: %w", err)
 		}
 		annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-	}
-	if opts.MemoryFilePath != "" {
-		if !filepath.IsAbs(opts.MemoryFilePath) || filepath.Clean(opts.MemoryFilePath) != opts.MemoryFilePath {
-			return nil, fmt.Errorf("TTC memory file path %q must be absolute and clean", opts.MemoryFilePath)
-		}
-		annotations[specutils.AnnotationTTCMemoryFile] = opts.MemoryFilePath
 	}
 	if len(copiedHostMounts) != 0 {
 		encoded, err := json.Marshal(copiedHostMounts)

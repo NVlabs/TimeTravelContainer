@@ -190,8 +190,9 @@ stream described by the signed allocator metadata. The target may read and
 install that stream in configurable aligned ranges, but its present/missing
 accounting remains page-granular. Publication uses a temporary file, sync, and
 atomic rename; a transaction never advertises a partially written snapshot.
-The target's persistent `application.mem` is distinct from the immutable
-handoff file, so target writes cannot alter the snapshot.
+The target's anonymous live MemoryFile is distinct from the immutable handoff
+objects, so target writes cannot alter the snapshot and ordinary guest memory
+traffic never depends on host filesystem I/O.
 
 For the optional TCP path, the unit of ownership and acknowledgement is a
 guest base page. The transfer unit is an independently configurable, aligned
@@ -748,9 +749,10 @@ cloning keeps this proportional to allocator metadata rather than copied RAM
 on a capable shared filesystem; the daemon's explicit slow-copy mode permits
 a buffered fallback for development filesystems.
 
-The target reserves a persistent `application.mem`, restores the Kernel from
-the small metadata envelope, and uses the shared file as its asynchronous page
-reader. Target faults and adaptive prefetch populate the persistent backing.
+The target reserves an anonymous memfd-backed MemoryFile, restores the Kernel
+from the small metadata envelope, and uses the shared file as its asynchronous
+page reader. Target faults and adaptive prefetch populate RAM-backed live
+memory; only durable dehydration and handoff objects use the shared filesystem.
 The source transaction becomes independent as soon as target publication
 succeeds, so source-side page services and dirty-page push workers are absent.
 Dependency monitoring continues on B and removes the handoff file after the

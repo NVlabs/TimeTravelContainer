@@ -47,6 +47,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -54,7 +55,6 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/processutil"
-	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -5392,15 +5392,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("creating branch bootstrap directory: %w", err)
 	}
 	defer os.RemoveAll(stagingDir)
-	memoryPath := filepath.Join(stagingDir, "application.mem")
-	memoryFile, err := os.OpenFile(memoryPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return fmt.Errorf("creating branch bootstrap memory file: %w", err)
-	}
-	if err := memoryFile.Close(); err != nil {
-		return fmt.Errorf("closing branch bootstrap memory file: %w", err)
-	}
-	bundleDir, cleanupBundle, err := b.containerStore().PrepareTransientBranchStartBundle(info.ID, target.branch, filesystemBranch, memoryPath)
+	bundleDir, cleanupBundle, err := b.containerStore().PrepareTransientBranchStartBundle(info.ID, target.branch, filesystemBranch)
 	if err != nil {
 		return err
 	}
@@ -9158,20 +9150,6 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if peer {
 		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots)
 	}
-	spec, err := b.containerStore().LoadSpec(info.ID)
-	if err != nil {
-		return err
-	}
-	memoryPath, err := specutils.TTCMemoryFilePath(spec)
-	if err != nil {
-		return err
-	}
-	if memoryPath == "" {
-		return errors.New("container has no persistent application memory file")
-	}
-	if err := os.Truncate(memoryPath, 0); err != nil {
-		return fmt.Errorf("resetting dehydration target memory: %w", err)
-	}
 	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
 	if err != nil {
 		return fmt.Errorf("preparing dehydration restore bundle: %w", err)
@@ -9281,19 +9259,6 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 
 func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File) error {
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
-	activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
-	if err := os.RemoveAll(activeDir); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(activeDir, 0700); err != nil {
-		return err
-	}
-	keepTargets := false
-	defer func() {
-		if !keepTargets {
-			_ = os.RemoveAll(activeDir)
-		}
-	}()
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
 		for _, file := range targets {
@@ -9301,10 +9266,11 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		}
 	}()
 	for i := range capture.Memories {
-		file, err := os.OpenFile(filepath.Join(activeDir, fmt.Sprintf("memory-%04d.mem", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+		fd, err := memutil.CreateMemFD(fmt.Sprintf("ttc-rehydration-memory-%04d", i), 0)
 		if err != nil {
-			return fmt.Errorf("creating active dehydration memory %d: %w", i, err)
+			return fmt.Errorf("creating anonymous active dehydration memory %d: %w", i, err)
 		}
+		file := os.NewFile(uintptr(fd), fmt.Sprintf("ttc-rehydration-memory-%04d", i))
 		// Peer restore constructs its MemoryFiles after systrap has reserved the
 		// Sentry's application address range. Perform the executable mmap used
 		// to prime host IMA here, before donating the file to the sandbox.
@@ -9364,7 +9330,6 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
 	}
-	keepTargets = true
 	state := "paused"
 	if capture.Resume {
 		state = "running"
@@ -9373,7 +9338,6 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		if _, destroyErr := b.command("timetravel", info.ID, "destroy", target.branch); destroyErr != nil {
 			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
 		}
-		keepTargets = false
 		return err
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot

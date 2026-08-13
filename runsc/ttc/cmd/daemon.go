@@ -1463,7 +1463,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
 	}
-	if _, err := (ttcbundle.Store{Root: daemonDataRoot}).PruneImageRoots(context.Background()); err != nil {
+	store := ttcbundle.Store{Root: daemonDataRoot}
+	if _, err := store.RemoveObsoleteApplicationMemoryFiles(); err != nil {
+		fmt.Fprintf(stderr, "ttcd: removing obsolete application memory files: %v\n", err)
+		return 1
+	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "ttcd: pruning stale image roots: %v\n", err)
 		return 1
 	}

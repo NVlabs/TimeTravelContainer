@@ -82,14 +82,13 @@ const (
 	// repository directories donated to the Sentry.
 	AnnotationTTCVolumeRepositories = "dev.timetravelcontainer.volume-repositories"
 
-	// AnnotationTTCMemoryFile identifies the persistent sparse file donated as
-	// the application MemoryFile for a TTC sandbox family. The path is a host
-	// control-plane detail and is never exposed in the guest namespace.
+	// AnnotationTTCMemoryFile identifies obsolete pathname-backed application
+	// memory created by older TTC versions. It is retained only so upgraded
+	// bundles can discard it safely; runtimes must never open the path.
 	AnnotationTTCMemoryFile = "dev.timetravelcontainer.memory-file"
 
-	// AnnotationTTCDistributedTarget reserves the donated persistent MemoryFile
-	// for a subsequently restored distributed-fork Kernel. The bootstrap Kernel
-	// uses a temporary memfd so it cannot dirty or allocate from that file.
+	// AnnotationTTCDistributedTarget asks the Sentry to reserve an anonymous
+	// MemoryFile for a subsequently restored distributed-fork Kernel.
 	AnnotationTTCDistributedTarget = "dev.timetravelcontainer.distributed-target"
 
 	// AnnotationTTCInitialBranchID, AnnotationTTCInitialBranchParentID, and AnnotationTTCInitialFilesystemBranch
@@ -333,9 +332,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 		}
 		spec.Annotations[AnnotationTTCVolumeRepositories] = string(normalized)
 	}
-	if path := spec.Annotations[AnnotationTTCMemoryFile]; path != "" {
-		spec.Annotations[AnnotationTTCMemoryFile] = absPath(bundleDir, path)
-	}
+	delete(spec.Annotations, AnnotationTTCMemoryFile)
 	if encoded := spec.Annotations[AnnotationMountTarOnExit]; encoded != "" {
 		var targets map[string]MountTarOnExitTarget
 		if err := json.Unmarshal([]byte(encoded), &targets); err != nil {
@@ -375,24 +372,9 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 	return nil
 }
 
-// TTCMemoryFilePath returns the persistent TTC application MemoryFile path.
-func TTCMemoryFilePath(spec *specs.Spec) (string, error) {
-	if spec == nil || spec.Annotations == nil {
-		return "", nil
-	}
-	path := spec.Annotations[AnnotationTTCMemoryFile]
-	if path == "" {
-		return "", nil
-	}
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return "", fmt.Errorf("%s path %q must be absolute and clean", AnnotationTTCMemoryFile, path)
-	}
-	return path, nil
-}
-
 // TTCDistributedTarget reports whether spec is an unpublished distributed
-// fork target whose persistent application MemoryFile must remain empty until
-// the remote Kernel metadata is installed.
+// fork target whose reserved anonymous MemoryFile must remain empty until the
+// remote Kernel metadata is installed.
 func TTCDistributedTarget(spec *specs.Spec) bool {
 	return spec != nil && spec.Annotations != nil && spec.Annotations[AnnotationTTCDistributedTarget] == "true"
 }

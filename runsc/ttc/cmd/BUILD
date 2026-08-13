@@ -12,6 +12,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/hostarch",
+		"//pkg/memutil",
 		"//pkg/sentry/kernel",
 		"//pkg/sentry/pgalloc",
 		"//pkg/sentry/ttcchunk",
