@@ -82,7 +82,7 @@ fi
 ttc "$@"
 
 # The ordinary writable root uses the same direct-to-disk branch machinery.
-# Stopping never exports a tar, and cp reconstructs fully stopped branches from
+# Stopping never exports a tar, and cp reconstructs exited branches from
 # their persistent layers without starting the image entrypoint.
 HOST_IMPORT="$TTC_E2E_ROOT/rootfs-import"
 CHILD_EXPORT="$TTC_E2E_ROOT/rootfs-child-export"

@@ -1,6 +1,6 @@
 # TimeTravelContainer security, performance, and compatibility audit
 
-This audit was refreshed on 2026-07-24 through configurable virtual-NIC
+This audit records the 2026-07-24 review through configurable virtual-NIC
 identity, line-oriented image progress, default guest SUID semantics, rootless
 namespace preflight, orderly daemon shutdown, persistent writable-root restart,
 and the private-memory and interactive-exec fixes. It evaluates the native OCI
@@ -8,6 +8,13 @@ image store, rootless execution, Docker-like CLI, in-memory live fork, and
 TTC-specific changes to gVisor's security boundary. It is a manual
 development-readiness review, not a security certification or a substitute for
 continuous fuzzing and an independent adversarial audit.
+
+It was reconciled with the August 2026 branch state machine, disk-backed
+rootfs, process-free dehydration, sparse 1 MiB memory chunks, repeated
+same-family remote imports, and Kernel-scoped global-resource audit. The
+[current limitations page](../user_guide/ttc_limitations.md) is the concise
+user-facing status; dated measurements and resolved findings below remain as
+an engineering record rather than a claim of current certification.
 
 ## Executive assessment
 
@@ -489,13 +496,13 @@ rootless `ttc` virtual-NIC mode, optional user-mode NAT, and persistent TCP
 port publication, but this is not the Docker network API. Host mode cannot be
 live-forked.
 
-Restart recreates an exited main branch from persistent configuration, the
-immutable image, and the main rootfs repository branch. Rootfs and managed
+Restart recreates any selected exited branch from persistent configuration,
+the immutable image, and that branch's rootfs repository root. Rootfs and managed
 volume mutations are applied directly to opaque host files and immutable
-metadata-tree roots; stop/start performs no TTC export/import. A stopped branch
-does not retain its in-memory Kernel, and child process state cannot be started,
-but its persistent filesystem branch remains available to stopped-branch
-`ttc cp`. Child changes are not promoted automatically.
+metadata-tree roots. An exited branch does not retain its former in-memory
+Kernel, but its persistent filesystem remains available to branch-aware
+`ttc cp` and it can be started fresh without changing active peers. Branch
+changes are never promoted automatically.
 
 ### C2: current gVisor networking and the TTC subset
 

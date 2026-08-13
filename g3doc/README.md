@@ -13,9 +13,9 @@ containers.
 gVisor can be used with Docker, Kubernetes, or directly using `runsc`. Use the
 links below to see detailed instructions for each of them:
 
-*   [TimeTravelContainer](./user_guide/timetravelcontainer.md): Build and use the experimental
-    rootless `ttc` CLI, including live container fork, branches, and managed
-    volumes.
+*   [TimeTravelContainer](./user_guide/timetravelcontainer.md): Build and use
+    the rootless TTC runtime, including live fork, dehydration, and remote
+    branches.
 *   [Docker](./user_guide/quick_start/docker.md): The quickest and easiest way
     to get started.
 *   [Kubernetes](./user_guide/quick_start/kubernetes.md): Isolate Pods in your

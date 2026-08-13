@@ -1,9 +1,10 @@
-# TimeTravelContainer `ttc` product and CLI roadmap
+# TimeTravelContainer `ttc` product and CLI implementation record
 
-Status: implemented for the documented systrap and KVM scope. The original
-tmpfs-plus-tar managed-volume prototype was removed before release and replaced
-by the direct-to-disk `ttcvol` filesystem specified in
-[ttc_disk_backed_volumes.md](ttc_disk_backed_volumes.md).
+Status: implemented for the documented systrap and KVM scope. This file records
+the design and completed milestones; the
+[user guide](../user_guide/timetravelcontainer.md) and
+[branch state machine](../ttc_state_machine.md) are authoritative for current
+behavior.
 
 Implementation status: the roadmap is implemented. The `ttc` client is available at
 `//runsc/ttc:ttc`. It controls existing TimeTravel-enabled runsc OCI
@@ -11,7 +12,8 @@ sandboxes through runsc's JSON command surface, pulls OCI/Docker images directly
 into a native content store with Docker config and credential-helper authentication, generates
 rootless image-backed OCI bundles, and implements the
 run/create/start/wait/restart/inspect/list/remove lifecycle with
-persistent metadata and immutable branch lineage/tombstones, plus synchronous, detached, and TTY exec into a selected
+persistent metadata, reusable branch names, and presentation-only fork
+ancestry, plus synchronous, detached, and TTY exec into a selected
 live branch, with branch-local managed-session list, wait, signal, log, and
 reattach support.
 Docker-style `ttc container` aliases cover the ordinary lifecycle surface;
@@ -22,7 +24,7 @@ Live-fork failures return transactional resource diagnostics. Bash, Zsh, and
 Fish completion scripts
 resolve live families/branches, images, volumes, and exec sessions. Branch trees
 show Sentry-reported PID 1 state and live CoW-sharing status alongside persisted
-creation/deletion times and immutable lineage. Timestamped retained console
+creation times and compacted presentation ancestry. Timestamped retained console
 records support Docker-style log time filters and per-line timestamp output.
 Effective Docker entrypoint, command, user, and image labels are retained in the
 generated bundle for later inspection. Generated bundles include procfs,
@@ -77,12 +79,9 @@ serves a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
 startup is explicit so its fixed isolation mode is never inferred from a
 client request, and `--direct` remains an explicit recovery path.
-Explicit commit/import, quiescent main-branch snapshots before stop, restart,
-and sole-branch forced removal, plus a Sentry post-init-exit snapshot hook are
-implemented. The Sentry retains the mount namespace through init teardown,
-writes container-specific pending archives, and publishes readiness markers
-only after successful serialization and sync; TTC validates and atomically
-promotes completed archives.
+Writable roots and managed volumes are updated directly in disk-backed
+`ttcvol` repositories. Stop, start, restart, and branch removal therefore need
+no rootfs export/import archive or post-exit snapshot hook.
 
 This document records the product, runtime, filesystem, process-control, and
 console work required to turn the TimeTravelContainer gVisor prototype into a
@@ -132,29 +131,29 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
 ## Object and state model
 
 - [x] Define a stable 64-hex family ID and distinct user-facing container name.
-- [x] Define branch selectors, initially `<container>@<branch>`, with `main` as
-      the default branch.
-- [x] Define immutable branch creation lineage. `ParentID` remains historical
-      even if an ancestor is destroyed.
-- [x] Persist branch tombstones and lineage metadata so `ttc ls --tree` can show
-      descendants whose source branch was deleted.
+- [x] Define full `<container>@<branch>` selectors for branch operations;
+      `main` is an ordinary branch rather than an implicit default.
+- [x] Treat `ParentID` as presentation metadata only. Removing a branch
+      reparents its display children to the removed branch's display parent.
+- [x] Remove branch tombstones when a branch is deleted so names and storage
+      are immediately reusable.
 - [x] Add an `exited` branch state and reconcile runtime state after virtual PID
       1 exits.
 - [x] Distinguish family state, branch state, and exec-session state.
 - [x] Define `stop` as process termination, not suspension; `pause`/`resume`
-      retain memory and kernel state. The current `main` init remains the sandbox
-      lifetime anchor, so its exit quiesces and exits all descendant branches.
+      retain memory and kernel state. The runtime bookkeeping role may move to
+      another live branch and does not make `main` a lifecycle anchor.
 - [x] Define initial `start` semantics: a created or exited base container
       starts from its persistent OCI bundle and immutable image root; destroyed
       in-memory branch state is not reconstructed.
 - [x] Use typed namespaces: family names and IDs conflict globally with other
-      families; branch IDs conflict within one family and immutable lineage; exec
+      families; live branch IDs conflict within one family; exec
       session IDs conflict within one branch. Image references and managed-volume
       names are independent namespaces, so they may equal a family, branch, or
       exec name without ambiguity because commands and selector delimiters carry
       the object type.
 - [x] Store initial desired configuration and lifecycle metadata separately
-      from transient Sentry state so created/stopped containers can be listed,
+      from transient Sentry state so created/exited containers can be listed,
       inspected, restarted, and removed.
 - [x] Move default persistent-state ownership behind `ttcd`; metadata files
       use synchronized temp-file replacement, and structural requests use a
@@ -250,7 +249,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       image `STOPSIGNAL` when no override is supplied, persist both values in
       container metadata and Docker inspect, and honor them in `stop` and
       `restart` unless a command-level timeout override is supplied.
-      Successful main-branch waits also reconcile the final exit state, code,
+      Successful branch waits also reconcile the final exit state, code,
       and finish time into persistent inspect metadata.
 - [x] Support existing host paths through `-v HOST:CONTAINER:ro` and
       `--mount type=bind,...,readonly`.
@@ -301,12 +300,13 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       `-` tar streaming in both directions. Execute a donated TTC helper inside
       the selected Sentry VFS so images need no `tar` or `cp`, validate archive
       paths and symlink ancestors, and serialize copy-in against live fork.
-      Running branches are supported initially; stopped-container VFS access
-      remains future work.
+      Running and paused branches use an in-Sentry helper; exited and created
+      branches use a short-lived management-only Sentry when no active peer
+      would create a conflicting repository cache.
 - [x] `ttc create` as persistent image-root and OCI-bundle preparation.
 - [x] `ttc start CONTAINER@BRANCH` for created/exited branches, detached by
       default with optional `--attach`. Multiple detached branches start in
-      argument order, and stale stopped runsc records are removed before OCI
+      argument order, and stale exited runsc records are removed before OCI
       recreation while live duplicate IDs remain protected.
 - [x] Docker-style `ttc container` aliases for run, create, start, attach,
       logs, exec, inspect, rm, ls/ps, top, pause/unpause, kill, stop, wait, and
@@ -653,7 +653,7 @@ and reason.
       opportunistic reflinks, unconditional streamed-copy fallback, hard links,
       symlinks, ownership, modes, and xattrs.
 - [x] Include private host repositories in checkpoint/restore and support
-      running, paused, and stopped `ttc cp` through mounted subtrees.
+      running, paused, and exited `ttc cp` through mounted subtrees.
 
 ### Managed volumes
 
@@ -684,9 +684,6 @@ and reason.
 - [x] Remove the containerd daemon and client dependency. Use the OCI registry,
       manifest, archive, and local content-store libraries in process while TTC
       owns its catalog, locking, lifecycle, and storage paths.
-      Existing materialized families remain usable across this upgrade, while
-      image names previously owned by containerd must be pulled once into the
-      native store before they can seed new families.
 - [x] Store digest-verified blobs in a private rootless CAS under `--data-root`,
       with atomic, versioned image metadata and target-guarded tag deletion.
 - [x] Add deterministic native content pins for every prepared family. The
@@ -749,7 +746,7 @@ and reason.
       directory, with peer-UID checks and a `0600` socket. Keep isolation mode
       exclusively in daemon startup configuration; clients never send it.
 - [x] Persist family configuration, image references, rootfs/managed-volume
-      repository identities, lineage, and tombstones; live process memory
+      repository identities and presentation ancestry; live process memory
       remains exclusively in the Sentry.
 - [x] Reconcile persisted metadata with the native image catalog and live runsc
       sandboxes after daemon restart, and restart missing branch/exec console
@@ -855,8 +852,8 @@ process, fork its branch, and then attach independently to both branches.
 - [x] Initial fork/pause/resume and beautified branch tree.
 - [x] Atomic pause-validate-fork transaction with automatic source resume on
       rejection.
-- [x] Rich branch-tree diagnostics with PID 1 state, CoW state, immutable lineage
-      and deletion tombstones, creation/deletion times, fork timings, and structured
+- [x] Rich branch-tree diagnostics with PID 1 state, CoW state, compacted
+      presentation ancestry, creation times, fork timings, and structured
       rejected-fork resource diagnostics.
 - [x] Rootless daemon lifecycle, recovery, events, documentation, and shell
       completion.
@@ -867,8 +864,8 @@ bundle.
 
 ## Open semantic decisions
 
-- [x] Define `start` for an exited main branch as OCI recreation from the
-      immutable image, persistent configuration, and the existing main
+- [x] Define `start` for any selected exited branch as OCI recreation from the
+      immutable image, persistent configuration, and the selected
       rootfs/managed-volume repository branches. Writes, including shutdown
       handler writes, update those repositories directly; stop/restart takes no
       TTC snapshot and performs no export/import.
@@ -884,10 +881,11 @@ bundle.
       death closes clients, restart begins with no stale owner, and `--takeover`
       provides explicit replacement while a daemon remains alive.
 - [x] Host-mutation semantics and warnings for shared read-only binds.
-- [x] Do not share managed-volume contents across unrelated families. A name is a
-      configuration identity; each family instantiates its own forkable tmpfs.
-- [x] Do not retain stopped branch filesystem state without its Kernel and memory;
-      branch-local writable state exists only for the live sandbox family.
+- [x] Prevent simultaneous writable attachment of one managed volume to
+      unrelated families; branches of its owning family receive independent
+      persistent `ttcvol` roots through live fork.
+- [x] Retain branch-local disk-backed filesystem state after execution exits;
+      `start` reopens it without reconstructing the former process memory.
 - [x] Use the per-user `ttcd` API as the default deployment, keep direct runsc as
       an explicit recovery path, and defer a task-v2 shim extension until branch
       lifecycle integration is required by external managers.

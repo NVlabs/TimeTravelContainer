@@ -7,7 +7,7 @@ unintended privilege-escalation paths.
 ## TTC-specific vulnerabilities
 
 Report vulnerabilities introduced by TimeTravelContainer privately through
-[GitHub Security Advisories](https://github.com/gzz2000/TimeTravelOS/security/advisories/new).
+[GitHub Security Advisories](https://github.com/gzz2000/TimeTravelContainer/security/advisories/new).
 Please include the affected commit or version, host configuration, container
 image, reproduction steps, and the expected security impact. Do not open a
 public issue before a fix or coordinated disclosure is ready.

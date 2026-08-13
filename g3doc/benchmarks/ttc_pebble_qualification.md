@@ -9,8 +9,8 @@ durable commits, branch deletion, and crash recovery. It does not exercise the
 gVisor `MemoryFile`, guest page faults, VFS coherence, remote reads, or the
 eventual TTC reachability collector.
 
-The active implementation plan subsequently selected immutable **1 MiB loose
-chunk files on TTC's shared filesystem** and postponed Pebble entirely. The
+The runtime subsequently implemented immutable **1 MiB loose chunk files on
+TTC's shared filesystem** and postponed Pebble entirely. The
 64 KiB loose-file and Pebble results below remain historical qualification
 data; they do not qualify or predict the new 1 MiB format.
 
@@ -319,10 +319,10 @@ acceptance tests.
 
 ## Conclusion and gate
 
-Pebble passed this synthetic functional gate but is not in TTC's current
-implementation plan. TTC will first integrate 1 MiB loose chunk files for
-memory hydration and shared-filesystem remote fork. Pebble is not selected for
-memory, rootfs, or managed-volume storage.
+Pebble passed this synthetic functional gate but is not in TTC's runtime. TTC
+now uses 1 MiB loose chunk files for memory hydration and shared-filesystem
+remote fork. Pebble is not selected for memory, rootfs, or managed-volume
+storage.
 
 No Pebble integration work is planned. If that decision is revisited after the
 loose-chunk implementation is measured, ordinary SST values were the safer
@@ -330,7 +330,8 @@ mode in this historical test. Pebble's experimental blob mode had a real
 write-amplification advantage under complete overwrite churn, but lost
 branch-read latency and steady-state disk space.
 
-Before adoption, the next gate must integrate the backend with TTC and measure:
+Before any future Pebble adoption, a new gate would need to integrate the
+backend with TTC and measure:
 
 1. actual guest page-fault latency and `mmap`/`read`/`write` coherence;
 2. fork, dehydrate, rehydrate, remove, and daemon-crash paths with real branch

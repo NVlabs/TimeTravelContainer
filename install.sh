@@ -4,7 +4,7 @@
 
 set -eu
 
-repository=${TTC_GITHUB_REPOSITORY:-gzz2000/TimeTravelOS}
+repository=${TTC_GITHUB_REPOSITORY:-gzz2000/TimeTravelContainer}
 install_dir=${TTC_INSTALL_DIR:-"$HOME/.local/bin"}
 
 case "$(uname -s)" in

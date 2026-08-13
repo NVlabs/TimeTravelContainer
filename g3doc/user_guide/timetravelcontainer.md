@@ -1,9 +1,10 @@
 # TimeTravelContainer user guide
 
-TimeTravelContainer (TTC) is an experimental, rootless container manager built
-on a modified gVisor userspace kernel. In addition to Docker-like image and
-container commands, TTC can pause, resume, dehydrate, rehydrate, and live-fork
-a running container into multiple branches inside one Sentry process.
+TimeTravelContainer (TTC) is a rootless container runtime built on a modified
+gVisor userspace kernel. In addition to Docker-style image and container
+commands, TTC can pause, resume, dehydrate, rehydrate, and live-fork a running
+container into independent branches. Active branches in one family share a
+Sentry process on each node.
 
 TTC is currently intended for trusted development and integration-test
 workloads. It is not yet a general Docker replacement or a production security
@@ -311,7 +312,7 @@ ttc rm web@test-a
 not remove surviving peers. Use `-f` to remove a running or paused branch.
 
 `ttc rm web` removes the whole family and requires all live branches to be
-stopped unless `--force` is used.
+exited unless `--force` is used.
 
 Starting or restarting an exited branch does not require its peers to stop.
 TTC starts only the selected branch in a short-lived paused bootstrap, imports
@@ -322,9 +323,10 @@ reload their memory, so their size does not determine start latency.
 ## Distributed live fork
 
 Configured TTC nodes can place a live child on another host without first
-copying all container memory or creating a checkpoint. The target begins with
-remote memory and fetches configurable page ranges directly from the source;
-each installed page releases the corresponding source dependency.
+copying all container memory or creating a checkpoint. The target starts from
+a sparse memory manifest. It can temporarily fetch missing 1 MiB chunks from
+the live source while immutable copies are published to shared storage; once a
+chunk is durable, the target no longer depends on the source process for it.
 
 The nodes must use the same shared TTC data root and repository ID, have the
 same image content available, and be able to reach each other's control and
@@ -359,14 +361,17 @@ Create several siblings from one source pause and one metadata capture by
 listing all destinations in a single command:
 
 ```shell
-ttc fork --target node-b web@main candidate-a@main candidate-b@main candidate-c@main
+ttc fork --target node-b web@main \
+  remote-web@candidate-a remote-web@candidate-b remote-web@candidate-c
 ```
 
-Each child has an independent filesystem branch and memory dependency. A
-child becomes fully independent when it has installed every required page;
-`ttc inspect` reports its distributed transaction state and final transfer
-metrics. If the source daemon is stopped while children still depend on it,
-TTC asks the children to drain their remaining pages before shutdown.
+Using one destination family lets compatible branches share one Sentry and
+resident page cache on node B. Each child still has an independent filesystem
+and process state. A child becomes source-independent when every live memory
+dependency has been promoted to shared storage; it need not fault every chunk
+into RAM. `ttc inspect` reports transaction state and transfer metrics. Source
+shutdown drains or promotes remaining dependencies before allowing the source
+daemon to exit.
 
 Distributed live fork currently targets one remote node per command. Use a
 durable checkpoint for offline transfer or for TTC installations that do not
@@ -390,18 +395,19 @@ formerly running branches run, while formerly paused branches remain paused.
 Its persistent root filesystem, volumes, ancestry, and copy-on-write sharing
 with siblings are unchanged.
 
-TTC tracks page ownership across the entire family. A page used only by one or
-more dehydrated branches is synchronized to the application-memory backing
-file and may be reclaimed from host RAM. A page also referenced by a live
-branch stays resident and copy-on-write shared. Rehydrating any owner faults
-the persisted bytes back on demand without making private copies for its
-dehydrated siblings.
+TTC tracks page versions across the entire family. Memory that must survive
+without a resident owner is stored in immutable, content-addressed files of up
+to 1 MiB in the TTC data root. Resident sharing and write-time CoW remain
+4 KiB-granular. If an active peer still shares a page, TTC can keep that page
+resident; when the peer first writes, TTC preserves the old version for the
+dehydrated branch. Rehydration loads complete 1 MiB chunks on demand and
+installs their constituent pages with their existing CoW identities.
 
-For a distributed child that still reads memory from its source node,
-dehydration first drains every outstanding page over the page-transfer
-connection. Only then does TTC persist and release the child's local runtime,
-so the dehydrated branch has no remaining remote-memory dependency. Concurrent
-remote reads are quiesced as part of that transition.
+For a distributed child that still has a live source dependency, dehydration
+first makes each required chunk durable in the shared repository. It then
+publishes the branch manifest and releases the local runtime. Rehydration can
+therefore proceed on any compatible node without contacting the original
+source process.
 
 Dehydration and checkpointing solve different problems:
 
@@ -409,18 +415,17 @@ Dehydration and checkpointing solve different problems:
 |---|---|---|
 | Result | The same branch remains in its family tree | A standalone archive file |
 | Restore identity | Rehydrates the original branch | Creates a new unrelated family |
-| Filesystem relationship | Keeps existing branch ancestry and CoW sharing | Imports private writable repositories |
+| Filesystem relationship | Remains in the same family and keeps CoW sharing | Imports private writable repositories |
 | Portability | Internal to the same TTC data root and compatible build | Intended for explicit transfer, subject to image/build compatibility |
 | Immutable image | Referenced from the existing family | Locked by exact recorded digest |
 
 Dehydration persists task, kernel, internal-resource, tmpfs, and private-memory
 state rather than merely writing anonymous pages. It releases the guest task
-and kernel graph and private application-memory mappings. The current
-implementation intentionally retains a small Sentry control shell and its
-read-only filesystem transport so rehydration remains possible after `ttcd`
-has exited; it is therefore not yet a process-free cold archive. A checkpoint
-is the appropriate representation when a single portable file or an unrelated
-restored family is required.
+and kernel graph and every runtime process that exists only for the dehydrated
+family. When all branches in a family are dehydrated, no Sentry or filesystem
+transport process remains. A checkpoint is still the appropriate
+representation when one portable file or an unrelated restored family is
+required.
 
 ## Durable checkpoint and restore
 
@@ -456,7 +461,7 @@ branch restores running; one made from a paused branch restores paused:
 
 ```shell
 ttc restore --name paused-copy paused.ttc
-ttc resume paused-copy
+ttc resume paused-copy@main
 ```
 
 Published host ports are not recreated automatically. Add the desired
@@ -470,7 +475,7 @@ between arbitrary TTC or upstream gVisor versions. Compression defaults to
 fast DEFLATE and may be disabled:
 
 ```shell
-ttc checkpoint --compression none web raw-checkpoint.ttc
+ttc checkpoint --compression none web@main raw-checkpoint.ttc
 ```
 
 ## Exec, attach, detach, and logs
@@ -481,7 +486,7 @@ Run a command in a selected branch:
 ttc exec web@test-b cat /etc/os-release
 ttc exec -it web@test-b sh
 ttc exec -d web@test-b long-running-command
-ttc exec ls web@test-b
+ttc exec web@test-b ls
 ```
 
 For `-t`, TTC propagates the invoking client's `TERM` value into a new
@@ -555,14 +560,14 @@ archive has no separate source operand. TTC runs its own donated copy helper in
 the selected branch, so neither `tar` nor `cp` needs to exist in the image and
 the binary stream is not routed through a guest shell.
 
-Copy supports running, paused, and fully stopped branches. For a paused branch,
+Copy supports running, paused, and exited branches. For a paused branch,
 TTC runs only its trusted copy helper while the branch's existing tasks remain
-stopped.
-For a stopped family, TTC launches a short-lived helper Sentry whose process is
+paused.
+For an exited branch, TTC launches a short-lived helper Sentry whose process is
 the donated TTC copy helper, mounts the immutable image lower plus the selected
 persistent `ttcvol` rootfs/volume branch, and exits when the copy completes.
 It neither launches the image entrypoint nor restores process memory. TTC
-rejects offline access to one stopped child while another branch in the same
+rejects offline access to one exited child while another branch in the same
 family remains live, because two Sentries would otherwise cache one repository
 concurrently. A copy process temporarily owns host stream FDs; `ttcd` therefore
 serializes copy operations with lifecycle mutations such as fork, pause, stop,
@@ -840,14 +845,6 @@ ttc completion fish >"$HOME/.config/fish/completions/ttc.fish"
 ```
 
 Create the target directory first if it does not exist.
-
-## Upgrade from the old containerd-backed build
-
-Existing family metadata and materialized root filesystems remain usable.
-Image records and blobs formerly owned by containerd are not imported; pull
-each required image once into the native TTC data root. Restart a manually
-managed `ttcd` after upgrading, then start it explicitly before issuing normal
-commands.
 
 ## Further verification
 

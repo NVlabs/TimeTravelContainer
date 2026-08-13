@@ -110,7 +110,7 @@ covers:
 - simultaneous read-only host binds, write rejection, shared-view fork
   warnings, and host-side mutation visibility in parent and child;
 - persistent isolated writable host views, protection of the host lower,
-  visibility of uncopied live-lower changes, stop/start persistence, stopped
+  visibility of uncopied live-lower changes, stop/start persistence, exited
   `ttc cp`, checkpoint/restore, inspect output, and parent/child CoW divergence;
 - detached `:copy` imports for directories and individual files, source
   deletion independence, fork divergence, inspect output, and
@@ -119,7 +119,7 @@ covers:
 
 The dedicated disk-volume suite additionally covers the ordinary rootfs upper:
 direct disk objects while running, absence of tar snapshots, O(1) branch
-creation and divergence, stopped main/child `ttc cp`, copy into a
+creation and divergence, exited main/child `ttc cp`, copy into a
 created-but-never-started container, and stop/start reopening without explicit
 save or restore.
 
@@ -203,17 +203,6 @@ RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 Use `TTC_UNSAFE_NO_HOST_ISOLATION=1` only on a trusted host that cannot create
 unprivileged user namespaces. Set `TTC_ALLOW_SLOW_VOLUME_COPY=1` when the
 test's data root is on a filesystem without `FICLONE`.
-
-### Upgrading from the containerd-backed image store
-
-Existing TTC container-family metadata and already-materialized root filesystems
-remain usable after upgrading. Image names and blobs that were owned by a
-containerd daemon are not copied into TTC's native store automatically; pull
-those image names again before creating a new family from them. The native
-content is downloaded once per `--data-root` and is reused by later pulls and
-families. Restart any manually managed `ttcd` process after upgrading because
-the daemon protocol version changed, then explicitly start it before issuing
-normal commands.
 
 ## Terminal and live-fork integration
 

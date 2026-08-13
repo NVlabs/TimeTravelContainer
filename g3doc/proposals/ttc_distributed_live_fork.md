@@ -395,7 +395,7 @@ The protocol must explicitly test these races:
 | Retry vs. delayed original response | Both carry the same epoch and content; only one target transition wins. |
 | Cancel vs. response/ACK | Transaction accounting chooses a terminal outcome without leaks or double release. |
 | B destruction vs. active faults | Waiters fail, B stops, and A releases the cancelled snapshot only after no sender can use it. |
-| A shutdown vs. incomplete B | A either completes a configured drain or B is stopped with an explicit dependency error. |
+| A shutdown vs. incomplete B | A either completes a configured drain or B is marked failed with an explicit dependency error. |
 | Snapshot ID reuse/stale packet | Message is rejected without touching current page state. |
 
 Use a small locked or atomic transition helper as the only writer of protocol

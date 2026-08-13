@@ -114,8 +114,8 @@ completion, and recovery in detail.
 
 The `ttcx` SDKs talk directly to a running `ttcd`; applications do not need to
 spawn or parse the `ttc` CLI. Each SDK returns structured stdout, stderr, and
-exit status and provides helpers for run, exec, fork, pause, resume, stop, and
-remove.
+exit status and provides helpers for run, exec, batch or remote fork,
+pause/resume, dehydration, checkpoint/restore, lifecycle control, and removal.
 
 - [Python](sdk/python/README.md)
 - [TypeScript](sdk/typescript/README.md)

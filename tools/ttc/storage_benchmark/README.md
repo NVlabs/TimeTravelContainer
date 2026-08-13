@@ -59,10 +59,10 @@ or `--pebble-build=nowal` to compare memtable/flush construction with direct SST
 ingestion.
 
 This command preserves the historical 64 KiB/Pebble qualification. TTC's
-current plan uses 1 MiB loose chunk files and does not integrate Pebble. Before
-runtime implementation, extend or replace this harness with a 1 MiB
-shared-filesystem workload that measures full-chunk read amplification,
-cross-host visibility, inode/metadata cost, and concurrent loader leases.
+runtime uses 1 MiB loose chunk files and does not integrate Pebble. Future
+storage comparisons should add a 1 MiB shared-filesystem workload that measures
+full-chunk read amplification, cross-host visibility, inode/metadata cost, and
+concurrent loader leases.
 
 The commands remove the supplied database directory before starting. Do not
 point `--dir` at data that must be retained.

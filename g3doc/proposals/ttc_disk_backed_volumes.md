@@ -1,9 +1,10 @@
 # TTC disk-backed managed volumes
 
-> **Planned successor:**
-> [TTC userspace extent store](ttc_userspace_extent_store.md) specifies a
-> page-granular replacement for the current reflink/whole-file object engine.
-> This document continues to describe the implementation that exists today.
+> **Current storage design:** This document describes the implementation used
+> today. The [TTC userspace extent store](ttc_userspace_extent_store.md) now
+> backs dehydrated and distributed memory only. Replacing rootfs and volume
+> storage with that model is deferred until filesystem benchmarks justify the
+> additional complexity.
 
 ## Status
 
@@ -23,10 +24,6 @@ forks, restart durability, and both rootless isolation modes. The available
 test host does not provide `FICLONE` in the workspace filesystem, so the same
 end-to-end suite was run in explicitly enabled whole-file-copy mode; reflink
 selection and cloning are covered by focused tests.
-
-Existing directories created by the removed driver are ignored. TTC does not
-delete them automatically, because doing so would destroy user data. This is a
-pre-release design replacement, not a migration interface.
 
 ## Goals
 
@@ -341,7 +338,7 @@ from the guest-visible logical quota.
    * Restore `--volume`, `--mount type=volume`, anonymous volumes, image
      `VOLUME`, `volume-nocopy`, inspect projection, and `rm -v`.
    * `ttc cp` imports/exports running branches, admits only its trusted helper
-     while an existing branch remains paused, and reconstructs fully stopped
+     while an existing branch remains paused, and reconstructs exited
      branches in a transient helper Sentry without a checkpoint restore.
    * Explicit branch-head promotion remains future work; ordinary rootfs and
      managed-volume writes are already persistent.

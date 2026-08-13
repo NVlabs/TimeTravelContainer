@@ -2,7 +2,7 @@
 
 ## Status
 
-The memory-hydration prototype is implemented. It includes stable logical page
+The memory-hydration backend is implemented. It includes stable logical page
 and content-version IDs, branch-scoped capture of application and private
 `MemoryFile` owners, immutable 1 MiB loose objects, deterministic chunk
 assembly, compact manifests, transactional whole-chunk demand loading,
@@ -57,7 +57,7 @@ storage engine is selected:
 9. Optional hole punching only as an optimization. Correctness and bounded
    reuse must not depend on it.
 
-The first prototype is deliberately narrower: store each immutable 1 MiB
+The implemented memory backend is deliberately narrower: it stores each immutable 1 MiB
 dehydrated-memory transfer unit in an ordinary file in the cluster's shared TTC
 data root. Each chunk contains up to 256 stable logical 4 KiB page slots. The
 implemented repository uses the first two content-digest bytes for lazy shard
@@ -105,8 +105,8 @@ The candidates investigated in August 2026 are:
 
 ### Selected memory hydration design
 
-Phase 0 implements only loose 1 MiB chunk files. Pebble remains benchmarked
-prior art and is not included as an A/B runtime backend in this phase.
+The runtime uses loose 1 MiB chunk files. Pebble remains benchmarked prior art
+and is not included as an A/B runtime backend.
 
 Snapshot contents are written as immutable chunks before an immutable manifest
 is published. A branch pointer is atomically replaced only after its manifest
@@ -120,7 +120,7 @@ garbage collection, and daemon reconciliation cover interrupted construction
 and ownership transfer. Retained shard directory descriptors remain an
 optional demand-path optimization to benchmark.
 
-The completed backend must chunk every referenced range from every
+The backend chunks every referenced range from every
 `MemoryFile` captured by the existing dehydration/remote-fork traversal,
 including application anonymous memory and private resource `MemoryFile`s.
 Kernel object graphs remain in the existing metadata stream. Reconstructible
@@ -458,16 +458,15 @@ branch faults first, one network/NFS read installs the complete chunk for both.
 A later write by B.2 CoWs only the affected 4 KiB page; B.3 keeps the fork-time
 page.
 
-The current TTC implementation already supplies the core mechanism for this
-specific same-Sentry case: `MemoryManager.Fork` shares its `MemoryFile`, the
-remote async loader is attached once to that `MemoryFile`, and private PMAs are
-made CoW by local fork. Current demand loading can still install subranges, so
-the canonical `NodeChunkInstance` and atomic 1 MiB residency transaction are
-new work. Branches restored into separate Sentry processes do not currently
-share resident host pages merely because they reference the same NFS chunk;
-they each need a load unless a later cross-Sentry shared-page cache is added.
+The implementation supplies this same-Sentry mechanism: `MemoryManager.Fork`
+shares its `MemoryFile`, one sparse loader is attached to that memory file,
+private PMAs are made CoW by local fork, and the canonical chunk table installs
+all valid slots of a 1 MiB chunk transactionally. Branches in unrelated Sentry
+processes do not share resident host pages merely because they reference the
+same shared-filesystem chunk; they each load a copy unless a future
+cross-Sentry page cache is added.
 
-The distributed implementation MUST maintain one active Sentry per
+The distributed implementation maintains one active Sentry per
 `(global family ID, node ID)` and import every compatible branch of that family
 on the node into it. Local fork, peer rehydration, and repeated remote forks to
 the same node therefore use the same `MemoryFile` and canonical chunk/page
@@ -475,8 +474,8 @@ tables. The first branch creates the node-local family runtime; later branches
 are imported through its control server without spawning another Sentry.
 Incompatible platform or family configuration is rejected rather than silently
 creating a second runtime. Unrelated global families retain separate Sentries.
-The current remote CLI's new-target-family behavior must be replaced as part of
-this work; a cross-Sentry page cache is not part of the first implementation.
+The remote CLI imports repeated destinations for one global family into that
+runtime. A cross-Sentry page cache is not part of the implementation.
 
 ### Forking a branch with an upstream live origin
 
@@ -500,7 +499,7 @@ published. By default, if the provider cannot be contacted and no shared
 version exists, the fork fails without publishing the child. An explicit slow
 policy may first materialize the required chunks and retry; it is never an
 implicit latency surprise. A published branch whose last provider is later
-lost before durable promotion is stopped and marked failed when it next cannot
+lost before durable promotion is marked failed when it next cannot
 resolve the dependency; TTC never substitutes zeroes or exposes partial chunk
 installation.
 
@@ -1351,11 +1350,13 @@ branch observe another branch's private write.
 
 ## Implementation record and remaining plan
 
-### Memory-hydration prototype
+### Memory-hydration backend
 
-This checklist records both implemented foundations and remaining work. The
-status section above is authoritative; unchecked optimization and stress-test
-items remain specifications rather than claims of completion.
+This is the original implementation and qualification checklist. The status
+section above is authoritative: core format, lifecycle, import, loading, and
+reclamation items are implemented, while optimization and extended stress or
+benchmark items remain acceptance specifications. Imperative wording below
+does not by itself mean an item is unfinished.
 
 * Define a versioned immutable manifest and 1 MiB loose-chunk format. Do not
   add Pebble to TTC's runtime dependency graph.

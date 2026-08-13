@@ -3,6 +3,13 @@
 Status: implemented for the documented systrap and KVM scope; unsupported
 external resources are rejected by design.
 
+The status and implementation notes in this document are current. Imperative
+language in the design and phase sections records the invariants used to build
+and review the implementation; it is not an uncompleted roadmap. Distributed
+fork and process-free dehydration are documented separately in
+[ttc_distributed_live_fork.md](ttc_distributed_live_fork.md) and
+[ttc_userspace_extent_store.md](ttc_userspace_extent_store.md).
+
 Follow-on product, mount, volume, exec, attach/detach, image-management, and
 Docker-like CLI work is tracked in
 [timetravel_ttc_cli.md](timetravel_ttc_cli.md).
@@ -33,19 +40,22 @@ latency rather than branch failure isolation.
    between branches.
 4. Clone internal pipes, epoll graphs, Unix sockets, timers, and similar Sentry
    objects through the existing state object-graph machinery.
-5. Use an OverlayFS-style root with an immutable lower and a tmpfs upper whose
-   file data becomes page-level CoW at live fork.
+5. Use an immutable image lower and a persistent `ttcvol` upper whose metadata
+   roots fork in O(1); shared regular files split on first write using reflinks
+   or the explicitly enabled whole-file-copy fallback.
 6. Reject a fork before mutation if any reachable resource is not supported or
    escapes the sandbox closure.
 7. Make failure atomic from the guest's perspective: failure may leave the
    parent more conservatively write-protected, but must not change its data or
    observable kernel state.
 
-## Non-goals for the first implementation
+## Original local-fork non-goals
 
-* Running different branches in different Sentry processes or hosts.
+These scoped the first local live-fork milestone. Persistence and cross-node
+fork were subsequently implemented by the documents linked above.
+
+* Running branches of one family in different Sentry processes on one host.
 * Supporting ptrace or other gVisor platforms beyond systrap and KVM.
-* Migrating or persisting branches.
 * Cloning host-network/hostinet or arbitrary external links, writable gofer
   mounts, host FDs, devices, GPU state, packet mmap rings, KCOV, AIO, or
   io_uring. TTC's own virtual NIC is supported by an explicit parent-retain,

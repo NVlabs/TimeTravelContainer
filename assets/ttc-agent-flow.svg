@@ -1,90 +1,133 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">Agent exploration with TimeTravelContainer</title>
   <desc id="desc">A main agent forks one initialized sandbox into three independent subagent branches, which explore in parallel and return summaries.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+    .background-start { stop-color: #f7faff; }
+    .background-end { stop-color: #e7f3ff; }
+    .canvas-title, .card-title { fill: #0b2d53; }
+    .canvas-subtitle, .card-body { fill: #496986; }
+    .card { fill: #ffffff; stroke: #c5d8e9; stroke-width: 1.5; }
+    .primary-header { fill: #145994; }
+    .primary-header-text { fill: #ffffff; }
+    .primary-line { stroke: #087fae; }
+    .primary-arrow { fill: #087fae; }
+    .fork-node { fill: #ffffff; stroke: #087fae; }
+    .fork-mark { stroke: #0b416f; }
+    .summary { fill: #0879a5; }
+    .accent-line { stroke: #d99100; }
+    .accent-arrow, .accent-dot { fill: #e9a300; }
+    .accent-header { fill: #ffc433; }
+    .accent-header-text { fill: #152f4d !important; }
+    .pill { fill: #ffffff; stroke: #87b8d8; }
+    .pill-text { fill: #234d70; }
+    .shadow-color { flood-color: #153a5b; flood-opacity: .18; }
+    @media (prefers-color-scheme: dark) {
+      .background-start { stop-color: #071c43; }
+      .background-end { stop-color: #0a315d; }
+      .canvas-title, .primary-header-text { fill: #ffffff; }
+      .canvas-subtitle { fill: #a9c8e7; }
+      .card { fill: #102f51; stroke: #275578; }
+      .card-title { fill: #ffffff; }
+      .card-body { fill: #bdd4e8; }
+      .primary-header { fill: #155b99; }
+      .primary-line { stroke: #46d7fa; }
+      .primary-arrow { fill: #46d7fa; }
+      .fork-node { fill: #073466; stroke: #46d7fa; }
+      .fork-mark { stroke: #ffffff; }
+      .summary { fill: #55dafa; }
+      .accent-line { stroke: #ffc433; }
+      .accent-arrow, .accent-dot { fill: #ffc433; }
+      .accent-header-text { fill: #071c43 !important; }
+      .pill { fill: #06264d; stroke: #22689e; }
+      .pill-text { fill: #d7ecff; }
+      .shadow-color { flood-color: #00132f; flood-opacity: .35; }
+    }
+  </style>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#071c43"/>
-      <stop offset="1" stop-color="#0a315d"/>
+      <stop class="background-start" offset="0"/>
+      <stop class="background-end" offset="1"/>
     </linearGradient>
     <linearGradient id="branch" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0" stop-color="#27c9f5"/>
       <stop offset="1" stop-color="#6ce2ff"/>
     </linearGradient>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#00132f" flood-opacity=".35"/>
+      <feDropShadow class="shadow-color" dx="0" dy="7" stdDeviation="10"/>
     </filter>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#46d7fa"/>
+      <path class="primary-arrow" d="M 0 0 L 10 5 L 0 10 z"/>
     </marker>
     <marker id="arrow-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ffc433"/>
+      <path class="accent-arrow" d="M 0 0 L 10 5 L 0 10 z"/>
     </marker>
   </defs>
 
   <rect width="1200" height="620" rx="24" fill="url(#background)"/>
-  <text x="600" y="48" text-anchor="middle" fill="#ffffff" font-family="Inter,Segoe UI,sans-serif" font-size="25" font-weight="700">One live sandbox, many possible futures</text>
-  <text x="600" y="77" text-anchor="middle" fill="#a9c8e7" font-family="Inter,Segoe UI,sans-serif" font-size="15">Processes, memory, filesystem, and internal resources branch together</text>
+  <text class="canvas-title" x="600" y="48" text-anchor="middle" font-family="Inter,Segoe UI,sans-serif" font-size="25" font-weight="700">One live sandbox, many possible futures</text>
+  <text class="canvas-subtitle" x="600" y="77" text-anchor="middle" font-family="Inter,Segoe UI,sans-serif" font-size="15">Processes, memory, filesystem, and internal resources branch together</text>
 
   <g filter="url(#shadow)">
-    <rect x="54" y="205" width="235" height="180" rx="18" fill="#ffffff"/>
-    <rect x="54" y="205" width="235" height="48" rx="18" fill="#0d4b89"/>
-    <rect x="54" y="235" width="235" height="18" fill="#0d4b89"/>
-    <circle cx="82" cy="229" r="8" fill="#ffc433"/>
-    <text x="101" y="236" fill="#ffffff" font-family="Inter,Segoe UI,sans-serif" font-size="17" font-weight="700">Main agent</text>
-    <text x="76" y="283" fill="#0d3159" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@main</text>
-    <text x="76" y="312" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Repository indexed</text>
-    <text x="76" y="336" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Dependencies installed</text>
-    <text x="76" y="360" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Services warmed</text>
+    <rect class="card" x="54" y="205" width="235" height="180" rx="18"/>
+    <rect class="primary-header" x="54" y="205" width="235" height="48" rx="18"/>
+    <rect class="primary-header" x="54" y="235" width="235" height="18"/>
+    <circle class="accent-dot" cx="82" cy="229" r="8"/>
+    <text class="primary-header-text" x="101" y="236" font-family="Inter,Segoe UI,sans-serif" font-size="17" font-weight="700">Main agent</text>
+    <text class="card-title" x="76" y="283" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@main</text>
+    <text class="card-body" x="76" y="312" font-family="Inter,Segoe UI,sans-serif" font-size="14">Repository indexed</text>
+    <text class="card-body" x="76" y="336" font-family="Inter,Segoe UI,sans-serif" font-size="14">Dependencies installed</text>
+    <text class="card-body" x="76" y="360" font-family="Inter,Segoe UI,sans-serif" font-size="14">Services warmed</text>
   </g>
 
-  <path d="M289 294 H352" stroke="#46d7fa" stroke-width="5" fill="none" marker-end="url(#arrow)"/>
+  <path class="primary-line" d="M289 294 H352" stroke-width="5" fill="none" marker-end="url(#arrow)"/>
   <g>
-    <circle cx="383" cy="294" r="31" fill="#073466" stroke="#46d7fa" stroke-width="3"/>
-    <path d="M371 294 h24 M383 282 v24" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
-    <text x="383" y="343" text-anchor="middle" fill="#a9c8e7" font-family="Inter,Segoe UI,sans-serif" font-size="13">live fork</text>
+    <circle class="fork-node" cx="383" cy="294" r="31" stroke-width="3"/>
+    <path class="fork-mark" d="M371 294 h24 M383 282 v24" stroke-width="4" stroke-linecap="round"/>
+    <text class="canvas-subtitle" x="383" y="343" text-anchor="middle" font-family="Inter,Segoe UI,sans-serif" font-size="13">live fork</text>
   </g>
 
-  <path d="M414 294 C460 294 456 150 510 150" stroke="#46d7fa" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
-  <path d="M414 294 H510" stroke="#46d7fa" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
-  <path d="M414 294 C460 294 456 438 510 438" stroke="#46d7fa" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path class="primary-line" d="M414 294 C460 294 456 150 510 150" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path class="primary-line" d="M414 294 H510" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path class="primary-line" d="M414 294 C460 294 456 438 510 438" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
 
   <g filter="url(#shadow)">
-    <rect x="520" y="98" width="275" height="110" rx="16" fill="#ffffff"/>
+    <rect class="card" x="520" y="98" width="275" height="110" rx="16"/>
     <rect x="520" y="98" width="9" height="110" rx="4" fill="url(#branch)"/>
-    <text x="552" y="128" fill="#0d3159" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@investigate</text>
-    <text x="552" y="154" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Inspect code and reproduce</text>
-    <text x="552" y="179" fill="#0d78a6" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: root cause + evidence</text>
+    <text class="card-title" x="552" y="128" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@investigate</text>
+    <text class="card-body" x="552" y="154" font-family="Inter,Segoe UI,sans-serif" font-size="14">Inspect code and reproduce</text>
+    <text class="summary" x="552" y="179" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: root cause + evidence</text>
 
-    <rect x="520" y="242" width="275" height="110" rx="16" fill="#ffffff"/>
+    <rect class="card" x="520" y="242" width="275" height="110" rx="16"/>
     <rect x="520" y="242" width="9" height="110" rx="4" fill="url(#branch)"/>
-    <text x="552" y="272" fill="#0d3159" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@solution-a</text>
-    <text x="552" y="298" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Patch, build, and test</text>
-    <text x="552" y="323" fill="#0d78a6" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: result + test report</text>
+    <text class="card-title" x="552" y="272" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@solution-a</text>
+    <text class="card-body" x="552" y="298" font-family="Inter,Segoe UI,sans-serif" font-size="14">Patch, build, and test</text>
+    <text class="summary" x="552" y="323" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: result + test report</text>
 
-    <rect x="520" y="386" width="275" height="110" rx="16" fill="#ffffff"/>
+    <rect class="card" x="520" y="386" width="275" height="110" rx="16"/>
     <rect x="520" y="386" width="9" height="110" rx="4" fill="url(#branch)"/>
-    <text x="552" y="416" fill="#0d3159" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@solution-b</text>
-    <text x="552" y="442" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Try alternative and benchmark</text>
-    <text x="552" y="467" fill="#0d78a6" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: tradeoffs + metrics</text>
+    <text class="card-title" x="552" y="416" font-family="Inter,Segoe UI,sans-serif" font-size="16" font-weight="700">agent@solution-b</text>
+    <text class="card-body" x="552" y="442" font-family="Inter,Segoe UI,sans-serif" font-size="14">Try alternative and benchmark</text>
+    <text class="summary" x="552" y="467" font-family="Inter,Segoe UI,sans-serif" font-size="13">summary: tradeoffs + metrics</text>
   </g>
 
-  <path d="M795 153 C850 153 845 270 901 270" stroke="#ffc433" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
-  <path d="M795 297 H901" stroke="#ffc433" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
-  <path d="M795 441 C850 441 845 324 901 324" stroke="#ffc433" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
+  <path class="accent-line" d="M795 153 C850 153 845 270 901 270" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
+  <path class="accent-line" d="M795 297 H901" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
+  <path class="accent-line" d="M795 441 C850 441 845 324 901 324" stroke-width="4" fill="none" marker-end="url(#arrow-gold)"/>
 
   <g filter="url(#shadow)">
-    <rect x="911" y="210" width="235" height="180" rx="18" fill="#ffffff"/>
-    <rect x="911" y="210" width="235" height="48" rx="18" fill="#ffc433"/>
-    <text x="1029" y="241" text-anchor="middle" fill="#152f4d" font-family="Inter,Segoe UI,sans-serif" font-size="17" font-weight="700">Main agent continues</text>
-    <text x="936" y="289" fill="#0d3159" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">Compare summaries</text>
-    <text x="936" y="318" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Choose or combine results</text>
-    <text x="936" y="344" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Keep useful branches</text>
-    <text x="936" y="370" fill="#456681" font-family="Inter,Segoe UI,sans-serif" font-size="14">Discard the rest</text>
+    <rect class="card" x="911" y="210" width="235" height="180" rx="18"/>
+    <rect class="accent-header" x="911" y="210" width="235" height="48" rx="18"/>
+    <text class="accent-header-text" x="1029" y="241" text-anchor="middle" font-family="Inter,Segoe UI,sans-serif" font-size="17" font-weight="700">Main agent continues</text>
+    <text class="card-title" x="936" y="289" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">Compare summaries</text>
+    <text class="card-body" x="936" y="318" font-family="Inter,Segoe UI,sans-serif" font-size="14">Choose or combine results</text>
+    <text class="card-body" x="936" y="344" font-family="Inter,Segoe UI,sans-serif" font-size="14">Keep useful branches</text>
+    <text class="card-body" x="936" y="370" font-family="Inter,Segoe UI,sans-serif" font-size="14">Discard the rest</text>
   </g>
 
   <g transform="translate(344 548)">
-    <rect width="512" height="42" rx="21" fill="#06264d" stroke="#22689e"/>
-    <circle cx="27" cy="21" r="9" fill="#ffc433"/>
-    <text x="48" y="27" fill="#d7ecff" font-family="Inter,Segoe UI,sans-serif" font-size="14">Each branch starts from the same live state and writes independently</text>
+    <rect class="pill" width="512" height="42" rx="21"/>
+    <circle class="accent-dot" cx="27" cy="21" r="9"/>
+    <text class="pill-text" x="48" y="27" font-family="Inter,Segoe UI,sans-serif" font-size="14">Each branch starts from the same live state and writes independently</text>
   </g>
 </svg>
