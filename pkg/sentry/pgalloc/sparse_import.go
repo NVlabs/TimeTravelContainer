@@ -32,28 +32,43 @@ import (
 // schemes distinct. The returned ranges read directly from the capture's
 // packed TCP stream.
 func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind usage.MemoryKind, memCgID uint32) (*SparseChunkInstallation, *SparseRelocation, []RemoteLoadRange, error) {
-	byChunk := make(map[LogicalChunkID][]CapturedPageBinding)
-	for _, binding := range bindings {
+	type chunkInstance struct {
+		id       LogicalChunkID
+		instance uint32
+	}
+	orderedBindings := append([]CapturedPageBinding(nil), bindings...)
+	sort.Slice(orderedBindings, func(i, j int) bool { return orderedBindings[i].StreamOffset < orderedBindings[j].StreamOffset })
+	byChunk := make(map[chunkInstance][]CapturedPageBinding)
+	current := make(map[LogicalChunkID]chunkInstance)
+	used := make(map[chunkInstance][4]uint64)
+	var chunks []chunkInstance
+	for _, binding := range orderedBindings {
 		chunk, slot := binding.Page.Chunk()
 		if binding.ResourceID.Ok() || binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 {
 			return nil, nil, nil, fmt.Errorf("invalid live sparse binding %+v", binding)
 		}
-		byChunk[chunk] = append(byChunk[chunk], binding)
-	}
-	chunks := make([]LogicalChunkID, 0, len(byChunk))
-	for chunk := range byChunk {
-		chunks = append(chunks, chunk)
-	}
-	sort.Slice(chunks, func(i, j int) bool {
-		if chunks[i].Allocator != chunks[j].Allocator {
-			return string(chunks[i].Allocator[:]) < string(chunks[j].Allocator[:])
+		key, ok := current[chunk]
+		if !ok {
+			key = chunkInstance{id: chunk}
+			current[chunk] = key
+			chunks = append(chunks, key)
 		}
-		return chunks[i].Sequence < chunks[j].Sequence
-	})
+		bitmap := used[key]
+		if bitmap[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+			key.instance++
+			current[chunk] = key
+			chunks = append(chunks, key)
+			bitmap = used[key]
+		}
+		bitmap[slot/64] |= uint64(1) << (slot % 64)
+		used[key] = bitmap
+		byChunk[key] = append(byChunk[key], binding)
+	}
 	installs := make([]SparseChunkInstall, 0, len(chunks))
 	objectBindings := make(map[SparseChunkObjectID][]CapturedPageBinding, len(chunks))
-	for _, chunk := range chunks {
-		pages := byChunk[chunk]
+	for _, key := range chunks {
+		chunk := key.id
+		pages := byChunk[key]
 		sort.Slice(pages, func(i, j int) bool { return pages[i].Slot < pages[j].Slot })
 		hash := sha256.New()
 		hash.Write([]byte("ttc-live-page-versions-v1\x00"))
