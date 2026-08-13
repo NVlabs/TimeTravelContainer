@@ -87,6 +87,12 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if err != nil {
 		return nil, fmt.Errorf("duplicating dehydration metadata: %w", err)
 	}
+	// The duplicated descriptor is the only one used below. Close the donated
+	// descriptor before replying so a client may remove the consumed control
+	// directory immediately even when it resides on NFS. Waiting for uRPC's
+	// deferred payload cleanup leaves a small response/unlink race in which NFS
+	// materializes an open metadata.state as a .nfs placeholder.
+	_ = args.FilePayload.Files[0].Close()
 	metadataFile := os.NewFile(uintptr(metadataFD), "dehydration-metadata")
 	metadata, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
 	metadataFile.Close()
@@ -256,6 +262,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	if err != nil {
 		return nil, err
 	}
+	_ = args.FilePayload.Files[0].Close()
 	metadataFile := os.NewFile(uintptr(metadataFD), "dehydration-peer-metadata")
 	metadata, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
 	metadataFile.Close()

@@ -95,6 +95,27 @@ func TestTimekeeperClockStateCanonicalizesKernel(t *testing.T) {
 	}
 }
 
+func TestTimekeeperTCPIPClockStateCanonicalizesKernel(t *testing.T) {
+	canonical := &Timekeeper{}
+	foreign := stateTestTimekeeper(t)
+	defer foreign.Destroy()
+	k := &Kernel{timekeeper: canonical}
+	ctx := context.WithValue(context.Background(), CtxKernel, k)
+
+	source := &timekeeperTCPIPClock{tk: foreign}
+	var image bytes.Buffer
+	if _, err := state.Save(ctx, &image, source); err != nil {
+		t.Fatalf("saving network clock with active foreign Timekeeper: %v", err)
+	}
+	var restored timekeeperTCPIPClock
+	if _, err := state.Load(ctx, bytes.NewReader(image.Bytes()), &restored); err != nil {
+		t.Fatalf("loading network clock: %v", err)
+	}
+	if restored.tk != canonical {
+		t.Fatalf("restored network clock Timekeeper=%p, want current Kernel Timekeeper %p", restored.tk, canonical)
+	}
+}
+
 // TestTimekeeperMonotonicZero tests that monotonic time starts at zero.
 func TestTimekeeperMonotonicZero(t *testing.T) {
 	c := &mockClocks{

@@ -819,7 +819,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("getting root credentials")
 	}
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace, l.k)
+	netns, err := newRootNetworkNamespace(args.Conf, tk.TCPIPClock(), creds.UserNamespace, l.k)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
 	}

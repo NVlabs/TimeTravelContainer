@@ -493,6 +493,58 @@ func (tc *timekeeperClock) NewTimer(l ktime.Listener) ktime.Timer {
 
 var _ tcpip.Clock = (*Timekeeper)(nil)
 
+// timekeeperTCPIPClock is the clock object installed in netstack. Keeping the
+// adapter distinct from Timekeeper is important for live branch state: network
+// objects retain tcpip.Clock interface values in many places, and an interface
+// copied from another branch must be rebound to the Kernel currently being
+// saved and restored rather than pulling that branch's Timekeeper into the
+// state graph.
+//
+// +stateify type
+type timekeeperTCPIPClock struct {
+	tk *Timekeeper
+}
+
+// StateSave canonicalizes the adapter to the Kernel being saved. Keep slot 0
+// stable for compatibility with images produced by this adapter.
+func (tc *timekeeperTCPIPClock) StateSave(s state.Sink) {
+	tk := tc.tk
+	if k, ok := s.Context().Value(CtxKernel).(*Kernel); ok && k != nil && k.timekeeper != nil {
+		tk = k.timekeeper
+	}
+	s.Save(0, &tk)
+}
+
+// StateLoad repairs a stale cross-branch reference after the containing
+// Kernel has been decoded.
+func (tc *timekeeperTCPIPClock) StateLoad(ctx context.Context, s state.Source) {
+	s.Load(0, &tc.tk)
+	s.AfterLoad(func() {
+		if k, ok := ctx.Value(CtxKernel).(*Kernel); ok && k != nil && k.timekeeper != nil {
+			tc.tk = k.timekeeper
+		}
+	})
+}
+
+// TCPIPClock returns a serializable network clock bound to t.
+func (t *Timekeeper) TCPIPClock() tcpip.Clock {
+	return &timekeeperTCPIPClock{tk: t}
+}
+
+var _ tcpip.Clock = (*timekeeperTCPIPClock)(nil)
+
+func (tc *timekeeperTCPIPClock) Now() time.Time {
+	return tc.tk.Now()
+}
+
+func (tc *timekeeperTCPIPClock) NowMonotonic() tcpip.MonotonicTime {
+	return tc.tk.NowMonotonic()
+}
+
+func (tc *timekeeperTCPIPClock) AfterFunc(d time.Duration, f func()) tcpip.Timer {
+	return tc.tk.AfterFunc(d, f)
+}
+
 // Now implements tcpip.Clock.
 func (t *Timekeeper) Now() time.Time {
 	nsec, err := t.GetTime(sentrytime.Realtime)
