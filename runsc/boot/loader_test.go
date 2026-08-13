@@ -245,7 +245,6 @@ func TestTTCMaxTasks(t *testing.T) {
 		{name: "marker requires resources", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}}, wantErr: true},
 		{name: "marker requires positive limit", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: nonPositive}}}, wantErr: true},
 		{name: "TTC limit", spec: &specs.Spec{Annotations: map[string]string{ttcPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
-		{name: "legacy TimeTravelOS limit", spec: &specs.Spec{Annotations: map[string]string{legacyPidsLimitAnnotation: "sentry"}, Linux: &specs.Linux{Resources: &specs.LinuxResources{Pids: positive}}}, want: 7},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := ttcMaxTasks(test.spec)

@@ -2379,7 +2379,7 @@ func (f *SandboxFamily) Signal(id, cid string, pid, signo int32, mode SignalDeli
 // Wait waits for a process in one branch and returns its wait status. PID 0
 // selects the container's init process.
 func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
-	b, done, err := f.beginControl(id)
+	b, done, err := f.beginWaitControl(id)
 	if err != nil {
 		return 0, err
 	}
@@ -2402,6 +2402,34 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 		f.mu.Unlock()
 	}
 	return status, nil
+}
+
+// beginWaitControl acquires a Kernel-lifetime lease for process waiting.
+// Unlike ordinary live control operations, waiting remains valid after init
+// exits because Kernel retains GlobalInit and its terminal wait status until
+// branch destruction.
+func (f *SandboxFamily) beginWaitControl(id string) (*sandboxBranch, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
+	if b.state != BranchRunning && b.state != BranchPaused && b.state != BranchExited {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("branch %q is %s", id, state)
+	}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	b.opMu.Unlock()
+	return b, b.controlOps.Done, nil
 }
 
 func (f *SandboxFamily) execSession(args *ExecSessionArgs) (*sandboxBranch, *execSession, func(), error) {
