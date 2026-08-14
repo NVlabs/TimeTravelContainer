@@ -19,8 +19,10 @@ package cpuid
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // FeatureSet defines features in terms of CPUID leaves and bits.
@@ -91,14 +93,14 @@ func regsFromVendorID(r [12]byte) (bx, cx, dx uint32) {
 	bx |= uint32(r[1]) << 8
 	bx |= uint32(r[2]) << 16
 	bx |= uint32(r[3]) << 24
-	cx |= uint32(r[4])
-	cx |= uint32(r[5]) << 8
-	cx |= uint32(r[6]) << 16
-	cx |= uint32(r[7]) << 24
-	dx |= uint32(r[8])
-	dx |= uint32(r[9]) << 8
-	dx |= uint32(r[10]) << 16
-	dx |= uint32(r[10]) << 24
+	dx |= uint32(r[4])
+	dx |= uint32(r[5]) << 8
+	dx |= uint32(r[6]) << 16
+	dx |= uint32(r[7]) << 24
+	cx |= uint32(r[8])
+	cx |= uint32(r[9]) << 8
+	cx |= uint32(r[10]) << 16
+	cx |= uint32(r[11]) << 24
 	return
 }
 
@@ -175,6 +177,47 @@ func (fs FeatureSet) SteppingID() uint8 {
 	ax, _, _, _ := fs.query(featureInfo)
 	_, _, _, _, _, sid := signatureSplit(ax)
 	return sid
+}
+
+// ProcessorBrandString returns the processor brand string exposed through
+// extended CPUID leaves 0x80000002 through 0x80000004. It returns an empty
+// string when the leaves are unavailable or contain no brand string.
+func (fs FeatureSet) ProcessorBrandString() string {
+	maxExtended, _, _, _ := fs.query(extendedFunctionInfo)
+	if maxExtended < uint32(processorBrandString4) {
+		return ""
+	}
+
+	var brand [48]byte
+	for i, leaf := range [...]cpuidFunction{
+		processorBrandString2,
+		processorBrandString3,
+		processorBrandString4,
+	} {
+		ax, bx, cx, dx := fs.query(leaf)
+		offset := i * 16
+		binary.LittleEndian.PutUint32(brand[offset:], ax)
+		binary.LittleEndian.PutUint32(brand[offset+4:], bx)
+		binary.LittleEndian.PutUint32(brand[offset+8:], cx)
+		binary.LittleEndian.PutUint32(brand[offset+12:], dx)
+	}
+	return strings.TrimSpace(strings.TrimRight(string(brand[:]), "\x00"))
+}
+
+// displayFamilyModel returns the family and model numbers as Linux displays
+// them in /proc/cpuinfo. Extended family applies only to base family 0xf;
+// extended model applies only to base families 0x6 and 0xf.
+func displayFamilyModel(signature uint32) (uint16, uint16) {
+	ef, em, _, f, m, _ := signatureSplit(signature)
+	family := uint16(f)
+	if f == 0xf {
+		family += uint16(ef)
+	}
+	model := uint16(m)
+	if f == 0x6 || f == 0xf {
+		model |= uint16(em) << 4
+	}
+	return family, model
 }
 
 // VirtualAddressBits returns the number of bits available for virtual
@@ -330,14 +373,19 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 	// Avoid many redundant calls here, since this can occasionally appear
 	// in the hot path. Read all basic information up front, see above.
 	ax, _, _, _ := fs.query(featureInfo)
-	ef, em, _, f, m, _ := signatureSplit(ax)
+	_, _, _, _, _, stepping := signatureSplit(ax)
+	family, model := displayFamilyModel(ax)
 	vendor := fs.VendorID()
+	modelName := fs.ProcessorBrandString()
+	if modelName == "" {
+		modelName = string(vendor[:])
+	}
 	fmt.Fprintf(w, "processor\t: %d\n", cpu)
 	fmt.Fprintf(w, "vendor_id\t: %s\n", string(vendor[:]))
-	fmt.Fprintf(w, "cpu family\t: %d\n", ((ef<<4)&0xff)|f)
-	fmt.Fprintf(w, "model\t\t: %d\n", ((em<<4)&0xff)|m)
-	fmt.Fprintf(w, "model name\t: %s\n", "unknown") // Unknown for now.
-	fmt.Fprintf(w, "stepping\t: %s\n", "unknown")   // Unknown for now.
+	fmt.Fprintf(w, "cpu family\t: %d\n", family)
+	fmt.Fprintf(w, "model\t\t: %d\n", model)
+	fmt.Fprintf(w, "model name\t: %s\n", modelName)
+	fmt.Fprintf(w, "stepping\t: %d\n", stepping)
 	fmt.Fprintf(w, "cpu MHz\t\t: %.3f\n", cpuFreqMHz)
 	// Pretend the CPU has 8192 KB of cache. Note that real /proc/cpuinfo exposes total L3 cache
 	// size on Intel and per-core L2 cache size on AMD (as of Linux 6.1.0), so the value of this

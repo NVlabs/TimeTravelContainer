@@ -18,6 +18,9 @@
 package cpuid
 
 import (
+	"bytes"
+	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +74,82 @@ func TestFixedExtendedState(t *testing.T) {
 		}
 	}
 
+}
+
+func featureSetWithIdentity(signature uint32, vendor, brand string) FeatureSet {
+	static := make(Static)
+	var vendorBytes [12]byte
+	copy(vendorBytes[:], vendor)
+	bx, cx, dx := regsFromVendorID(vendorBytes)
+	static[In{Eax: uint32(vendorID)}] = Out{Eax: uint32(xSaveInfo), Ebx: bx, Ecx: cx, Edx: dx}
+	static[In{Eax: uint32(featureInfo)}] = Out{Eax: signature, Ebx: 8 << 8}
+	static[In{Eax: uint32(extendedFunctionInfo)}] = Out{Eax: uint32(processorBrandString4)}
+
+	var brandBytes [48]byte
+	copy(brandBytes[:], brand)
+	for i, leaf := range [...]cpuidFunction{
+		processorBrandString2,
+		processorBrandString3,
+		processorBrandString4,
+	} {
+		offset := i * 16
+		static[In{Eax: uint32(leaf)}] = Out{
+			Eax: binary.LittleEndian.Uint32(brandBytes[offset:]),
+			Ebx: binary.LittleEndian.Uint32(brandBytes[offset+4:]),
+			Ecx: binary.LittleEndian.Uint32(brandBytes[offset+8:]),
+			Edx: binary.LittleEndian.Uint32(brandBytes[offset+12:]),
+		}
+	}
+	return FeatureSet{Function: static}
+}
+
+func TestWriteCPUInfoIdentity(t *testing.T) {
+	tests := []struct {
+		name      string
+		signature uint32
+		vendor    string
+		brand     string
+		want      []string
+	}{
+		{
+			name:      "Intel",
+			signature: 0x000806f8,
+			vendor:    "GenuineIntel",
+			brand:     "Intel(R) Xeon(R) Platinum 8488C",
+			want: []string{
+				"vendor_id\t: GenuineIntel\n",
+				"cpu family\t: 6\n",
+				"model\t\t: 143\n",
+				"model name\t: Intel(R) Xeon(R) Platinum 8488C\n",
+				"stepping\t: 8\n",
+			},
+		},
+		{
+			name:      "AMD extended family",
+			signature: 0x00a10f12,
+			vendor:    "AuthenticAMD",
+			brand:     "AMD EPYC Test Processor",
+			want: []string{
+				"vendor_id\t: AuthenticAMD\n",
+				"cpu family\t: 25\n",
+				"model\t\t: 17\n",
+				"model name\t: AMD EPYC Test Processor\n",
+				"stepping\t: 2\n",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			features := featureSetWithIdentity(test.signature, test.vendor, test.brand)
+			var output bytes.Buffer
+			features.WriteCPUInfoTo(0, 1, &output)
+			for _, want := range test.want {
+				if !strings.Contains(output.String(), want) {
+					t.Errorf("WriteCPUInfoTo output missing %q:\n%s", want, output.String())
+				}
+			}
+		})
+	}
 }
 
 func TestHasFeature(t *testing.T) {
