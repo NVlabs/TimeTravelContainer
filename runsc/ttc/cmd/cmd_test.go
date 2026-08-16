@@ -34,6 +34,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -78,6 +79,26 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 				t.Fatalf("help created daemon socket: %v", err)
 			}
 		})
+	}
+}
+
+func TestTTYStatRoutesNamedSessionAndJSON(t *testing.T) {
+	backend := &fakeBackend{ttyObservation: kernel.InternalConsoleObservation{
+		Version: 1, InputPendingBytes: 7, Canonical: true, ForegroundPGID: 42,
+	}}
+	var stdout bytes.Buffer
+	if err := runTTY([]string{"stat", "demo@main", "--session", "build1", "--json"}, &stdout, backend); err != nil {
+		t.Fatal(err)
+	}
+	if backend.ttyTarget != (selector{container: "demo", branch: "main"}) || backend.ttySession != "build1" {
+		t.Fatalf("tty route target=%v session=%q", backend.ttyTarget, backend.ttySession)
+	}
+	var got kernel.InternalConsoleObservation
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Version != 1 || got.InputPendingBytes != 7 || !got.Canonical || got.ForegroundPGID != 42 {
+		t.Fatalf("tty observation=%+v", got)
 	}
 }
 
@@ -4063,6 +4084,9 @@ type fakeBackend struct {
 	families           []Family
 	processTarget      selector
 	processList        []ProcessInfo
+	ttyTarget          selector
+	ttySession         string
+	ttyObservation     kernel.InternalConsoleObservation
 	rootfsSizes        map[selector]uint64
 	diffChanges        []BranchPathChange
 	sizeCalls          []selector
@@ -4251,6 +4275,12 @@ func (b *fakeBackend) listFamilies() ([]Family, error) {
 func (b *fakeBackend) processes(target selector) ([]ProcessInfo, error) {
 	b.processTarget = target
 	return b.processList, b.err
+}
+
+func (b *fakeBackend) consoleObservation(target selector, session string) (kernel.InternalConsoleObservation, error) {
+	b.ttyTarget = target
+	b.ttySession = session
+	return b.ttyObservation, b.err
 }
 
 func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {

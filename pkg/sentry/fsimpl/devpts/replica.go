@@ -105,11 +105,17 @@ func (rfd *replicaFileDescription) Release(ctx context.Context) {
 // EventRegister implements waiter.Waitable.EventRegister.
 func (rfd *replicaFileDescription) EventRegister(e *waiter.Entry) error {
 	rfd.inode.t.ld.replicaWaiter.EventRegister(e)
+	if e.Mask()&waiter.ReadableEvents != 0 {
+		rfd.inode.t.ld.replicaReadWaiter(1)
+	}
 	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (rfd *replicaFileDescription) EventUnregister(e *waiter.Entry) {
+	if e.Mask()&waiter.ReadableEvents != 0 {
+		rfd.inode.t.ld.replicaReadWaiter(-1)
+	}
 	rfd.inode.t.ld.replicaWaiter.EventUnregister(e)
 }
 
@@ -126,6 +132,16 @@ func (rfd *replicaFileDescription) Epollable() bool {
 // Read implements vfs.FileDescriptionImpl.Read.
 func (rfd *replicaFileDescription) Read(ctx context.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
 	return rfd.inode.t.ld.inputQueueRead(ctx, dst)
+}
+
+// ReadBlockStart implements vfs.ReadBlockObserver.
+func (rfd *replicaFileDescription) ReadBlockStart() {
+	rfd.inode.t.ld.replicaBlockedReader(1)
+}
+
+// ReadBlockEnd implements vfs.ReadBlockObserver.
+func (rfd *replicaFileDescription) ReadBlockEnd() {
+	rfd.inode.t.ld.replicaBlockedReader(-1)
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
@@ -207,7 +223,11 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, rfd.inode.t.replicaKTTY, kernel.ProcessGroupID(pgid))
+		if err := t.ThreadGroup().SetForegroundProcessGroupID(ctx, rfd.inode.t.replicaKTTY, kernel.ProcessGroupID(pgid)); err != nil {
+			return 0, err
+		}
+		rfd.inode.t.ld.observeForeground(int32(pgid))
+		return 0, nil
 	default:
 		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
 		return 0, linuxerr.ENOTTY

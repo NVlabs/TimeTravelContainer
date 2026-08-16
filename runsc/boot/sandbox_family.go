@@ -309,6 +309,13 @@ type ConsoleReadResult struct {
 	WouldBlock bool
 }
 
+// ConsoleObservationArgs selects a branch-local internal console without
+// consuming its streams.
+type ConsoleObservationArgs struct {
+	BranchID  string
+	ConsoleID string
+}
+
 // ConsoleWaitArgs waits for branch-local console I/O readiness. A zero timeout
 // performs a nonblocking readiness check.
 type ConsoleWaitArgs struct {
@@ -2700,6 +2707,33 @@ func (f *SandboxFamily) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResul
 		return err
 	}
 	*out = ConsoleReadResult{Data: data, EOF: eof, WouldBlock: wouldBlock}
+	return nil
+}
+
+// ConsoleObservation returns one point-in-time observation while serializing
+// against branch replacement. It does not consume terminal input or output.
+func (f *SandboxFamily) ConsoleObservation(args *ConsoleObservationArgs, out *kernel.InternalConsoleObservation) error {
+	if args == nil || out == nil {
+		return fmt.Errorf("missing internal console observation arguments or result")
+	}
+	b, err := f.branch(args.BranchID)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s", args.BranchID, state)
+	}
+	f.mu.Unlock()
+	observation, err := b.k.ObserveInternalConsole(b.k.SupervisorContext(), args.ConsoleID)
+	if err != nil {
+		return err
+	}
+	*out = observation
 	return nil
 }
 

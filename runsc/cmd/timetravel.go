@@ -129,7 +129,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait|prepare-stop <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-stat|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -653,6 +653,11 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			ConsoleID: t.consoleID,
 			Stream:    stream,
 			MaxBytes:  t.consoleMaxBytes,
+		})
+	case "console-stat":
+		output, err = cont.Sandbox.ObserveConsole(&boot.ConsoleObservationArgs{
+			BranchID:  f.Arg(2),
+			ConsoleID: t.consoleID,
 		})
 	case "console-wait":
 		output, err = cont.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{

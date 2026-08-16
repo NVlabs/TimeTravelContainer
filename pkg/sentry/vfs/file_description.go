@@ -541,6 +541,14 @@ type FileDescriptionImpl interface {
 	UnregisterFileAsyncHandler(fd *FileDescription)
 }
 
+// ReadBlockObserver is optionally implemented by file descriptions that expose
+// exact task-blocking state. The syscall layer calls it only around an actual
+// blocking read wait, never for nonblocking reads or readiness polling.
+type ReadBlockObserver interface {
+	ReadBlockStart()
+	ReadBlockEnd()
+}
+
 // Dirent holds the information contained in struct linux_dirent64.
 //
 // +stateify savable

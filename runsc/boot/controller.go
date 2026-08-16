@@ -195,6 +195,9 @@ const (
 	// ContMgrConsoleRead reads branch-local internal console output.
 	ContMgrConsoleRead = "containerManager.ConsoleRead"
 
+	// ContMgrConsoleObservation reads branch-local terminal state without I/O.
+	ContMgrConsoleObservation = "containerManager.ConsoleObservation"
+
 	// ContMgrConsoleWait waits for branch-local internal console readiness.
 	ContMgrConsoleWait = "containerManager.ConsoleWait"
 
@@ -1360,6 +1363,11 @@ func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *u
 // ConsoleRead reads output from a branch-local internal console.
 func (cm *containerManager) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadResult) error {
 	return cm.l.family.ConsoleRead(args, out)
+}
+
+// ConsoleObservation returns terminal state without consuming its streams.
+func (cm *containerManager) ConsoleObservation(args *ConsoleObservationArgs, out *kernel.InternalConsoleObservation) error {
+	return cm.l.family.ConsoleObservation(args, out)
 }
 
 // ConsoleWait waits for branch-local internal console I/O readiness.

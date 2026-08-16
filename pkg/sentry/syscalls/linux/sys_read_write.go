@@ -116,7 +116,7 @@ func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opt
 		}
 
 		// Wait for a notification that we should retry.
-		if err = t.BlockWithDeadline(ch, hasDeadline, deadline); err != nil {
+		if err = blockOnRead(t, file, ch, hasDeadline, deadline); err != nil {
 			if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
 				err = linuxerr.ErrWouldBlock
 			}
@@ -126,6 +126,14 @@ func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opt
 	file.EventUnregister(&w)
 
 	return total, err
+}
+
+func blockOnRead(t *kernel.Task, file *vfs.FileDescription, ch <-chan struct{}, hasDeadline bool, deadline ktime.Time) error {
+	if observer, ok := file.Impl().(vfs.ReadBlockObserver); ok {
+		observer.ReadBlockStart()
+		defer observer.ReadBlockEnd()
+	}
+	return t.BlockWithDeadline(ch, hasDeadline, deadline)
 }
 
 // Pread64 implements Linux syscall pread64(2).
@@ -266,7 +274,7 @@ func pread(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, of
 		}
 
 		// Wait for a notification that we should retry.
-		if err = t.BlockWithDeadline(ch, hasDeadline, deadline); err != nil {
+		if err = blockOnRead(t, file, ch, hasDeadline, deadline); err != nil {
 			if linuxerr.Equals(linuxerr.ETIMEDOUT, err) {
 				err = linuxerr.ErrWouldBlock
 			}

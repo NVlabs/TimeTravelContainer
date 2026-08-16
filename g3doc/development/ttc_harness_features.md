@@ -28,7 +28,7 @@ memory, memory mappings, internal TCP and Unix sockets, pipes, epoll,
 
 | Capability | Status | Acceptance criteria |
 | --- | --- | --- |
-| TTY observation channel | in progress | Named exec terminals expose consistent synchronous snapshots and streamed `S` frames with saved/forked monotonic counters, generations, process-group identity, and Sentry monotonic timestamps. |
+| TTY observation channel | in progress | `ttc tty stat TARGET --session NAME --json` now exposes saved/forked queue counters, exact blocked readers, readiness waiters, termios/foreground/flush generations, process-group identity, and the Sentry monotonic clock. Local live-fork and dehydration round trips preserve the snapshot. Debounced streamed `S` frames and heartbeat delivery remain. |
 | `ttc commit BRANCH IMAGE` | implemented | Commit snapshots the branch filesystem without stopping it, emits a runnable OCI image, supports `--label`/`--label-file`, and preserves and overrides OCI labels through `image inspect`. Complex regression verification is pending. |
 | `ttc stats` | planned | Report per-branch private and CoW-shared memory and disk bytes, plus non-double-counted family totals, in human and stable JSON forms. |
 | Named durable exec sessions | implemented | `ttc exec --session NAME -d` creates a reusable name; attach/logs/wait/kill work after client disconnect; retained output is bounded by the existing durable ring buffer. Complex regression verification is pending. |

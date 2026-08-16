@@ -128,12 +128,24 @@ type lineDiscipline struct {
 	// Currently only TIOCPKT_FLUSHREAD and TIOCPKT_FLUSHWRITE are emitted
 	// through packetStatus.
 	packetStatus uint8
+
+	// The following counters form TTC's durable terminal observation state.
+	// Each is protected by the lock associated with the state it describes.
+	inputConsumedBytes       uint64 // inQueue.mu
+	outputBytes              uint64 // outQueue.mu
+	termiosGeneration        uint64 // termiosMu
+	foregroundPGID           int32  // termiosMu
+	foregroundPGIDGeneration uint64 // termiosMu
+	inputFlushGeneration     uint64 // termiosMu
+	replicaReadWaiters       uint64 // termiosMu
+	replicaBlockedReaders    uint64 // termiosMu
 }
 
 func newLineDiscipline(termios linux.KernelTermios, terminal *Terminal) *lineDiscipline {
 	ld := lineDiscipline{
-		termios:  termios,
-		terminal: terminal,
+		termios:           termios,
+		terminal:          terminal,
+		termiosGeneration: 1,
 	}
 	ld.inQueue.transformer = &inputQueueTransformer{}
 	ld.outQueue.transformer = &outputQueueTransformer{}
@@ -175,6 +187,7 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 	l.termiosMu.Lock()
 	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
 	l.termios = t
+	l.termiosGeneration++
 
 	// If canonical mode is turned off, move bytes from inQueue's wait
 	// buffer to its read buffer. Anything already in the read buffer is
@@ -204,6 +217,7 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	l.termiosMu.Lock()
 	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
 	l.termios.FromTermios(t)
+	l.termiosGeneration++
 
 	// If canonical mode is turned off, move bytes from inQueue's wait
 	// buffer to its read buffer. Anything already in the read buffer is
@@ -275,7 +289,7 @@ func (l *lineDiscipline) inputQueueReadSize(t *kernel.Task, io usermem.IO, args 
 func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSequence) (int64, error) {
 	l.termiosMu.RLock()
 	// Replica never reads in packet mode.
-	n, pushed, notifyEcho, err := l.inQueue.read(ctx, dst, l, false /* packet */)
+	n, pushed, notifyEcho, err := l.inQueue.read(ctx, dst, l, false /* packet */, &l.inputConsumedBytes)
 	isCanon := l.termios.LEnabled(linux.ICANON)
 	l.termiosMu.RUnlock()
 	if err != nil {
@@ -333,7 +347,7 @@ func (l *lineDiscipline) outputQueueRead(ctx context.Context, dst usermem.IOSequ
 	}
 	l.termiosMu.RLock()
 	// Ignore notifyEcho, as it cannot happen when reading from the output queue.
-	n, pushed, _, err := l.outQueue.read(ctx, dst, l, l.packet)
+	n, pushed, _, err := l.outQueue.read(ctx, dst, l, l.packet, &l.outputBytes)
 	l.termiosMu.RUnlock()
 	if err != nil {
 		return 0, err
@@ -376,6 +390,61 @@ func (l *lineDiscipline) replicaClose() {
 	if notify {
 		l.masterWaiter.Notify(waiter.EventHUp)
 	}
+}
+
+func (l *lineDiscipline) replicaReadWaiter(delta int) {
+	l.termiosMu.Lock()
+	if delta > 0 {
+		l.replicaReadWaiters++
+	} else if l.replicaReadWaiters != 0 {
+		l.replicaReadWaiters--
+	}
+	l.termiosMu.Unlock()
+}
+
+func (l *lineDiscipline) replicaBlockedReader(delta int) {
+	l.termiosMu.Lock()
+	if delta > 0 {
+		l.replicaBlockedReaders++
+	} else if l.replicaBlockedReaders != 0 {
+		l.replicaBlockedReaders--
+	}
+	l.termiosMu.Unlock()
+}
+
+func (l *lineDiscipline) observeForeground(pgid int32) {
+	l.termiosMu.Lock()
+	if l.foregroundPGID != pgid {
+		l.foregroundPGID = pgid
+		l.foregroundPGIDGeneration++
+	}
+	l.termiosMu.Unlock()
+}
+
+func (l *lineDiscipline) observation() kernel.InternalConsoleObservation {
+	// Preserve the documented lock order: termiosMu, inQueue.mu, outQueue.mu.
+	l.termiosMu.RLock()
+	l.inQueue.mu.Lock()
+	l.outQueue.mu.Lock()
+	observation := kernel.InternalConsoleObservation{
+		InputPendingBytes:        uint64(len(l.inQueue.readBuf)) + l.inQueue.waitBufLen,
+		InputReadable:            l.inQueue.readable,
+		InputConsumedBytes:       l.inputConsumedBytes,
+		ReplicaReadWaiters:       l.replicaReadWaiters,
+		ReplicaBlockedReaders:    l.replicaBlockedReaders,
+		Canonical:                l.termios.LEnabled(linux.ICANON),
+		Echo:                     l.termios.LEnabled(linux.ECHO),
+		TermiosGeneration:        l.termiosGeneration,
+		ForegroundPGID:           l.foregroundPGID,
+		ForegroundPGIDGeneration: l.foregroundPGIDGeneration,
+		OutputBytes:              l.outputBytes,
+		InputFlushGeneration:     l.inputFlushGeneration,
+		ReplicaOpenCount:         uint64(l.numReplicas),
+	}
+	l.outQueue.mu.Unlock()
+	l.inQueue.mu.Unlock()
+	l.termiosMu.RUnlock()
+	return observation
 }
 
 // transformer is a helper interface to make it easier to stateify queue.
@@ -800,8 +869,12 @@ func (l *lineDiscipline) notifyWritableForFlushedQueue(q *queue) {
 func (l *lineDiscipline) tcFlush(endpoint ptyEndpoint, arg uint32) error {
 	inputQueue := l.inputQueueForEndpoint(endpoint)
 	outputQueue := l.outputQueueForEndpoint(endpoint)
+	flushedGuestInput := false
 	flushAndNotify := func(q *queue) {
 		q.flush()
+		if q == &l.inQueue {
+			flushedGuestInput = true
+		}
 		l.notifyWritableForFlushedQueue(q)
 	}
 
@@ -815,6 +888,11 @@ func (l *lineDiscipline) tcFlush(endpoint ptyEndpoint, arg uint32) error {
 		flushAndNotify(outputQueue)
 	default:
 		return linuxerr.EINVAL
+	}
+	if flushedGuestInput {
+		l.termiosMu.Lock()
+		l.inputFlushGeneration++
+		l.termiosMu.Unlock()
 	}
 	l.notifyPacketStatus(l.packetStatusForFlush(endpoint, arg))
 	return nil

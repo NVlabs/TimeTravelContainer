@@ -105,7 +105,7 @@ func (q *queue) readableSize(t *kernel.Task, io usermem.IO, args arch.SyscallArg
 //   - Whether any data was echoed back (need to notify readers).
 //
 // Preconditions: l.termiosMu must be held for reading.
-func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipline, packet bool) (int64, bool, bool, error) {
+func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipline, packet bool, consumed *uint64) (int64, bool, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -149,6 +149,9 @@ func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipl
 	}))
 	if err != nil {
 		return 0, false, false, err
+	}
+	if consumed != nil {
+		*consumed += uint64(n)
 	}
 
 	// Move data from the queue's wait buffer to its read buffer.

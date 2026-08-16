@@ -147,6 +147,22 @@ func (mfd *masterFileDescription) SetInternalConsoleWindowSize(size linux.Winsiz
 	mfd.t.ld.setWindowSizeValue(size)
 }
 
+// InternalConsoleObservation implements TTC's Sentry-internal terminal
+// observation interface without performing a guest ioctl or consuming data.
+func (mfd *masterFileDescription) InternalConsoleObservation() kernel.InternalConsoleObservation {
+	tg := mfd.t.replicaKTTY.ThreadGroup()
+	if tg == nil {
+		return mfd.t.ld.observation()
+	}
+	if pgid, err := tg.ForegroundProcessGroupID(mfd.t.replicaKTTY); err == nil {
+		mfd.t.ld.observeForeground(int32(pgid))
+	}
+	observation := mfd.t.ld.observation()
+	namespace := tg.PIDNamespace()
+	observation.SessionLeaderPID = int32(namespace.IDOfSession(tg.Session()))
+	return observation
+}
+
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
@@ -226,7 +242,11 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
 			return 0, err
 		}
-		return 0, t.ThreadGroup().SetForegroundProcessGroupID(ctx, mfd.t.masterKTTY, kernel.ProcessGroupID(pgid))
+		if err := t.ThreadGroup().SetForegroundProcessGroupID(ctx, mfd.t.masterKTTY, kernel.ProcessGroupID(pgid)); err != nil {
+			return 0, err
+		}
+		mfd.t.ld.observeForeground(int32(pgid))
+		return 0, nil
 	case linux.TIOCPKT:
 		// Enable or disable packet mode.
 		var mode primitive.Int32

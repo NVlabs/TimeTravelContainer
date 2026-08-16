@@ -49,6 +49,7 @@ import (
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -318,6 +319,7 @@ Commands:
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
+  tty stat TARGET --session NAME  Observe a named terminal without consuming I/O
   fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
@@ -362,6 +364,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+			"tty":        "Usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
@@ -433,6 +436,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPs(args[1:], stdout, stderr, backend)
 	case "top":
 		err = runTop(args[1:], stdout, stderr, backend)
+	case "tty":
+		err = runTTY(args[1:], stdout, backend)
 	case "fork":
 		err = runFork(args[1:], stdout, stderr, backend)
 	case "checkpoint":
@@ -3939,6 +3944,57 @@ func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
 	return writeTopTable(stdout, processes, columns)
 }
 
+func runTTY(args []string, stdout io.Writer, backend backend) error {
+	if len(args) == 0 || args[0] != "stat" {
+		return errors.New("usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]")
+	}
+	var targetValue, session string
+	jsonOutput := false
+	for index := 1; index < len(args); index++ {
+		switch args[index] {
+		case "--json":
+			jsonOutput = true
+		case "--session":
+			index++
+			if index == len(args) {
+				return errors.New("--session requires a name")
+			}
+			session = args[index]
+		default:
+			if strings.HasPrefix(args[index], "--session=") {
+				session = strings.TrimPrefix(args[index], "--session=")
+			} else if strings.HasPrefix(args[index], "-") {
+				return fmt.Errorf("unknown tty stat option %q", args[index])
+			} else if targetValue == "" {
+				targetValue = args[index]
+			} else {
+				return fmt.Errorf("unexpected tty stat argument %q", args[index])
+			}
+		}
+	}
+	if targetValue == "" || session == "" {
+		return errors.New("usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]")
+	}
+	target, err := parseSelector(targetValue)
+	if err != nil {
+		return err
+	}
+	observation, err := backend.consoleObservation(target, session)
+	if err != nil {
+		return fmt.Errorf("observing terminal session %q in %s: %w", session, target, err)
+	}
+	if jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(&observation)
+	}
+	_, err = fmt.Fprintf(stdout, "input_pending=%d readable=%t blocked_readers=%d waiters=%d canonical=%t echo=%t foreground_pgid=%d output_bytes=%d monotonic_ns=%d\n",
+		observation.InputPendingBytes, observation.InputReadable, observation.ReplicaBlockedReaders,
+		observation.ReplicaReadWaiters, observation.Canonical, observation.Echo,
+		observation.ForegroundPGID, observation.OutputBytes, observation.MonotonicNS)
+	return err
+}
+
 func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -4845,6 +4901,7 @@ type backend interface {
 	remove(name string, force, volumes bool) error
 	listFamilies() ([]Family, error)
 	processes(target selector) ([]ProcessInfo, error)
+	consoleObservation(target selector, session string) (kernel.InternalConsoleObservation, error)
 	rootfsSize(target selector) (uint64, error)
 	diff(target selector) ([]BranchPathChange, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
@@ -8532,6 +8589,33 @@ func (b *runtimeBackend) execSession(target selector, execID string) (runscExecS
 		}
 	}
 	return runscExecSession{}, fmt.Errorf("exec session %q does not exist in %s", execID, target)
+}
+
+func (b *runtimeBackend) consoleObservation(target selector, session string) (kernel.InternalConsoleObservation, error) {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return kernel.InternalConsoleObservation{}, err
+	}
+	consoleID := "init"
+	if session != "init" {
+		execSession, err := b.execSession(resolved, session)
+		if err != nil {
+			return kernel.InternalConsoleObservation{}, err
+		}
+		if !execSession.Terminal {
+			return kernel.InternalConsoleObservation{}, fmt.Errorf("exec session %q is not a terminal", session)
+		}
+		consoleID = execSession.ConsoleID
+	}
+	output, err := b.command("timetravel", "--console", consoleID, resolved.container, "console-stat", resolved.branch)
+	if err != nil {
+		return kernel.InternalConsoleObservation{}, err
+	}
+	var observation kernel.InternalConsoleObservation
+	if err := json.Unmarshal(output, &observation); err != nil {
+		return kernel.InternalConsoleObservation{}, fmt.Errorf("decoding terminal observation: %w", err)
+	}
+	return observation, nil
 }
 
 func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32, error) {

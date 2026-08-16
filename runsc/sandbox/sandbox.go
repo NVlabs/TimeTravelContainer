@@ -51,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -2438,6 +2439,15 @@ func (s *Sandbox) ReadConsole(args *boot.ConsoleReadArgs) (boot.ConsoleReadResul
 	var result boot.ConsoleReadResult
 	if err := s.call(boot.ContMgrConsoleRead, args, &result); err != nil {
 		return boot.ConsoleReadResult{}, fmt.Errorf("reading internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, err)
+	}
+	return result, nil
+}
+
+// ObserveConsole returns terminal state without consuming console streams.
+func (s *Sandbox) ObserveConsole(args *boot.ConsoleObservationArgs) (kernel.InternalConsoleObservation, error) {
+	var result kernel.InternalConsoleObservation
+	if err := s.call(boot.ContMgrConsoleObservation, args, &result); err != nil {
+		return kernel.InternalConsoleObservation{}, err
 	}
 	return result, nil
 }

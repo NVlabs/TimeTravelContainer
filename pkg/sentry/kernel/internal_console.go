@@ -50,6 +50,31 @@ type InternalConsoleReadiness struct {
 	Stdin  bool
 }
 
+// InternalConsoleObservation is a versioned, point-in-time view of the state
+// relevant to deciding whether an interactive terminal is waiting for input.
+// Counters are part of Sentry state and therefore survive live fork and
+// dehydration. MonotonicNS is measured in the guest kernel's monotonic clock.
+type InternalConsoleObservation struct {
+	Version                  uint32 `json:"version"`
+	SessionEpoch             uint64 `json:"session_epoch"`
+	MonotonicNS              int64  `json:"monotonic_ns"`
+	Terminal                 bool   `json:"terminal"`
+	InputPendingBytes        uint64 `json:"input_pending_bytes"`
+	InputReadable            bool   `json:"input_readable"`
+	InputConsumedBytes       uint64 `json:"input_consumed_bytes"`
+	ReplicaBlockedReaders    uint64 `json:"replica_blocked_readers"`
+	ReplicaReadWaiters       uint64 `json:"replica_read_waiters"`
+	Canonical                bool   `json:"canonical"`
+	Echo                     bool   `json:"echo"`
+	TermiosGeneration        uint64 `json:"termios_generation"`
+	ForegroundPGID           int32  `json:"foreground_pgid"`
+	ForegroundPGIDGeneration uint64 `json:"foreground_pgid_generation"`
+	SessionLeaderPID         int32  `json:"session_leader_pid"`
+	OutputBytes              uint64 `json:"output_bytes"`
+	InputFlushGeneration     uint64 `json:"input_flush_generation"`
+	ReplicaOpenCount         uint64 `json:"replica_open_count"`
+}
+
 // InternalConsole owns either the control-side peers of three Sentry-internal
 // pipes or the master of a Sentry-internal PTY. The process-side endpoints live
 // in its FDTable. Both sides are serialized as part of Kernel state, so live
@@ -66,6 +91,39 @@ type InternalConsole struct {
 	stdin  *vfs.FileDescription
 	stdout *vfs.FileDescription
 	stderr *vfs.FileDescription
+}
+
+type internalConsoleObserver interface {
+	InternalConsoleObservation() InternalConsoleObservation
+}
+
+// ObserveInternalConsole returns one coherent terminal observation without
+// consuming input or output. Pipe-backed exec sessions report Terminal=false
+// and retain the generic console-level fields.
+func (k *Kernel) ObserveInternalConsole(ctx context.Context, id string) (InternalConsoleObservation, error) {
+	console, err := k.internalConsole(id)
+	if err != nil {
+		return InternalConsoleObservation{}, err
+	}
+	console.mu.Lock()
+	defer console.mu.Unlock()
+	observation := InternalConsoleObservation{
+		Version: 1, SessionEpoch: 1, Terminal: console.terminal,
+		MonotonicNS: k.MonotonicClock().Now().Nanoseconds(),
+	}
+	if !console.terminal {
+		return observation, nil
+	}
+	observer, ok := console.master.Impl().(internalConsoleObserver)
+	if !ok {
+		return InternalConsoleObservation{}, fmt.Errorf("internal console %q master %T does not expose observations", id, console.master.Impl())
+	}
+	terminal := observer.InternalConsoleObservation()
+	terminal.Version = observation.Version
+	terminal.SessionEpoch = observation.SessionEpoch
+	terminal.MonotonicNS = observation.MonotonicNS
+	terminal.Terminal = true
+	return terminal, nil
 }
 
 // NewInternalConsoleFDTable creates process stdio backed only by Sentry-owned
