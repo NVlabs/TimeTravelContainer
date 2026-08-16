@@ -35,7 +35,7 @@ memory, memory mappings, internal TCP and Unix sockets, pipes, epoll,
 | `ttc cp` from dehydrated branch | implemented | Read and write a dehydrated branch without changing its lifecycle state, including while peer branches are live. Complex regression verification is pending. |
 | `ttc diff BRANCH` | implemented | Return changed paths and change kinds from TTC filesystem metadata without walking the guest tree. Complex regression verification is pending. |
 | Batch local fork | implemented | `ttc fork SOURCE a b c` pauses and validates the source once and creates all siblings atomically. Complex regression verification is pending for this combined feature set. |
-| Fork dehydrated branch | planned | Local and remote batch fork accept a durable dehydrated source without first rehydrating it; children preserve CoW memory/filesystem sharing and source state. |
+| Fork dehydrated branch | implemented | Local and remote batch fork accept a durable dehydrated source without first rehydrating it; children preserve CoW memory/filesystem sharing and source state. Local systrap coverage includes running and paused batches, source rehydration, and divergent child writes; the wider stress matrix is pending. |
 
 ## TTY observation contract
 

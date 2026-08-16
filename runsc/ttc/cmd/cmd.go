@@ -8692,6 +8692,13 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			}
 		}
 	}
+	sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
+	if err != nil {
+		return nil, err
+	}
+	if normalizeLifecycleState(sourceRecord.State) == "dehydrated" {
+		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused)
+	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
@@ -8746,10 +8753,6 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			}
 			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
 		}
-		sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
-		if err != nil {
-			return nil, err
-		}
 		for i := range records {
 			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch); err != nil {
 				var cleanupErr error
@@ -8792,6 +8795,161 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	}
 
 	return branches, nil
+}
+
+// forkDehydratedMany creates local children directly from durable branch
+// state. The source remains process-free and its dehydration image is never
+// consumed. Filesystem metadata and sparse-memory manifests are immutable, so
+// preparing any number of siblings does not copy file or memory data.
+func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused bool) (_ []Branch, retErr error) {
+	if b.dataRoot == "" {
+		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
+	}
+	sourceDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(source.branch)))
+	controlData, err := os.ReadFile(filepath.Join(sourceDir, "control.json"))
+	if err != nil {
+		return nil, fmt.Errorf("reading dehydrated source control state: %w", err)
+	}
+	var capture boot.BranchDehydrateInfo
+	if err := json.Unmarshal(controlData, &capture); err != nil {
+		return nil, fmt.Errorf("decoding dehydrated source control state: %w", err)
+	}
+	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
+		return nil, errors.New("dehydrated source control state is incomplete")
+	}
+	if sourceBranch.FilesystemBranch != "" && sourceBranch.FilesystemBranch != capture.FilesystemBranch {
+		return nil, fmt.Errorf("dehydrated source filesystem branch changed from %q to %q", sourceBranch.FilesystemBranch, capture.FilesystemBranch)
+	}
+	metadataData, err := os.ReadFile(filepath.Join(sourceDir, "metadata.state"))
+	if err != nil {
+		return nil, fmt.Errorf("reading dehydrated source metadata: %w", err)
+	}
+
+	type preparedChild struct {
+		target selector
+		branch ttcbundle.BranchInfo
+		dir    string
+	}
+	children := make([]preparedChild, 0, len(destinations))
+	rollback := func() error {
+		var result error
+		for i := len(children) - 1; i >= 0; i-- {
+			child := children[i]
+			latest, loadErr := b.containerStore().LoadContainer(info.ID)
+			if loadErr == nil {
+				if recorded, recordErr := persistentBranchInfo(latest, child.branch.ID); recordErr == nil {
+					result = errors.Join(result, b.destroy(child.target, true))
+					_ = recorded
+					continue
+				}
+			}
+			result = errors.Join(result, os.RemoveAll(child.dir))
+			result = errors.Join(result, b.releaseSparseMemoryRoot(info.ID, child.branch.FilesystemBranch))
+			result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, child.branch))
+		}
+		return result
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, rollback())
+		}
+	}()
+
+	createdAt := time.Now().UTC()
+	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
+	for _, destination := range destinations {
+		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
+		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", CreatedAt: createdAt}
+		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
+		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
+		if err != nil {
+			return nil, fmt.Errorf("forking filesystems for %s@%s: %w", source.container, destination, err)
+		}
+		for index, transaction := range transactions {
+			if err := transaction.commit(); err != nil {
+				for abortIndex := len(transactions) - 1; abortIndex > index; abortIndex-- {
+					_ = transactions[abortIndex].abort()
+				}
+				return nil, fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err)
+			}
+		}
+		if capture.SparseManifest != (ttcchunk.ManifestID{}) {
+			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks"))
+			if err != nil {
+				return nil, err
+			}
+			err = repository.SetBranch(filesystemBranch, capture.SparseManifest)
+			closeErr := repository.Close()
+			if err != nil {
+				return nil, fmt.Errorf("rooting sparse memory for %s@%s: %w", source.container, destination, err)
+			}
+			if closeErr != nil {
+				return nil, closeErr
+			}
+		}
+
+		childCapture := capture
+		childCapture.FilesystemBranch = filesystemBranch
+		childCapture.Resume = capture.Resume && !paused
+		if _, err := os.Stat(childDir); err == nil {
+			return nil, fmt.Errorf("dehydration image already exists for branch %q", destination)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		staging, err := os.MkdirTemp(filepath.Dir(sourceDir), ".fork-"+hex.EncodeToString([]byte(destination))+"-")
+		if err != nil {
+			return nil, err
+		}
+		if err := writeDurableJSON(filepath.Join(staging, "control.json"), &childCapture); err != nil {
+			_ = os.RemoveAll(staging)
+			return nil, err
+		}
+		if err := writeDurableDistributedFile(filepath.Join(staging, "metadata.state"), metadataData); err != nil {
+			_ = os.RemoveAll(staging)
+			return nil, err
+		}
+		if capture.SparseManifest == (ttcchunk.ManifestID{}) {
+			for index := range capture.Memories {
+				name := fmt.Sprintf("memory-%04d.snapshot", index)
+				if err := copyCheckpointHostFile(filepath.Join(sourceDir, name), filepath.Join(staging, name), 0600); err != nil {
+					_ = os.RemoveAll(staging)
+					return nil, err
+				}
+			}
+		}
+		if err := os.Rename(staging, childDir); err != nil {
+			_ = os.RemoveAll(staging)
+			return nil, err
+		}
+		records = append(records, branch)
+	}
+	if err := b.containerStore().RecordBranches(info.ID, records); err != nil {
+		return nil, fmt.Errorf("recording dehydrated fork children: %w", err)
+	}
+
+	peer := false
+	if output, err := b.command("timetravel", info.ID, "branches"); err == nil && len(output) != 0 {
+		peer = true
+	} else {
+		// A fully cold family may leave an OCI shell whose control server has
+		// already exited. It has no state and must not block creation of the
+		// first child runtime.
+		_, _ = b.command("delete", "--force", info.ID)
+	}
+	result := make([]Branch, 0, len(children))
+	for _, child := range children {
+		if err := b.rehydrateCold(child.target, info, child.branch, peer); err != nil {
+			return nil, fmt.Errorf("starting dehydrated fork child %s: %w", child.target, err)
+		}
+		peer = true
+		state := "paused"
+		if capture.Resume && !paused {
+			state = "running"
+		}
+		result = append(result, Branch{ID: child.branch.ID, ParentID: source.branch, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
+	}
+	return result, nil
 }
 
 func (b *runtimeBackend) pause(target selector) error {
