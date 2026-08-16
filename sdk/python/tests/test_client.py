@@ -125,6 +125,23 @@ class ClientTest(unittest.TestCase):
             "/run/b/ttc/ttcd.sock",
         )
 
+    def test_terminal_observation_frames_preserve_records(self):
+        def handler(conn, _request):
+            conn.sendall(frame(b"S", b'{"version":1,"output_bytes":4}'))
+            conn.sendall(frame(b"S", b'{"version":1,"output_bytes":9}'))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                result = Client(daemon.path).command(["tty", "watch", "demo@main", "--session", "repl"])
+                self.assertEqual(
+                    result.stdout,
+                    b'{"version":1,"output_bytes":4}\n{"version":1,"output_bytes":9}\n',
+                )
+            finally:
+                daemon.close()
+
     def test_batch_remote_fork_uses_current_cli_shape(self):
         def handler(conn, request):
             self.assertEqual(

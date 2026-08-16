@@ -38,11 +38,13 @@ The environment entry is optional when the host inherits the same
 ## Tools
 
 The server provides tools for daemon status, listing and inspection, image
-pull, run/start/exec, local or remote single and batch fork, pause/resume,
-dehydrate/rehydrate, checkpoint/restore, stop/restart, signal, wait, and
-removal. Tool names use the `ttc_` prefix, for example `ttc_fork_many` and
-`ttc_checkpoint`. `ttc_command` provides the rest of TTC's non-interactive
-command surface.
+pull, run/start/exec, durable named exec sessions, local or remote batch fork,
+pause/resume, dehydrate/rehydrate, commit with OCI labels, resource accounting,
+filesystem diff, copy, synchronous terminal observation, checkpoint/restore,
+stop/restart, signal, wait, and removal. Tool names use the `ttc_` prefix, for
+example `ttc_fork_many`, `ttc_exec_logs`, `ttc_stats`, `ttc_diff`,
+`ttc_tty_stat`, and `ttc_checkpoint`. `ttc_command` provides the rest of TTC's
+non-interactive command surface.
 
 `ttc_run` creates a live-fork-eligible family by default. Set
 `waiveLiveFork: true` only when also requesting a deliberately incompatible

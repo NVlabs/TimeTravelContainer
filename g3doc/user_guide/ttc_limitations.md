@@ -25,12 +25,15 @@ non-forkable for its entire lifetime.
 
 - Fork latency depends on the number of processes, mappings, and kernel
   resources; it is not universally constant time.
-- A fork still rejects an invalid request, including a missing, exited,
-  dehydrated, or transitional source, an invalid/existing destination branch,
+- A fork still rejects an invalid request, including a missing, exited, or
+  transitional source, an invalid/existing destination branch,
   or a family created with `--waive-live-fork`. Resource exhaustion, damaged
   persistent state, and internal/runtime failures can also make an individual
   operation fail; these are operational errors, not workload-dependent
   eligibility decisions.
+- A dehydrated source is forkable without first becoming resident. Its children
+  start from the durable sparse-memory and filesystem roots; the source remains
+  dehydrated.
 - `--network=host` is intentionally outside TTC's branchable resource graph and
   therefore requires `--waive-live-fork`. Unsupported host FD, device, FUSE,
   io_uring/AIO, packet-ring, KCOV, writable-sysfs, and nftables creation paths

@@ -253,6 +253,75 @@ impl Client {
         self.command(args)
     }
 
+    pub fn exec_session(
+        &self,
+        target: &str,
+        command: &[&str],
+        session: &str,
+        tty: bool,
+        interactive: bool,
+    ) -> Result<CommandResult, Error> {
+        let mut args = vec![
+            "exec".to_owned(),
+            "--session".to_owned(),
+            session.to_owned(),
+            "--detach".to_owned(),
+        ];
+        if tty {
+            args.push("--tty".to_owned());
+        }
+        if interactive {
+            args.push("--interactive".to_owned());
+        }
+        args.push(target.to_owned());
+        args.extend(command.iter().map(|value| (*value).to_owned()));
+        self.command(args)
+    }
+
+    pub fn exec_sessions(&self, target: &str) -> Result<serde_json::Value, Error> {
+        Ok(self.command(["exec", "ls", "--json", target])?.json()?)
+    }
+
+    pub fn exec_logs(&self, target: &str, session: &str) -> Result<CommandResult, Error> {
+        self.command(["logs", "--exec", session, target])
+    }
+
+    pub fn exec_wait(&self, target: &str, session: &str) -> Result<CommandResult, Error> {
+        self.command(vec!["exec".to_owned(), "wait".to_owned(), format!("{target}:{session}")])
+    }
+
+    pub fn tty_stat(&self, target: &str, session: &str) -> Result<serde_json::Value, Error> {
+        Ok(self.command(["tty", "stat", target, "--session", session, "--json"])?.json()?)
+    }
+
+    pub fn commit(
+        &self,
+        target: &str,
+        image: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<CommandResult, Error> {
+        let mut args = vec!["commit".to_owned()];
+        for (key, value) in labels {
+            args.push("--label".to_owned());
+            args.push(format!("{key}={value}"));
+        }
+        args.push(target.to_owned());
+        args.push(image.to_owned());
+        self.command(args)
+    }
+
+    pub fn stats(&self, target: &str) -> Result<serde_json::Value, Error> {
+        Ok(self.command(["stats", "--json", target])?.json()?)
+    }
+
+    pub fn diff(&self, target: &str) -> Result<serde_json::Value, Error> {
+        Ok(self.command(["diff", "--json", target])?.json()?)
+    }
+
+    pub fn copy(&self, source: &str, destination: &str) -> Result<CommandResult, Error> {
+        self.command(["cp", source, destination])
+    }
+
     pub fn fork(
         &self,
         source: &str,
@@ -434,6 +503,12 @@ impl Client {
             let (kind, payload) = read_frame(&mut stream)?;
             match kind {
                 b'O' => stdout.extend_from_slice(&payload),
+                b'S' => {
+                    // Terminal observations are complete JSON objects. Keep
+                    // their frame boundaries in the buffered command result.
+                    stdout.extend_from_slice(&payload);
+                    stdout.push(b'\n');
+                }
                 b'E' => stderr.extend_from_slice(&payload),
                 b'A' => {
                     if payload.len() != 4 {
@@ -569,6 +644,25 @@ mod tests {
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
         assert_eq!(Client::new(&path).ping().unwrap()["version"], API_VERSION);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn terminal_observation_frames_preserve_records() {
+        let path = temporary_socket("terminal-observations");
+        let server = mock_server(&path, |mut stream, _request| {
+            write_frame(&mut stream, b'S', br#"{"version":1,"output_bytes":4}"#).unwrap();
+            write_frame(&mut stream, b'S', br#"{"version":1,"output_bytes":9}"#).unwrap();
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .command(["tty", "watch", "demo@main", "--session", "repl"])
+            .unwrap();
+        assert_eq!(
+            result.stdout,
+            b"{\"version\":1,\"output_bytes\":4}\n{\"version\":1,\"output_bytes\":9}\n"
+        );
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

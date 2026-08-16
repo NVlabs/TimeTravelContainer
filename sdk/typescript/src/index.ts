@@ -182,6 +182,53 @@ export class Client {
     return this.command(["exec", target, ...command], options);
   }
 
+  execSession(
+    target: string,
+    command: readonly string[],
+    session: string,
+    options: { tty?: boolean; interactive?: boolean } = {},
+  ): Promise<Result> {
+    return this.command([
+      "exec", "--session", session, "--detach",
+      ...(options.tty ? ["--tty"] : []),
+      ...(options.interactive ? ["--interactive"] : []),
+      target, ...command,
+    ]);
+  }
+
+  async execSessions<T = unknown>(target: string): Promise<T> {
+    return (await this.command(["exec", "ls", "--json", target], { check: true })).json<T>();
+  }
+
+  execLogs(target: string, session: string): Promise<Result> {
+    return this.command(["logs", "--exec", session, target]);
+  }
+
+  execWait(target: string, session: string): Promise<Result> {
+    return this.command(["exec", "wait", `${target}:${session}`], { timeoutMs: undefined });
+  }
+
+  async ttyStat<T = unknown>(target: string, session: string): Promise<T> {
+    return (await this.command(["tty", "stat", target, "--session", session, "--json"], { check: true })).json<T>();
+  }
+
+  commit(target: string, image: string, labels: Readonly<Record<string, string>> = {}): Promise<Result> {
+    const options = Object.entries(labels).flatMap(([key, value]) => ["--label", `${key}=${value}`]);
+    return this.command(["commit", ...options, target, image]);
+  }
+
+  async stats<T = unknown>(target: string): Promise<T> {
+    return (await this.command(["stats", "--json", target], { check: true })).json<T>();
+  }
+
+  async diff<T = unknown>(target: string): Promise<T> {
+    return (await this.command(["diff", "--json", target], { check: true })).json<T>();
+  }
+
+  copy(source: string, destination: string): Promise<Result> {
+    return this.command(["cp", source, destination]);
+  }
+
   fork(
     source: string,
     destination: string,
@@ -351,6 +398,11 @@ export class Client {
           switch (kind) {
             case "O":
               stdout.push(Buffer.from(payload));
+              break;
+            case "S":
+              // Terminal observations are complete JSON objects. Preserve
+              // frame boundaries as newline-delimited stdout records.
+              stdout.push(Buffer.from(payload), Buffer.from("\n"));
               break;
             case "E":
               stderr.push(Buffer.from(payload));

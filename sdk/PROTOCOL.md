@@ -55,9 +55,11 @@ After the JSON header, both directions use:
 ```
 
 Payloads are at most 1 MiB. Server frame types are `O` (stdout), `E` (stderr),
-`X` (four-byte exit status), `A` (four-byte stdin acknowledgement), and `T`
-(terminal state). Client frame types are `I` (stdin bytes), `C` (stdin EOF),
-and `W` (terminal resize).
+`X` (four-byte exit status), `A` (four-byte stdin acknowledgement), `T`
+(terminal mode), and `S` (one complete JSON terminal-observation object).
+Buffered SDK requests expose consecutive `S` objects as newline-delimited
+stdout records. Client frame types are `I` (stdin bytes), `C` (stdin EOF), and
+`W` (terminal resize).
 
 The bindings support non-interactive input and implement ttcd's 1 MiB stdin
 flow-control window. Interactive terminal ownership remains the responsibility

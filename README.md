@@ -85,8 +85,7 @@ ordinary branch and can be forked or removed like any other.
 # Start a prepared environment and fork two possible futures.
 ttc run -dit --name agent ubuntu:26.04 bash
 ttc exec agent@main sh -lc 'apt-get update && apt-get install -y git'
-ttc fork agent@main approach-a
-ttc fork agent@main approach-b
+ttc fork agent@main approach-a approach-b
 
 # Work in each branch and inspect the branch tree.
 ttc exec -it agent@approach-a bash
@@ -97,6 +96,7 @@ ttc ls --tree
 ttc pause agent@approach-a
 ttc resume agent@approach-a
 ttc dehydrate agent@approach-b
+ttc cp agent@approach-b:/workspace/result.patch ./result.patch
 ttc rehydrate agent@approach-b
 
 # Remove one branch without affecting its peers.
@@ -112,6 +112,8 @@ Common workflows include:
 | Interact | `ttc exec`, `ttc attach`, `ttc logs`, `ttc cp` |
 | Manage branches | `ttc fork`, `ttc pause`, `ttc resume`, `ttc rm` |
 | Persist live state | `ttc dehydrate`, `ttc rehydrate`, `ttc checkpoint`, `ttc restore` |
+| Inspect CoW state | `ttc stats`, `ttc diff`, `ttc tty stat` |
+| Produce a reusable image | `ttc commit` |
 | Manage networking | `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
 | Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 
@@ -123,8 +125,9 @@ completion, and recovery in detail.
 
 The `ttcx` SDKs talk directly to a running `ttcd`; applications do not need to
 spawn or parse the `ttc` CLI. Each SDK returns structured stdout, stderr, and
-exit status and provides helpers for run, exec, batch or remote fork,
-pause/resume, dehydration, checkpoint/restore, lifecycle control, and removal.
+exit status and provides helpers for run, named exec sessions, batch or remote
+fork, pause/resume, dehydration, commit, resource accounting, filesystem diff,
+copy, checkpoint/restore, lifecycle control, and removal.
 
 - [Python](sdk/python/README.md)
 - [TypeScript](sdk/typescript/README.md)
@@ -149,9 +152,11 @@ print(result.stdout_text())
 TTC includes:
 
 - Direct OCI image pulls and Docker-style image, container, volume, log, exec,
-  attach, copy, port-forwarding, and lifecycle commands.
+  attach, copy, commit, port-forwarding, and lifecycle commands.
 - Full-branch pause, resume, fork, dehydration, rehydration, checkpoint, and
   restore.
+- Per-branch CoW resource accounting, metadata-based filesystem diffs, named
+  reattachable exec sessions, and terminal-observation APIs for agent harnesses.
 - Copy-on-write process memory, tmpfs, internal IPC and sockets, and persistent
   writable filesystems.
 - Rootless userspace networking with isolated virtual NICs, outbound NAT,
@@ -226,6 +231,7 @@ recovery, and nested execution.
 
 ### Development Docs
 
+- [Harness feature tracker and stress-test policy](g3doc/development/ttc_harness_features.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
 - [Branch state machine](g3doc/ttc_state_machine.md)
 - [Distributed live-fork plan](g3doc/proposals/ttc_distributed_live_fork.md)

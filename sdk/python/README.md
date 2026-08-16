@@ -49,17 +49,27 @@ print(result.stdout_text())
 result.check()
 ```
 
-The convenience API covers run, start, exec, local and remote batch fork,
-pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
-removal. For example, one source pause can create several remote branches in
-the same target family:
+The convenience API covers run, start, named exec sessions, local and remote
+batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
+wait, and removal. For example, one source pause can create several branches:
 
 ```python
 ttc.fork_many(
     "demo@main",
-    ["remote@candidate-a", "remote@candidate-b"],
-    target_node="node-b",
+    ["candidate-a", "candidate-b"],
 ).check()
+```
+
+Harness-oriented helpers return structured JSON or ordinary command results:
+
+```python
+ttc.exec_session("demo@candidate-a", ["sh"], session="build1", tty=True).check()
+print(ttc.tty_stat("demo@candidate-a", "build1"))
+print(ttc.stats("demo@candidate-a"))
+print(ttc.diff("demo@candidate-a"))
+ttc.commit("demo@candidate-a", "local/result:latest",
+           labels={"timetravel.usage": "review"}).check()
 ```
 
 Families created by `run` are live-fork eligible by default. If an application
@@ -80,7 +90,8 @@ else:
 
 Pass `input=b"..."` to stream stdin. Reuse an explicit `request_id` only when
 deliberately retrying the same mutation. Interactive TTY attachment remains a
-CLI feature.
+CLI feature. `tty_stat()` provides synchronous terminal observations;
+`ttc tty watch` supplies the streaming form for long-lived frame consumers.
 
 `checkpoint()` and `restore()` convert local paths to absolute paths before
 sending them to `ttcd`. Other raw commands that name host files should likewise
@@ -97,4 +108,5 @@ PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests
 ```
 
 The tests run against an in-process protocol server and cover framing,
-nonzero results, and stdin flow control across a payload larger than 1 MiB.
+terminal-observation records, nonzero results, and stdin flow control across a
+payload larger than 1 MiB.

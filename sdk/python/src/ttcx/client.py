@@ -144,6 +144,53 @@ class Client:
     def exec(self, target: str, command: Sequence[str], *, input: bytes | str | None = None) -> Result:
         return self.command(["exec", target, *command], input=input)
 
+    def exec_session(
+        self,
+        target: str,
+        command: Sequence[str],
+        *,
+        session: str,
+        tty: bool = False,
+        interactive: bool = False,
+    ) -> Result:
+        options = ["--session", session, "--detach"]
+        if tty:
+            options.append("--tty")
+        if interactive:
+            options.append("--interactive")
+        return self.command(["exec", *options, target, *command])
+
+    def exec_sessions(self, target: str) -> Any:
+        return self.command(["exec", "ls", "--json", target], check=True).json()
+
+    def exec_logs(self, target: str, session: str) -> Result:
+        return self.command(["logs", "--exec", session, target])
+
+    def exec_wait(self, target: str, session: str) -> Result:
+        return self.command(["exec", "wait", f"{target}:{session}"], timeout=None)
+
+    def tty_stat(self, target: str, session: str) -> Any:
+        return self.command(
+            ["tty", "stat", target, "--session", session, "--json"], check=True
+        ).json()
+
+    def commit(
+        self, target: str, image: str, *, labels: Mapping[str, str] | None = None
+    ) -> Result:
+        options: list[str] = []
+        for key, value in (labels or {}).items():
+            options.extend(["--label", f"{key}={value}"])
+        return self.command(["commit", *options, target, image])
+
+    def stats(self, target: str) -> Any:
+        return self.command(["stats", "--json", target], check=True).json()
+
+    def diff(self, target: str) -> Any:
+        return self.command(["diff", "--json", target], check=True).json()
+
+    def copy(self, source: str, destination: str) -> Result:
+        return self.command(["cp", source, destination])
+
     def fork(
         self,
         source: str,
@@ -285,6 +332,12 @@ class Client:
                     del receive[: 5 + length]
                     if kind == b"O":
                         stdout.extend(payload)
+                    elif kind == b"S":
+                        # Terminal observations are complete JSON objects. Keep
+                        # command() lossless by exposing each object as one
+                        # newline-delimited stdout record.
+                        stdout.extend(payload)
+                        stdout.extend(b"\n")
                     elif kind == b"E":
                         stderr.extend(payload)
                     elif kind == b"A":

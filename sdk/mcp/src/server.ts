@@ -126,11 +126,92 @@ export function createServer(client = new Client()): McpServer {
         target: z.string().describe("Full container@branch selector"),
         command: z.array(z.string()).min(1),
         stdin: z.string().optional(),
+		session: z.string().optional().describe("Durable detached exec-session name"),
+		tty: z.boolean().default(false),
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    async ({ target, command, stdin }) =>
-      commandResponse(await client.exec(target, command, { input: stdin })),
+	async ({ target, command, stdin, session, tty }) => {
+		if (session) {
+			if (stdin !== undefined) throw new Error("stdin is unavailable when creating a detached exec session");
+			return commandResponse(await client.execSession(target, command, session, { tty, interactive: tty }));
+		}
+		return commandResponse(await client.exec(target, command, { input: stdin }));
+	},
+  );
+
+  server.registerTool(
+	"ttc_commit",
+	{
+		description: "Commit one branch filesystem as a runnable OCI image with optional labels.",
+		inputSchema: {
+			target: z.string(),
+			image: z.string(),
+			labels: z.record(z.string(), z.string()).default({}),
+		},
+		annotations: { destructiveHint: true },
+	},
+	async ({ target, image, labels }) => commandResponse(await client.commit(target, image, labels)),
+  );
+
+  server.registerTool(
+	"ttc_stats",
+	{
+		description: "Report per-branch private/shared memory and filesystem usage plus family totals.",
+		inputSchema: { target: z.string() },
+		annotations: { readOnlyHint: true, idempotentHint: true },
+	},
+	async ({ target }) => jsonResponse(await client.stats(target)),
+  );
+
+  server.registerTool(
+	"ttc_diff",
+	{
+		description: "List paths changed in a branch's CoW filesystem layer.",
+		inputSchema: { target: z.string() },
+		annotations: { readOnlyHint: true, idempotentHint: true },
+	},
+	async ({ target }) => jsonResponse(await client.diff(target)),
+  );
+
+  server.registerTool(
+	"ttc_cp",
+	{
+		description: "Copy between the host and a TTC branch, including a dehydrated branch.",
+		inputSchema: { source: z.string(), destination: z.string() },
+		annotations: { destructiveHint: true },
+	},
+	async ({ source, destination }) => commandResponse(await client.copy(source, destination)),
+  );
+
+  server.registerTool(
+	"ttc_exec_sessions",
+	{
+		description: "List named durable exec sessions in a branch.",
+		inputSchema: { target: z.string() },
+		annotations: { readOnlyHint: true, idempotentHint: true },
+	},
+	async ({ target }) => jsonResponse(await client.execSessions(target)),
+  );
+
+  server.registerTool(
+	"ttc_exec_logs",
+	{
+		description: "Read retained output from a named exec session.",
+		inputSchema: { target: z.string(), session: z.string() },
+		annotations: { readOnlyHint: true, idempotentHint: true },
+	},
+	async ({ target, session }) => commandResponse(await client.execLogs(target, session)),
+  );
+
+  server.registerTool(
+	"ttc_tty_stat",
+	{
+		description: "Observe a named terminal session without consuming its input or output.",
+		inputSchema: { target: z.string(), session: z.string() },
+		annotations: { readOnlyHint: true, idempotentHint: true },
+	},
+	async ({ target, session }) => jsonResponse(await client.ttyStat(target, session)),
   );
 
   server.registerTool(

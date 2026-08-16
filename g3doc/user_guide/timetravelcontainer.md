@@ -293,6 +293,12 @@ nonzero. Create a running child branch directly:
 ttc fork web@main test-a
 ```
 
+Create several siblings with one source pause and validation pass:
+
+```shell
+ttc fork web@main test-a test-b test-c
+```
+
 Or create it paused so no child instruction executes before inspection:
 
 ```shell
@@ -327,6 +333,14 @@ TTC starts only the selected branch in a short-lived paused bootstrap, imports
 that never-executed branch into the family's existing Sentry, and then resumes
 it. Running and paused peers remain in place throughout; TTC does not write or
 reload their memory, so their size does not determine start latency.
+
+A dehydrated branch is also a valid fork source. TTC clones its durable sparse
+memory manifest and filesystem roots, starts the children, and leaves the
+source process-free:
+
+```shell
+ttc fork web@archived candidate-a candidate-b
+```
 
 ## Distributed live fork
 
@@ -499,6 +513,35 @@ ttc exec -d web@test-b long-running-command
 ttc exec web@test-b ls
 ```
 
+Give a detached exec a durable name when a harness must reconnect after its
+client process exits:
+
+```shell
+ttc exec --session build1 -dit web@test-b sh
+ttc exec ls web@test-b
+ttc attach -i --exec build1 web@test-b
+ttc logs --exec build1 --tail 200 web@test-b
+ttc exec wait web@test-b:build1
+ttc exec kill --signal TERM web@test-b:build1
+```
+
+The session name, exit status, and bounded output log survive client
+disconnects, live fork, and dehydration. TTC supplies the supervision; the
+image does not need `tmux`, `screen`, or another process supervisor.
+
+For REPL automation, inspect one named PTY synchronously or stream complete
+JSON observations with heartbeat delivery:
+
+```shell
+ttc tty stat web@test-b --session build1 --json
+ttc tty watch web@test-b --session build1 --json
+```
+
+The observation includes input-consumption and queue counters, blocked readers
+and readiness waiters, termios and foreground-process-group generations,
+output progress, flush detection, and the Sentry monotonic clock. TTC reports
+observations only; the harness decides what constitutes a ready prompt.
+
 For `-t`, TTC propagates the invoking client's `TERM` value into a new
 container or exec process when the image/container and command do not already
 define `TERM`; an unset client value falls back to `xterm`. This lets terminal
@@ -568,9 +611,11 @@ archive has no separate source operand. TTC runs its own donated copy helper in
 the selected branch, so neither `tar` nor `cp` needs to exist in the image and
 the binary stream is not routed through a guest shell.
 
-Copy supports running, paused, and exited branches. For a paused branch,
+Copy supports running, paused, dehydrated, and exited branches. For a paused branch,
 TTC runs only its trusted copy helper while the branch's existing tasks remain
 paused.
+For a dehydrated branch, TTC mounts its persistent filesystem directly and
+does not rehydrate or change the branch state.
 For an exited branch, TTC launches a short-lived helper Sentry whose process is
 the donated TTC copy helper, mounts the immutable image lower plus the selected
 persistent `ttcvol` rootfs/volume branch, and exits when the copy completes.
@@ -580,6 +625,41 @@ family remains live, because two Sentries would otherwise cache one repository
 concurrently. A copy process temporarily owns host stream FDs; `ttcd` therefore
 serializes copy operations with lifecycle mutations such as fork, pause, stop,
 and branch removal.
+
+## Commit, diff, and resource accounting
+
+Commit a branch filesystem as a runnable local OCI image. Existing OCI labels
+round-trip through commit and image inspection; repeated `--label` options add
+or replace labels for harness metadata such as a bundled prompt:
+
+```shell
+ttc commit --label timetravel.usage=code-review \
+  web@test-b local/web-review:prepared
+ttc image inspect local/web-review:prepared
+```
+
+`ttc diff` reads TTC's CoW metadata rather than walking the guest tree. Its
+JSON form reports changed paths and change kinds relative to the branch's
+lower layer:
+
+```shell
+ttc diff web@test-b
+ttc diff --json web@test-b
+```
+
+`ttc stats` reports the selected family in one snapshot. For each branch it
+separates private and CoW-shared resident memory, durable dehydration backing,
+and persistent filesystem bytes, and reports non-double-counted family totals:
+
+```shell
+ttc stats web@test-b
+ttc stats --json web@test-b
+```
+
+Resident memory counts mapped application pages in the Sentry; it deliberately
+does not estimate the Sentry's Go heap or unmapped cache. Filesystem sharing is
+reported at TTC's immutable file-object boundary, while durable memory backing
+is reported from still-present sparse chunk objects.
 
 ## Filesystems and volumes
 

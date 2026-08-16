@@ -33,17 +33,31 @@ console.log(result.stdoutText());
 result.check();
 ```
 
-The convenience API covers run, start, exec, local and remote batch fork,
-pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
-removal. A coordinated remote fan-out uses one source pause:
+The convenience API covers run, start, named exec sessions, local and remote
+batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
+wait, and removal. A coordinated local fan-out uses one source pause:
 
 ```ts
 (await ttc.forkMany(
   "demo@main",
-  ["remote@candidate-a", "remote@candidate-b"],
-  { targetNode: "node-b" },
+  ["candidate-a", "candidate-b"],
 )).check();
 ```
+
+Harness-oriented helpers are available directly:
+
+```ts
+(await ttc.execSession("demo@candidate-a", ["sh"], "build1", { tty: true })).check();
+console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
+console.log(await ttc.stats("demo@candidate-a"));
+console.log(await ttc.diff("demo@candidate-a"));
+(await ttc.commit("demo@candidate-a", "local/result:latest",
+                  { "timetravel.usage": "review" })).check();
+```
+
+`ttyStat()` is the synchronous terminal-observation API. `ttc tty watch`
+supplies the streaming form for clients that consume a long-lived request.
 
 Families created by `run` are live-fork eligible by default. Use an option set
 such as `["--network=host", "--waive-live-fork"]` only when deliberately

@@ -124,6 +124,25 @@ test("default socket environment precedence", () => {
   assert.equal(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/b" }), "/run/b/ttc/ttcd.sock");
 });
 
+test("terminal observation frames preserve records", async () => {
+  await withServer(
+    (socket) => {
+      socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":4}')));
+      socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":9}')));
+      socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
+    },
+    async (path) => {
+      const result = await new Client(path).command([
+        "tty", "watch", "demo@main", "--session", "repl",
+      ]);
+      assert.equal(
+        result.stdoutText(),
+        '{"version":1,"output_bytes":4}\n{"version":1,"output_bytes":9}\n',
+      );
+    },
+  );
+});
+
 test("batch remote fork uses the current CLI shape", async () => {
   await withServer(
     (socket, request) => {

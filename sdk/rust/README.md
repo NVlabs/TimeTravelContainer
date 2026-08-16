@@ -38,18 +38,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The convenience API covers run, start, exec, local and remote batch fork,
-pause/resume, dehydration, checkpoint/restore, stop/restart, signal, wait, and
-removal. A coordinated remote fan-out looks like:
+The convenience API covers run, start, named exec sessions, local and remote
+batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
+wait, and removal. A coordinated local fan-out looks like:
 
 ```rust
 ttc.fork_many(
     "demo@main",
-    &["remote@candidate-a", "remote@candidate-b"],
+    &["candidate-a", "candidate-b"],
     false,
-    Some("node-b"),
+    None,
 )?.check()?;
 ```
+
+`exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
+named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
+accepts OCI labels and `copy` exposes branch-aware file transfer. `tty_stat`
+is synchronous, while `ttc tty watch` is the streaming terminal-observation
+form for clients that implement long-lived frame consumption.
 
 `Client::command` accepts every other non-interactive TTC command. Use
 `command_with_options` for stdin, a timeout override, or an explicit request ID
@@ -74,5 +81,5 @@ Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or use
 cargo test --manifest-path sdk/rust/Cargo.toml
 ```
 
-Tests use an in-process Unix-socket server and cover the protocol and stdin
-flow control beyond 1 MiB.
+Tests use an in-process Unix-socket server and cover the protocol, terminal
+observation records, and stdin flow control beyond 1 MiB.
