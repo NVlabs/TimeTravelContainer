@@ -86,6 +86,7 @@ MULTI_A="$PREFIX-multi-a"
 MULTI_B="$PREFIX-multi-b"
 HOSTNET="$PREFIX-hostnet"
 VNET="$PREFIX-vnet"
+NETNS="$PREFIX-netns"
 DAEMON_STOP="$PREFIX-daemon-stop"
 STOP_POLICY="$PREFIX-stop-policy"
 PIDS_LIMIT="$PREFIX-pids-limit"
@@ -124,7 +125,7 @@ ttc_daemon_crash() {
 }
 
 cleanup() {
-  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
+  for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$NETNS" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
     ttc rm --force "$container" >/dev/null 2>&1 || true
   done
   ttc daemon stop >/dev/null 2>&1 || true
@@ -257,7 +258,7 @@ ttc container rm "$MULTI_A" "$MULTI_B"
 
 echo "== persisted host networking and fork rejection =="
 command -v curl >/dev/null 2>&1 || fail "curl is required for the host-network service probe"
-ttc container create --network host --name "$HOSTNET" "$BUSYBOX_IMAGE" sh -c \
+ttc container create --network host --waive-live-fork --name "$HOSTNET" "$BUSYBOX_IMAGE" sh -c \
   "mkdir -p /tmp/www; echo hostnet-ok >/tmp/www/index.html; exec httpd -f -p $HOSTNET_PORT -h /tmp/www"
 ttc container start "$HOSTNET"
 deadline=$(( $(date +%s) + 15 ))
@@ -344,6 +345,25 @@ if ttc port ls --json "$VNET@main" | grep -q '"branch_id": "child"'; then
   fail "deleted child branch retained published-port metadata"
 fi
 ttc rm --force "$VNET"
+
+echo "== Sentry-managed secondary network namespace =="
+ttc run --name "$NETNS" --detach "$BUSYBOX_IMAGE" sleep 300 >/dev/null
+ttc exec --detach --cap CAP_SYS_ADMIN --cap CAP_NET_ADMIN "$NETNS@main" \
+  unshare -n sh -c \
+  'ip link set lo up; mkdir -p /tmp/ns-www; echo namespace-ok >/tmp/ns-www/index.html; httpd -f -p 8080 -h /tmp/ns-www & while :; do wget -qO /tmp/ns-result http://127.0.0.1:8080 || true; sleep 1; done' \
+  >/dev/null
+deadline=$(( $(date +%s) + 15 ))
+until [ "$(ttc exec "$NETNS@main" cat /tmp/ns-result 2>/dev/null || true)" = namespace-ok ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "secondary network namespace service did not become ready"
+  sleep 1
+done
+ttc fork "$NETNS@main" child >/dev/null
+sleep 2
+[ "$(ttc exec "$NETNS@main" cat /tmp/ns-result)" = namespace-ok ] ||
+  fail "source secondary network namespace stopped after fork"
+[ "$(ttc exec "$NETNS@child" cat /tmp/ns-result)" = namespace-ok ] ||
+  fail "forked secondary network namespace did not retain internal TCP"
+ttc rm --force "$NETNS"
 
 ttc run --name "$PREFIX-alpine" "$ALPINE_IMAGE" sh -c \
   'grep -q Alpine /etc/os-release && apk --version >/dev/null && echo alpine-ok'

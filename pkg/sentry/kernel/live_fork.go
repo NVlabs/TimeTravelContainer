@@ -184,18 +184,12 @@ func (k *Kernel) ValidateLiveFork(ctx context.Context, opts LiveForkValidationOp
 		return fmt.Errorf("live fork validation requires a paused kernel")
 	}
 	k.tasks.waitForExternalStop()
-	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil && !opts.AllowNetworkStack {
-		return fmt.Errorf("live fork does not yet support a network stack")
-	}
 	return k.quiescePausedAnd(ctx, func() error {
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.Pause()
-			defer stack.Resume()
-			if err := k.validateLiveForkNetwork(stack); err != nil {
-				return err
-			}
+		resumeNetwork, err := k.pauseLiveForkNetworkStacks(opts.AllowNetworkStack, true)
+		if err != nil {
+			return err
 		}
+		defer resumeNetwork()
 		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
 			return err
 		}
@@ -217,8 +211,9 @@ func (k *Kernel) validateLiveForkResourcesAndMappings() error {
 // The returned Kernel has not executed any task instructions; callers must call
 // StartPaused and then Unpause to make it runnable.
 //
-// This API is intentionally experimental. It currently rejects private
-// filesystem MemoryFiles and an initialized network stack.
+// This API is intentionally experimental. Eligible TTC kernels prevent known
+// unsupported resources from entering the graph; the frozen validation and
+// private-MemoryFile checks below remain fail-closed invariant guards.
 //
 // Preconditions: k must be paused for the duration of the call.
 func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, error) {
@@ -237,22 +232,14 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	if opts.Clocks == nil {
 		return nil, fmt.Errorf("live fork requires a clock source")
 	}
-	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil && !opts.AllowNetworkStack {
-		return nil, fmt.Errorf("live fork does not yet support a network stack")
-	}
-
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
 		validationStarted := time.Now()
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.SetRemoveConf(false)
-			stack.Pause()
-			defer stack.Resume()
-			if err := k.validateLiveForkNetwork(stack); err != nil {
-				return err
-			}
+		resumeNetwork, err := k.pauseLiveForkNetworkStacks(opts.AllowNetworkStack, true)
+		if err != nil {
+			return err
 		}
+		defer resumeNetwork()
 		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
 			return err
 		}
@@ -442,21 +429,8 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := injectLiveForkFailure(opts, LiveForkStageVDSOPrivatized); err != nil {
 			return err
 		}
-		if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			sourceStack := k.rootNetworkNamespace.Stack()
-			cloner, ok := sourceStack.(inet.LiveForkStackConfigCloner)
-			if !ok {
-				return fmt.Errorf("live fork network stack %T cannot clone unsaved configuration", sourceStack)
-			}
-			if err := cloner.CloneLiveForkConfig(rootNS.Stack()); err != nil {
-				return fmt.Errorf("cloning live-fork network configuration: %w", err)
-			}
-			rootNS.Stack().Restore()
-			if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
-				if err := resetter.ResetLiveForkChild(); err != nil {
-					return fmt.Errorf("resetting child external network state: %w", err)
-				}
-			}
+		if err := child.restoreLiveForkNetworkStacks(k.rootNetworkNamespace.Stack()); err != nil {
+			return err
 		}
 		if err := injectLiveForkFailure(opts, LiveForkStageNetworkRestored); err != nil {
 			return err
@@ -645,11 +619,11 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 		// resumption. Pair the metadata-only save with the same stack lifecycle
 		// used by LiveFork and Kernel.SaveTo; otherwise the primary batch child
 		// retains frozen endpoints while only the decoded siblings are thawed.
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.Pause()
-			defer stack.Resume()
+		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, false)
+		if err != nil {
+			return err
 		}
+		defer resumeNetwork()
 		k.prepareSharedMemoryForLiveFork(k.SupervisorContext())
 
 		mfs := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
@@ -746,27 +720,9 @@ func (k *Kernel) loadCapturedLiveForkChild(
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-		if networkConfigSource == nil {
-			child.Release()
-			return nil, fmt.Errorf("live fork network configuration source is unavailable")
-		}
-		cloner, ok := networkConfigSource.(inet.LiveForkStackConfigCloner)
-		if !ok {
-			child.Release()
-			return nil, fmt.Errorf("live fork network stack %T cannot clone unsaved configuration", networkConfigSource)
-		}
-		if err := cloner.CloneLiveForkConfig(rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("cloning live-fork network configuration: %w", err)
-		}
-		rootNS.Stack().Restore()
-		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
-			if err := resetter.ResetLiveForkChild(); err != nil {
-				child.Release()
-				return nil, fmt.Errorf("resetting child external network state: %w", err)
-			}
-		}
+	if err := child.restoreLiveForkNetworkStacks(networkConfigSource); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -825,9 +781,8 @@ func (k *Kernel) validateLiveForkFilesystems(ctx context.Context, allowShared bo
 	return &LiveForkResourceError{Issues: issues}
 }
 
-// validateLiveForkNetwork verifies that stack is a contained root netstack and
-// that no task observes a secondary network namespace. The latter remains an
-// explicit restriction until all namespace stacks are paused and restored.
+// validateLiveForkNetwork verifies that stack and its link graph are contained
+// within the Sentry.
 func (k *Kernel) validateLiveForkNetwork(stack inet.Stack) error {
 	validator, ok := stack.(inet.LiveForkStackValidator)
 	if !ok {
@@ -839,17 +794,136 @@ func (k *Kernel) validateLiveForkNetwork(stack inet.Stack) error {
 	if err := validator.ValidateLiveFork(); err != nil {
 		return fmt.Errorf("live fork network containment validation failed: %w", err)
 	}
-	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-	for task, tid := range k.tasks.Root.tids {
-		// Exit teardown releases the task's network namespace before the task
-		// is reaped from its PID namespace. Such zombies have no remaining
-		// network state to validate or clone.
-		if task.netns == nil {
+	return nil
+}
+
+// pauseLiveForkNetworkStacks pauses every stack owned by k's network namespace
+// family. The complete set is tracked independently of tasks so namespaces
+// retained only by nsfs descriptors are included as well. k must be paused and
+// protected by quiescePausedAnd.
+func (k *Kernel) pauseLiveForkNetworkStacks(allow, validate bool) (func(), error) {
+	if k.rootNetworkNamespace == nil {
+		return func() {}, nil
+	}
+	var paused []inet.Stack
+	resume := func() {
+		for i := len(paused) - 1; i >= 0; i-- {
+			if saver, ok := paused[i].(inet.LiveForkStackConfigSaver); ok {
+				saver.SetLiveForkSaveConfig(false)
+			}
+			paused[i].Resume()
+		}
+	}
+	seen := make(map[inet.Stack]struct{})
+	for _, ns := range k.rootNetworkNamespace.RelatedNamespaces() {
+		stack := ns.Stack()
+		if stack == nil {
 			continue
 		}
-		if task.netns != k.rootNetworkNamespace {
-			return fmt.Errorf("live fork does not yet support non-root network namespace observed by pid %d", tid)
+		if _, ok := seen[stack]; ok {
+			continue
+		}
+		seen[stack] = struct{}{}
+		if !allow {
+			resume()
+			return func() {}, fmt.Errorf("live fork does not support this container's network mode")
+		}
+		stack.SetRemoveConf(false)
+		if saver, ok := stack.(inet.LiveForkStackConfigSaver); ok {
+			saver.SetLiveForkSaveConfig(true)
+		}
+		stack.Pause()
+		paused = append(paused, stack)
+		if validate {
+			if err := k.validateLiveForkNetwork(stack); err != nil {
+				resume()
+				return func() {}, err
+			}
+		}
+	}
+	return resume, nil
+}
+
+// restoreLiveForkNetworkStacks thaws all decoded Sentry-owned stacks. The root
+// stack additionally receives runtime-managed TTC NIC configuration, which is
+// intentionally reconstructed rather than borrowed from the source branch.
+func (k *Kernel) restoreLiveForkNetworkStacks(rootConfigSource inet.Stack) error {
+	if k.rootNetworkNamespace == nil {
+		return nil
+	}
+	seen := make(map[inet.Stack]struct{})
+	for _, ns := range k.rootNetworkNamespace.RelatedNamespaces() {
+		stack := ns.Stack()
+		if stack == nil {
+			continue
+		}
+		if _, ok := seen[stack]; ok {
+			continue
+		}
+		seen[stack] = struct{}{}
+		if restorer, ok := stack.(inet.LiveForkStackConfigRestorer); ok {
+			if err := restorer.PrepareLiveForkRestore(); err != nil {
+				return fmt.Errorf("preparing live-fork network configuration: %w", err)
+			}
+		}
+		if ns.IsRoot() {
+			if rootConfigSource == nil {
+				return fmt.Errorf("live fork network configuration source is unavailable")
+			}
+			cloner, ok := rootConfigSource.(inet.LiveForkStackConfigCloner)
+			if !ok {
+				return fmt.Errorf("live fork network stack %T cannot clone unsaved configuration", rootConfigSource)
+			}
+			if err := cloner.CloneLiveForkConfig(stack); err != nil {
+				return fmt.Errorf("cloning live-fork network configuration: %w", err)
+			}
+		}
+		stack.Restore()
+		if resetter, ok := stack.(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				return fmt.Errorf("resetting child external network state: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// restoreReconfiguredNetworkStacks restores a decoded network namespace graph
+// when the root's host-facing TTC NIC must be recreated by the destination
+// runtime (distributed fork and rehydration). Secondary namespace stacks retain
+// their serialized, Sentry-owned configuration.
+func (k *Kernel) restoreReconfiguredNetworkStacks(configureRoot func(inet.Stack) error) error {
+	if k.rootNetworkNamespace == nil {
+		return nil
+	}
+	seen := make(map[inet.Stack]struct{})
+	for _, ns := range k.rootNetworkNamespace.RelatedNamespaces() {
+		stack := ns.Stack()
+		if stack == nil {
+			continue
+		}
+		if _, ok := seen[stack]; ok {
+			continue
+		}
+		seen[stack] = struct{}{}
+		if restorer, ok := stack.(inet.LiveForkStackConfigRestorer); ok {
+			if err := restorer.PrepareLiveForkRestore(); err != nil {
+				return fmt.Errorf("preparing restored network configuration: %w", err)
+			}
+		}
+		if ns.IsRoot() {
+			if configureRoot == nil {
+				return errors.New("network root configurator was not provided")
+			}
+			if err := configureRoot(stack); err != nil {
+				return err
+			}
+		}
+		stack.Restore()
+		if resetter, ok := stack.(inet.LiveForkStackChildResetter); ok {
+			if err := resetter.ResetLiveForkChild(); err != nil {
+				return fmt.Errorf("resetting child external network state: %w", err)
+			}
 		}
 	}
 	return nil

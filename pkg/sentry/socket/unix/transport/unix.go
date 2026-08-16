@@ -28,25 +28,26 @@ import (
 )
 
 // ValidateLiveFork verifies that ep and every transport object reachable from
-// it are implemented entirely by Sentry. Host-backed peers and queued file
-// descriptor control messages are rejected.
-func ValidateLiveFork(ep Endpoint) error {
+// it are implemented entirely by Sentry. It returns Sentry file descriptions
+// carried by queued SCM_RIGHTS as opaque resources for the socket layer to
+// validate recursively.
+func ValidateLiveFork(ep Endpoint) ([]any, error) {
 	return validateLiveForkEndpoint(ep, make(map[*connectionedEndpoint]struct{}))
 }
 
-func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct{}) error {
+func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct{}) ([]any, error) {
 	switch e := ep.(type) {
 	case *connectionlessEndpoint:
 		return validateLiveForkBaseEndpoint(&e.baseEndpoint)
 	case *connectionedEndpoint:
 		if _, ok := seen[e]; ok {
-			return nil
+			return nil, nil
 		}
 		seen[e] = struct{}{}
 		e.Lock()
 		if e.boundSocketFD != nil {
 			e.Unlock()
-			return fmt.Errorf("unix endpoint is bound to a host socket")
+			return nil, fmt.Errorf("unix endpoint is bound to a host socket")
 		}
 		accepted := make([]*connectionedEndpoint, 0, len(e.acceptedChan))
 		for range len(e.acceptedChan) {
@@ -55,69 +56,96 @@ func validateLiveForkEndpoint(ep Endpoint, seen map[*connectionedEndpoint]struct
 			e.acceptedChan <- child
 		}
 		e.Unlock()
-		if err := validateLiveForkBaseEndpoint(&e.baseEndpoint); err != nil {
-			return err
+		resources, err := validateLiveForkBaseEndpoint(&e.baseEndpoint)
+		if err != nil {
+			return nil, err
 		}
 		for _, child := range accepted {
-			if err := validateLiveForkEndpoint(child, seen); err != nil {
-				return err
+			childResources, err := validateLiveForkEndpoint(child, seen)
+			if err != nil {
+				return nil, err
 			}
+			resources = append(resources, childResources...)
 		}
-		return nil
+		return resources, nil
 	default:
-		return fmt.Errorf("unsupported unix endpoint type %T", ep)
+		return nil, fmt.Errorf("unsupported unix endpoint type %T", ep)
 	}
 }
 
-func validateLiveForkBaseEndpoint(e *baseEndpoint) error {
+func validateLiveForkBaseEndpoint(e *baseEndpoint) ([]any, error) {
 	e.Lock()
 	receiver := e.receiver
 	connected := e.connected
 	e.Unlock()
-	if err := validateLiveForkReceiver(receiver); err != nil {
-		return err
+	resources, err := validateLiveForkReceiver(receiver)
+	if err != nil {
+		return nil, err
 	}
 	switch c := connected.(type) {
 	case nil:
-		return nil
+		return resources, nil
 	case *connectedEndpoint:
-		return validateLiveForkQueue(c.writeQueue)
+		queued, err := validateLiveForkQueue(c.writeQueue)
+		return append(resources, queued...), err
 	default:
-		return fmt.Errorf("host-backed unix connected endpoint %T", connected)
+		return nil, fmt.Errorf("host-backed unix connected endpoint %T", connected)
 	}
 }
 
-func validateLiveForkReceiver(receiver Receiver) error {
+func validateLiveForkReceiver(receiver Receiver) ([]any, error) {
 	switch r := receiver.(type) {
 	case nil:
-		return nil
+		return nil, nil
 	case *queueReceiver:
 		return validateLiveForkQueue(r.readQueue)
 	case *streamQueueReceiver:
 		r.mu.Lock()
-		hasRights := r.control.Rights != nil
+		resources, err := liveForkRightsResources(r.control.Rights)
 		r.mu.Unlock()
-		if hasRights {
-			return fmt.Errorf("unix stream receiver has pending SCM_RIGHTS")
+		if err != nil {
+			return nil, err
 		}
-		return validateLiveForkQueue(r.readQueue)
+		queued, err := validateLiveForkQueue(r.readQueue)
+		return append(resources, queued...), err
 	default:
-		return fmt.Errorf("host-backed unix receiver %T", receiver)
+		return nil, fmt.Errorf("host-backed unix receiver %T", receiver)
 	}
 }
 
-func validateLiveForkQueue(q *queue) error {
+func validateLiveForkQueue(q *queue) ([]any, error) {
 	if q == nil {
-		return nil
+		return nil, nil
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	var resources []any
 	for m := q.dataList.Front(); m != nil; m = m.Next() {
-		if m.Control.Rights != nil {
-			return fmt.Errorf("unix receive queue contains SCM_RIGHTS")
+		rightsResources, err := liveForkRightsResources(m.Control.Rights)
+		if err != nil {
+			return nil, err
 		}
+		resources = append(resources, rightsResources...)
 	}
-	return nil
+	return resources, nil
+}
+
+// LiveForkRights exposes the Sentry resources referenced by a queued rights
+// message without consuming it. Host-backed and unknown rights messages do not
+// implement this interface and remain ineligible.
+type LiveForkRights interface {
+	LiveForkResources() []any
+}
+
+func liveForkRightsResources(rights RightsControlMessage) ([]any, error) {
+	if rights == nil {
+		return nil, nil
+	}
+	provider, ok := rights.(LiveForkRights)
+	if !ok {
+		return nil, fmt.Errorf("unix receive queue contains unsupported SCM_RIGHTS %T", rights)
+	}
+	return provider.LiveForkResources(), nil
 }
 
 const (

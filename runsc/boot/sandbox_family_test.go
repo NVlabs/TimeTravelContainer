@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,16 @@ import (
 
 type testDistributedBranchResource struct {
 	removed []string
+}
+
+func TestSandboxFamilyWaivedLiveForkIsSystematicallyRejected(t *testing.T) {
+	family := NewSandboxFamily(&kernel.Kernel{}, SandboxFamilyOptions{LiveForkEligible: false})
+	if _, err := family.Fork(&ForkBranchArgs{ID: "child"}); err == nil || !strings.Contains(err.Error(), "waived live fork eligibility") {
+		t.Fatalf("Fork() error=%v, want immutable eligibility rejection", err)
+	}
+	if got := family.List(); len(got) != 1 || got[0].ID != DefaultBranchID {
+		t.Fatalf("rejected fork changed branches: %+v", got)
+	}
 }
 
 func (*testDistributedBranchResource) Fork(string, string) error { return nil }

@@ -715,6 +715,17 @@ func (fs *RightsFiles) Clone() transport.RightsControlMessage {
 	return &nfs
 }
 
+// LiveForkResources implements transport.LiveForkRights. Returning opaque
+// values avoids a transport-to-VFS package cycle; the Unix socket layer checks
+// their concrete type before adding them to the descriptor graph.
+func (fs *RightsFiles) LiveForkResources() []any {
+	resources := make([]any, len(*fs))
+	for i, file := range *fs {
+		resources[i] = file
+	}
+	return resources
+}
+
 // TransferRights implements transport.RightsControlMessage.TransferRights.
 func (fs *RightsFiles) TransferRights() transport.RightsControlMessage {
 	nfs := *fs

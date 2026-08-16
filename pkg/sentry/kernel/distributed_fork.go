@@ -165,15 +165,11 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	k.ReceiveTaskStates()
 	var capture *DistributedForkCapture
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.SetRemoveConf(false)
-			stack.Pause()
-			defer stack.Resume()
-			if err := k.validateLiveForkNetwork(stack); err != nil {
-				return err
-			}
+		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, true)
+		if err != nil {
+			return err
 		}
+		defer resumeNetwork()
 		if err := k.validateLiveForkFilesystems(ctx, opts.AllowSharedFilesystemResources); err != nil {
 			return err
 		}
@@ -486,28 +482,17 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, fmt.Errorf("sparse distributed target network configurator was not provided")
+			return errors.New("sparse distributed target network configurator was not provided")
 		}
-		// Network devices and routes are target-local runtime state. As in the
-		// ordinary checkpoint restore path, discard the saved configuration before
-		// recreating it. This is also required for repeated imports: state fields
-		// such as netstack's NIC map are intentionally not serialized and may be nil
-		// in a newly loaded peer.
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring sparse distributed target network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring sparse distributed target network: %w", err)
 		}
-		rootNS.Stack().Restore()
-		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
-			if err := resetter.ResetLiveForkChild(); err != nil {
-				child.Release()
-				return nil, fmt.Errorf("resetting sparse distributed child external network state: %w", err)
-			}
-		}
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -617,23 +602,17 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, fmt.Errorf("distributed target network configurator was not provided")
+			return errors.New("distributed target network configurator was not provided")
 		}
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring distributed target network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring distributed target network: %w", err)
 		}
-		rootNS.Stack().Restore()
-		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
-			if err := resetter.ResetLiveForkChild(); err != nil {
-				child.Release()
-				return nil, fmt.Errorf("resetting distributed child external network state: %w", err)
-			}
-		}
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -733,23 +712,17 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, errors.New("relocated distributed target network configurator was not provided")
+			return errors.New("relocated distributed target network configurator was not provided")
 		}
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring relocated distributed target network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring relocated distributed target network: %w", err)
 		}
-		rootNS.Stack().Restore()
-		if resetter, ok := rootNS.Stack().(inet.LiveForkStackChildResetter); ok {
-			if err := resetter.ResetLiveForkChild(); err != nil {
-				child.Release()
-				return nil, fmt.Errorf("resetting relocated distributed child network: %w", err)
-			}
-		}
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()

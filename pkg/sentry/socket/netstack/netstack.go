@@ -462,9 +462,6 @@ var _ = socket.Socket(&sock{})
 
 // ValidateLiveFork implements vfs.LiveForkFileDescription.
 func (s *sock) ValidateLiveFork() ([]*vfs.FileDescription, error) {
-	if !s.namespace.IsRoot() {
-		return nil, fmt.Errorf("network socket belongs to a non-root network namespace")
-	}
 	validator, ok := s.namespace.Stack().(inet.LiveForkStackValidator)
 	if !ok {
 		return nil, fmt.Errorf("network stack has not opted into live fork")
@@ -3036,6 +3033,9 @@ func (s *sock) setSockOptIP(t *kernel.Task, ep commonEndpoint, name int, optVal 
 func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	switch name {
 	case linux.PACKET_RX_RING:
+		if t.Kernel().LiveForkEligible {
+			return syserr.ErrNotSupported
+		}
 		var tpacketReq linux.TpacketReq
 		if len(optVal) < tpacketReq.SizeBytes() {
 			return syserr.ErrInvalidArgument

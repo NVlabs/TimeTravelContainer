@@ -353,6 +353,56 @@ func TestBuildSpecDonatesPersistentRootfsUpper(t *testing.T) {
 	}
 }
 
+func TestBuildSpecRecordsImmutableLiveForkEligibility(t *testing.T) {
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	for _, tc := range []struct {
+		name  string
+		waive bool
+		want  string
+	}{
+		{name: "eligible by default", want: "true"},
+		{name: "explicitly waived", waive: true, want: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := BuildSpec(image, SpecOptions{
+				RootFS:        t.TempDir(),
+				WaiveLiveFork: tc.waive,
+			})
+			if err != nil {
+				t.Fatalf("BuildSpec: %v", err)
+			}
+			if got := spec.Annotations[specutils.AnnotationTTCLiveForkEligible]; got != tc.want {
+				t.Fatalf("live-fork eligibility annotation = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadLegacyHostNetworkFamilyIsSystematicallyIneligible(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "legacy-host")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["true"]}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "legacy-host", Name: "legacy-host", BundleDir: bundleDir,
+		NetworkMode: "host", State: "exited", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := (Store{Root: root}).LoadContainer("legacy-host")
+	if err != nil {
+		t.Fatalf("LoadContainer: %v", err)
+	}
+	if info.LiveForkEligible || info.LiveForkWaiver != "legacy host network configuration" {
+		t.Fatalf("legacy host family eligibility=(%t, %q), want systematic legacy waiver", info.LiveForkEligible, info.LiveForkWaiver)
+	}
+}
+
 func TestValidateManagedVolumeAttachment(t *testing.T) {
 	containers := []ContainerInfo{{
 		Name: "writer",
@@ -1182,6 +1232,9 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 	if containers[0].NetworkMode != "none" {
 		t.Errorf("legacy network mode=%q, want none", containers[0].NetworkMode)
+	}
+	if !containers[0].LiveForkEligible || containers[0].LiveForkWaiver != "" {
+		t.Errorf("legacy contained family eligibility=(%t, %q), want eligible without waiver", containers[0].LiveForkEligible, containers[0].LiveForkWaiver)
 	}
 	if containers[0].StopSignal != DefaultStopSignal || containers[0].StopTimeout == nil || *containers[0].StopTimeout != DefaultStopTimeoutSeconds {
 		t.Errorf("legacy stop policy=(%q, %v), want (%q, %d)", containers[0].StopSignal, containers[0].StopTimeout, DefaultStopSignal, DefaultStopTimeoutSeconds)

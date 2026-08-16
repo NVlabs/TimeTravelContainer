@@ -224,6 +224,8 @@ type PrepareOptions struct {
 	NetworkIP          string
 	NetworkMAC         string
 	PublishedPorts     []PortBinding
+	WaiveLiveFork      bool
+	LiveForkWaiver     string
 	Progress           images.ProgressFunc
 	// VolumeCopyMode is the copy policy already verified by ttcd at startup.
 	// Empty permits Store-only callers to probe either supported mode.
@@ -339,6 +341,8 @@ type ContainerInfo struct {
 	RootFS                       string                           `json:"rootfs"`
 	Branches                     []BranchInfo                     `json:"branches,omitempty"`
 	NetworkMode                  string                           `json:"network_mode,omitempty"`
+	LiveForkEligible             bool                             `json:"live_fork_eligible"`
+	LiveForkWaiver               string                           `json:"live_fork_waiver,omitempty"`
 	NetworkNAT                   bool                             `json:"network_nat,omitempty"`
 	NetworkIP                    string                           `json:"network_ip,omitempty"`
 	NetworkMAC                   string                           `json:"network_mac,omitempty"`
@@ -739,6 +743,17 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if len(opts.PublishedPorts) != 0 && networkMode != "ttc" {
 		return Prepared{}, fmt.Errorf("published ports require network mode ttc")
 	}
+	liveForkEligible := !opts.WaiveLiveFork
+	if liveForkEligible && opts.LiveForkWaiver != "" {
+		return Prepared{}, fmt.Errorf("live-fork-eligible container cannot record waiver %q", opts.LiveForkWaiver)
+	}
+	if liveForkEligible && networkMode == "host" {
+		return Prepared{}, fmt.Errorf("network mode host is incompatible with live fork eligibility; explicitly waive eligibility during ttc run")
+	}
+	if !liveForkEligible && opts.LiveForkWaiver == "" {
+		return Prepared{}, fmt.Errorf("ineligible container requires an explicit live fork waiver")
+	}
+	opts.SpecOptions.WaiveLiveFork = opts.WaiveLiveFork
 	opts.ExtraHosts, err = ParseExtraHosts(opts.ExtraHosts)
 	if err != nil {
 		return Prepared{}, err
@@ -861,6 +876,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		BundleDir:           bundleDir,
 		RootFS:              rootfs,
 		NetworkMode:         networkMode,
+		LiveForkEligible:    liveForkEligible,
+		LiveForkWaiver:      opts.LiveForkWaiver,
 		NetworkNAT:          opts.NetworkNAT,
 		NetworkIP:           opts.NetworkIP,
 		NetworkMAC:          opts.NetworkMAC,
@@ -2171,6 +2188,26 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
+	// Metadata predating the immutable eligibility property omitted both fields.
+	// Existing contained-network families were created under TTC's forkable
+	// configuration, while legacy host-network families necessarily remain
+	// ineligible.
+	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+		if networkMode == "host" {
+			info.LiveForkWaiver = "legacy host network configuration"
+		} else {
+			info.LiveForkEligible = true
+		}
+	}
+	if info.LiveForkEligible && info.LiveForkWaiver != "" {
+		return ContainerInfo{}, fmt.Errorf("container %q is live-fork eligible but records waiver %q", key, info.LiveForkWaiver)
+	}
+	if info.LiveForkEligible && networkMode == "host" {
+		return ContainerInfo{}, fmt.Errorf("container %q is live-fork eligible but uses host networking", key)
+	}
+	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+		return ContainerInfo{}, fmt.Errorf("container %q is not live-fork eligible but has no waiver", key)
+	}
 	if len(info.PublishedPorts) != 0 && networkMode != "ttc" {
 		return ContainerInfo{}, fmt.Errorf("container %q publishes ports with network mode %q", key, networkMode)
 	}

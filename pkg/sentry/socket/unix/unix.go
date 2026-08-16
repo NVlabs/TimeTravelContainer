@@ -72,10 +72,19 @@ var _ vfs.LiveForkFileDescription = (*Socket)(nil)
 
 // ValidateLiveFork implements vfs.LiveForkFileDescription.
 func (s *Socket) ValidateLiveFork() ([]*vfs.FileDescription, error) {
-	if err := transport.ValidateLiveFork(s.ep); err != nil {
+	resources, err := transport.ValidateLiveFork(s.ep)
+	if err != nil {
 		return nil, err
 	}
-	return nil, nil
+	files := make([]*vfs.FileDescription, 0, len(resources))
+	for _, resource := range resources {
+		file, ok := resource.(*vfs.FileDescription)
+		if !ok {
+			return nil, fmt.Errorf("queued SCM_RIGHTS contains unsupported resource %T", resource)
+		}
+		files = append(files, file)
+	}
+	return files, nil
 }
 
 func isAbstract(path string) bool {

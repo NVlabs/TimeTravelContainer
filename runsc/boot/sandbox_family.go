@@ -474,6 +474,7 @@ type SandboxFamily struct {
 	defaultStartedOnce sync.Once
 	// allowNetworkStack is true only when loader configuration proves that
 	// network state has no host-facing links.
+	liveForkEligible               bool
 	allowNetworkStack              bool
 	allowSharedFilesystemResources bool
 	watchdogOpts                   *watchdog.Opts
@@ -499,6 +500,7 @@ type distributedForkSession struct {
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
 type SandboxFamilyOptions struct {
+	LiveForkEligible               bool
 	AllowNetworkStack              bool
 	AllowSharedFilesystemResources bool
 	WatchdogOpts                   *watchdog.Opts
@@ -564,6 +566,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		initialFilesystemBranch = ttcvolume.MainBranch
 	}
 	f := &SandboxFamily{
+		liveForkEligible:               opts.LiveForkEligible,
 		allowNetworkStack:              opts.AllowNetworkStack,
 		allowSharedFilesystemResources: opts.AllowSharedFilesystemResources,
 		watchdogOpts:                   opts.WatchdogOpts,
@@ -1475,6 +1478,9 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	}
 	if len(args.IDs) == 0 {
 		return nil, fmt.Errorf("at least one branch ID is required")
+	}
+	if !f.liveForkEligible {
+		return nil, fmt.Errorf("container family explicitly waived live fork eligibility at creation")
 	}
 	sourceID := args.Source
 	if sourceID == "" {

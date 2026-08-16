@@ -291,6 +291,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, err
 	}
 	source = resolved
+	if !sourceInfo.LiveForkEligible {
+		return selector{}, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
+	}
 	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
 	if err != nil {
 		return selector{}, err
@@ -716,6 +719,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		return nil, err
 	}
 	source = resolved
+	if !sourceInfo.LiveForkEligible {
+		return nil, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
+	}
 	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
 		return nil, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
 	}

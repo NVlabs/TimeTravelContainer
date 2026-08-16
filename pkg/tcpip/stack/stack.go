@@ -104,6 +104,16 @@ type Stack struct {
 	// nicIDGen is used to generate NIC IDs.
 	nicIDGen atomicbitops.Int32 `state:"nosave"`
 
+	// liveForkSaveConfig requests that savedConfig include the otherwise
+	// runtime-supplied NIC, route, and iptables graph. It is enabled only for
+	// TTC in-memory/durable branch capture, never ordinary gVisor checkpoint.
+	liveForkSaveConfig           bool              `state:"nosave"`
+	liveForkConfigRestored       bool              `state:"nosave"`
+	liveForkPreviousTCPMigration bool              `state:"nosave"`
+	liveForkRestoreTCPMigration  bool              `state:"nosave"`
+	liveForkPendingConfig        *savedStackConfig `state:"nosave"`
+	savedConfig                  struct{}          `state:".(*savedStackConfig)"`
+
 	// cleanupEndpointsMu protects cleanupEndpoints.
 	cleanupEndpointsMu cleanupEndpointsMutex `state:"nosave"`
 	// +checklocks:cleanupEndpointsMu
@@ -2157,6 +2167,11 @@ func (s *Stack) Restore() {
 	for _, p := range s.transportProtocols {
 		p.proto.Restore()
 	}
+	s.mu.Lock()
+	if s.liveForkConfigRestored {
+		s.allowLiveTCPMigration = s.liveForkRestoreTCPMigration
+	}
+	s.mu.Unlock()
 }
 
 // Resume resumes the stack after a save.

@@ -481,6 +481,11 @@ type Kernel struct {
 	// IOUringEnabled determines if io_uring is enabled.
 	IOUringEnabled bool
 
+	// LiveForkEligible is the immutable TTC family policy selected when the
+	// initial Kernel is created. Eligible kernels must not admit resources that
+	// can make a later live fork workload-dependently ineligible.
+	LiveForkEligible bool
+
 	// MaxKeySetSize is the maximum number of keys in a key set.
 	MaxKeySetSize atomicbitops.Int32
 

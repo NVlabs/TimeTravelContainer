@@ -223,6 +223,7 @@ go_library(
         "iptables_mutex.go",
         "iptables_targets.go",
         "iptables_types.go",
+        "live_fork_state.go",
         "multi_port_endpoint_mutex.go",
         "nat.go",
         "neighbor_cache.go",

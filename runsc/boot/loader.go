@@ -774,11 +774,23 @@ func New(args Args) (*Loader, error) {
 			log.Warningf("Application cudaMallocManaged() is flaky on -platform=kvm, see gvisor.dev/docs/user_guide/gpu/#platforms")
 		}
 	}
+	liveForkEligible := false
+	if args.Spec.Annotations != nil {
+		if args.Spec.Annotations[specutils.AnnotationTTCLiveForkEligible] != "" {
+			liveForkEligible = specutils.AnnotationToBool(args.Spec, specutils.AnnotationTTCLiveForkEligible)
+		} else if args.Spec.Annotations[InternalConsoleAnnotation] != "" {
+			// TTC bundles predating the explicit annotation were always created
+			// with the contained-resource configuration. Preserve their behavior
+			// without imposing TTC restrictions on ordinary runsc bundles.
+			liveForkEligible = true
+		}
+	}
 	l.k = &kernel.Kernel{
 		Platform:            p,
 		NvidiaDriverVersion: args.NvidiaDriverVersion,
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
+		LiveForkEligible:    liveForkEligible,
 	}
 
 	// Distributed and cold-dehydration targets need an unused MemoryFile backing
@@ -914,6 +926,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("TTC initial branch annotations must be specified together")
 	}
 	l.family = NewSandboxFamily(l.k, SandboxFamilyOptions{
+		LiveForkEligible:               l.k.LiveForkEligible,
 		AllowNetworkStack:              args.Conf.Network == config.NetworkNone || args.Conf.Network == config.NetworkTimeTravel,
 		AllowSharedFilesystemResources: true,
 		WatchdogOpts:                   &dogOpts,
@@ -1081,6 +1094,21 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 	}
 	if nftables.IsNFTablesEnabled() && eps.Stack.NFTables() == nil {
 		eps.Stack.SetNFTables(nftables.NewNFTables(eps.Stack, eps.Stack.Clock(), eps.Stack.SecureRNG()))
+	}
+	if eps.HasLiveForkRestoredConfig() {
+		// TTC state contains the complete guest-managed network graph. Recreate
+		// only the runtime-owned TTC link; replaying the original OCI network
+		// setup would discard or collide with interfaces and routes created by
+		// the workload after container start.
+		if networkArgs.TimeTravel != nil {
+			if _, ok := eps.Interfaces()[int32(timeTravelNICID)]; ok {
+				if err := eps.Stack.RemoveNIC(timeTravelNICID); err != nil {
+					return fmt.Errorf("removing restored TTC interface: %v", err)
+				}
+			}
+			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false)
+		}
+		return nil
 	}
 	n := &Network{
 		Stack:  eps.Stack,

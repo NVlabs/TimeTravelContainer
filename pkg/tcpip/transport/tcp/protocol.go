@@ -88,7 +88,10 @@ const (
 
 // +stateify savable
 type protocol struct {
-	stack *stack.Stack
+	// afterLoad draws fresh secrets from the Stack RNG, so the Stack's
+	// afterLoad callback must complete first. TTC's saved network configuration
+	// adds more graph edges and makes relying on incidental decode order unsafe.
+	stack *stack.Stack `state:"wait"`
 
 	// restore coordinates endpoint reconstruction for this protocol instance.
 	// It must be per-stack: TTC may restore multiple branch stacks concurrently

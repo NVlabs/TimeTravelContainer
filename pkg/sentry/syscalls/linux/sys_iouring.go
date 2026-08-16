@@ -25,6 +25,9 @@ import (
 
 // IOUringSetup implements linux syscall io_uring_setup(2).
 func IOUringSetup(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	if t.Kernel().LiveForkEligible {
+		return 0, nil, linuxerr.EOPNOTSUPP
+	}
 	if !t.Kernel().IOUringEnabled {
 		return 0, nil, linuxerr.ENOSYS
 	}

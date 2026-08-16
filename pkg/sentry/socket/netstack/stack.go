@@ -31,11 +31,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
-	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
@@ -1258,9 +1258,34 @@ func (s *Stack) SetRemoveConf(removeConf bool) {
 	s.Stack.SetRemoveConf(removeConf)
 }
 
-// ValidateLiveFork implements inet.LiveForkStackValidator. The initial live
-// fork networking policy accepts an empty stack or the canonical loopback NIC
-// and rejects every host-facing or cross-namespace link.
+// SetLiveForkSaveConfig implements inet.LiveForkStackConfigSaver.
+func (s *Stack) SetLiveForkSaveConfig(enabled bool) {
+	s.Stack.SetLiveForkSaveConfig(enabled)
+}
+
+// HasLiveForkRestoredConfig implements inet.LiveForkStackConfigRestorer.
+func (s *Stack) HasLiveForkRestoredConfig() bool {
+	return s.Stack.HasLiveForkRestoredConfig()
+}
+
+// PrepareLiveForkRestore implements inet.LiveForkStackConfigRestorer.
+func (s *Stack) PrepareLiveForkRestore() error {
+	if err := s.Stack.PrepareLiveForkRestore(); err != nil {
+		return err
+	}
+	// The nftables interpreter is omitted because eligible TTC families reject
+	// mutation. Recreate the empty interpreter for every restored namespace,
+	// not only the root namespace that receives runtime network hooks.
+	if s.Stack.NFTables() == nil && nftables.IsNFTablesEnabled() {
+		s.Stack.SetNFTables(nftables.NewNFTables(s.Stack, s.Stack.Clock(), s.Stack.SecureRNG()))
+	}
+	return nil
+}
+
+// ValidateLiveFork implements inet.LiveForkStackValidator. A netstack without
+// runtime hooks is wholly represented in the Sentry state graph; this includes
+// guest-created network namespaces, veth pairs, routes, and filtering state.
+// Runtime hooks are required for links whose peer lives outside that graph.
 func (s *Stack) ValidateLiveFork() error {
 	if s.liveForkNetwork != nil {
 		if s.liveForkNetwork.Validate == nil {
@@ -1268,33 +1293,12 @@ func (s *Stack) ValidateLiveFork() error {
 		}
 		return s.liveForkNetwork.Validate(s)
 	}
-	if tables := s.Stack.IPTables(); tables == nil {
-		return fmt.Errorf("network stack has no iptables configuration")
-	} else if tables.Modified() {
-		return fmt.Errorf("modified iptables/conntrack state is not yet supported")
-	}
-	if s.Stack.NFTables() != nil {
-		return fmt.Errorf("nftables configuration is not yet supported")
-	}
-	interfaces := s.Interfaces()
-	for id, iface := range interfaces {
-		if id != linux.LOOPBACK_IFINDEX || iface.DeviceType != linux.ARPHRD_LOOPBACK || iface.Name != "lo" {
-			return fmt.Errorf("network interface %d (%q, device type %d) is not the canonical loopback interface", id, iface.Name, iface.DeviceType)
-		}
-	}
-	for _, route := range s.RouteTable() {
-		if route.OutputInterface != 0 {
-			if _, ok := interfaces[route.OutputInterface]; !ok {
-				return fmt.Errorf("route uses unknown interface %d", route.OutputInterface)
-			}
-		}
-	}
 	return nil
 }
 
-// CloneLiveForkConfig implements inet.LiveForkStackConfigCloner. Validation
-// restricts the source to an empty stack or canonical loopback, so rebuilding
-// config never borrows a host or parent-branch link endpoint.
+// CloneLiveForkConfig implements inet.LiveForkStackConfigCloner. Sentry-owned
+// configuration is already present in the decoded child. A runtime hook only
+// reconstructs the deliberately unsaved external side of a managed link.
 func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
 	if err := s.ValidateLiveFork(); err != nil {
 		return err
@@ -1303,45 +1307,25 @@ func (s *Stack) CloneLiveForkConfig(dst inet.Stack) error {
 	if !ok {
 		return fmt.Errorf("cannot clone netstack config into %T", dst)
 	}
+	if dstStack.Stack.IPTables() == nil {
+		tables, ok := s.Stack.IPTables().CloneUnmodifiedForLiveFork(dstStack.Stack.Clock())
+		if !ok {
+			return fmt.Errorf("modified iptables state was absent from live-fork metadata")
+		}
+		dstStack.Stack.SetIPTables(tables)
+	}
+	// nftables is not stateified by upstream netstack. Eligible TTC guests do
+	// not receive NETLINK_NETFILTER mutation support, so recreating the empty
+	// interpreter preserves their observable configuration.
+	if s.Stack.NFTables() != nil && dstStack.Stack.NFTables() == nil {
+		dstStack.Stack.SetNFTables(nftables.NewNFTables(dstStack.Stack, dstStack.Stack.Clock(), dstStack.Stack.SecureRNG()))
+	}
 	if s.liveForkNetwork != nil {
 		if s.liveForkNetwork.Clone == nil {
 			return fmt.Errorf("contained live-fork network has no config cloner")
 		}
 		return s.liveForkNetwork.Clone(dstStack)
 	}
-	interfaces := s.Interfaces()
-	tables, ok := s.Stack.IPTables().CloneUnmodifiedForLiveFork(dstStack.Stack.Clock())
-	if !ok {
-		return fmt.Errorf("modified iptables/conntrack state is not yet supported")
-	}
-	dstStack.Stack.SetIPTables(tables)
-	if len(interfaces) == 0 {
-		dstStack.Stack.ResetConfig()
-		return nil
-	}
-	const nicID = tcpip.NICID(linux.LOOPBACK_IFINDEX)
-	sourceNIC, ok := s.Stack.SingleNICInfo(nicID)
-	if !ok {
-		return fmt.Errorf("source loopback NIC %d disappeared", nicID)
-	}
-	dstStack.Stack.ResetConfig()
-	if err := dstStack.Stack.CreateNICWithOptions(nicID, ethernet.New(loopback.New()), stack.NICOptions{
-		Name:               "lo",
-		DeliverLinkPackets: true,
-	}); err != nil {
-		return fmt.Errorf("creating cloned loopback NIC: %v", err)
-	}
-	destinationNIC, ok := dstStack.Stack.SingleNICInfo(nicID)
-	if !ok {
-		return fmt.Errorf("cloned loopback NIC %d disappeared", nicID)
-	}
-	sourceNIC.Stats.Clone(&destinationNIC.Stats)
-	for _, addr := range s.InterfaceAddrs()[linux.LOOPBACK_IFINDEX] {
-		if err := dstStack.AddInterfaceAddr(linux.LOOPBACK_IFINDEX, addr); err != nil {
-			return fmt.Errorf("adding cloned loopback address: %v", err)
-		}
-	}
-	dstStack.Stack.SetRouteTable(s.Stack.GetRouteTable())
 	return nil
 }
 

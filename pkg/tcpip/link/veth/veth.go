@@ -16,6 +16,8 @@
 package veth
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -32,6 +34,7 @@ type veth struct {
 	mu           vethRWMutex `state:"nosave"`
 	closed       bool
 	backlogQueue chan vethPacket `state:"nosave"`
+	backlogSize  uint32
 	mtu          uint32
 	endpoints    [2]Endpoint
 }
@@ -88,6 +91,7 @@ type Endpoint struct {
 func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
 	veth := veth{
 		backlogQueue: make(chan vethPacket, backlogQueueSize),
+		backlogSize:  backlogQueueSize,
 		mtu:          mtu,
 		endpoints: [2]Endpoint{
 			{
@@ -104,14 +108,25 @@ func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
 	b.peer = a
 	a.veth = &veth
 	b.veth = &veth
+	veth.start()
+	return a, b
+}
+
+func (v *veth) start() {
 	go func() {
-		for t := range veth.backlogQueue {
+		for t := range v.backlogQueue {
 			t.e.InjectInbound(t.protocol, t.pkt)
 			t.pkt.DecRef()
 		}
 
 	}()
-	return a, b
+}
+
+// afterLoad recreates the runtime queue and worker omitted from state. NIC
+// restoration subsequently reattaches both endpoints to their decoded stacks.
+func (v *veth) afterLoad(context.Context) {
+	v.backlogQueue = make(chan vethPacket, v.backlogSize)
+	v.start()
 }
 
 // Close closes e. Further packet injections will return an error, and all pending

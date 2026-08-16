@@ -16,6 +16,7 @@ package inet
 
 import (
 	goContext "context"
+	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -30,7 +31,10 @@ type Namespace struct {
 	inode *nsfs.Inode
 
 	// stack is the network stack implementation of this network namespace.
-	stack Stack
+	// afterLoad inspects the decoded stack before deciding whether ordinary
+	// checkpoint configuration should replace it. Wait for the complete stack
+	// object, not merely its interface wrapper.
+	stack Stack `state:"wait"`
 
 	// creator allows kernel to create new network stack for network namespaces.
 	// If nil, no networking will function if network is namespaced.
@@ -42,6 +46,12 @@ type Namespace struct {
 	// isRoot indicates whether this is the root network namespace.
 	isRoot bool
 
+	// registry weakly tracks every network namespace descended from the same
+	// root. It does not own references: namespace destruction unregisters the
+	// namespace. TTC uses this to quiesce the complete Sentry-owned network
+	// graph, including namespaces retained only by an nsfs descriptor.
+	registry *namespaceRegistry `state:"wait"`
+
 	userNS *auth.UserNamespace
 
 	// abstractSockets tracks abstract sockets that are in use.
@@ -51,17 +61,46 @@ type Namespace struct {
 	netlinkMcastTable *McastTable
 }
 
+// +stateify savable
+type namespaceRegistry struct {
+	mu sync.Mutex `state:"nosave"`
+
+	namespaces map[*Namespace]struct{} `state:"nosave"`
+}
+
+func (r *namespaceRegistry) afterLoad(goContext.Context) {
+	r.namespaces = make(map[*Namespace]struct{})
+}
+
+func (r *namespaceRegistry) register(n *Namespace) {
+	r.mu.Lock()
+	if r.namespaces == nil {
+		r.namespaces = make(map[*Namespace]struct{})
+	}
+	r.namespaces[n] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *namespaceRegistry) unregister(n *Namespace) {
+	r.mu.Lock()
+	delete(r.namespaces, n)
+	r.mu.Unlock()
+}
+
 // NewRootNamespace creates the root network namespace, with creator
 // allowing new network namespaces to be created. If creator is nil, no
 // networking will function if the network is namespaced.
 func NewRootNamespace(stack Stack, creator NetworkStackCreator, userNS *auth.UserNamespace) *Namespace {
+	registry := &namespaceRegistry{namespaces: make(map[*Namespace]struct{})}
 	n := &Namespace{
 		stack:             stack,
 		creator:           creator,
 		isRoot:            true,
 		userNS:            userNS,
 		netlinkMcastTable: NewNetlinkMcastTable(),
+		registry:          registry,
 	}
+	registry.register(n)
 	if eventPublishingStack, ok := stack.(InterfaceEventPublisher); ok {
 		eventPublishingStack.AddInterfaceEventSubscriber(n.netlinkMcastTable)
 	}
@@ -90,13 +129,18 @@ func NewNamespace(root *Namespace, userNS *auth.UserNamespace) *Namespace {
 		creator:           root.creator,
 		userNS:            userNS,
 		netlinkMcastTable: NewNetlinkMcastTable(),
+		registry:          root.registry,
 	}
+	n.registry.register(n)
 	n.init()
 	return n
 }
 
 // Destroy implements nsfs.Namespace.Destroy.
 func (n *Namespace) Destroy(ctx context.Context) {
+	if n.registry != nil {
+		n.registry.unregister(n)
+	}
 	if s := n.Stack(); s != nil {
 		s.Destroy()
 	}
@@ -128,6 +172,22 @@ func (n *Namespace) IsRoot() bool {
 	return n.isRoot
 }
 
+// RelatedNamespaces returns all live network namespaces descended from the
+// same root as n. The returned slice is a weak snapshot; callers must prevent
+// guest namespace creation and destruction while using it.
+func (n *Namespace) RelatedNamespaces() []*Namespace {
+	if n.registry == nil {
+		return []*Namespace{n}
+	}
+	n.registry.mu.Lock()
+	defer n.registry.mu.Unlock()
+	result := make([]*Namespace, 0, len(n.registry.namespaces))
+	for related := range n.registry.namespaces {
+		result = append(result, related)
+	}
+	return result
+}
+
 // RestoreRootStack restores the root network namespace with stack. This should
 // only be called when restoring kernel.
 func (n *Namespace) RestoreRootStack(stack Stack) {
@@ -151,6 +211,13 @@ func (n *Namespace) init() {
 	if n.isRoot {
 		return
 	}
+	if restored, ok := n.stack.(LiveForkStackConfigRestorer); ok && restored.HasLiveForkRestoredConfig() {
+		// TTC serialized this Sentry-owned namespace's complete configuration.
+		// Retain the decoded stack instead of replacing it with the ordinary
+		// checkpoint restore template.
+		n.abstractSockets.init()
+		return
+	}
 	if n.creator != nil {
 		var err error
 		n.stack, err = n.creator.CreateStack()
@@ -166,6 +233,12 @@ func (n *Namespace) init() {
 
 // afterLoad is invoked by stateify.
 func (n *Namespace) afterLoad(goContext.Context) {
+	if n.registry == nil {
+		// Backward compatibility with checkpoints created before the registry
+		// was introduced.
+		n.registry = &namespaceRegistry{namespaces: make(map[*Namespace]struct{})}
+	}
+	n.registry.register(n)
 	n.init()
 }
 

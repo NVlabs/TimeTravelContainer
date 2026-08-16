@@ -50,19 +50,29 @@ func (k *Kernel) saveDanglingEndpoints() []tcpip.Endpoint {
 	if !k.filteringBranchDanglingEndpoints {
 		return endpoints
 	}
-	if k.rootNetworkNamespace == nil || k.rootNetworkNamespace.Stack() == nil {
+	if k.rootNetworkNamespace == nil {
 		return nil
 	}
-	owner, ok := k.rootNetworkNamespace.Stack().(inet.LiveForkDanglingEndpointOwner)
-	if !ok {
-		// Network live-fork validation must reject stacks that cannot identify
-		// branch ownership before serialization reaches this point.
-		return nil
+	var owners []inet.LiveForkDanglingEndpointOwner
+	for _, ns := range k.rootNetworkNamespace.RelatedNamespaces() {
+		if ns.Stack() == nil {
+			continue
+		}
+		owner, ok := ns.Stack().(inet.LiveForkDanglingEndpointOwner)
+		if !ok {
+			// Network live-fork validation must reject stacks that cannot identify
+			// branch ownership before serialization reaches this point.
+			continue
+		}
+		owners = append(owners, owner)
 	}
 	owned := make([]tcpip.Endpoint, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		if owner.OwnsLiveForkDanglingEndpoint(endpoint) {
-			owned = append(owned, endpoint)
+		for _, owner := range owners {
+			if owner.OwnsLiveForkDanglingEndpoint(endpoint) {
+				owned = append(owned, endpoint)
+				break
+			}
 		}
 	}
 	return owned

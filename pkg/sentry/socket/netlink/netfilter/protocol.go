@@ -46,6 +46,12 @@ func NewProtocol(t *kernel.Task) (netlink.Protocol, *syserr.Error) {
 	if !nftables.IsNFTablesEnabled() {
 		return nil, syserr.ErrProtocolNotSupported
 	}
+	if t.Kernel().LiveForkEligible {
+		// Upstream nftables state is not stateifiable. Keep eligible families
+		// immutable at the syscall boundary so a successful run can never turn
+		// into a later fork denial.
+		return nil, syserr.ErrProtocolNotSupported
+	}
 
 	return &Protocol{}, nil
 }

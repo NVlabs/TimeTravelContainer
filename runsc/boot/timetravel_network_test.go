@@ -26,6 +26,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
+	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -194,6 +196,13 @@ func TestTimeTravelNetworkLiveForkHooks(t *testing.T) {
 		HandleLocal:        true,
 	}), 2)
 	t.Cleanup(child.Destroy)
+	// Model guest-owned configuration already decoded by state.Load. Runtime
+	// link reconstruction must not flatten or discard it.
+	guestVeth, _ := veth.NewPair(1500, veth.DefaultBacklogSize)
+	const guestNIC = tcpip.NICID(7)
+	if err := child.Stack.CreateNICWithOptions(guestNIC, ethernet.New(guestVeth), stack.NICOptions{Name: "guest-veth"}); err != nil {
+		t.Fatalf("creating decoded guest veth: %v", err)
+	}
 	if err := source.CloneLiveForkConfig(child); err != nil {
 		t.Fatalf("CloneLiveForkConfig: %v", err)
 	}
@@ -205,6 +214,9 @@ func TestTimeTravelNetworkLiveForkHooks(t *testing.T) {
 	}
 	if source.Stack == child.Stack {
 		t.Fatal("live-fork child shares the source netstack")
+	}
+	if nic, ok := child.Interfaces()[int32(guestNIC)]; !ok || nic.Name != "guest-veth" {
+		t.Fatalf("live-fork runtime link reconstruction discarded guest NIC: %+v", child.Interfaces())
 	}
 }
 

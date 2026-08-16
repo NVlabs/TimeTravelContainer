@@ -83,6 +83,11 @@ type IPTables struct {
 	connections ConnTrack
 
 	reaper tcpip.Timer `state:"nosave"`
+	// liveForkSaveFrozen is set when beforeSave has stopped the source
+	// connection reaper and locked the connection table for a TTC snapshot.
+	// TTC explicitly thaws the source after encoding; ordinary checkpoint
+	// restore creates a new, unlocked object and leaves this field false.
+	liveForkSaveFrozen bool `state:"nosave"`
 
 	mu ipTablesRWMutex `state:"nosave"`
 	// v4Tables and v6tables map tableIDs to tables. They hold builtin

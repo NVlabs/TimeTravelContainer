@@ -97,6 +97,17 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		// except for those parameters that are being changed.
 		//
 		// The src and filesystem type are ignored for MS_REMOUNT.
+		if t.Kernel().LiveForkEligible && !opts.ReadOnly {
+			vd, err := t.Kernel().VFS().GetDentryAt(t, creds, &target.pop, &vfs.GetDentryOptions{})
+			if err != nil {
+				return 0, nil, err
+			}
+			fsType := vd.Mount().Filesystem().FilesystemType().Name()
+			vd.DecRef(t)
+			if fsType == "sysfs" {
+				return 0, nil, linuxerr.EOPNOTSUPP
+			}
+		}
 		return 0, nil, t.Kernel().VFS().RemountAt(t, creds, &target.pop, &opts)
 	case flags&linux.MS_BIND != 0:
 		sourcePath, err := copyInPath(t, sourceAddr)
@@ -137,6 +148,9 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	fsType, err := t.CopyInString(typeAddr, hostarch.PageSize)
 	if err != nil {
 		return 0, nil, err
+	}
+	if t.Kernel().LiveForkEligible && (fsType == "fuse" || fsType == "sysfs" && !opts.ReadOnly) {
+		return 0, nil, linuxerr.EOPNOTSUPP
 	}
 	_, err = t.Kernel().VFS().MountAt(t, creds, source, &target.pop, fsType, &opts)
 	return 0, nil, err

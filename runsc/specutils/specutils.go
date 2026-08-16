@@ -97,6 +97,9 @@ const (
 	AnnotationTTCInitialBranchID         = "dev.timetravelcontainer.initial-branch-id"
 	AnnotationTTCInitialBranchParentID   = "dev.timetravelcontainer.initial-branch-parent-id"
 	AnnotationTTCInitialFilesystemBranch = "dev.timetravelcontainer.initial-filesystem-branch"
+	// AnnotationTTCLiveForkEligible records the immutable family policy chosen
+	// by TTC when the container is created.
+	AnnotationTTCLiveForkEligible = "dev.timetravelcontainer.live-fork-eligible"
 	// AnnotationTTCInitialStartPaused starts a fresh branch in a task-set-wide
 	// stop while ttcd restores independently dehydrated peers into its Sentry.
 	AnnotationTTCInitialStartPaused = "dev.timetravelcontainer.initial-start-paused"

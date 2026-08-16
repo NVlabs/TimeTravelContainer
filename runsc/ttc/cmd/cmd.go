@@ -1190,6 +1190,23 @@ func parseNetworkMode(value string) (string, error) {
 	}
 }
 
+func liveForkWaiverReason(waived bool, networkMode string) string {
+	if !waived {
+		return ""
+	}
+	if networkMode == "host" {
+		return "explicit waiver for host networking"
+	}
+	return "explicitly waived during container creation"
+}
+
+func validateLiveForkCreationPolicy(networkMode string, waived bool) error {
+	if networkMode == "host" && !waived {
+		return errors.New("--network=host is incompatible with live fork eligibility; pass --waive-live-fork to create a systematically non-forkable family")
+	}
+	return nil
+}
+
 func validateVirtualNICOptions(networkMode, ipValue, macValue string) error {
 	if (ipValue != "" || macValue != "") && networkMode != "ttc" {
 		return errors.New("--ip and --mac-address require --network=ttc")
@@ -1389,6 +1406,8 @@ type runRequest struct {
 	user               string
 	hostname           string
 	networkMode        string
+	liveForkEligible   bool
+	liveForkWaiver     string
 	networkNAT         bool
 	networkIP          string
 	networkMAC         string
@@ -1499,6 +1518,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	hostname := fs.String("hostname", "", "container hostname")
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
+	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
@@ -1570,6 +1590,9 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	}
 	networkMode, err := parseNetworkMode(*networkModeValue)
 	if err != nil {
+		return err
+	}
+	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
 	if *networkNAT && networkMode != "ttc" {
@@ -1677,6 +1700,8 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		liveForkEligible:   !*waiveLiveFork,
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
@@ -1761,6 +1786,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	hostname := fs.String("hostname", "", "container hostname")
 	fs.StringVar(hostname, "h", "", "container hostname")
 	networkModeValue := fs.String("network", "none", "network mode: none, host, or ttc")
+	waiveLiveFork := fs.Bool("waive-live-fork", false, "explicitly create a family that is not eligible for live fork")
 	networkNAT := fs.Bool("nat", false, "allow outbound host networking from a ttc virtual NIC")
 	networkIP := fs.String("ip", "", "IPv4 address for the ttc virtual NIC")
 	networkMAC := fs.String("mac-address", "", "MAC address for the ttc virtual NIC")
@@ -1832,6 +1858,9 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	}
 	networkMode, err := parseNetworkMode(*networkModeValue)
 	if err != nil {
+		return err
+	}
+	if err := validateLiveForkCreationPolicy(networkMode, *waiveLiveFork); err != nil {
 		return err
 	}
 	if *networkNAT && networkMode != "ttc" {
@@ -1939,6 +1968,8 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		user:               *user,
 		hostname:           *hostname,
 		networkMode:        networkMode,
+		liveForkEligible:   !*waiveLiveFork,
+		liveForkWaiver:     liveForkWaiverReason(*waiveLiveFork, networkMode),
 		networkNAT:         *networkNAT,
 		networkIP:          *networkIP,
 		networkMAC:         strings.ToLower(*networkMAC),
@@ -4533,16 +4564,18 @@ type Branch struct {
 
 // Family is stable family metadata returned by ttc ls --json.
 type Family struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name,omitempty"`
-	Image      string    `json:"image,omitempty"`
-	Digest     string    `json:"digest,omitempty"`
-	ImageSize  int64     `json:"image_size,omitempty"`
-	State      string    `json:"state"`
-	CreatedAt  time.Time `json:"created_at"`
-	SandboxPID int       `json:"sandbox_pid,omitempty"`
-	Branches   []Branch  `json:"branches"`
-	Error      string    `json:"error,omitempty"`
+	ID               string    `json:"id"`
+	Name             string    `json:"name,omitempty"`
+	Image            string    `json:"image,omitempty"`
+	Digest           string    `json:"digest,omitempty"`
+	ImageSize        int64     `json:"image_size,omitempty"`
+	LiveForkEligible bool      `json:"live_fork_eligible"`
+	LiveForkWaiver   string    `json:"live_fork_waiver,omitempty"`
+	State            string    `json:"state"`
+	CreatedAt        time.Time `json:"created_at"`
+	SandboxPID       int       `json:"sandbox_pid,omitempty"`
+	Branches         []Branch  `json:"branches"`
+	Error            string    `json:"error,omitempty"`
 }
 
 // ProcessInfo is stable branch-local process information returned by ttc top.
@@ -5189,6 +5222,8 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
+		WaiveLiveFork:      !request.liveForkEligible,
+		LiveForkWaiver:     request.liveForkWaiver,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		NodeID:             b.nodeID,
@@ -5262,6 +5297,8 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		NetworkIP:          request.networkIP,
 		NetworkMAC:         request.networkMAC,
 		PublishedPorts:     request.publishedPorts,
+		WaiveLiveFork:      !request.liveForkEligible,
+		LiveForkWaiver:     request.liveForkWaiver,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
 		NodeID:             b.nodeID,
@@ -8002,14 +8039,16 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			state = "created"
 		}
 		byID[container.ID] = Family{
-			ID:        container.ID,
-			Name:      container.Name,
-			Image:     container.Reference,
-			Digest:    container.Digest,
-			ImageSize: container.ImageSize,
-			State:     state,
-			CreatedAt: container.CreatedAt,
-			Branches:  persistentBranches(container.Branches),
+			ID:               container.ID,
+			Name:             container.Name,
+			Image:            container.Reference,
+			Digest:           container.Digest,
+			ImageSize:        container.ImageSize,
+			LiveForkEligible: container.LiveForkEligible,
+			LiveForkWaiver:   container.LiveForkWaiver,
+			State:            state,
+			CreatedAt:        container.CreatedAt,
+			Branches:         persistentBranches(container.Branches),
 		}
 	}
 	if runtimeErr == nil {
@@ -8029,6 +8068,8 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family.Image = persistent.Image
 				family.Digest = persistent.Digest
 				family.ImageSize = persistent.ImageSize
+				family.LiveForkEligible = persistent.LiveForkEligible
+				family.LiveForkWaiver = persistent.LiveForkWaiver
 				family.CreatedAt = persistent.CreatedAt
 				family.Branches = mergeBranchHistory(persistent.Branches, family.Branches)
 				for i := range family.Branches {
@@ -8401,6 +8442,9 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		return nil, err
 	}
 	source = resolved
+	if !containerInfo.LiveForkEligible {
+		return nil, fmt.Errorf("container family %q is not live fork eligible: %s", containerInfo.Name, containerInfo.LiveForkWaiver)
+	}
 	seen := make(map[string]struct{}, len(destinations))
 	for _, destination := range destinations {
 		if _, ok := seen[destination]; ok {

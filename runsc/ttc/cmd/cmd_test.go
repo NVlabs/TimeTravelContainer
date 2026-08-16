@@ -1032,14 +1032,14 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "-h", "demo-host", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
+	args := []string{"run", "--name", "demo", "-dit", "--rm", "--read-only", "--stop-signal", "SIGUSR2", "--stop-timeout", "7", "--pids-limit", "23", "-m", "128m", "--cpus", "1.5", "--cpu-shares", "512", "--shm-size", "32m", "--group-add", "wheel", "--group-add", "4242", "--cap-add", "sys_admin", "--cap-drop", "cap_net_raw", "--ulimit", "nofile=64:128", "--ulimit", "core=0", "--pull", "never", "--network", "host", "--waive-live-fork", "-e", "A=1", "--label", "suite=fast", "--workdir", "/work", "--user", "123:456", "-h", "demo-host", "--entrypoint", "/entry", "--log-driver", "json-file", "--log-opt", "max-size=1.5m", "--log-opt", "max-file=4", "--log-opt", "env=A", "--log-opt", "labels=suite", "-v", "/host/a:/host-data:ro", "--mount", "type=bind,src=/host/b,dst=/config,readonly,immutable-source", "--tmpfs", "/scratch:mode=0700,size=1m", "--mount", "type=tmpfs,target=/worktmp,tmpfs-size=2097152,tmpfs-mode=0750", "--mount", "type=proc,target=/alt-proc,readonly", "--mount", "type=sysfs,target=/alt-sys", "busybox:1.36", "echo", "ok"}
 	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("run status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {
 		t.Errorf("run output=%q, want %q", got, want)
 	}
-	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.hostname != "demo-host" || b.runRequest.networkMode != "host" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
+	if b.runRequest.name != "demo" || b.runRequest.reference != "busybox:1.36" || !b.runRequest.detach || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || !b.runRequest.readonlyRootfs || b.runRequest.cwd != "/work" || b.runRequest.user != "123:456" || b.runRequest.hostname != "demo-host" || b.runRequest.networkMode != "host" || b.runRequest.liveForkEligible || b.runRequest.liveForkWaiver == "" || b.runRequest.pullPolicy != "never" || b.runRequest.stopSignal != "SIGUSR2" || b.runRequest.stopTimeout != 7 {
 		t.Errorf("run request=%+v", b.runRequest)
 	}
 	if b.runRequest.pidsLimit == nil || *b.runRequest.pidsLimit != 23 {
@@ -1501,6 +1501,26 @@ func TestRunAndCreateRejectUnsupportedNetwork(t *testing.T) {
 	}
 }
 
+func TestRunAndCreateRequireExplicitHostNetworkForkWaiver(t *testing.T) {
+	for _, command := range []string{"run", "create"} {
+		b := &fakeBackend{}
+		var stdout, stderr bytes.Buffer
+		if status := runCommand([]string{command, "--network=host", "busybox"}, &stdout, &stderr, b); status != 1 {
+			t.Errorf("%s host network without waiver status=%d, want 1", command, status)
+		}
+		if !strings.Contains(stderr.String(), "--waive-live-fork") {
+			t.Errorf("%s host network error=%q, want waiver guidance", command, stderr.String())
+		}
+		stderr.Reset()
+		if status := runCommand([]string{command, "--network=host", "--waive-live-fork", "busybox"}, &stdout, &stderr, b); status != 0 {
+			t.Fatalf("%s host network with waiver status=%d: %s", command, status, stderr.String())
+		}
+		if b.runRequest.liveForkEligible || b.runRequest.liveForkWaiver == "" {
+			t.Errorf("%s request eligibility=(%t, %q), want explicit waiver", command, b.runRequest.liveForkEligible, b.runRequest.liveForkWaiver)
+		}
+	}
+}
+
 func TestRunRejectsInvalidLogOptions(t *testing.T) {
 	for _, option := range []string{"max-size=0", "max-size=nope", "max-file=0", "labels=one,,two", "env-regex=[", "unknown=value", "missing"} {
 		b := &fakeBackend{}
@@ -1625,10 +1645,10 @@ func TestCreateAndStart(t *testing.T) {
 	containerID := strings.Repeat("b", 64)
 	b := &fakeBackend{containerID: containerID}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--stop-signal", "SIGQUIT", "--stop-timeout", "4", "-h", "create-host", "--net", "host", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"create", "--name", "demo", "-it", "--rm", "--stop-signal", "SIGQUIT", "--stop-timeout", "4", "-h", "create-host", "--net", "host", "--waive-live-fork", "busybox", "sleep", "30"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("create status=%d, stderr=%q", status, stderr.String())
 	}
-	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.hostname != "create-host" || b.runRequest.networkMode != "host" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.stopSignal != "SIGQUIT" || b.runRequest.stopTimeout != 4 || strings.Join(b.runRequest.args, " ") != "sleep 30" {
+	if !b.created || b.runRequest.name != "demo" || b.runRequest.pullPolicy != "missing" || b.runRequest.hostname != "create-host" || b.runRequest.networkMode != "host" || b.runRequest.liveForkEligible || b.runRequest.liveForkWaiver == "" || !b.runRequest.interactive || !b.runRequest.terminal || !b.runRequest.autoRemove || b.runRequest.stopSignal != "SIGQUIT" || b.runRequest.stopTimeout != 4 || strings.Join(b.runRequest.args, " ") != "sleep 30" {
 		t.Errorf("create request=%+v created=%t", b.runRequest, b.created)
 	}
 	if got, want := stdout.String(), containerID+"\n"; got != want {

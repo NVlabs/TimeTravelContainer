@@ -31,6 +31,12 @@ import (
 
 // IoSetup implements linux syscall io_setup(2).
 func IoSetup(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	if t.Kernel().LiveForkEligible {
+		// AIO ring VMAs do not yet have branch-local backing. Reject creation,
+		// rather than allowing a later fork to become workload-dependently
+		// ineligible.
+		return 0, nil, linuxerr.EOPNOTSUPP
+	}
 	nrEvents := args[0].Int()
 	idAddr := args[1].Pointer()
 

@@ -158,6 +158,20 @@ type LiveForkStackConfigCloner interface {
 	CloneLiveForkConfig(dst Stack) error
 }
 
+// LiveForkStackConfigSaver controls serialization of guest-managed network
+// configuration that ordinary gVisor checkpoints reconstruct externally.
+type LiveForkStackConfigSaver interface {
+	SetLiveForkSaveConfig(bool)
+}
+
+// LiveForkStackConfigRestorer identifies a stack whose guest-managed
+// configuration was decoded from a TTC branch snapshot.
+type LiveForkStackConfigRestorer interface {
+	PrepareLiveForkRestore() error
+
+	HasLiveForkRestoredConfig() bool
+}
+
 // LiveForkStackChildResetter removes branch-external transport state from a
 // freshly cloned stack after its endpoints have been restored.
 type LiveForkStackChildResetter interface {

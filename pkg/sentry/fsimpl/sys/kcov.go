@@ -52,6 +52,9 @@ func (i *kcovInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.D
 	if k == nil {
 		panic("KernelFromContext returned nil")
 	}
+	if k.LiveForkEligible {
+		return nil, linuxerr.EOPNOTSUPP
+	}
 	fd := &kcovFD{
 		inode: i,
 		kcov:  k.NewKcov(),

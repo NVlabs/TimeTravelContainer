@@ -47,7 +47,7 @@ func TestValidateLiveForkRejectsQueuedRights(t *testing.T) {
 	a, b := NewPair(ctx, linux.SOCK_SEQPACKET, &liveForkTestIDProvider{})
 	defer a.Close(ctx)
 	defer b.Close(ctx)
-	if err := ValidateLiveFork(a); err != nil {
+	if _, err := ValidateLiveFork(a); err != nil {
 		t.Fatalf("empty internal socketpair rejected: %v", err)
 	}
 	n, notify, err := a.SendMsg(ctx, [][]byte{[]byte("rights")}, ControlMessages{Rights: &liveForkTestRights{}}, nil)
@@ -57,7 +57,7 @@ func TestValidateLiveForkRejectsQueuedRights(t *testing.T) {
 	if notify != nil {
 		notify()
 	}
-	if err := ValidateLiveFork(a); err == nil {
+	if _, err := ValidateLiveFork(a); err == nil {
 		t.Fatal("socketpair with queued SCM_RIGHTS was accepted")
 	}
 }

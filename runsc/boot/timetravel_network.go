@@ -393,11 +393,15 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	}, stack.AddressProperties{}); err != nil {
 		return fmt.Errorf("adding TTC guest address: %v", err)
 	}
-	dst.Stack.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4LoopbackSubnet, NIC: 1},
-		{Destination: header.IPv6Loopback.WithPrefix().Subnet(), NIC: 1},
-		{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID},
-	})
+	routes := dst.Stack.GetRouteTable()
+	if reset {
+		routes = []tcpip.Route{
+			{Destination: header.IPv4LoopbackSubnet, NIC: 1},
+			{Destination: header.IPv6Loopback.WithPrefix().Subnet(), NIC: 1},
+		}
+	}
+	routes = append(routes, tcpip.Route{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID})
+	dst.Stack.SetRouteTable(routes)
 
 	gateway := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
@@ -438,12 +442,17 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	hooks := &sentrynetstack.LiveForkNetworkHooks{
 		Validate: validateTimeTravelNetwork,
 		Clone: func(child *sentrynetstack.Stack) error {
-			tables, ok := dst.Stack.IPTables().CloneUnmodifiedForLiveFork(child.Stack.Clock())
-			if !ok {
-				return fmt.Errorf("modified iptables/conntrack state is not yet supported")
+			// The child already contains the serialized Sentry-owned network
+			// graph. Replace only TTC's runtime link, whose proxy peer is
+			// deliberately not serialized. RemoveNIC also drops routes through
+			// the obsolete endpoint while preserving guest-created interfaces,
+			// veth pairs, routes, iptables, and nftables state.
+			if _, ok := child.Interfaces()[int32(timeTravelNICID)]; ok {
+				if err := child.Stack.RemoveNIC(timeTravelNICID); err != nil {
+					return fmt.Errorf("removing inherited TTC interface: %v", err)
+				}
 			}
-			child.Stack.SetIPTables(tables)
-			return configureTimeTravelNetwork(child, cfg, true)
+			return configureTimeTravelNetwork(child, cfg, false)
 		},
 		ResetChild: func(child *sentrynetstack.Stack) error {
 			return resetTimeTravelChildConnections(child, guestAddress)
@@ -456,31 +465,9 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 }
 
 func validateTimeTravelNetwork(s *sentrynetstack.Stack) error {
-	if tables := s.Stack.IPTables(); tables == nil {
-		return fmt.Errorf("network stack has no iptables configuration")
-	} else if tables.Modified() {
-		return fmt.Errorf("modified iptables/conntrack state is not yet supported")
-	}
-	if s.Stack.NFTables() != nil {
-		return fmt.Errorf("nftables configuration is not yet supported")
-	}
-	interfaces := s.Interfaces()
-	if len(interfaces) != 2 {
-		return fmt.Errorf("TTC network has %d interfaces, want loopback and %s", len(interfaces), timeTravelNICName)
-	}
-	if lo, ok := interfaces[1]; !ok || lo.Name != "lo" {
-		return fmt.Errorf("TTC network canonical loopback is missing")
-	}
-	if nic, ok := interfaces[int32(timeTravelNICID)]; !ok || nic.Name != timeTravelNICName {
-		return fmt.Errorf("TTC virtual NIC %s is missing", timeTravelNICName)
-	}
-	for _, route := range s.RouteTable() {
-		if route.OutputInterface != 0 {
-			if _, ok := interfaces[route.OutputInterface]; !ok {
-				return fmt.Errorf("route uses unknown interface %d", route.OutputInterface)
-			}
-		}
-	}
+	// All guest-visible configuration is Sentry-owned and serialized. The
+	// runtime hook itself proves that the only external edge, TTC's proxy peer,
+	// is omitted and can be recreated branch-locally.
 	return nil
 }
 

@@ -692,14 +692,34 @@ func (it *IPTables) check(table Table, hook Hook, pkt *PacketBuffer, r *Route, a
 // beforeSave is invoked by stateify.
 func (it *IPTables) beforeSave() {
 	// Ensure the reaper exits cleanly.
-	it.reaper.Stop()
+	// Unmodified default tables never start one.
+	if it.reaper != nil {
+		it.reaper.Stop()
+	}
 	// Prevent others from modifying the connection table.
 	it.connections.mu.Lock()
+	it.liveForkSaveFrozen = true
+}
+
+// resumeAfterLiveForkSave thaws the source IPTables after TTC encoded it.
+// Stateify's afterLoad hook applies only to the decoded child, while TTC keeps
+// the source alive and therefore has to undo beforeSave explicitly.
+func (it *IPTables) resumeAfterLiveForkSave() {
+	if !it.liveForkSaveFrozen {
+		return
+	}
+	it.liveForkSaveFrozen = false
+	it.connections.mu.Unlock()
+	if it.modified {
+		it.startReaper(reaperDelay)
+	}
 }
 
 // afterLoad is invoked by stateify.
 func (it *IPTables) afterLoad(context.Context) {
-	it.startReaper(reaperDelay)
+	if it.modified {
+		it.startReaper(reaperDelay)
+	}
 }
 
 // startReaper periodically reaps timed out connections.

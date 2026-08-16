@@ -89,18 +89,21 @@ var defaultCapabilities = []string{
 
 // SpecOptions contains user-facing overrides for an image's OCI configuration.
 type SpecOptions struct {
-	Name             string
-	RootFS           string
-	Args             []string
-	Env              []string
-	Labels           map[string]string
-	Cwd              string
-	User             string
-	Hostname         string
-	Terminal         bool
-	TerminalType     string
-	ConsoleSize      *specs.Box
-	NetworkMode      string
+	Name         string
+	RootFS       string
+	Args         []string
+	Env          []string
+	Labels       map[string]string
+	Cwd          string
+	User         string
+	Hostname     string
+	Terminal     bool
+	TerminalType string
+	ConsoleSize  *specs.Box
+	NetworkMode  string
+	// WaiveLiveFork explicitly opts the family out of TTC live-fork eligibility.
+	// The zero value preserves TTC's default eligibility guarantee.
+	WaiveLiveFork    bool
 	ReadonlyRootfs   bool
 	StopSignal       string
 	PidsLimit        *int64
@@ -641,6 +644,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		"dev.gvisor.spec.rootfs.overlay":            "memory",
 		"dev.timetravelcontainer.internal-console":  "init",
 		"dev.timetravelcontainer.config.network":    networkMode,
+		specutils.AnnotationTTCLiveForkEligible:     strconv.FormatBool(!opts.WaiveLiveFork),
 		specutils.ContainerdContainerNameAnnotation: opts.Name,
 	}
 	var resources *specs.LinuxResources

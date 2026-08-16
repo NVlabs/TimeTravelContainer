@@ -56,6 +56,27 @@ type Fd struct {
 	context fsContext
 }
 
+var _ vfs.LiveForkFileDescription = (*Fd)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription. Filesystem objects
+// reachable from an awaiting context are classified by the VFS filesystem
+// walk; descriptor-valued parameters must also participate in the FD graph.
+func (fd *Fd) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	fd.contextMu.Lock()
+	defer fd.contextMu.Unlock()
+	creating, ok := fd.context.(*createParamsContext)
+	if !ok {
+		return nil, nil
+	}
+	var referenced []*vfs.FileDescription
+	for _, param := range creating.params {
+		if value, ok := param.Value.(FSValueFd); ok && value.FileDescription != nil {
+			referenced = append(referenced, value.FileDescription)
+		}
+	}
+	return referenced, nil
+}
+
 // FSValue represents the value assigned to a parameter passed to the filesystem. There are 5
 // valid types: bool, string, []byte, FileDescription, and string (path).
 type FSValue interface {

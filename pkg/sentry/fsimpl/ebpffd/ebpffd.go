@@ -37,6 +37,14 @@ type ProgramFD struct {
 	program *ebpf.Program
 }
 
+var _ vfs.LiveForkFileDescription = (*ProgramFD)(nil)
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription. Programs are
+// immutable Sentry objects and contain no host resource.
+func (*ProgramFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	return nil, nil
+}
+
 // New returns a new eBPF program file descriptor.
 func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fileFlags uint32, program *ebpf.Program) (*vfs.FileDescription, error) {
 	creds := auth.CredentialsFromContext(ctx)

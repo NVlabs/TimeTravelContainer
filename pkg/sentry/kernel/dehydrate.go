@@ -383,12 +383,11 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		metadataFile:        opts.MetadataFile,
 	}
 	err := k.quiescePausedAnd(ctx, func() error {
-		if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
-			stack := rootNS.Stack()
-			stack.SetRemoveConf(false)
-			stack.Pause()
-			defer stack.Resume()
+		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, false)
+		if err != nil {
+			return err
 		}
+		defer resumeNetwork()
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for dehydration: %w", err)
 		}
@@ -533,17 +532,17 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, errors.New("dehydrated network stack requires a configurator")
+			return errors.New("dehydrated network stack requires a configurator")
 		}
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring rehydrated network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring rehydrated network: %w", err)
 		}
-		rootNS.Stack().Restore()
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -645,17 +644,17 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, errors.New("durable dehydration network configurator was not provided")
+			return errors.New("durable dehydration network configurator was not provided")
 		}
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring rehydrated network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring rehydrated network: %w", err)
 		}
-		rootNS.Stack().Restore()
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -808,17 +807,17 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if rootNS := child.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
-			child.Release()
-			return nil, errors.New("sparse dehydrated network configurator was not provided")
+			return errors.New("sparse dehydrated network configurator was not provided")
 		}
-		rootNS.Stack().ResetConfig()
-		if err := opts.ConfigureNetwork(child, rootNS.Stack()); err != nil {
-			child.Release()
-			return nil, fmt.Errorf("configuring sparse rehydrated network: %w", err)
+		if err := opts.ConfigureNetwork(child, stack); err != nil {
+			return fmt.Errorf("configuring sparse rehydrated network: %w", err)
 		}
-		rootNS.Stack().Restore()
+		return nil
+	}); err != nil {
+		child.Release()
+		return nil, err
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()

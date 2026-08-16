@@ -45,6 +45,9 @@ func FSOpen(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 	if err != nil {
 		return 0, nil, err
 	}
+	if t.Kernel().LiveForkEligible && fsname == "fuse" {
+		return 0, nil, linuxerr.EOPNOTSUPP
+	}
 
 	vfsObj := t.Kernel().VFS()
 	fileFlags := uint32(linux.O_RDWR)
@@ -225,6 +228,9 @@ func FSMount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 
 	// Parse mount options specified in attrFlags
 	parseAttrFlagsIntoMountOpts(attrFlags, opts)
+	if t.Kernel().LiveForkEligible && fs.FilesystemType().Name() == "sysfs" && !opts.ReadOnly {
+		return 0, nil, linuxerr.EOPNOTSUPP
+	}
 
 	// Create the mount, which we will place at the root of a new anonymous mount namespace
 	mountNs := t.Kernel().VFS().NewMountNamespaceFrom(t, creds, fs, root, opts, t.Kernel(), true /* anon */)
