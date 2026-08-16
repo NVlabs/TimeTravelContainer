@@ -1163,7 +1163,6 @@ func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchI
 
 func wireOptions(opts options) daemonWireOptions {
 	return daemonWireOptions{
-		Root: opts.root, Runsc: opts.runsc, DataRoot: opts.dataRoot,
 		ClientExecutable: opts.clientExecutable,
 	}
 }
@@ -1175,18 +1174,16 @@ func optionsFromWire(w daemonWireOptions) options {
 	}
 }
 
-// optionsFromRequest applies daemon-owned defaults to fields omitted by direct
-// API clients. The CLI still sends these fields for compatibility, but SDKs
-// should not need to know how ttcd was installed or where it keeps runtime
-// state.
+// optionsFromRequest applies daemon-owned configuration. Runtime state, the
+// runtime executable, platform, isolation, and persistent data all belong to
+// the daemon selected by the socket; accepting client overrides would let two
+// independently configured daemons accidentally operate on the same runtime.
+// The legacy wire fields remain decodable for API compatibility but are
+// intentionally ignored.
 func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 	opts := optionsFromWire(w)
-	if opts.root == "" {
-		opts.root = s.root
-	}
-	if opts.runsc == "" {
-		opts.runsc = s.runsc
-	}
+	opts.root = s.root
+	opts.runsc = s.runsc
 	if opts.clientExecutable == "" {
 		opts.clientExecutable = s.clientExecutable
 	}
@@ -1649,7 +1646,15 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 		return nil, errors.New("cluster page listen address is empty")
 	}
 	if len(opts.Peers) != 0 && opts.PageAdvertise == "" {
-		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:PORT (PORT may be 0)")
+		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:0")
+	}
+	if err := requireEphemeralClusterPagePort("--cluster-page-listen", opts.PageListen); err != nil {
+		return nil, err
+	}
+	if opts.PageAdvertise != "" {
+		if err := requireEphemeralClusterPagePort("--cluster-page-advertise", opts.PageAdvertise); err != nil {
+			return nil, err
+		}
 	}
 	opts.PagingPolicy.PageSize = hostarch.PageSize
 	if err := opts.PagingPolicy.Validate(); err != nil {
@@ -1711,6 +1716,17 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 			pageListen: opts.PageListen, pageAdvertise: opts.PageAdvertise,
 		},
 	}, nil
+}
+
+func requireEphemeralClusterPagePort(option, address string) error {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid %s address %q: %w", option, address, err)
+	}
+	if port != "0" {
+		return fmt.Errorf("%s must use port 0; each concurrent remote fork requires an independent page listener", option)
+	}
+	return nil
 }
 
 func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err error) {

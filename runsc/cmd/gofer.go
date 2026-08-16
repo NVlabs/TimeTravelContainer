@@ -192,7 +192,11 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	willReexec := g.applyCaps && (config.CgoEnabled || g.syncFDs.usernsFD >= 0)
 
 	specFile := os.NewFile(uintptr(g.specFD), "spec file")
-	defer specFile.Close()
+	defer func() {
+		if specFile != nil {
+			_ = specFile.Close()
+		}
+	}()
 	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile, conf)
 	if err != nil {
 		util.Fatalf("reading spec: %v", err)
@@ -280,6 +284,17 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	// re-executed gofer may reuse goferToHostRPCFD's file descriptor for an
 	// unrelated file.
 	goferToHostRPC.Close()
+
+	// The spec descriptor is needed across the optional capability-changing
+	// re-exec above, but the decoded spec is authoritative after that point.
+	// Do not retain the descriptor for the lifetime of the gofer: TTC may
+	// atomically update the on-disk bundle spec while promoting persistent
+	// repositories for a remote fork, and NFS preserves an unlinked open file
+	// as a .nfs placeholder.
+	if err := specFile.Close(); err != nil {
+		util.Fatalf("closing spec file: %v", err)
+	}
+	specFile = nil
 
 	// Start profiling. This will be a noop if no profiling arguments were passed.
 	profileOpts := profile.MakeOpts(&g.profileFDs, conf.ProfileGCInterval)

@@ -77,7 +77,7 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 }
 
-func TestDaemonRequestOptionsPreserveClientRuntimeOverrides(t *testing.T) {
+func TestDaemonRequestOptionsIgnoreClientRuntimeOverrides(t *testing.T) {
 	server := &daemonServer{
 		root:             "/default/root",
 		runsc:            "/default/ttcd",
@@ -90,10 +90,10 @@ func TestDaemonRequestOptionsPreserveClientRuntimeOverrides(t *testing.T) {
 		DataRoot:         "/ignored/client/data",
 		ClientExecutable: "/custom/ttc",
 	})
-	if got, want := opts.root, "/custom/root"; got != want {
+	if got, want := opts.root, server.root; got != want {
 		t.Errorf("root=%q, want %q", got, want)
 	}
-	if got, want := opts.runsc, "/custom/ttcd"; got != want {
+	if got, want := opts.runsc, server.runsc; got != want {
 		t.Errorf("runsc=%q, want %q", got, want)
 	}
 	if got, want := opts.dataRoot, server.dataRoot; got != want {
@@ -740,6 +740,17 @@ func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
+	}
+}
+
+func TestClusterPageAddressesRequireEphemeralPorts(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:0", "[::1]:0", "node-a.example:0"} {
+		if err := requireEphemeralClusterPagePort("--cluster-page-listen", address); err != nil {
+			t.Errorf("ephemeral address %q rejected: %v", address, err)
+		}
+	}
+	if err := requireEphemeralClusterPagePort("--cluster-page-listen", "127.0.0.1:7444"); err == nil || !strings.Contains(err.Error(), "port 0") {
+		t.Fatalf("fixed cluster page port error=%v, want port 0 guidance", err)
 	}
 }
 

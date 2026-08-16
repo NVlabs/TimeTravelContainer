@@ -2881,6 +2881,32 @@ func TestReadConsoleWaitStatus(t *testing.T) {
 	}
 }
 
+func TestStopContainerConsoleDrainsRemovesInactiveFollower(t *testing.T) {
+	dataRoot := t.TempDir()
+	base := filepath.Join(dataRoot, "containers", "demo", "console", "exec", "main", "exec-test")
+	if err := os.MkdirAll(filepath.Dir(base), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		base + ".lock":        "",
+		base + ".pid":         "2147483647\n",
+		base + ".wait-status": "0\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := runtimeBackend{dataRoot: dataRoot}
+	if err := b.stopContainerConsoleDrains("demo"); err != nil {
+		t.Fatalf("stopContainerConsoleDrains: %v", err)
+	}
+	for _, path := range []string{base + ".pid", base + ".wait-status"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%q still exists or could not be inspected: %v", path, err)
+		}
+	}
+}
+
 func TestVerifyCgroupV2Resources(t *testing.T) {
 	const pid = 4242
 	root := t.TempDir()
@@ -3438,14 +3464,15 @@ if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
    [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
    [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
    [ "$7" = "--exec-id" ] && [ "$8" = "exec-test" ] &&
-   [ "$9" = "--env" ] && [ "${10}" = "A=1" ] &&
-   [ "${11}" = "--cwd" ] && [ "${12}" = "/work" ] &&
-   [ "${13}" = "--user" ] && [ "${14}" = "123:456" ] &&
-   [ "${15}" = "--additional-gids" ] && [ "${16}" = "12" ] &&
-   [ "${17}" = "--additional-gids" ] && [ "${18}" = "34" ] &&
-   [ "${19}" = "--cap" ] && [ "${20}" = "CAP_CHOWN" ] &&
-   [ "${21}" = "--cap" ] && [ "${22}" = "CAP_SYS_PTRACE" ] &&
-   [ "${23}" = "web" ] && [ "${24}" = "echo" ] && [ "${25}" = "ok" ]; then
+   [ "$9" = "--internal-console" ] && [ "${10}" = "ttc-exec-test" ] &&
+   [ "${11}" = "--env" ] && [ "${12}" = "A=1" ] &&
+   [ "${13}" = "--cwd" ] && [ "${14}" = "/work" ] &&
+   [ "${15}" = "--user" ] && [ "${16}" = "123:456" ] &&
+   [ "${17}" = "--additional-gids" ] && [ "${18}" = "12" ] &&
+   [ "${19}" = "--additional-gids" ] && [ "${20}" = "34" ] &&
+   [ "${21}" = "--cap" ] && [ "${22}" = "CAP_CHOWN" ] &&
+   [ "${23}" = "--cap" ] && [ "${24}" = "CAP_SYS_PTRACE" ] &&
+   [ "${25}" = "web" ] && [ "${26}" = "echo" ] && [ "${27}" = "ok" ]; then
 	echo branch-output
 	exit 0
 fi
@@ -3483,8 +3510,9 @@ if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
    [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
    [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
    [ "$7" = "--exec-id" ] && [ "$8" = "exec-test" ] &&
-   [ "$9" = "--process" ] && [ "${10}" = "/process.json" ] &&
-   [ "${11}" = "web" ] && [ -z "${12}" ]; then
+   [ "$9" = "--internal-console" ] && [ "${10}" = "ttc-exec-test" ] &&
+   [ "${11}" = "--process" ] && [ "${12}" = "/process.json" ] &&
+   [ "${13}" = "web" ] && [ -z "${14}" ]; then
 	exit 0
 fi
 echo "unexpected command: $*" >&2

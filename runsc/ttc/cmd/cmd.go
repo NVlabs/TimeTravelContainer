@@ -4796,14 +4796,22 @@ func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	if err != nil || pid <= 0 {
 		return fmt.Errorf("invalid console follower PID %q", strings.TrimSpace(string(pidData)))
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
 	lockFile, err := os.OpenFile(paths.Lock, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = os.Remove(paths.PID)
+		_ = os.Remove(paths.WaitStatus)
+		return nil
+	} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		return err
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
 	if err := waitForPortLock(lockFile, 5*time.Second); err != nil {
 		return fmt.Errorf("waiting for console follower %d: %w", pid, err)
 	}
@@ -4811,6 +4819,32 @@ func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	_ = os.Remove(paths.PID)
 	_ = os.Remove(paths.WaitStatus)
 	return nil
+}
+
+func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
+	consoleDir := filepath.Join(b.dataRoot, "containers", containerID, "console")
+	var result error
+	err := filepath.WalkDir(consoleDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pid") {
+			return nil
+		}
+		base := strings.TrimSuffix(path, ".pid")
+		if stopErr := b.stopConsoleDrain(ttcbundle.ConsolePaths{
+			Lock:       base + ".lock",
+			WaitStatus: base + ".wait-status",
+			PID:        path,
+		}); stopErr != nil {
+			result = errors.Join(result, fmt.Errorf("stopping console follower %q: %w", path, stopErr))
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return result
+	}
+	return errors.Join(result, err)
 }
 
 type runtimeBackend struct {
@@ -5759,9 +5793,12 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		}
 	}
 	args = append(args, "--exec-id", execID)
+	consoleID = "ttc-" + execID
+	args = append(args, "--internal-console", consoleID)
 	if request.detach {
-		consoleID = "ttc-" + execID
-		args = append(args, "--detach", "--internal-console", consoleID)
+		args = append(args, "--detach")
+	} else if request.interactive {
+		args = append(args, "--internal-console-stdin")
 	}
 
 	for _, value := range request.env {
@@ -5783,16 +5820,9 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		args = append(args, "--process", request.processPath)
 	}
 	if request.terminal {
-		if !request.detach {
-			consoleID = fmt.Sprintf("ttc-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
-			args = append(args, "--internal-console", consoleID)
-		}
 		args = append(args, "--internal-console-terminal")
 		if hasConsoleSize {
 			args = append(args, "--internal-console-rows", strconv.Itoa(rows), "--internal-console-cols", strconv.Itoa(cols))
-		}
-		if request.interactive && !request.detach {
-			args = append(args, "--internal-console-stdin")
 		}
 	}
 	args = append(args, request.target.container)
@@ -7342,6 +7372,9 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			}
 		}
 	}
+	if err := b.stopContainerConsoleDrains(info.ID); err != nil {
+		return fmt.Errorf("stopping console followers for %q: %w", name, err)
+	}
 	runtimeID := info.ID
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
@@ -8112,6 +8145,12 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 					}
 				}
 			}
+			// Once the Sentry is known to be gone, no console follower or gofer
+			// may retain files from the persistent container directory. Reap the
+			// sidecars before recording process-free state so later removal is
+			// also safe on NFS, where unlinking an open file creates .nfs files.
+			_ = b.stopContainerConsoleDrains(container.ID)
+			_, _ = b.command("delete", "--force", container.ID)
 			if err := store.ReconcileRuntimeUnavailable(container.ID, exitStatus); err != nil {
 				continue
 			}

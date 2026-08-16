@@ -357,7 +357,9 @@ ttc daemon start \
 Start node B with the node names and peer address reversed. `TTC_DATA_ROOT`
 should name the shared repository path on both hosts; `TTC_RUNTIME_DIR` should
 remain a fast, node-local path. `ttc daemon status` reports the active cluster
-identity and negotiated capabilities.
+identity and negotiated capabilities. Both page-transfer addresses must use
+port `0`: TTC assigns an independent ephemeral listener to every concurrent
+remote fork.
 
 From node A, create one child on node B:
 
