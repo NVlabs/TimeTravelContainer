@@ -44,6 +44,10 @@ removal. Tool names use the `ttc_` prefix, for example `ttc_fork_many` and
 `ttc_checkpoint`. `ttc_command` provides the rest of TTC's non-interactive
 command surface.
 
+`ttc_run` creates a live-fork-eligible family by default. Set
+`waiveLiveFork: true` only when also requesting a deliberately incompatible
+feature such as host networking; the resulting family can never be forked.
+
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
 take longer.

@@ -96,6 +96,12 @@ export function createServer(client = new Client()): McpServer {
         name: z.string().optional(),
         command: z.array(z.string()).default([]),
         detach: z.boolean().default(true),
+        waiveLiveFork: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Explicitly create a permanently non-forkable family; required by incompatible options such as host networking",
+          ),
         options: z
           .array(z.string())
           .default([])
@@ -103,10 +109,11 @@ export function createServer(client = new Client()): McpServer {
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    async ({ image, name, command, detach, options }) => {
+    async ({ image, name, command, detach, waiveLiveFork, options }) => {
       const runOptions = [...options];
       if (detach) runOptions.push("-d");
       if (name) runOptions.push("--name", name);
+      if (waiveLiveFork) runOptions.push("--waive-live-fork");
       return commandResponse(await client.run(image, command, runOptions));
     },
   );

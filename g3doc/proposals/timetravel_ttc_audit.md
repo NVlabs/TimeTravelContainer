@@ -18,11 +18,12 @@ an engineering record rather than a claim of current certification.
 
 ## Executive assessment
 
-TTC is suitable for controlled integration-test workloads whose resource graph can complete
-`ttc fork` validation. It runs several nontrivial unmodified images and its
-application-memory fork cost is effectively independent of resident byte count
-in the measured range. It does not copy application RAM to disk or duplicate
-all resident pages at fork time.
+TTC is suitable for controlled integration-test workloads. Eligible families
+reject unsupported resource creation up front, so normal workload activity
+does not make a later `ttc fork` unpredictably fail. TTC runs several nontrivial
+unmodified images, and its application-memory fork cost is effectively
+independent of resident byte count in the measured range. It does not copy
+application RAM to disk or duplicate all resident pages at fork time.
 
 TTC is not a drop-in Docker daemon or a universally compatible Linux container
 runtime. The biggest performance cost is full kernel-metadata serialization
@@ -395,10 +396,15 @@ in both branches. Applications that require independent streams remain
 responsible for reseeding, as with ordinary process fork. TTC does not promise
 replay of external nondeterministic inputs.
 
-### C1: fork compatibility is deliberately narrower than run compatibility
+### C1: live-fork eligibility is immutable
 
-TTC can run many resources that it refuses to fork. `ttc fork` is the authoritative runtime decision: it pauses the source,
-validates before mutation, and resumes it on rejection.
+The current TTC policy does not let a workload drift from forkable to
+unforkable. A family is live-fork eligible by default; unsupported creation
+paths fail at the syscall or container-creation boundary. A user may explicitly
+choose an incompatible external facility with `--waive-live-fork`, in which
+case the family is permanently and systematically non-forkable. The frozen
+resource walk remains as an invariant check against implementation bugs, not as
+a workload-dependent policy decision.
 
 Currently demonstrated as branch-local or safely cloned:
 
@@ -408,24 +414,28 @@ Currently demonstrated as branch-local or safely cloned:
 * SysV shared memory;
 * anonymous pipes, eventfd, epoll graphs, timerfd, signalfd, inotify, pidfds,
   and Sentry-owned netlink sockets;
-* entirely internal Unix socket graphs without queued `SCM_RIGHTS`; and
-* an empty or canonical loopback-only netstack, including internal UDP/TCP
-  queues and connections; and
-* the TTC virtual NIC and an unmodified network configuration. Internal flows
-  clone, while external child TCP flows reset and the source stays connected.
+* entirely internal Unix socket graphs, including queued `SCM_RIGHTS` whose
+  referenced descriptors are themselves forkable;
+* Sentry-managed network namespaces, veth pairs, NICs, routes, iptables and
+  conntrack state, including internal UDP/TCP queues and connections; and
+* the TTC virtual NIC. Internal flows clone, while external child TCP flows
+  reset and the source stays connected.
 
-Rejected or externally shared:
+Creation-time rejected in eligible families, or available only after an
+explicit family waiver:
 
-* host-network mode, hostinet/plugin stacks, secondary network namespaces,
-  modified iptables/conntrack, and nftables. TTC user-mode NAT and published
-  TCP flows are handled by reset-on-child policy instead of rejection;
-* imported host FDs, external pipes, host eventfd, host-bound Unix sockets,
-  host-backed peers, and queued `SCM_RIGHTS`;
+* host-network mode and other hostinet/plugin stacks require
+  `--waive-live-fork`. TTC user-mode NAT and published TCP flows instead use
+  reset-on-child policy;
+* imported host FDs, external pipes, host eventfd, host-bound Unix sockets, and
+  host-backed peers are not exposed by normal eligible TTC creation/exec paths;
 * directfs and writable gofer filesystems;
-* AIO ring, io_uring ring, PACKET_MMAP, and KCOV mappings;
+* AIO rings, io_uring rings, PACKET_MMAP, KCOV, FUSE, writable sysfs, and
+  nftables mutation fail when requested by an eligible guest;
 * host/FUSE/device mappings retained after their FD closes;
 * TPU/GPU/device proxy state and private filesystem MemoryFiles; and
-* any anonymous object or filesystem that has not explicitly opted in.
+* any internal anonymous object or filesystem not implementing the live-fork
+  contract is treated as an invariant violation.
 
 "Host FD" in this list means a file description whose behavior is owned by the
 host kernel and has been imported into the guest graph: for example host stdio,
@@ -446,11 +456,9 @@ description, offset, locks, and external mutations rather than creating a
 branch-local clone, so TTC disables directfs in its normal runsc arguments.
 
 Queued `SCM_RIGHTS` means an internal Unix socket has an unread ancillary
-message carrying one or more FDs. Ordinary queued bytes clone correctly, but
-the rights message adds graph edges to arbitrary file descriptions. Supporting
-it requires cloning those edges with correct aliasing, cycles, reference counts,
-and fork validators; this is feasible for fully Sentry-owned targets but is
-not implemented yet.
+message carrying one or more FDs. TTC follows those graph edges and retains
+their aliasing; the enqueue is accepted when every referenced description is
+itself Sentry-owned and forkable.
 
 AIO and io_uring expose memory-mapped submission/completion rings and may retain
 pending operations, registered buffers, files, and worker state. Their mapped
@@ -527,11 +535,12 @@ guest address and derives the gateway at `.2` in the selected `/24`;
 `--mac-address` may replace the default guest MAC. Both identities persist
 through restart and live fork.
 
-Live fork accepts canonical loopback and an unmodified TTC virtual-NIC stack.
-The child gets a new link and proxy realm. Internal TCP/UDP endpoints and queues
-clone; established or connecting child TCP endpoints that terminate in NAT or
-a published-port proxy are reset. The parent retains its proxy realm, existing
-connections, and published listener. A child is not published automatically;
+Live fork accepts the complete Sentry-owned network graph: guest namespaces,
+veth pairs, routes, iptables/conntrack, interfaces, and internal endpoints. The
+child gets a new TTC external link and proxy realm. Internal TCP/UDP endpoints
+and queues clone; established or connecting child TCP endpoints that terminate
+in NAT or a published-port proxy are reset. The parent retains its proxy realm,
+existing connections, and published listener. A child is not published automatically;
 `ttc port publish CONTAINER@BRANCH ...` can assign an independent persistent
 listener to any live child after the fork.
 
@@ -549,9 +558,10 @@ This gives useful fail-soft semantics without pretending that one host TCP flow
 can be duplicated. It does not replay bytes arriving from outside during the
 pause window or preserve a child's external TCP session. Explicit branch port
 bindings provide stable public endpoints and are reconciled after daemon
-restart. NAT is presently IPv4 TCP/UDP; publication is IPv4 TCP only. Modified
-iptables/conntrack, nftables, host mode, secondary
-network namespaces, external sandbox links, and plugin stacks still reject.
+restart. NAT is presently IPv4 TCP/UDP; publication is IPv4 TCP only. Eligible
+guests cannot mutate nftables until that interpreter is serializable. Host
+mode, external sandbox links, and plugin stacks require an explicit family-wide
+live-fork waiver instead of becoming a dynamic fork rejection.
 
 ### C2: one image reference stores one selected platform
 

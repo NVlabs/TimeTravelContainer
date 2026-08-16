@@ -276,10 +276,18 @@ processes in one branch.
 
 ## Live fork, pause, and resume
 
-Fork atomically pauses the source and validates its frozen resource graph. If
-validation fails, TTC removes the tentative child, resumes a previously running
-source, writes the reason to stderr, and exits nonzero. Create a running child
-branch directly:
+Live-fork eligibility is immutable for a container family. A normal `ttc run`
+or `ttc create` produces an eligible family, and TTC rejects unsupported
+resource creation rather than letting later workload activity revoke that
+promise. Features intentionally outside TTC's branchable graph must be chosen
+with `--waive-live-fork`; fork then rejects that family systematically. A fork
+can still fail for an invalid source/destination, resource exhaustion, damaged
+state, or an internal/runtime error.
+
+Fork atomically pauses the source and checks internal invariants before
+mutation. If an operational check fails, TTC removes the tentative child,
+resumes a previously running source, writes the reason to stderr, and exits
+nonzero. Create a running child branch directly:
 
 ```shell
 ttc fork web@main test-a
@@ -442,9 +450,9 @@ Checkpoint accepts either a running or paused branch. TTC briefly creates a
 private, paused in-memory fork, resumes the source, and serializes the private
 snapshot. The potentially slow file write therefore does not keep a running
 source paused. The private branch is removed after the archive is complete and
-does not appear in the family tree. Consequently, the selected branch must be
-eligible for live fork; if validation fails, TTC leaves the source unchanged
-and returns the same resource diagnostic used by `ttc fork`.
+does not appear in the family tree. Consequently, the selected family must be
+live-fork eligible. If the private fork fails operationally, TTC leaves the
+source unchanged and returns the same diagnostic used by `ttc fork`.
 
 The checkpoint contains the selected branch's process tree, threads, memory,
 supported kernel and internal-network state, writable root filesystem, managed
@@ -507,12 +515,10 @@ Attach to the branch's init console:
 ttc attach -i web@test-b
 ```
 
-The default detach sequence is Ctrl-P followed by Ctrl-Q. Init-console and
-managed-console attachments use TTC's internal pipes or PTYs and do not place
-host FDs in the guest resource graph, so merely attaching does not make the
-branch ineligible. A synchronous exec created with directly imported host stdio
-is different: that exec must exit before the branch can fork. Output continues
-into persistent logs:
+The default detach sequence is Ctrl-P followed by Ctrl-Q. Init-console,
+managed-console, and CLI exec sessions use TTC-managed pipes or PTYs and do not
+change the family's immutable live-fork eligibility. Output continues into
+persistent logs:
 
 ```shell
 ttc logs --follow --tail 100 web@test-b
@@ -683,7 +689,8 @@ TTC exposes three network modes:
 ```shell
 --network none       # loopback-only netstack; forkable and the default
 --network ttc       # loopback plus rootless in-process virtual NIC; forkable
---network host       # hostinet; host-facing and not live-forkable
+--network=host --waive-live-fork
+                     # hostinet; explicitly and permanently non-forkable
 ```
 
 `none` creates a userspace netstack with only canonical loopback. Processes in
@@ -775,11 +782,13 @@ outbound. A child is not published automatically, but `ttc port publish` can
 assign it an independent host endpoint after the fork. UDP NAT mappings are
 runtime-only and are re-created on later child datagrams.
 
-Modified iptables/conntrack state, nftables, secondary network namespaces,
-hostinet, and plugin stacks still cause `ttc fork` to fail during its atomic
-validation. `host` mode remains
-useful for conventional execution but is not live-forkable because its socket
-state belongs to the host kernel.
+Guest-created network namespaces, veth pairs, routes, iptables rules, conntrack
+state, and internal sockets are part of the Sentry-owned graph and are cloned.
+Eligible families currently reject nftables mutation because that state is not
+yet serializable. Hostinet and other external/plugin stacks are not
+live-forkable because their socket and link state belongs outside the Sentry;
+TTC exposes host mode only when creation explicitly includes
+`--waive-live-fork`.
 
 Upstream runsc's `sandbox` mode imports a network namespace prepared by Docker,
 CNI, or another manager. That manager owns the veth/bridge topology, address

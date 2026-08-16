@@ -56,6 +56,11 @@ ttc.fork_many(
 for an intentional idempotent retry. `CommandResult` preserves raw stdout,
 stderr, and exit status.
 
+Families created by `run` are live-fork eligible by default. Pass
+`--waive-live-fork` together with any deliberately incompatible external
+feature (for example host networking); the resulting family is permanently
+non-forkable.
+
 `checkpoint()` and `restore()` make file paths absolute before sending them to
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.

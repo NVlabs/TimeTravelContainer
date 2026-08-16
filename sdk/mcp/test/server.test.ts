@@ -136,6 +136,25 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       "12",
       "demo@main",
     ]);
+
+    await client.callTool({
+      name: "ttc_run",
+      arguments: {
+        image: "alpine:3.20",
+        name: "hosted",
+        options: ["--network=host"],
+        waiveLiveFork: true,
+      },
+    });
+    assert.deepEqual(mock.requests[5].args, [
+      "run",
+      "--network=host",
+      "-d",
+      "--name",
+      "hosted",
+      "--waive-live-fork",
+      "alpine:3.20",
+    ]);
   } finally {
     await client.close();
     await new Promise<void>((resolveClose) => mock.server.close(() => resolveClose()));

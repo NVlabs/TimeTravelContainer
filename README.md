@@ -45,6 +45,15 @@ TTC is designed for efficiency. Memory and writable storage are
   without first transferring all of its memory. Missing memory is fetched on
   demand over the network or from shared storage.
 
+Live-fork eligibility is a lifetime property of a container family. Families
+are eligible by default, and TTC rejects incompatible features when they are
+requested rather than allowing a running workload to become unexpectedly
+unforkable. A feature whose state is deliberately outside the Sentry, such as
+host networking, can be selected only together with `--waive-live-fork`; every
+fork of that family then fails predictably. Guest-created, Sentry-managed
+resources—including network namespaces, virtual interfaces, routes, iptables,
+and internal sockets—remain forkable.
+
 ## Get Started
 
 TTC is delivered as two static Linux binaries with no runtime dependencies.

@@ -62,6 +62,12 @@ ttc.fork_many(
 ).check()
 ```
 
+Families created by `run` are live-fork eligible by default. If an application
+deliberately needs an incompatible external feature, pass both that option and
+`--waive-live-fork` (for example
+`options=["--network=host", "--waive-live-fork"]`); that family is permanently
+non-forkable.
+
 `Client.command([...])` exposes every other non-interactive TTC command:
 
 ```python

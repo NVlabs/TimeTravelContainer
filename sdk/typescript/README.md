@@ -45,6 +45,10 @@ removal. A coordinated remote fan-out uses one source pause:
 )).check();
 ```
 
+Families created by `run` are live-fork eligible by default. Use an option set
+such as `["--network=host", "--waive-live-fork"]` only when deliberately
+creating a permanently non-forkable family.
+
 Use `client.command(["port", "ls", "--json", "demo@main"])` for any other
 non-interactive TTC command. Results keep stdout, stderr, and exit status
 separate. Pass `input` for stdin and an explicit `requestId` when deliberately

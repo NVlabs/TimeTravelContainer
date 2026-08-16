@@ -43,8 +43,8 @@ latency rather than branch failure isolation.
 5. Use an immutable image lower and a persistent `ttcvol` upper whose metadata
    roots fork in O(1); shared regular files split on first write using reflinks
    or the explicitly enabled whole-file-copy fallback.
-6. Reject a fork before mutation if any reachable resource is not supported or
-   escapes the sandbox closure.
+6. Reject unsupported resource creation in an eligible family. Retain a frozen
+   pre-fork closure check as an invariant guard before mutation.
 7. Make failure atomic from the guest's perspective: failure may leave the
    parent more conservatively write-protected, but must not change its data or
    observable kernel state.
@@ -366,20 +366,22 @@ queue and peer-topology tests pass.
 
 ### Networking
 
-The implemented validator accepts:
+The current implementation accepts:
 
-* canonical loopback netstack TCP/UDP where endpoints and queued packets are
-  contained in the cloned Kernel;
-* purely internal Unix sockets without queued `SCM_RIGHTS`; and
-* the TTC in-process virtual NIC with its unmodified routes and firewall state.
+* Sentry-owned netstack TCP/UDP endpoints and queues across guest-created
+  network namespaces, interfaces, veth pairs, routes, and iptables/conntrack;
+* purely internal Unix sockets, including queued `SCM_RIGHTS` when every
+  referenced descriptor is itself forkable; and
+* the TTC in-process virtual NIC with guest-managed configuration.
 
 The TTC NIC has an explicit external-flow policy. The source keeps its
 gateway/proxy, published listener, and host-facing connections. The child
 reconstructs a fresh link and proxy realm, retains internal loopback/`ttc0`
 queues, resets inherited TCP endpoints that terminate outside the branch, and
-starts unpublished. Hostinet, plugin stacks, arbitrary external links,
-secondary network namespaces, and modified firewall/conntrack state remain
-rejection cases.
+starts unpublished. Hostinet, plugin stacks, and arbitrary external links are
+available only to families created with an explicit live-fork waiver. Nftables
+mutation is rejected at creation time in eligible families until its state is
+serializable.
 
 The source proxy's explicitly marked port-forwarding waiter registrations are
 host-runtime state rather than part of the Sentry object graph. Queue snapshots
@@ -422,7 +424,8 @@ Sentry control socket.
 Validation is mandatory and precedes parent CoW mutation. The report should
 include a stable resource kind, guest-visible owner when available, and reason.
 
-Initial policy:
+Current policy (the frozen walk remains fail-closed if an object somehow
+bypassed its creation-time gate):
 
 | Resource | Initial disposition |
 |---|---|
@@ -434,14 +437,14 @@ Initial policy:
 | SysV SHM | Clone through a branch-local page map with first-fault CoW |
 | pidfd | Clone and rebind its target to the corresponding branch-local task |
 | Sentry netlink socket | Clone its protocol, queued datagrams, port allocation, and network-namespace state |
-| Internal Unix socket | Clone; reject host peers and queued SCM_RIGHTS |
-| Loopback netstack socket | Clone on canonical loopback with unmodified default iptables |
+| Internal Unix socket | Clone, including queued SCM_RIGHTS whose referenced FDs are forkable; reject host peers |
+| Sentry netstack socket | Clone across guest namespaces, NICs, routes, iptables/conntrack, and internal queues |
 | TTC virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
-| Host TCP/UDP/Unix socket outside the TTC proxy policy | Reject |
-| Writable or mutable gofer mount | Reject |
-| Host FD/device/FUSE/GPU | Reject |
-| AIO/io_uring/KCOV/packet mmap | Reject |
-| Guest stdio connected outside | Reject in strict mode |
+| Host TCP/UDP/Unix socket outside the TTC proxy policy | Require a family-level live-fork waiver |
+| Writable or mutable gofer mount | Do not admit to an eligible family |
+| Host FD/device/FUSE/GPU | Do not admit to an eligible family |
+| AIO/io_uring/KCOV/packet mmap | Fail creation in an eligible family |
+| TTC-managed guest stdio | Clone |
 
 The validator must inspect reachable kernel/VFS objects, not only the numeric
 FD table. An unsupported object reachable through epoll, SCM_RIGHTS queues,
@@ -535,11 +538,12 @@ parent MM is transitioned to CoW. It walks each distinct task FD table,
 recursively follows epoll interests, and returns a stable PID/FD/resource/reason
 report. Anonymous and socket objects fail closed unless their implementation
 opts in. Pure eventfds are accepted while host-backed eventfds are rejected;
-Unix transport validation rejects host-backed receivers, peers, bound host
-sockets, and queued SCM_RIGHTS. A real-loader test checks direct and
+Unix transport validation rejects host-backed receivers, peers, and bound host
+sockets. Queued `SCM_RIGHTS` is traversed recursively and accepted when every
+carried description is forkable. A real-loader test checks direct and
 epoll-reachable host eventfd rejection, then removes the resource and completes
-a valid fork. Filesystem-specific and ioctl-held closure still need the same
-explicit treatment in later phases.
+a valid fork. The check is now an invariant guard: normal eligible TTC paths do
+not import such host descriptions.
 
 The first Phase 4 tmpfs slice is implemented for main-MemoryFile-backed regular
 files, including memfd. Each tmpfs filesystem maintains a runtime registry that
@@ -588,28 +592,26 @@ rule as tmpfs. A real-loader test maps one segment twice and verifies alias
 coherence within parent, child, and grandchild branches, isolation between those
 branches, and recursive re-forking without copying untouched pages.
 
-VMA resource closure now runs immediately after FD-graph validation and before
-any page-ownership mutation. Mappables may provide an explicit live-fork
-validator; AIO rings, io_uring SQ/CQ/SQE mappings, PACKET_MMAP rings, and KCOV
-mappings reject with a stable PID/address-range/resource/reason report. A
+VMA resource closure runs immediately after FD-graph validation and before any
+page-ownership mutation as an invariant check. Mappables provide an explicit
+live-fork validator; eligible kernels reject creation of AIO rings, io_uring
+SQ/CQ/SQE mappings, PACKET_MMAP rings, and KCOV before such mappings can enter
+the graph. A
 fallback also rejects mappings whose retained VFS identity belongs to host,
 FUSE, anonymous, dev, or devtmpfs filesystems, covering closed device FDs that
 remain reachable only through a VMA. The real-loader gate creates an AIO ring,
 checks rejection, destroys it, and then forks the same parent successfully.
 
-The first Phase 6 slice admits an empty netstack or exactly the canonical
-loopback NIC. Stack validation rejects every other interface, unknown route,
-non-root network namespace, modified iptables/conntrack state, nftables, and
-stack implementation without an explicit containment hook. Netstack socket FDs
-opt in only through that same validator. Because NICs, routes, and firewall
-objects are intentionally omitted from normal state serialization, live fork
-reconstructs fresh child loopback link/NIC/address/route objects and independent
-unmodified default iptables before restoring endpoints. The real-loader gate
+The first Phase 6 slice admitted only canonical loopback. The current slice
+serializes TTC-only stack configuration, including Sentry-owned NICs, routes,
+iptables/conntrack, and related network namespaces, while leaving ordinary
+gVisor checkpoint behavior unchanged. The runtime-owned TTC proxy link is
+reconstructed branch-locally before restoring endpoints. The real-loader gate
 uses connected nonblocking UDP sockets and an established TCP stream: unread
 datagrams and stream bytes clone into parent, child, and grandchild receive
 queues, while later sends and readiness remain local to the originating branch.
-Hostinet, plugin stacks, external links, secondary network namespaces, modified
-firewall state, and packet-mmap VMAs still reject.
+Hostinet, plugin stacks, and external links require an explicit family waiver;
+packet-mmap creation and nftables mutation fail in an eligible family.
 
 ## Implementation phases and gates
 

@@ -1,9 +1,12 @@
 # TimeTravelContainer Current Limitations
 
 This page tracks limitations that users should consider when deciding whether
-TTC fits a workload. The authoritative compatibility check for a live branch
-is `ttc fork`: TTC pauses and validates the source atomically, then either
-creates the child or resumes the unchanged source and returns a diagnostic.
+TTC fits a workload. Live-fork eligibility is fixed when a family is created.
+The default is eligible: TTC rejects unsupported resource-creation operations
+instead of allowing later workload activity to make `ttc fork` unpredictable.
+Features whose state is intentionally outside the Sentry require the explicit
+`--waive-live-fork` run/create option; such a family is systematically
+non-forkable for its entire lifetime.
 
 ## Isolation and portability
 
@@ -22,9 +25,16 @@ creates the child or resumes the unchanged source and returns a diagnostic.
 
 - Fork latency depends on the number of processes, mappings, and kernel
   resources; it is not universally constant time.
-- Resources connected directly to the host or another container may not be
-  safely duplicable. TTC rejects a fork when it cannot preserve the requested
-  semantics.
+- A fork still rejects an invalid request, including a missing, exited,
+  dehydrated, or transitional source, an invalid/existing destination branch,
+  or a family created with `--waive-live-fork`. Resource exhaustion, damaged
+  persistent state, and internal/runtime failures can also make an individual
+  operation fail; these are operational errors, not workload-dependent
+  eligibility decisions.
+- `--network=host` is intentionally outside TTC's branchable resource graph and
+  therefore requires `--waive-live-fork`. Unsupported host FD, device, FUSE,
+  io_uring/AIO, packet-ring, KCOV, writable-sysfs, and nftables creation paths
+  fail at creation in an eligible family rather than poisoning it later.
 - Internal virtual-network connections are copied. The source keeps external
   connections, while the child starts with external connections disconnected
   and no inherited published host ports.
@@ -35,7 +45,8 @@ creates the child or resumes the unchanged source and returns a diagnostic.
   Use `ttc checkpoint` for an explicitly exportable file.
 - Checkpoint restore currently needs a compatible TTC build and the exact
   recorded image digest in the destination image store. Creating a checkpoint
-  also requires the selected branch to be eligible for live fork.
+  also requires a live-fork-eligible family because it begins with a private
+  live fork.
 
 ## Storage and networking
 
