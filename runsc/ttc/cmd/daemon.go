@@ -67,6 +67,7 @@ const (
 	daemonFrameStderr      = byte('E')
 	daemonFrameStatus      = byte('X')
 	daemonFrameTerminal    = byte('T')
+	daemonFrameTTYState    = byte('S')
 	daemonMaxFrame         = 1 << 20
 	daemonRootlessProbeArg = "_rootless-userns-probe"
 )
@@ -845,6 +846,30 @@ type daemonFrameWriter struct {
 	conn net.Conn
 	mu   *sync.Mutex
 	typ  byte
+}
+
+type daemonJSONFrameWriter struct {
+	conn   net.Conn
+	mu     *sync.Mutex
+	typ    byte
+	buffer []byte
+}
+
+func (w *daemonJSONFrameWriter) Write(data []byte) (int, error) {
+	w.buffer = append(w.buffer, data...)
+	for {
+		newline := bytes.IndexByte(w.buffer, '\n')
+		if newline < 0 {
+			return len(data), nil
+		}
+		payload := append([]byte(nil), w.buffer[:newline]...)
+		w.buffer = w.buffer[newline+1:]
+		if len(payload) != 0 {
+			if err := writeDaemonFrame(w.conn, w.mu, w.typ, payload); err != nil {
+				return 0, err
+			}
+		}
+	}
 }
 
 // OwnConsoleSidecar tracks and reaps one ready console follower. Followers are
@@ -2148,6 +2173,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, status)
 		return
 	}
+	if len(request.Args) >= 2 && request.Args[0] == "tty" && request.Args[1] == "watch" {
+		backend.stdout = &daemonJSONFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameTTYState}
+		status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
+		stdinReader.Close()
+		_ = writeDaemonStatus(conn, &writeMu, status)
+		return
+	}
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
@@ -2624,6 +2656,10 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 			}
 		case daemonFrameTerminal:
 			if err := terminal.configure(payload); err != nil {
+				return 1, err
+			}
+		case daemonFrameTTYState:
+			if _, err := stdout.Write(append(payload, '\n')); err != nil {
 				return 1, err
 			}
 		case daemonFrameStatus:

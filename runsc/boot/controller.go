@@ -173,6 +173,9 @@ const (
 
 	// ContMgrBranchRootfsSize gets writable rootfs usage in one branch.
 	ContMgrBranchRootfsSize = "containerManager.BranchRootfsSize"
+	// ContMgrFamilyResidentMemory accounts mapped resident memory across all
+	// branches in one Sentry family.
+	ContMgrFamilyResidentMemory = "containerManager.FamilyResidentMemory"
 
 	// ContMgrBranchSignal sends a signal within one in-memory branch.
 	ContMgrBranchSignal = "containerManager.BranchSignal"
@@ -1261,6 +1264,11 @@ func (cm *containerManager) BranchProcesses(args *BranchProcessesArgs, out *[]*c
 // BranchRootfsSize returns writable rootfs usage from one branch.
 func (cm *containerManager) BranchRootfsSize(args *BranchRootfsSizeArgs, out *control.RootfsSize) error {
 	return cm.l.family.RootfsSize(args.BranchID, args.CID, out)
+}
+
+// FamilyResidentMemory accounts mapped resident guest pages across branches.
+func (cm *containerManager) FamilyResidentMemory(_ *struct{}, out *FamilyResidentMemory) error {
+	return cm.l.family.ResidentMemory(out)
 }
 
 // BranchSignal sends a signal within one branch.

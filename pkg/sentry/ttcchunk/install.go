@@ -392,7 +392,7 @@ func (r *ChunkReader) Close() error {
 	var err error
 	if r.ownStore {
 		if r.consumption != nil {
-			r.consumption.ReaderClosed()
+			err = r.consumption.ReaderClosed()
 		} else {
 			err = r.store.closeRepository()
 		}

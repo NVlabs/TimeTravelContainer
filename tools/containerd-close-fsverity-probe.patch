@@ -1,0 +1,12 @@
+diff --git a/internal/fsverity/fsverity_linux.go b/internal/fsverity/fsverity_linux.go
+index e8a234d..93a9e16 100644
+--- a/internal/fsverity/fsverity_linux.go
++++ b/internal/fsverity/fsverity_linux.go
+@@ -98,6 +98,7 @@ func Enable(path string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	defer f.Close()
+ 
+ 	var args = &fsverityEnableArg{}
+ 	args.version = 1

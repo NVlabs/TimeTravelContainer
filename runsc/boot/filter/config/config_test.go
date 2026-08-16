@@ -83,6 +83,25 @@ func TestIoctlFirstArgumentIsNonNegativeFD(t *testing.T) {
 	}
 }
 
+func TestTTCVolumeAllowsSharedRepositoryLock(t *testing.T) {
+	rules, _ := Rules(Options{
+		Platform:  (&systrap.Systrap{}).SeccompInfo(),
+		TTCVolume: true,
+	})
+	found := false
+	if err := rules.ForSingleArgument(unix.SYS_FLOCK, 1, func(matcher seccomp.ValueMatcher) error {
+		if equal, ok := matcher.(seccomp.EqualTo); ok && equal == seccomp.EqualTo(unix.LOCK_SH) {
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inspecting flock rules: %v", err)
+	}
+	if !found {
+		t.Fatal("TTC volume seccomp rules reject LOCK_SH used by sparse dehydration readers")
+	}
+}
+
 // TestOptionsConfigKey verifies the behavior of `Options.ConfigKey`.
 func TestOptionsConfigKey(t *testing.T) {
 	// mutateFn mutates the value of a specific Options field.

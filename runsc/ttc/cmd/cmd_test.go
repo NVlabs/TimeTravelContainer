@@ -102,6 +102,27 @@ func TestTTYStatRoutesNamedSessionAndJSON(t *testing.T) {
 	}
 }
 
+func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
+	backend := &fakeBackend{resourceStatsResult: FamilyResourceStats{
+		Container: "demo", ResidentMemoryUniqueBytes: 4096, FilesystemUniqueBytes: 8192,
+		Branches: []BranchResourceStats{{Target: "demo@main", State: "running", ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096}}},
+	}}
+	var stdout bytes.Buffer
+	if err := runStats([]string{"--json", "demo@main"}, &stdout, io.Discard, backend); err != nil {
+		t.Fatal(err)
+	}
+	if backend.resourceStatsTarget != (selector{container: "demo", branch: "main"}) {
+		t.Fatalf("stats target=%v", backend.resourceStatsTarget)
+	}
+	var got FamilyResourceStats
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || len(got.Branches) != 1 {
+		t.Fatalf("stats=%+v", got)
+	}
+}
+
 func TestParseSelector(t *testing.T) {
 	tests := []struct {
 		input string
@@ -2219,6 +2240,17 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	}
 }
 
+func TestExecSessionBeforeCombinedShortOptions(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "--session", "build1", "-dit", "demo@main", "sh"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.execRequest.execID != "build1" || !b.execRequest.detach || !b.execRequest.interactive || !b.execRequest.terminal {
+		t.Fatalf("exec request=%+v", b.execRequest)
+	}
+}
+
 func TestExecProcessFileControlsCompleteProcess(t *testing.T) {
 	dir := t.TempDir()
 	processPath := filepath.Join(dir, "process.json")
@@ -4080,92 +4112,99 @@ type startCall struct {
 }
 
 type fakeBackend struct {
-	mu                 sync.Mutex
-	families           []Family
-	processTarget      selector
-	processList        []ProcessInfo
-	ttyTarget          selector
-	ttySession         string
-	ttyObservation     kernel.InternalConsoleObservation
-	rootfsSizes        map[selector]uint64
-	diffChanges        []BranchPathChange
-	sizeCalls          []selector
-	sizeErr            error
-	err                error
-	killErr            error
-	forkSource         selector
-	forkDestination    string
-	forkDestinations   []string
-	forkPaused         bool
-	publishedTarget    selector
-	publishedBinding   ttcbundle.PortBinding
-	portListContainer  string
-	portList           []ttcbundle.PortBinding
-	unpublishedTarget  selector
-	unpublishedBinding ttcbundle.PortBinding
-	paused             selector
-	resumed            selector
-	preparedStop       selector
-	preparedStops      []selector
-	discarded          selector
-	discards           []selector
-	dehydratedTargets  []selector
-	rehydratedTargets  []selector
-	destroyed          selector
-	destroyForce       bool
-	signals            []signalCall
-	waited             selector
-	waitCalls          []selector
-	waitStatus         uint32
-	waitStatuses       map[selector]uint32
-	waitRelease        chan struct{}
-	pullReference      string
-	pullPlatform       string
-	pullInfo           ttcimages.Info
-	imageList          []ImageInfo
-	imageInspectID     string
-	imageInspectInfo   ImageInspectInfo
-	imageRemoveID      string
-	imageRemoveForce   bool
-	imageRemoveResult  ImageRemoveResult
-	commitTarget       selector
-	commitReference    string
-	commitLabels       map[string]string
-	commitInfo         ttcimages.Info
-	runRequest         runRequest
-	containerID        string
-	runStatus          int
-	created            bool
-	started            selector
-	startCalls         []startCall
-	startDetach        bool
-	startInteractive   bool
-	attached           attachRequest
-	logsTarget         selector
-	logsOptions        logsOptions
-	inspectInfo        InspectInfo
-	removed            string
-	removeForce        bool
-	removeVolumes      bool
-	execRequest        execRequest
-	execStatus         int
-	execSessionList    []runscExecSession
-	execControlTarget  selector
-	execControlID      string
-	execControlSignal  int
-	copyStdin          io.Reader
-	copyExportTarget   selector
-	copyExportPath     string
-	copyExportFollow   bool
-	copyExportData     []byte
-	copyImportTarget   selector
-	copyImportPath     string
-	copyImportArchive  bool
-	copyImportRaw      bool
-	copyImportData     []byte
-	checkpointRequest  checkpointRequest
-	restoreSource      string
-	restoreName        string
+	mu                  sync.Mutex
+	families            []Family
+	processTarget       selector
+	processList         []ProcessInfo
+	ttyTarget           selector
+	ttySession          string
+	ttyObservation      kernel.InternalConsoleObservation
+	rootfsSizes         map[selector]uint64
+	diffChanges         []BranchPathChange
+	resourceStatsTarget selector
+	resourceStatsResult FamilyResourceStats
+	sizeCalls           []selector
+	sizeErr             error
+	err                 error
+	killErr             error
+	forkSource          selector
+	forkDestination     string
+	forkDestinations    []string
+	forkPaused          bool
+	publishedTarget     selector
+	publishedBinding    ttcbundle.PortBinding
+	portListContainer   string
+	portList            []ttcbundle.PortBinding
+	unpublishedTarget   selector
+	unpublishedBinding  ttcbundle.PortBinding
+	paused              selector
+	resumed             selector
+	preparedStop        selector
+	preparedStops       []selector
+	discarded           selector
+	discards            []selector
+	dehydratedTargets   []selector
+	rehydratedTargets   []selector
+	destroyed           selector
+	destroyForce        bool
+	signals             []signalCall
+	waited              selector
+	waitCalls           []selector
+	waitStatus          uint32
+	waitStatuses        map[selector]uint32
+	waitRelease         chan struct{}
+	pullReference       string
+	pullPlatform        string
+	pullInfo            ttcimages.Info
+	imageList           []ImageInfo
+	imageInspectID      string
+	imageInspectInfo    ImageInspectInfo
+	imageRemoveID       string
+	imageRemoveForce    bool
+	imageRemoveResult   ImageRemoveResult
+	commitTarget        selector
+	commitReference     string
+	commitLabels        map[string]string
+	commitInfo          ttcimages.Info
+	runRequest          runRequest
+	containerID         string
+	runStatus           int
+	created             bool
+	started             selector
+	startCalls          []startCall
+	startDetach         bool
+	startInteractive    bool
+	attached            attachRequest
+	logsTarget          selector
+	logsOptions         logsOptions
+	inspectInfo         InspectInfo
+	removed             string
+	removeForce         bool
+	removeVolumes       bool
+	execRequest         execRequest
+	execStatus          int
+	execSessionList     []runscExecSession
+	execControlTarget   selector
+	execControlID       string
+	execControlSignal   int
+	copyStdin           io.Reader
+	copyExportTarget    selector
+	copyExportPath      string
+	copyExportFollow    bool
+	copyExportData      []byte
+	copyImportTarget    selector
+	copyImportPath      string
+	copyImportArchive   bool
+	copyImportRaw       bool
+	copyImportData      []byte
+	checkpointRequest   checkpointRequest
+	restoreSource       string
+	restoreName         string
+}
+
+func (b *fakeBackend) resourceStats(target selector) (FamilyResourceStats, error) {
+	b.resourceStatsTarget = target
+	return b.resourceStatsResult, b.err
 }
 
 func (b *fakeBackend) resultID(request runRequest) string {

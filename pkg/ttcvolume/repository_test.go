@@ -1129,6 +1129,47 @@ func TestListDirectoryItemsAndBranchUsage(t *testing.T) {
 	}
 }
 
+func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("usage-set")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	shared, err := repository.CreateRegular(MainBranch, RootInode, "shared", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := repository.CreateRegular(MainBranch, RootInode, "changed", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inode := range []uint64{shared, changed} {
+		if _, _, err := repository.WriteAt(MainBranch, inode, []byte("base"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt("child", changed, []byte("child"), 0); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := repository.BranchSetUsage([]string{"child", MainBranch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := uint64(os.Getpagesize())
+	if usage.UniqueBytes != 3*page || len(usage.Branches) != 2 {
+		t.Fatalf("usage=%+v, want three unique pages and two branches", usage)
+	}
+	for _, branch := range usage.Branches {
+		if branch.PrivateBytes != page || branch.SharedBytes != page || branch.TotalBytes != 2*page {
+			t.Fatalf("branch usage=%+v, want one private and one shared page", branch)
+		}
+	}
+}
+
 func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("diff")

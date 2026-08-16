@@ -2372,6 +2372,15 @@ func (s *Sandbox) BranchRootfsSize(branchID, cid string) (control.RootfsSize, er
 	return size, nil
 }
 
+// FamilyResidentMemory accounts mapped resident guest pages in this Sentry.
+func (s *Sandbox) FamilyResidentMemory() (boot.FamilyResidentMemory, error) {
+	var memory boot.FamilyResidentMemory
+	if err := s.call(boot.ContMgrFamilyResidentMemory, nil, &memory); err != nil {
+		return boot.FamilyResidentMemory{}, fmt.Errorf("accounting family resident memory: %w", err)
+	}
+	return memory, nil
+}
+
 // SignalBranch sends a signal within one in-memory branch.
 func (s *Sandbox) SignalBranch(args *boot.BranchSignalArgs) error {
 	if err := s.call(boot.ContMgrBranchSignal, args, nil); err != nil {

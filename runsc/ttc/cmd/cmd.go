@@ -319,7 +319,8 @@ Commands:
   ls [--tree|--json]              List container families and branch trees
   ps [OPTIONS]                    List and filter container branches
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
-  tty stat TARGET --session NAME  Observe a named terminal without consuming I/O
+  stats [--json] TARGET           Show branch/family CoW resource accounting
+  tty stat|watch TARGET --session NAME Observe or stream a named terminal
   fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
@@ -364,7 +365,8 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
 			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
 			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
-			"tty":        "Usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]",
+			"stats":      "Usage: ttc stats [--json] CONTAINER@BRANCH",
+			"tty":        "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
@@ -424,6 +426,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runCopy(args[1:], stdout, stderr, backend)
 	case "diff":
 		err = runDiff(args[1:], stdout, stderr, backend)
+	case "stats":
+		err = runStats(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -2359,7 +2363,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 	}
 
-	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e", "--additional-gids", "--cap", "--process")
+	args = expandCombinedShortBools(args, "dit", "--workdir", "-w", "--user", "-u", "--env", "-e", "--additional-gids", "--cap", "--process", "--session")
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	detach := fs.Bool("detach", false, "run in the background")
@@ -3945,9 +3949,10 @@ func runTop(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runTTY(args []string, stdout io.Writer, backend backend) error {
-	if len(args) == 0 || args[0] != "stat" {
-		return errors.New("usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]")
+	if len(args) == 0 || (args[0] != "stat" && args[0] != "watch") {
+		return errors.New("usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]")
 	}
+	action := args[0]
 	var targetValue, session string
 	jsonOutput := false
 	for index := 1; index < len(args); index++ {
@@ -3973,7 +3978,7 @@ func runTTY(args []string, stdout io.Writer, backend backend) error {
 		}
 	}
 	if targetValue == "" || session == "" {
-		return errors.New("usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]")
+		return errors.New("usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]")
 	}
 	target, err := parseSelector(targetValue)
 	if err != nil {
@@ -3982,6 +3987,34 @@ func runTTY(args []string, stdout io.Writer, backend backend) error {
 	observation, err := backend.consoleObservation(target, session)
 	if err != nil {
 		return fmt.Errorf("observing terminal session %q in %s: %w", session, target, err)
+	}
+	if action == "watch" {
+		if watcher, ok := backend.(interface {
+			watchConsole(selector, string, io.Writer) error
+		}); ok {
+			return watcher.watchConsole(target, session, stdout)
+		}
+		encoder := json.NewEncoder(stdout)
+		last := observation
+		lastEmit := time.Time{}
+		for {
+			now := time.Now()
+			semanticLast, semanticCurrent := last, observation
+			semanticLast.MonotonicNS = 0
+			semanticCurrent.MonotonicNS = 0
+			if semanticLast != semanticCurrent || lastEmit.IsZero() || now.Sub(lastEmit) >= time.Second {
+				if err := encoder.Encode(&observation); err != nil {
+					return err
+				}
+				last = observation
+				lastEmit = now
+			}
+			time.Sleep(10 * time.Millisecond)
+			observation, err = backend.consoleObservation(target, session)
+			if err != nil {
+				return fmt.Errorf("observing terminal session %q in %s: %w", session, target, err)
+			}
+		}
 	}
 	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
@@ -4749,6 +4782,73 @@ type BranchPathChange struct {
 	Kind  string `json:"kind"`
 	Type  string `json:"type,omitempty"`
 	Mount string `json:"mount"`
+}
+
+// ResourceBytes classifies branch-attributed bytes by CoW sharing.
+type ResourceBytes struct {
+	PrivateBytes uint64 `json:"private_bytes"`
+	SharedBytes  uint64 `json:"shared_bytes"`
+	TotalBytes   uint64 `json:"total_bytes"`
+}
+
+// BranchResourceStats is one branch's resource-accounting snapshot.
+type BranchResourceStats struct {
+	Target           string        `json:"target"`
+	State            string        `json:"state"`
+	ResidentMemory   ResourceBytes `json:"resident_memory"`
+	MemoryBacking    ResourceBytes `json:"memory_backing"`
+	Filesystem       ResourceBytes `json:"filesystem"`
+	FilesystemInodes uint64        `json:"filesystem_inodes"`
+}
+
+// FamilyResourceStats includes branch attribution and non-double-counted totals.
+type FamilyResourceStats struct {
+	Container                 string                `json:"container"`
+	Branches                  []BranchResourceStats `json:"branches"`
+	ResidentMemoryUniqueBytes uint64                `json:"resident_memory_unique_bytes"`
+	MemoryBackingUniqueBytes  uint64                `json:"memory_backing_unique_bytes"`
+	FilesystemUniqueBytes     uint64                `json:"filesystem_unique_bytes"`
+}
+
+type resourceStatsBackend interface {
+	resourceStats(target selector) (FamilyResourceStats, error)
+}
+
+func runStats(args []string, stdout, stderr io.Writer, b backend) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttc stats [--json] CONTAINER@BRANCH")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	accountant, ok := b.(resourceStatsBackend)
+	if !ok {
+		return errors.New("resource accounting is not supported by this backend")
+	}
+	stats, err := accountant.resourceStats(target)
+	if err != nil {
+		return fmt.Errorf("accounting %s: %w", target, err)
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(stats)
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, 24, 0)
+	fmt.Fprintln(table, "TARGET\tSTATE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED")
+	for _, branch := range stats.Branches {
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", branch.Target, branch.State,
+			formatImageSize(int64(branch.ResidentMemory.PrivateBytes)), formatImageSize(int64(branch.ResidentMemory.SharedBytes)),
+			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)))
+	}
+	return table.Flush()
 }
 
 func runDiff(args []string, stdout, stderr io.Writer, b backend) error {
@@ -8618,6 +8718,55 @@ func (b *runtimeBackend) consoleObservation(target selector, session string) (ke
 	return observation, nil
 }
 
+func (b *runtimeBackend) watchConsole(target selector, session string, stdout io.Writer) error {
+	resolved, _, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	consoleID := "init"
+	if session != "init" {
+		execSession, err := b.execSession(resolved, session)
+		if err != nil {
+			return err
+		}
+		if !execSession.Terminal {
+			return fmt.Errorf("exec session %q is not a terminal", session)
+		}
+		consoleID = execSession.ConsoleID
+	}
+	command := runscCommand(b.runsc, "--root", b.root, "timetravel", "--console", consoleID, resolved.container, "console-watch", resolved.branch)
+	pipe, err := command.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	var stderr strings.Builder
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(pipe)
+	scanner.Buffer(make([]byte, 4096), daemonMaxFrame)
+	for scanner.Scan() {
+		if _, err := fmt.Fprintln(stdout, scanner.Text()); err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return err
+	}
+	if err := command.Wait(); err != nil {
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			return fmt.Errorf("%s: %w", message, err)
+		}
+		return err
+	}
+	return nil
+}
+
 func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32, error) {
 	resolved, _, err := b.resolveSelector(target)
 	if err != nil {
@@ -9137,7 +9286,8 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
 		return fmt.Errorf("settling remote branches before stopping %s: %w", target, err)
 	}
-	if _, err := persistentBranchInfo(info, target.branch); err != nil {
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
 		return err
 	}
 	store := b.containerStore()
@@ -9200,6 +9350,15 @@ func (b *runtimeBackend) discard(target selector) error {
 		break
 	}
 
+	// Runtime destruction is the lifecycle commit point. Persist it before
+	// reclaiming the dehydration image or sparse roots: cleanup may fail (for
+	// example because an NFS server briefly delays an unlink), but a retry must
+	// see an exited branch rather than a dehydrated branch whose control image
+	// has already been removed.
+	if err := store.StopBranch(info.ID, target.branch, 128+int(linux.SIGKILL)); err != nil {
+		return err
+	}
+
 	encodedBranch := hex.EncodeToString([]byte(target.branch))
 	for _, kind := range []string{"active", "dehydrated"} {
 		path := filepath.Join(b.dataRoot, "containers", info.ID, "memory", kind, encodedBranch)
@@ -9207,15 +9366,8 @@ func (b *runtimeBackend) discard(target selector) error {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
 	}
-	branch, err := persistentBranchInfo(info, target.branch)
-	if err != nil {
-		return err
-	}
 	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
 		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
-	}
-	if err := store.StopBranch(info.ID, target.branch, 128+int(linux.SIGKILL)); err != nil {
-		return err
 	}
 	latest, err := store.LoadContainer(info.ID)
 	if err != nil {
@@ -9794,7 +9946,14 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 			_ = file.Close()
 		}
 	}()
-	for i := range capture.Memories {
+	firstTarget := 0
+	if sparse {
+		// Sparse peer restores install application chunks into the family's
+		// existing MemoryFile. Only private filesystem MemoryFiles need new
+		// donated backing files.
+		firstTarget = 1
+	}
+	for i := firstTarget; i < len(capture.Memories); i++ {
 		fd, err := memutil.CreateMemFD(fmt.Sprintf("ttc-rehydration-memory-%04d", i), 0)
 		if err != nil {
 			return fmt.Errorf("creating anonymous active dehydration memory %d: %w", i, err)
@@ -9809,6 +9968,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse,
+		ReusePeerApplicationMemoryFile: sparse,
 	}
 	networkArgs, err := dehydrationNetworkArgs(info)
 	if err != nil {
@@ -10151,6 +10311,147 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		return changes[i].Path < changes[j].Path
 	})
 	return changes, nil
+}
+
+func addResourceBytes(target *ResourceBytes, privateBytes, sharedBytes uint64) {
+	target.PrivateBytes += privateBytes
+	target.SharedBytes += sharedBytes
+	target.TotalBytes = target.PrivateBytes + target.SharedBytes
+}
+
+func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return FamilyResourceStats{}, err
+	}
+	if _, err := persistentBranchInfo(info, resolved.branch); err != nil {
+		return FamilyResourceStats{}, err
+	}
+	result := FamilyResourceStats{Container: info.Name}
+	if result.Container == "" {
+		result.Container = target.container
+	}
+	branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
+	result.Branches = make([]BranchResourceStats, 0, len(branches))
+	byID := make(map[string]*BranchResourceStats, len(branches))
+	filesystemBranches := make(map[string]string, len(branches))
+	for _, branch := range branches {
+		account := BranchResourceStats{Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State)}
+		result.Branches = append(result.Branches, account)
+		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
+		filesystemBranch := branch.FilesystemBranch
+		if filesystemBranch == "" {
+			filesystemBranch = offlineCopyBranch(info.ID, branch.ID)
+		}
+		filesystemBranches[branch.ID] = filesystemBranch
+	}
+
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return FamilyResourceStats{}, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return FamilyResourceStats{}, err
+	}
+	for _, config := range repositories {
+		dir, err := os.Open(config.Path)
+		if err != nil {
+			return FamilyResourceStats{}, err
+		}
+		repository, openErr := ttcvolume.OpenRepositoryFD(dir, ttcvolume.CopyMode(config.CopyMode))
+		_ = dir.Close()
+		if openErr != nil {
+			return FamilyResourceStats{}, openErr
+		}
+		filesystemIDs := make([]string, 0, len(filesystemBranches))
+		seenFilesystemIDs := make(map[string]struct{}, len(filesystemBranches))
+		for _, filesystemBranch := range filesystemBranches {
+			if _, ok := seenFilesystemIDs[filesystemBranch]; ok {
+				continue
+			}
+			seenFilesystemIDs[filesystemBranch] = struct{}{}
+			filesystemIDs = append(filesystemIDs, filesystemBranch)
+		}
+		usage, usageErr := repository.BranchSetUsage(filesystemIDs)
+		closeErr := repository.Close()
+		if usageErr != nil {
+			return FamilyResourceStats{}, usageErr
+		}
+		if closeErr != nil {
+			return FamilyResourceStats{}, closeErr
+		}
+		result.FilesystemUniqueBytes += usage.UniqueBytes
+		visibleByFilesystem := make(map[string][]string)
+		for visible, filesystem := range filesystemBranches {
+			visibleByFilesystem[filesystem] = append(visibleByFilesystem[filesystem], visible)
+		}
+		for _, branchUsage := range usage.Branches {
+			for _, visible := range visibleByFilesystem[branchUsage.ID] {
+				account := byID[visible]
+				addResourceBytes(&account.Filesystem, branchUsage.PrivateBytes, branchUsage.SharedBytes)
+				account.FilesystemInodes += branchUsage.Inodes
+			}
+		}
+	}
+
+	memoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+	if _, statErr := os.Stat(memoryPath); statErr == nil {
+		memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
+		if openErr != nil {
+			return FamilyResourceStats{}, openErr
+		}
+		roots, rootsErr := memoryRepository.ListBranches()
+		if rootsErr != nil {
+			memoryRepository.Close()
+			return FamilyResourceStats{}, rootsErr
+		}
+		memoryBranches := make(map[string]string)
+		for visible, filesystem := range filesystemBranches {
+			if _, ok := roots[filesystem]; ok {
+				memoryBranches[visible] = filesystem
+			}
+		}
+		usage, usageErr := memoryRepository.BranchSetUsage(memoryBranches)
+		closeErr := memoryRepository.Close()
+		if usageErr != nil {
+			return FamilyResourceStats{}, usageErr
+		}
+		if closeErr != nil {
+			return FamilyResourceStats{}, closeErr
+		}
+		result.MemoryBackingUniqueBytes = usage.UniqueBytes
+		for _, branchUsage := range usage.Branches {
+			if account := byID[branchUsage.ID]; account != nil {
+				addResourceBytes(&account.MemoryBacking, branchUsage.PrivateBytes, branchUsage.SharedBytes)
+			}
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return FamilyResourceStats{}, statErr
+	}
+
+	output, residentErr := b.command("timetravel", resolved.container, "stats", resolved.branch)
+	if residentErr == nil {
+		var resident boot.FamilyResidentMemory
+		if err := json.Unmarshal(output, &resident); err != nil {
+			return FamilyResourceStats{}, fmt.Errorf("decoding resident memory accounting: %w", err)
+		}
+		result.ResidentMemoryUniqueBytes = resident.UniqueBytes
+		for _, branchMemory := range resident.Branches {
+			if account := byID[branchMemory.ID]; account != nil {
+				addResourceBytes(&account.ResidentMemory, branchMemory.PrivateBytes, branchMemory.SharedBytes)
+			}
+		}
+	} else {
+		for _, branch := range branches {
+			state := normalizeLifecycleState(branch.State)
+			if state == "running" || state == "paused" {
+				return FamilyResourceStats{}, residentErr
+			}
+		}
+	}
+	return result, nil
 }
 
 func repositoryGuestMount(spec *specs.Spec, repository specutils.TTCVolumeRepository) (string, error) {

@@ -697,6 +697,10 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 	}()
 	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
+		// LoadSparseDurableDehydration consumes one ownership reference for
+		// every MemoryFile. Application memory is shared with the active family,
+		// so donate a new owner rather than transferring the source's owner.
+		source.MemoryFile().IncOwner()
 		memories[checkpoint.ResourceID{}] = source.MemoryFile()
 		for resource, mf := range private {
 			memories[resource] = mf

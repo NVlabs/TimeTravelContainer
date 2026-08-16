@@ -129,7 +129,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait|prepare-stop <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-stat|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-stat|console-watch|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -595,6 +595,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.BranchProcesses(f.Arg(2), cont.ID)
 	case "size":
 		output, err = cont.Sandbox.BranchRootfsSize(f.Arg(2), cont.ID)
+	case "stats":
+		output, err = cont.Sandbox.FamilyResidentMemory()
 	case "signal":
 		mode := boot.DeliverToProcess
 		if t.all {
@@ -659,6 +661,32 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			BranchID:  f.Arg(2),
 			ConsoleID: t.consoleID,
 		})
+	case "console-watch":
+		encoder := json.NewEncoder(&util.Writer{})
+		var last kernel.InternalConsoleObservation
+		lastEmit := time.Time{}
+		for {
+			observation, observeErr := cont.Sandbox.ObserveConsole(&boot.ConsoleObservationArgs{
+				BranchID: f.Arg(2), ConsoleID: t.consoleID,
+			})
+			if observeErr != nil {
+				err = observeErr
+				break
+			}
+			now := time.Now()
+			semanticLast, semanticCurrent := last, observation
+			semanticLast.MonotonicNS = 0
+			semanticCurrent.MonotonicNS = 0
+			if semanticLast != semanticCurrent || lastEmit.IsZero() || now.Sub(lastEmit) >= time.Second {
+				if encodeErr := encoder.Encode(&observation); encodeErr != nil {
+					err = encodeErr
+					break
+				}
+				last = observation
+				lastEmit = now
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	case "console-wait":
 		output, err = cont.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
 			BranchID:  f.Arg(2),

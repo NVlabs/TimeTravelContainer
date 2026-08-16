@@ -774,6 +774,50 @@ func TestDonatedRepositoryPublishesAndReadsRelativeToFD(t *testing.T) {
 	}
 }
 
+func TestBranchSetUsageTracksDurableSharedPages(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x4d)
+	for _, branch := range []string{"main", "child"} {
+		if err := repository.SetBranch(branch, manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usage, err := repository.BranchSetUsage(map[string]string{"main": "main", "child": "child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.UniqueBytes != hostarch.PageSize || len(usage.Branches) != 2 {
+		t.Fatalf("usage=%+v, want one unique page", usage)
+	}
+	for _, branch := range usage.Branches {
+		if branch.PrivateBytes != 0 || branch.SharedBytes != hostarch.PageSize {
+			t.Fatalf("branch usage=%+v, want one shared page", branch)
+		}
+	}
+	loaded, err := repository.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "child"} {
+		if err := repository.MarkConsumed(branch, manifest, []ID{loaded.Runs[0].Object}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repository.CollectGarbage(GCOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	usage, err = repository.BranchSetUsage(map[string]string{"main": "main", "child": "child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.UniqueBytes != 0 {
+		t.Fatalf("consumed durable usage=%+v, want zero", usage)
+	}
+}
+
 func TestRepositoryLeaseProtectsThenReclaimsManifest(t *testing.T) {
 	repository, err := OpenMemoryRepository(t.TempDir())
 	if err != nil {
@@ -938,6 +982,51 @@ func TestConsumptionTrackerWaitsForRestoreCommit(t *testing.T) {
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConsumptionTrackerLeaseProtectsUnreadObjects(t *testing.T) {
+	root := t.TempDir()
+	repository, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, repository, 0x75)
+	loaded, err := repository.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := loaded.Runs[0].Object
+	if err := repository.SetBranch("branch", manifest); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	donated, err := OpenMemoryRepositoryFD(dir)
+	dir.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewOwnedConsumingChunkReader(donated, []InstalledChunk{{
+		Object: object, Target: memmap.FileRange{Start: 0, End: pgalloc.SparseChunkBytes}, StreamOffset: 0,
+	}}, "branch", manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.ActivateConsumption(nil)
+	if err := repository.DeleteBranch("branch"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
+		t.Fatalf("GC with live sparse reader = %+v, %v", got, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
+		t.Fatalf("GC after sparse reader close = %+v, %v", got, err)
 	}
 }
 

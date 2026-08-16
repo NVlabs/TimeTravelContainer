@@ -677,6 +677,11 @@ go_deps.module_override(
     patches = ["//tools:protobuf.disable-binary-reading-on-init.patch"],
     path = "google.golang.org/protobuf",
 )
+go_deps.module_override(
+    patch_strip = 1,
+    patches = ["//tools:containerd-close-fsverity-probe.patch"],
+    path = "github.com/containerd/containerd/v2",
+)
 go_deps.gazelle_override(
     directives = [
         "gazelle:proto disable",

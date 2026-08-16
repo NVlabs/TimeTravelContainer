@@ -227,6 +227,9 @@ type Kernel struct {
 	// internalConsoles owns Sentry pipe peers used by detachable process
 	// consoles. It is saved so live fork clones console queues and endpoints.
 	internalConsoles map[string]*InternalConsole
+	// nextInternalConsoleEpoch distinguishes successive consoles that reuse the
+	// same user-visible session name.
+	nextInternalConsoleEpoch uint64
 
 	// internalConsolesMu protects internalConsoles.
 	internalConsolesMu sync.Mutex `state:"nosave"`

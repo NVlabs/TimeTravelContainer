@@ -29,10 +29,12 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -264,6 +266,22 @@ type BranchProcessesArgs struct {
 type BranchRootfsSizeArgs struct {
 	BranchID string
 	CID      string
+}
+
+// BranchResidentMemory is mapped resident memory attributed to one live
+// branch. Private and shared classify physical Sentry pages across this family.
+type BranchResidentMemory struct {
+	ID           string `json:"id"`
+	State        string `json:"state"`
+	PrivateBytes uint64 `json:"private_bytes"`
+	SharedBytes  uint64 `json:"shared_bytes"`
+	TotalBytes   uint64 `json:"total_bytes"`
+}
+
+// FamilyResidentMemory is a family-wide resident-memory accounting snapshot.
+type FamilyResidentMemory struct {
+	Branches    []BranchResidentMemory `json:"branches"`
+	UniqueBytes uint64                 `json:"unique_bytes"`
 }
 
 // BranchWaitArgs selects a process inside one live branch. PID 0 selects the
@@ -2319,6 +2337,81 @@ func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) erro
 	}
 	defer done()
 	return control.RootfsUpperLayerSize(b.k, cid, out)
+}
+
+// ResidentMemory accounts mapped resident guest pages across live branches.
+// It deliberately excludes Sentry Go heap and unmapped page-cache objects.
+func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
+	f.dehydrationMu.Lock()
+	defer f.dehydrationMu.Unlock()
+
+	type heldBranch struct {
+		branch *sandboxBranch
+		pages  map[mm.ResidentPageVersion]struct{}
+	}
+	f.mu.Lock()
+	ids := make([]string, 0, len(f.branches))
+	for id := range f.branches {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	branches := make([]*sandboxBranch, 0, len(ids))
+	for _, id := range ids {
+		branches = append(branches, f.branches[id])
+	}
+	f.mu.Unlock()
+	held := make([]heldBranch, 0, len(ids))
+	for _, branch := range branches {
+		branch.opMu.Lock()
+		f.mu.Lock()
+		if branch.k != nil && branch.state != BranchCreating && branch.state != BranchDestroying && branch.state != BranchFailed {
+			branch.controlOps.Add(1)
+			held = append(held, heldBranch{branch: branch})
+		}
+		f.mu.Unlock()
+		branch.opMu.Unlock()
+	}
+	defer func() {
+		for _, branch := range held {
+			branch.branch.controlOps.Done()
+		}
+	}()
+
+	counts := make(map[mm.ResidentPageVersion]uint32)
+	for index := range held {
+		held[index].pages = held[index].branch.k.ResidentPageVersions()
+		for page := range held[index].pages {
+			counts[page]++
+		}
+	}
+	out.Branches = make([]BranchResidentMemory, 0, len(ids))
+	const pageBytes = uint64(hostarch.PageSize)
+	for _, id := range ids {
+		var branch *heldBranch
+		for index := range held {
+			if held[index].branch.id == id {
+				branch = &held[index]
+				break
+			}
+		}
+		f.mu.Lock()
+		state := f.branches[id].state
+		f.mu.Unlock()
+		account := BranchResidentMemory{ID: id, State: string(state)}
+		if branch != nil {
+			for page := range branch.pages {
+				if counts[page] > 1 {
+					account.SharedBytes += pageBytes
+				} else {
+					account.PrivateBytes += pageBytes
+				}
+			}
+			account.TotalBytes = account.PrivateBytes + account.SharedBytes
+		}
+		out.Branches = append(out.Branches, account)
+	}
+	out.UniqueBytes = uint64(len(counts)) * pageBytes
+	return nil
 }
 
 // Signal sends a signal within one branch. Foreground process-group delivery

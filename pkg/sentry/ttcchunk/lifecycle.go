@@ -228,9 +228,18 @@ func (r *MemoryRepository) AcquireLease(id ManifestID, ttl time.Duration) (*Leas
 	if err != nil {
 		return nil, err
 	}
-	lease := &Lease{repo: r, path: filepath.Join(r.leaseRoot, name+".lease"), manifest: id, ttl: ttl}
+	leaseName := name + ".lease"
+	leasePath := filepath.Join(r.leaseRoot, leaseName)
+	if r.rootFD != nil {
+		leasePath = "leases/" + leaseName
+	}
+	lease := &Lease{repo: r, path: leasePath, manifest: id, ttl: ttl}
 	r.mu.Lock()
-	err = atomicReplace(r.leaseRoot, ".lease-", lease.path, data)
+	if r.rootFD != nil {
+		err = atomicReplaceRelative(int(r.rootFD.Fd()), "leases", leaseName, data)
+	} else {
+		err = atomicReplace(r.leaseRoot, ".lease-", lease.path, data)
+	}
 	r.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -254,13 +263,21 @@ func (l *Lease) Renew() error {
 		return err
 	}
 	l.repo.mu.Lock()
-	err = atomicReplace(l.repo.leaseRoot, ".lease-", l.path, data)
+	if l.repo.rootFD != nil {
+		err = atomicReplaceRelative(int(l.repo.rootFD.Fd()), "leases", filepath.Base(l.path), data)
+	} else {
+		err = atomicReplace(l.repo.leaseRoot, ".lease-", l.path, data)
+	}
 	l.repo.mu.Unlock()
 	if err != nil {
 		return err
 	}
 	if err := l.repo.validateManifestObjects(l.manifest); err != nil {
-		_ = os.Remove(l.path)
+		if l.repo.rootFD != nil {
+			_ = unlinkRelative(int(l.repo.rootFD.Fd()), l.path)
+		} else {
+			_ = os.Remove(l.path)
+		}
 		l.released = true
 		return fmt.Errorf("manifest %s was reclaimed while renewing its lease: %w", l.manifest, err)
 	}
@@ -278,9 +295,17 @@ func (l *Lease) Release() error {
 		return nil
 	}
 	l.repo.mu.Lock()
-	err := os.Remove(l.path)
-	if err == nil {
-		err = syncDirectory(l.repo.leaseRoot)
+	var err error
+	if l.repo.rootFD != nil {
+		err = unlinkRelative(int(l.repo.rootFD.Fd()), l.path)
+		if err == nil {
+			err = syncDirRelative(int(l.repo.rootFD.Fd()), "leases")
+		}
+	} else {
+		err = os.Remove(l.path)
+		if err == nil {
+			err = syncDirectory(l.repo.leaseRoot)
+		}
 	}
 	l.repo.mu.Unlock()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -910,7 +935,7 @@ func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 			return GCResult{}, err
 		}
 	}
-	if err := os.RemoveAll(quarantineRoot); err != nil {
+	if err := removeGarbageQuarantine(quarantineRoot); err != nil {
 		return GCResult{}, err
 	}
 	committed = true
@@ -928,4 +953,21 @@ func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 		return GCResult{}, err
 	}
 	return result, nil
+}
+
+// removeGarbageQuarantine tolerates only the short directory-coherency window
+// that may follow the last close/unlink on NFS. Demand readers and GC are
+// serialized by gc.lock, and live readers additionally hold manifest leases,
+// so a persistent ENOTEMPTY remains a correctness failure. In particular, we
+// do not recognize or ignore any filesystem-generated placeholder filename.
+func removeGarbageQuarantine(path string) error {
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := os.RemoveAll(path)
+		transientDirectoryState := errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EBUSY)
+		if err == nil || !transientDirectoryState || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

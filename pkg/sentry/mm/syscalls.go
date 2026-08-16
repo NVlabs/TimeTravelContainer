@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 // HandleUserFault handles an application page fault. sp is the faulting
@@ -1484,6 +1485,42 @@ func (mm *MemoryManager) ResidentSetSize() uint64 {
 	mm.activeMu.RLock()
 	defer mm.activeMu.RUnlock()
 	return mm.curRSS
+}
+
+// ResidentPageVersion identifies one resident page backing a mapping in mm.
+// File identity is significant: equal logical versions installed in distinct
+// MemoryFiles occupy distinct host memory and are not resident CoW sharing.
+type ResidentPageVersion struct {
+	File    *pgalloc.MemoryFile
+	Version pgalloc.PageVersionID
+}
+
+// ResidentPageVersions returns a deduplicated snapshot of resident pages
+// backing mappings in mm. Aliases of the same page within one address space
+// are returned once.
+func (mm *MemoryManager) ResidentPageVersions() map[ResidentPageVersion]struct{} {
+	mm.activeMu.RLock()
+	defer mm.activeMu.RUnlock()
+	pages := make(map[ResidentPageVersion]struct{}, mm.curRSS/hostarch.PageSize)
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+		if !ok {
+			continue
+		}
+		for _, run := range mf.LogicalPageRanges(pseg.fileRange()) {
+			count := run.Range.Length() / hostarch.PageSize
+			for index := uint64(0); index < count; index++ {
+				pages[ResidentPageVersion{
+					File: mf,
+					Version: pgalloc.PageVersionID{
+						Allocator: run.FirstVersion.Allocator,
+						Sequence:  run.FirstVersion.Sequence + index,
+					},
+				}] = struct{}{}
+			}
+		}
+	}
+	return pages
 }
 
 // MaxResidentSetSize returns the value advertised as mm's max RSS in bytes.

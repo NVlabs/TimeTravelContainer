@@ -1851,6 +1851,92 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 	return uint64(len(state.inodes)), bytes, nil
 }
 
+// BranchDataUsage accounts logical regular-file data referenced by one branch.
+type BranchDataUsage struct {
+	ID           string `json:"id"`
+	Inodes       uint64 `json:"inodes"`
+	PrivateBytes uint64 `json:"private_bytes"`
+	SharedBytes  uint64 `json:"shared_bytes"`
+	TotalBytes   uint64 `json:"total_bytes"`
+}
+
+// BranchSetDataUsage accounts file-object sharing across a selected branch set.
+// UniqueBytes counts each immutable data object once across the set.
+type BranchSetDataUsage struct {
+	Branches    []BranchDataUsage `json:"branches"`
+	UniqueBytes uint64            `json:"unique_bytes"`
+}
+
+// BranchSetUsage returns file-data sharing for branchIDs without walking the
+// guest namespace or materializing files. Sharing is based on immutable TTC
+// object identity, and therefore reflects TTC's file-level CoW boundary.
+func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, error) {
+	ids := append([]string(nil), branchIDs...)
+	sort.Strings(ids)
+	type snapshot struct {
+		inodes  uint64
+		objects map[string]uint64
+	}
+	snapshots := make(map[string]snapshot, len(ids))
+	objectBranches := make(map[string]uint64)
+	objectSizes := make(map[string]uint64)
+	pageSize := uint64(os.Getpagesize())
+	for _, id := range ids {
+		if _, exists := snapshots[id]; exists {
+			return BranchSetDataUsage{}, fmt.Errorf("duplicate branch %q in usage set", id)
+		}
+		branch, err := r.readBranch(id)
+		if err != nil {
+			return BranchSetDataUsage{}, err
+		}
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return BranchSetDataUsage{}, err
+		}
+		state.mu.RLock()
+		current := snapshot{inodes: uint64(len(state.inodes)), objects: make(map[string]uint64)}
+		for _, inode := range state.inodes {
+			if inode.Type != "regular" || inode.Size <= 0 {
+				continue
+			}
+			if inode.Object == "" {
+				state.mu.RUnlock()
+				return BranchSetDataUsage{}, fmt.Errorf("branch %q inode %d has data without an object", id, inode.Number)
+			}
+			size := (uint64(inode.Size) + pageSize - 1) &^ (pageSize - 1)
+			if size > current.objects[inode.Object] {
+				current.objects[inode.Object] = size
+			}
+		}
+		state.mu.RUnlock()
+		snapshots[id] = current
+		for object, size := range current.objects {
+			objectBranches[object]++
+			if size > objectSizes[object] {
+				objectSizes[object] = size
+			}
+		}
+	}
+	result := BranchSetDataUsage{Branches: make([]BranchDataUsage, 0, len(ids))}
+	for _, id := range ids {
+		snapshot := snapshots[id]
+		usage := BranchDataUsage{ID: id, Inodes: snapshot.inodes}
+		for object, size := range snapshot.objects {
+			if objectBranches[object] > 1 {
+				usage.SharedBytes += size
+			} else {
+				usage.PrivateBytes += size
+			}
+		}
+		usage.TotalBytes = usage.PrivateBytes + usage.SharedBytes
+		result.Branches = append(result.Branches, usage)
+	}
+	for _, size := range objectSizes {
+		result.UniqueBytes += size
+	}
+	return result, nil
+}
+
 // BranchDiff returns paths changed by branchID relative to the immutable
 // metadata layer beneath its current writable layer. It reads TTC metadata;
 // it does not walk materialized host or guest directory trees.

@@ -84,9 +84,10 @@ type InternalConsoleObservation struct {
 type InternalConsole struct {
 	mu sync.Mutex `state:"nosave"`
 
-	terminal    bool
-	stdinClosed bool
-	master      *vfs.FileDescription
+	sessionEpoch uint64
+	terminal     bool
+	stdinClosed  bool
+	master       *vfs.FileDescription
 
 	stdin  *vfs.FileDescription
 	stdout *vfs.FileDescription
@@ -108,7 +109,7 @@ func (k *Kernel) ObserveInternalConsole(ctx context.Context, id string) (Interna
 	console.mu.Lock()
 	defer console.mu.Unlock()
 	observation := InternalConsoleObservation{
-		Version: 1, SessionEpoch: 1, Terminal: console.terminal,
+		Version: 1, SessionEpoch: console.sessionEpoch, Terminal: console.terminal,
 		MonotonicNS: k.MonotonicClock().Now().Nanoseconds(),
 	}
 	if !console.terminal {
@@ -176,10 +177,12 @@ func (k *Kernel) NewInternalConsoleFDTable(ctx context.Context, id string) (*FDT
 	if k.internalConsoles == nil {
 		k.internalConsoles = make(map[string]*InternalConsole)
 	}
+	k.nextInternalConsoleEpoch++
 	console := &InternalConsole{
-		stdin:  pairs[0].writer,
-		stdout: pairs[1].reader,
-		stderr: pairs[2].reader,
+		sessionEpoch: k.nextInternalConsoleEpoch,
+		stdin:        pairs[0].writer,
+		stdout:       pairs[1].reader,
+		stderr:       pairs[2].reader,
 	}
 	k.internalConsoles[id] = console
 	k.internalConsolesMu.Unlock()
@@ -228,7 +231,8 @@ func (k *Kernel) NewInternalTTYConsoleFDTable(ctx context.Context, id string, ma
 		k.internalConsoles = make(map[string]*InternalConsole)
 	}
 	master.IncRef()
-	console := &InternalConsole{terminal: true, master: master}
+	k.nextInternalConsoleEpoch++
+	console := &InternalConsole{sessionEpoch: k.nextInternalConsoleEpoch, terminal: true, master: master}
 	k.internalConsoles[id] = console
 	k.internalConsolesMu.Unlock()
 

@@ -17,6 +17,7 @@ package cmd
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
 	"strings"
@@ -24,6 +25,44 @@ import (
 	"testing"
 	"time"
 )
+
+func TestDaemonJSONFrameWriterFramesCompleteObjects(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	var writeMu sync.Mutex
+	w := &daemonJSONFrameWriter{conn: server, mu: &writeMu, typ: daemonFrameTTYState}
+	done := make(chan error, 1)
+	go func() {
+		if _, err := w.Write([]byte(`{"version":1`)); err != nil {
+			done <- err
+			return
+		}
+		_, err := w.Write([]byte("}\n{\"version\":2}\n"))
+		done <- err
+	}()
+	for want := 1; want <= 2; want++ {
+		typ, payload, err := readDaemonFrame(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ != daemonFrameTTYState {
+			t.Fatalf("frame type=%q, want %q", typ, daemonFrameTTYState)
+		}
+		var got struct {
+			Version int `json:"version"`
+		}
+		if err := json.Unmarshal(payload, &got); err != nil {
+			t.Fatalf("payload %q: %v", payload, err)
+		}
+		if got.Version != want {
+			t.Fatalf("version=%d, want %d", got.Version, want)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestDaemonStdinFlowControlWindow(t *testing.T) {
 	flow := newDaemonStdinFlow()

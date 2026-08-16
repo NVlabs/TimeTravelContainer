@@ -526,6 +526,13 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 		},
 		unix.SYS_FLOCK: seccomp.Or{
+			// Sparse dehydration readers hold a shared repository lock while
+			// opening immutable chunks. Peer restore runs after the Sentry's
+			// filters are installed, unlike cold restore during boot.
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.LOCK_SH),
+			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(unix.LOCK_EX),

@@ -23,11 +23,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
@@ -576,6 +578,81 @@ func (r *MemoryRepository) ListBranches() (map[string]ManifestID, error) {
 			return nil, fmt.Errorf("reading TTC memory branch %q: %w", decoded, err)
 		}
 		result[string(decoded)] = manifest
+	}
+	return result, nil
+}
+
+// BranchMemoryUsage accounts durable logical pages named by one branch root.
+type BranchMemoryUsage struct {
+	ID           string `json:"id"`
+	PrivateBytes uint64 `json:"private_bytes"`
+	SharedBytes  uint64 `json:"shared_bytes"`
+	TotalBytes   uint64 `json:"total_bytes"`
+}
+
+// BranchSetMemoryUsage accounts durable page sharing across branch roots.
+type BranchSetMemoryUsage struct {
+	Branches    []BranchMemoryUsage `json:"branches"`
+	UniqueBytes uint64              `json:"unique_bytes"`
+}
+
+// BranchSetUsage reads immutable manifests and classifies their logical page
+// versions. Consumed chunk objects need not remain on disk: their manifest
+// identities still describe CoW relationships with hydrated or remote peers.
+func (r *MemoryRepository) BranchSetUsage(branches map[string]string) (BranchSetMemoryUsage, error) {
+	ids := make([]string, 0, len(branches))
+	for id := range branches {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	sets := make(map[string]map[pgalloc.PageVersionID]struct{}, len(ids))
+	counts := make(map[pgalloc.PageVersionID]uint32)
+	available := make(map[ID]bool)
+	checked := make(map[ID]bool)
+	for _, id := range ids {
+		manifestID, err := r.Branch(branches[id])
+		if err != nil {
+			return BranchSetMemoryUsage{}, err
+		}
+		manifest, err := r.LoadManifest(manifestID)
+		if err != nil {
+			return BranchSetMemoryUsage{}, err
+		}
+		pages := make(map[pgalloc.PageVersionID]struct{})
+		for _, run := range manifest.Runs {
+			if !checked[run.Object] {
+				checked[run.Object] = true
+				objectErr := r.chunks.Contains(run.Object)
+				if objectErr != nil && !errors.Is(objectErr, os.ErrNotExist) {
+					return BranchSetMemoryUsage{}, objectErr
+				}
+				available[run.Object] = objectErr == nil
+			}
+			if !available[run.Object] {
+				continue
+			}
+			for page := uint16(0); page < run.Pages; page++ {
+				version := pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + uint64(page)}
+				pages[version] = struct{}{}
+			}
+		}
+		sets[id] = pages
+		for version := range pages {
+			counts[version]++
+		}
+	}
+	result := BranchSetMemoryUsage{Branches: make([]BranchMemoryUsage, 0, len(ids)), UniqueBytes: uint64(len(counts)) * hostarch.PageSize}
+	for _, id := range ids {
+		usage := BranchMemoryUsage{ID: id}
+		for version := range sets[id] {
+			if counts[version] > 1 {
+				usage.SharedBytes += hostarch.PageSize
+			} else {
+				usage.PrivateBytes += hostarch.PageSize
+			}
+		}
+		usage.TotalBytes = usage.PrivateBytes + usage.SharedBytes
+		result.Branches = append(result.Branches, usage)
 	}
 	return result, nil
 }

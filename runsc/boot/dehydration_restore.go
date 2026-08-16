@@ -52,8 +52,15 @@ type DurableDehydrationRestoreArgs struct {
 	// SetNetworkArgs having reached the Loader yet.
 	NetworkArgs *CreateLinksAndRoutesArgs
 	// UseDonatedMemoryFiles selects peer import into an already-running Sentry.
-	// Files then contains metadata, N snapshots, and N empty target files.
+	// Files then contains metadata, N snapshots, and N empty target files. A
+	// sparse restore substitutes its repository for snapshots; when application
+	// memory is reused, it donates only N-1 private target files.
 	UseDonatedMemoryFiles bool
+	// ReusePeerApplicationMemoryFile installs sparse application chunks into
+	// the active family's shared MemoryFile instead of a newly donated memfd.
+	// This lets siblings restored from the same durable manifest share the
+	// same resident host pages and retain 4 KiB CoW behavior.
+	ReusePeerApplicationMemoryFile bool
 	// Sparse uses Files as metadata, memory repository, and (for peer import)
 	// one empty target file per metadata MemoryFile.
 	Sparse bool
@@ -273,6 +280,9 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	wantFiles := 1 + 2*n
 	if args.Sparse {
 		wantFiles = 2 + n
+		if args.ReusePeerApplicationMemoryFile {
+			wantFiles--
+		}
 	}
 	if got := len(args.FilePayload.Files); got != wantFiles {
 		return nil, fmt.Errorf("dehydration peer import got %d files, want %d", got, wantFiles)
@@ -297,11 +307,18 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 			}
 			loadMemories[i].Reader = stateio.NewFDReader(int32(snapshotFD), 1<<20, 64, 4)
 		}
+		if args.Sparse && args.ReusePeerApplicationMemoryFile && i == 0 {
+			continue
+		}
 		targetStart := 1 + n
 		if args.Sparse {
 			targetStart = 2
 		}
-		targetFD, err := unix.Dup(int(args.FilePayload.Files[targetStart+i].Fd()))
+		targetIndex := targetStart + i
+		if args.Sparse && args.ReusePeerApplicationMemoryFile {
+			targetIndex--
+		}
+		targetFD, err := unix.Dup(int(args.FilePayload.Files[targetIndex].Fd()))
 		if err != nil {
 			cleanupMemories()
 			return nil, err
@@ -340,6 +357,14 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
 			if openErr != nil {
 				return nil, openErr
+			}
+			if args.ReusePeerApplicationMemoryFile {
+				if source.MemoryFile() == nil {
+					_ = repository.Close()
+					return nil, errors.New("active peer has no application MemoryFile")
+				}
+				source.MemoryFile().IncOwner()
+				loadMemories[0].MemoryFile = source.MemoryFile()
 			}
 			memoryFiles := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(loadMemories))
 			for i := range loadMemories {

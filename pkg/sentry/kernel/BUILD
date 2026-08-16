@@ -295,6 +295,7 @@ go_library(
         "ptrace_amd64.go",
         "ptrace_arm64.go",
         "rseq.go",
+        "resource_accounting.go",
         "running_tasks_mutex.go",
         "seccheck.go",
         "seccomp.go",
