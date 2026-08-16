@@ -61,9 +61,22 @@ Buffered SDK requests expose consecutive `S` objects as newline-delimited
 stdout records. Client frame types are `I` (stdin bytes), `C` (stdin EOF), and
 `W` (terminal resize).
 
+A `W` payload is eight bytes: a big-endian `uint32` row count followed by a
+big-endian `uint32` column count. `attach` does not begin streaming until the
+client reports a size, and fails with `timed out waiting for attached client
+terminal size` otherwise. A non-interactive caller must therefore send one `W`
+frame immediately after the header rather than waiting for a real resize.
+
 The bindings support non-interactive input and implement ttcd's 1 MiB stdin
 flow-control window. Interactive terminal ownership remains the responsibility
 of the `ttc` CLI.
+
+Bindings additionally expose a streaming form for operations that outlive one
+request/response exchange: `tty watch`, `events --follow`, `logs --follow`, and
+`attach`. A stream delivers frames through callbacks as they arrive and keeps
+stdin writable for the life of the operation. It must never send `C` implicitly,
+because stdin EOF terminates an interactive shell; closing stdin is always an
+explicit caller action.
 
 Every request ends with exactly one `X` frame unless the connection or daemon
 fails. A nonzero command status is an ordinary command result, not a wire error;

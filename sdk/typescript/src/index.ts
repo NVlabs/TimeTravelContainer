@@ -103,6 +103,260 @@ function frame(kind: string, payload: Uint8Array = new Uint8Array()): Buffer {
   return result;
 }
 
+/**
+ * Builds a `W` terminal-size frame.
+ *
+ * The payload is eight bytes: big-endian rows followed by big-endian columns,
+ * each a uint32. See `decodeDaemonTerminalSize` in runsc/ttc/cmd.
+ */
+function sizeFrame(rows: number, cols: number): Buffer {
+  const payload = Buffer.allocUnsafe(8);
+  payload.writeUInt32BE(rows >>> 0, 0);
+  payload.writeUInt32BE(cols >>> 0, 4);
+  return frame("W", payload);
+}
+
+/**
+ * Callbacks for a streaming operation. Every one is optional.
+ *
+ * `onObservation` receives one complete `S` frame payload. ttcd guarantees each
+ * such frame is a whole JSON object, so callers never reassemble across frame
+ * boundaries.
+ */
+export interface StreamHandlers {
+  onStdout?: (chunk: Buffer) => void;
+  onStderr?: (chunk: Buffer) => void;
+  onObservation?: (payload: Buffer) => void;
+  onTerminal?: (payload: Buffer) => void;
+}
+
+export interface StreamOptions extends StreamHandlers {
+  /**
+   * Declare an stdin channel. Required before `write` is legal. Unlike a
+   * buffered command, a stream never sends EOF implicitly: closing stdin
+   * terminates an interactive shell, so it must be an explicit act.
+   */
+  stdin?: boolean;
+  requestId?: string;
+  /**
+   * Abort after this many milliseconds. Endless operations such as
+   * `tty watch`, `events --follow`, and `attach` normally leave this unset.
+   */
+  timeoutMs?: number;
+  /**
+   * Terminal size to announce immediately after the header.
+   *
+   * `attach` blocks until the client reports one and fails with "timed out
+   * waiting for attached client terminal size", so a non-interactive caller
+   * must supply it. It is sent inside the connect handler rather than by a
+   * separate `resize` call, which would otherwise be queued ahead of the
+   * header.
+   */
+  size?: { rows: number; cols: number };
+}
+
+/**
+ * One live ttcd operation with incremental delivery.
+ *
+ * `Client.command` buffers to completion, which cannot express an endless
+ * `tty watch` stream or an `attach` that must stay writable for hours. A stream
+ * delivers frames as they arrive and keeps stdin open until the caller closes
+ * it or the daemon reports status.
+ */
+export class TtcStream {
+  readonly args: readonly string[];
+  /** Resolves with the command status, or rejects on a transport failure. */
+  readonly exited: Promise<number>;
+
+  private readonly socket: Socket;
+  private readonly handlers: StreamHandlers;
+  private receive: Buffer = Buffer.alloc(0);
+  private pending: Buffer[] = [];
+  private unacknowledged = 0;
+  private settled = false;
+  private eofSent = false;
+  private eofRequested = false;
+  /**
+   * Frames may only be written once the header has been sent. Node queues
+   * pre-connect writes and flushes them in order, so pumping early would put
+   * stdin bytes ahead of the JSON header and desynchronize the daemon.
+   */
+  private connected = false;
+  private readonly stdinDeclared: boolean;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private resolveExit!: (status: number) => void;
+  private rejectExit!: (error: Error) => void;
+
+  /**
+   * Takes the fully built request rather than reconstructing it, so that
+   * non-`command` actions such as `ping`, whose header carries no `args` or
+   * `stdin` keys at all, round-trip byte for byte.
+   */
+  constructor(socketPath: string, request: Record<string, unknown>, options: StreamOptions = {}) {
+    this.args = Array.isArray(request.args) ? [...(request.args as string[])] : [];
+    this.handlers = options;
+    this.stdinDeclared = options.stdin === true;
+    this.exited = new Promise<number>((res, rej) => {
+      this.resolveExit = res;
+      this.rejectExit = rej;
+    });
+    // Fire-and-forget streams are a normal usage, and without this Node reports
+    // an unhandled rejection when such a stream fails.
+    this.exited.catch(() => {});
+
+    this.socket = createConnection(socketPath);
+    this.socket.setNoDelay(true);
+
+    if (options.timeoutMs !== undefined) {
+      this.timer = setTimeout(
+        () => this.finish(new TTCError(`TTC operation timed out after ${options.timeoutMs} ms`)),
+        options.timeoutMs,
+      );
+      this.timer.unref?.();
+    }
+
+    this.socket.once("connect", () => {
+      this.socket.write(`${JSON.stringify(request)}\n`);
+      if (options.size) {
+        this.socket.write(sizeFrame(options.size.rows, options.size.cols));
+      }
+      this.connected = true;
+      this.pump();
+    });
+    this.socket.on("drain", () => this.pump());
+    this.socket.on("error", (error) => this.finish(error));
+    this.socket.on("close", () => {
+      if (!this.settled) {
+        this.finish(new ProtocolError("ttcd closed the connection before returning status"));
+      }
+    });
+    this.socket.on("data", (chunk: Buffer) => this.consume(chunk));
+  }
+
+  /**
+   * Queues stdin bytes, respecting ttcd's 1 MiB acknowledgement window. Data
+   * beyond the window waits for an `A` frame rather than being dropped.
+   */
+  write(data: Buffer | string): void {
+    if (!this.stdinDeclared) {
+      throw new TTCError("stream was not opened with stdin enabled");
+    }
+    if (this.eofSent) throw new TTCError("stdin already closed");
+    if (this.settled) return;
+    this.pending.push(typeof data === "string" ? Buffer.from(data) : data);
+    this.pump();
+  }
+
+  /**
+   * Requests stdin EOF, which ends an interactive shell.
+   *
+   * The `C` frame is sent only once every queued byte has been written. Input
+   * larger than the flow-control window is still in `pending` at this point,
+   * and discarding it would silently truncate the stream.
+   */
+  closeStdin(): void {
+    if (!this.stdinDeclared || this.eofRequested || this.settled) return;
+    this.eofRequested = true;
+    this.pump();
+  }
+
+  /** Sends a `W` resize frame carrying big-endian rows then columns. */
+  resize(rows: number, cols: number): void {
+    if (this.settled) return;
+    this.socket.write(sizeFrame(rows, cols));
+  }
+
+  /** Drops the connection without waiting for a status frame. */
+  close(): void {
+    this.finish(undefined, 0);
+  }
+
+  private pump(): void {
+    if (this.settled || !this.connected) return;
+    while (this.pending.length > 0 && this.unacknowledged < STDIN_WINDOW) {
+      const head = this.pending[0]!;
+      const size = Math.min(MAX_FRAME, STDIN_WINDOW - this.unacknowledged, head.length);
+      const payload = head.subarray(0, size);
+      if (size === head.length) this.pending.shift();
+      else this.pending[0] = head.subarray(size);
+      this.unacknowledged += size;
+      if (!this.socket.write(frame("I", payload))) return;
+    }
+    if (this.eofRequested && !this.eofSent && this.pending.length === 0) {
+      this.eofSent = true;
+      this.socket.write(frame("C"));
+    }
+  }
+
+  private consume(chunk: Buffer): void {
+    this.receive = this.receive.length === 0 ? chunk : Buffer.concat([this.receive, chunk]);
+    while (this.receive.length >= 5) {
+      const length = this.receive.readUInt32BE(1);
+      if (length > MAX_FRAME) {
+        this.finish(new ProtocolError(`oversized TTC frame: ${length} bytes`));
+        return;
+      }
+      if (this.receive.length < 5 + length) return;
+      const kind = String.fromCharCode(this.receive[0]!);
+      const payload = Buffer.from(this.receive.subarray(5, 5 + length));
+      this.receive = this.receive.subarray(5 + length);
+      if (!this.dispatch(kind, payload)) return;
+    }
+  }
+
+  /** Returns false once the stream has settled and parsing must stop. */
+  private dispatch(kind: string, payload: Buffer): boolean {
+    switch (kind) {
+      case "O":
+        this.handlers.onStdout?.(payload);
+        return true;
+      case "E":
+        this.handlers.onStderr?.(payload);
+        return true;
+      case "S":
+        this.handlers.onObservation?.(payload);
+        return true;
+      case "T":
+        this.handlers.onTerminal?.(payload);
+        return true;
+      case "A": {
+        if (payload.length !== 4) {
+          this.finish(new ProtocolError("invalid stdin acknowledgement"));
+          return false;
+        }
+        const acknowledged = payload.readUInt32BE(0);
+        if (acknowledged > this.unacknowledged) {
+          this.finish(new ProtocolError("ttcd acknowledged unsent stdin"));
+          return false;
+        }
+        this.unacknowledged -= acknowledged;
+        this.pump();
+        return true;
+      }
+      case "X": {
+        if (payload.length !== 4) {
+          this.finish(new ProtocolError("invalid status frame"));
+          return false;
+        }
+        this.finish(undefined, payload.readUInt32BE(0));
+        return false;
+      }
+      default:
+        this.finish(new ProtocolError(`unexpected TTC frame ${JSON.stringify(kind)}`));
+        return false;
+    }
+  }
+
+  private finish(error?: Error, status?: number): void {
+    if (this.settled) return;
+    this.settled = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.socket.destroy();
+    if (error) this.rejectExit(error);
+    else this.resolveExit(status ?? 0);
+  }
+}
+
 export class Client {
   readonly socketPath: string;
   readonly timeoutMs: number;
@@ -322,132 +576,127 @@ export class Client {
     return this.command(["rm", ...(force ? ["--force"] : []), target]);
   }
 
-  private exchange(
+  /**
+   * Opens a streaming operation.
+   *
+   * Use this for anything that outlives a single request/response: `tty watch`,
+   * `events --follow`, `logs --follow`, and `attach`.
+   */
+  stream(args: readonly string[], options: StreamOptions = {}): TtcStream {
+    if (args.length === 0 || args.some((arg) => typeof arg !== "string")) {
+      throw new TypeError("args must be a non-empty array of strings");
+    }
+    return new TtcStream(
+      this.socketPath,
+      {
+        version: API_VERSION,
+        action: "command",
+        request_id: options.requestId ?? randomBytes(16).toString("hex"),
+        args: [...args],
+        stdin: options.stdin === true,
+      },
+      options,
+    );
+  }
+
+  /**
+   * Streams terminal observations for a named exec session.
+   *
+   * The Sentry pushes a snapshot on registration, coalesced snapshots after
+   * observable state changes, and a periodic heartbeat. Each payload delivered
+   * to `onObservation` is one complete JSON object.
+   *
+   * Observations do not follow a fork: a child branch starts with no observers,
+   * so watch the child explicitly after forking.
+   */
+  watchTty(target: string, session: string, handlers: StreamHandlers): TtcStream {
+    return this.stream(["tty", "watch", target, "--session", session], handlers);
+  }
+
+  /**
+   * Attaches to a branch's init console or a managed exec session.
+   *
+   * Stdin stays open until `closeStdin` or `close` is called. Sending EOF ends
+   * an interactive shell, so neither happens implicitly.
+   */
+  attach(
+    target: string,
+    options: {
+      exec?: string;
+      stdin?: boolean;
+      takeover?: boolean;
+      size?: { rows: number; cols: number };
+    } & StreamHandlers = {},
+  ): TtcStream {
+    const { exec, stdin = true, takeover = false, size, ...handlers } = options;
+    return this.stream(
+      [
+        "attach",
+        ...(stdin ? ["--interactive"] : ["--no-stdin"]),
+        ...(takeover ? ["--takeover"] : []),
+        ...(exec ? ["--exec", exec] : []),
+        target,
+      ],
+      // ttcd will not begin the attach until it learns a terminal size, so a
+      // programmatic caller that never resizes still needs a default.
+      { ...handlers, stdin, size: size ?? { rows: 24, cols: 80 } },
+    );
+  }
+
+  /** Follows the daemon lifecycle event log as newline-delimited JSON. */
+  watchEvents(
+    handlers: StreamHandlers & { since?: string; filters?: Readonly<Record<string, string>> } = {},
+  ): TtcStream {
+    const { since, filters, ...rest } = handlers;
+    const filterArgs = Object.entries(filters ?? {}).flatMap(([key, value]) => [
+      "--filter",
+      `${key}=${value}`,
+    ]);
+    return this.stream(
+      ["events", "--json", "--follow", ...(since ? ["--since", since] : []), ...filterArgs],
+      rest,
+    );
+  }
+
+  /** Follows init or managed exec session logs. */
+  followLogs(
+    target: string,
+    options: { exec?: string; tail?: string | number } & StreamHandlers = {},
+  ): TtcStream {
+    const { exec, tail, ...handlers } = options;
+    return this.stream(
+      [
+        "logs",
+        "--follow",
+        ...(tail === undefined ? [] : ["-n", String(tail)]),
+        ...(exec ? ["--exec", exec] : []),
+        target,
+      ],
+      handlers,
+    );
+  }
+
+  private async exchange(
     request: Record<string, unknown>,
     input: Buffer | undefined,
     timeoutMs: number | undefined,
   ): Promise<Result> {
-    return new Promise((resolve, reject) => {
-      const socket = createConnection(this.socketPath);
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      let receive = Buffer.alloc(0);
-      let inputOffset = 0;
-      let unacknowledged = 0;
-      let eofSent = input === undefined;
-      let settled = false;
-
-      const finish = (error?: Error, result?: Result): void => {
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        if (error) reject(error);
-        else resolve(result!);
-      };
-
-      const timer = setTimeout(
-        () => finish(new TTCError(`ttcd operation timed out after ${timeoutMs ?? this.timeoutMs} ms`)),
-        timeoutMs ?? this.timeoutMs,
-      );
-      timer.unref();
-
-      const pumpInput = (): void => {
-        if (input === undefined || settled) return;
-        while (inputOffset < input.length && unacknowledged < STDIN_WINDOW) {
-          const size = Math.min(
-            MAX_FRAME,
-            STDIN_WINDOW - unacknowledged,
-            input.length - inputOffset,
-          );
-          const payload = input.subarray(inputOffset, inputOffset + size);
-          inputOffset += size;
-          unacknowledged += size;
-          if (!socket.write(frame("I", payload))) break;
-        }
-        if (inputOffset === input.length && !eofSent) {
-          eofSent = true;
-          socket.write(frame("C"));
-        }
-      };
-
-      socket.once("connect", () => {
-        socket.write(`${JSON.stringify(request)}\n`);
-        pumpInput();
-      });
-      socket.on("drain", pumpInput);
-      socket.on("error", (error) => finish(error));
-      socket.on("close", () => {
-        clearTimeout(timer);
-        if (!settled) {
-          finish(new ProtocolError("ttcd closed the connection before returning status"));
-        }
-      });
-      socket.on("data", (chunk: Buffer) => {
-        receive = Buffer.concat([receive, chunk]);
-        while (receive.length >= 5) {
-          const length = receive.readUInt32BE(1);
-          if (length > MAX_FRAME) {
-            clearTimeout(timer);
-            finish(new ProtocolError(`oversized ttcd frame: ${length} bytes`));
-            return;
-          }
-          if (receive.length < 5 + length) return;
-          const kind = String.fromCharCode(receive[0]);
-          const payload = receive.subarray(5, 5 + length);
-          receive = receive.subarray(5 + length);
-          switch (kind) {
-            case "O":
-              stdout.push(Buffer.from(payload));
-              break;
-            case "S":
-              // Terminal observations are complete JSON objects. Preserve
-              // frame boundaries as newline-delimited stdout records.
-              stdout.push(Buffer.from(payload), Buffer.from("\n"));
-              break;
-            case "E":
-              stderr.push(Buffer.from(payload));
-              break;
-            case "A": {
-              if (payload.length !== 4) {
-                clearTimeout(timer);
-                finish(new ProtocolError("invalid stdin acknowledgement"));
-                return;
-              }
-              const acknowledged = payload.readUInt32BE(0);
-              if (acknowledged > unacknowledged) {
-                clearTimeout(timer);
-                finish(new ProtocolError("ttcd acknowledged unsent stdin"));
-                return;
-              }
-              unacknowledged -= acknowledged;
-              pumpInput();
-              break;
-            }
-            case "T":
-              break;
-            case "X":
-              if (payload.length !== 4) {
-                clearTimeout(timer);
-                finish(new ProtocolError("invalid status frame"));
-                return;
-              }
-              clearTimeout(timer);
-              finish(
-                undefined,
-                new Result(
-                  payload.readUInt32BE(0),
-                  Buffer.concat(stdout),
-                  Buffer.concat(stderr),
-                ),
-              );
-              return;
-            default:
-              clearTimeout(timer);
-              finish(new ProtocolError(`unexpected ttcd frame type ${JSON.stringify(kind)}`));
-              return;
-          }
-        }
-      });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const stream = new TtcStream(this.socketPath, request, {
+      stdin: input !== undefined,
+      timeoutMs: timeoutMs ?? this.timeoutMs,
+      onStdout: (chunk) => stdout.push(chunk),
+      onStderr: (chunk) => stderr.push(chunk),
+      // Terminal observations are complete JSON objects. Preserve frame
+      // boundaries as newline-delimited stdout records.
+      onObservation: (payload) => stdout.push(payload, Buffer.from("\n")),
     });
+    if (input !== undefined) {
+      stream.write(input);
+      stream.closeStdin();
+    }
+    const status = await stream.exited;
+    return new Result(status, Buffer.concat(stdout), Buffer.concat(stderr));
   }
 }

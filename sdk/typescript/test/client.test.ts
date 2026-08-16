@@ -186,3 +186,100 @@ test("checkpoint normalizes the daemon-host path", async () => {
     },
   );
 });
+
+test("stream delivers observations as whole objects and reports status", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, ["tty", "watch", "demo@main", "--session", "repl"]);
+      assert.equal(request.stdin, false);
+      socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":1}')));
+      socket.write(frame("S", Buffer.from('{"version":1,"output_bytes":2}')));
+      socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
+    },
+    async (path) => {
+      const seen: number[] = [];
+      const stream = new Client(path).watchTty("demo@main", "repl", {
+        onObservation: (payload) => seen.push(JSON.parse(payload.toString()).output_bytes),
+      });
+      assert.equal(await stream.exited, 0);
+      // Each S frame is one whole JSON object, so no reassembly is required.
+      assert.deepEqual(seen, [1, 2]);
+    },
+  );
+});
+
+test("attach announces a terminal size before sending stdin", async () => {
+  await withServer(
+    (socket, request, rest) => {
+      assert.deepEqual(request.args, ["attach", "--interactive", "--exec", "repl", "demo@main"]);
+      assert.equal(request.stdin, true);
+      let receive = rest;
+      const frames: Array<{ kind: string; payload: Buffer }> = [];
+      const consume = (chunk?: Buffer): void => {
+        if (chunk) receive = Buffer.concat([receive, chunk]);
+        while (receive.length >= 5) {
+          const size = receive.readUInt32BE(1);
+          if (receive.length < 5 + size) return;
+          frames.push({
+            kind: String.fromCharCode(receive[0]),
+            payload: Buffer.from(receive.subarray(5, 5 + size)),
+          });
+          receive = receive.subarray(5 + size);
+          if (frames.length === 2) {
+            // The size must precede stdin: ttcd will not start the attach
+            // without it, and a non-interactive caller never resizes.
+            assert.equal(frames[0].kind, "W");
+            assert.equal(frames[0].payload.length, 8);
+            assert.equal(frames[0].payload.readUInt32BE(0), 40);
+            assert.equal(frames[0].payload.readUInt32BE(4), 120);
+            assert.equal(frames[1].kind, "I");
+            assert.equal(frames[1].payload.toString(), "echo hi\n");
+            socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
+          }
+        }
+      };
+      socket.on("data", consume);
+      consume();
+    },
+    async (path) => {
+      const stream = new Client(path).attach("demo@main", {
+        exec: "repl",
+        size: { rows: 40, cols: 120 },
+      });
+      stream.write("echo hi\n");
+      assert.equal(await stream.exited, 0);
+    },
+  );
+});
+
+test("stream never closes stdin implicitly", async () => {
+  await withServer(
+    (socket, request, rest) => {
+      assert.equal(request.stdin, true);
+      let receive = rest;
+      const kinds: string[] = [];
+      const consume = (chunk?: Buffer): void => {
+        if (chunk) receive = Buffer.concat([receive, chunk]);
+        while (receive.length >= 5) {
+          const size = receive.readUInt32BE(1);
+          if (receive.length < 5 + size) return;
+          kinds.push(String.fromCharCode(receive[0]));
+          receive = receive.subarray(5 + size);
+        }
+      };
+      socket.on("data", consume);
+      consume();
+      // Sending EOF would kill an interactive shell, so a stream that merely
+      // wrote input must not have produced a C frame.
+      setTimeout(() => {
+        assert.ok(!kinds.includes("C"), `unexpected EOF frame in ${kinds.join(",")}`);
+        socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
+      }, 60);
+    },
+    async (path) => {
+      const stream = new Client(path).stream(["attach", "demo@main"], { stdin: true });
+      stream.write("still open\n");
+      assert.equal(await stream.exited, 0);
+    },
+  );
+});
