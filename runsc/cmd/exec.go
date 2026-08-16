@@ -197,9 +197,6 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		e.ConsoleRows = uint16(ex.internalConsoleRows)
 		e.ConsoleCols = uint16(ex.internalConsoleCols)
 	}
-	if ex.execID != "" && e.InternalConsoleID == "" && !ex.pausedManagement {
-		util.Fatalf("--exec-id requires --internal-console")
-	}
 	if ex.pausedManagement && ex.execID == "" {
 		util.Fatalf("--paused-management requires --exec-id")
 	}
@@ -329,7 +326,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 
 	// Wait for the process to exit.
 	var ws unix.WaitStatus
-	if e.PausedManagement {
+	if e.ExecID != "" {
 		status, waitErr := c.Sandbox.WaitExecSession(&boot.ExecSessionArgs{
 			BranchID: e.BranchID,
 			ExecID:   e.ExecID,

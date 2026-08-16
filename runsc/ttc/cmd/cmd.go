@@ -2376,12 +2376,9 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 	}
-	execID := ""
-	if *detach {
-		execID, err = newExecID()
-		if err != nil {
-			return err
-		}
+	execID, err := newExecID()
+	if err != nil {
+		return err
 	}
 	status, err := backend.exec(execRequest{
 		detach:         *detach,
@@ -5753,12 +5750,18 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	}
 	args := []string{"--root", b.root, "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch}
 	consoleID := ""
-	if request.detach {
-		if request.execID == "" {
-			return 1, fmt.Errorf("detached exec requires a stable session ID")
+	execID := request.execID
+	if execID == "" {
+		var err error
+		execID, err = newExecID()
+		if err != nil {
+			return 1, fmt.Errorf("creating stable exec session ID: %w", err)
 		}
-		consoleID = "ttc-" + request.execID
-		args = append(args, "--detach", "--exec-id", request.execID, "--internal-console", consoleID)
+	}
+	args = append(args, "--exec-id", execID)
+	if request.detach {
+		consoleID = "ttc-" + execID
+		args = append(args, "--detach", "--internal-console", consoleID)
 	}
 
 	for _, value := range request.env {

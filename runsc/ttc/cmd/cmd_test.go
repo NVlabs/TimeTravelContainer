@@ -2174,6 +2174,9 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	if got := strings.Join(request.args, " "); got != "sh -c echo ok" {
 		t.Errorf("exec args=%q", got)
 	}
+	if !strings.HasPrefix(request.execID, "exec-") {
+		t.Errorf("attached exec has no stable session ID: %q", request.execID)
+	}
 }
 
 func TestExecProcessFileControlsCompleteProcess(t *testing.T) {
@@ -3434,14 +3437,15 @@ func TestRuntimeBackendExecUsesBranchFlag(t *testing.T) {
 if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
    [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
    [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
-   [ "$7" = "--env" ] && [ "$8" = "A=1" ] &&
-   [ "$9" = "--cwd" ] && [ "${10}" = "/work" ] &&
-   [ "${11}" = "--user" ] && [ "${12}" = "123:456" ] &&
-   [ "${13}" = "--additional-gids" ] && [ "${14}" = "12" ] &&
-   [ "${15}" = "--additional-gids" ] && [ "${16}" = "34" ] &&
-   [ "${17}" = "--cap" ] && [ "${18}" = "CAP_CHOWN" ] &&
-   [ "${19}" = "--cap" ] && [ "${20}" = "CAP_SYS_PTRACE" ] &&
-   [ "${21}" = "web" ] && [ "${22}" = "echo" ] && [ "${23}" = "ok" ]; then
+   [ "$7" = "--exec-id" ] && [ "$8" = "exec-test" ] &&
+   [ "$9" = "--env" ] && [ "${10}" = "A=1" ] &&
+   [ "${11}" = "--cwd" ] && [ "${12}" = "/work" ] &&
+   [ "${13}" = "--user" ] && [ "${14}" = "123:456" ] &&
+   [ "${15}" = "--additional-gids" ] && [ "${16}" = "12" ] &&
+   [ "${17}" = "--additional-gids" ] && [ "${18}" = "34" ] &&
+   [ "${19}" = "--cap" ] && [ "${20}" = "CAP_CHOWN" ] &&
+   [ "${21}" = "--cap" ] && [ "${22}" = "CAP_SYS_PTRACE" ] &&
+   [ "${23}" = "web" ] && [ "${24}" = "echo" ] && [ "${25}" = "ok" ]; then
 	echo branch-output
 	exit 0
 fi
@@ -3455,6 +3459,7 @@ exit 2
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
 	status, err := b.exec(execRequest{
 		target:         selector{container: "web", branch: "child"},
+		execID:         "exec-test",
 		args:           []string{"echo", "ok"},
 		env:            []string{"A=1"},
 		cwd:            "/work",
@@ -3477,8 +3482,9 @@ func TestRuntimeBackendExecForwardsProcessFile(t *testing.T) {
 if [ "$1" = "--root" ] && [ "$2" = "/runtime" ] &&
    [ "$3" = "exec" ] && [ "$4" = "--ttc-allow-stopped-sandbox" ] &&
    [ "$5" = "--branch" ] && [ "$6" = "child" ] &&
-   [ "$7" = "--process" ] && [ "$8" = "/process.json" ] &&
-   [ "$9" = "web" ] && [ -z "${10}" ]; then
+   [ "$7" = "--exec-id" ] && [ "$8" = "exec-test" ] &&
+   [ "$9" = "--process" ] && [ "${10}" = "/process.json" ] &&
+   [ "${11}" = "web" ] && [ -z "${12}" ]; then
 	exit 0
 fi
 echo "unexpected command: $*" >&2
@@ -3491,6 +3497,7 @@ exit 2
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, stderr: &stderr}
 	status, err := b.exec(execRequest{
 		target:      selector{container: "web", branch: "child"},
+		execID:      "exec-test",
 		processPath: "/process.json",
 	})
 	if err != nil || status != 0 {

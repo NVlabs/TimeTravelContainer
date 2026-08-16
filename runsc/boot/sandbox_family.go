@@ -1347,9 +1347,6 @@ func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecA
 	if args.ExecID == "" {
 		return nil
 	}
-	if args.InternalConsoleID == "" && !args.PausedManagement {
-		return fmt.Errorf("exec session %q requires a Sentry-owned internal console", args.ExecID)
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := b.execSessions[args.ExecID]; ok {
