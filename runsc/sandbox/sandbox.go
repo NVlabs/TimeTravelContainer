@@ -2461,6 +2461,36 @@ func (s *Sandbox) ObserveConsole(args *boot.ConsoleObservationArgs) (kernel.Inte
 	return result, nil
 }
 
+// WatchConsole copies newline-delimited, Sentry-driven terminal observations
+// to output until the branch changes lifecycle, the client disconnects, or an
+// error occurs. The long-lived uRPC replaces client-side observation polling.
+func (s *Sandbox) WatchConsole(args *boot.ConsoleObservationArgs, output io.Writer) error {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("creating console watch pipe: %w", err)
+	}
+	copyDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(output, reader)
+		_ = reader.Close()
+		copyDone <- copyErr
+	}()
+	watchArgs := &boot.ConsoleWatchArgs{
+		FilePayload:            urpc.FilePayload{Files: []*os.File{writer}},
+		ConsoleObservationArgs: *args,
+	}
+	callErr := s.call(boot.ContMgrConsoleWatch, watchArgs, nil)
+	_ = writer.Close()
+	copyErr := <-copyDone
+	if copyErr != nil {
+		return fmt.Errorf("copying terminal observations: %w", copyErr)
+	}
+	if callErr != nil {
+		return fmt.Errorf("watching internal console %q in branch %q: %w", args.ConsoleID, args.BranchID, callErr)
+	}
+	return nil
+}
+
 // WaitConsole waits for branch-local internal-console I/O readiness.
 func (s *Sandbox) WaitConsole(args *boot.ConsoleWaitArgs) (boot.ConsoleWaitResult, error) {
 	var result boot.ConsoleWaitResult

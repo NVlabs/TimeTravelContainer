@@ -116,6 +116,11 @@ type lineDiscipline struct {
 	// replicaWaiter is used to wait on the replica end of the TTY.
 	replicaWaiter waiter.Queue
 
+	// observationWaiter notifies TTC terminal observers after observable state
+	// changes. Registrations are control-plane runtime state and are therefore
+	// transient across save, live fork, and dehydration.
+	observationWaiter waiter.Queue
+
 	// terminal is the terminal linked to this lineDiscipline.
 	terminal *Terminal
 
@@ -202,6 +207,7 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 	} else {
 		l.termiosMu.Unlock()
 	}
+	l.notifyObservation()
 
 	return 0, nil
 }
@@ -232,6 +238,7 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	} else {
 		l.termiosMu.Unlock()
 	}
+	l.notifyObservation()
 
 	return 0, nil
 }
@@ -296,6 +303,7 @@ func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSeque
 		return 0, err
 	}
 	if n > 0 {
+		l.notifyObservation()
 		if notifyEcho {
 			l.masterWaiter.Notify(waiter.ReadableEvents | waiter.WritableEvents)
 		} else {
@@ -307,6 +315,7 @@ func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSeque
 		return n, nil
 	}
 	if notifyEcho {
+		l.notifyObservation()
 		l.masterWaiter.Notify(waiter.ReadableEvents)
 	}
 	if !pushed && isCanon {
@@ -327,6 +336,7 @@ func (l *lineDiscipline) inputQueueWrite(ctx context.Context, src usermem.IOSequ
 		l.masterWaiter.Notify(waiter.ReadableEvents)
 	}
 	if n > 0 {
+		l.notifyObservation()
 		l.replicaWaiter.Notify(waiter.ReadableEvents)
 		return n, nil
 	}
@@ -353,6 +363,7 @@ func (l *lineDiscipline) outputQueueRead(ctx context.Context, dst usermem.IOSequ
 		return 0, err
 	}
 	if n > 0 {
+		l.notifyObservation()
 		l.replicaWaiter.Notify(waiter.WritableEvents)
 		if pushed {
 			l.masterWaiter.Notify(waiter.ReadableEvents)
@@ -370,6 +381,9 @@ func (l *lineDiscipline) outputQueueWrite(ctx context.Context, src usermem.IOSeq
 	if err != nil {
 		return 0, err
 	}
+	if n > 0 {
+		l.notifyObservation()
+	}
 	l.masterWaiter.Notify(waiter.ReadableEvents)
 	return n, nil
 }
@@ -377,8 +391,9 @@ func (l *lineDiscipline) outputQueueWrite(ctx context.Context, src usermem.IOSeq
 // replicaOpen is called when a replica file descriptor is opened.
 func (l *lineDiscipline) replicaOpen() {
 	l.termiosMu.Lock()
-	defer l.termiosMu.Unlock()
 	l.numReplicas++
+	l.termiosMu.Unlock()
+	l.notifyObservation()
 }
 
 // replicaClose is called when a replica file descriptor is closed.
@@ -387,6 +402,7 @@ func (l *lineDiscipline) replicaClose() {
 	l.numReplicas--
 	notify := l.numReplicas == 0
 	l.termiosMu.Unlock()
+	l.notifyObservation()
 	if notify {
 		l.masterWaiter.Notify(waiter.EventHUp)
 	}
@@ -400,6 +416,7 @@ func (l *lineDiscipline) replicaReadWaiter(delta int) {
 		l.replicaReadWaiters--
 	}
 	l.termiosMu.Unlock()
+	l.notifyObservation()
 }
 
 func (l *lineDiscipline) replicaBlockedReader(delta int) {
@@ -410,20 +427,60 @@ func (l *lineDiscipline) replicaBlockedReader(delta int) {
 		l.replicaBlockedReaders--
 	}
 	l.termiosMu.Unlock()
+	l.notifyObservation()
 }
 
 func (l *lineDiscipline) observeForeground(pgid int32) {
+	l.termiosMu.RLock()
+	unchanged := l.foregroundPGID == pgid
+	l.termiosMu.RUnlock()
+	if unchanged {
+		return
+	}
 	l.termiosMu.Lock()
+	changed := false
 	if l.foregroundPGID != pgid {
 		l.foregroundPGID = pgid
 		l.foregroundPGIDGeneration++
+		changed = true
 	}
 	l.termiosMu.Unlock()
+	if changed {
+		l.notifyObservation()
+	}
 }
 
-func (l *lineDiscipline) observation() kernel.InternalConsoleObservation {
-	// Preserve the documented lock order: termiosMu, inQueue.mu, outQueue.mu.
+// observation returns one internally coherent snapshot. The common path takes
+// only termiosMu for reading. A live foreground process-group value upgrades
+// to the write lock only when the durable mirror actually changed.
+func (l *lineDiscipline) observation(foregroundPGID int32, haveForeground bool, sessionLeaderPID int32) kernel.InternalConsoleObservation {
 	l.termiosMu.RLock()
+	if haveForeground && l.foregroundPGID != foregroundPGID {
+		l.termiosMu.RUnlock()
+		l.termiosMu.Lock()
+		changed := l.foregroundPGID != foregroundPGID
+		if changed {
+			l.foregroundPGID = foregroundPGID
+			l.foregroundPGIDGeneration++
+		}
+		observation := l.observationLocked(sessionLeaderPID)
+		l.termiosMu.Unlock()
+		if changed {
+			l.notifyObservation()
+		}
+		return observation
+	}
+	observation := l.observationLocked(sessionLeaderPID)
+	l.termiosMu.RUnlock()
+	return observation
+}
+
+// observationLocked snapshots all terminal observation fields under one
+// termios critical section.
+//
+// Preconditions: l.termiosMu must be held for reading or writing.
+func (l *lineDiscipline) observationLocked(sessionLeaderPID int32) kernel.InternalConsoleObservation {
+	// Preserve the documented lock order: termiosMu, inQueue.mu, outQueue.mu.
 	l.inQueue.mu.Lock()
 	l.outQueue.mu.Lock()
 	observation := kernel.InternalConsoleObservation{
@@ -437,14 +494,26 @@ func (l *lineDiscipline) observation() kernel.InternalConsoleObservation {
 		TermiosGeneration:        l.termiosGeneration,
 		ForegroundPGID:           l.foregroundPGID,
 		ForegroundPGIDGeneration: l.foregroundPGIDGeneration,
+		SessionLeaderPID:         sessionLeaderPID,
 		OutputBytes:              l.outputBytes,
 		InputFlushGeneration:     l.inputFlushGeneration,
 		ReplicaOpenCount:         uint64(l.numReplicas),
 	}
 	l.outQueue.mu.Unlock()
 	l.inQueue.mu.Unlock()
-	l.termiosMu.RUnlock()
 	return observation
+}
+
+func (l *lineDiscipline) notifyObservation() {
+	l.observationWaiter.Notify(waiter.EventInternal)
+}
+
+func (l *lineDiscipline) observationEventRegister(entry *waiter.Entry) {
+	l.observationWaiter.EventRegister(entry)
+}
+
+func (l *lineDiscipline) observationEventUnregister(entry *waiter.Entry) {
+	l.observationWaiter.EventUnregister(entry)
 }
 
 // transformer is a helper interface to make it easier to stateify queue.
@@ -894,6 +963,7 @@ func (l *lineDiscipline) tcFlush(endpoint ptyEndpoint, arg uint32) error {
 		l.inputFlushGeneration++
 		l.termiosMu.Unlock()
 	}
+	l.notifyObservation()
 	l.notifyPacketStatus(l.packetStatusForFlush(endpoint, arg))
 	return nil
 }

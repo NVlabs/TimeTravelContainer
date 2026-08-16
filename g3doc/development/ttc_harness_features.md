@@ -28,7 +28,7 @@ memory, memory mappings, internal TCP and Unix sockets, pipes, epoll,
 
 | Capability | Status | Acceptance criteria |
 | --- | --- | --- |
-| TTY observation channel | verified | `ttc tty stat TARGET --session NAME --json` exposes saved/forked queue counters, exact blocked readers, readiness waiters, termios/foreground/flush generations, process-group identity, and the Sentry monotonic clock. `ttc tty watch` delivers complete JSON `S` frames, coalesces changes at 10 ms, and emits heartbeats. Each new internal console receives a durable `session_epoch`; live fork and dehydration preserve it. Verified through a local PTY fork/dehydrate/rehydrate sequence and SDK protocol tests. |
+| TTY observation channel | verified | `ttc tty stat TARGET --session NAME --json` exposes saved/forked queue counters, exact blocked readers, readiness waiters, termios/foreground/flush generations, process-group identity, and the Sentry monotonic clock. `ttc tty watch` uses Sentry-side change notification, coalesces bursts at 10 ms, and emits complete JSON `S` frames plus heartbeats without polling or a runsc subprocess. Each new internal console receives a durable `session_epoch`; live fork and dehydration preserve it. Verified through local fork/dehydrate/rehydrate, SDK protocol tests, and 50 concurrently watched hot PTYs. |
 | `ttc commit BRANCH IMAGE` | verified | Commit snapshots the branch filesystem without stopping it, emits a runnable OCI image, supports `--label`/`--label-file`, and preserves and overrides OCI labels through `image inspect`. Verified on an NFS-backed data root, including `timetravel.usage` label round-trip. |
 | `ttc stats` | verified | Reports per-branch private and CoW-shared resident mapped memory, durable sparse-memory backing, and persistent file-object bytes, plus non-double-counted family totals, in human and stable JSON forms. It deliberately excludes the Sentry Go heap and unmapped cache rather than presenting estimates as branch ownership. Verified under systrap, KVM, NFS, live remote fork, and cold remote/local fork. |
 | Named durable exec sessions | verified | `ttc exec --session NAME -d` creates a reusable name; attach/logs/wait/kill work after client disconnect; retained output is bounded by the existing durable ring buffer. Verified on systrap, KVM, NFS, and while a resource-stress process was live. |
@@ -81,6 +81,24 @@ feature is marked verified.
   after destroying the runtime and before reclaiming persistent artifacts. A
   later NFS or disk cleanup error therefore remains retryable instead of
   leaving metadata that falsely claims a deleted dehydration image is usable.
+- A harness review found that terminal observation polled at 100 Hz, performed
+  a foreground-process-group write-lock acquisition on every sample, and took
+  the foreground mirror and remaining fields in separate critical sections.
+  PTY mutations now notify a transient Sentry waiter; the Sentry performs the
+  10 ms coalescing and one-second heartbeat, while `ttcd` opens one streaming
+  uRPC directly instead of spawning runsc. The unchanged-foreground path uses
+  only `termiosMu.RLock`, upgrades only after a mismatch, and constructs all
+  mutable terminal fields in the same critical section. The human `tty stat`
+  view now includes input consumption, every generation, `session_epoch`, and
+  replica count.
+- The scale regression ran 50 independently hot PTYs with 50 simultaneous
+  watches. In two seconds all watches delivered 158--181 records, no
+  `console-watch` runsc process existed, and all 50 streams remained connected
+  while their source branch was batch-forked. An idle PTY emitted exactly the
+  initial record and two heartbeats in 2.3 seconds. Pause/resume preserved its
+  stream; dehydration terminated it with an explicit lifecycle error. Separate
+  runs passed with rootless host isolation, the KVM platform, an NFS-backed
+  data root, and a live remote-fork target served by a second clustered daemon.
 
 ## Live-fork failure audit
 

@@ -540,7 +540,9 @@ ttc tty watch web@test-b --session build1 --json
 The observation includes input-consumption and queue counters, blocked readers
 and readiness waiters, termios and foreground-process-group generations,
 output progress, flush detection, and the Sentry monotonic clock. TTC reports
-observations only; the harness decides what constitutes a ready prompt.
+observations only; the harness decides what constitutes a ready prompt. Watch
+streams are driven by changes inside the Sentry, with burst coalescing and
+heartbeats; they do not poll the sandbox or launch a helper runtime process.
 
 For `-t`, TTC propagates the invoking client's `TERM` value into a new
 container or exec process when the image/container and command do not already

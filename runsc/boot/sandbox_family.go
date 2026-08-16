@@ -334,6 +334,14 @@ type ConsoleObservationArgs struct {
 	ConsoleID string
 }
 
+// ConsoleWatchArgs streams terminal observations to the single file in
+// FilePayload. The Sentry emits an initial record, coalesced change records,
+// and heartbeats without client-side polling.
+type ConsoleWatchArgs struct {
+	urpc.FilePayload
+	ConsoleObservationArgs
+}
+
 // ConsoleWaitArgs waits for branch-local console I/O readiness. A zero timeout
 // performs a nonblocking readiness check.
 type ConsoleWaitArgs struct {
@@ -2828,6 +2836,30 @@ func (f *SandboxFamily) ConsoleObservation(args *ConsoleObservationArgs, out *ke
 	}
 	*out = observation
 	return nil
+}
+
+// ConsoleWatch streams Sentry-driven observations while holding a cancellable
+// Kernel-lifetime lease. Lifecycle operations cancel and join the transient
+// waiter before replacing or destroying the branch.
+func (f *SandboxFamily) ConsoleWatch(args *ConsoleObservationArgs, emit func(kernel.InternalConsoleObservation) error) error {
+	if args == nil || emit == nil {
+		return fmt.Errorf("missing internal console watch arguments or emitter")
+	}
+	for {
+		b, lease, done, err := f.beginConsoleWait(args.BranchID)
+		if err != nil {
+			return err
+		}
+		err = b.k.WatchInternalConsole(b.k.SupervisorContext(), args.ConsoleID, 10*time.Millisecond, time.Second, lease.cancel, emit)
+		done()
+		if err != nil {
+			return err
+		}
+		// A nil result means a lifecycle operation cancelled the transient
+		// registration. Reacquire after the operation releases opMu so a watch
+		// of a surviving fork source remains connected. Dehydration and removal
+		// fail beginConsoleWait above and terminate the stream.
+	}
 }
 
 // ConsoleWait blocks on Sentry endpoint readiness without retaining the branch

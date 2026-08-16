@@ -16,6 +16,7 @@ package boot
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -200,6 +201,9 @@ const (
 
 	// ContMgrConsoleObservation reads branch-local terminal state without I/O.
 	ContMgrConsoleObservation = "containerManager.ConsoleObservation"
+
+	// ContMgrConsoleWatch streams Sentry-driven terminal observations.
+	ContMgrConsoleWatch = "containerManager.ConsoleWatch"
 
 	// ContMgrConsoleWait waits for branch-local internal console readiness.
 	ContMgrConsoleWait = "containerManager.ConsoleWait"
@@ -1376,6 +1380,17 @@ func (cm *containerManager) ConsoleRead(args *ConsoleReadArgs, out *ConsoleReadR
 // ConsoleObservation returns terminal state without consuming its streams.
 func (cm *containerManager) ConsoleObservation(args *ConsoleObservationArgs, out *kernel.InternalConsoleObservation) error {
 	return cm.l.family.ConsoleObservation(args, out)
+}
+
+// ConsoleWatch streams newline-delimited terminal observation objects.
+func (cm *containerManager) ConsoleWatch(args *ConsoleWatchArgs, _ *struct{}) error {
+	if args == nil || len(args.FilePayload.Files) != 1 {
+		return fmt.Errorf("console watch requires exactly one output file")
+	}
+	encoder := json.NewEncoder(args.FilePayload.Files[0])
+	return cm.l.family.ConsoleWatch(&args.ConsoleObservationArgs, func(observation kernel.InternalConsoleObservation) error {
+		return encoder.Encode(&observation)
+	})
 }
 
 // ConsoleWait waits for branch-local internal console I/O readiness.

@@ -96,6 +96,8 @@ type InternalConsole struct {
 
 type internalConsoleObserver interface {
 	InternalConsoleObservation() InternalConsoleObservation
+	InternalConsoleObservationEventRegister(*waiter.Entry)
+	InternalConsoleObservationEventUnregister(*waiter.Entry)
 }
 
 // ObserveInternalConsole returns one coherent terminal observation without
@@ -125,6 +127,106 @@ func (k *Kernel) ObserveInternalConsole(ctx context.Context, id string) (Interna
 	terminal.MonotonicNS = observation.MonotonicNS
 	terminal.Terminal = true
 	return terminal, nil
+}
+
+// WatchInternalConsole emits an initial terminal observation, coalesced
+// snapshots after Sentry-side change notifications, and periodic heartbeats.
+// It performs no polling. cancel terminates the transient subscription during
+// branch lifecycle transitions.
+func (k *Kernel) WatchInternalConsole(ctx context.Context, id string, coalesce, heartbeat time.Duration, cancel <-chan struct{}, emit func(InternalConsoleObservation) error) error {
+	if coalesce <= 0 || heartbeat <= 0 {
+		return fmt.Errorf("internal console watch intervals must be positive")
+	}
+	console, err := k.internalConsole(id)
+	if err != nil {
+		return err
+	}
+	console.mu.Lock()
+	if !console.terminal {
+		console.mu.Unlock()
+		return fmt.Errorf("internal console %q is not a terminal", id)
+	}
+	master := console.master
+	master.IncRef()
+	sessionEpoch := console.sessionEpoch
+	console.mu.Unlock()
+	defer master.DecRef(ctx)
+
+	observer, ok := master.Impl().(internalConsoleObserver)
+	if !ok {
+		return fmt.Errorf("internal console %q master %T does not expose observations", id, master.Impl())
+	}
+	entry, changed := waiter.NewTransientChannelEntry(waiter.EventInternal)
+	observer.InternalConsoleObservationEventRegister(&entry)
+	defer observer.InternalConsoleObservationEventUnregister(&entry)
+
+	observe := func() InternalConsoleObservation {
+		observation := observer.InternalConsoleObservation()
+		observation.Version = 1
+		observation.SessionEpoch = sessionEpoch
+		observation.MonotonicNS = k.MonotonicClock().Now().Nanoseconds()
+		observation.Terminal = true
+		return observation
+	}
+	semantic := func(observation InternalConsoleObservation) InternalConsoleObservation {
+		observation.MonotonicNS = 0
+		return observation
+	}
+	last := observe()
+	if err := emit(last); err != nil {
+		return err
+	}
+
+	heartbeatTimer := time.NewTimer(heartbeat)
+	defer heartbeatTimer.Stop()
+	coalesceTimer := time.NewTimer(coalesce)
+	if !coalesceTimer.Stop() {
+		<-coalesceTimer.C
+	}
+	defer coalesceTimer.Stop()
+	resetHeartbeat := func() {
+		if !heartbeatTimer.Stop() {
+			select {
+			case <-heartbeatTimer.C:
+			default:
+			}
+		}
+		heartbeatTimer.Reset(heartbeat)
+	}
+	for {
+		select {
+		case <-cancel:
+			return nil
+		case <-heartbeatTimer.C:
+			last = observe()
+			if err := emit(last); err != nil {
+				return err
+			}
+			heartbeatTimer.Reset(heartbeat)
+		case <-changed:
+			coalesceTimer.Reset(coalesce)
+			select {
+			case <-cancel:
+				if !coalesceTimer.Stop() {
+					select {
+					case <-coalesceTimer.C:
+					default:
+					}
+				}
+				return nil
+			case <-coalesceTimer.C:
+			}
+			current := observe()
+			if semantic(current) == semantic(last) {
+				continue
+			}
+			if err := emit(current); err != nil {
+				return err
+			}
+			last = current
+			resetHeartbeat()
+		}
+	}
 }
 
 // NewInternalConsoleFDTable creates process stdio backed only by Sentry-owned

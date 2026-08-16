@@ -16,12 +16,56 @@ package devpts
 
 import (
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+func TestObservationNotificationsTrackPTYMutations(t *testing.T) {
+	ld := newLineDiscipline(linux.DefaultReplicaTermios, nil)
+	entry, changed := waiter.NewTransientChannelEntry(waiter.EventInternal)
+	ld.observationEventRegister(&entry)
+	defer ld.observationEventUnregister(&entry)
+	wantChange := func(label string) {
+		t.Helper()
+		select {
+		case <-changed:
+		case <-time.After(time.Second):
+			t.Fatalf("no observation notification after %s", label)
+		}
+	}
+	wantNoChange := func(label string) {
+		t.Helper()
+		select {
+		case <-changed:
+			t.Fatalf("unexpected observation notification after %s", label)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	ctx := contexttest.Context(t)
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("hello\n"))); err != nil {
+		t.Fatalf("inputQueueWrite: %v", err)
+	}
+	wantChange("input write")
+	if _, err := ld.inputQueueRead(ctx, usermem.BytesIOSequence(make([]byte, 16))); err != nil {
+		t.Fatalf("inputQueueRead: %v", err)
+	}
+	wantChange("input consumption")
+	ld.observeForeground(42)
+	wantChange("foreground change")
+	ld.observeForeground(42)
+	wantNoChange("unchanged foreground observation")
+
+	observation := ld.observation(43, true, 7)
+	if observation.ForegroundPGID != 43 || observation.ForegroundPGIDGeneration != 2 || observation.SessionLeaderPID != 7 {
+		t.Fatalf("observation after foreground upgrade: %+v", observation)
+	}
+	wantChange("foreground upgrade during snapshot")
+}
 
 func TestSimpleMasterToReplica(t *testing.T) {
 	ld := newLineDiscipline(linux.DefaultReplicaTermios, nil)

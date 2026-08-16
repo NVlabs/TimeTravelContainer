@@ -152,15 +152,27 @@ func (mfd *masterFileDescription) SetInternalConsoleWindowSize(size linux.Winsiz
 func (mfd *masterFileDescription) InternalConsoleObservation() kernel.InternalConsoleObservation {
 	tg := mfd.t.replicaKTTY.ThreadGroup()
 	if tg == nil {
-		return mfd.t.ld.observation()
+		return mfd.t.ld.observation(0, false, 0)
 	}
+	var foregroundPGID int32
+	haveForeground := false
 	if pgid, err := tg.ForegroundProcessGroupID(mfd.t.replicaKTTY); err == nil {
-		mfd.t.ld.observeForeground(int32(pgid))
+		foregroundPGID = int32(pgid)
+		haveForeground = true
 	}
-	observation := mfd.t.ld.observation()
 	namespace := tg.PIDNamespace()
-	observation.SessionLeaderPID = int32(namespace.IDOfSession(tg.Session()))
-	return observation
+	return mfd.t.ld.observation(foregroundPGID, haveForeground, int32(namespace.IDOfSession(tg.Session())))
+}
+
+// InternalConsoleObservationEventRegister registers a transient control-plane
+// observer for terminal state changes.
+func (mfd *masterFileDescription) InternalConsoleObservationEventRegister(entry *waiter.Entry) {
+	mfd.t.ld.observationEventRegister(entry)
+}
+
+// InternalConsoleObservationEventUnregister removes a terminal observer.
+func (mfd *masterFileDescription) InternalConsoleObservationEventUnregister(entry *waiter.Entry) {
+	mfd.t.ld.observationEventUnregister(entry)
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.

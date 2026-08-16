@@ -102,6 +102,26 @@ func TestTTYStatRoutesNamedSessionAndJSON(t *testing.T) {
 	}
 }
 
+func TestTTYStatHumanOutputIncludesCausalFields(t *testing.T) {
+	backend := &fakeBackend{ttyObservation: kernel.InternalConsoleObservation{
+		Version: 1, SessionEpoch: 9, InputConsumedBytes: 17,
+		TermiosGeneration: 2, ForegroundPGIDGeneration: 3,
+		InputFlushGeneration: 4, ReplicaOpenCount: 5,
+	}}
+	var stdout bytes.Buffer
+	if err := runTTY([]string{"stat", "demo@main", "--session", "build1"}, &stdout, backend); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"session_epoch=9", "input_consumed=17", "termios_generation=2",
+		"foreground_generation=3", "input_flush_generation=4", "replica_open_count=5",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("human observation %q does not contain %q", stdout.String(), want)
+		}
+	}
+}
+
 func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	backend := &fakeBackend{resourceStatsResult: FamilyResourceStats{
 		Container: "demo", ResidentMemoryUniqueBytes: 4096, FilesystemUniqueBytes: 8192,
@@ -4320,6 +4340,15 @@ func (b *fakeBackend) consoleObservation(target selector, session string) (kerne
 	b.ttyTarget = target
 	b.ttySession = session
 	return b.ttyObservation, b.err
+}
+
+func (b *fakeBackend) watchConsole(target selector, session string, output io.Writer) error {
+	b.ttyTarget = target
+	b.ttySession = session
+	if b.err != nil {
+		return b.err
+	}
+	return json.NewEncoder(output).Encode(&b.ttyObservation)
 }
 
 func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {

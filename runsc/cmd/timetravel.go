@@ -662,31 +662,9 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			ConsoleID: t.consoleID,
 		})
 	case "console-watch":
-		encoder := json.NewEncoder(&util.Writer{})
-		var last kernel.InternalConsoleObservation
-		lastEmit := time.Time{}
-		for {
-			observation, observeErr := cont.Sandbox.ObserveConsole(&boot.ConsoleObservationArgs{
-				BranchID: f.Arg(2), ConsoleID: t.consoleID,
-			})
-			if observeErr != nil {
-				err = observeErr
-				break
-			}
-			now := time.Now()
-			semanticLast, semanticCurrent := last, observation
-			semanticLast.MonotonicNS = 0
-			semanticCurrent.MonotonicNS = 0
-			if semanticLast != semanticCurrent || lastEmit.IsZero() || now.Sub(lastEmit) >= time.Second {
-				if encodeErr := encoder.Encode(&observation); encodeErr != nil {
-					err = encodeErr
-					break
-				}
-				last = observation
-				lastEmit = now
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		err = cont.Sandbox.WatchConsole(&boot.ConsoleObservationArgs{
+			BranchID: f.Arg(2), ConsoleID: t.consoleID,
+		}, &util.Writer{})
 	case "console-wait":
 		output, err = cont.Sandbox.WaitConsole(&boot.ConsoleWaitArgs{
 			BranchID:  f.Arg(2),

@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -3984,47 +3985,26 @@ func runTTY(args []string, stdout io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	if action == "watch" {
+		return backend.watchConsole(target, session, stdout)
+	}
 	observation, err := backend.consoleObservation(target, session)
 	if err != nil {
 		return fmt.Errorf("observing terminal session %q in %s: %w", session, target, err)
-	}
-	if action == "watch" {
-		if watcher, ok := backend.(interface {
-			watchConsole(selector, string, io.Writer) error
-		}); ok {
-			return watcher.watchConsole(target, session, stdout)
-		}
-		encoder := json.NewEncoder(stdout)
-		last := observation
-		lastEmit := time.Time{}
-		for {
-			now := time.Now()
-			semanticLast, semanticCurrent := last, observation
-			semanticLast.MonotonicNS = 0
-			semanticCurrent.MonotonicNS = 0
-			if semanticLast != semanticCurrent || lastEmit.IsZero() || now.Sub(lastEmit) >= time.Second {
-				if err := encoder.Encode(&observation); err != nil {
-					return err
-				}
-				last = observation
-				lastEmit = now
-			}
-			time.Sleep(10 * time.Millisecond)
-			observation, err = backend.consoleObservation(target, session)
-			if err != nil {
-				return fmt.Errorf("observing terminal session %q in %s: %w", session, target, err)
-			}
-		}
 	}
 	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(&observation)
 	}
-	_, err = fmt.Fprintf(stdout, "input_pending=%d readable=%t blocked_readers=%d waiters=%d canonical=%t echo=%t foreground_pgid=%d output_bytes=%d monotonic_ns=%d\n",
-		observation.InputPendingBytes, observation.InputReadable, observation.ReplicaBlockedReaders,
+	_, err = fmt.Fprintf(stdout, "version=%d session_epoch=%d input_pending=%d input_readable=%t input_consumed=%d blocked_readers=%d read_waiters=%d canonical=%t echo=%t termios_generation=%d foreground_pgid=%d foreground_generation=%d session_leader_pid=%d output_bytes=%d input_flush_generation=%d replica_open_count=%d monotonic_ns=%d\n",
+		observation.Version, observation.SessionEpoch, observation.InputPendingBytes,
+		observation.InputReadable, observation.InputConsumedBytes, observation.ReplicaBlockedReaders,
 		observation.ReplicaReadWaiters, observation.Canonical, observation.Echo,
-		observation.ForegroundPGID, observation.OutputBytes, observation.MonotonicNS)
+		observation.TermiosGeneration, observation.ForegroundPGID,
+		observation.ForegroundPGIDGeneration, observation.SessionLeaderPID,
+		observation.OutputBytes, observation.InputFlushGeneration,
+		observation.ReplicaOpenCount, observation.MonotonicNS)
 	return err
 }
 
@@ -5002,6 +4982,7 @@ type backend interface {
 	listFamilies() ([]Family, error)
 	processes(target selector) ([]ProcessInfo, error)
 	consoleObservation(target selector, session string) (kernel.InternalConsoleObservation, error)
+	watchConsole(target selector, session string, output io.Writer) error
 	rootfsSize(target selector) (uint64, error)
 	diff(target selector) ([]BranchPathChange, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
@@ -8723,48 +8704,34 @@ func (b *runtimeBackend) watchConsole(target selector, session string, stdout io
 	if err != nil {
 		return err
 	}
+	cont, err := container.Load(b.root, container.FullID{SandboxID: resolved.container, ContainerID: resolved.container}, container.LoadOpts{Exact: true, SkipCheck: true})
+	if err != nil {
+		return fmt.Errorf("loading sandbox for terminal watch: %w", err)
+	}
 	consoleID := "init"
 	if session != "init" {
-		execSession, err := b.execSession(resolved, session)
+		sessions, err := cont.Sandbox.ExecSessions(&boot.ExecSessionsArgs{BranchID: resolved.branch, CID: resolved.container})
 		if err != nil {
 			return err
+		}
+		var execSession *boot.ExecSessionInfo
+		for i := range sessions {
+			if sessions[i].ID == session {
+				execSession = &sessions[i]
+				break
+			}
+		}
+		if execSession == nil {
+			return fmt.Errorf("exec session %q does not exist in %s", session, resolved)
 		}
 		if !execSession.Terminal {
 			return fmt.Errorf("exec session %q is not a terminal", session)
 		}
 		consoleID = execSession.ConsoleID
 	}
-	command := runscCommand(b.runsc, "--root", b.root, "timetravel", "--console", consoleID, resolved.container, "console-watch", resolved.branch)
-	pipe, err := command.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	var stderr strings.Builder
-	command.Stderr = &stderr
-	if err := command.Start(); err != nil {
-		return err
-	}
-	scanner := bufio.NewScanner(pipe)
-	scanner.Buffer(make([]byte, 4096), daemonMaxFrame)
-	for scanner.Scan() {
-		if _, err := fmt.Fprintln(stdout, scanner.Text()); err != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-			return err
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return err
-	}
-	if err := command.Wait(); err != nil {
-		if message := strings.TrimSpace(stderr.String()); message != "" {
-			return fmt.Errorf("%s: %w", message, err)
-		}
-		return err
-	}
-	return nil
+	return cont.Sandbox.WatchConsole(&boot.ConsoleObservationArgs{
+		BranchID: resolved.branch, ConsoleID: consoleID,
+	}, stdout)
 }
 
 func (b *runtimeBackend) waitExecSession(target selector, execID string) (uint32, error) {
