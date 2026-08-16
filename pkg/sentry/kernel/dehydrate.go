@@ -273,7 +273,7 @@ func SyncAndDropDehydrationCache(captures []*DehydrationCapture) error {
 }
 
 func (d *DehydrationCapture) reserveMemoryFile(ctx context.Context, resourceID checkpoint.ResourceID, mf *pgalloc.MemoryFile) error {
-	allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, mf)
+	allocatorMetadata, regions, loads, snapshots, err := pgalloc.ExportMemoryFileMetadataAndSnapshotsForRemote(ctx, mf, 1)
 	if err != nil {
 		return err
 	}
@@ -286,10 +286,7 @@ func (d *DehydrationCapture) reserveMemoryFile(ctx context.Context, resourceID c
 		d.MemoryImages = append(d.MemoryImages, image)
 		return nil
 	}
-	reservation, err := pgalloc.NewRemoteSnapshot(regions)
-	if err != nil {
-		return err
-	}
+	reservation := snapshots[0]
 	image.StreamBytes = reservation.StreamBytes()
 	image.Snapshot = reservation
 	d.reservations = append(d.reservations, reservation)

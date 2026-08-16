@@ -315,7 +315,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		var remoteSnapshot *pgalloc.RemoteSnapshot
 		if opts.RemoteMemoryFile != nil {
 			childMemoryFile = opts.RemoteMemoryFile
-			allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
+			allocatorMetadata, _, loads, snapshots, err := pgalloc.ExportMemoryFileMetadataAndSnapshotsForRemote(ctx, k.mf, 1)
 			if err != nil {
 				childMemoryFile.Destroy()
 				return fmt.Errorf("exporting remote MemoryFile metadata: %w", err)
@@ -324,11 +324,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				childMemoryFile.Destroy()
 				return fmt.Errorf("importing remote MemoryFile metadata: %w", err)
 			}
-			snapshot, err := pgalloc.NewRemoteSnapshot(regions)
-			if err != nil {
-				childMemoryFile.Destroy()
-				return fmt.Errorf("creating remote memory snapshot: %w", err)
-			}
+			snapshot := snapshots[0]
 			var reader stateio.AsyncReader
 			if opts.RemotePageReaderFactory != nil {
 				reader, err = opts.RemotePageReaderFactory(snapshot)

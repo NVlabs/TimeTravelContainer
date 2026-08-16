@@ -424,8 +424,38 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 // page-stream layout without reading page contents. The returned bytes contain
 // no process-local pointers and may be sent to another Sentry process.
 func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) ([]byte, []RemoteSnapshotRegion, []RemoteLoadRange, error) {
+	metadata, regions, loads, _, err := exportMemoryFileMetadataForRemote(ctx, source, false)
+	return metadata, regions, loads, err
+}
+
+// ExportMemoryFileMetadataAndSnapshotsForRemote atomically exports source's
+// allocator layout and pins count snapshots of the exported page stream. The
+// temporary pin acquired while source.mu is held closes the gap in which a
+// sibling Kernel sharing source could otherwise free or recycle an exported
+// range before NewRemoteSnapshots acquires its reservation.
+func ExportMemoryFileMetadataAndSnapshotsForRemote(ctx context.Context, source *MemoryFile, count int) ([]byte, []RemoteSnapshotRegion, []RemoteLoadRange, []*RemoteSnapshot, error) {
+	metadata, regions, loads, temporaryPins, err := exportMemoryFileMetadataForRemote(ctx, source, true)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	defer func() {
+		for _, fr := range temporaryPins {
+			source.DecRef(fr)
+		}
+	}()
+	if len(regions) == 0 {
+		return metadata, regions, loads, nil, nil
+	}
+	snapshots, err := NewRemoteSnapshots(regions, count)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return metadata, regions, loads, snapshots, nil
+}
+
+func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, pin bool) ([]byte, []RemoteSnapshotRegion, []RemoteLoadRange, []memmap.FileRange, error) {
 	if source == nil {
-		return nil, nil, nil, errors.New("source MemoryFile is nil")
+		return nil, nil, nil, nil, errors.New("source MemoryFile is nil")
 	}
 	var metadata bytes.Buffer
 	var used []memmap.FileRange
@@ -437,8 +467,9 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	}
 	if len(source.evictable) != 0 {
 		source.mu.Unlock()
-		return nil, nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
+		return nil, nil, nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
 	}
+	defer source.mu.Unlock()
 	collectUsed := func(set *unfreeSet) {
 		for seg := set.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			if seg.ValuePtr().refs != 0 {
@@ -461,8 +492,7 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 		memAcct:          &source.memAcct,
 		chunks:           source.chunksLoad(),
 	}); err != nil {
-		source.mu.Unlock()
-		return nil, nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("saving remote MemoryFile metadata: %w", err)
 	}
 	sort.Slice(used, func(i, j int) bool { return used[i].Start < used[j].Start })
 	merged := used[:0]
@@ -473,8 +503,7 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 		}
 		last := &merged[len(merged)-1]
 		if fr.Start < last.End {
-			source.mu.Unlock()
-			return nil, nil, nil, fmt.Errorf("source MemoryFile used ranges overlap: %v and %v", *last, fr)
+			return nil, nil, nil, nil, fmt.Errorf("source MemoryFile used ranges overlap: %v and %v", *last, fr)
 		}
 		last.End = fr.End
 	}
@@ -509,11 +538,9 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 			}
 		}
 		if covered != usedRange.Length() {
-			source.mu.Unlock()
-			return nil, nil, nil, fmt.Errorf("logical page metadata covers %#x of used range %v", covered, usedRange)
+			return nil, nil, nil, nil, fmt.Errorf("logical page metadata covers %#x of used range %v", covered, usedRange)
 		}
 	}
-	source.mu.Unlock()
 	sort.Slice(pieces, func(i, j int) bool {
 		if cmp := bytes.Compare(pieces[i].chunk.Allocator[:], pieces[j].chunk.Allocator[:]); cmp != 0 {
 			return cmp < 0
@@ -565,7 +592,7 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 	}
 	pieces = grouped
 	if uint64(len(pieces)) > uint64(^RemoteRegionID(0)) {
-		return nil, nil, nil, fmt.Errorf("remote memory layout has %d logical pieces", len(pieces))
+		return nil, nil, nil, nil, fmt.Errorf("remote memory layout has %d logical pieces", len(pieces))
 	}
 	regions := make([]RemoteSnapshotRegion, 0, len(pieces))
 	loads := make([]RemoteLoadRange, 0, len(pieces))
@@ -578,7 +605,14 @@ func ExportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile) 
 		loads = append(loads, RemoteLoadRange{Target: piece.range_, StreamOffset: streamOffset})
 		streamOffset += piece.range_.Length()
 	}
-	return metadata.Bytes(), regions, loads, nil
+	var temporaryPins []memmap.FileRange
+	if pin {
+		temporaryPins = append(temporaryPins, used...)
+		for _, fr := range temporaryPins {
+			source.incRefLocked(fr)
+		}
+	}
+	return metadata.Bytes(), regions, loads, temporaryPins, nil
 }
 
 // ImportMemoryFileMetadataForRemote reconstructs allocator metadata exported

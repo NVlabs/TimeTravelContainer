@@ -1283,3 +1283,36 @@ func TestNewRemoteSnapshotRejectsOverlap(t *testing.T) {
 		t.Fatal("NewRemoteSnapshot accepted overlapping regions")
 	}
 }
+
+func TestRemoteExportPinsLayoutUntilSnapshotAcquiresReferences(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 2)
+	_, regions, _, temporaryPins, err := exportMemoryFileMetadataForRemote(context.Background(), mf, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temporaryPins) == 0 {
+		t.Fatal("remote export acquired no temporary pins")
+	}
+
+	// Model the sharing branch releasing its last ordinary reference after the
+	// allocator layout was exported but before the durable snapshot acquires
+	// its own reference. The temporary export pin must keep the range valid.
+	mf.DecRef(fr)
+	snapshot, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatalf("NewRemoteSnapshot after source release: %v", err)
+	}
+	for _, pinned := range temporaryPins {
+		mf.DecRef(pinned)
+	}
+
+	buf := make([]byte, fr.Length())
+	if n, err := snapshot.CopyStreamAt(buf, 0); err != nil || uint64(n) != fr.Length() {
+		t.Fatalf("CopyStreamAt got (%d, %v), want (%d, nil)", n, err, fr.Length())
+	}
+	// Restore the helper's cleanup reference before releasing the snapshot.
+	mf.IncRef(fr, 0)
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

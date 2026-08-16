@@ -228,11 +228,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			return fmt.Errorf("capturing distributed-fork kernel memory graph: %w", err)
 		}
 		k.mf.MarkSavable()
-		allocatorMetadata, regions, loads, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
-		if err != nil {
-			return err
-		}
-		snapshots, err := pgalloc.NewRemoteSnapshots(regions, len(childBranchIDs))
+		allocatorMetadata, regions, loads, snapshots, err := pgalloc.ExportMemoryFileMetadataAndSnapshotsForRemote(ctx, k.mf, len(childBranchIDs))
 		if err != nil {
 			return err
 		}
