@@ -368,6 +368,14 @@ func (rf *regularFile) flushDiskMetadata() error {
 func (rf *regularFile) copyOnWriteLocked(ctx context.Context, mr memmap.MappableRange) error {
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	for cowSeg := rf.cow.LowerBoundSegment(mr.Start); cowSeg.Ok() && cowSeg.Start() < mr.End; {
+		// LowerBoundSegment may return the segment immediately preceding mr
+		// when that segment ends exactly at mr.Start. It is adjacent, not an
+		// overlapping CoW range, and must not reach MemoryFile.Allocate with a
+		// zero length.
+		if cowSeg.End() <= mr.Start {
+			cowSeg = cowSeg.NextSegment()
+			continue
+		}
 		cowRange := cowSeg.Range().Intersect(mr)
 		cowSeg = rf.cow.Isolate(cowSeg, cowRange)
 		dataSeg := rf.data.FindSegment(cowRange.Start)

@@ -204,6 +204,34 @@ func TestLiveForkPWriteFromSameMemoryManagerDoesNotReenterActiveLock(t *testing.
 	}
 }
 
+func TestLiveForkCopyOnWriteSkipsAdjacentRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+
+	data := bytes.Repeat([]byte{'a'}, 2*hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
+	}
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	rf.prepareLiveFork()
+
+	// Leave a CoW range that ends exactly where the requested translation
+	// starts. FileRangeSet.LowerBoundSegment may return that preceding segment,
+	// but adjacency is not a zero-length CoW operation.
+	rf.dataMu.Lock()
+	rf.cow.RemoveRange(memmap.MappableRange{Start: hostarch.PageSize, End: 2 * hostarch.PageSize})
+	err = rf.copyOnWriteLocked(ctx, memmap.MappableRange{Start: hostarch.PageSize, End: 2 * hostarch.PageSize})
+	rf.dataMu.Unlock()
+	if err != nil {
+		t.Fatalf("copyOnWriteLocked for range adjacent to CoW state: %v", err)
+	}
+}
+
 // Test that we can write some data to a file and read it back.`
 func TestSimpleWriteRead(t *testing.T) {
 	ctx := contexttest.Context(t)
