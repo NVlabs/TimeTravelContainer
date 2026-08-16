@@ -480,7 +480,10 @@ func (s *Shm) afterLoad(ctx goContext.Context) {
 					logical = mr.End
 				}
 			}
-			*set = relocated
+			// Preserve the segment tree's internal parent links when replacing
+			// the restored set; a struct copy is invalid once the set has more
+			// than one tree level.
+			set.MoveFrom(&relocated)
 			return nil
 		}
 		if err := relocateSet(&s.data); err != nil {

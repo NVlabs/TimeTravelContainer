@@ -412,7 +412,14 @@ func (rf *regularFile) copyOnWriteLocked(ctx context.Context, mr memmap.Mappable
 		}
 		dataSeg.SetValue(newRange.Start)
 		rf.inode.fs.mf.DecRef(oldRange)
-		cowSeg = rf.cow.Remove(cowSeg).NextSegment()
+		gap := rf.cow.Remove(cowSeg)
+		// Removing the final CoW segment empties the set and returns a
+		// terminal gap. Calling NextSegment on that gap dereferences a nil
+		// set node. There cannot be more work when the set is empty.
+		if !gap.Ok() {
+			break
+		}
+		cowSeg = gap.NextSegment()
 	}
 	return nil
 }

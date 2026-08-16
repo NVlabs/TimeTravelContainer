@@ -232,6 +232,34 @@ func TestLiveForkCopyOnWriteSkipsAdjacentRange(t *testing.T) {
 	}
 }
 
+func TestLiveForkCopyOnWriteRemovesFinalRange(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fd, cleanup, err := newFileFD(ctx, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	defer fd.DecRef(ctx)
+
+	data := bytes.Repeat([]byte{'a'}, hostarch.PageSize)
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("initial PWrite: n=%d err=%v", n, err)
+	}
+	rf := fd.Impl().(*regularFileFD).inode().impl.(*regularFile)
+	rf.prepareLiveFork()
+
+	rf.dataMu.Lock()
+	err = rf.copyOnWriteLocked(ctx, memmap.MappableRange{Start: 0, End: hostarch.PageSize})
+	empty := rf.cow.IsEmpty()
+	rf.dataMu.Unlock()
+	if err != nil {
+		t.Fatalf("copyOnWriteLocked for final CoW range: %v", err)
+	}
+	if !empty {
+		t.Fatal("final CoW range was not removed")
+	}
+}
+
 // Test that we can write some data to a file and read it back.`
 func TestSimpleWriteRead(t *testing.T) {
 	ctx := contexttest.Context(t)

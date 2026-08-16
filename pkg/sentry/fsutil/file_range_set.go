@@ -57,7 +57,12 @@ func RelocateFileRangeSet(ctx goContext.Context, mf *pgalloc.MemoryFile, set *Fi
 			logical = mr.End
 		}
 	}
-	*set = relocated
+	// MoveFrom repairs the copied root's direct child parent pointers. A plain
+	// struct assignment leaves those children pointing at relocated.root; once
+	// the relocated set has enough segments to form an internal node, later
+	// removal mutates the copied root through stale tree links and corrupts the
+	// set.
+	set.MoveFrom(&relocated)
 	return nil
 }
 

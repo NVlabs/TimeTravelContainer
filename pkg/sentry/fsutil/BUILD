@@ -158,11 +158,14 @@ go_test(
     size = "small",
     srcs = [
         "dirty_set_test.go",
+        "file_range_set_test.go",
     ],
     library = ":fsutil",
     deps = [
         "//pkg/hostarch",
+        "//pkg/sentry/contexttest",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
     ],
 )
