@@ -959,6 +959,7 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 			Platform:   "linux/arm64/v8",
 			Containers: []string{"zeta", "alpha"},
 			CreatedAt:  created,
+			Labels:     map[string]string{"base.label": "kept"},
 		},
 		{
 			Reference:    "docker.io/library/busybox:stable",
@@ -982,6 +983,24 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 	}
 	if want := []string{"alpha", "zeta"}; !reflect.DeepEqual(got.Containers, want) {
 		t.Errorf("Containers=%q, want %q", got.Containers, want)
+	}
+	if got.Config.Labels["base.label"] != "kept" {
+		t.Errorf("Config.Labels=%v", got.Config.Labels)
+	}
+}
+
+func TestCommitCommandRoutesLabels(t *testing.T) {
+	digest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	b := &fakeBackend{commitInfo: ttcimages.Info{Digest: digest}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"commit", "--label", "timetravel.usage=agent-session", "demo@child", "example/session:v1"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("commit status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.commitTarget != (selector{container: "demo", branch: "child"}) || b.commitReference != "example/session:v1" || b.commitLabels["timetravel.usage"] != "agent-session" {
+		t.Fatalf("commit target=%+v reference=%q labels=%v", b.commitTarget, b.commitReference, b.commitLabels)
+	}
+	if stdout.String() != digest+"\n" {
+		t.Fatalf("commit output=%q", stdout.String())
 	}
 }
 
@@ -4085,6 +4104,10 @@ type fakeBackend struct {
 	imageRemoveID      string
 	imageRemoveForce   bool
 	imageRemoveResult  ImageRemoveResult
+	commitTarget       selector
+	commitReference    string
+	commitLabels       map[string]string
+	commitInfo         ttcimages.Info
 	runRequest         runRequest
 	containerID        string
 	runStatus          int
@@ -4212,6 +4235,13 @@ func (b *fakeBackend) removeImage(identifier string, force bool) (ImageRemoveRes
 	b.imageRemoveID = identifier
 	b.imageRemoveForce = force
 	return b.imageRemoveResult, b.err
+}
+
+func (b *fakeBackend) commit(target selector, reference string, labels map[string]string) (ttcimages.Info, error) {
+	b.commitTarget = target
+	b.commitReference = reference
+	b.commitLabels = cloneStringMap(labels)
+	return b.commitInfo, b.err
 }
 
 func (b *fakeBackend) listFamilies() ([]Family, error) {

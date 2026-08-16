@@ -16,11 +16,13 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -145,14 +147,25 @@ type DeleteOptions struct {
 
 // Info describes a pulled platform-specific image.
 type Info struct {
-	Reference string     `json:"reference"`
-	Digest    string     `json:"digest"`
-	MediaType string     `json:"media_type"`
-	Size      int64      `json:"size"`
-	Platform  string     `json:"platform"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	PullStats *PullStats `json:"pull_stats,omitempty"`
+	Reference string            `json:"reference"`
+	Digest    string            `json:"digest"`
+	MediaType string            `json:"media_type"`
+	Size      int64             `json:"size"`
+	Platform  string            `json:"platform"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	PullStats *PullStats        `json:"pull_stats,omitempty"`
+}
+
+// CommitOptions creates a new OCI image by appending an uncompressed rootfs
+// upper layer to an existing image. Layer must be an OCI layer tar stream.
+type CommitOptions struct {
+	Root       string
+	BaseDigest string
+	Reference  string
+	Layer      io.Reader
+	Labels     map[string]string
 }
 
 // PullStats summarizes committed content reuse observed during one pull.
@@ -302,6 +315,7 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 		Platform:  imagePlatform(config.OS, config.Architecture, config.Variant),
 		CreatedAt: imageCreatedAt(now, config.Created),
 		UpdatedAt: now,
+		Labels:    cloneLabels(config.Config.Labels),
 	}
 	if snapshotErr == nil {
 		if contentAfter, err := snapshotContent(ctx, store.content); err == nil {
@@ -318,6 +332,153 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	}
 	complete = true
 	return info, nil
+}
+
+// Commit appends a TTC rootfs-upper tar stream to an existing image and stores
+// a new OCI manifest. The base image configuration is retained, including all
+// existing OCI labels; opts.Labels override or add keys.
+func Commit(ctx context.Context, opts CommitOptions) (Info, error) {
+	if opts.Layer == nil {
+		return Info{}, errors.New("image commit requires a layer stream")
+	}
+	reference, err := NormalizeReference(opts.Reference)
+	if err != nil {
+		return Info{}, err
+	}
+	store, err := openNativeStore(opts.Root)
+	if err != nil {
+		return Info{}, err
+	}
+	defer store.close()
+	var base imageRecord
+	found := false
+	for _, record := range store.catalog.Images {
+		if record.Info.Digest == opts.BaseDigest {
+			base = record
+			found = true
+			break
+		}
+	}
+	if !found {
+		return Info{}, fmt.Errorf("base image %s is not present", opts.BaseDigest)
+	}
+	matcher, err := platformMatcher(base.Info.Platform)
+	if err != nil {
+		return Info{}, err
+	}
+	baseManifest, err := containerdimages.Manifest(ctx, store.content, base.Target, matcher)
+	if err != nil {
+		return Info{}, fmt.Errorf("reading base image manifest: %w", err)
+	}
+	configData, err := content.ReadBlob(ctx, store.content, baseManifest.Config)
+	if err != nil {
+		return Info{}, fmt.Errorf("reading base image config: %w", err)
+	}
+	var config ocispec.Image
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return Info{}, fmt.Errorf("decoding base image config: %w", err)
+	}
+
+	temporary, err := os.CreateTemp(store.root, ".commit-layer-")
+	if err != nil {
+		return Info{}, err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	algorithm := base.Target.Digest.Algorithm()
+	if !algorithm.Available() {
+		temporary.Close()
+		return Info{}, fmt.Errorf("base image uses unavailable digest algorithm %q", algorithm)
+	}
+	digester := algorithm.Digester()
+	layerSize, copyErr := io.Copy(io.MultiWriter(temporary, digester.Hash()), opts.Layer)
+	if copyErr != nil {
+		temporary.Close()
+		return Info{}, fmt.Errorf("reading committed layer: %w", copyErr)
+	}
+	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+		temporary.Close()
+		return Info{}, err
+	}
+	layer := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer, Digest: digester.Digest(), Size: layerSize,
+	}
+	if err := content.WriteBlob(ctx, store.content, "ttc-commit-layer-"+layer.Digest.Encoded(), temporary, layer); err != nil {
+		temporary.Close()
+		return Info{}, fmt.Errorf("storing committed layer: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return Info{}, err
+	}
+
+	now := time.Now().UTC()
+	config.Created = &now
+	config.RootFS.Type = "layers"
+	config.RootFS.DiffIDs = append(config.RootFS.DiffIDs, layer.Digest)
+	config.History = append(config.History, ocispec.History{Created: &now, CreatedBy: "ttc commit", Comment: "TimeTravelContainer branch commit"})
+	config.Config.Labels = cloneLabels(config.Config.Labels)
+	if config.Config.Labels == nil && len(opts.Labels) != 0 {
+		config.Config.Labels = make(map[string]string)
+	}
+	for key, value := range opts.Labels {
+		config.Config.Labels[key] = value
+	}
+	encodedConfig, err := json.Marshal(&config)
+	if err != nil {
+		return Info{}, err
+	}
+	configDescriptor := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageConfig,
+		Digest:    algorithm.FromBytes(encodedConfig), Size: int64(len(encodedConfig)),
+	}
+	if err := content.WriteBlob(ctx, store.content, "ttc-commit-config-"+configDescriptor.Digest.Encoded(), bytes.NewReader(encodedConfig), configDescriptor); err != nil {
+		return Info{}, fmt.Errorf("storing committed image config: %w", err)
+	}
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    configDescriptor, Layers: append(append([]ocispec.Descriptor(nil), baseManifest.Layers...), layer),
+	}
+	manifest.SchemaVersion = 2
+	encodedManifest, err := json.Marshal(&manifest)
+	if err != nil {
+		return Info{}, err
+	}
+	target := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    algorithm.FromBytes(encodedManifest), Size: int64(len(encodedManifest)),
+	}
+	if err := content.WriteBlob(ctx, store.content, "ttc-commit-manifest-"+target.Digest.Encoded(), bytes.NewReader(encodedManifest), target); err != nil {
+		return Info{}, fmt.Errorf("storing committed image manifest: %w", err)
+	}
+	image := containerdimages.Image{Name: reference, Target: target}
+	size, err := image.Size(ctx, store.content, matcher)
+	if err != nil {
+		return Info{}, fmt.Errorf("measuring committed image: %w", err)
+	}
+	info := Info{
+		Reference: reference, Digest: target.Digest.String(), MediaType: target.MediaType,
+		Size: size, Platform: imagePlatform(config.OS, config.Architecture, config.Variant),
+		CreatedAt: now, UpdatedAt: now, Labels: cloneLabels(config.Config.Labels),
+	}
+	store.catalog.Images[reference] = imageRecord{Info: info, Target: target}
+	if err := store.saveCatalog(); err != nil {
+		return Info{}, fmt.Errorf("saving committed image record: %w", err)
+	}
+	if err := store.garbageCollect(ctx); err != nil {
+		return Info{}, err
+	}
+	return info, nil
+}
+
+func cloneLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(labels))
+	for key, value := range labels {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // List returns all named image records ordered by reference. Multiple

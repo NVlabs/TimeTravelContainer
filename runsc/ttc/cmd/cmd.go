@@ -16,6 +16,7 @@
 package cmd
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -299,6 +300,7 @@ Commands:
   container COMMAND              Docker-style container command aliases
   rmi [OPTIONS] IMAGE...         Remove one or more local images
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
+  commit [OPTIONS] TARGET IMAGE  Commit a branch rootfs as a new OCI image
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
   start [OPTIONS] TARGET         Start a prepared or exited branch
@@ -401,6 +403,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runImageRemove(args[1:], stdout, stderr, backend)
 	case "pull":
 		err = runPull(args[1:], stdout, stderr, backend)
+	case "commit":
+		err = runCommit(args[1:], stdout, stderr, backend)
 	case "run":
 		err = runContainer(args[1:], stdout, stderr, backend)
 	case "create":
@@ -526,7 +530,18 @@ func runContainerNamespace(args []string, stdout, stderr io.Writer, backend back
 type stringSlice []string
 
 func (s *stringSlice) String() string { return fmt.Sprintf("%q", *s) }
-func (s *stringSlice) Get() any       { return s }
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+func (s *stringSlice) Get() any { return s }
 func (s *stringSlice) Set(value string) error {
 	*s = append(*s, value)
 	return nil
@@ -4601,37 +4616,74 @@ type ProcessInfo struct {
 
 // ImageInfo is one named local image record enriched with TTC cache usage.
 type ImageInfo struct {
-	Reference    string    `json:"reference"`
-	Digest       string    `json:"digest"`
-	MediaType    string    `json:"media_type"`
-	Size         int64     `json:"size"`
-	Platform     string    `json:"platform"`
-	Materialized bool      `json:"materialized"`
-	Containers   []string  `json:"containers,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	Reference    string            `json:"reference"`
+	Digest       string            `json:"digest"`
+	MediaType    string            `json:"media_type"`
+	Size         int64             `json:"size"`
+	Platform     string            `json:"platform"`
+	Materialized bool              `json:"materialized"`
+	Containers   []string          `json:"containers,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
 // ImageInspectInfo follows Docker's top-level image inspection naming while
 // exposing TTC-specific root and container use explicitly.
 type ImageInspectInfo struct {
-	ID           string    `json:"Id"`
-	RepoTags     []string  `json:"RepoTags"`
-	RepoDigests  []string  `json:"RepoDigests"`
-	Created      time.Time `json:"Created"`
-	Size         int64     `json:"Size"`
-	Architecture string    `json:"Architecture"`
-	OS           string    `json:"Os"`
-	Variant      string    `json:"Variant,omitempty"`
-	MediaType    string    `json:"MediaType"`
-	Materialized bool      `json:"Materialized"`
-	Containers   []string  `json:"Containers,omitempty"`
+	ID           string             `json:"Id"`
+	RepoTags     []string           `json:"RepoTags"`
+	RepoDigests  []string           `json:"RepoDigests"`
+	Created      time.Time          `json:"Created"`
+	Size         int64              `json:"Size"`
+	Architecture string             `json:"Architecture"`
+	OS           string             `json:"Os"`
+	Variant      string             `json:"Variant,omitempty"`
+	MediaType    string             `json:"MediaType"`
+	Materialized bool               `json:"Materialized"`
+	Containers   []string           `json:"Containers,omitempty"`
+	Config       ImageInspectConfig `json:"Config"`
+}
+
+// ImageInspectConfig is the Docker-compatible inspect subset TTC currently
+// guarantees to round-trip when committing images.
+type ImageInspectConfig struct {
+	Labels map[string]string `json:"Labels,omitempty"`
 }
 
 // ImageRemoveResult describes Docker-compatible removal output.
 type ImageRemoveResult struct {
 	Untagged []string
 	Deleted  string
+}
+
+func runCommit(args []string, stdout, stderr io.Writer, b backend) error {
+	fs := flag.NewFlagSet("commit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var labels, labelFiles stringSlice
+	fs.Var(&labels, "label", "set image OCI label KEY=VALUE")
+	fs.Var(&labels, "l", "set image OCI label KEY=VALUE")
+	fs.Var(&labelFiles, "label-file", "read image labels from a file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: ttc commit [--label KEY=VALUE] CONTAINER@BRANCH IMAGE")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	values, err := collectLabels(labelFiles, labels)
+	if err != nil {
+		return err
+	}
+	info, err := b.commit(target, fs.Arg(1), values)
+	if err != nil {
+		return fmt.Errorf("committing %s: %w", target, err)
+	}
+	fmt.Fprintln(stdout, info.Digest)
+	return nil
 }
 
 // BranchPathChange is one guest-visible path changed in a branch's writable
@@ -4779,6 +4831,7 @@ type backend interface {
 	listImages() ([]ImageInfo, error)
 	inspectImage(identifier string) (ImageInspectInfo, error)
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
+	commit(target selector, reference string, labels map[string]string) (ttcimages.Info, error)
 	create(request runRequest) (string, error)
 	run(request runRequest) (containerRunResult, error)
 	start(target selector, detach, interactive bool) (int, error)
@@ -5006,6 +5059,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 			Platform:     record.Platform,
 			Materialized: materialized,
 			Containers:   containerNames,
+			Labels:       cloneStringMap(record.Labels),
 			CreatedAt:    record.CreatedAt,
 			UpdatedAt:    record.UpdatedAt,
 		})
@@ -5019,6 +5073,94 @@ func (b *runtimeBackend) inspectImage(identifier string) (ImageInspectInfo, erro
 		return ImageInspectInfo{}, err
 	}
 	return inspectImageFromInventory(infos, identifier)
+}
+
+func (b *runtimeBackend) commit(target selector, reference string, labels map[string]string) (result ttcimages.Info, retErr error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return ttcimages.Info{}, err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return ttcimages.Info{}, err
+	}
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = offlineCopyBranch(info.ID, resolved.branch)
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return ttcimages.Info{}, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return ttcimages.Info{}, err
+	}
+	var rootfs *specutils.TTCVolumeRepository
+	for i := range repositories {
+		if repositories[i].Source == specutils.TTCRootfsUpperSource {
+			rootfs = &repositories[i]
+			break
+		}
+	}
+
+	reader, writer := io.Pipe()
+	exportDone := make(chan error, 1)
+	var repository *ttcvolume.Repository
+	temporaryBranch := ""
+	if rootfs == nil {
+		go func() {
+			tarWriter := tar.NewWriter(writer)
+			err := tarWriter.Close()
+			_ = writer.CloseWithError(err)
+			exportDone <- err
+		}()
+	} else {
+		repository, err = ttcvolume.OpenRepository(rootfs.Path, ttcvolume.CopyMode(rootfs.CopyMode))
+		if err != nil {
+			reader.Close()
+			writer.Close()
+			return ttcimages.Info{}, fmt.Errorf("opening rootfs upper: %w", err)
+		}
+		var random [12]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			repository.Close()
+			reader.Close()
+			writer.Close()
+			return ttcimages.Info{}, err
+		}
+		temporaryBranch = "commit-" + hex.EncodeToString(random[:])
+		if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
+			repository.Close()
+			reader.Close()
+			writer.Close()
+			return ttcimages.Info{}, fmt.Errorf("snapshotting rootfs upper: %w", err)
+		}
+		defer func() {
+			cleanupErr := repository.RemoveBranch(temporaryBranch)
+			if cleanupErr == nil {
+				cleanupErr = repository.GarbageCollect()
+			}
+			cleanupErr = errors.Join(cleanupErr, repository.Close())
+			if cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("removing commit snapshot: %w", cleanupErr))
+			}
+		}()
+		go func() {
+			err := repository.WriteLayerTar(temporaryBranch, writer)
+			_ = writer.CloseWithError(err)
+			exportDone <- err
+		}()
+	}
+	result, commitErr := ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
+		Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader, Labels: labels,
+	})
+	_ = reader.Close()
+	exportErr := <-exportDone
+	if commitErr != nil || exportErr != nil {
+		return ttcimages.Info{}, errors.Join(commitErr, exportErr)
+	}
+	return result, nil
 }
 
 func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspectInfo, error) {
@@ -5099,6 +5241,7 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 		MediaType:    selected.MediaType,
 		Materialized: materialized,
 		Containers:   containers,
+		Config:       ImageInspectConfig{Labels: cloneStringMap(selected.Labels)},
 	}, nil
 }
 

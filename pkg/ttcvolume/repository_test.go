@@ -15,6 +15,8 @@
 package ttcvolume
 
 import (
+	"archive/tar"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -1168,5 +1170,77 @@ func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	}
 	if !reflect.DeepEqual(changes, want) {
 		t.Fatalf("BranchDiff=%+v, want %+v", changes, want)
+	}
+}
+
+func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("layer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0640, 12, 34)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := repository.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Xattrs = map[string]string{"user.test": "present"}
+	if err := repository.UpdateMetadata(MainBranch, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Link(MainBranch, RootInode, "hard", ino); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateSpecial(MainBranch, RootInode, ".wh.removed", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := repository.WriteLayerTar(MainBranch, &output); err != nil {
+		t.Fatal(err)
+	}
+	reader := tar.NewReader(&output)
+	headers := make(map[string]*tar.Header)
+	bodies := make(map[string]string)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy := *header
+		headers[strings.TrimSuffix(header.Name, "/")] = &copy
+		if header.Typeflag == tar.TypeReg && header.Size != 0 {
+			data, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodies[header.Name] = string(data)
+		}
+	}
+	value := headers["value"]
+	hard := headers["hard"]
+	if value == nil || hard == nil || value.Uid != 12 || value.Gid != 34 || value.Mode != 0640 {
+		t.Fatalf("layer headers value=%+v hard=%+v", value, hard)
+	}
+	regularName := "value"
+	link := hard
+	if value.Typeflag == tar.TypeLink {
+		regularName = "hard"
+		link = value
+	}
+	if bodies[regularName] != "payload" || link.Typeflag != tar.TypeLink || link.Linkname != regularName {
+		t.Fatalf("regular=%q bodies=%v link=%+v", regularName, bodies, link)
+	}
+	if whiteout := headers[".wh.removed"]; whiteout == nil || whiteout.Typeflag != tar.TypeReg || whiteout.Size != 0 {
+		t.Fatalf("whiteout=%+v", whiteout)
 	}
 }

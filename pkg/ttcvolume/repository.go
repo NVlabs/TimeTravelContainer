@@ -18,6 +18,7 @@
 package ttcvolume
 
 import (
+	"archive/tar"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -498,6 +499,25 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		return nil, fmt.Errorf("unsupported repository format %q", strings.TrimSpace(string(format)))
 	}
 	return repo, nil
+}
+
+// OpenRepository opens a trusted path-backed repository. Unlike
+// OpenRepositoryFD, the returned Repository may perform garbage collection.
+func OpenRepository(path string, mode CopyMode) (*Repository, error) {
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("repository path %q is not absolute", path)
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	repository, err := OpenRepositoryFD(dir, mode)
+	_ = dir.Close()
+	if err != nil {
+		return nil, err
+	}
+	repository.path = path
+	return repository, nil
 }
 
 // Close releases the repository directory descriptor.
@@ -1894,6 +1914,143 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes, nil
+}
+
+// WriteLayerTar writes the complete branch-visible repository namespace as an
+// uncompressed OCI layer. For a rootfs-upper repository this is the complete
+// set of changes relative to the immutable image, including overlay whiteout
+// entries. Open Unix sockets are runtime state and are intentionally omitted.
+func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return err
+	}
+	state, err := r.metadataForBranch(branch)
+	if err != nil {
+		return err
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	writer := tar.NewWriter(output)
+	hardlinks := make(map[uint64]string)
+	var writeInode func(string, Inode) error
+	writeInode = func(name string, inode Inode) error {
+		if inode.Type == "socket" {
+			return nil
+		}
+		header := &tar.Header{
+			Name: name, Mode: int64(inode.Mode), Uid: int(inode.UID), Gid: int(inode.GID),
+			ModTime: time.Unix(0, inode.MtimeNsec), AccessTime: time.Unix(0, inode.AtimeNsec),
+			ChangeTime: time.Unix(0, inode.CtimeNsec), Format: tar.FormatPAX,
+		}
+		if len(inode.Xattrs) != 0 {
+			header.PAXRecords = make(map[string]string, len(inode.Xattrs))
+			for key, value := range inode.Xattrs {
+				header.PAXRecords["SCHILY.xattr."+key] = value
+			}
+		}
+		whiteout := strings.HasPrefix(pathBase(name), ".wh.")
+		switch {
+		case whiteout:
+			header.Typeflag = tar.TypeReg
+			header.Mode = 0600
+		case inode.Type == "regular":
+			if first, ok := hardlinks[inode.Number]; ok {
+				header.Typeflag = tar.TypeLink
+				header.Linkname = first
+			} else {
+				hardlinks[inode.Number] = name
+				header.Typeflag = tar.TypeReg
+				header.Size = inode.Size
+			}
+		case inode.Type == "directory":
+			header.Typeflag = tar.TypeDir
+			if !strings.HasSuffix(header.Name, "/") {
+				header.Name += "/"
+			}
+		case inode.Type == "symlink":
+			header.Typeflag = tar.TypeSymlink
+			header.Linkname = inode.Target
+		case inode.Type == "fifo":
+			header.Typeflag = tar.TypeFifo
+		case inode.Type == "char":
+			header.Typeflag = tar.TypeChar
+			header.Devmajor = int64(inode.DevMajor)
+			header.Devminor = int64(inode.DevMinor)
+		case inode.Type == "block":
+			header.Typeflag = tar.TypeBlock
+			header.Devmajor = int64(inode.DevMajor)
+			header.Devminor = int64(inode.DevMinor)
+		default:
+			return fmt.Errorf("inode %d has unsupported layer type %q", inode.Number, inode.Type)
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			return err
+		}
+		if inode.Type == "regular" && !whiteout && header.Typeflag != tar.TypeLink {
+			file, err := r.openObject(inode.Object, os.O_RDONLY)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.CopyN(writer, file, inode.Size)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+		return nil
+	}
+	root, ok := state.inodes[rootInode]
+	if !ok {
+		return errors.New("repository branch has no root inode")
+	}
+	if err := writeInode(".", root); err != nil {
+		return err
+	}
+	var walk func(uint64, string) error
+	walk = func(parent uint64, prefix string) error {
+		entries := state.directories[parent]
+		names := make([]string, 0, len(entries))
+		for name := range entries {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			entry := entries[name]
+			inode, ok := state.inodes[entry.Inode]
+			if !ok {
+				return fmt.Errorf("directory entry %q references missing inode %d", name, entry.Inode)
+			}
+			archiveName := name
+			if prefix != "" {
+				archiveName = prefix + "/" + name
+			}
+			if err := writeInode(archiveName, inode); err != nil {
+				return err
+			}
+			if inode.Type == "directory" {
+				if err := walk(inode.Number, archiveName); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(rootInode, ""); err != nil {
+		return err
+	}
+	return writer.Close()
+}
+
+func pathBase(name string) string {
+	name = strings.TrimSuffix(name, "/")
+	if index := strings.LastIndexByte(name, '/'); index >= 0 {
+		return name[index+1:]
+	}
+	return name
 }
 
 func metadataPaths(state *branchMetadata) (map[string]Inode, error) {

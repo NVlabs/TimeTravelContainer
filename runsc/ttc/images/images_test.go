@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +28,8 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -118,6 +121,87 @@ func TestNativeDeleteGuardsAgainstRetargetedTag(t *testing.T) {
 	err = Delete(context.Background(), DeleteOptions{Root: root, Reference: reference, Digest: "sha256:" + strings.Repeat("b", 64)})
 	if err == nil || !strings.Contains(err.Error(), "changed from") {
 		t.Fatalf("Delete retarget guard error=%v", err)
+	}
+}
+
+func TestCommitPreservesAndOverridesLabels(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	config := ocispec.Image{
+		Created: &created, Platform: ocispec.Platform{Architecture: "amd64", OS: "linux"},
+		Config: ocispec.ImageConfig{Labels: map[string]string{"base": "kept", "override": "old"}},
+		RootFS: ocispec.RootFS{Type: "layers"},
+	}
+	configData, err := json.Marshal(&config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	algorithm := ocispec.Descriptor{Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}.Digest.Algorithm()
+	configDescriptor := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageConfig, Digest: algorithm.FromBytes(configData), Size: int64(len(configData))}
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest, Config: configDescriptor,
+	}
+	manifest.SchemaVersion = 2
+	manifestData, err := json.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: algorithm.FromBytes(manifestData), Size: int64(len(manifestData))}
+	store, err := openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := content.WriteBlob(ctx, store.content, "base-config", bytes.NewReader(configData), configDescriptor); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	if err := content.WriteBlob(ctx, store.content, "base-manifest", bytes.NewReader(manifestData), target); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	baseReference := "docker.io/library/base:latest"
+	store.catalog.Images[baseReference] = imageRecord{Info: Info{Reference: baseReference, Digest: target.Digest.String(), Platform: "linux/amd64"}, Target: target}
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+
+	info, err := Commit(ctx, CommitOptions{
+		Root: root, BaseDigest: target.Digest.String(), Reference: "session:v1",
+		Layer:  bytes.NewReader(make([]byte, 1024)),
+		Labels: map[string]string{"override": "new", "timetravel.usage": "prompt"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Labels["base"] != "kept" || info.Labels["override"] != "new" || info.Labels["timetravel.usage"] != "prompt" {
+		t.Fatalf("committed labels=%v", info.Labels)
+	}
+	store, err = openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	record := store.catalog.Images["docker.io/library/session:v1"]
+	committedManifest, err := containerdimages.Manifest(ctx, store.content, record.Target, platforms.DefaultStrict())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(committedManifest.Layers) != 1 {
+		t.Fatalf("committed layers=%d, want 1", len(committedManifest.Layers))
+	}
+	committedConfigData, err := content.ReadBlob(ctx, store.content, committedManifest.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var committedConfig ocispec.Image
+	if err := json.Unmarshal(committedConfigData, &committedConfig); err != nil {
+		t.Fatal(err)
+	}
+	if committedConfig.Config.Labels["base"] != "kept" || committedConfig.Config.Labels["override"] != "new" || len(committedConfig.RootFS.DiffIDs) != 1 {
+		t.Fatalf("committed config=%+v", committedConfig)
 	}
 }
 
