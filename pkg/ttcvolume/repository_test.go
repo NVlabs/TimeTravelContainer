@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
@@ -1123,5 +1124,49 @@ func TestListDirectoryItemsAndBranchUsage(t *testing.T) {
 	wantBytes := uint64(2 * os.Getpagesize())
 	if inodes != 3 || bytes != wantBytes {
 		t.Fatalf("BranchUsage=(%d, %d), want (3, %d)", inodes, bytes, wantBytes)
+	}
+}
+
+func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	keep, err := repository.CreateRegular(MainBranch, RootInode, "keep", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, keep, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "remove", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt("child", keep, []byte("child"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Unlink("child", RootInode, "remove"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateDirectory("child", RootInode, "added", 0755, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PathChange{
+		{Path: "/", Kind: "modify", Type: "directory"},
+		{Path: "/added", Kind: "add", Type: "directory"},
+		{Path: "/keep", Kind: "modify", Type: "regular"},
+		{Path: "/remove", Kind: "delete", Type: "regular"},
+	}
+	if !reflect.DeepEqual(changes, want) {
+		t.Fatalf("BranchDiff=%+v, want %+v", changes, want)
 	}
 }

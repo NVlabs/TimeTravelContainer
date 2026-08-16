@@ -244,7 +244,7 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return imageCompletionCandidates(backend)
 	case "inspect":
 		return familyCompletionCandidates(backend, false, true)
-	case "start", "restart", "attach", "logs", "pause", "resume", "rehydrate", "kill", "wait", "top":
+	case "start", "restart", "attach", "logs", "pause", "resume", "rehydrate", "kill", "wait", "top", "diff":
 		return familyCompletionCandidates(backend, true, true)
 	case "rm":
 		candidates, err := familyAndBranchCompletionCandidates(backend)

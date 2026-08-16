@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/processutil"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -306,6 +307,7 @@ Commands:
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
   exec ls|wait|kill ...          Manage detached exec sessions
   cp [OPTIONS] SRC_PATH DEST_PATH Copy files between host and a container branch
+  diff [--json] TARGET           Show paths changed in a branch's writable layer
   inspect [OPTIONS] CONTAINER... Show Docker and TTC branch/process state
   events [OPTIONS]               Stream durable manager lifecycle events
   wait [OPTIONS] TARGET...       Wait for branches and print exit codes
@@ -413,6 +415,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runExec(args[1:], stdout, stderr, backend)
 	case "cp":
 		err = runCopy(args[1:], stdout, stderr, backend)
+	case "diff":
+		err = runDiff(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -2354,6 +2358,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.Var(&additionalGIDs, "additional-gids", "add a supplementary numeric GID")
 	fs.Var(&capabilities, "cap", "add a Linux capability to the process")
 	processPath := fs.String("process", "", "OCI process JSON file (replaces command and process overrides)")
+	sessionID := fs.String("session", "", "durable branch-local exec session name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -2376,9 +2381,14 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 			return err
 		}
 	}
-	execID, err := newExecID()
-	if err != nil {
-		return err
+	execID := *sessionID
+	if execID == "" {
+		execID, err = newExecID()
+		if err != nil {
+			return err
+		}
+	} else if _, err := parseExecSelector(target.String() + ":" + execID); err != nil {
+		return fmt.Errorf("invalid --session: %w", err)
 	}
 	status, err := backend.exec(execRequest{
 		detach:         *detach,
@@ -4624,6 +4634,45 @@ type ImageRemoveResult struct {
 	Deleted  string
 }
 
+// BranchPathChange is one guest-visible path changed in a branch's writable
+// TTC filesystem layer.
+type BranchPathChange struct {
+	Path  string `json:"path"`
+	Kind  string `json:"kind"`
+	Type  string `json:"type,omitempty"`
+	Mount string `json:"mount"`
+}
+
+func runDiff(args []string, stdout, stderr io.Writer, b backend) error {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: ttc diff [--json] CONTAINER@BRANCH")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	changes, err := b.diff(target)
+	if err != nil {
+		return fmt.Errorf("diffing %s: %w", target, err)
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(changes)
+	}
+	code := map[string]string{"add": "A", "modify": "C", "delete": "D"}
+	for _, change := range changes {
+		fmt.Fprintf(stdout, "%s %s\n", code[change.Kind], change.Path)
+	}
+	return nil
+}
+
 type volumeCommandBackend interface {
 	createVolume(name string) (ttcvolume.VolumeInfo, error)
 	listVolumes() ([]ttcvolume.VolumeInfo, error)
@@ -4744,6 +4793,7 @@ type backend interface {
 	listFamilies() ([]Family, error)
 	processes(target selector) ([]ProcessInfo, error)
 	rootfsSize(target selector) (uint64, error)
+	diff(target selector) ([]BranchPathChange, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
 	forkMany(source selector, destinations []string, paused bool) ([]Branch, error)
 	publishPort(target selector, binding ttcbundle.PortBinding) error
@@ -9653,6 +9703,84 @@ func (b *runtimeBackend) rootfsSize(target selector) (uint64, error) {
 		return 0, fmt.Errorf("decoding branch rootfs size: %w", err)
 	}
 	return size.WritableBytes, nil
+}
+
+func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return nil, err
+	}
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = offlineCopyBranch(info.ID, resolved.branch)
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return nil, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, err
+	}
+	changes := make([]BranchPathChange, 0)
+	for _, config := range repositories {
+		mount, err := repositoryGuestMount(spec, config)
+		if err != nil {
+			return nil, err
+		}
+		dir, err := os.Open(config.Path)
+		if err != nil {
+			return nil, fmt.Errorf("opening repository for %s: %w", mount, err)
+		}
+		repository, err := ttcvolume.OpenRepositoryFD(dir, ttcvolume.CopyMode(config.CopyMode))
+		_ = dir.Close()
+		if err != nil {
+			return nil, fmt.Errorf("opening repository for %s: %w", mount, err)
+		}
+		diff, diffErr := repository.BranchDiff(filesystemBranch)
+		closeErr := repository.Close()
+		if diffErr != nil {
+			return nil, fmt.Errorf("reading repository diff for %s: %w", mount, diffErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		for _, change := range diff {
+			path := mount
+			if change.Path != "/" {
+				path = filepath.Join(mount, strings.TrimPrefix(change.Path, "/"))
+			}
+			changes = append(changes, BranchPathChange{
+				Path: path, Kind: change.Kind, Type: change.Type, Mount: mount,
+			})
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool {
+		if changes[i].Path == changes[j].Path {
+			return changes[i].Mount < changes[j].Mount
+		}
+		return changes[i].Path < changes[j].Path
+	})
+	return changes, nil
+}
+
+func repositoryGuestMount(spec *specs.Spec, repository specutils.TTCVolumeRepository) (string, error) {
+	if repository.Source == specutils.TTCRootfsUpperSource {
+		return "/", nil
+	}
+	if repository.OverlayDestination != "" {
+		return repository.OverlayDestination, nil
+	}
+	for _, mount := range spec.Mounts {
+		if mount.Source == repository.Source {
+			return mount.Destination, nil
+		}
+	}
+	return "", fmt.Errorf("repository source %q has no guest mount", repository.Source)
 }
 
 func (b *runtimeBackend) signal(target selector, signal int, all bool) error {

@@ -216,6 +216,15 @@ type DirectoryItem struct {
 	Inode Inode
 }
 
+// PathChange describes one namespace path changed in a branch's writable
+// metadata layer relative to the immutable layer it inherited at the most
+// recent fork. Kind is add, modify, or delete.
+type PathChange struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+	Type string `json:"type,omitempty"`
+}
+
 // Repository is one named persistent volume.
 type Repository struct {
 	path     string
@@ -1820,6 +1829,142 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 		}
 	}
 	return uint64(len(state.inodes)), bytes, nil
+}
+
+// BranchDiff returns paths changed by branchID relative to the immutable
+// metadata layer beneath its current writable layer. It reads TTC metadata;
+// it does not walk materialized host or guest directory trees.
+func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return nil, err
+	}
+	layers, err := r.metadataLayers(branch.Root)
+	if err != nil {
+		return nil, err
+	}
+	current, err := r.metadataForBranch(branch)
+	if err != nil {
+		return nil, err
+	}
+	current.mu.RLock()
+	currentPaths, err := metadataPaths(current)
+	current.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+
+	base := newBranchMetadata(Branch{ID: branchID + "-diff-base"})
+	if len(layers) > 1 {
+		base.layers = append([]string(nil), layers[:len(layers)-1]...)
+		base.branch.Root = base.layers[len(base.layers)-1]
+		for _, layer := range base.layers {
+			size, sequence, err := r.replayMetadataLayer(layer, base)
+			if err != nil {
+				return nil, fmt.Errorf("replaying diff base layer %q: %w", layer, err)
+			}
+			base.layerSizes[layer] = size
+			base.nextSequence = sequence
+		}
+	}
+	basePaths, err := metadataPaths(base)
+	if err != nil {
+		return nil, err
+	}
+
+	all := make(map[string]struct{}, len(currentPaths)+len(basePaths))
+	for path := range currentPaths {
+		all[path] = struct{}{}
+	}
+	for path := range basePaths {
+		all[path] = struct{}{}
+	}
+	changes := make([]PathChange, 0)
+	for path := range all {
+		currentInode, currentOK := currentPaths[path]
+		baseInode, baseOK := basePaths[path]
+		switch {
+		case currentOK && !baseOK:
+			changes = append(changes, PathChange{Path: path, Kind: "add", Type: currentInode.Type})
+		case !currentOK && baseOK:
+			changes = append(changes, PathChange{Path: path, Kind: "delete", Type: baseInode.Type})
+		case currentOK && baseOK && !sameDiffInode(currentInode, baseInode):
+			changes = append(changes, PathChange{Path: path, Kind: "modify", Type: currentInode.Type})
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	return changes, nil
+}
+
+func metadataPaths(state *branchMetadata) (map[string]Inode, error) {
+	paths := make(map[string]Inode, len(state.entries)+1)
+	if root, ok := state.inodes[rootInode]; ok {
+		paths["/"] = root
+	}
+	visiting := make(map[uint64]bool)
+	var walk func(uint64, string) error
+	walk = func(parent uint64, prefix string) error {
+		if visiting[parent] {
+			return fmt.Errorf("directory cycle at inode %d", parent)
+		}
+		visiting[parent] = true
+		defer delete(visiting, parent)
+		entries := state.directories[parent]
+		names := make([]string, 0, len(entries))
+		for name := range entries {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			entry := entries[name]
+			inode, ok := state.inodes[entry.Inode]
+			if !ok {
+				return fmt.Errorf("directory entry %q references missing inode %d", name, entry.Inode)
+			}
+			path := "/" + name
+			if prefix != "" && prefix != "/" {
+				path = prefix + "/" + name
+			}
+			paths[path] = inode
+			if inode.Type == "directory" {
+				if err := walk(inode.Number, path); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if _, ok := state.inodes[rootInode]; ok {
+		if err := walk(rootInode, ""); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
+}
+
+func sameDiffInode(a, b Inode) bool {
+	// Reads may update atime without changing branch contents. Everything else
+	// is guest-visible metadata or regular-file identity and belongs in diff.
+	a.AtimeNsec = 0
+	b.AtimeNsec = 0
+	return a.Number == b.Number && a.Type == b.Type && a.Mode == b.Mode &&
+		a.UID == b.UID && a.GID == b.GID && a.Nlink == b.Nlink &&
+		a.Size == b.Size && a.Object == b.Object && a.DataGeneration == b.DataGeneration &&
+		a.Target == b.Target && a.DevMajor == b.DevMajor && a.DevMinor == b.DevMinor &&
+		a.BtimeNsec == b.BtimeNsec && a.CtimeNsec == b.CtimeNsec && a.MtimeNsec == b.MtimeNsec &&
+		mapsEqual(a.Xattrs, b.Xattrs)
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Repository) createObject(source string) (string, error) {

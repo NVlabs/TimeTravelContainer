@@ -306,8 +306,19 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 				return b.runLiveCopyHelper(resolved, helperArgs, input, output, false)
 			case "paused":
 				return b.runLiveCopyHelper(resolved, helperArgs, input, output, true)
+			case "dehydrated":
+				// A dehydrated branch has no Kernel or open filesystem handles.
+				// Its persistent TTC volume branches can therefore be mounted by
+				// the short-lived offline helper without rehydrating it or
+				// disturbing live peers in the family.
+				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 			default:
 				return fmt.Errorf("cannot copy to or from branch %q while it is %s", resolved.branch, branch.State)
+			}
+		}
+		for _, branch := range info.Branches {
+			if branch.ID == resolved.branch && branch.State == "dehydrated" {
+				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 			}
 		}
 		return fmt.Errorf("cannot copy the offline branch %q while another branch in its family is live", resolved.branch)

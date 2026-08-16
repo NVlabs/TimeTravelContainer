@@ -2230,6 +2230,26 @@ func TestExecDetachReturnsQualifiedSessionID(t *testing.T) {
 	}
 }
 
+func TestExecNamedDurableSession(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"exec", "--session", "build1", "-d", "demo@child", "make"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("named detached exec status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := b.execRequest.execID; got != "build1" {
+		t.Fatalf("exec session=%q, want build1", got)
+	}
+	if got, want := stdout.String(), "demo@child:build1\n"; got != want {
+		t.Fatalf("detached exec output=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"exec", "--session", "../escape", "-d", "demo@child", "true"}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("exec accepted an unsafe session name")
+	}
+}
+
 func TestExecSessionControls(t *testing.T) {
 	created := time.Date(2026, time.July, 17, 2, 3, 4, 0, time.UTC)
 	b := &fakeBackend{execSessionList: []runscExecSession{{
@@ -2255,6 +2275,31 @@ func TestExecSessionControls(t *testing.T) {
 	}
 	if stdout.String() != "demo@child:exec-abc\n" {
 		t.Fatalf("exec kill output=%q", stdout.String())
+	}
+}
+
+func TestDiffHumanAndJSON(t *testing.T) {
+	b := &fakeBackend{diffChanges: []BranchPathChange{
+		{Path: "/work/new", Kind: "add", Type: "regular", Mount: "/"},
+		{Path: "/work/old", Kind: "delete", Type: "regular", Mount: "/"},
+	}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"diff", "demo@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("diff status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "A /work/new\nD /work/old\n"; got != want {
+		t.Fatalf("diff output=%q, want %q", got, want)
+	}
+	if b.processTarget != (selector{container: "demo", branch: "child"}) {
+		t.Fatalf("diff target=%+v", b.processTarget)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"diff", "--json", "demo@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("diff --json status=%d, stderr=%q", status, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"path": "/work/new"`) || !strings.Contains(stdout.String(), `"kind": "add"`) {
+		t.Fatalf("diff JSON=%q", stdout.String())
 	}
 }
 
@@ -4000,6 +4045,7 @@ type fakeBackend struct {
 	processTarget      selector
 	processList        []ProcessInfo
 	rootfsSizes        map[selector]uint64
+	diffChanges        []BranchPathChange
 	sizeCalls          []selector
 	sizeErr            error
 	err                error
@@ -4183,6 +4229,11 @@ func (b *fakeBackend) rootfsSize(target selector) (uint64, error) {
 		return 0, b.sizeErr
 	}
 	return b.rootfsSizes[target], nil
+}
+
+func (b *fakeBackend) diff(target selector) ([]BranchPathChange, error) {
+	b.processTarget = target
+	return append([]BranchPathChange(nil), b.diffChanges...), b.err
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
