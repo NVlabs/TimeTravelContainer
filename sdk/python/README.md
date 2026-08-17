@@ -88,10 +88,29 @@ else:
     print(result.stderr_text())
 ```
 
-Pass `input=b"..."` to stream stdin. Reuse an explicit `request_id` only when
-deliberately retrying the same mutation. Interactive TTY attachment remains a
-CLI feature. `tty_stat()` provides synchronous terminal observations;
-`ttc tty watch` supplies the streaming form for long-lived frame consumers.
+Pass `input=b"..."` to a buffered command. Reuse an explicit `request_id` only
+when deliberately retrying the same mutation. Long-lived operations use
+`TTCStream` and callbacks:
+
+```python
+import json
+import sys
+
+watch = ttc.watch_tty(
+    "demo@candidate-a", "build1",
+    lambda payload: print(json.loads(payload)),
+)
+shell = ttc.attach(
+    "demo@candidate-a", exec_session="build1", size=(40, 120),
+    on_stdout=lambda chunk: sys.stdout.buffer.write(chunk),
+)
+shell.write("make test\n")
+shell.resize(50, 160)
+```
+
+`close_stdin()` explicitly delivers EOF. `close()` is local cancellation, so
+`wait()` raises `StreamCancelled` instead of fabricating status zero.
+`watch_events()` and `follow_logs()` expose the other unbounded streams.
 
 `checkpoint()` and `restore()` convert local paths to absolute paths before
 sending them to `ttcd`. Other raw commands that name host files should likewise

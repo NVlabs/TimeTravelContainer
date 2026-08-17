@@ -41,6 +41,9 @@ destination is a branch name; a remote fork destination is a
 `CONTAINER@BRANCH` selector on the target node. The protocol does not add
 implicit `main` selection beyond what the CLI command itself documents.
 
+`ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
+The legacy `parent_id` spelling is emitted alongside `parent` for compatibility.
+
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`
 requests should do the same for checkpoint, restore, copy, process JSON, env
@@ -77,6 +80,13 @@ request/response exchange: `tty watch`, `events --follow`, `logs --follow`, and
 stdin writable for the life of the operation. It must never send `C` implicitly,
 because stdin EOF terminates an interactive shell; closing stdin is always an
 explicit caller action.
+
+Client frames must follow the JSON header even when the caller writes or
+resizes immediately after constructing a stream. A local stream cancellation
+is not a successful command status: only an `X` frame supplies status, so
+bindings report cancellation separately. Writes after stdin EOF is requested
+are rejected. Callback-based bindings convert callback failures into stream
+failures rather than letting them escape a socket event loop.
 
 Every request ends with exactly one `X` frame unless the connection or daemon
 fails. A nonzero command status is an ordinary command result, not a wire error;

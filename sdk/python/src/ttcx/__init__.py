@@ -14,7 +14,23 @@
 
 """Python bindings for the TimeTravelContainer daemon."""
 
-from .client import Client, CommandFailed, ProtocolError, Result, TTCError
+from .client import (
+    Client,
+    CommandFailed,
+    ProtocolError,
+    Result,
+    StreamCancelled,
+    TTCError,
+    TTCStream,
+)
 
-__all__ = ["Client", "CommandFailed", "ProtocolError", "Result", "TTCError"]
+__all__ = [
+    "Client",
+    "CommandFailed",
+    "ProtocolError",
+    "Result",
+    "StreamCancelled",
+    "TTCError",
+    "TTCStream",
+]
 __version__ = "0.1.0"

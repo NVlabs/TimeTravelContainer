@@ -22,10 +22,11 @@ import secrets
 import select
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 API_VERSION = 4
 MAX_FRAME = 1 << 20
@@ -38,6 +39,10 @@ class TTCError(Exception):
 
 class ProtocolError(TTCError):
     """The daemon closed the connection or returned an invalid frame."""
+
+
+class StreamCancelled(TTCError):
+    """A local caller closed a stream before ttcd returned its status."""
 
 
 class CommandFailed(TTCError):
@@ -91,6 +96,215 @@ def _frame(kind: bytes, payload: bytes = b"") -> bytes:
     if len(kind) != 1 or len(payload) > MAX_FRAME:
         raise ValueError("invalid TTC frame")
     return kind + struct.pack(">I", len(payload)) + payload
+
+
+def _size_frame(rows: int, cols: int) -> bytes:
+    for name, value in (("rows", rows), ("cols", cols)):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 0xFFFFFFFF
+        ):
+            raise ValueError(f"{name} must be a uint32")
+    return _frame(b"W", struct.pack(">II", rows, cols))
+
+
+class TTCStream:
+    """One long-lived ttcd operation with incremental callbacks and stdin."""
+
+    def __init__(
+        self,
+        socket_path: str,
+        request: Mapping[str, Any],
+        *,
+        stdin: bool = False,
+        timeout: float | None = None,
+        size: tuple[int, int] | None = None,
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
+        on_observation: Callable[[bytes], None] | None = None,
+        on_terminal: Callable[[bytes], None] | None = None,
+    ) -> None:
+        self.args = tuple(request.get("args", ()))
+        self._stdin_declared = stdin
+        self._callbacks = {
+            b"O": on_stdout,
+            b"E": on_stderr,
+            b"S": on_observation,
+            b"T": on_terminal,
+        }
+        initial_size = _size_frame(*size) if size is not None else None
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.settimeout(timeout)
+        self._send_lock = threading.Lock()
+        self._input_lock = threading.Lock()
+        self._state = threading.Condition()
+        self._unacknowledged = 0
+        self._settled = False
+        self._eof_requested = False
+        self._eof_sent = False
+        self._status: int | None = None
+        self._error: BaseException | None = None
+
+        # Python's connect is synchronous, so the header and initial size are
+        # fully ordered before this object becomes visible to the caller.
+        try:
+            self._socket.connect(socket_path)
+            header = json.dumps(request, separators=(",", ":")).encode() + b"\n"
+            self._socket.sendall(header)
+            if initial_size is not None:
+                self._socket.sendall(initial_size)
+        except BaseException:
+            self._socket.close()
+            raise
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def write(self, data: bytes | str) -> None:
+        """Write stdin, blocking only while ttcd's 1 MiB window is full."""
+        if not self._stdin_declared:
+            raise TTCError("stream was not opened with stdin enabled")
+        payload = data.encode() if isinstance(data, str) else bytes(data)
+        with self._input_lock:
+            with self._state:
+                if self._eof_requested or self._eof_sent:
+                    raise TTCError("stdin already closed")
+            offset = 0
+            while offset < len(payload):
+                with self._state:
+                    while not self._settled and self._unacknowledged >= STDIN_WINDOW:
+                        self._state.wait()
+                    self._raise_if_settled()
+                    size = min(
+                        MAX_FRAME,
+                        STDIN_WINDOW - self._unacknowledged,
+                        len(payload) - offset,
+                    )
+                    self._unacknowledged += size
+                try:
+                    self._send(_frame(b"I", payload[offset : offset + size]))
+                except BaseException as error:
+                    self._finish(error=error)
+                    raise
+                offset += size
+
+    def close_stdin(self) -> None:
+        """Send stdin EOF after any currently executing write completes."""
+        if not self._stdin_declared:
+            raise TTCError("stream was not opened with stdin enabled")
+        with self._input_lock:
+            with self._state:
+                if self._eof_requested or self._eof_sent:
+                    return
+                self._raise_if_settled()
+                self._eof_requested = True
+            try:
+                self._send(_frame(b"C"))
+            except BaseException as error:
+                self._finish(error=error)
+                raise
+            with self._state:
+                self._eof_sent = True
+
+    def resize(self, rows: int, cols: int) -> None:
+        self._send(_size_frame(rows, cols))
+
+    def close(self) -> None:
+        """Cancel locally without fabricating a successful daemon status."""
+        self._finish(
+            error=StreamCancelled(
+                "TTC stream was cancelled before returning status"
+            )
+        )
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for ttcd's status frame, raising on transport failure/cancellation."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._state:
+            while not self._settled:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("timed out waiting for TTC stream status")
+                self._state.wait(remaining)
+            if self._error is not None:
+                raise self._error
+            assert self._status is not None
+            return self._status
+
+    def _send(self, data: bytes) -> None:
+        with self._state:
+            self._raise_if_settled()
+        with self._send_lock:
+            self._socket.sendall(data)
+
+    def _raise_if_settled(self) -> None:
+        if not self._settled:
+            return
+        if self._error is not None:
+            raise self._error
+        raise TTCError(f"stream already exited with status {self._status}")
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                kind, payload = self._read_frame()
+                if kind == b"A":
+                    if len(payload) != 4:
+                        raise ProtocolError("invalid stdin acknowledgement")
+                    acknowledged = struct.unpack(">I", payload)[0]
+                    with self._state:
+                        if acknowledged > self._unacknowledged:
+                            raise ProtocolError("ttcd acknowledged unsent stdin")
+                        self._unacknowledged -= acknowledged
+                        self._state.notify_all()
+                    continue
+                if kind == b"X":
+                    if len(payload) != 4:
+                        raise ProtocolError("invalid status frame")
+                    self._finish(status=struct.unpack(">I", payload)[0])
+                    return
+                callback = self._callbacks.get(kind)
+                if kind not in self._callbacks:
+                    raise ProtocolError(f"unexpected ttcd frame type {kind!r}")
+                if callback is not None:
+                    callback(payload)
+                with self._state:
+                    if self._settled:
+                        return
+        except BaseException as error:
+            self._finish(error=error)
+
+    def _read_frame(self) -> tuple[bytes, bytes]:
+        header = self._read_exact(5)
+        length = struct.unpack(">I", header[1:])[0]
+        if length > MAX_FRAME:
+            raise ProtocolError(f"oversized ttcd frame: {length} bytes")
+        return header[:1], self._read_exact(length)
+
+    def _read_exact(self, size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            chunk = self._socket.recv(size - len(result))
+            if not chunk:
+                raise ProtocolError("ttcd closed the connection before returning status")
+            result.extend(chunk)
+        return bytes(result)
+
+    def _finish(
+        self, *, error: BaseException | None = None, status: int | None = None
+    ) -> None:
+        with self._state:
+            if self._settled:
+                return
+            self._settled = True
+            self._error = error
+            self._status = status
+            self._state.notify_all()
+        try:
+            self._socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._socket.close()
 
 
 class Client:
@@ -270,6 +484,125 @@ class Client:
 
     def remove(self, target: str, *, force: bool = False) -> Result:
         return self.command(["rm", *(["--force"] if force else []), target])
+
+    def stream(
+        self,
+        args: Sequence[str],
+        *,
+        stdin: bool = False,
+        request_id: str | None = None,
+        timeout: float | None = None,
+        size: tuple[int, int] | None = None,
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
+        on_observation: Callable[[bytes], None] | None = None,
+        on_terminal: Callable[[bytes], None] | None = None,
+    ) -> TTCStream:
+        """Open a long-lived operation without buffering its output."""
+        if not args or any(not isinstance(arg, str) for arg in args):
+            raise ValueError("args must be a non-empty sequence of strings")
+        request = {
+            "version": API_VERSION,
+            "action": "command",
+            "request_id": request_id or secrets.token_hex(16),
+            "args": list(args),
+            "stdin": stdin,
+        }
+        return TTCStream(
+            self.socket_path,
+            request,
+            stdin=stdin,
+            timeout=timeout,
+            size=size,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_observation=on_observation,
+            on_terminal=on_terminal,
+        )
+
+    def watch_tty(
+        self,
+        target: str,
+        session: str,
+        on_observation: Callable[[bytes], None],
+    ) -> TTCStream:
+        return self.stream(
+            ["tty", "watch", target, "--session", session],
+            on_observation=on_observation,
+        )
+
+    def attach(
+        self,
+        target: str,
+        *,
+        exec_session: str | None = None,
+        stdin: bool = True,
+        takeover: bool = False,
+        size: tuple[int, int] = (24, 80),
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
+        on_terminal: Callable[[bytes], None] | None = None,
+    ) -> TTCStream:
+        return self.stream(
+            [
+                "attach",
+                *(["--interactive"] if stdin else ["--no-stdin"]),
+                *(["--takeover"] if takeover else []),
+                *(["--exec", exec_session] if exec_session else []),
+                target,
+            ],
+            stdin=stdin,
+            size=size,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_terminal=on_terminal,
+        )
+
+    def watch_events(
+        self,
+        *,
+        since: str | None = None,
+        filters: Mapping[str, str] | None = None,
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
+    ) -> TTCStream:
+        filter_args = [
+            value
+            for key, match in (filters or {}).items()
+            for value in ("--filter", f"{key}={match}")
+        ]
+        return self.stream(
+            [
+                "events",
+                "--json",
+                "--follow",
+                *(["--since", since] if since else []),
+                *filter_args,
+            ],
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+    def follow_logs(
+        self,
+        target: str,
+        *,
+        exec_session: str | None = None,
+        tail: str | int | None = None,
+        on_stdout: Callable[[bytes], None] | None = None,
+        on_stderr: Callable[[bytes], None] | None = None,
+    ) -> TTCStream:
+        return self.stream(
+            [
+                "logs",
+                "--follow",
+                *(["-n", str(tail)] if tail is not None else []),
+                *(["--exec", exec_session] if exec_session else []),
+                target,
+            ],
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
 
     def _exchange(
         self, request: Mapping[str, Any], input_data: bytes, timeout: float | None

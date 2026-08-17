@@ -21,6 +21,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 pub const API_VERSION: u32 = 4;
@@ -34,6 +35,7 @@ pub enum Error {
     Json(serde_json::Error),
     Protocol(String),
     InvalidArguments(String),
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -42,6 +44,7 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
             Self::Protocol(message) | Self::InvalidArguments(message) => f.write_str(message),
+            Self::Cancelled => f.write_str("TTC stream was cancelled before returning status"),
         }
     }
 }
@@ -118,6 +121,209 @@ pub struct CommandOptions {
     pub input: Option<Vec<u8>>,
     pub request_id: Option<String>,
     pub timeout: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamOptions {
+    pub stdin: bool,
+    pub request_id: Option<String>,
+    pub timeout: Option<Duration>,
+    /// Initial (rows, columns), sent immediately after the request header.
+    pub size: Option<(u32, u32)>,
+}
+
+/// One complete frame delivered by a long-lived TTC operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Observation(Vec<u8>),
+    Terminal(Vec<u8>),
+    Exited(u32),
+}
+
+#[derive(Debug, Default)]
+struct StreamState {
+    unacknowledged: usize,
+    settled: bool,
+    eof_requested: bool,
+    eof_sent: bool,
+}
+
+#[derive(Debug)]
+struct StreamShared {
+    state: Mutex<StreamState>,
+    changed: Condvar,
+    input: Mutex<()>,
+    writer: Mutex<UnixStream>,
+    shutdown: UnixStream,
+}
+
+/// A streaming TTC operation. Output arrives through `recv`; stdin and resize
+/// remain writable until the daemon returns an `Exited` event.
+pub struct TtcStream {
+    pub args: Vec<String>,
+    shared: Arc<StreamShared>,
+    events: mpsc::Receiver<Result<StreamEvent, Error>>,
+    event_sender: mpsc::Sender<Result<StreamEvent, Error>>,
+    stdin_declared: bool,
+}
+
+impl TtcStream {
+    pub fn write(&self, data: &[u8]) -> Result<(), Error> {
+        if !self.stdin_declared {
+            return Err(Error::InvalidArguments(
+                "stream was not opened with stdin enabled".to_owned(),
+            ));
+        }
+        let _input = self.shared.input.lock().unwrap();
+        {
+            let state = self.shared.state.lock().unwrap();
+            if state.eof_requested || state.eof_sent {
+                return Err(Error::InvalidArguments("stdin already closed".to_owned()));
+            }
+            ensure_stream_active(&state)?;
+        }
+        let mut offset = 0;
+        while offset < data.len() {
+            let mut state = self.shared.state.lock().unwrap();
+            while !state.settled && state.unacknowledged >= STDIN_WINDOW {
+                state = self.shared.changed.wait(state).unwrap();
+            }
+            ensure_stream_active(&state)?;
+            let size = MAX_FRAME
+                .min(STDIN_WINDOW - state.unacknowledged)
+                .min(data.len() - offset);
+            state.unacknowledged += size;
+            drop(state);
+            let write_result = {
+                let mut writer = self.shared.writer.lock().unwrap();
+                write_frame(&mut writer, b'I', &data[offset..offset + size])
+            };
+            if let Err(error) = write_result {
+                let message = error.to_string();
+                settle_stream(
+                    &self.shared,
+                    &self.event_sender,
+                    Err(Error::Protocol(message)),
+                );
+                return Err(error);
+            }
+            offset += size;
+        }
+        Ok(())
+    }
+
+    pub fn close_stdin(&self) -> Result<(), Error> {
+        if !self.stdin_declared {
+            return Err(Error::InvalidArguments(
+                "stream was not opened with stdin enabled".to_owned(),
+            ));
+        }
+        let _input = self.shared.input.lock().unwrap();
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if state.eof_requested || state.eof_sent {
+                return Ok(());
+            }
+            ensure_stream_active(&state)?;
+            state.eof_requested = true;
+        }
+        let write_result = {
+            let mut writer = self.shared.writer.lock().unwrap();
+            write_frame(&mut writer, b'C', &[])
+        };
+        if let Err(error) = write_result {
+            let message = error.to_string();
+            settle_stream(
+                &self.shared,
+                &self.event_sender,
+                Err(Error::Protocol(message)),
+            );
+            return Err(error);
+        }
+        self.shared.state.lock().unwrap().eof_sent = true;
+        Ok(())
+    }
+
+    pub fn resize(&self, rows: u32, cols: u32) -> Result<(), Error> {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&rows.to_be_bytes());
+        payload[4..].copy_from_slice(&cols.to_be_bytes());
+        {
+            let state = self.shared.state.lock().unwrap();
+            ensure_stream_active(&state)?;
+        }
+        let write_result = {
+            let mut writer = self.shared.writer.lock().unwrap();
+            write_frame(&mut writer, b'W', &payload)
+        };
+        if let Err(error) = write_result {
+            let message = error.to_string();
+            settle_stream(
+                &self.shared,
+                &self.event_sender,
+                Err(Error::Protocol(message)),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn recv(&self) -> Result<StreamEvent, Error> {
+        self.events.recv().map_err(|_| {
+            Error::Protocol("TTC stream event channel closed before status".to_owned())
+        })?
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<StreamEvent, Error> {
+        self.events
+            .recv_timeout(timeout)
+            .map_err(|error| Error::Protocol(format!("waiting for TTC stream event: {error}")))?
+    }
+
+    pub fn wait(&self) -> Result<u32, Error> {
+        loop {
+            if let StreamEvent::Exited(status) = self.recv()? {
+                return Ok(status);
+            }
+        }
+    }
+
+    pub fn close(&self) {
+        settle_stream(&self.shared, &self.event_sender, Err(Error::Cancelled));
+    }
+}
+
+impl Drop for TtcStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn ensure_stream_active(state: &StreamState) -> Result<(), Error> {
+    if state.settled {
+        Err(Error::Protocol("TTC stream is already settled".to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn settle_stream(
+    shared: &Arc<StreamShared>,
+    sender: &mpsc::Sender<Result<StreamEvent, Error>>,
+    event: Result<StreamEvent, Error>,
+) -> bool {
+    let mut state = shared.state.lock().unwrap();
+    if state.settled {
+        return false;
+    }
+    state.settled = true;
+    shared.changed.notify_all();
+    drop(state);
+    let _ = shared.shutdown.shutdown(std::net::Shutdown::Both);
+    let _ = sender.send(event);
+    true
 }
 
 /// Returns ttcd's default per-user socket path.
@@ -287,11 +493,17 @@ impl Client {
     }
 
     pub fn exec_wait(&self, target: &str, session: &str) -> Result<CommandResult, Error> {
-        self.command(vec!["exec".to_owned(), "wait".to_owned(), format!("{target}:{session}")])
+        self.command(vec![
+            "exec".to_owned(),
+            "wait".to_owned(),
+            format!("{target}:{session}"),
+        ])
     }
 
     pub fn tty_stat(&self, target: &str, session: &str) -> Result<serde_json::Value, Error> {
-        Ok(self.command(["tty", "stat", target, "--session", session, "--json"])?.json()?)
+        Ok(self
+            .command(["tty", "stat", target, "--session", session, "--json"])?
+            .json()?)
     }
 
     pub fn commit(
@@ -451,6 +663,135 @@ impl Client {
         }
     }
 
+    pub fn stream<I, S>(&self, args: I, options: StreamOptions) -> Result<TtcStream, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
+        if args.is_empty() {
+            return Err(Error::InvalidArguments(
+                "args must contain at least one string".to_owned(),
+            ));
+        }
+        let request_id = match options.request_id {
+            Some(id) => id,
+            None => random_request_id()?,
+        };
+        let stream_args = args.clone();
+        let request = json!({
+            "version": API_VERSION,
+            "action": "command",
+            "request_id": request_id,
+            "args": args,
+            "stdin": options.stdin,
+        });
+        let mut writer = UnixStream::connect(&self.socket_path)?;
+        writer.set_read_timeout(options.timeout)?;
+        writer.set_write_timeout(options.timeout)?;
+        serde_json::to_writer(&mut writer, &request)?;
+        writer.write_all(b"\n")?;
+        if let Some((rows, cols)) = options.size {
+            let mut payload = [0u8; 8];
+            payload[..4].copy_from_slice(&rows.to_be_bytes());
+            payload[4..].copy_from_slice(&cols.to_be_bytes());
+            write_frame(&mut writer, b'W', &payload)?;
+        }
+        let reader = writer.try_clone()?;
+        let shutdown = writer.try_clone()?;
+        let shared = Arc::new(StreamShared {
+            state: Mutex::new(StreamState::default()),
+            changed: Condvar::new(),
+            input: Mutex::new(()),
+            writer: Mutex::new(writer),
+            shutdown,
+        });
+        let (sender, events) = mpsc::channel();
+        let reader_shared = Arc::clone(&shared);
+        let reader_sender = sender.clone();
+        std::thread::spawn(move || stream_read_loop(reader, reader_shared, reader_sender));
+        Ok(TtcStream {
+            args: stream_args,
+            shared,
+            events,
+            event_sender: sender,
+            stdin_declared: options.stdin,
+        })
+    }
+
+    pub fn watch_tty(&self, target: &str, session: &str) -> Result<TtcStream, Error> {
+        self.stream(
+            ["tty", "watch", target, "--session", session],
+            StreamOptions::default(),
+        )
+    }
+
+    pub fn attach(
+        &self,
+        target: &str,
+        exec_session: Option<&str>,
+        stdin: bool,
+        takeover: bool,
+        size: (u32, u32),
+    ) -> Result<TtcStream, Error> {
+        let mut args = vec!["attach".to_owned()];
+        args.push(if stdin { "--interactive" } else { "--no-stdin" }.to_owned());
+        if takeover {
+            args.push("--takeover".to_owned());
+        }
+        if let Some(session) = exec_session {
+            args.extend(["--exec".to_owned(), session.to_owned()]);
+        }
+        args.push(target.to_owned());
+        self.stream(
+            args,
+            StreamOptions {
+                stdin,
+                size: Some(size),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn watch_events(
+        &self,
+        since: Option<&str>,
+        filters: &[(&str, &str)],
+    ) -> Result<TtcStream, Error> {
+        let mut args = vec![
+            "events".to_owned(),
+            "--json".to_owned(),
+            "--follow".to_owned(),
+        ];
+        if let Some(since) = since {
+            args.extend(["--since".to_owned(), since.to_owned()]);
+        }
+        for (key, value) in filters {
+            args.extend(["--filter".to_owned(), format!("{key}={value}")]);
+        }
+        self.stream(args, StreamOptions::default())
+    }
+
+    pub fn follow_logs(
+        &self,
+        target: &str,
+        exec_session: Option<&str>,
+        tail: Option<&str>,
+    ) -> Result<TtcStream, Error> {
+        let mut args = vec!["logs".to_owned(), "--follow".to_owned()];
+        if let Some(tail) = tail {
+            args.extend(["-n".to_owned(), tail.to_owned()]);
+        }
+        if let Some(session) = exec_session {
+            args.extend(["--exec".to_owned(), session.to_owned()]);
+        }
+        args.push(target.to_owned());
+        self.stream(args, StreamOptions::default())
+    }
+
     fn timed_lifecycle_command(
         &self,
         command: &str,
@@ -537,6 +878,87 @@ impl Client {
                         "unexpected ttcd frame type 0x{kind:02x}"
                     )))
                 }
+            }
+        }
+    }
+}
+
+fn stream_read_loop(
+    mut reader: UnixStream,
+    shared: Arc<StreamShared>,
+    sender: mpsc::Sender<Result<StreamEvent, Error>>,
+) {
+    loop {
+        let (kind, payload) = match read_frame(&mut reader) {
+            Ok(frame) => frame,
+            Err(error) => {
+                settle_stream(&shared, &sender, Err(error));
+                return;
+            }
+        };
+        match kind {
+            b'A' => {
+                if payload.len() != 4 {
+                    settle_stream(
+                        &shared,
+                        &sender,
+                        Err(Error::Protocol("invalid stdin acknowledgement".to_owned())),
+                    );
+                    return;
+                }
+                let acknowledged =
+                    u32::from_be_bytes(payload.try_into().expect("length checked")) as usize;
+                let mut state = shared.state.lock().unwrap();
+                if acknowledged > state.unacknowledged {
+                    drop(state);
+                    settle_stream(
+                        &shared,
+                        &sender,
+                        Err(Error::Protocol("ttcd acknowledged unsent stdin".to_owned())),
+                    );
+                    return;
+                }
+                state.unacknowledged -= acknowledged;
+                shared.changed.notify_all();
+            }
+            b'X' => {
+                if payload.len() != 4 {
+                    settle_stream(
+                        &shared,
+                        &sender,
+                        Err(Error::Protocol("invalid status frame".to_owned())),
+                    );
+                    return;
+                }
+                let status = u32::from_be_bytes(payload.try_into().expect("length checked"));
+                settle_stream(&shared, &sender, Ok(StreamEvent::Exited(status)));
+                return;
+            }
+            b'O' | b'E' | b'S' | b'T' => {
+                if shared.state.lock().unwrap().settled {
+                    return;
+                }
+                let event = match kind {
+                    b'O' => StreamEvent::Stdout(payload),
+                    b'E' => StreamEvent::Stderr(payload),
+                    b'S' => StreamEvent::Observation(payload),
+                    b'T' => StreamEvent::Terminal(payload),
+                    _ => unreachable!(),
+                };
+                if sender.send(Ok(event)).is_err() {
+                    settle_stream(&shared, &sender, Err(Error::Cancelled));
+                    return;
+                }
+            }
+            _ => {
+                settle_stream(
+                    &shared,
+                    &sender,
+                    Err(Error::Protocol(format!(
+                        "unexpected ttcd frame type 0x{kind:02x}"
+                    ))),
+                );
+                return;
             }
         }
     }
@@ -663,6 +1085,122 @@ mod tests {
             result.stdout,
             b"{\"version\":1,\"output_bytes\":4}\n{\"version\":1,\"output_bytes\":9}\n"
         );
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stream_delivers_observations_and_status() {
+        let path = temporary_socket("stream-observations");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["tty", "watch", "demo@main", "--session", "repl"])
+            );
+            write_frame(&mut stream, b'S', br#"{"output_bytes":1}"#).unwrap();
+            write_frame(&mut stream, b'S', br#"{"output_bytes":2}"#).unwrap();
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let stream = Client::new(&path).watch_tty("demo@main", "repl").unwrap();
+        assert_eq!(
+            stream.recv().unwrap(),
+            StreamEvent::Observation(br#"{"output_bytes":1}"#.to_vec())
+        );
+        assert_eq!(
+            stream.recv().unwrap(),
+            StreamEvent::Observation(br#"{"output_bytes":2}"#.to_vec())
+        );
+        assert_eq!(stream.wait().unwrap(), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn attach_orders_size_before_stdin() {
+        let path = temporary_socket("stream-attach");
+        let server = mock_server(&path, |mut socket, request| {
+            assert_eq!(
+                request["args"],
+                json!(["attach", "--interactive", "--exec", "repl", "demo@main"])
+            );
+            let (kind, payload) = read_frame(&mut socket).unwrap();
+            assert_eq!(kind, b'W');
+            assert_eq!(&payload[..4], &40u32.to_be_bytes());
+            assert_eq!(&payload[4..], &120u32.to_be_bytes());
+            let (kind, payload) = read_frame(&mut socket).unwrap();
+            assert_eq!((kind, payload.as_slice()), (b'I', b"echo hi\n".as_slice()));
+            write_frame(&mut socket, b'A', &(payload.len() as u32).to_be_bytes()).unwrap();
+            write_frame(&mut socket, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let stream = Client::new(&path)
+            .attach("demo@main", Some("repl"), true, false, (40, 120))
+            .unwrap();
+        stream.write(b"echo hi\n").unwrap();
+        assert_eq!(stream.wait().unwrap(), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stream_flow_controls_more_than_one_window() {
+        let path = temporary_socket("stream-flow-control");
+        let expected = vec![b'z'; STDIN_WINDOW + 31];
+        let server_expected = expected.clone();
+        let server = mock_server(&path, move |mut socket, request| {
+            assert_eq!(request["stdin"], true);
+            let mut received = Vec::new();
+            loop {
+                let (kind, payload) = read_frame(&mut socket).unwrap();
+                if kind == b'C' {
+                    break;
+                }
+                assert_eq!(kind, b'I');
+                received.extend_from_slice(&payload);
+                write_frame(&mut socket, b'A', &(payload.len() as u32).to_be_bytes()).unwrap();
+            }
+            assert_eq!(received, server_expected);
+            write_frame(&mut socket, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let stream = Client::new(&path)
+            .stream(
+                ["exec", "demo@main", "cat"],
+                StreamOptions {
+                    stdin: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        stream.write(&expected).unwrap();
+        stream.close_stdin().unwrap();
+        assert_eq!(stream.wait().unwrap(), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn close_is_cancellation_and_stdin_stays_closed() {
+        let path = temporary_socket("stream-cancel");
+        let server = mock_server(&path, |mut socket, _request| {
+            let _ = read_frame(&mut socket);
+            let mut byte = [0u8; 1];
+            let _ = socket.read(&mut byte);
+        });
+        let stream = Client::new(&path)
+            .stream(
+                ["attach", "demo@main"],
+                StreamOptions {
+                    stdin: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        stream.close_stdin().unwrap();
+        assert!(matches!(
+            stream.write(b"late"),
+            Err(Error::InvalidArguments(_))
+        ));
+        stream.close();
+        assert!(matches!(stream.wait(), Err(Error::Cancelled)));
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

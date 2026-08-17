@@ -19,7 +19,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from ttcx import Client, CommandFailed
+from ttcx import Client, CommandFailed, StreamCancelled, TTCError
 from ttcx.client import API_VERSION, default_socket_path
 
 
@@ -190,6 +190,125 @@ class ClientTest(unittest.TestCase):
                     .checkpoint("demo@main", "state.ttc", compression="none")
                     .ok
                 )
+            finally:
+                daemon.close()
+
+    def test_stream_delivers_observations_and_status(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["tty", "watch", "demo@main", "--session", "repl"],
+            )
+            conn.sendall(frame(b"S", b'{"output_bytes":1}'))
+            conn.sendall(frame(b"S", b'{"output_bytes":2}'))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                seen = []
+                stream = Client(daemon.path).watch_tty(
+                    "demo@main", "repl", lambda payload: seen.append(json.loads(payload))
+                )
+                self.assertEqual(stream.wait(), 0)
+                self.assertEqual([item["output_bytes"] for item in seen], [1, 2])
+            finally:
+                daemon.close()
+
+    def test_attach_sends_size_before_stdin(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["attach", "--interactive", "--exec", "repl", "demo@main"],
+            )
+            kind = read_exact(conn, 1)
+            size = struct.unpack(">I", read_exact(conn, 4))[0]
+            self.assertEqual((kind, size), (b"W", 8))
+            self.assertEqual(struct.unpack(">II", read_exact(conn, size)), (40, 120))
+            kind = read_exact(conn, 1)
+            size = struct.unpack(">I", read_exact(conn, 4))[0]
+            self.assertEqual((kind, read_exact(conn, size)), (b"I", b"echo hi\n"))
+            conn.sendall(frame(b"A", struct.pack(">I", size)))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                stream = Client(daemon.path).attach(
+                    "demo@main", exec_session="repl", size=(40, 120)
+                )
+                stream.write("echo hi\n")
+                self.assertEqual(stream.wait(), 0)
+            finally:
+                daemon.close()
+
+    def test_stream_flow_controls_more_than_one_window(self):
+        payload = b"z" * ((1 << 20) + 31)
+
+        def handler(conn, request):
+            self.assertIs(request["stdin"], True)
+            received = bytearray()
+            while True:
+                kind = read_exact(conn, 1)
+                size = struct.unpack(">I", read_exact(conn, 4))[0]
+                data = read_exact(conn, size)
+                if kind == b"C":
+                    break
+                self.assertEqual(kind, b"I")
+                received.extend(data)
+                conn.sendall(frame(b"A", struct.pack(">I", len(data))))
+            self.assertEqual(bytes(received), payload)
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                stream = Client(daemon.path).stream(
+                    ["exec", "demo@main", "cat"], stdin=True
+                )
+                stream.write(payload)
+                stream.close_stdin()
+                self.assertEqual(stream.wait(), 0)
+            finally:
+                daemon.close()
+
+    def test_callback_failure_and_local_cancel_are_not_success(self):
+        callback_error = RuntimeError("handler failed")
+
+        def handler(conn, _request):
+            conn.sendall(frame(b"O", b"output"))
+            try:
+                conn.recv(1)
+            except ConnectionError:
+                pass
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                stream = Client(daemon.path).stream(
+                    ["logs", "--follow", "demo@main"],
+                    on_stdout=lambda _payload: (_ for _ in ()).throw(callback_error),
+                )
+                with self.assertRaisesRegex(RuntimeError, "handler failed"):
+                    stream.wait()
+            finally:
+                daemon.close()
+
+        def idle(conn, _request):
+            conn.recv(1)
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", idle)
+            try:
+                stream = Client(daemon.path).stream(
+                    ["attach", "demo@main"], stdin=True
+                )
+                stream.close_stdin()
+                with self.assertRaises(TTCError):
+                    stream.write("late")
+                stream.close()
+                with self.assertRaises(StreamCancelled):
+                    stream.wait()
             finally:
                 daemon.close()
 

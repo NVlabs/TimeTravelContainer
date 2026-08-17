@@ -55,7 +55,9 @@ Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 take longer.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
-errors. Interactive TTY sessions remain available through the CLI. Checkpoint
+errors. `ttc_list` includes each non-root branch's `parent`, allowing MCP hosts
+to render fork trees without parsing human output. Interactive TTY sessions
+remain available through the CLI. Checkpoint
 paths refer to the `ttcd` host; use absolute paths when the MCP process and
 daemon have different working directories.
 

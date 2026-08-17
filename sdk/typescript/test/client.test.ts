@@ -19,7 +19,14 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { API_VERSION, Client, CommandFailed, defaultSocketPath } from "../src/index.js";
+import {
+  API_VERSION,
+  Client,
+  CommandFailed,
+  StreamCancelled,
+  TTCError,
+  defaultSocketPath,
+} from "../src/index.js";
 
 function frame(kind: string, payload: Buffer = Buffer.alloc(0)): Buffer {
   const result = Buffer.alloc(5 + payload.length);
@@ -280,6 +287,59 @@ test("stream never closes stdin implicitly", async () => {
       const stream = new Client(path).stream(["attach", "demo@main"], { stdin: true });
       stream.write("still open\n");
       assert.equal(await stream.exited, 0);
+    },
+  );
+});
+
+test("an immediate resize remains behind the request header", async () => {
+  await withServer(
+    (socket, request, rest) => {
+      assert.deepEqual(request.args, ["attach", "demo@main"]);
+      let receive = rest;
+      const consume = (chunk?: Buffer): void => {
+        if (chunk) receive = Buffer.concat([receive, chunk]);
+        if (receive.length < 13) return;
+        assert.equal(String.fromCharCode(receive[0]!), "W");
+        assert.equal(receive.readUInt32BE(1), 8);
+        assert.equal(receive.readUInt32BE(5), 55);
+        assert.equal(receive.readUInt32BE(9), 132);
+        socket.end(frame("X", Buffer.alloc(4)));
+      };
+      socket.on("data", consume);
+      consume();
+    },
+    async (path) => {
+      const stream = new Client(path).stream(["attach", "demo@main"]);
+      stream.resize(55, 132);
+      assert.equal(await stream.exited, 0);
+    },
+  );
+});
+
+test("callback failures reject exited instead of escaping EventEmitter", async () => {
+  await withServer(
+    (socket) => socket.write(frame("O", Buffer.from("output"))),
+    async (path) => {
+      const expected = new Error("handler failed");
+      const stream = new Client(path).stream(["logs", "--follow", "demo@main"], {
+        onStdout: () => {
+          throw expected;
+        },
+      });
+      await assert.rejects(stream.exited, (error) => error === expected);
+    },
+  );
+});
+
+test("local close is cancellation and closeStdin rejects later writes", async () => {
+  await withServer(
+    () => {},
+    async (path) => {
+      const stream = new Client(path).stream(["attach", "demo@main"], { stdin: true });
+      stream.closeStdin();
+      assert.throws(() => stream.write("late"), TTCError);
+      stream.close();
+      await assert.rejects(stream.exited, StreamCancelled);
     },
   );
 });

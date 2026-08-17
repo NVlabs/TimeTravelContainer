@@ -4642,7 +4642,7 @@ func (s selector) String() string {
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
 	ID               string    `json:"id"`
-	ParentID         string    `json:"parent_id,omitempty"`
+	ParentID         string    `json:"parent,omitempty"`
 	State            string    `json:"state"`
 	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
 	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
@@ -4651,6 +4651,38 @@ type Branch struct {
 	InitPID          int32     `json:"init_pid,omitempty"`
 	InitState        string    `json:"init_state,omitempty"`
 	MemorySharing    string    `json:"memory_sharing,omitempty"`
+}
+
+// MarshalJSON preserves the original parent_id field for existing SDK users
+// and also exposes parent, the branch-parentage name used by harness APIs and
+// daemon events. Roots omit both fields.
+func (b Branch) MarshalJSON() ([]byte, error) {
+	type branchJSON Branch
+	return json.Marshal(struct {
+		branchJSON
+		LegacyParentID string `json:"parent_id,omitempty"`
+	}{branchJSON: branchJSON(b), LegacyParentID: b.ParentID})
+}
+
+// UnmarshalJSON accepts both the canonical parent and the pre-harness
+// parent_id spelling.
+func (b *Branch) UnmarshalJSON(data []byte) error {
+	type branchJSON Branch
+	var decoded branchJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.ParentID == "" {
+		var legacy struct {
+			ParentID string `json:"parent_id"`
+		}
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		decoded.ParentID = legacy.ParentID
+	}
+	*b = Branch(decoded)
+	return nil
 }
 
 // Family is stable family metadata returned by ttc ls --json.

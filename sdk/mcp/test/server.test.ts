@@ -43,10 +43,12 @@ function mockDaemon(path: string) {
         unknown
       >;
       requests.push(request);
-      const output =
-        request.action === "ping"
-          ? '{"version":4,"isolation_mode":"rootless"}\n'
-          : `ran:${(request.args as string[]).join(" ")}\n`;
+      const args = request.args as string[] | undefined;
+      const output = request.action === "ping"
+        ? '{"version":4,"isolation_mode":"rootless"}\n'
+        : args?.join(" ") === "ls --json"
+          ? '[{"id":"demo","branches":[{"id":"main"},{"id":"child","parent":"main","parent_id":"main"}]}]\n'
+          : `ran:${args?.join(" ")}\n`;
       socket.write(frame("O", Buffer.from(output)));
       socket.end(frame("X", Buffer.alloc(4)));
     });
@@ -83,11 +85,11 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     assert.equal(status.isError, undefined);
     assert.match((status.content[0] as { text: string }).text, /"version": 4/);
 
-    const command = await client.callTool({
-      name: "ttc_command",
-      arguments: { args: ["ls", "--json"] },
+    const families = await client.callTool({
+      name: "ttc_list",
+      arguments: {},
     });
-    assert.match((command.content[0] as { text: string }).text, /ran:ls --json/);
+    assert.match((families.content[0] as { text: string }).text, /"parent": "main"/);
     assert.deepEqual(mock.requests[1].args, ["ls", "--json"]);
     assert.equal(mock.requests[1].options, undefined);
 

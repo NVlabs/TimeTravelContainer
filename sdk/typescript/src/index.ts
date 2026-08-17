@@ -23,6 +23,7 @@ const STDIN_WINDOW = 1 << 20;
 
 export class TTCError extends Error {}
 export class ProtocolError extends TTCError {}
+export class StreamCancelled extends TTCError {}
 
 export class CommandFailed extends TTCError {
   constructor(public readonly result: Result) {
@@ -110,9 +111,14 @@ function frame(kind: string, payload: Uint8Array = new Uint8Array()): Buffer {
  * each a uint32. See `decodeDaemonTerminalSize` in runsc/ttc/cmd.
  */
 function sizeFrame(rows: number, cols: number): Buffer {
+  for (const [name, value] of [["rows", rows], ["cols", cols]] as const) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+      throw new RangeError(`${name} must be a uint32`);
+    }
+  }
   const payload = Buffer.allocUnsafe(8);
-  payload.writeUInt32BE(rows >>> 0, 0);
-  payload.writeUInt32BE(cols >>> 0, 4);
+  payload.writeUInt32BE(rows, 0);
+  payload.writeUInt32BE(cols, 4);
   return frame("W", payload);
 }
 
@@ -182,6 +188,7 @@ export class TtcStream {
    * stdin bytes ahead of the JSON header and desynchronize the daemon.
    */
   private connected = false;
+  private pendingSize: { rows: number; cols: number } | undefined;
   private readonly stdinDeclared: boolean;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private resolveExit!: (status: number) => void;
@@ -196,6 +203,8 @@ export class TtcStream {
     this.args = Array.isArray(request.args) ? [...(request.args as string[])] : [];
     this.handlers = options;
     this.stdinDeclared = options.stdin === true;
+    if (options.size) sizeFrame(options.size.rows, options.size.cols);
+    this.pendingSize = options.size;
     this.exited = new Promise<number>((res, rej) => {
       this.resolveExit = res;
       this.rejectExit = rej;
@@ -217,8 +226,9 @@ export class TtcStream {
 
     this.socket.once("connect", () => {
       this.socket.write(`${JSON.stringify(request)}\n`);
-      if (options.size) {
-        this.socket.write(sizeFrame(options.size.rows, options.size.cols));
+      if (this.pendingSize) {
+        this.socket.write(sizeFrame(this.pendingSize.rows, this.pendingSize.cols));
+        this.pendingSize = undefined;
       }
       this.connected = true;
       this.pump();
@@ -241,8 +251,8 @@ export class TtcStream {
     if (!this.stdinDeclared) {
       throw new TTCError("stream was not opened with stdin enabled");
     }
-    if (this.eofSent) throw new TTCError("stdin already closed");
-    if (this.settled) return;
+    if (this.settled) throw new TTCError("stream is already settled");
+    if (this.eofRequested || this.eofSent) throw new TTCError("stdin already closed");
     this.pending.push(typeof data === "string" ? Buffer.from(data) : data);
     this.pump();
   }
@@ -255,20 +265,32 @@ export class TtcStream {
    * and discarding it would silently truncate the stream.
    */
   closeStdin(): void {
-    if (!this.stdinDeclared || this.eofRequested || this.settled) return;
+    if (!this.stdinDeclared) {
+      throw new TTCError("stream was not opened with stdin enabled");
+    }
+    if (this.settled) throw new TTCError("stream is already settled");
+    if (this.eofRequested) return;
     this.eofRequested = true;
     this.pump();
   }
 
   /** Sends a `W` resize frame carrying big-endian rows then columns. */
   resize(rows: number, cols: number): void {
-    if (this.settled) return;
+    if (this.settled) throw new TTCError("stream is already settled");
+    // Validate synchronously even when the connection is still pending.
+    sizeFrame(rows, cols);
+    if (!this.connected) {
+      // Only the latest pre-connect size matters. It must be sent by the
+      // connect handler after the JSON header, never queued on Socket first.
+      this.pendingSize = { rows, cols };
+      return;
+    }
     this.socket.write(sizeFrame(rows, cols));
   }
 
-  /** Drops the connection without waiting for a status frame. */
+  /** Cancels locally; `exited` rejects because no daemon status was received. */
   close(): void {
-    this.finish(undefined, 0);
+    this.finish(new StreamCancelled("TTC stream was cancelled before returning status"));
   }
 
   private pump(): void {
@@ -308,17 +330,13 @@ export class TtcStream {
   private dispatch(kind: string, payload: Buffer): boolean {
     switch (kind) {
       case "O":
-        this.handlers.onStdout?.(payload);
-        return true;
+        return this.deliver(this.handlers.onStdout, payload);
       case "E":
-        this.handlers.onStderr?.(payload);
-        return true;
+        return this.deliver(this.handlers.onStderr, payload);
       case "S":
-        this.handlers.onObservation?.(payload);
-        return true;
+        return this.deliver(this.handlers.onObservation, payload);
       case "T":
-        this.handlers.onTerminal?.(payload);
-        return true;
+        return this.deliver(this.handlers.onTerminal, payload);
       case "A": {
         if (payload.length !== 4) {
           this.finish(new ProtocolError("invalid stdin acknowledgement"));
@@ -345,6 +363,18 @@ export class TtcStream {
         this.finish(new ProtocolError(`unexpected TTC frame ${JSON.stringify(kind)}`));
         return false;
     }
+  }
+
+  private deliver(handler: ((payload: Buffer) => void) | undefined, payload: Buffer): boolean {
+    try {
+      handler?.(payload);
+    } catch (error) {
+      this.finish(error instanceof Error ? error : new TTCError(String(error)));
+      return false;
+    }
+    // A callback may intentionally cancel the stream. Do not deliver frames
+    // that happened to arrive in the same socket chunk after cancellation.
+    return !this.settled;
   }
 
   private finish(error?: Error, status?: number): void {

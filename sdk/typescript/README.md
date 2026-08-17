@@ -56,8 +56,27 @@ console.log(await ttc.diff("demo@candidate-a"));
                   { "timetravel.usage": "review" })).check();
 ```
 
-`ttyStat()` is the synchronous terminal-observation API. `ttc tty watch`
-supplies the streaming form for clients that consume a long-lived request.
+`ttyStat()` is the synchronous terminal-observation API. Long-lived operations
+use `TtcStream` without buffering output:
+
+```ts
+const watch = ttc.watchTty("demo@candidate-a", "build1", {
+  onObservation: (payload) => console.log(JSON.parse(payload.toString())),
+});
+
+const shell = ttc.attach("demo@candidate-a", {
+  exec: "build1",
+  size: { rows: 40, cols: 120 },
+  onStdout: (chunk) => process.stdout.write(chunk),
+});
+shell.write("make test\n");
+shell.resize(50, 160);
+```
+
+Call `closeStdin()` only when the guest should observe EOF. `close()` cancels
+the local stream and rejects `exited` with `StreamCancelled`; only a daemon
+status frame resolves `exited` successfully. `watchEvents()` and
+`followLogs()` expose the other unbounded streams.
 
 Families created by `run` are live-fork eligible by default. Use an option set
 such as `["--network=host", "--waive-live-fork"]` only when deliberately

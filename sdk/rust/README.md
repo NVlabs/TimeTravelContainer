@@ -54,9 +54,25 @@ ttc.fork_many(
 
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
 named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
-accepts OCI labels and `copy` exposes branch-aware file transfer. `tty_stat`
-is synchronous, while `ttc tty watch` is the streaming terminal-observation
-form for clients that implement long-lived frame consumption.
+accepts OCI labels and `copy` exposes branch-aware file transfer. Long-lived
+operations return `TtcStream` and complete frame events:
+
+```rust
+use ttcx::StreamEvent;
+
+let watch = ttc.watch_tty("demo@candidate-a", "build1")?;
+loop {
+    match watch.recv()? {
+        StreamEvent::Observation(json) => println!("{}", String::from_utf8_lossy(&json)),
+        StreamEvent::Exited(status) => break,
+        _ => {}
+    }
+}
+```
+
+`attach`, `watch_events`, and `follow_logs` use the same channel. Explicitly
+call `close_stdin` for guest EOF. `close` produces `Error::Cancelled`; only a
+daemon `Exited` event is a command status.
 
 `Client::command` accepts every other non-interactive TTC command. Use
 `command_with_options` for stdin, a timeout override, or an explicit request ID

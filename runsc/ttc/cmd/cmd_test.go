@@ -228,6 +228,45 @@ func TestWriteTree(t *testing.T) {
 	}
 }
 
+func TestListJSONIncludesBranchParentage(t *testing.T) {
+	b := &fakeBackend{families: []Family{{
+		ID: "web", State: "running",
+		Branches: []Branch{
+			{ID: "main", State: "running"},
+			{ID: "child", ParentID: "main", State: "paused"},
+		},
+	}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"ls", "--json"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ls --json status=%d, stderr=%q", status, stderr.String())
+	}
+	var families []struct {
+		Branches []map[string]any `json:"branches"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &families); err != nil {
+		t.Fatalf("decoding ls JSON: %v", err)
+	}
+	if got := families[0].Branches[0]["parent"]; got != nil {
+		t.Errorf("root parent=%v, want omitted", got)
+	}
+	child := families[0].Branches[1]
+	if child["parent"] != "main" || child["parent_id"] != "main" {
+		t.Errorf("child parentage=%v, want parent and parent_id main", child)
+	}
+	for _, encoded := range []string{
+		`{"id":"child","parent":"main","state":"paused"}`,
+		`{"id":"child","parent_id":"main","state":"paused"}`,
+	} {
+		var branch Branch
+		if err := json.Unmarshal([]byte(encoded), &branch); err != nil {
+			t.Fatalf("decoding branch %s: %v", encoded, err)
+		}
+		if branch.ParentID != "main" {
+			t.Errorf("decoded branch %s parent=%q, want main", encoded, branch.ParentID)
+		}
+	}
+}
+
 func TestStoppedStateIsExposedAsExited(t *testing.T) {
 	container := ttcbundle.ContainerInfo{
 		ID: "legacy", Name: "legacy", State: "stopped",
