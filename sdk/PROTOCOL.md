@@ -42,7 +42,6 @@ destination is a branch name; a remote fork destination is a
 implicit `main` selection beyond what the CLI command itself documents.
 
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
-The legacy `parent_id` spelling is emitted alongside `parent` for compatibility.
 
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`

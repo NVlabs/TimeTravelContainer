@@ -47,7 +47,7 @@ function mockDaemon(path: string) {
       const output = request.action === "ping"
         ? '{"version":4,"isolation_mode":"rootless"}\n'
         : args?.join(" ") === "ls --json"
-          ? '[{"id":"demo","branches":[{"id":"main"},{"id":"child","parent":"main","parent_id":"main"}]}]\n'
+          ? '[{"id":"demo","branches":[{"id":"main"},{"id":"child","parent":"main"}]}]\n'
           : `ran:${args?.join(" ")}\n`;
       socket.write(frame("O", Buffer.from(output)));
       socket.end(frame("X", Buffer.alloc(4)));

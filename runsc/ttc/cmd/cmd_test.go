@@ -250,20 +250,11 @@ func TestListJSONIncludesBranchParentage(t *testing.T) {
 		t.Errorf("root parent=%v, want omitted", got)
 	}
 	child := families[0].Branches[1]
-	if child["parent"] != "main" || child["parent_id"] != "main" {
-		t.Errorf("child parentage=%v, want parent and parent_id main", child)
+	if child["parent"] != "main" {
+		t.Errorf("child parentage=%v, want parent main", child)
 	}
-	for _, encoded := range []string{
-		`{"id":"child","parent":"main","state":"paused"}`,
-		`{"id":"child","parent_id":"main","state":"paused"}`,
-	} {
-		var branch Branch
-		if err := json.Unmarshal([]byte(encoded), &branch); err != nil {
-			t.Fatalf("decoding branch %s: %v", encoded, err)
-		}
-		if branch.ParentID != "main" {
-			t.Errorf("decoded branch %s parent=%q, want main", encoded, branch.ParentID)
-		}
+	if _, ok := child["parent_id"]; ok {
+		t.Errorf("child parentage=%v, parent_id must not be emitted", child)
 	}
 }
 

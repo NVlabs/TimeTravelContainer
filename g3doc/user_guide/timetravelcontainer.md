@@ -272,9 +272,8 @@ web@test  selects branch test in family web
 ```
 
 Use `ttc ls --tree` for human-readable branch lineage and `ttc ls --json` for
-the stable machine-readable form. Each non-root branch carries `parent` (and
-the compatibility alias `parent_id`). Use `ttc top web@test` for the processes
-in one branch.
+the stable machine-readable form. Each non-root branch carries `parent`. Use
+`ttc top web@test` for the processes in one branch.
 
 ## Live fork, pause, and resume
 
