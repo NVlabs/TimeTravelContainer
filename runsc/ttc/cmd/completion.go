@@ -24,9 +24,9 @@ import (
 
 var topLevelCompletionCommands = []string{
 	"attach", "completion", "container", "cp", "create", "daemon", "events", "exec", "fork",
-	"dehydrate", "help", "image", "images", "inspect", "kill", "logs", "ls", "pause",
+	"dehydrate", "help", "image", "images", "inspect", "kill", "load", "logs", "ls", "pause",
 	"port", "ps", "pull", "rehydrate", "restart", "resume", "rm", "rmi", "run", "start", "stop",
-	"top", "unpause", "wait",
+	"save", "top", "unpause", "wait",
 }
 
 const bashCompletion = `# bash completion for ttc
@@ -222,12 +222,14 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 		return nil, nil
 	case "image":
 		if len(rest) == 0 {
-			return []string{"inspect", "ls", "pull", "rm"}, nil
+			return []string{"inspect", "load", "ls", "pull", "rm", "save"}, nil
 		}
-		if rest[0] == "inspect" || rest[0] == "rm" || rest[0] == "remove" {
+		if rest[0] == "inspect" || rest[0] == "rm" || rest[0] == "remove" || rest[0] == "save" {
 			return imageCompletionCandidates(backend)
 		}
 		return nil, nil
+	case "save":
+		return imageCompletionCandidates(backend)
 	case "port":
 		if len(rest) == 0 {
 			return []string{"ls", "publish", "unpublish"}, nil

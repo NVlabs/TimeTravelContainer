@@ -16,6 +16,7 @@ package images
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -124,7 +126,7 @@ func TestNativeDeleteGuardsAgainstRetargetedTag(t *testing.T) {
 	}
 }
 
-func TestCommitPreservesAndOverridesLabels(t *testing.T) {
+func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
@@ -170,8 +172,12 @@ func TestCommitPreservesAndOverridesLabels(t *testing.T) {
 
 	info, err := Commit(ctx, CommitOptions{
 		Root: root, BaseDigest: target.Digest.String(), Reference: "session:v1",
-		Layer:  bytes.NewReader(make([]byte, 1024)),
-		Labels: map[string]string{"override": "new", "timetravel.usage": "prompt"},
+		Layer: bytes.NewReader(make([]byte, 1024)), Author: "TTC Harness <ttc@example.com>", Message: "prepared session",
+		Changes: []string{
+			"LABEL override=new timetravel.usage=prompt",
+			"ENV SESSION_MODE=review",
+			`CMD ["agent","run"]`,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +189,6 @@ func TestCommitPreservesAndOverridesLabels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.close()
 	record := store.catalog.Images["docker.io/library/session:v1"]
 	committedManifest, err := containerdimages.Manifest(ctx, store.content, record.Target, platforms.DefaultStrict())
 	if err != nil {
@@ -200,8 +205,94 @@ func TestCommitPreservesAndOverridesLabels(t *testing.T) {
 	if err := json.Unmarshal(committedConfigData, &committedConfig); err != nil {
 		t.Fatal(err)
 	}
-	if committedConfig.Config.Labels["base"] != "kept" || committedConfig.Config.Labels["override"] != "new" || len(committedConfig.RootFS.DiffIDs) != 1 {
+	if committedConfig.Config.Labels["base"] != "kept" || committedConfig.Config.Labels["override"] != "new" ||
+		committedConfig.Config.Labels["timetravel.usage"] != "prompt" || committedConfig.Author != "TTC Harness <ttc@example.com>" ||
+		!reflect.DeepEqual(committedConfig.Config.Cmd, []string{"agent", "run"}) || !slices.Contains(committedConfig.Config.Env, "SESSION_MODE=review") ||
+		len(committedConfig.RootFS.DiffIDs) != 1 || committedConfig.History[len(committedConfig.History)-1].Comment != "prepared session" {
 		t.Fatalf("committed config=%+v", committedConfig)
+	}
+	alias := record
+	alias.Info.Reference = "docker.io/library/session:review"
+	store.catalog.Images[alias.Info.Reference] = alias
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+
+	var archive bytes.Buffer
+	if err := Save(ctx, SaveOptions{Root: root, Archive: &archive, Images: []string{"session"}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	if _, err := gzipWriter.Write(archive.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(ctx, LoadOptions{Root: t.TempDir(), Archive: bytes.NewReader(compressed.Bytes()), Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var references []string
+	for _, loadedInfo := range loaded {
+		references = append(references, loadedInfo.Reference)
+	}
+	wantReferences := []string{"docker.io/library/session:review", "docker.io/library/session:v1"}
+	if !reflect.DeepEqual(references, wantReferences) {
+		t.Fatalf("loaded references=%q, want %q", references, wantReferences)
+	}
+}
+
+func TestApplyCommitChangeDockerForms(t *testing.T) {
+	config := ocispec.ImageConfig{
+		Env:    []string{"KEPT=yes", "REPLACED=old"},
+		Labels: map[string]string{"base": "kept"},
+	}
+	for _, change := range []string{
+		"ENV REPLACED=new ADDED='two words'",
+		"EXPOSE 8080 8443/udp",
+		"LABEL timetravel.usage 'agent session'",
+		`ENTRYPOINT ["agent"]`,
+		"CMD run --foreground",
+		"USER 1000:1000",
+		`VOLUME ["/work","/cache"]`,
+		"WORKDIR /work",
+	} {
+		if err := applyCommitChange(&config, change); err != nil {
+			t.Fatalf("applyCommitChange(%q): %v", change, err)
+		}
+	}
+	if want := []string{"KEPT=yes", "REPLACED=new", "ADDED=two words"}; !reflect.DeepEqual(config.Env, want) {
+		t.Errorf("Env=%q, want %q", config.Env, want)
+	}
+	if _, ok := config.ExposedPorts["8080/tcp"]; !ok {
+		t.Errorf("ExposedPorts=%v", config.ExposedPorts)
+	}
+	if _, ok := config.ExposedPorts["8443/udp"]; !ok {
+		t.Errorf("ExposedPorts=%v", config.ExposedPorts)
+	}
+	if config.Labels["base"] != "kept" || config.Labels["timetravel.usage"] != "agent session" {
+		t.Errorf("Labels=%v", config.Labels)
+	}
+	if want := []string{"agent"}; !reflect.DeepEqual(config.Entrypoint, want) {
+		t.Errorf("Entrypoint=%q, want %q", config.Entrypoint, want)
+	}
+	if want := []string{"/bin/sh", "-c", "run --foreground"}; !reflect.DeepEqual(config.Cmd, want) {
+		t.Errorf("Cmd=%q, want %q", config.Cmd, want)
+	}
+	if config.User != "1000:1000" || config.WorkingDir != "/work" {
+		t.Errorf("User=%q WorkingDir=%q", config.User, config.WorkingDir)
+	}
+	for _, volume := range []string{"/work", "/cache"} {
+		if _, ok := config.Volumes[volume]; !ok {
+			t.Errorf("Volumes=%v", config.Volumes)
+		}
+	}
+	if err := applyCommitChange(&config, "RUN echo unsupported"); err == nil {
+		t.Fatal("RUN unexpectedly accepted")
 	}
 }
 

@@ -79,6 +79,8 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     assert(listed.tools.some((tool) => tool.name === "ttc_fork_many"));
     assert(listed.tools.some((tool) => tool.name === "ttc_checkpoint"));
     assert(listed.tools.some((tool) => tool.name === "ttc_restore"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_image_load"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_image_save"));
     assert(listed.tools.some((tool) => tool.name === "ttc_command"));
 
     const status = await client.callTool({ name: "ttc_status", arguments: {} });
@@ -156,6 +158,38 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       "hosted",
       "--waive-live-fork",
       "alpine:3.20",
+    ]);
+
+    await client.callTool({
+      name: "ttc_image_load",
+      arguments: {
+        input: "/srv/images.tar.gz",
+        platform: "linux/amd64",
+        quiet: true,
+      },
+    });
+    assert.deepEqual(mock.requests[6].args, [
+      "load",
+      "--input",
+      "/srv/images.tar.gz",
+      "--platform",
+      "linux/amd64",
+      "--quiet",
+    ]);
+
+    await client.callTool({
+      name: "ttc_image_save",
+      arguments: {
+        images: ["one:latest", "two:test"],
+        output: "/srv/images.tar",
+      },
+    });
+    assert.deepEqual(mock.requests[7].args, [
+      "save",
+      "--output",
+      "/srv/images.tar",
+      "one:latest",
+      "two:test",
     ]);
   } finally {
     await client.close();

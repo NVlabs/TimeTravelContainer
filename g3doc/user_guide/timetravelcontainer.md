@@ -215,10 +215,13 @@ Do not point two incompatible TTC versions at the same live runtime root.
 
 ## Images
 
-Pull, list, inspect, and remove images with familiar commands:
+Pull, load, save, list, inspect, and remove images with Docker-compatible
+commands:
 
 ```shell
 ttc pull alpine:3.20
+ttc load -i images.tar
+ttc save -o alpine.tar alpine:3.20
 ttc images
 ttc image inspect alpine:3.20
 ttc rmi alpine:3.20
@@ -244,6 +247,18 @@ downloading, reusing, and extracting content.
 Redirected output remains line-oriented and contains no terminal control
 sequences. `ttc pull -q` suppresses progress and prints only the digest.
 `--pull missing` is the fastest offline path after the first pull.
+
+`ttc load` reads a Docker-save or OCI archive from standard input by default;
+`-i/--input` names a daemon-host file. It restores every tag in the archive
+that matches the selected `--platform`. `ttc save` writes a Docker/OCI archive
+to standard output by default; `-o/--output` names a daemon-host file. Both
+commands also work as `ttc image load` and `ttc image save`:
+
+```shell
+docker save tools:latest | ttc load
+ttc save tools:latest | gzip > tools.tar.gz
+gzip -dc tools.tar.gz | ttc load
+```
 
 ## Run and inspect containers
 
@@ -631,15 +646,23 @@ and branch removal.
 
 ## Commit, diff, and resource accounting
 
-Commit a branch filesystem as a runnable local OCI image. Existing OCI labels
-round-trip through commit and image inspection; repeated `--label` options add
-or replace labels for harness metadata such as a bundled prompt:
+Commit a branch filesystem as a runnable local OCI image. Docker-style
+`--change` options update supported image configuration fields. Existing OCI
+labels round-trip; a `LABEL` change adds or replaces harness metadata such as a
+bundled prompt:
 
 ```shell
-ttc commit --label timetravel.usage=code-review \
+ttc commit --change 'LABEL timetravel.usage=code-review' \
   web@test-b local/web-review:prepared
 ttc image inspect local/web-review:prepared
 ```
+
+As with `docker commit`, TTC pauses a running branch while capturing it unless
+`--pause=false` is supplied. `-a/--author` records an author and `-m/--message`
+records the history message. Repeat `-c/--change` to apply `CMD`, `ENTRYPOINT`,
+`ENV`, `EXPOSE`, `LABEL`, `USER`, `VOLUME`, or `WORKDIR`. TTC requires the
+destination repository argument so the committed image remains addressable in
+its local image store.
 
 `ttc diff` reads TTC's CoW metadata rather than walking the guest tree. Its
 JSON form reports changed paths and change kinds relative to the branch's

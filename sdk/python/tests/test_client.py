@@ -171,6 +171,84 @@ class ClientTest(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_image_helpers_use_docker_compatible_command_shapes(self):
+        with self.assertRaisesRegex(ValueError, "requires input or archive"):
+            Client("/unused").load()
+
+        def commit_handler(conn, request):
+            self.assertEqual(request["args"], [
+                "commit",
+                "--author", "TTC Harness",
+                "--message", "prepared",
+                "--change", "LABEL timetravel.usage=review",
+                "--pause=false",
+                "demo@main",
+                "local/result:latest",
+            ])
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", commit_handler)
+            try:
+                result = Client(daemon.path).commit(
+                    "demo@main",
+                    "local/result:latest",
+                    author="TTC Harness",
+                    message="prepared",
+                    changes=["LABEL timetravel.usage=review"],
+                    pause=False,
+                )
+                self.assertTrue(result.ok)
+            finally:
+                daemon.close()
+
+        archive = b"image archive"
+
+        def load_handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["load", "--platform", "linux/amd64", "--quiet"],
+            )
+            self.assertIs(request["stdin"], True)
+            received = bytearray()
+            while True:
+                kind = read_exact(conn, 1)
+                size = struct.unpack(">I", read_exact(conn, 4))[0]
+                data = read_exact(conn, size)
+                if kind == b"C":
+                    break
+                self.assertEqual(kind, b"I")
+                received.extend(data)
+                conn.sendall(frame(b"A", struct.pack(">I", len(data))))
+            self.assertEqual(bytes(received), archive)
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", load_handler)
+            try:
+                result = Client(daemon.path).load(
+                    archive=archive, platform="linux/amd64", quiet=True
+                )
+                self.assertTrue(result.ok)
+            finally:
+                daemon.close()
+
+        def save_handler(conn, request):
+            self.assertEqual(request["args"], [
+                "save", "--output", "/srv/images.tar", "one:latest", "two:test",
+            ])
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", save_handler)
+            try:
+                result = Client(daemon.path).save(
+                    ["one:latest", "two:test"], output="/srv/images.tar"
+                )
+                self.assertTrue(result.ok)
+            finally:
+                daemon.close()
+
     def test_checkpoint_normalizes_daemon_host_path(self):
         def handler(conn, request):
             self.assertEqual(request["args"][:4], [

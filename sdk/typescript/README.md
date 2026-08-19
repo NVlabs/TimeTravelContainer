@@ -53,8 +53,14 @@ console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
 console.log(await ttc.stats("demo@candidate-a"));
 console.log(await ttc.diff("demo@candidate-a"));
 (await ttc.commit("demo@candidate-a", "local/result:latest",
-                  { "timetravel.usage": "review" })).check();
+                  { changes: ["LABEL timetravel.usage=review"] })).check();
+const archive = await ttc.save(["local/result:latest"]);
+await ttc.load({ archive: archive.stdout });
 ```
+
+`load({ archive })` and `save()` buffer the archive in the client. For large
+archives, use `input`/`output` paths visible to `ttcd`, or the streaming command
+API.
 
 `ttyStat()` is the synchronous terminal-observation API. Long-lived operations
 use `TtcStream` without buffering output:

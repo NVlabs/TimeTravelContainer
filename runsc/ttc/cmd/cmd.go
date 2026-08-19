@@ -298,10 +298,12 @@ Global options:
 
 Commands:
   images [OPTIONS]               List local images
-  image COMMAND                  Manage local images (ls, inspect, rm)
+  image COMMAND                  Manage local images (ls, pull, load, save, inspect, rm)
   container COMMAND              Docker-style container command aliases
   rmi [OPTIONS] IMAGE...         Remove one or more local images
   pull [OPTIONS] IMAGE           Pull an OCI/Docker image into local content
+  load [OPTIONS]                 Load images from a tar archive or standard input
+  save [OPTIONS] IMAGE...        Save images to a tar archive or standard output
   commit [OPTIONS] TARGET IMAGE  Commit a branch rootfs as a new OCI image
   run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
@@ -355,7 +357,10 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 	if len(args) == 2 && args[1] == "--help" {
 		usage := map[string]string{
 			"container":  "Usage: ttc container COMMAND",
-			"image":      "Usage: ttc image COMMAND",
+			"image":      "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
+			"load":       "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
+			"save":       "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
+			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
 			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
@@ -383,6 +388,8 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container unpause": "Usage: ttc container unpause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container top":     "Usage: ttc container top CONTAINER@BRANCH [PS OPTIONS]",
 			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
+			"image load":        "Usage: ttc image load [--input FILE] [--platform PLATFORM] [--quiet]",
+			"image save":        "Usage: ttc image save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
@@ -409,6 +416,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runImageRemove(args[1:], stdout, stderr, backend)
 	case "pull":
 		err = runPull(args[1:], stdout, stderr, backend)
+	case "load":
+		err = runImageLoad(args[1:], stdout, stderr, backend)
+	case "save":
+		err = runImageSave(args[1:], stdout, stderr, backend)
 	case "commit":
 		err = runCommit(args[1:], stdout, stderr, backend)
 	case "run":
@@ -2934,15 +2945,77 @@ func runPull(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+func runImageLoad(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("load", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	platform := fs.String("platform", "", "load only the given platform")
+	input := fs.String("input", "", "read from a tar archive file instead of standard input")
+	fs.StringVar(input, "i", "", "read from a tar archive file instead of standard input")
+	quiet := fs.Bool("quiet", false, "suppress load output")
+	fs.BoolVar(quiet, "q", false, "suppress load output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]")
+	}
+	var archive io.Reader
+	if *input != "" {
+		file, err := os.Open(*input)
+		if err != nil {
+			return fmt.Errorf("opening image archive: %w", err)
+		}
+		defer file.Close()
+		archive = file
+	}
+	infos, err := backend.loadImages(archive, *platform)
+	if err != nil {
+		return err
+	}
+	if !*quiet {
+		for _, info := range infos {
+			fmt.Fprintf(stdout, "Loaded image: %s\n", familiarImageReference(info.Reference))
+		}
+	}
+	return nil
+}
+
+func runImageSave(args []string, stdout, stderr io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("save", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	platform := fs.String("platform", "", "save only the given platform")
+	output := fs.String("output", "", "write to a file instead of standard output")
+	fs.StringVar(output, "o", "", "write to a file instead of standard output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]")
+	}
+	if *output != "" {
+		file, err := os.OpenFile(*output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return fmt.Errorf("opening image archive output: %w", err)
+		}
+		saveErr := backend.saveImages(file, fs.Args(), *platform)
+		return errors.Join(saveErr, file.Close())
+	}
+	return backend.saveImages(stdout, fs.Args(), *platform)
+}
+
 func runImage(args []string, stdout, stderr io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttc image ls|pull|inspect|rm [OPTIONS]")
+		return errors.New("usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]")
 	}
 	switch args[0] {
 	case "ls", "list":
 		return runImages(args[1:], stdout, stderr, backend)
 	case "pull":
 		return runPull(args[1:], stdout, stderr, backend)
+	case "load":
+		return runImageLoad(args[1:], stdout, stderr, backend)
+	case "save":
+		return runImageSave(args[1:], stdout, stderr, backend)
 	case "inspect":
 		return runImageInspect(args[1:], stdout, backend)
 	case "rm", "remove":
@@ -4726,28 +4799,38 @@ type ImageRemoveResult struct {
 	Deleted  string
 }
 
+type imageCommitOptions struct {
+	Author  string
+	Message string
+	Changes []string
+	Pause   bool
+}
+
 func runCommit(args []string, stdout, stderr io.Writer, b backend) error {
 	fs := flag.NewFlagSet("commit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var labels, labelFiles stringSlice
-	fs.Var(&labels, "label", "set image OCI label KEY=VALUE")
-	fs.Var(&labels, "l", "set image OCI label KEY=VALUE")
-	fs.Var(&labelFiles, "label-file", "read image labels from a file")
+	author := fs.String("author", "", "author (for example, Name <email@example.com>)")
+	fs.StringVar(author, "a", "", "author (for example, Name <email@example.com>)")
+	message := fs.String("message", "", "commit message")
+	fs.StringVar(message, "m", "", "commit message")
+	var changes stringSlice
+	fs.Var(&changes, "change", "apply a Dockerfile instruction to the created image")
+	fs.Var(&changes, "c", "apply a Dockerfile instruction to the created image")
+	pause := fs.Bool("pause", true, "pause the branch during commit")
+	fs.BoolVar(pause, "p", true, "pause the branch during commit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return errors.New("usage: ttc commit [--label KEY=VALUE] CONTAINER@BRANCH IMAGE")
+		return errors.New("usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	values, err := collectLabels(labelFiles, labels)
-	if err != nil {
-		return err
-	}
-	info, err := b.commit(target, fs.Arg(1), values)
+	info, err := b.commit(target, fs.Arg(1), imageCommitOptions{
+		Author: *author, Message: *message, Changes: append([]string(nil), changes...), Pause: *pause,
+	})
 	if err != nil {
 		return fmt.Errorf("committing %s: %w", target, err)
 	}
@@ -4964,10 +5047,12 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 
 type backend interface {
 	pull(reference, platform string, progress bool) (ttcimages.Info, error)
+	loadImages(archive io.Reader, platform string) ([]ttcimages.Info, error)
+	saveImages(archive io.Writer, identifiers []string, platform string) error
 	listImages() ([]ImageInfo, error)
 	inspectImage(identifier string) (ImageInspectInfo, error)
 	removeImage(identifier string, force bool) (ImageRemoveResult, error)
-	commit(target selector, reference string, labels map[string]string) (ttcimages.Info, error)
+	commit(target selector, reference string, options imageCommitOptions) (ttcimages.Info, error)
 	create(request runRequest) (string, error)
 	run(request runRequest) (containerRunResult, error)
 	start(target selector, detach, interactive bool) (int, error)
@@ -5213,7 +5298,7 @@ func (b *runtimeBackend) inspectImage(identifier string) (ImageInspectInfo, erro
 	return inspectImageFromInventory(infos, identifier)
 }
 
-func (b *runtimeBackend) commit(target selector, reference string, labels map[string]string) (result ttcimages.Info, retErr error) {
+func (b *runtimeBackend) commit(target selector, reference string, options imageCommitOptions) (result ttcimages.Info, retErr error) {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return ttcimages.Info{}, err
@@ -5221,6 +5306,16 @@ func (b *runtimeBackend) commit(target selector, reference string, labels map[st
 	branch, err := persistentBranchInfo(info, resolved.branch)
 	if err != nil {
 		return ttcimages.Info{}, err
+	}
+	if options.Pause && normalizeLifecycleState(branch.State) == "running" {
+		if err := b.pause(resolved); err != nil {
+			return ttcimages.Info{}, fmt.Errorf("pausing branch for commit: %w", err)
+		}
+		defer func() {
+			if err := b.resume(resolved); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("resuming branch after commit: %w", err))
+			}
+		}()
 	}
 	filesystemBranch := branch.FilesystemBranch
 	if filesystemBranch == "" {
@@ -5291,7 +5386,8 @@ func (b *runtimeBackend) commit(target selector, reference string, labels map[st
 		}()
 	}
 	result, commitErr := ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
-		Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader, Labels: labels,
+		Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader,
+		Author: options.Author, Message: options.Message, Changes: options.Changes,
 	})
 	_ = reader.Close()
 	exportErr := <-exportDone
@@ -8363,6 +8459,37 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 		return ttcimages.Info{}, fmt.Errorf("pruning superseded image roots: %w", err)
 	}
 	return info, nil
+}
+
+func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcimages.Info, error) {
+	if archive == nil {
+		archive = b.stdin
+	}
+	if archive == nil {
+		return nil, errors.New("no image archive on standard input")
+	}
+	ctx := context.Background()
+	infos, err := ttcimages.Load(ctx, ttcimages.LoadOptions{
+		Root: b.dataRoot, Archive: archive, Platform: platform,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, info := range infos {
+		if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, info.Platform, nil); err != nil {
+			return nil, fmt.Errorf("preparing loaded image %q root: %w", info.Reference, err)
+		}
+	}
+	if _, err := b.containerStore().PruneImageRoots(ctx); err != nil {
+		return nil, fmt.Errorf("pruning superseded image roots: %w", err)
+	}
+	return infos, nil
+}
+
+func (b *runtimeBackend) saveImages(archive io.Writer, identifiers []string, platform string) error {
+	return ttcimages.Save(context.Background(), ttcimages.SaveOptions{
+		Root: b.dataRoot, Archive: archive, Images: identifiers, Platform: platform,
+	})
 }
 
 func (b *runtimeBackend) command(args ...string) ([]byte, error) {

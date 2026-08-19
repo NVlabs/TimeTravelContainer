@@ -69,8 +69,14 @@ print(ttc.tty_stat("demo@candidate-a", "build1"))
 print(ttc.stats("demo@candidate-a"))
 print(ttc.diff("demo@candidate-a"))
 ttc.commit("demo@candidate-a", "local/result:latest",
-           labels={"timetravel.usage": "review"}).check()
+           changes=["LABEL timetravel.usage=review"]).check()
+archive = ttc.save(["local/result:latest"]).stdout
+ttc.load(archive=archive).check()
 ```
+
+`load(archive=...)` and `save()` buffer the archive in the client. For large
+archives, use `input`/`output` paths visible to `ttcd`, or the streaming command
+API.
 
 Families created by `run` are live-fork eligible by default. If an application
 deliberately needs an incompatible external feature, pass both that option and

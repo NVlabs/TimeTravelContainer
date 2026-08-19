@@ -54,8 +54,13 @@ ttc.fork_many(
 
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
 named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
-accepts OCI labels and `copy` exposes branch-aware file transfer. Long-lived
-operations return `TtcStream` and complete frame events:
+accepts Docker-style image changes, while `load` and `save` exchange standard
+image archives. `copy` exposes branch-aware file transfer.
+
+The byte-oriented `load`/`save` forms buffer archives in the client. Prefer
+daemon-host `input`/`output` paths or `stream` for large archives.
+
+Long-lived operations return `TtcStream` and complete frame events:
 
 ```rust
 use ttcx::StreamEvent;

@@ -389,12 +389,62 @@ class Client:
         ).json()
 
     def commit(
-        self, target: str, image: str, *, labels: Mapping[str, str] | None = None
+        self,
+        target: str,
+        image: str,
+        *,
+        author: str | None = None,
+        message: str | None = None,
+        changes: Sequence[str] = (),
+        pause: bool = True,
     ) -> Result:
         options: list[str] = []
-        for key, value in (labels or {}).items():
-            options.extend(["--label", f"{key}={value}"])
+        if author is not None:
+            options.extend(["--author", author])
+        if message is not None:
+            options.extend(["--message", message])
+        for change in changes:
+            options.extend(["--change", change])
+        if not pause:
+            options.append("--pause=false")
         return self.command(["commit", *options, target, image])
+
+    def load(
+        self,
+        *,
+        input: str | None = None,
+        archive: bytes | None = None,
+        platform: str | None = None,
+        quiet: bool = False,
+    ) -> Result:
+        if input is not None and archive is not None:
+            raise ValueError("image load accepts either input or archive, not both")
+        if input is None and archive is None:
+            raise ValueError("image load requires input or archive")
+        args = ["load"]
+        if input is not None:
+            args.extend(["--input", str(Path(input).expanduser().resolve())])
+        if platform is not None:
+            args.extend(["--platform", platform])
+        if quiet:
+            args.append("--quiet")
+        return self.command(args, input=archive)
+
+    def save(
+        self,
+        images: Sequence[str],
+        *,
+        output: str | None = None,
+        platform: str | None = None,
+    ) -> Result:
+        if not images:
+            raise ValueError("image save requires at least one image")
+        args = ["save"]
+        if output is not None:
+            args.extend(["--output", str(Path(output).expanduser().resolve())])
+        if platform is not None:
+            args.extend(["--platform", platform])
+        return self.command([*args, *images])
 
     def stats(self, target: str) -> Any:
         return self.command(["stats", "--json", target], check=True).json()

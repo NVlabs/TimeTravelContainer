@@ -88,6 +88,36 @@ export function createServer(client = new Client()): McpServer {
   );
 
   server.registerTool(
+    "ttc_image_load",
+    {
+      description: "Load a Docker-save or OCI image archive from a path visible to ttcd.",
+      inputSchema: {
+        input: z.string().describe("Archive path on the ttcd host"),
+        platform: z.string().optional(),
+        quiet: z.boolean().default(false),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ input, platform, quiet }) =>
+      commandResponse(await client.load({ input, platform, quiet })),
+  );
+
+  server.registerTool(
+    "ttc_image_save",
+    {
+      description: "Save one or more TTC images to an archive path visible to ttcd.",
+      inputSchema: {
+        images: z.array(z.string()).min(1),
+        output: z.string().describe("Archive path on the ttcd host"),
+        platform: z.string().optional(),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ images, output, platform }) =>
+      commandResponse(await client.save(images, { output, platform })),
+  );
+
+  server.registerTool(
     "ttc_run",
     {
       description: "Start a non-interactive container from an OCI image.",
@@ -143,15 +173,18 @@ export function createServer(client = new Client()): McpServer {
   server.registerTool(
 	"ttc_commit",
 	{
-		description: "Commit one branch filesystem as a runnable OCI image with optional labels.",
+		description: "Commit one branch filesystem as a runnable OCI image using Docker-style image configuration changes.",
 		inputSchema: {
 			target: z.string(),
 			image: z.string(),
-			labels: z.record(z.string(), z.string()).default({}),
+			author: z.string().optional(),
+			message: z.string().optional(),
+			changes: z.array(z.string()).default([]).describe("Dockerfile instructions such as LABEL timetravel.usage=review"),
+			pause: z.boolean().default(true),
 		},
 		annotations: { destructiveHint: true },
 	},
-	async ({ target, image, labels }) => commandResponse(await client.commit(target, image, labels)),
+	async ({ target, image, author, message, changes, pause }) => commandResponse(await client.commit(target, image, { author, message, changes, pause })),
   );
 
   server.registerTool(

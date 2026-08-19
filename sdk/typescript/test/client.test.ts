@@ -175,6 +175,89 @@ test("batch remote fork uses the current CLI shape", async () => {
   );
 });
 
+test("image helpers use Docker-compatible command shapes", async () => {
+  assert.throws(() => new Client("/unused").load(), /requires input or archive/);
+
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "commit",
+        "--author", "TTC Harness",
+        "--message", "prepared",
+        "--change", "LABEL timetravel.usage=review",
+        "--pause=false",
+        "demo@main",
+        "local/result:latest",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      const result = await new Client(path).commit("demo@main", "local/result:latest", {
+        author: "TTC Harness",
+        message: "prepared",
+        changes: ["LABEL timetravel.usage=review"],
+        pause: false,
+      });
+      assert.equal(result.ok, true);
+    },
+  );
+
+  const archive = Buffer.from("image archive");
+  await withServer(
+    (socket, request, rest) => {
+      assert.deepEqual(request.args, ["load", "--platform", "linux/amd64", "--quiet"]);
+      assert.equal(request.stdin, true);
+      let receive = rest;
+      const body: Buffer[] = [];
+      const consume = (chunk?: Buffer): void => {
+        if (chunk) receive = Buffer.concat([receive, chunk]);
+        while (receive.length >= 5) {
+          const size = receive.readUInt32BE(1);
+          if (receive.length < 5 + size) return;
+          const kind = String.fromCharCode(receive[0]);
+          const payload = receive.subarray(5, 5 + size);
+          receive = receive.subarray(5 + size);
+          if (kind === "I") {
+            body.push(Buffer.from(payload));
+            const ack = Buffer.alloc(4);
+            ack.writeUInt32BE(payload.length);
+            socket.write(frame("A", ack));
+          } else {
+            assert.equal(kind, "C");
+            assert.deepEqual(Buffer.concat(body), archive);
+            socket.end(frame("X", Buffer.alloc(4)));
+          }
+        }
+      };
+      socket.on("data", consume);
+      consume();
+    },
+    async (path) => {
+      const result = await new Client(path).load({
+        archive,
+        platform: "linux/amd64",
+        quiet: true,
+      });
+      assert.equal(result.ok, true);
+    },
+  );
+
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "save", "--output", "/srv/images.tar", "one:latest", "two:test",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      const result = await new Client(path).save(["one:latest", "two:test"], {
+        output: "/srv/images.tar",
+      });
+      assert.equal(result.ok, true);
+    },
+  );
+});
+
 test("checkpoint normalizes the daemon-host path", async () => {
   await withServer(
     (socket, request) => {

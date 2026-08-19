@@ -107,13 +107,12 @@ Common workflows include:
 
 | Task | Command |
 | --- | --- |
-| Pull and list images | `ttc pull IMAGE`, `ttc images` |
+| Manage images | `ttc pull`, `ttc images`, `ttc load`, `ttc save`, `ttc commit` |
 | Run and inspect | `ttc run`, `ttc ps`, `ttc inspect`, `ttc top` |
 | Interact | `ttc exec`, `ttc attach`, `ttc logs`, `ttc cp` |
 | Manage branches | `ttc fork`, `ttc pause`, `ttc resume`, `ttc rm` |
 | Persist live state | `ttc dehydrate`, `ttc rehydrate`, `ttc checkpoint`, `ttc restore` |
 | Inspect CoW state | `ttc stats`, `ttc diff`, `ttc tty stat` |
-| Produce a reusable image | `ttc commit` |
 | Manage networking | `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
 | Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 

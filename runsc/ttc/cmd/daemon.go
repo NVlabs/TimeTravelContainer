@@ -2248,7 +2248,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore":
 		return true
 	case "cp":
 		_, _, _, err := parseCopyCommandArgs(args[1:])
@@ -2258,7 +2258,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	case "start":
 		return !daemonCommandBoolFlag(args[1:], 'a', "--attach")
 	case "image":
-		return len(args) > 1 && (args[1] == "pull" || args[1] == "rm" || args[1] == "remove")
+		return len(args) > 1 && (args[1] == "pull" || args[1] == "load" || args[1] == "save" || args[1] == "rm" || args[1] == "remove")
 	case "port":
 		return len(args) > 1 && (args[1] == "publish" || args[1] == "unpublish")
 	default:
@@ -2282,6 +2282,24 @@ func daemonCommandNeedsMutationJournal(args []string) bool {
 		return false
 	}
 	if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+		return false
+	}
+	// A load consumes a stream the client holds. Replaying it would need the
+	// archive a second time, and a pipe cannot supply one.
+	if len(args) != 0 && args[0] == "load" {
+		return false
+	}
+	if len(args) > 1 && args[0] == "image" && args[1] == "load" {
+		return false
+	}
+	// Save is read-only but holds the lifecycle lock so image replacement and
+	// garbage collection cannot race the archive traversal. Commit reads live
+	// branch state and may temporarily pause it. Neither operation is suitable
+	// for replay from a buffered mutation record.
+	if len(args) != 0 && (args[0] == "save" || args[0] == "commit") {
+		return false
+	}
+	if len(args) > 1 && args[0] == "image" && args[1] == "save" {
 		return false
 	}
 	// Checkpoint publishes a caller-named host file and therefore cannot be
@@ -2491,6 +2509,23 @@ func writeDaemonStatus(writer io.Writer, mu *sync.Mutex, status int) error {
 	return writeDaemonFrame(writer, mu, daemonFrameStatus, payload[:])
 }
 
+// imageLoadReadsStdin reports whether Docker-style load reads the client's
+// standard input rather than a daemon-host file named by --input.
+func imageLoadReadsStdin(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-i" || arg == "--input" || arg == "-input":
+			return false
+		case strings.HasPrefix(arg, "--input=") || strings.HasPrefix(arg, "-input="):
+			return false
+		case arg == "--platform" || arg == "-platform":
+			i++
+		}
+	}
+	return true
+}
+
 func daemonCommandUsesStdin(args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -2505,6 +2540,10 @@ func daemonCommandUsesStdin(args []string) bool {
 	case "cp":
 		_, source, _, err := parseCopyCommandArgs(args[1:])
 		return err == nil && source == "-"
+	case "load":
+		return imageLoadReadsStdin(args[1:])
+	case "image":
+		return len(args) > 1 && args[1] == "load" && imageLoadReadsStdin(args[2:])
 	case "attach", "run", "start":
 	case "exec":
 		if len(args) > 1 && (args[1] == "ls" || args[1] == "wait" || args[1] == "kill") {
@@ -2528,6 +2567,11 @@ func daemonCommandUsesStdin(args []string) bool {
 }
 
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	var err error
+	args, err = normalizeDaemonImageArchivePaths(args)
+	if err != nil {
+		return 1, err
+	}
 	stderrTerminal, stderrWidth := terminalWriterInfo(stderr)
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
@@ -2576,6 +2620,65 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		return 1, fmt.Errorf("daemon mutation request %s: %w", request.RequestID, lastErr)
 	}
 	return 1, lastErr
+}
+
+// normalizeDaemonImageArchivePaths gives load/save the same client-relative
+// path behavior as Docker. The command itself runs in ttcd, whose working
+// directory may be unrelated to the shell that invoked ttc.
+func normalizeDaemonImageArchivePaths(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return args, nil
+	}
+	commandIndex := 0
+	if args[0] == "image" {
+		if len(args) < 2 {
+			return args, nil
+		}
+		commandIndex = 1
+	}
+	var short, long string
+	switch args[commandIndex] {
+	case "load":
+		short, long = "-i", "--input"
+	case "save":
+		short, long = "-o", "--output"
+	default:
+		return args, nil
+	}
+	result := append([]string(nil), args...)
+	for i := commandIndex + 1; i < len(result); i++ {
+		arg := result[i]
+		if arg == short || arg == long || arg == "-"+strings.TrimPrefix(long, "--") {
+			if i+1 >= len(result) {
+				return result, nil // Let flag parsing produce the canonical error.
+			}
+			if result[i+1] == "" {
+				return result, nil
+			}
+			absolute, err := filepath.Abs(result[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("resolving image archive path: %w", err)
+			}
+			result[i+1] = absolute
+			return result, nil
+		}
+		for _, prefix := range []string{short + "=", long + "=", "-" + strings.TrimPrefix(long, "--") + "="} {
+			if !strings.HasPrefix(arg, prefix) {
+				continue
+			}
+			path := strings.TrimPrefix(arg, prefix)
+			if path == "" {
+				return result, nil
+			}
+			absolute, err := filepath.Abs(path)
+			if err != nil {
+				return nil, fmt.Errorf("resolving image archive path: %w", err)
+			}
+			result[i] = prefix + absolute
+			return result, nil
+		}
+	}
+	return result, nil
 }
 
 func connectRunningDaemon(socket string) (net.Conn, error) {

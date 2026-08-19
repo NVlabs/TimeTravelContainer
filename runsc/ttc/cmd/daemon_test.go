@@ -442,12 +442,44 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 		{[]string{"cp", "-", "demo@main:/tmp"}, true},
 		{[]string{"cp", "local", "demo@main:/tmp"}, false},
 		{[]string{"cp", "demo@main:/tmp", "-"}, false},
+		{[]string{"load"}, true},
+		{[]string{"load", "--platform", "linux/amd64"}, true},
+		{[]string{"load", "-i", "/tmp/images.tar"}, false},
+		{[]string{"image", "load"}, true},
+		{[]string{"image", "load", "--input=/tmp/images.tar"}, false},
 		{[]string{"exec", "ls", "demo"}, false},
 		{[]string{"exec", "demo@main", "true"}, false},
 		{[]string{"logs", "-f", "demo"}, false},
 	} {
 		if got := daemonCommandUsesStdin(test.args); got != test.want {
 			t.Errorf("daemonCommandUsesStdin(%q)=%t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
+func TestNormalizeDaemonImageArchivePaths(t *testing.T) {
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"load", "-i", "images.tar"}, []string{"load", "-i", filepath.Join(workingDirectory, "images.tar")}},
+		{[]string{"image", "load", "--input=images.tar.gz"}, []string{"image", "load", "--input=" + filepath.Join(workingDirectory, "images.tar.gz")}},
+		{[]string{"save", "-o=out.tar", "alpine"}, []string{"save", "-o=" + filepath.Join(workingDirectory, "out.tar"), "alpine"}},
+		{[]string{"image", "save", "--output", "/tmp/out.tar", "alpine"}, []string{"image", "save", "--output", "/tmp/out.tar", "alpine"}},
+		{[]string{"load"}, []string{"load"}},
+		{[]string{"pull", "alpine"}, []string{"pull", "alpine"}},
+	} {
+		got, err := normalizeDaemonImageArchivePaths(test.args)
+		if err != nil {
+			t.Errorf("normalizeDaemonImageArchivePaths(%q): %v", test.args, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, test.want) {
+			t.Errorf("normalizeDaemonImageArchivePaths(%q)=%q, want %q", test.args, got, test.want)
 		}
 	}
 }
@@ -462,6 +494,11 @@ func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 		{[]string{"container", "restart", "demo"}, true},
 		{[]string{"image", "rm", "alpine"}, true},
 		{[]string{"image", "pull", "alpine"}, true},
+		{[]string{"load"}, true},
+		{[]string{"image", "load"}, true},
+		{[]string{"save", "alpine"}, true},
+		{[]string{"image", "save", "alpine"}, true},
+		{[]string{"commit", "demo@main", "local/demo:latest"}, true},
 		{[]string{"rm", "demo@child"}, true},
 		{[]string{"port", "publish", "demo@main", "8080:80"}, true},
 		{[]string{"port", "unpublish", "demo@main", "8080:80"}, true},
@@ -500,6 +537,11 @@ func TestDaemonCommandNeedsMutationJournal(t *testing.T) {
 		{[]string{"restore", "--name", "recovered", "/tmp/demo.ttc"}, true},
 		{[]string{"pull", "alpine"}, false},
 		{[]string{"image", "pull", "alpine"}, false},
+		{[]string{"load"}, false},
+		{[]string{"image", "load"}, false},
+		{[]string{"save", "alpine"}, false},
+		{[]string{"image", "save", "alpine"}, false},
+		{[]string{"commit", "demo@main", "local/demo:latest"}, false},
 		{[]string{"logs", "demo@main"}, false},
 	} {
 		if got := daemonCommandNeedsMutationJournal(test.args); got != test.want {

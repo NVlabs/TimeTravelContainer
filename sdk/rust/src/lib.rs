@@ -132,6 +132,39 @@ pub struct StreamOptions {
     pub size: Option<(u32, u32)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CommitImageOptions {
+    pub author: Option<String>,
+    pub message: Option<String>,
+    pub changes: Vec<String>,
+    pub pause: bool,
+}
+
+impl Default for CommitImageOptions {
+    fn default() -> Self {
+        Self {
+            author: None,
+            message: None,
+            changes: Vec::new(),
+            pause: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImageLoadOptions {
+    pub input: Option<PathBuf>,
+    pub archive: Option<Vec<u8>>,
+    pub platform: Option<String>,
+    pub quiet: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImageSaveOptions {
+    pub output: Option<PathBuf>,
+    pub platform: Option<String>,
+}
+
 /// One complete frame delivered by a long-lived TTC operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamEvent {
@@ -510,15 +543,76 @@ impl Client {
         &self,
         target: &str,
         image: &str,
-        labels: &[(&str, &str)],
+        options: CommitImageOptions,
     ) -> Result<CommandResult, Error> {
         let mut args = vec!["commit".to_owned()];
-        for (key, value) in labels {
-            args.push("--label".to_owned());
-            args.push(format!("{key}={value}"));
+        if let Some(author) = options.author {
+            args.extend(["--author".to_owned(), author]);
+        }
+        if let Some(message) = options.message {
+            args.extend(["--message".to_owned(), message]);
+        }
+        for change in options.changes {
+            args.extend(["--change".to_owned(), change]);
+        }
+        if !options.pause {
+            args.push("--pause=false".to_owned());
         }
         args.push(target.to_owned());
         args.push(image.to_owned());
+        self.command(args)
+    }
+
+    pub fn load(&self, options: ImageLoadOptions) -> Result<CommandResult, Error> {
+        if options.input.is_some() && options.archive.is_some() {
+            return Err(Error::InvalidArguments(
+                "image load accepts either input or archive, not both".to_owned(),
+            ));
+        }
+        if options.input.is_none() && options.archive.is_none() {
+            return Err(Error::InvalidArguments(
+                "image load requires input or archive".to_owned(),
+            ));
+        }
+        let mut args = vec!["load".to_owned()];
+        if let Some(input) = options.input {
+            let input = absolute_path(&input)?;
+            args.extend(["--input".to_owned(), input.to_string_lossy().into_owned()]);
+        }
+        if let Some(platform) = options.platform {
+            args.extend(["--platform".to_owned(), platform]);
+        }
+        if options.quiet {
+            args.push("--quiet".to_owned());
+        }
+        self.command_with_options(
+            args,
+            CommandOptions {
+                input: options.archive,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn save(
+        &self,
+        images: &[&str],
+        options: ImageSaveOptions,
+    ) -> Result<CommandResult, Error> {
+        if images.is_empty() {
+            return Err(Error::InvalidArguments(
+                "image save requires at least one image".to_owned(),
+            ));
+        }
+        let mut args = vec!["save".to_owned()];
+        if let Some(output) = options.output {
+            let output = absolute_path(&output)?;
+            args.extend(["--output".to_owned(), output.to_string_lossy().into_owned()]);
+        }
+        if let Some(platform) = options.platform {
+            args.extend(["--platform".to_owned(), platform]);
+        }
+        args.extend(images.iter().map(|image| (*image).to_owned()));
         self.command(args)
     }
 
@@ -1268,6 +1362,102 @@ mod tests {
                 &["remote@one", "remote@two"],
                 true,
                 Some("node-b"),
+            )
+            .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn image_helpers_use_docker_compatible_command_shapes() {
+        assert!(matches!(
+            Client::new("/unused").load(ImageLoadOptions::default()),
+            Err(Error::InvalidArguments(_))
+        ));
+
+        let path = temporary_socket("image-commit");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!([
+                    "commit",
+                    "--author",
+                    "TTC Harness",
+                    "--message",
+                    "prepared",
+                    "--change",
+                    "LABEL timetravel.usage=review",
+                    "--pause=false",
+                    "demo@main",
+                    "local/result:latest"
+                ])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .commit(
+                "demo@main",
+                "local/result:latest",
+                CommitImageOptions {
+                    author: Some("TTC Harness".to_owned()),
+                    message: Some("prepared".to_owned()),
+                    changes: vec!["LABEL timetravel.usage=review".to_owned()],
+                    pause: false,
+                },
+            )
+            .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let path = temporary_socket("image-load");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["load", "--platform", "linux/amd64", "--quiet"])
+            );
+            assert_eq!(request["stdin"], true);
+            let mut received = Vec::new();
+            loop {
+                let (kind, payload) = read_frame(&mut stream).unwrap();
+                if kind == b'C' {
+                    break;
+                }
+                assert_eq!(kind, b'I');
+                received.extend_from_slice(&payload);
+                write_frame(&mut stream, b'A', &(payload.len() as u32).to_be_bytes()).unwrap();
+            }
+            assert_eq!(received, b"image archive");
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .load(ImageLoadOptions {
+                archive: Some(b"image archive".to_vec()),
+                platform: Some("linux/amd64".to_owned()),
+                quiet: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let path = temporary_socket("image-save");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["save", "--output", "/srv/images.tar", "one:latest", "two:test"])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .save(
+                &["one:latest", "two:test"],
+                ImageSaveOptions {
+                    output: Some(PathBuf::from("/srv/images.tar")),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert!(result.ok());

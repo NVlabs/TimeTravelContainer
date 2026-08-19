@@ -60,6 +60,9 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 		{"cp", []string{"cp", "--help"}, "Usage: ttc cp"},
 		{"events", []string{"events", "--help"}, "Usage: ttc events"},
 		{"image inspect", []string{"image", "inspect", "--help"}, "Usage: ttc image inspect"},
+		{"image load", []string{"image", "load", "--help"}, "Usage: ttc image load"},
+		{"image save", []string{"image", "save", "--help"}, "Usage: ttc image save"},
+		{"commit", []string{"commit", "--help"}, "Usage: ttc commit"},
 		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttc exec wait"},
 		{"daemon", []string{"daemon", "--help"}, "Usage: ttc daemon"},
 	} {
@@ -994,6 +997,60 @@ func TestPullOptionsAndQuietOutput(t *testing.T) {
 	}
 }
 
+func TestImageLoadUsesDockerCLIAndRestoresEveryTag(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "images.tar")
+	if err := os.WriteFile(archive, []byte("archive bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"load", "-i", archive, "--platform", "linux/amd64"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("load status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.loadedBytes != len("archive bytes") || b.loadedPlatform != "linux/amd64" {
+		t.Fatalf("load bytes=%d platform=%q", b.loadedBytes, b.loadedPlatform)
+	}
+	want := "Loaded image: one:latest\nLoaded image: two:test\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("load output=%q, want %q", got, want)
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"image", "load", "-q", "-i", archive}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("image load status=%d, stderr=%q", status, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("quiet image load output=%q", stdout.String())
+	}
+	if status := runCommand([]string{"image", "import", archive}, &stdout, &stderr, b); status == 0 {
+		t.Fatal("legacy image import unexpectedly succeeded")
+	}
+}
+
+func TestImageSaveUsesDockerCLIAndStreamsArchive(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"save", "--platform", "linux/amd64", "one:latest", "two:test"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("save status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); got != "image archive" {
+		t.Fatalf("save archive=%q", got)
+	}
+	if want := []string{"one:latest", "two:test"}; !reflect.DeepEqual(b.savedIdentifiers, want) || b.savedPlatform != "linux/amd64" {
+		t.Fatalf("save identifiers=%q platform=%q", b.savedIdentifiers, b.savedPlatform)
+	}
+	output := filepath.Join(t.TempDir(), "images.tar")
+	if status := runCommand([]string{"image", "save", "-o", output, "one:latest"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("image save status=%d, stderr=%q", status, stderr.String())
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "image archive" {
+		t.Fatalf("saved file=%q", data)
+	}
+}
+
 func TestImagesDockerStyleTableAndQuietAliases(t *testing.T) {
 	digest := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	b := &fakeBackend{imageList: []ImageInfo{
@@ -1081,15 +1138,23 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 	}
 }
 
-func TestCommitCommandRoutesLabels(t *testing.T) {
+func TestCommitCommandUsesDockerOptions(t *testing.T) {
 	digest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	b := &fakeBackend{commitInfo: ttcimages.Info{Digest: digest}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"commit", "--label", "timetravel.usage=agent-session", "demo@child", "example/session:v1"}, &stdout, &stderr, b); status != 0 {
+	args := []string{
+		"commit", "--author", "TTC Harness <ttc@example.com>", "--message", "prepared session",
+		"--change", "LABEL timetravel.usage=agent-session", "--change", `CMD ["agent","run"]`,
+		"--pause=false", "demo@child", "example/session:v1",
+	}
+	if status := runCommand(args, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("commit status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.commitTarget != (selector{container: "demo", branch: "child"}) || b.commitReference != "example/session:v1" || b.commitLabels["timetravel.usage"] != "agent-session" {
-		t.Fatalf("commit target=%+v reference=%q labels=%v", b.commitTarget, b.commitReference, b.commitLabels)
+	wantChanges := []string{"LABEL timetravel.usage=agent-session", `CMD ["agent","run"]`}
+	if b.commitTarget != (selector{container: "demo", branch: "child"}) || b.commitReference != "example/session:v1" ||
+		b.commitOptions.Author != "TTC Harness <ttc@example.com>" || b.commitOptions.Message != "prepared session" ||
+		b.commitOptions.Pause || !reflect.DeepEqual(b.commitOptions.Changes, wantChanges) {
+		t.Fatalf("commit target=%+v reference=%q options=%+v", b.commitTarget, b.commitReference, b.commitOptions)
 	}
 	if stdout.String() != digest+"\n" {
 		t.Fatalf("commit output=%q", stdout.String())
@@ -4162,6 +4227,10 @@ type startCall struct {
 }
 
 type fakeBackend struct {
+	loadedBytes         int
+	loadedPlatform      string
+	savedIdentifiers    []string
+	savedPlatform       string
 	mu                  sync.Mutex
 	families            []Family
 	processTarget       selector
@@ -4214,7 +4283,7 @@ type fakeBackend struct {
 	imageRemoveResult   ImageRemoveResult
 	commitTarget        selector
 	commitReference     string
-	commitLabels        map[string]string
+	commitOptions       imageCommitOptions
 	commitInfo          ttcimages.Info
 	runRequest          runRequest
 	containerID         string
@@ -4329,6 +4398,29 @@ func (b *fakeBackend) remove(name string, force, volumes bool) error {
 	return b.err
 }
 
+func (b *fakeBackend) loadImages(archive io.Reader, platform string) ([]ttcimages.Info, error) {
+	if archive == nil {
+		return nil, errors.New("no image archive on standard input")
+	}
+	data, err := io.ReadAll(archive)
+	if err != nil {
+		return nil, err
+	}
+	b.loadedBytes = len(data)
+	b.loadedPlatform = platform
+	return []ttcimages.Info{
+		{Reference: "docker.io/library/one:latest", Digest: "sha256:one", Platform: platform},
+		{Reference: "docker.io/library/two:test", Digest: "sha256:two", Platform: platform},
+	}, nil
+}
+
+func (b *fakeBackend) saveImages(archive io.Writer, identifiers []string, platform string) error {
+	b.savedIdentifiers = append([]string(nil), identifiers...)
+	b.savedPlatform = platform
+	_, err := archive.Write([]byte("image archive"))
+	return err
+}
+
 func (b *fakeBackend) pull(reference, platform string, progress bool) (ttcimages.Info, error) {
 	b.pullReference = reference
 	b.pullPlatform = platform
@@ -4350,10 +4442,11 @@ func (b *fakeBackend) removeImage(identifier string, force bool) (ImageRemoveRes
 	return b.imageRemoveResult, b.err
 }
 
-func (b *fakeBackend) commit(target selector, reference string, labels map[string]string) (ttcimages.Info, error) {
+func (b *fakeBackend) commit(target selector, reference string, options imageCommitOptions) (ttcimages.Info, error) {
 	b.commitTarget = target
 	b.commitReference = reference
-	b.commitLabels = cloneStringMap(labels)
+	b.commitOptions = options
+	b.commitOptions.Changes = append([]string(nil), options.Changes...)
 	return b.commitInfo, b.err
 }
 

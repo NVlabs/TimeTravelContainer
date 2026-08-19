@@ -81,6 +81,25 @@ export interface ForkOptions {
   targetNode?: string;
 }
 
+export interface CommitOptions {
+  author?: string;
+  message?: string;
+  changes?: readonly string[];
+  pause?: boolean;
+}
+
+export interface ImageLoadOptions {
+  input?: string;
+  archive?: string | Uint8Array;
+  platform?: string;
+  quiet?: boolean;
+}
+
+export interface ImageSaveOptions {
+  output?: string;
+  platform?: string;
+}
+
 export function defaultSocketPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
@@ -496,9 +515,35 @@ export class Client {
     return (await this.command(["tty", "stat", target, "--session", session, "--json"], { check: true })).json<T>();
   }
 
-  commit(target: string, image: string, labels: Readonly<Record<string, string>> = {}): Promise<Result> {
-    const options = Object.entries(labels).flatMap(([key, value]) => ["--label", `${key}=${value}`]);
-    return this.command(["commit", ...options, target, image]);
+  commit(target: string, image: string, options: CommitOptions = {}): Promise<Result> {
+    const args = ["commit"];
+    if (options.author !== undefined) args.push("--author", options.author);
+    if (options.message !== undefined) args.push("--message", options.message);
+    for (const change of options.changes ?? []) args.push("--change", change);
+    if (options.pause === false) args.push("--pause=false");
+    return this.command([...args, target, image]);
+  }
+
+  load(options: ImageLoadOptions = {}): Promise<Result> {
+    if (options.input !== undefined && options.archive !== undefined) {
+      throw new TypeError("image load accepts either input or archive, not both");
+    }
+    if (options.input === undefined && options.archive === undefined) {
+      throw new TypeError("image load requires input or archive");
+    }
+    const args = ["load"];
+    if (options.input !== undefined) args.push("--input", resolve(options.input));
+    if (options.platform !== undefined) args.push("--platform", options.platform);
+    if (options.quiet) args.push("--quiet");
+    return this.command(args, { input: options.archive });
+  }
+
+  save(images: readonly string[], options: ImageSaveOptions = {}): Promise<Result> {
+    if (images.length === 0) throw new TypeError("image save requires at least one image");
+    const args = ["save"];
+    if (options.output !== undefined) args.push("--output", resolve(options.output));
+    if (options.platform !== undefined) args.push("--platform", options.platform);
+    return this.command([...args, ...images]);
   }
 
   async stats<T = unknown>(target: string): Promise<T> {

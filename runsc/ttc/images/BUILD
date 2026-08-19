@@ -19,6 +19,7 @@ go_library(
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_errdefs//:go_default_library",
         "@com_github_containerd_containerd_v2//core/images",
+        "@com_github_containerd_containerd_v2//core/images/archive",
         "@com_github_containerd_containerd_v2//core/remotes",
         "@com_github_containerd_containerd_v2//core/remotes/docker",
         "@com_github_containerd_containerd_v2//pkg/archive",
@@ -41,6 +42,7 @@ go_test(
     deps = [
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_containerd_v2//core/images",
+        "@com_github_containerd_containerd_v2//core/images/archive",
         "@com_github_containerd_platforms//:platforms",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
         "@org_golang_x_sys//unix:go_default_library",
