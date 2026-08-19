@@ -3650,13 +3650,22 @@ func selectStoredImage(stored []images.Info, reference, platform string) (images
 func (s Store) prepareImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (info images.RootFSInfo, rootfs string, retErr error) {
 	err := s.withImageRootLock(func() error {
 		var err error
-		info, rootfs, err = s.prepareImageRootLocked(ctx, pulled, platform, progress)
+		info, rootfs, err = s.prepareImageRootLocked(ctx, pulled, platform, progress, nil)
 		return err
 	})
 	return info, rootfs, err
 }
 
-func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (_ images.RootFSInfo, _ string, retErr error) {
+func (s Store) prepareImportedImageRoot(ctx context.Context, imported images.ImportedImage, platform string, progress images.ProgressFunc) (info images.RootFSInfo, rootfs string, retErr error) {
+	err := s.withImageRootLock(func() error {
+		var err error
+		info, rootfs, err = s.prepareImageRootLocked(ctx, imported.Info, platform, progress, &imported)
+		return err
+	})
+	return info, rootfs, err
+}
+
+func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc, imported *images.ImportedImage) (_ images.RootFSInfo, _ string, retErr error) {
 	imagesDir := filepath.Join(s.Root, "images")
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating image cache: %w", err)
@@ -3687,13 +3696,19 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 		}
 	}()
 	rootfs := filepath.Join(tempDir, "rootfs")
-	info, err := images.MaterializeRootFS(ctx, images.RootFSOptions{
+	rootOptions := images.RootFSOptions{
 		StoreRoot: s.Root,
 		Reference: pulled.Reference,
 		Platform:  platform,
 		Root:      rootfs,
 		Progress:  progress,
-	})
+	}
+	var info images.RootFSInfo
+	if imported == nil {
+		info, err = images.MaterializeRootFS(ctx, rootOptions)
+	} else {
+		info, err = images.MaterializeImportedRootFS(ctx, rootOptions, *imported)
+	}
 	if err != nil {
 		return images.RootFSInfo{}, "", err
 	}
@@ -3774,6 +3789,12 @@ func removeImageRoot(root string) error {
 // leaves the image ready to run.
 func (s Store) EnsureImageRoot(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc) (images.RootFSInfo, string, error) {
 	return s.prepareImageRoot(ctx, pulled, platform, progress)
+}
+
+// EnsureImportedImageRoot materializes an archive entry without requiring its
+// final tag to be visible in the native image catalog.
+func (s Store) EnsureImportedImageRoot(ctx context.Context, imported images.ImportedImage, platform string, progress images.ProgressFunc) (images.RootFSInfo, string, error) {
+	return s.prepareImportedImageRoot(ctx, imported, platform, progress)
 }
 
 func imageRootKey(digest, platform string) string {

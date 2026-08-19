@@ -63,6 +63,15 @@ type LoadOptions struct {
 	Platform string
 }
 
+// ImportedImage is an image archive entry whose content is present in TTC's
+// native store but whose tag has not yet been published. Callers materialize
+// all imported roots before publishing the batch, so a failed load never
+// replaces existing tags or exposes an unusable image.
+type ImportedImage struct {
+	Info   Info
+	target ocispec.Descriptor
+}
+
 // SaveOptions controls saving named images as a Docker/OCI-compatible archive.
 type SaveOptions struct {
 	Root     string
@@ -355,10 +364,10 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	return info, nil
 }
 
-// Load reads an OCI or Docker image archive into TTC's native content store.
-// Every named image matching the selected platform is restored under the tags
-// carried by the archive, matching docker load semantics.
-func Load(ctx context.Context, opts LoadOptions) ([]Info, error) {
+// Load reads an OCI or Docker image archive into TTC's native content store
+// without publishing its tags. The caller must invoke PublishLoaded after all
+// image roots are ready, or DiscardLoaded after a failure.
+func Load(ctx context.Context, opts LoadOptions) ([]ImportedImage, error) {
 	if opts.Archive == nil {
 		return nil, errors.New("image load requires an archive stream")
 	}
@@ -396,7 +405,7 @@ func Load(ctx context.Context, opts LoadOptions) ([]Info, error) {
 		return nil, fmt.Errorf("decoding archive index: %w", err)
 	}
 	now := time.Now().UTC()
-	loaded := make(map[string]imageRecord)
+	loaded := make(map[string]ImportedImage)
 	for _, descriptor := range parsed.Manifests {
 		reference := descriptor.Annotations[containerdimages.AnnotationImageName]
 		if reference == "" {
@@ -442,7 +451,7 @@ func Load(ctx context.Context, opts LoadOptions) ([]Info, error) {
 			UpdatedAt: now,
 			Labels:    cloneLabels(config.Config.Labels),
 		}
-		loaded[reference] = imageRecord{Info: info, Target: descriptor}
+		loaded[reference] = ImportedImage{Info: info, target: descriptor}
 	}
 	if len(loaded) == 0 {
 		if opts.Platform != "" {
@@ -450,20 +459,50 @@ func Load(ctx context.Context, opts LoadOptions) ([]Info, error) {
 		}
 		return nil, errors.New("image archive contains no named Linux image for this platform")
 	}
-	infos := make([]Info, 0, len(loaded))
-	for reference, record := range loaded {
-		store.catalog.Images[reference] = record
-		infos = append(infos, record.Info)
-	}
-	if err := store.saveCatalog(); err != nil {
-		return nil, fmt.Errorf("saving native image records: %w", err)
-	}
-	if err := store.garbageCollect(ctx); err != nil {
-		return nil, fmt.Errorf("collecting superseded image content: %w", err)
+	images := make([]ImportedImage, 0, len(loaded))
+	for _, image := range loaded {
+		images = append(images, image)
 	}
 	complete = true
-	sort.Slice(infos, func(i, j int) bool { return infos[i].Reference < infos[j].Reference })
-	return infos, nil
+	sort.Slice(images, func(i, j int) bool { return images[i].Info.Reference < images[j].Info.Reference })
+	return images, nil
+}
+
+// PublishLoaded atomically makes every imported tag visible. Image content is
+// already durable; superseded unreferenced blobs are collected afterward.
+func PublishLoaded(ctx context.Context, root string, images []ImportedImage) error {
+	if len(images) == 0 {
+		return errors.New("publishing image load requires at least one image")
+	}
+	store, err := openNativeStore(root)
+	if err != nil {
+		return err
+	}
+	defer store.close()
+	for _, image := range images {
+		if image.Info.Reference == "" || image.target.Digest == "" {
+			return errors.New("cannot publish an incomplete imported image")
+		}
+		store.catalog.Images[image.Info.Reference] = imageRecord{Info: image.Info, Target: image.target}
+	}
+	if err := store.saveCatalog(); err != nil {
+		return fmt.Errorf("saving loaded image records: %w", err)
+	}
+	// Catalog publication is the commit point. Garbage collection is cleanup,
+	// not a reason to report that an otherwise usable load failed.
+	_ = store.garbageCollect(ctx)
+	return nil
+}
+
+// DiscardLoaded removes content that is not referenced by a published image
+// or active container lease.
+func DiscardLoaded(ctx context.Context, root string) error {
+	store, err := openNativeStore(root)
+	if err != nil {
+		return err
+	}
+	defer store.close()
+	return store.garbageCollect(ctx)
 }
 
 // Save writes named native images as a Docker/OCI-compatible archive.

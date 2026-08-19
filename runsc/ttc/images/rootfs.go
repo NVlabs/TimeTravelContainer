@@ -61,17 +61,10 @@ type RootFSInfo struct {
 // their image UIDs and GIDs are persisted in a sidecar manifest for the gofer
 // to expose to the Sentry.
 func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, error) {
-	if opts.Root == "" {
-		return RootFSInfo{}, fmt.Errorf("rootfs destination must not be empty")
-	}
 	reference, err := NormalizeReference(opts.Reference)
 	if err != nil {
 		return RootFSInfo{}, err
 	}
-	if err := prepareEmptyRoot(opts.Root); err != nil {
-		return RootFSInfo{}, err
-	}
-
 	store, err := openNativeStore(opts.StoreRoot)
 	if err != nil {
 		return RootFSInfo{}, err
@@ -81,6 +74,28 @@ func MaterializeRootFS(ctx context.Context, opts RootFSOptions) (RootFSInfo, err
 	if !ok {
 		return RootFSInfo{}, fmt.Errorf("finding image %q: %w", reference, ErrNotFound)
 	}
+	return materializeRootFSRecord(ctx, opts, store, record)
+}
+
+// MaterializeImportedRootFS materializes an archive entry before its final tag
+// is published by PublishLoaded.
+func MaterializeImportedRootFS(ctx context.Context, opts RootFSOptions, imported ImportedImage) (RootFSInfo, error) {
+	store, err := openNativeStore(opts.StoreRoot)
+	if err != nil {
+		return RootFSInfo{}, err
+	}
+	defer store.close()
+	return materializeRootFSRecord(ctx, opts, store, imageRecord{Info: imported.Info, Target: imported.target})
+}
+
+func materializeRootFSRecord(ctx context.Context, opts RootFSOptions, store *nativeStore, record imageRecord) (RootFSInfo, error) {
+	if opts.Root == "" {
+		return RootFSInfo{}, fmt.Errorf("rootfs destination must not be empty")
+	}
+	if err := prepareEmptyRoot(opts.Root); err != nil {
+		return RootFSInfo{}, err
+	}
+	reference := record.Info.Reference
 	matcher := platforms.DefaultStrict()
 	if opts.Platform != "" {
 		platform, err := platforms.Parse(opts.Platform)
@@ -212,6 +227,14 @@ func applyLayerWithOwnership(ctx context.Context, root string, compressed io.Rea
 		return fmt.Errorf("preparing layer directories: %w", err)
 	}
 	filter := func(header *tar.Header) (bool, error) {
+		// containerd skips device nodes only when it detects that extraction is
+		// running inside a host user namespace. TTC is rootless in both daemon
+		// isolation modes, so unsafe-no-host-isolation would otherwise attempt a
+		// host mknod(2) and fail with EPERM. Container /dev is supplied by the
+		// Sentry, not by immutable image contents.
+		if header.Typeflag == tar.TypeBlock || header.Typeflag == tar.TypeChar {
+			return false, nil
+		}
 		if owners != nil {
 			accepted, err := owners.record(header)
 			if err != nil || !accepted {
@@ -425,15 +448,15 @@ func takeVirtualXattrs(header *tar.Header) map[string][]byte {
 			continue
 		}
 		attribute := strings.TrimPrefix(key, "SCHILY.xattr.")
-		if !strings.HasPrefix(attribute, "security.") && !strings.HasPrefix(attribute, "trusted.") {
-			continue
-		}
 		if virtual == nil {
 			virtual = make(map[string][]byte)
 		}
 		virtual[attribute] = []byte(value)
-		// These namespaces require host privileges. The immutable-image gofer
-		// serves the value from TTC's metadata manifest instead.
+		// Immutable image xattrs are guest metadata. Keeping every namespace in
+		// TTC's manifest avoids depending on host xattr support (notably NFS) and
+		// avoids privileged security.*, trusted.*, and ACL operations. The image
+		// gofer merges these values with any host-backed attributes when serving
+		// the guest.
 		delete(header.PAXRecords, key)
 	}
 	return virtual

@@ -232,13 +232,57 @@ func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	if err := gzipWriter.Close(); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := Load(ctx, LoadOptions{Root: t.TempDir(), Archive: bytes.NewReader(compressed.Bytes()), Platform: "linux/amd64"})
+	loadedRoot := t.TempDir()
+	existingTarget := target.Digest.Algorithm().FromString("existing image")
+	existingDigest := existingTarget.String()
+	loadedStore, err := openNativeStore(loadedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existingReference := "docker.io/library/session:v1"
+	loadedStore.catalog.Images[existingReference] = imageRecord{
+		Info: Info{Reference: existingReference, Digest: existingDigest, Platform: "linux/amd64"},
+		Target: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    existingTarget,
+		},
+	}
+	if err := loadedStore.saveCatalog(); err != nil {
+		loadedStore.close()
+		t.Fatal(err)
+	}
+	loadedStore.close()
+	loaded, err := Load(ctx, LoadOptions{Root: loadedRoot, Archive: bytes.NewReader(compressed.Bytes()), Platform: "linux/amd64"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	loadedStore, err = openNativeStore(loadedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := loadedStore.catalog.Images
+	loadedStore.close()
+	if len(visible) != 1 || visible[existingReference].Info.Digest != existingDigest {
+		t.Fatalf("unpublished load changed the visible catalog: %+v", visible)
+	}
+	if err := PublishLoaded(ctx, loadedRoot, loaded); err != nil {
+		t.Fatalf("PublishLoaded: %v", err)
+	}
+	published, err := List(ctx, ListOptions{Root: loadedRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(published) != 2 {
+		t.Fatalf("published images=%+v, want two archive tags", published)
+	}
+	for _, image := range published {
+		if image.Reference == existingReference && image.Digest == existingDigest {
+			t.Fatalf("published load retained superseded image: %+v", image)
+		}
+	}
 	var references []string
 	for _, loadedInfo := range loaded {
-		references = append(references, loadedInfo.Reference)
+		references = append(references, loadedInfo.Info.Reference)
 	}
 	wantReferences := []string{"docker.io/library/session:review", "docker.io/library/session:v1"}
 	if !reflect.DeepEqual(references, wantReferences) {

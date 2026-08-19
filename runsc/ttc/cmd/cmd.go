@@ -8469,19 +8469,35 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 		return nil, errors.New("no image archive on standard input")
 	}
 	ctx := context.Background()
-	infos, err := ttcimages.Load(ctx, ttcimages.LoadOptions{
+	imported, err := ttcimages.Load(ctx, ttcimages.LoadOptions{
 		Root: b.dataRoot, Archive: archive, Platform: platform,
 	})
 	if err != nil {
 		return nil, err
 	}
-	for _, info := range infos {
-		if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, info.Platform, nil); err != nil {
-			return nil, fmt.Errorf("preparing loaded image %q root: %w", info.Reference, err)
+	published := false
+	defer func() {
+		if !published {
+			_ = ttcimages.DiscardLoaded(context.Background(), b.dataRoot)
+			_, _ = b.containerStore().PruneImageRoots(context.Background())
 		}
+	}()
+	infos := make([]ttcimages.Info, 0, len(imported))
+	for _, image := range imported {
+		if _, _, err := b.containerStore().EnsureImportedImageRoot(ctx, image, image.Info.Platform, nil); err != nil {
+			return nil, fmt.Errorf("preparing loaded image %q root: %w", image.Info.Reference, err)
+		}
+		infos = append(infos, image.Info)
 	}
+	if err := ttcimages.PublishLoaded(ctx, b.dataRoot, imported); err != nil {
+		return nil, fmt.Errorf("publishing loaded images: %w", err)
+	}
+	published = true
 	if _, err := b.containerStore().PruneImageRoots(ctx); err != nil {
-		return nil, fmt.Errorf("pruning superseded image roots: %w", err)
+		// Tags are already atomically published and their roots are usable.
+		// Stale-root cleanup must not turn a successful load into a reported
+		// failure that appears partially committed.
+		fmt.Fprintf(b.stderr, "ttc: warning: pruning superseded image roots: %v\n", err)
 	}
 	return infos, nil
 }

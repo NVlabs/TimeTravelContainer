@@ -109,15 +109,18 @@ func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 	}
 }
 
-func TestApplyLayerVirtualizesPrivilegedXattrs(t *testing.T) {
+func TestApplyLayerVirtualizesXattrs(t *testing.T) {
 	root := t.TempDir()
 	owners := newOwnershipState()
 	layer := makeLayer(t, false, []tarEntry{
 		{
-			name:   "usr/bin/newgidmap",
-			body:   "binary",
-			mode:   0755,
-			xattrs: map[string]string{"security.capability": "capability-data"},
+			name: "usr/bin/newgidmap",
+			body: "binary",
+			mode: 0755,
+			xattrs: map[string]string{
+				"security.capability": "capability-data",
+				"user.image-metadata": "portable-data",
+			},
 		},
 		{
 			name:   "replace",
@@ -147,8 +150,34 @@ func TestApplyLayerVirtualizesPrivilegedXattrs(t *testing.T) {
 	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !errors.Is(err, unix.ENODATA) {
 		t.Fatalf("physical security.capability unexpectedly exists: %v", err)
 	}
+	value, ok = manifest.LookupXattr("usr/bin/newgidmap", "user.image-metadata")
+	if !ok || string(value) != "portable-data" {
+		t.Fatalf("virtual user xattr=%q, ok=%t", value, ok)
+	}
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "user.image-metadata", nil); !errors.Is(err, unix.ENODATA) {
+		t.Fatalf("physical user.image-metadata unexpectedly exists: %v", err)
+	}
 	if _, ok := manifest.LookupXattr("replace", "security.capability"); ok {
 		t.Fatal("replacement directory retained the replaced file's capability")
+	}
+}
+
+func TestApplyLayerSkipsHostDeviceCreation(t *testing.T) {
+	root := t.TempDir()
+	owners := newOwnershipState()
+	layer := makeLayer(t, false, []tarEntry{
+		{name: "dev/", mode: 0755},
+		{name: "dev/image-device", mode: 0600, typeflag: tar.TypeChar},
+		{name: "payload", body: "ok", mode: 0644},
+	})
+	if err := applyLayerWithOwnership(context.Background(), root, bytes.NewReader(layer), owners); err != nil {
+		t.Fatalf("applying layer containing a device node: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "dev/image-device")); !os.IsNotExist(err) {
+		t.Fatalf("image device exists on host or stat failed: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "payload")); err != nil || string(got) != "ok" {
+		t.Fatalf("payload=%q, err=%v", got, err)
 	}
 }
 
