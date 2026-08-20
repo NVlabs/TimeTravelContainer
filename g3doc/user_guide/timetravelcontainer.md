@@ -369,22 +369,27 @@ chunk is durable, the target no longer depends on the source process for it.
 The nodes must use the same shared TTC data root and repository ID, have the
 same image content available, and be able to reach each other's control and
 page-transfer listeners. Give every daemon a certificate issued by one cluster
-CA whose identity matches its node ID. For example, start node A with:
+CA whose identity matches its node ID. Dynamic discovery is preferred: a node
+publishes a lease and advertised mTLS endpoint in the shared root, so other
+daemons discover it without restarting. For example, start node A with:
 
 ```shell
 ttc daemon start \
   --cluster-node-id node-a \
   --cluster-repository-id team-repository \
   --cluster-listen 0.0.0.0:7443 \
+  --cluster-advertise https://node-a.example:7443,node-a.example \
   --cluster-page-listen 0.0.0.0:0 \
-  --cluster-page-advertise node-a.example:0 \
   --cluster-cert /shared/cluster/node-a.pem \
   --cluster-key /shared/cluster/node-a.key \
   --cluster-ca /shared/cluster/ca.pem \
-  --cluster-peer node-b=https://node-b.example:7443,node-b
+  --cluster-memory-target 64GiB \
+  --cluster-auto-rebalance
 ```
 
-Start node B with the node names and peer address reversed. `TTC_DATA_ROOT`
+Start node B with its own node ID, advertised address, and certificate.
+`--cluster-peer` remains available as a static override but is unnecessary
+when every daemon has `--cluster-advertise`. `TTC_DATA_ROOT`
 should name the shared repository path on both hosts; `TTC_RUNTIME_DIR` should
 remain a fast, node-local path. `ttc daemon status` reports the active cluster
 identity and negotiated capabilities. Both page-transfer addresses must use
@@ -416,6 +421,46 @@ daemon to exit.
 Distributed live fork currently targets one remote node per command. Use a
 durable checkpoint for offline transfer or for TTC installations that do not
 share a repository and trust configuration.
+
+### Elastic placement and node removal
+
+A client attached to any cluster daemon can list membership and memory load:
+
+```shell
+ttc node ls
+```
+
+Commands naming `CONTAINER@BRANCH` are routed to the recorded owner. Move a
+branch without changing its family, branch name, filesystem identity, or
+process state with:
+
+```shell
+ttc migrate --target node-b web@candidate-a
+```
+
+The current migration path uses a durable conservative cutover: it dehydrates
+the branch, transfers its fenced ownership, then rehydrates it on the target.
+The source cannot execute after ownership changes. External connections are
+interrupted according to the same policy as remote fork.
+
+To remove a compute node, drain it from any TTC client:
+
+```shell
+ttc node drain node-a
+ttc daemon stop                 # run against node-a after drain succeeds
+```
+
+Drain first changes the node to `draining`, which rejects new runs, forks,
+rehydrations, and incoming migrations. It migrates running/paused branches,
+transfers cold branch placement without waking them, and makes remote page
+dependencies durable. If a step fails, the node stays cordoned and the same
+command can be retried. `--target node-b` restricts all placements to one
+destination; otherwise TTC selects ready nodes by reported load.
+
+`ttc node rebalance node-a` performs a smaller pressure-relief move using the
+configured memory targets and branch CoW accounting. Starting `ttcd` with
+`--cluster-auto-rebalance` runs this operation automatically when the node
+crosses its target, with a 10% low-water mark and cooldown to avoid oscillation.
 
 ## Dehydrate and rehydrate
 

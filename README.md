@@ -166,7 +166,9 @@ TTC includes:
   mappings; AppImages, the FUSE daemon, mount state, and cached pages remain
   forkable.
 - Optional multi-node live fork using authenticated TTC peers, a shared TTC
-  data root, common image content, and a page-transfer network.
+  data root, common image content, and a page-transfer network. Elastic mode
+  adds dynamic node discovery, transparent command routing, branch migration,
+  node draining, and pressure-aware placement.
 
 Unlike [CRIU](https://github.com/checkpoint-restore/criu) or a
 [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, a

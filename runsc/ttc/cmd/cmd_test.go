@@ -4155,6 +4155,24 @@ exit 2
 	}
 }
 
+func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
+	info := ttcbundle.ContainerInfo{
+		NodeID: "node-a",
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "local", NodeID: "node-a", State: "dehydrated"},
+			{ID: "remote", NodeID: "node-b", State: "running"},
+		},
+	}
+	allCold, count := allBranchesColdOnNode(info, "node-a")
+	if !allCold || count != 1 {
+		t.Fatalf("allBranchesColdOnNode(node-a)=(%t,%d), want (true,1)", allCold, count)
+	}
+	allCold, count = allBranchesColdOnNode(info, "")
+	if allCold || count != 2 {
+		t.Fatalf("allBranchesColdOnNode(legacy)=(%t,%d), want (false,2)", allCold, count)
+	}
+}
+
 func TestListFamiliesReconcilesDeadListedSandbox(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

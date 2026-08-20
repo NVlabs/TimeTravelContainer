@@ -8715,6 +8715,22 @@ func containerHasBranchOnNode(info ttcbundle.ContainerInfo, nodeID string) bool 
 	return false
 }
 
+func allBranchesColdOnNode(info ttcbundle.ContainerInfo, nodeID string) (allCold bool, count int) {
+	allCold = true
+	for _, branch := range info.Branches {
+		if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
+			continue
+		}
+		count++
+		switch normalizeLifecycleState(branch.State) {
+		case "created", "dehydrated", "exited", "failed", "dead":
+		default:
+			allCold = false
+		}
+	}
+	return allCold, count
+}
+
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
 	if b.dataRoot == "" {
@@ -10058,15 +10074,8 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if loadErr != nil {
 			return loadErr
 		}
-		allCold := len(latest.Branches) != 0
-		for _, branch := range latest.Branches {
-			switch normalizeLifecycleState(branch.State) {
-			case "created", "dehydrated", "exited", "failed", "dead":
-			default:
-				allCold = false
-			}
-		}
-		if allCold {
+		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
+		if allCold && localBranches != 0 {
 			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
 				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
 			}

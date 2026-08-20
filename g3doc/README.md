@@ -18,7 +18,8 @@ links below to see detailed instructions for each of them:
     branches.
     The [elastic cluster proposal](./proposals/ttc_elastic_cluster.md) covers
     dynamic membership, transparent migration, draining, and memory-aware
-    placement.
+    placement. Current test evidence is recorded in the
+    [elastic qualification report](./benchmarks/ttc_elastic_qualification.md).
 *   [Docker](./user_guide/quick_start/docker.md): The quickest and easiest way
     to get started.
 *   [Kubernetes](./user_guide/quick_start/kubernetes.md): Isolate Pods in your

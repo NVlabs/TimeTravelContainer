@@ -1,6 +1,8 @@
 # Elastic TimeTravelContainer clusters
 
-Status: implementation plan. Phase 1 is the first delivery target.
+Status: phases 1 and 2 implemented; phase 3 drain and phase 4 placement are
+implemented with the limitations called out below. Capacity-provider sinks and
+live (non-dehydrating) migration remain follow-up work.
 
 This document specifies an elastic TTC cluster in which compute nodes may join
 and leave without restarting existing daemons. A client connected to any
@@ -196,6 +198,8 @@ unreferenced live filesystem writer.
 
 ### Phase 1: dynamic discovery and global view
 
+**Implemented.**
+
 * Add lease-bearing node records and heartbeats in the shared repository.
 * Add advertised control endpoints and dynamic peer client construction.
 * Retain static peers as explicit overrides during transition.
@@ -206,6 +210,11 @@ Exit: nodes can join after existing daemons start; every node sees the same
 families; stale and duplicate node incarnations are detected.
 
 ### Phase 2: routed commands and manual migration
+
+**Implemented with conservative durable cutover.** `ttc migrate` currently
+dehydrates the selected branch, transfers its fenced ownership, and rehydrates
+it under the same identity on the destination. This is slower than the planned
+live sparse cutover, but never permits two runnable owners.
 
 * Add daemon-to-daemon command proxying with placement-generation fencing.
 * Implement `ttc migrate CONTAINER@BRANCH --target NODE` without changing
@@ -218,6 +227,13 @@ state, never runs both copies, and survives retries at every boundary.
 
 ### Phase 3: draining and capacity integration
 
+**Partially implemented.** `ttc node ls` and `ttc node drain` provide dynamic
+membership diagnostics, admission fencing, active and cold branch evacuation,
+restart-safe retry, and dependency draining. A drained daemon remains online
+in the `draining` state for diagnostics until `ttc daemon stop` marks it
+offline. Executable/webhook capacity sinks and durable automatic resumption of
+an interrupted multi-branch drain remain outstanding.
+
 * Add `ttc node drain`, admission control, dependency draining, and offline
   verification.
 * Add executable and webhook capacity sinks with durable idempotency records.
@@ -228,6 +244,13 @@ leave without branch loss or repository garbage.
 
 ### Phase 4: placement planner
 
+**Implemented as an initial bounded planner.** `ttc node rebalance` and the
+opt-in `--cluster-auto-rebalance` loop use cgroup memory as the hard signal and
+per-family resident private/shared summaries for move selection. The current
+Sentry accounting ABI exposes shared totals rather than exact chunk-version
+hyperedges, so the live integration uses a conservative coarse family edge;
+the deterministic planner itself accepts exact 1 MiB edges once exported.
+
 * Export bounded chunk-sharing summaries and node actual/reserved memory.
 * Implement deterministic bipartition dry runs and scoring diagnostics.
 * Add watermarks, hysteresis, cooldowns, and destination reservations.
@@ -237,6 +260,10 @@ Exit: correlated sibling workloads use materially less cluster memory than
 random placement and do not oscillate under a stable workload.
 
 ### Phase 5: qualification
+
+**In progress.** See [Elastic cluster qualification](../benchmarks/ttc_elastic_qualification.md)
+for completed local, migration, and NFS cases and remaining physical-node/KVM
+coverage.
 
 Run unit, race, fuzz, and crash injection; multi-daemon loopback and local NFS
 tests under delay, loss, and restart; systrap and KVM package-build,

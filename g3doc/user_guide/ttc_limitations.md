@@ -79,6 +79,13 @@ non-forkable for its entire lifetime.
 - Cross-node fork requires mutually authenticated TTC peers, common image
   content, a shared TTC data root, and a reachable page-transfer network. Use
   a checkpoint for offline transfer or unrelated TTC installations.
+- Elastic migration currently uses a conservative dehydrate/ownership-CAS/
+  rehydrate cutover rather than the live sparse handoff planned for later.
+  Automatic rebalancing uses coarse per-family shared-memory summaries until
+  exact bounded chunk-version edges are exported by the Sentry. External
+  capacity-provider hooks are not yet implemented; an unsuccessful drain or
+  rebalance reports that another ready node is required and remains safely
+  retryable.
 
 For the detailed resource matrix, measurements, and audit evidence, see the
 [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md).
