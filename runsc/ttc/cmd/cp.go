@@ -407,14 +407,25 @@ func offlineCopyCapabilities() *specs.LinuxCapabilities {
 	}
 }
 
-func offlineCopyBranch(scope, visible string) string {
+// offlineCopyBranch is the storage a visible branch name stands for.
+//
+// Read from the record rather than derived from the name, because the two can
+// differ: a distributed target keeps its source family's repository branch
+// while showing as "main", and a renamed branch keeps the storage it was
+// created with. Deriving it would look in the wrong place for both.
+func offlineCopyBranch(info ttcbundle.ContainerInfo, visible string) string {
+	for _, branch := range info.Branches {
+		if branch.ID == visible && branch.FilesystemBranch != "" {
+			return branch.FilesystemBranch
+		}
+	}
 	if visible == defaultBranchID {
 		return ttcvolume.MainBranch
 	}
-	return ttcvolume.ScopedBranchID(scope, visible)
+	return ttcvolume.ScopedBranchID(info.ID, visible)
 }
 
-func offlineCopySpec(original *specs.Spec, scope, branch string, helperArgs []string) (*specs.Spec, error) {
+func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch string, helperArgs []string) (*specs.Spec, error) {
 	encoded, err := json.Marshal(original)
 	if err != nil {
 		return nil, fmt.Errorf("cloning container spec: %w", err)
@@ -460,7 +471,7 @@ func offlineCopySpec(original *specs.Spec, scope, branch string, helperArgs []st
 			return nil, errors.New("writable container predates persistent rootfs uppers; recreate it before using stopped-container cp")
 		}
 	}
-	persistentBranch := offlineCopyBranch(scope, branch)
+	persistentBranch := offlineCopyBranch(info, branch)
 	for i := range repositories {
 		repositories[i].Branch = persistentBranch
 	}
@@ -493,7 +504,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	if err != nil {
 		return err
 	}
-	spec, err := offlineCopySpec(original, info.ID, resolved.branch, helperArgs)
+	spec, err := offlineCopySpec(original, info, resolved.branch, helperArgs)
 	if err != nil {
 		return err
 	}

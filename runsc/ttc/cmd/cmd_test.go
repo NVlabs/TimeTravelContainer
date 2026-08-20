@@ -4319,6 +4319,7 @@ type fakeBackend struct {
 	checkpointRequest   checkpointRequest
 	restoreSource       string
 	restoreName         string
+	renamed             []string
 }
 
 func (b *fakeBackend) resourceStats(target selector) (FamilyResourceStats, error) {
@@ -4537,6 +4538,11 @@ func (b *fakeBackend) pause(target selector) error {
 
 func (b *fakeBackend) resume(target selector) error {
 	b.resumed = target
+	return b.err
+}
+
+func (b *fakeBackend) renameBranch(target selector, name string) error {
+	b.renamed = append(b.renamed, target.String()+"->"+name)
 	return b.err
 }
 
@@ -4936,5 +4942,22 @@ func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
 	}
 	if _, err := repository.LoadManifest(manifest); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unrooted manifest error=%v, want not-exist", err)
+	}
+}
+
+func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
+	backend := &fakeBackend{}
+	var out bytes.Buffer
+	if err := runRename([]string{"demo@try-a", "main"}, &out, backend); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if len(backend.renamed) != 1 || backend.renamed[0] != "demo@try-a->main" {
+		t.Fatalf("backend saw %v", backend.renamed)
+	}
+	if got := strings.TrimSpace(out.String()); got != "demo@main" {
+		t.Fatalf("printed %q, want the branch under its new name", got)
+	}
+	if err := runRename([]string{"demo@try-a"}, &out, backend); err == nil {
+		t.Fatal("a rename with no new name was accepted")
 	}
 }

@@ -2297,6 +2297,14 @@ func (s *Sandbox) PauseBranch(id string) error {
 	return nil
 }
 
+// RenameBranch changes one branch's visible name.
+func (s *Sandbox) RenameBranch(id, newID string) error {
+	if err := s.call(boot.ContMgrRenameBranch, &boot.BranchRenameArgs{ID: id, NewID: newID}, nil); err != nil {
+		return fmt.Errorf("renaming live branch %q to %q: %w", id, newID, err)
+	}
+	return nil
+}
+
 // ResumeBranch resumes one in-memory branch.
 func (s *Sandbox) ResumeBranch(id string) error {
 	if err := s.call(boot.ContMgrResumeBranch, &boot.BranchArgs{ID: id}, nil); err != nil {

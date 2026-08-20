@@ -27,6 +27,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
 
 func TestParseCopyCommandArgs(t *testing.T) {
@@ -90,7 +91,7 @@ func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
 			"dev.timetravelcontainer.internal-console": "init",
 		},
 	}
-	cloned, err := offlineCopySpec(original, "family", "child", []string{"export", "/tmp/value"})
+	cloned, err := offlineCopySpec(original, ttcbundle.ContainerInfo{ID: "family"}, "child", []string{"export", "/tmp/value"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +126,7 @@ func TestOfflineCopySpecRejectsLegacyWritableRoot(t *testing.T) {
 	_, err := offlineCopySpec(&specs.Spec{
 		Process: &specs.Process{Args: []string{"true"}},
 		Root:    &specs.Root{Path: "/image"},
-	}, "family", defaultBranchID, []string{"export", "/"})
+	}, ttcbundle.ContainerInfo{ID: "family"}, defaultBranchID, []string{"export", "/"})
 	if err == nil || !strings.Contains(err.Error(), "predates persistent rootfs") {
 		t.Fatalf("offlineCopySpec error = %v", err)
 	}

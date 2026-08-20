@@ -220,6 +220,12 @@ type BranchArgs struct {
 	ID string
 }
 
+// BranchRenameArgs names a branch and the name it should answer to instead.
+type BranchRenameArgs struct {
+	ID    string
+	NewID string
+}
+
 // BranchDehydrateArgs selects a branch and donates its durable metadata file.
 type BranchDehydrateArgs struct {
 	urpc.FilePayload
@@ -1776,6 +1782,51 @@ func (f *SandboxFamily) Pause(id string) error {
 	f.mu.Lock()
 	b.state = BranchPaused
 	f.mu.Unlock()
+	return nil
+}
+
+// Rename changes a branch's visible name, leaving everything else alone.
+//
+// A name is how a branch is asked for, not what it is: the Kernel, the tasks in
+// it and the filesystem branch underneath are all reached through the record
+// rather than through the string. So this is a re-keying of the table, plus the
+// two other places a name is written down — the loader's own branch, and the
+// provenance edge each child keeps to its parent.
+//
+// It exists because a family has to be able to move forward. Work happens on a
+// fork and the good one has to become the branch everyone else forks from; the
+// alternative is copying it back, which pauses the source and duplicates
+// everything it holds to change one string.
+func (f *SandboxFamily) Rename(id, newID string) error {
+	if id == "" {
+		id = f.LoaderBranchID()
+	}
+	if newID == "" {
+		return fmt.Errorf("branch ID must not be empty")
+	}
+	if id == newID {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b := f.branches[id]
+	if b == nil {
+		return fmt.Errorf("branch %q does not exist", id)
+	}
+	if _, taken := f.branches[newID]; taken {
+		return fmt.Errorf("branch %q already exists", newID)
+	}
+	delete(f.branches, id)
+	b.id = newID
+	f.branches[newID] = b
+	if f.loaderBranchID == id {
+		f.loaderBranchID = newID
+	}
+	for _, other := range f.branches {
+		if other.parentID == id {
+			other.parentID = newID
+		}
+	}
 	return nil
 }
 

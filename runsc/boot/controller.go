@@ -163,6 +163,9 @@ const (
 	// ContMgrRehydrateBranch reconstructs one dehydrated branch.
 	ContMgrRehydrateBranch = "containerManager.RehydrateBranch"
 
+	// ContMgrRenameBranch changes one in-memory branch's visible name.
+	ContMgrRenameBranch = "containerManager.RenameBranch"
+
 	// ContMgrDestroyBranch destroys one in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
 	// ContMgrPrepareStopBranch moves branch-unaware loader bookkeeping away
@@ -1248,6 +1251,14 @@ func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExport
 // RehydrateBranch reconstructs one dehydrated branch.
 func (cm *containerManager) RehydrateBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Rehydrate(args.ID)
+}
+
+// RenameBranch changes one branch's visible name.
+func (cm *containerManager) RenameBranch(args *BranchRenameArgs, _ *struct{}) error {
+	if args == nil {
+		return errors.New("missing branch rename arguments")
+	}
+	return cm.l.family.Rename(args.ID, args.NewID)
 }
 
 // DestroyBranch destroys one branch.

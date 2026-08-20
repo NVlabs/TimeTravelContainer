@@ -124,6 +124,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|destroy <branch-id>\n" +
+		"timetravel [flags] <container-id> rename <branch-id> <new-branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-export <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
@@ -240,8 +241,12 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	}
 	action := f.Arg(1)
 	wantArgs := 3
-	if action == "branches" {
+	switch action {
+	case "branches":
 		wantArgs = 2
+	case "rename":
+		// The old name and the new one.
+		wantArgs = 4
 	}
 	if (action == "fork" && f.NArg() < wantArgs) || (action != "fork" && f.NArg() != wantArgs) {
 		f.Usage()
@@ -477,6 +482,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":
 		err = cont.Sandbox.ResumeBranch(f.Arg(2))
+	case "rename":
+		err = cont.Sandbox.RenameBranch(f.Arg(2), f.Arg(3))
 	case "dehydrate":
 		var metadataFile *os.File
 		if t.dehydrationFD >= 0 {

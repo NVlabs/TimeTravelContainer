@@ -2775,6 +2775,86 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 	return fmt.Errorf("branch %q is not recorded", branchID)
 }
 
+// RenameBranch changes a branch's visible name in the durable record.
+//
+// The name is metadata: the filesystem branch under it, the memory it holds and
+// the processes running in it are all identified some other way, and none of
+// them moves. What does move is the console state, which is filed under the
+// visible name — the log a caller reads, the lock that says a follower is
+// running, and the exec consoles namespaced beneath it. Those are renamed
+// rather than recreated, so a follower holding one open keeps writing to the
+// same file under its new name.
+func (s Store) RenameBranch(name, oldID, newID string) error {
+	if err := validateObjectName("branch", newID); err != nil {
+		return err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range info.Branches {
+		switch info.Branches[i].ID {
+		case newID:
+			return fmt.Errorf("branch %q already exists", newID)
+		case oldID:
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("branch %q is not recorded", oldID)
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ID == oldID {
+			info.Branches[i].ID = newID
+		}
+		if info.Branches[i].ParentID == oldID {
+			info.Branches[i].ParentID = newID
+		}
+	}
+	for i := range info.PublishedPorts {
+		if info.PublishedPorts[i].Branch() == oldID {
+			info.PublishedPorts[i].BranchID = newID
+		}
+	}
+	if err := s.renameConsoleState(info.ID, oldID, newID); err != nil {
+		return err
+	}
+	recomputeContainerState(&info)
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// renameConsoleState moves the files a branch's consoles are filed under.
+func (s Store) renameConsoleState(containerID, oldID, newID string) error {
+	dir := filepath.Join(s.Root, "containers", containerID, "console")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading console state: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != oldID && !strings.HasPrefix(name, oldID+".") {
+			continue
+		}
+		renamed := newID + strings.TrimPrefix(name, oldID)
+		if err := os.Rename(filepath.Join(dir, name), filepath.Join(dir, renamed)); err != nil {
+			return fmt.Errorf("renaming console state %q: %w", name, err)
+		}
+	}
+	execDir := filepath.Join(dir, "exec", oldID)
+	if _, err := os.Stat(execDir); err == nil {
+		if err := os.Rename(execDir, filepath.Join(dir, "exec", newID)); err != nil {
+			return fmt.Errorf("renaming exec console state: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading exec console state: %w", err)
+	}
+	return nil
+}
+
 // RecordBranchStart records a fresh process incarnation for one branch. Family
 // state is derived from all branches; starting one branch never deletes or
 // rewrites its peers.
