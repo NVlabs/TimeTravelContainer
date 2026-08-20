@@ -24,9 +24,12 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -34,6 +37,59 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+func TestResidentMemorySharingEdgesExactAndBounded(t *testing.T) {
+	page := func(sequence uint64) mm.ResidentPageVersion {
+		return mm.ResidentPageVersion{Version: pgalloc.PageVersionID{Sequence: sequence}}
+	}
+	set := func(sequences ...uint64) map[mm.ResidentPageVersion]struct{} {
+		pages := make(map[mm.ResidentPageVersion]struct{}, len(sequences))
+		for _, sequence := range sequences {
+			pages[page(sequence)] = struct{}{}
+		}
+		return pages
+	}
+	edges, truncated, omitted, counts := residentMemorySharingEdges(
+		[]string{"a", "b", "c"},
+		[]map[mm.ResidentPageVersion]struct{}{set(1, 2, 3), set(2, 3, 4), set(3, 5)},
+		maxResidentMemorySharingEdges,
+	)
+	if truncated || omitted != 0 || len(edges) != 2 {
+		t.Fatalf("edges=%+v truncated=%t omitted=%d", edges, truncated, omitted)
+	}
+	if got := counts[page(1)]; got != 1 {
+		t.Errorf("private page references=%d, want 1", got)
+	}
+	if got := counts[page(3)]; got != 3 {
+		t.Errorf("three-way page references=%d, want 3", got)
+	}
+	if got := edges[0]; got.Bytes != uint64(hostarch.PageSize) || strings.Join(got.Branches, ",") != "a,b" {
+		t.Errorf("first edge=%+v, want one a,b page", got)
+	}
+	if got := edges[1]; got.Bytes != uint64(hostarch.PageSize) || strings.Join(got.Branches, ",") != "a,b,c" {
+		t.Errorf("second edge=%+v, want one a,b,c page", got)
+	}
+	bounded, truncated, omitted, _ := residentMemorySharingEdges(
+		[]string{"a", "b", "c"},
+		[]map[mm.ResidentPageVersion]struct{}{set(1, 2, 3), set(2, 3, 4), set(3, 5)},
+		1,
+	)
+	if !truncated || len(bounded) != 1 || omitted != uint64(hostarch.PageSize) {
+		t.Fatalf("bounded edges=%+v truncated=%t omitted=%d", bounded, truncated, omitted)
+	}
+	ids := make([]string, 65)
+	pages := make([]map[mm.ResidentPageVersion]struct{}, len(ids))
+	for index := range ids {
+		ids[index] = fmt.Sprintf("b%02d", index)
+		pages[index] = set(uint64(1000 + index))
+	}
+	pages[0][page(2000)] = struct{}{}
+	pages[64][page(2000)] = struct{}{}
+	largeEdges, truncated, omitted, _ := residentMemorySharingEdges(ids, pages, maxResidentMemorySharingEdges)
+	if truncated || omitted != 0 || len(largeEdges) != 1 || strings.Join(largeEdges[0].Branches, ",") != "b00,b64" {
+		t.Fatalf("large-family edges=%+v truncated=%t omitted=%d", largeEdges, truncated, omitted)
+	}
+}
 
 type testDistributedBranchResource struct {
 	removed []string

@@ -24,6 +24,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -286,9 +287,24 @@ type BranchResidentMemory struct {
 
 // FamilyResidentMemory is a family-wide resident-memory accounting snapshot.
 type FamilyResidentMemory struct {
-	Branches    []BranchResidentMemory `json:"branches"`
-	UniqueBytes uint64                 `json:"unique_bytes"`
+	Branches                 []BranchResidentMemory      `json:"branches"`
+	SharingEdges             []ResidentMemorySharingEdge `json:"sharing_edges,omitempty"`
+	SharingEdgesTruncated    bool                        `json:"sharing_edges_truncated,omitempty"`
+	SharingEdgesOmittedBytes uint64                      `json:"sharing_edges_omitted_bytes,omitempty"`
+	UniqueBytes              uint64                      `json:"unique_bytes"`
 }
+
+// ResidentMemorySharingEdge is an exact weighted hyperedge. It coalesces all
+// resident physical pages referenced by the same set of branches; this is
+// algebraically equivalent to exporting one 4 KiB edge per page for placement
+// cost calculations, without producing a page-sized control response.
+type ResidentMemorySharingEdge struct {
+	ID       string   `json:"id"`
+	Bytes    uint64   `json:"bytes"`
+	Branches []string `json:"branches"`
+}
+
+const maxResidentMemorySharingEdges = 4096
 
 // BranchWaitArgs selects a process inside one live branch. PID 0 selects the
 // container init process.
@@ -2398,6 +2414,107 @@ func (f *SandboxFamily) RootfsSize(id, cid string, out *control.RootfsSize) erro
 	return control.RootfsUpperLayerSize(b.k, cid, out)
 }
 
+func residentMemorySharingEdges(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}, limit int) ([]ResidentMemorySharingEdge, bool, uint64, map[mm.ResidentPageVersion]uint32) {
+	if len(branchIDs) != len(branchPages) {
+		panic("resident memory branch identity/page count mismatch")
+	}
+	counts := make(map[mm.ResidentPageVersion]uint32)
+	for _, pages := range branchPages {
+		for page := range pages {
+			counts[page]++
+		}
+	}
+	type weightedMembership struct {
+		sortKey  string
+		branches []string
+		bytes    uint64
+	}
+	var memberships []weightedMembership
+	// Most families have at most 64 simultaneously resident branches. A word
+	// signature avoids allocating one membership slice and string per shared
+	// page; allocations scale with distinct hyperedges instead.
+	if len(branchIDs) <= 64 {
+		signatures := make(map[mm.ResidentPageVersion]uint64)
+		for index, pages := range branchPages {
+			bit := uint64(1) << uint(index)
+			for page := range pages {
+				if counts[page] > 1 {
+					signatures[page] |= bit
+				}
+			}
+		}
+		weights := make(map[uint64]uint64)
+		for _, signature := range signatures {
+			weights[signature] += uint64(hostarch.PageSize)
+		}
+		for signature, bytes := range weights {
+			var builder strings.Builder
+			var edgeBranches []string
+			for index, id := range branchIDs {
+				if signature&(uint64(1)<<uint(index)) == 0 {
+					continue
+				}
+				builder.WriteByte(0)
+				builder.WriteString(id)
+				edgeBranches = append(edgeBranches, id)
+			}
+			memberships = append(memberships, weightedMembership{
+				sortKey: builder.String(), branches: edgeBranches, bytes: bytes,
+			})
+		}
+	} else {
+		weights := make(map[string]uint64)
+		members := make(map[string][]string)
+		pageMembers := make(map[mm.ResidentPageVersion][]uint32)
+		for index, pages := range branchPages {
+			for page := range pages {
+				if counts[page] > 1 {
+					pageMembers[page] = append(pageMembers[page], uint32(index))
+				}
+			}
+		}
+		for _, indexes := range pageMembers {
+			var builder strings.Builder
+			edgeBranches := make([]string, 0, len(indexes))
+			for _, index := range indexes {
+				id := branchIDs[index]
+				builder.WriteByte(0)
+				builder.WriteString(id)
+				edgeBranches = append(edgeBranches, id)
+			}
+			key := builder.String()
+			weights[key] += uint64(hostarch.PageSize)
+			members[key] = edgeBranches
+		}
+		for key, bytes := range weights {
+			memberships = append(memberships, weightedMembership{
+				sortKey: key, branches: members[key], bytes: bytes,
+			})
+		}
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	sort.Slice(memberships, func(i, j int) bool { return memberships[i].sortKey < memberships[j].sortKey })
+	truncated := len(memberships) > limit
+	var omitted uint64
+	if truncated {
+		for _, membership := range memberships[limit:] {
+			omitted += membership.bytes
+		}
+		memberships = memberships[:limit]
+	}
+	edges := make([]ResidentMemorySharingEdge, 0, len(memberships))
+	for index, membership := range memberships {
+		edges = append(edges, ResidentMemorySharingEdge{
+			ID:       fmt.Sprintf("resident-share-%04d", index),
+			Bytes:    membership.bytes,
+			Branches: membership.branches,
+		})
+	}
+	return edges, truncated, omitted, counts
+}
+
 // ResidentMemory accounts mapped resident guest pages across live branches.
 // It deliberately excludes Sentry Go heap and unmapped page-cache objects.
 func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
@@ -2436,13 +2553,17 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 		}
 	}()
 
-	counts := make(map[mm.ResidentPageVersion]uint32)
 	for index := range held {
 		held[index].pages = held[index].branch.k.ResidentPageVersions()
-		for page := range held[index].pages {
-			counts[page]++
-		}
 	}
+	heldIDs := make([]string, 0, len(held))
+	heldPages := make([]map[mm.ResidentPageVersion]struct{}, 0, len(held))
+	for _, branch := range held {
+		heldIDs = append(heldIDs, branch.branch.id)
+		heldPages = append(heldPages, branch.pages)
+	}
+	var counts map[mm.ResidentPageVersion]uint32
+	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes, counts = residentMemorySharingEdges(heldIDs, heldPages, maxResidentMemorySharingEdges)
 	out.Branches = make([]BranchResidentMemory, 0, len(ids))
 	const pageBytes = uint64(hostarch.PageSize)
 	for _, id := range ids {

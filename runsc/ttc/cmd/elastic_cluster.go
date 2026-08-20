@@ -419,34 +419,46 @@ func (b *runtimeBackend) localPlannerResources() ([]cluster.BranchResource, []cl
 		for _, memory := range resident.Branches {
 			byID[memory.ID] = memory
 		}
-		// The current Sentry ABI exposes per-branch shared totals but not exact
-		// page-version hyperedges. Use the common lower bound as one coarse
-		// family edge and charge every residual byte to its branch. Actual cgroup
-		// memory remains the hard admission signal.
-		commonShared := ^uint64(0)
-		ids := make([]string, 0, len(local))
+		if resident.SharingEdgesTruncated {
+			return nil, nil, fmt.Errorf("resident sharing summary for %q exceeded its bound and omitted %d bytes", name, resident.SharingEdgesOmittedBytes)
+		}
+		localIDs := make(map[string]string, len(local))
 		for _, branch := range local {
 			memory, ok := byID[branch.ID]
 			if !ok {
 				return nil, nil, fmt.Errorf("runtime omitted resident accounting for %s@%s", name, branch.ID)
 			}
-			if memory.SharedBytes < commonShared {
-				commonShared = memory.SharedBytes
-			}
-			ids = append(ids, selector{container: name, branch: branch.ID}.String())
+			id := selector{container: name, branch: branch.ID}.String()
+			localIDs[branch.ID] = id
+			branches = append(branches, cluster.BranchResource{
+				ID: id, NodeID: b.nodeID, PrivateBytes: memory.PrivateBytes, Movable: true,
+			})
 		}
-		if len(local) < 2 {
-			commonShared = 0
+		accountedShared := make(map[string]uint64, len(local))
+		for _, edge := range resident.SharingEdges {
+			ids := make([]string, 0, len(edge.Branches))
+			for _, branchID := range edge.Branches {
+				id, ok := localIDs[branchID]
+				if !ok {
+					continue
+				}
+				ids = append(ids, id)
+				accountedShared[branchID] += edge.Bytes
+			}
+			if len(ids) != len(edge.Branches) {
+				return nil, nil, fmt.Errorf("resident sharing edge %q for %q includes a branch outside local placement metadata", edge.ID, name)
+			}
+			if len(ids) > 1 && edge.Bytes != 0 {
+				shared = append(shared, cluster.SharedResource{
+					ID: info.ID + "@" + edge.ID, Bytes: edge.Bytes, Branches: ids,
+				})
+			}
 		}
 		for _, branch := range local {
 			memory := byID[branch.ID]
-			branches = append(branches, cluster.BranchResource{
-				ID: selector{container: name, branch: branch.ID}.String(), NodeID: b.nodeID,
-				PrivateBytes: memory.PrivateBytes + memory.SharedBytes - commonShared, Movable: true,
-			})
-		}
-		if commonShared != 0 {
-			shared = append(shared, cluster.SharedResource{ID: info.ID + "@resident-common", Bytes: commonShared, Branches: ids})
+			if accountedShared[branch.ID] != memory.SharedBytes {
+				return nil, nil, fmt.Errorf("resident sharing summary for %s@%s accounts %d shared bytes, want %d", name, branch.ID, accountedShared[branch.ID], memory.SharedBytes)
+			}
 		}
 	}
 	return branches, shared, nil

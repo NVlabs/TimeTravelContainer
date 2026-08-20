@@ -252,12 +252,14 @@ leave without branch loss or repository garbage.
 
 **Implemented as an initial bounded planner.** `ttc node rebalance` and the
 opt-in `--cluster-auto-rebalance` loop use cgroup memory as the hard signal and
-per-family resident private/shared summaries for move selection. The current
-Sentry accounting ABI exposes shared totals rather than exact chunk-version
-hyperedges, so the live integration uses a conservative coarse family edge;
-the deterministic planner itself accepts exact 1 MiB edges once exported.
+exact per-family resident-sharing hyperedges for move selection. The Sentry
+coalesces physical 4 KiB page versions with identical branch membership into
+one weighted edge; this preserves exact placement costs without returning one
+JSON object per page. Responses are bounded at 4,096 distinct membership sets
+and report truncation explicitly instead of silently planning from incomplete
+data. Cgroup memory remains the hard admission signal.
 
-* Export bounded chunk-sharing summaries and node actual/reserved memory.
+* Export bounded resident-sharing summaries and node actual/reserved memory.
 * Implement deterministic bipartition dry runs and scoring diagnostics.
 * Add watermarks, hysteresis, cooldowns, and destination reservations.
 * Add optional automatic rebalance and capacity requests.

@@ -54,6 +54,29 @@ The no-target path was also exercised at unit level: concurrent pressure/drain
 attempts retain one durable request ID, and removing the accepted outbox entry
 allows the next pressure episode to publish a fresh ID.
 
+## Exact CoW hypergraph placement
+
+The live qualification worker in
+[`tools/ttc/elastic_memory_worker.c`](../../tools/ttc/elastic_memory_worker.c)
+prefaulted 128 MiB of anonymous memory before a three-way local fork. Branch
+`a` then overwrote the first 16 MiB and branch `b` independently overwrote the
+next 16 MiB. The Sentry exported three exact sharing edges:
+
+| Branch membership | Resident bytes |
+| --- | ---: |
+| `a`, `b`, `main` | 102,354,944 |
+| `a`, `main` | 16,777,216 |
+| `b`, `main` | 16,777,216 |
+
+Per-branch private/shared totals reconciled exactly with these edges. Under an
+artificial 100 MiB pressure deficit, the planner correctly selected all three
+branches: moving a strict subset would leave the large shared edge resident on
+both nodes. It estimated 170,090,496 bytes freed and added with a zero-byte cut.
+After conservative migration to the second daemon, routed execution succeeded
+and the target Sentry reported the same three edges and byte totals, proving
+that migration preserved the CoW topology. Removing the family and stopping
+both daemons left no workload, Sentry, gofer, or test directory.
+
 ## NFS remote-fork matrix
 
 The test data root was exported by the host kernel NFS server and mounted over

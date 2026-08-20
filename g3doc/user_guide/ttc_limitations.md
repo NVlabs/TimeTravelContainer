@@ -81,11 +81,12 @@ non-forkable for its entire lifetime.
   a checkpoint for offline transfer or unrelated TTC installations.
 - Elastic migration currently uses a conservative dehydrate/ownership-CAS/
   rehydrate cutover rather than the live sparse handoff planned for later.
-  Automatic rebalancing uses coarse per-family shared-memory summaries until
-  exact bounded chunk-version edges are exported by the Sentry. Capacity
-  acquisition uses a durable shared-filesystem JSON outbox; native executable
-  and HTTP provider adapters are not yet included. An unsuccessful drain or
-  rebalance remains safely retryable after a requested node joins.
+  Automatic rebalancing uses exact resident-memory sharing edges, coalesced by
+  branch membership and bounded at 4,096 distinct sets per family. TTC rejects
+  a plan if this bound is exceeded rather than using incomplete accounting.
+  Capacity acquisition uses a durable shared-filesystem JSON outbox; native
+  executable and HTTP provider adapters are not yet included. An unsuccessful
+  drain or rebalance remains safely retryable after a requested node joins.
 
 For the detailed resource matrix, measurements, and audit evidence, see the
 [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md).
