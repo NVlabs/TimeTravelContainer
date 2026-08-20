@@ -14,7 +14,14 @@
 
 package cmd
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+)
 
 func TestClusterAdvertiseResolution(t *testing.T) {
 	base, name, err := parseClusterAdvertise("https://node-a.example:0,node-a.example")
@@ -37,6 +44,43 @@ func TestClusterAdvertiseResolution(t *testing.T) {
 	}
 	if page != "node-a.example:0" {
 		t.Fatalf("page address=%q", page)
+	}
+}
+
+func TestDaemonCommandOwner(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	if err := os.MkdirAll(containerDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: filepath.Join(containerDir, "bundle")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := (ttcbundle.Store{Root: root}).LoadContainer("web"); err != nil || info.NodeID != "node-b" {
+		t.Fatalf("loading routing fixture=(%+v, %v)", info, err)
+	}
+	for _, args := range [][]string{
+		{"exec", "-it", "web@main", "bash"},
+		{"cp", "web@main:/tmp/result", "/tmp/result"},
+		{"fork", "web@main", "child"},
+	} {
+		owner, err := daemonCommandOwner(root, args)
+		if err != nil || owner != "node-b" {
+			t.Fatalf("daemonCommandOwner(%v)=(%q, %v)", args, owner, err)
+		}
+	}
+	if owner, err := daemonCommandOwner(root, []string{"images"}); err != nil || owner != "" {
+		t.Fatalf("image command owner=(%q, %v)", owner, err)
 	}
 }
 

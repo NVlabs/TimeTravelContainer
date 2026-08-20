@@ -109,19 +109,27 @@ class Experiment:
             "--cluster-prefetch", self.case["prefetch"],
             "--cluster-push", self.case["push"],
         ]
-        self.ttc("a", "daemon", "start", *common,
-                 "--cluster-listen", "127.0.0.1:27443",
-                 "--cluster-node-id", "node-a",
-                 "--cluster-cert", self.root / "node-a.pem",
-                 "--cluster-key", self.root / "node-a.key",
-                 "--cluster-peer", "node-b=https://127.0.0.1:37443,node-b")
+        node_a = [
+            "--cluster-listen", "127.0.0.1:27443",
+            "--cluster-node-id", "node-a",
+            "--cluster-cert", self.root / "node-a.pem",
+            "--cluster-key", self.root / "node-a.key",
+        ]
+        node_b = [
+            "--cluster-listen", "127.0.0.1:37443",
+            "--cluster-node-id", "node-b",
+            "--cluster-cert", self.root / "node-b.pem",
+            "--cluster-key", self.root / "node-b.key",
+        ]
+        if self.args.dynamic_discovery:
+            node_a += ["--cluster-advertise", "https://127.0.0.1:27443,node-a"]
+            node_b += ["--cluster-advertise", "https://127.0.0.1:37443,node-b"]
+        else:
+            node_a += ["--cluster-peer", "node-b=https://127.0.0.1:37443,node-b"]
+            node_b += ["--cluster-peer", "node-a=https://127.0.0.1:27443,node-a"]
+        self.ttc("a", "daemon", "start", *common, *node_a)
         try:
-            self.ttc("b", "daemon", "start", *common,
-                     "--cluster-listen", "127.0.0.1:37443",
-                     "--cluster-node-id", "node-b",
-                     "--cluster-cert", self.root / "node-b.pem",
-                     "--cluster-key", self.root / "node-b.key",
-                     "--cluster-peer", "node-a=https://127.0.0.1:27443,node-a")
+            self.ttc("b", "daemon", "start", *common, *node_b)
         except Exception:
             self.ttc("a", "daemon", "stop", check=False)
             raise
@@ -248,6 +256,7 @@ class Experiment:
         target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
         source_ok = self.ttc("a", "exec", self.branch(self.source), "true", check=False).returncode == 0
         target_ok = [self.ttc("b", "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
+        routed_target_ok = [self.ttc("a", "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
         return {
             "schema_version": 2,
             "case": self.case,
@@ -260,6 +269,8 @@ class Experiment:
             "independent_ms": independent_ms,
             "source_ok": source_ok,
             "target_ok": target_ok,
+            "routed_target_ok": routed_target_ok,
+            "dynamic_discovery": self.args.dynamic_discovery,
             "transactions": [target["TTC"]["distributed_fork"] for target in final],
             "source_live_statuses": statuses,
             "target_loader_statuses": target_statuses,
@@ -357,6 +368,10 @@ def main():
     parser.add_argument("--work-dir", help="persistent cache/results directory")
     parser.add_argument("--output", help="JSONL output (default: stdout only)")
     parser.add_argument("--independence-timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--dynamic-discovery", action="store_true",
+        help="discover peers from shared lease records instead of --cluster-peer",
+    )
     parser.add_argument(
         "--verify-dehydrate", action="store_true",
         help="dehydrate and rehydrate every remote target before its workload",

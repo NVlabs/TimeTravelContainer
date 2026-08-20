@@ -98,6 +98,7 @@ type daemonRequest struct {
 	Options        daemonWireOptions `json:"options,omitempty"`
 	Args           []string          `json:"args,omitempty"`
 	Stdin          bool              `json:"stdin,omitempty"`
+	Route          []string          `json:"route,omitempty"`
 }
 
 type daemonServer struct {
@@ -171,12 +172,14 @@ type daemonClusterRuntime struct {
 }
 
 type daemonTargetRuntime struct {
-	backend *runtimeBackend
-	nodeID  string
-	store   *cluster.Store
-	done    <-chan struct{}
-	watch   sync.Map
-	locks   sync.Map
+	backend     *runtimeBackend
+	nodeID      string
+	incarnation string
+	directory   *cluster.NodeDirectory
+	store       *cluster.Store
+	done        <-chan struct{}
+	watch       sync.Map
+	locks       sync.Map
 }
 
 func (r *daemonTargetRuntime) lockTarget(name string) func() {
@@ -189,6 +192,15 @@ func (r *daemonTargetRuntime) lockTarget(name string) func() {
 func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction) error {
 	if r == nil || r.backend == nil || tx == nil {
 		return errors.New("distributed target runtime is unavailable")
+	}
+	if r.directory != nil {
+		record, err := r.directory.Lookup(r.nodeID)
+		if err != nil {
+			return fmt.Errorf("checking elastic target admission: %w", err)
+		}
+		if record.Incarnation != r.incarnation || !record.AcceptsPlacement(time.Now()) {
+			return fmt.Errorf("cluster node %q is not accepting placement (state=%s)", r.nodeID, record.State)
+		}
 	}
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
@@ -1973,9 +1985,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
+			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
 			store: clusterRuntime.controlPlane.Store, done: clusterDone,
 		}
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
+		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
 		clusterListener, err := net.Listen("tcp", clusterRuntime.listen)
 		if err != nil {
 			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)
@@ -2257,6 +2271,49 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if len(request.Args) == 0 {
 		writeError(errors.New("empty command"))
 		return
+	}
+	if s.distributedSource != nil && s.clusterCapabilities != nil {
+		owner, err := daemonCommandOwner(s.dataRoot, request.Args)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		if owner != "" && owner != s.clusterCapabilities.NodeID {
+			if slices.Contains(request.Route, owner) || slices.Contains(request.Route, s.clusterCapabilities.NodeID) {
+				writeError(fmt.Errorf("cluster command routing loop through %v to node %q", request.Route, owner))
+				return
+			}
+			peer, err := s.distributedSource.peer(owner, false)
+			if err != nil {
+				writeError(err)
+				return
+			}
+			request.Route = append(request.Route, s.clusterCapabilities.NodeID)
+			encoded, err := json.Marshal(&request)
+			if err != nil {
+				writeError(err)
+				return
+			}
+			var input io.Reader = bytes.NewReader(append(encoded, '\n'))
+			if request.Stdin {
+				input = io.MultiReader(input, reader)
+			}
+			if err := peer.ProxyDaemon(context.Background(), input, conn); err != nil {
+				writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
+			}
+			return
+		}
+	}
+	if s.clusterDirectory != nil && daemonCommandNeedsPlacementAdmission(request.Args) {
+		record, err := s.clusterDirectory.Lookup(s.clusterCapabilities.NodeID)
+		if err != nil {
+			writeError(fmt.Errorf("checking cluster admission: %w", err))
+			return
+		}
+		if !record.AcceptsPlacement(time.Now()) {
+			writeError(fmt.Errorf("cluster node %q is not accepting new work (state=%s)", record.NodeID, record.State))
+			return
+		}
 	}
 
 	stdinReader, stdinWriter := io.Pipe()

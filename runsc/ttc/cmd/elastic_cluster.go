@@ -19,14 +19,115 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
+
+type daemonClusterProxy struct {
+	socket string
+}
+
+func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Content-Type") != "application/vnd.ttc.daemon-stream" {
+		http.Error(w, "invalid daemon stream content type", http.StatusUnsupportedMediaType)
+		return
+	}
+	if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
+		http.Error(w, "cluster transport does not support full-duplex streams: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	conn, err := net.Dial("unix", p.socket)
+	if err != nil {
+		http.Error(w, "connecting to local ttcd: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer conn.Close()
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(conn, r.Body)
+		if unix, ok := conn.(*net.UnixConn); ok {
+			_ = unix.CloseWrite()
+		}
+		close(copyDone)
+	}()
+	w.Header().Set("Content-Type", "application/vnd.ttc.daemon-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	buffer := make([]byte, 32<<10)
+	for {
+		n, readErr := conn.Read(buffer)
+		if n != 0 {
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	select {
+	case <-copyDone:
+	default:
+	}
+}
+
+func daemonCommandOwner(dataRoot string, args []string) (string, error) {
+	if dataRoot == "" {
+		return "", nil
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	owner := ""
+	for _, arg := range args[1:] {
+		candidate := arg
+		if colon := strings.IndexByte(candidate, ':'); colon >= 0 {
+			candidate = candidate[:colon]
+		}
+		at := strings.LastIndexByte(candidate, '@')
+		if at <= 0 || at == len(candidate)-1 {
+			continue
+		}
+		selected, err := parseSelector(candidate)
+		if err != nil {
+			continue
+		}
+		info, err := store.LoadContainer(selected.container)
+		if err != nil {
+			continue
+		}
+		if info.NodeID == "" {
+			continue
+		}
+		if owner != "" && owner != info.NodeID {
+			return "", fmt.Errorf("command spans cluster nodes %q and %q", owner, info.NodeID)
+		}
+		owner = info.NodeID
+	}
+	return owner, nil
+}
+
+func daemonCommandNeedsPlacementAdmission(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "run", "create", "fork", "rehydrate", "restore":
+		return true
+	case "container":
+		return len(args) > 1 && (args[1] == "run" || args[1] == "create")
+	default:
+		return false
+	}
+}
 
 func parseClusterAdvertise(value string) (baseURL, serverName string, err error) {
 	comma := strings.LastIndexByte(value, ',')

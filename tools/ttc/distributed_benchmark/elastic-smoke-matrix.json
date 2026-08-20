@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+    "name": "elastic-fanout-sequential",
+    "memory_mib": 128,
+    "rounds": 2,
+    "fanout": 4,
+    "capture_mode": "batch",
+    "workload": "sequential",
+    "touch_fraction": 1.0
+    },
+    {
+    "name": "elastic-random-sparse",
+    "memory_mib": 128,
+    "rounds": 3,
+    "fanout": 2,
+    "capture_mode": "batch",
+    "workload": "random",
+    "touch_fraction": 0.25
+    }
+  ]
+}

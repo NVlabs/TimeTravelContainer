@@ -40,6 +40,7 @@ import (
 const (
 	controlReservePath = "/v1/forks/reserve"
 	controlForkPrefix  = "/v1/forks/"
+	controlProxyPath   = "/v1/daemon"
 	maxControlBody     = 1 << 20
 )
 
@@ -277,8 +278,11 @@ type ControlPlane struct {
 	MaxTransactions int
 	Now             func() time.Time
 	TargetRuntime   TargetRuntime
-	operationMu     sync.Mutex // serializes reservation/quota accounting
-	transactionMu   sync.Map   // transaction ID -> *sync.Mutex
+	// CommandProxy forwards the TTC daemon wire protocol after mTLS peer
+	// authentication. It is optional for non-elastic deployments.
+	CommandProxy  http.Handler
+	operationMu   sync.Mutex // serializes reservation/quota accounting
+	transactionMu sync.Map   // transaction ID -> *sync.Mutex
 }
 
 func (c *ControlPlane) lockTransaction(id string) func() {
@@ -298,6 +302,14 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	peer, err := verifiedPeerNodeID(r)
 	if err != nil {
 		writeControlError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if r.URL.Path == controlProxyPath && r.Method == http.MethodPost {
+		if c.CommandProxy == nil {
+			writeControlError(w, http.StatusNotImplemented, "daemon command proxy is unavailable")
+			return
+		}
+		c.CommandProxy.ServeHTTP(w, r)
 		return
 	}
 	if r.URL.Path == controlReservePath {
@@ -772,8 +784,36 @@ func NewClient(baseURL string, tlsConfig *tls.Config, timeout time.Duration) (*C
 	if tlsConfig == nil || timeout <= 0 {
 		return nil, errors.New("cluster client requires TLS and a positive timeout")
 	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone()}
+	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), ForceAttemptHTTP2: true}
 	return &Client{BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Transport: transport, Timeout: timeout}}, nil
+}
+
+// ProxyDaemon carries one framed TTC daemon connection over the authenticated
+// cluster transport. The caller controls cancellation through ctx.
+func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+controlProxyPath, input)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/vnd.ttc.daemon-stream")
+	// Streaming exec sessions may legitimately outlive the timeout used for
+	// individual transaction RPCs; their context is the lifetime bound.
+	client := &http.Client{Transport: c.HTTP.Transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		limited := io.LimitReader(resp.Body, maxControlBody+1)
+		var remote controlError
+		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {
+			return fmt.Errorf("cluster peer returned HTTP %s", resp.Status)
+		}
+		return fmt.Errorf("cluster peer: %s", remote.Error)
+	}
+	_, err = io.Copy(output, resp.Body)
+	return err
 }
 
 // Reserve negotiates and reserves an unpublished target transaction.

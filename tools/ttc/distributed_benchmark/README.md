@@ -25,6 +25,10 @@ tools/ttc/distributed_benchmark/benchmark.py \
   --work-dir /tmp/ttc-bench --output /tmp/ttc-bench/results.jsonl
 ```
 
+Add `--dynamic-discovery` to start node A before node B without configuring
+either daemon with the other's address. The run also executes target commands
+through node A to validate transparent cluster command routing.
+
 Run the example policy/network matrix on a disposable privileged node:
 
 ```bash

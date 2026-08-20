@@ -10,6 +10,8 @@ go_library(
     srcs = [
         "capabilities.go",
         "control.go",
+        "placement.go",
+		"planner.go",
         "registry.go",
         "store.go",
         "transaction.go",
@@ -24,6 +26,8 @@ go_test(
     srcs = [
         "cluster_test.go",
         "control_test.go",
+        "placement_test.go",
+		"planner_test.go",
         "registry_test.go",
     ],
     library = ":cluster",
