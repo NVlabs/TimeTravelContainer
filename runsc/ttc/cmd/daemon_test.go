@@ -741,6 +741,7 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		"--cluster-ca", "ca.pem",
 		"--cluster-advertise", "https://node-a.example:0,node-a.example",
 		"--cluster-memory-target", "8GiB",
+		"--cluster-auto-rebalance",
 		"--cluster-lease", "30s",
 		"--cluster-max-transactions", "17",
 		"--cluster-page-listen", "0.0.0.0:0",
@@ -768,7 +769,7 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 	if !opts.Configured || opts.Listen != "127.0.0.1:7443" || opts.NodeID != "node-a" ||
 		opts.RepositoryID != "repo" || opts.CertFile != "cert.pem" || opts.KeyFile != "key.pem" ||
 		opts.CAFile != "ca.pem" || opts.Advertise != "https://node-a.example:0,node-a.example" ||
-		opts.MemoryTarget != 8<<30 || opts.LeaseDuration != 30*time.Second || opts.MaxTransactions != 17 || opts.PageListen != "0.0.0.0:0" ||
+		opts.MemoryTarget != 8<<30 || !opts.AutoRebalance || opts.LeaseDuration != 30*time.Second || opts.MaxTransactions != 17 || opts.PageListen != "0.0.0.0:0" ||
 		opts.PageAdvertise != "node-a.example:0" || opts.PagingPolicy.TransferBytes != 128<<10 ||
 		opts.PagingPolicy.MaxOutstandingBytes != 8<<20 || opts.PagingPolicy.MaxConcurrency != 8 ||
 		opts.PagingPolicy.AckBatchPages != 128 || opts.PagingPolicy.AckInterval != 250*time.Microsecond ||

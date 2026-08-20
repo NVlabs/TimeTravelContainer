@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -323,6 +324,175 @@ func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, erro
 	return targets, nil
 }
 
+func (b *runtimeBackend) localPlannerResources() ([]cluster.BranchResource, []cluster.SharedResource, error) {
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return nil, nil, err
+	}
+	var branches []cluster.BranchResource
+	var shared []cluster.SharedResource
+	for _, info := range containers {
+		name := info.Name
+		if name == "" {
+			name = info.ID
+		}
+		var local []ttcbundle.BranchInfo
+		for _, branch := range info.Branches {
+			state := normalizeLifecycleState(branch.State)
+			if info.BranchNodeID(branch.ID) == b.nodeID && (state == "running" || state == "paused") {
+				local = append(local, branch)
+			}
+		}
+		if len(local) == 0 {
+			continue
+		}
+		output, err := b.command("timetravel", info.ID, "stats", local[0].ID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("accounting resident memory for %q: %w", name, err)
+		}
+		var resident boot.FamilyResidentMemory
+		if err := json.Unmarshal(output, &resident); err != nil {
+			return nil, nil, fmt.Errorf("decoding resident memory for %q: %w", name, err)
+		}
+		byID := make(map[string]boot.BranchResidentMemory, len(resident.Branches))
+		for _, memory := range resident.Branches {
+			byID[memory.ID] = memory
+		}
+		// The current Sentry ABI exposes per-branch shared totals but not exact
+		// page-version hyperedges. Use the common lower bound as one coarse
+		// family edge and charge every residual byte to its branch. Actual cgroup
+		// memory remains the hard admission signal.
+		commonShared := ^uint64(0)
+		ids := make([]string, 0, len(local))
+		for _, branch := range local {
+			memory, ok := byID[branch.ID]
+			if !ok {
+				return nil, nil, fmt.Errorf("runtime omitted resident accounting for %s@%s", name, branch.ID)
+			}
+			if memory.SharedBytes < commonShared {
+				commonShared = memory.SharedBytes
+			}
+			ids = append(ids, selector{container: name, branch: branch.ID}.String())
+		}
+		if len(local) < 2 {
+			commonShared = 0
+		}
+		for _, branch := range local {
+			memory := byID[branch.ID]
+			branches = append(branches, cluster.BranchResource{
+				ID: selector{container: name, branch: branch.ID}.String(), NodeID: b.nodeID,
+				PrivateBytes: memory.PrivateBytes + memory.SharedBytes - commonShared, Movable: true,
+			})
+		}
+		if commonShared != 0 {
+			shared = append(shared, cluster.SharedResource{ID: info.ID + "@resident-common", Bytes: commonShared, Branches: ids})
+		}
+	}
+	return branches, shared, nil
+}
+
+func betterPlacementPlan(candidate, best cluster.PlacementPlan) bool {
+	if len(best.Branches) == 0 {
+		return true
+	}
+	if candidate.EstimatedCut != best.EstimatedCut {
+		return candidate.EstimatedCut < best.EstimatedCut
+	}
+	if candidate.EstimatedAdded != best.EstimatedAdded {
+		return candidate.EstimatedAdded < best.EstimatedAdded
+	}
+	return candidate.TargetNode < best.TargetNode
+}
+
+func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool) (cluster.PlacementPlan, error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return cluster.PlacementPlan{}, errors.New("elastic rebalance requires dynamic cluster discovery")
+	}
+	if sourceNode != b.nodeID {
+		if local {
+			return cluster.PlacementPlan{}, fmt.Errorf("node rebalance reached %q, want %q", b.nodeID, sourceNode)
+		}
+		peer, err := b.distributedSource.peer(sourceNode, false)
+		if err != nil {
+			return cluster.PlacementPlan{}, err
+		}
+		requestID, err := newDaemonRequestID()
+		if err != nil {
+			return cluster.PlacementPlan{}, err
+		}
+		args := []string{"node", "rebalance", "--_local"}
+		if targetNode != "" {
+			args = append(args, "--target", targetNode)
+		}
+		args = append(args, sourceNode)
+		status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, args)
+		if err != nil {
+			return cluster.PlacementPlan{}, err
+		}
+		if status != 0 {
+			return cluster.PlacementPlan{}, errors.New(strings.TrimSpace(diagnostic))
+		}
+		var plan cluster.PlacementPlan
+		if err := json.Unmarshal([]byte(output), &plan); err != nil {
+			return cluster.PlacementPlan{}, fmt.Errorf("decoding remote placement plan: %w", err)
+		}
+		return plan, nil
+	}
+	source, err := b.distributedSource.directory.Lookup(sourceNode)
+	if err != nil {
+		return cluster.PlacementPlan{}, err
+	}
+	if !source.LeaseActive(time.Now()) || source.MemoryTargetBytes == 0 {
+		return cluster.PlacementPlan{}, fmt.Errorf("source node %q has no active lease or memory target", sourceNode)
+	}
+	if source.MemoryCurrentBytes <= source.MemoryTargetBytes {
+		return cluster.PlacementPlan{SourceNode: sourceNode, SourceAfterBytes: source.MemoryCurrentBytes}, nil
+	}
+	targets, err := b.drainTargets(targetNode)
+	if err != nil {
+		return cluster.PlacementPlan{}, err
+	}
+	branches, shared, err := b.localPlannerResources()
+	if err != nil {
+		return cluster.PlacementPlan{}, err
+	}
+	var best cluster.PlacementPlan
+	var planErr error
+	for _, target := range targets {
+		if target.MemoryTargetBytes == 0 {
+			continue
+		}
+		plan, err := cluster.PlanPressureRelief(
+			cluster.NodeResource{ID: source.NodeID, CurrentBytes: source.MemoryCurrentBytes, TargetBytes: source.MemoryTargetBytes},
+			cluster.NodeResource{ID: target.NodeID, CurrentBytes: target.MemoryCurrentBytes, TargetBytes: target.MemoryTargetBytes, ReservedBytes: target.IncomingReservedBytes},
+			branches, shared,
+		)
+		if err != nil {
+			planErr = errors.Join(planErr, fmt.Errorf("target %s: %w", target.NodeID, err))
+			continue
+		}
+		if len(plan.Branches) != 0 && betterPlacementPlan(plan, best) {
+			best = plan
+		}
+	}
+	if len(best.Branches) == 0 {
+		if planErr != nil {
+			return best, fmt.Errorf("no feasible pressure-relief placement; request more capacity: %w", planErr)
+		}
+		return best, errors.New("no movable branch can relieve memory pressure; request more capacity")
+	}
+	for _, value := range best.Branches {
+		target, err := parseSelector(value)
+		if err != nil {
+			return best, err
+		}
+		if err := b.migrate(target, best.TargetNode); err != nil {
+			return best, fmt.Errorf("executing placement plan at %s: %w", target, err)
+		}
+	}
+	return best, nil
+}
+
 // drainNode implements a restart-safe conservative drain. It rejects new
 // placements first, then migrates active branches and transfers cold branch
 // ownership. A failed step leaves the node draining so retry cannot race new
@@ -553,6 +723,43 @@ func maintainElasticNode(directory *cluster.NodeDirectory, initial cluster.NodeR
 				default:
 				}
 				return
+			}
+		}
+	}
+}
+
+func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error) {
+	interval := lease
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	lastAttempt := time.Time{}
+	for {
+		select {
+		case <-done:
+			return
+		case now := <-ticker.C:
+			record, err := backend.distributedSource.directory.Lookup(nodeID)
+			if err != nil || record.State != cluster.NodePressured || now.Sub(lastAttempt) < 30*time.Second {
+				continue
+			}
+			lastAttempt = now
+			var plan cluster.PlacementPlan
+			err = serialize(func() error {
+				var planErr error
+				plan, planErr = backend.rebalanceNode(nodeID, "", true)
+				return planErr
+			})
+			if err != nil {
+				if stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: elastic rebalance for node %s needs attention: %v\n", nodeID, err)
+				}
+				continue
+			}
+			if stderr != nil && len(plan.Branches) != 0 {
+				fmt.Fprintf(stderr, "ttcd: elastic rebalance moved %d branches from %s to %s (estimated freed %d bytes, cut %d bytes)\n", len(plan.Branches), plan.SourceNode, plan.TargetNode, plan.EstimatedFreed, plan.EstimatedCut)
 			}
 		}
 	}

@@ -146,6 +146,7 @@ type daemonClusterOptions struct {
 	CAFile          string
 	Advertise       string
 	MemoryTarget    uint64
+	AutoRebalance   bool
 	LeaseDuration   time.Duration
 	MaxTransactions int
 	PageListen      string
@@ -162,13 +163,14 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 }
 
 type daemonClusterRuntime struct {
-	listen       string
-	tlsConfig    *tls.Config
-	controlPlane *cluster.ControlPlane
-	source       *distributedSourceRuntime
-	directory    *cluster.NodeDirectory
-	nodeRecord   cluster.NodeRecord
-	lease        time.Duration
+	listen        string
+	tlsConfig     *tls.Config
+	controlPlane  *cluster.ControlPlane
+	source        *distributedSourceRuntime
+	directory     *cluster.NodeDirectory
+	nodeRecord    cluster.NodeRecord
+	lease         time.Duration
+	autoRebalance bool
 }
 
 type daemonTargetRuntime struct {
@@ -1543,6 +1545,11 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 	if len(args) == 0 {
 		return 0, nil
 	}
+	if args[0] == "--cluster-auto-rebalance" {
+		opts.AutoRebalance = true
+		opts.Configured = true
+		return 1, nil
+	}
 	setString := func(name string, dst *string) (int, error) {
 		if args[0] == name {
 			if len(args) < 2 || args[1] == "" {
@@ -1834,7 +1841,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 			dynamicPeers: make(map[string]dynamicClusterPeer),
 			pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 		},
-		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration,
+		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration, autoRebalance: opts.AutoRebalance,
 	}, nil
 }
 
@@ -1997,6 +2004,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		server.configureVolumeBackend(targetBackend)
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
+		targetBackend.distributedSource = clusterRuntime.source
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
@@ -2074,6 +2082,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}()
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
+		if clusterRuntime.autoRebalance && elasticRecord != nil {
+			go maintainElasticRebalancer(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
+				unlock := server.lockDataRoot(server.dataRoot)
+				defer unlock()
+				return run()
+			})
+		}
 	}
 	if stdout != nil {
 		fmt.Fprintf(stdout, "ttcd listening on %s (API v%d, platform=%s, isolation=%s, volume-copy=%s)\n", socket, daemonAPIVersion, runtimePlatform, daemonIsolationMode(unsafeNoHostIsolation), volumeCapability.Mode)
@@ -3044,6 +3059,9 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 		}
 		if clusterOpts.MemoryTarget != 0 {
 			commandArgs = append(commandArgs, "--cluster-memory-target", strconv.FormatUint(clusterOpts.MemoryTarget, 10))
+		}
+		if clusterOpts.AutoRebalance {
+			commandArgs = append(commandArgs, "--cluster-auto-rebalance")
 		}
 		if clusterOpts.PageAdvertise != "" {
 			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)

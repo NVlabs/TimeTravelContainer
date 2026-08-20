@@ -328,6 +328,7 @@ Commands:
   migrate --target NODE TARGET    Move a running branch to another cluster node
   node ls [--json]                 List elastic cluster nodes and memory load
   node drain [--target NODE] NODE  Evacuate a node and reject new placement
+  node rebalance [--target NODE] NODE Relieve a node's configured memory pressure
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
@@ -347,6 +348,7 @@ Commands:
                 --cluster-repository-id ID --cluster-cert FILE
                 --cluster-key FILE --cluster-ca FILE]
 		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
+		       [--cluster-memory-target SIZE --cluster-auto-rebalance]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -382,7 +384,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"migrate":    "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
-			"node":       "Usage: ttc node ls [--json] | ttc node drain [--target NODE] NODE",
+			"node":       "Usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
@@ -527,11 +529,12 @@ type elasticMigrationBackend interface {
 type elasticNodeBackend interface {
 	clusterNodes() ([]cluster.NodeRecord, error)
 	drainNode(sourceNode, targetNode string, local bool) ([]selector, error)
+	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.PlacementPlan, error)
 }
 
 func runNode(args []string, stdout io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttc node ls [--json] | ttc node drain [--target NODE] NODE")
+		return errors.New("usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE")
 	}
 	nodes, ok := backend.(elasticNodeBackend)
 	if !ok {
@@ -589,6 +592,24 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 			fmt.Fprintln(stdout, branch)
 		}
 		return nil
+	case "rebalance":
+		fs := flag.NewFlagSet("node rebalance", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		target := fs.String("target", "", "restrict the destination node")
+		local := fs.Bool("_local", false, "execute only on the addressed daemon")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("usage: ttc node rebalance [--target NODE] NODE")
+		}
+		plan, err := nodes.rebalanceNode(fs.Arg(0), *target, *local)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(plan)
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}
