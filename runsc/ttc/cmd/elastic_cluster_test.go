@@ -19,8 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
 func TestClusterAdvertiseResolution(t *testing.T) {
@@ -81,6 +83,59 @@ func TestDaemonCommandOwner(t *testing.T) {
 	}
 	if owner, err := daemonCommandOwner(root, []string{"images"}); err != nil || owner != "" {
 		t.Fatalf("image command owner=(%q, %v)", owner, err)
+	}
+}
+
+func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Unix(2, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, claims, err := daemonCommandPlacement(root, []string{"exec", "web@main", "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner != "node-b" || len(claims) != 1 || claims[0].Generation != created.Generation || claims[0].OwnerIncarnation != "boot-b" {
+		t.Fatalf("placement owner=%q claims=%+v", owner, claims)
+	}
+	if err := validateDaemonPlacementClaims(root, "node-b", claims); err != nil {
+		t.Fatalf("valid claim rejected: %v", err)
+	}
+	if _, err := placements.BeginMigration("web", "main", "node-b", "boot-b", created.Generation, "move-one", "node-c", time.Unix(3, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDaemonPlacementClaims(root, "node-b", claims); err == nil {
+		t.Fatal("stale pre-migration claim remained valid")
+	}
+	if _, _, err := daemonCommandPlacement(root, []string{"exec", "web@main", "true"}); err == nil {
+		t.Fatal("new command was routed into an in-progress migration")
 	}
 }
 

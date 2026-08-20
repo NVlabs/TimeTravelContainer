@@ -156,6 +156,12 @@ type Transaction struct {
 	// SparseHandoff is durable and non-secret, allowing either daemon to retry
 	// the live-to-shared reader transition after a control-plane restart.
 	SparseHandoff *SparseHandoffDescriptor `json:"sparse_handoff,omitempty"`
+	// DesiredPaused is the source-visible state requested at publication.
+	// Migration targets are always first published physically paused and become
+	// runnable only after placement CAS; Activated records that this final step
+	// completed. For a requested paused target, Activated is immediately true.
+	DesiredPaused bool `json:"desired_paused,omitempty"`
+	Activated     bool `json:"activated,omitempty"`
 }
 
 var transactionTransitions = map[TransactionState]map[TransactionState]bool{

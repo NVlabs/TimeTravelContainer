@@ -90,20 +90,33 @@ type daemonWireOptions struct {
 }
 
 type daemonRequest struct {
-	Version        int               `json:"version"`
-	Action         string            `json:"action"`
-	RequestID      string            `json:"request_id,omitempty"`
-	ClientTERM     string            `json:"client_term,omitempty"`
-	StderrTerminal bool              `json:"stderr_terminal,omitempty"`
-	StderrWidth    int               `json:"stderr_width,omitempty"`
-	Options        daemonWireOptions `json:"options,omitempty"`
-	Args           []string          `json:"args,omitempty"`
-	Stdin          bool              `json:"stdin,omitempty"`
-	Route          []string          `json:"route,omitempty"`
-	PlacementNode  string            `json:"placement_node,omitempty"`
+	Version         int                    `json:"version"`
+	Action          string                 `json:"action"`
+	RequestID       string                 `json:"request_id,omitempty"`
+	ClientTERM      string                 `json:"client_term,omitempty"`
+	StderrTerminal  bool                   `json:"stderr_terminal,omitempty"`
+	StderrWidth     int                    `json:"stderr_width,omitempty"`
+	Options         daemonWireOptions      `json:"options,omitempty"`
+	Args            []string               `json:"args,omitempty"`
+	Stdin           bool                   `json:"stdin,omitempty"`
+	Route           []string               `json:"route,omitempty"`
+	PlacementNode   string                 `json:"placement_node,omitempty"`
+	PlacementClaims []daemonPlacementClaim `json:"placement_claims,omitempty"`
 	// DistributedLeaf marks a coordinator-generated owner-local command. It
 	// prevents a family mutation from being expanded again on the destination.
 	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
+}
+
+// daemonPlacementClaim fences one routed branch command to the catalog
+// generation observed by the entry daemon. The owner validates it again after
+// taking its local lifecycle lock, so a delayed proxy cannot mutate a newer
+// incarnation after migration.
+type daemonPlacementClaim struct {
+	FamilyID         string `json:"family_id"`
+	BranchID         string `json:"branch_id"`
+	OwnerNode        string `json:"owner_node"`
+	OwnerIncarnation string `json:"owner_incarnation"`
+	Generation       uint64 `json:"generation"`
 }
 
 type daemonServer struct {
@@ -539,15 +552,6 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	if err != nil {
 		return err
 	}
-	if tx.Identity.Migration {
-		// This metadata replacement is the migration ownership cutover. It must
-		// precede the first target instruction: after it succeeds recovery only
-		// rolls forward on this node.
-		info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
-		if err != nil {
-			return err
-		}
-	}
 	if !paused && branch.State != "running" {
 		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
 			return fmt.Errorf("resuming distributed target: %w", err)
@@ -561,6 +565,13 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 		if err != nil {
 			return err
 		}
+	} else {
+		// A migration target is deliberately invisible until the source has
+		// committed the placement record. Starting any sidecars here would make
+		// them consult the still-source-owned placement and route back to the old
+		// node. Activate performs all externally visible publication work after
+		// that compare-and-swap succeeds.
+		return nil
 	}
 	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
 		return fmt.Errorf("starting distributed target console drain: %w", err)
@@ -577,9 +588,59 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 			return fmt.Errorf("starting distributed target exec console %q: %w", session.ID, err)
 		}
 	}
-	if tx.Identity.Migration {
-		if err := r.backend.ensurePublishedPortsForBranch(info, branch.ID); err != nil {
-			return fmt.Errorf("starting migrated published ports: %w", err)
+	r.monitorDependency(tx.Identity.TransactionID, info.ID)
+	return nil
+}
+
+func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transaction) error {
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	state, stateErr := r.backend.runtimeBranchLifecycle(info.ID, branch.ID)
+	if stateErr != nil {
+		return stateErr
+	}
+	if tx.DesiredPaused {
+		if state != "paused" {
+			return fmt.Errorf("distributed migration target is %q, want paused", state)
+		}
+	} else if state != "running" && state != "paused" {
+		return fmt.Errorf("distributed migration target is %q, want paused or running", state)
+	}
+	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+	if err != nil {
+		return fmt.Errorf("publishing distributed migration ownership: %w", err)
+	}
+	if !tx.DesiredPaused && state == "paused" {
+		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
+			return fmt.Errorf("resuming distributed migration target: %w", err)
+		}
+	}
+	targetState := "running"
+	if tx.DesiredPaused {
+		targetState = "paused"
+	}
+	if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, targetState); err != nil {
+		return err
+	}
+	if err := r.backend.ensurePublishedPortsForBranch(info, branch.ID); err != nil {
+		return fmt.Errorf("starting migrated published ports: %w", err)
+	}
+	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
+		return fmt.Errorf("starting migrated target console drain: %w", err)
+	}
+	sessions, err := r.backend.execSessions(selector{container: info.ID, branch: branch.ID})
+	if err != nil {
+		return fmt.Errorf("listing migrated target exec sessions: %w", err)
+	}
+	for _, session := range sessions {
+		if session.State != "running" {
+			continue
+		}
+		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, true); err != nil {
+			return fmt.Errorf("starting migrated target exec console %q: %w", session.ID, err)
 		}
 	}
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
@@ -633,9 +694,13 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			}
 		}
 		if peer {
-			_, _ = r.backend.command("timetravel", info.ID, "destroy", branch.ID)
+			if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
+				return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
+			}
 		} else {
-			_, _ = r.backend.command("delete", "--force", info.ID)
+			if _, deleteErr := r.backend.command("delete", "--force", info.ID); deleteErr != nil {
+				return fmt.Errorf("deleting canceled distributed target family %q: %w", info.ID, deleteErr)
+			}
 		}
 		if releaseErr := r.backend.releaseDistributedSparseRootTransaction(tx.Identity.TransactionID); releaseErr != nil {
 			return releaseErr
@@ -861,6 +926,12 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				return
 			}
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
+				continue
+			}
+			// Migration publication precedes the placement compare-and-swap. Do
+			// not let dependency completion race that cutover and advance the
+			// transaction before the target has become the authoritative owner.
+			if tx.Identity.Migration && !tx.Activated {
 				continue
 			}
 			targetBranch := tx.Identity.VisibleTargetBranch()
@@ -2428,7 +2499,19 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 	}
 	if s.distributedSource != nil && s.clusterCapabilities != nil {
-		owner, err := daemonCommandOwner(s.dataRoot, request.Args)
+		owner := ""
+		var err error
+		if len(request.PlacementClaims) == 0 {
+			owner, request.PlacementClaims, err = daemonCommandPlacement(s.dataRoot, request.Args)
+		} else {
+			for _, claim := range request.PlacementClaims {
+				if owner != "" && owner != claim.OwnerNode {
+					err = fmt.Errorf("routed command claims span cluster nodes %q and %q", owner, claim.OwnerNode)
+					break
+				}
+				owner = claim.OwnerNode
+			}
+		}
 		if err != nil {
 			writeError(err)
 			return
@@ -2547,6 +2630,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
+	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
+		unlock()
+		stdinReader.Close()
+		writeError(err)
+		return
+	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
 		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
 		if err != nil {
@@ -2571,6 +2660,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
+		if status == 0 {
+			if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
+				fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+			}
+		}
 		completed, err := completeDaemonMutation(opts.dataRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
 		if err != nil {
 			fmt.Fprintf(&mutationStderr, "ttcd: %v; command outcome is indeterminate\n", err)
@@ -2589,6 +2683,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
+	if status == 0 {
+		if err := backend.reconcilePlacementCatalog(); err != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+		}
+	}
 	unlock()
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
@@ -2839,6 +2938,7 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	// and target metadata ownership. Reconcile only after runtime/container
 	// state has been refreshed, and fail conservatively inside the helper.
 	_ = backend.reconcileClusterSparseMemoryRoots()
+	_ = backend.reconcilePlacementCatalog()
 	s.reconciled[key] = true
 }
 

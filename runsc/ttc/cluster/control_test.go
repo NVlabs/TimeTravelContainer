@@ -33,13 +33,15 @@ import (
 )
 
 type testTargetRuntime struct {
-	mu          sync.Mutex
-	prepared    int
-	published   int
-	drained     int
-	handedOff   int
-	canceled    int
-	independent int
+	mu            sync.Mutex
+	prepared      int
+	published     int
+	activated     int
+	publishPaused []bool
+	drained       int
+	handedOff     int
+	canceled      int
+	independent   int
 }
 
 func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error { return nil }
@@ -51,10 +53,18 @@ func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSession
 	return nil
 }
 
-func (r *testTargetRuntime) Publish(context.Context, *Transaction, bool) error {
+func (r *testTargetRuntime) Publish(_ context.Context, _ *Transaction, paused bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.published++
+	r.publishPaused = append(r.publishPaused, paused)
+	return nil
+}
+
+func (r *testTargetRuntime) Activate(context.Context, *Transaction) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.activated++
 	return nil
 }
 
@@ -277,9 +287,37 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if independent.Metrics == nil || independent.Metrics.PullRequests != 7 || independent.Metrics.TimeToIndependent <= 0 {
 		t.Fatalf("independent metrics=%+v", independent.Metrics)
 	}
+	migrationIdentity := testForkIdentity()
+	migrationIdentity.TransactionID = "tx-migration"
+	migrationIdentity.TargetContainer = migrationIdentity.SourceContainer
+	migrationIdentity.TargetBranch = "tx-migration"
+	migrationIdentity.TargetVisibleBranch = migrationIdentity.SourceBranch
+	migrationIdentity.Migration = true
+	migration, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: migrationIdentity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err = client.Prepare(context.Background(), migration.Identity.TransactionID, migration.Revision, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err = client.Publish(context.Background(), migration.Identity.TransactionID, migration.Revision, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migration.Activated || migration.DesiredPaused || migration.State != TransactionPublished {
+		t.Fatalf("migration publication=%+v, want paused cutover awaiting activation", migration)
+	}
+	migration, err = client.Activate(context.Background(), migration.Identity.TransactionID, migration.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migration.Activated {
+		t.Fatalf("activated migration=%+v", migration)
+	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.prepared != 1 || runtime.published != 1 || runtime.drained != 1 || runtime.independent != 1 {
+	if runtime.prepared != 2 || runtime.published != 2 || runtime.activated != 1 || runtime.drained != 1 || runtime.independent != 1 || len(runtime.publishPaused) != 2 || !runtime.publishPaused[0] || !runtime.publishPaused[1] {
 		t.Fatalf("runtime calls: %+v", runtime)
 	}
 }

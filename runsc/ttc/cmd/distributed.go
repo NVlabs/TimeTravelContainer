@@ -1328,6 +1328,15 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		}
 		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
 			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
+				if tx.Identity.Migration && tx.State == cluster.TransactionPublished && !tx.Activated {
+					if placements, openErr := cluster.OpenPlacementStore(filepath.Join(backend.dataRoot, "cluster", "placements")); openErr == nil {
+						if placement, lookupErr := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); lookupErr == nil &&
+							placement.OwnerNode == localNode && placement.LastOperationID == tx.Identity.TransactionID && placement.State != cluster.PlacementMigrating {
+							txCopy := tx
+							go recoverTargetMigrationActivation(targetRuntime, runtime.controlPlane, &txCopy)
+						}
+					}
+				}
 				if tx.State == cluster.TransactionPublished && tx.SparseHandoff != nil {
 					txCopy := tx
 					go recoverTargetSparseHandoff(targetRuntime, runtime.controlPlane, &txCopy)
@@ -1342,6 +1351,15 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		peer, err := runtime.source.peer(tx.Identity.TargetNodeID, false)
 		if err != nil {
 			continue
+		}
+		if tx.Identity.Migration && tx.State == cluster.TransactionPublished && !tx.Activated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			activated, activateErr := peer.Activate(ctx, tx.Identity.TransactionID, tx.Revision)
+			cancel()
+			if activateErr != nil || activated == nil || !activated.Activated {
+				continue
+			}
+			tx = *activated
 		}
 		monitorBackend := *backend
 		monitorBackend.stdin = strings.NewReader("")
@@ -1372,6 +1390,19 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				tx.Identity.SourceBranch, tx.Identity.TransactionID, nil)
 		}
 	}
+}
+
+func recoverTargetMigrationActivation(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
+	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.Activated || !tx.Identity.Migration {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	err := targetRuntime.Activate(ctx, tx)
+	cancel()
+	if err != nil {
+		return
+	}
+	_, _ = control.Store.MarkActivated(tx.Identity.TransactionID, tx.Revision, control.Now())
 }
 
 func recoverTargetSparseHandoff(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {

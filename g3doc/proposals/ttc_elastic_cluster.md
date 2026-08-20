@@ -62,10 +62,13 @@ newer process's lease.
 
 The first implementation stores node records atomically under
 `cluster/nodes/` in the shared root and locks each node record while changing
-it. This is sufficient for dynamic discovery and controlled NFS qualification.
-Branch ownership later moves behind a linearizable catalog interface;
-production multi-writer placement must not depend solely on cache-coherent NFS
-reads.
+it. Branch ownership uses a separate CAS-shaped `PlacementCatalog`. Its shared
+filesystem backend locks reads as well as writes, takes an exclusive catalog
+lock for a linearizable `List` snapshot, and uses a bounded set of record-lock
+shards so deleted branch names do not accumulate lock files. This backend
+requires coherent POSIX advisory locking from the shared filesystem (as in the
+qualified NFS setup). A consensus-backed service can replace it through the
+same interface when the storage environment cannot provide that guarantee.
 
 A branch placement record identifies the family, branch, owner node and
 incarnation, monotonically increasing ownership generation, lifecycle state,
@@ -104,9 +107,12 @@ and explicit diagnostics expose it.
 
 For mutating and streaming commands, the receiving daemon resolves branch
 placement and either executes locally or proxies to the owner. Proxy requests
-carry the original request ID, expected placement generation, terminal
-metadata, and framed stdin/stdout. The owner rejects a stale generation. Named
-exec sessions and retained output allow reconnection after migration.
+carry the original request ID, exact owner incarnation and placement generation,
+terminal metadata, and framed stdin/stdout. The owner revalidates every claim
+after taking its local lifecycle lock. A command observed during migration, or
+one delayed past cutover, is rejected for retry instead of reaching a stale
+Sentry. Named exec sessions and retained output allow reconnection after
+migration.
 
 Family-wide `stop`, `dehydrate`, and `rm` are coordinator operations. The entry
 daemon expands them into idempotent owner-local mutations before taking a
@@ -130,6 +136,12 @@ running or paused on A
 
 The destination first imports a temporary runtime identity. At cutover, the
 catalog transfers the visible branch and filesystem writer lease together.
+Target preparation and transaction publication leave the imported Kernel
+physically paused and absent from ordinary branch metadata. Only after the
+placement CAS succeeds does a separate idempotent activation publish the
+target owner, reconnect console and exec sidecars, recreate published ports,
+and resume a branch whose requested lifecycle was running. Dependency draining
+cannot advance before this activation marker.
 The source retains only immutable snapshot/page-server ownership needed by B;
 it may not resume or write the branch. Once B uses only shared chunks or local
 pages, the source snapshot is released.
@@ -225,6 +237,8 @@ unreferenced live filesystem writer.
 * Add advertised control endpoints and dynamic peer client construction.
 * Retain static peers as explicit overrides during transition.
 * Include remote-owned persistent families in list and inspect JSON.
+  Cataloged branch owners come from one locked catalog snapshot, so a
+  half-published target cannot leak into the unified view.
 * Report membership, compatibility, lease state, and actual memory usage.
 * Route new container admission to the compatible ready node with the lowest
   normalized current-plus-reserved memory load. **Implemented.** The selected

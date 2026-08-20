@@ -8802,6 +8802,41 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			Branches:         persistentBranches(container.Branches, container.NodeID),
 		}
 	}
+	// A single catalog snapshot is authoritative for branches that have entered
+	// elastic placement. Persistent container metadata remains the compatibility
+	// source for older/cold branches, but must not expose a half-published target
+	// during ownership cutover.
+	if b.nodeID != "" {
+		if placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements")); err == nil {
+			if records, err := placements.List(); err == nil {
+				for _, record := range records {
+					family, ok := byID[record.FamilyID]
+					if !ok || record.State == cluster.PlacementUnplaced {
+						continue
+					}
+					for i := range family.Branches {
+						if family.Branches[i].ID == record.BranchID {
+							family.Branches[i].NodeID = record.OwnerNode
+							break
+						}
+					}
+					owner := ""
+					for _, branch := range family.Branches {
+						if branch.NodeID == "" {
+							continue
+						}
+						if owner != "" && owner != branch.NodeID {
+							owner = ""
+							break
+						}
+						owner = branch.NodeID
+					}
+					family.NodeID = owner
+					byID[record.FamilyID] = family
+				}
+			}
+		}
+	}
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {

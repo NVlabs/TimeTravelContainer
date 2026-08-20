@@ -173,6 +173,21 @@ instead of silently becoming `main`. Family removal, daemon shutdown, and the
 smoke harness removed all Sentries, gofers, sockets, request state, and test
 directories.
 
+The same capacity-provider/drain smoke was then run with the complete shared
+data root on a loopback kernel NFSv3 mount (`hard`, TCP, 1 MiB reads/writes,
+`sync`, no root squashing). Both live sparse migrations, placement-generation
+fencing, catalog snapshot locks, provider retry, routed counters, and cleanup
+passed in 11.869 seconds. Removing the family reclaimed every placement JSON
+record; only the bounded catalog and two hash-shard lock files existed before
+the test mount and export were removed.
+
+A follow-up cutover-hardening run completed locally in 7.306 seconds. It
+verified that a prepared migration remains physically paused and hidden while
+placement still names the source, then publishes console/exec sidecars and
+resumes the target only after the ownership CAS. This run caught an attempted
+pre-cutover sidecar lookup that the new generation fence correctly rejected;
+moving sidecar activation behind the CAS removed the retry loop.
+
 Run it with:
 
 ```shell

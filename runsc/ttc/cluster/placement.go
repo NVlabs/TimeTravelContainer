@@ -103,6 +103,27 @@ type PlacementStore struct {
 	dir string
 }
 
+// PlacementCatalog is the linearizable ownership interface consumed by
+// routing and migration. PlacementStore is its shared-filesystem backend; a
+// replicated service can implement the same CAS contract without changing
+// callers.
+type PlacementCatalog interface {
+	Create(PlacementRecord, time.Time) (*PlacementRecord, error)
+	BeginMigration(family, branch, owner, incarnation string, generation uint64, operation, target string, now time.Time) (*PlacementRecord, error)
+	AdoptOwnerIncarnation(family, branch, owner, oldIncarnation, newIncarnation string, generation uint64, now time.Time) (*PlacementRecord, error)
+	RecoverSourceMigration(family, branch, operation, owner, oldIncarnation, newIncarnation string, generation uint64, now time.Time) (*PlacementRecord, error)
+	CommitMigration(family, branch, operation, target, targetIncarnation, physicalContainer, physicalBranch string, now time.Time) (*PlacementRecord, error)
+	AbortMigration(family, branch, operation string, now time.Time) (*PlacementRecord, error)
+	Unplace(family, branch, owner, incarnation string, generation uint64, now time.Time) (*PlacementRecord, error)
+	ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
+	UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
+	Remove(family, branch string, generation uint64) error
+	Lookup(family, branch string) (*PlacementRecord, error)
+	List() ([]PlacementRecord, error)
+}
+
+var _ PlacementCatalog = (*PlacementStore)(nil)
+
 func OpenPlacementStore(dir string) (*PlacementStore, error) {
 	if dir == "" {
 		return nil, errors.New("placement directory is empty")
@@ -121,21 +142,66 @@ func placementKey(family, branch string) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func (s *PlacementStore) withRecordLock(family, branch string, fn func() error) error {
-	key, err := placementKey(family, branch)
-	if err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(s.dir, key+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+func (s *PlacementStore) recordLockPath(key string) string {
+	// A fixed shard set keeps placement metadata bounded when a long-lived
+	// family creates and removes many branch names. The catalog lock protects
+	// snapshots; collisions here merely serialize unrelated branch mutations.
+	return filepath.Join(s.dir, ".record-"+key[:2]+".lock")
+}
+
+func (s *PlacementStore) withCatalogLock(exclusive bool, fn func() error) error {
+	lock, err := os.OpenFile(filepath.Join(s.dir, ".catalog.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	operation := syscall.LOCK_SH
+	if exclusive {
+		operation = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(lock.Fd()), operation); err != nil {
 		return err
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	return fn()
+}
+
+func (s *PlacementStore) withRecordLock(family, branch string, fn func() error) error {
+	return s.withCatalogLock(false, func() error {
+		key, err := placementKey(family, branch)
+		if err != nil {
+			return err
+		}
+		lock, err := os.OpenFile(s.recordLockPath(key), os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+			return err
+		}
+		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		return fn()
+	})
+}
+
+func (s *PlacementStore) withRecordReadLock(family, branch string, fn func() error) error {
+	return s.withCatalogLock(false, func() error {
+		key, err := placementKey(family, branch)
+		if err != nil {
+			return err
+		}
+		lock, err := os.OpenFile(s.recordLockPath(key), os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_SH); err != nil {
+			return err
+		}
+		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		return fn()
+	})
 }
 
 // Create installs an initial placement if the logical branch is absent.
@@ -423,8 +489,78 @@ func (s *PlacementStore) ClaimUnplaced(family, branch, owner, incarnation, physi
 	return &result, nil
 }
 
+// UpdateStableState changes running/paused lifecycle while invalidating routed
+// commands that observed the previous state. Ownership itself is unchanged.
+func (s *PlacementStore) UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error) {
+	if state != PlacementRunning && state != PlacementPaused {
+		return nil, fmt.Errorf("invalid stable placement state %q", state)
+	}
+	var result PlacementRecord
+	err := s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if record.State == state && record.OwnerNode == owner && record.OwnerIncarnation == incarnation {
+			result = record
+			return nil
+		}
+		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != incarnation ||
+			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			return errors.New("stale or non-stable placement cannot change lifecycle")
+		}
+		record.State = state
+		record.Generation++
+		record.Revision++
+		record.UpdatedAt = now
+		if err := record.validate(); err != nil {
+			return err
+		}
+		if err := s.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Remove reclaims a placement whose logical branch no longer exists. A
+// migration record is never removable: its operation must first commit or
+// abort so cleanup cannot erase a live ownership decision.
+func (s *PlacementStore) Remove(family, branch string, generation uint64) error {
+	return s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if record.Generation != generation || record.State == PlacementMigrating {
+			return errors.New("stale or migrating placement cannot be removed")
+		}
+		key, err := placementKey(family, branch)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(s.dir, key+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDirectory(s.dir)
+	})
+}
+
 func (s *PlacementStore) Lookup(family, branch string) (*PlacementRecord, error) {
-	record, err := s.load(family, branch)
+	var record PlacementRecord
+	err := s.withRecordReadLock(family, branch, func() error {
+		var err error
+		record, err = s.load(family, branch)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -432,12 +568,30 @@ func (s *PlacementStore) Lookup(family, branch string) (*PlacementRecord, error)
 }
 
 func (s *PlacementStore) List() ([]PlacementRecord, error) {
+	var result []PlacementRecord
+	err := s.withCatalogLock(true, func() error {
+		var err error
+		result, err = s.listUnlocked()
+		return err
+	})
+	return result, err
+}
+
+func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]PlacementRecord, 0, len(entries))
+	removedLegacyLocks := false
 	for _, entry := range entries {
+		if isLegacyPlacementLock(entry.Name()) {
+			if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+			removedLegacyLocks = true
+			continue
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
@@ -461,7 +615,20 @@ func (s *PlacementStore) List() ([]PlacementRecord, error) {
 		}
 		return result[i].BranchID < result[j].BranchID
 	})
+	if removedLegacyLocks {
+		if err := syncDirectory(s.dir); err != nil {
+			return nil, err
+		}
+	}
 	return result, nil
+}
+
+func isLegacyPlacementLock(name string) bool {
+	if len(name) != sha256.Size*2+len(".lock") || !strings.HasSuffix(name, ".lock") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimSuffix(name, ".lock"))
+	return err == nil
 }
 
 func (s *PlacementStore) load(family, branch string) (PlacementRecord, error) {

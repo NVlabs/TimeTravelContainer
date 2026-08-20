@@ -261,6 +261,7 @@ type TargetRuntime interface {
 	Reserve(context.Context, *Transaction) error
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
 	Publish(context.Context, *Transaction, bool) error
+	Activate(context.Context, *Transaction) error
 	Drain(context.Context, *Transaction) error
 	Handoff(context.Context, *Transaction, SparseHandoffDescriptor) error
 	Cancel(context.Context, *Transaction) error
@@ -341,6 +342,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 2 && parts[1] == "publish" && r.Method == http.MethodPost {
 		c.publish(w, r, id, peer)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "activate" && r.Method == http.MethodPost {
+		c.activate(w, r, id, peer)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "independent" && r.Method == http.MethodPost {
@@ -547,11 +552,56 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionTargetPaused, request.Revision))
 		return
 	}
-	if err := c.TargetRuntime.Publish(r.Context(), tx, request.Paused); err != nil {
+	runtimePaused := request.Paused
+	if tx.Identity.Migration {
+		runtimePaused = true
+	}
+	if err := c.TargetRuntime.Publish(r.Context(), tx, runtimePaused); err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
-	tx, err = c.Store.Advance(id, tx.Revision, TransactionPublished, "", c.Now())
+	tx, err = c.Store.Publish(id, tx.Revision, request.Paused, !tx.Identity.Migration, c.Now())
+	if err != nil {
+		writeControlError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeControlJSON(w, http.StatusOK, tx)
+}
+
+func (c *ControlPlane) activate(w http.ResponseWriter, r *http.Request, id, peer string) {
+	unlock := c.lockTransaction(id)
+	defer unlock()
+	if c.TargetRuntime == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
+		return
+	}
+	tx, err := c.Store.Load(id)
+	if err != nil {
+		writeControlError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if peer != tx.Identity.SourceNodeID {
+		writeControlError(w, http.StatusForbidden, "only the source node may activate the target")
+		return
+	}
+	var request RevisionRequest
+	if err := decodeControlJSON(r.Body, &request); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if tx.Activated {
+		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
+	if tx.State != TransactionPublished || tx.Revision != request.Revision || !tx.Identity.Migration {
+		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is not an activatable published migration at revision %d", request.Revision))
+		return
+	}
+	if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	tx, err = c.Store.MarkActivated(id, tx.Revision, c.Now())
 	if err != nil {
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -589,6 +639,10 @@ func (c *ControlPlane) handoff(w http.ResponseWriter, r *http.Request, id, peer 
 	}
 	if peer != tx.Identity.SourceNodeID {
 		writeControlError(w, http.StatusForbidden, "only the source node may hand off target memory")
+		return
+	}
+	if tx.Identity.Migration && !tx.Activated {
+		writeControlError(w, http.StatusConflict, "migration target is not activated after placement cutover")
 		return
 	}
 	var request HandoffRequest
@@ -869,6 +923,18 @@ func (c *Client) Publish(ctx context.Context, id string, revision uint64, paused
 	}
 	var tx Transaction
 	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/publish", PublishRequest{Revision: revision, Paused: paused}, &tx); err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+// Activate resumes a migration target after placement ownership has moved.
+func (c *Client) Activate(ctx context.Context, id string, revision uint64) (*Transaction, error) {
+	if !transactionIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid transaction ID %q", id)
+	}
+	var tx Transaction
+	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/activate", RevisionRequest{Revision: revision}, &tx); err != nil {
 		return nil, err
 	}
 	return &tx, nil

@@ -15,10 +15,116 @@
 package cluster
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenPlacementStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(800, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := store.UpdateStableState("family", "main", "node-a", "boot-a", created.Generation, PlacementPaused, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.Generation != created.Generation+1 || paused.State != PlacementPaused {
+		t.Fatalf("paused placement=%+v", paused)
+	}
+	if err := store.Remove("family", "main", created.Generation); err == nil {
+		t.Fatal("stale generation removed placement")
+	}
+	if err := store.Remove("family", "main", paused.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Lookup("family", "main"); !os.IsNotExist(err) {
+		t.Fatalf("removed placement lookup error=%v, want not exist", err)
+	}
+	legacy := strings.Repeat("a", 64) + ".lock"
+	if err := os.WriteFile(filepath.Join(root, legacy), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 32; i++ {
+		branch := fmt.Sprintf("branch-%d", i)
+		record, err := store.Create(PlacementRecord{
+			FamilyID: "family", BranchID: branch, PhysicalContainer: "family", PhysicalBranch: branch,
+			OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+		}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Remove("family", branch, record.Generation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if records, err := store.List(); err != nil || len(records) != 0 {
+		t.Fatalf("records after removal=%+v err=%v", records, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if isLegacyPlacementLock(entry.Name()) {
+			t.Fatalf("unbounded legacy record lock remains: %s", entry.Name())
+		}
+	}
+}
+
+func TestPlacementCatalogLocksReadsAgainstSnapshotWriter(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, time.Unix(900, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- store.withCatalogLock(true, func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+	lookupDone := make(chan error, 1)
+	go func() {
+		_, err := store.Lookup("family", "main")
+		lookupDone <- err
+	}()
+	select {
+	case err := <-lookupDone:
+		t.Fatalf("lookup escaped an exclusive catalog snapshot lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-lockDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-lookupDone; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestPlacementMigrationFencesConcurrentCutovers(t *testing.T) {
 	store, err := OpenPlacementStore(t.TempDir())

@@ -119,6 +119,76 @@ func (s *Store) AdvanceIndependent(id string, revision uint64, metrics TransferM
 	return s.advance(id, revision, TransactionIndependent, "", &metrics, now)
 }
 
+// Publish records the externally requested target state and whether the
+// runtime has already reached it. Migration may publish a physically paused
+// target with activated=false, perform ownership CAS, and activate afterward.
+func (s *Store) Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error) {
+	path, err := s.path(id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := loadTransaction(path, id)
+	if err != nil {
+		return nil, err
+	}
+	if tx.State == TransactionPublished {
+		if tx.DesiredPaused != desiredPaused || tx.Activated != activated {
+			return nil, errors.New("idempotent publication changed activation state")
+		}
+		return tx, nil
+	}
+	if tx.Revision != revision || tx.State != TransactionTargetPaused {
+		return nil, fmt.Errorf("transaction %q is %s revision %d, not target-paused revision %d", id, tx.State, tx.Revision, revision)
+	}
+	if err := tx.Advance(TransactionPublished, "", now); err != nil {
+		return nil, err
+	}
+	tx.DesiredPaused = desiredPaused
+	tx.Activated = activated
+	data, err := marshalTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.replace(path, data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// MarkActivated durably records that a migrated target reached its requested
+// running state after ownership CAS.
+func (s *Store) MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error) {
+	path, err := s.path(id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := loadTransaction(path, id)
+	if err != nil {
+		return nil, err
+	}
+	if tx.Activated {
+		return tx, nil
+	}
+	if tx.Revision != revision || tx.State != TransactionPublished || !tx.Identity.Migration {
+		return nil, fmt.Errorf("transaction %q cannot activate from %s revision %d", id, tx.State, tx.Revision)
+	}
+	tx.Activated = true
+	tx.Revision++
+	tx.UpdatedAt = now
+	data, err := marshalTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.replace(path, data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
 func (s *Store) advance(id string, revision uint64, next TransactionState, failure string, metrics *TransferMetrics, now time.Time) (*Transaction, error) {
 	path, err := s.path(id)
 	if err != nil {

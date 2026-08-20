@@ -308,8 +308,13 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func daemonCommandOwner(dataRoot string, args []string) (string, error) {
+	owner, _, err := daemonCommandPlacement(dataRoot, args)
+	return owner, err
+}
+
+func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPlacementClaim, error) {
 	if dataRoot == "" {
-		return "", nil
+		return "", nil, nil
 	}
 	// Route node-wide mutations before taking the receiving daemon's local
 	// lifecycle lock. Otherwise an arbitrary entry node can hold its lock while
@@ -328,11 +333,17 @@ func daemonCommandOwner(dataRoot string, args []string) (string, error) {
 			}
 		}
 		if len(positional) == 1 {
-			return positional[0], nil
+			return positional[0], nil, nil
 		}
 	}
 	store := ttcbundle.Store{Root: dataRoot}
+	placements, placementErr := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
+	if placementErr != nil {
+		return "", nil, placementErr
+	}
 	owner := ""
+	var claims []daemonPlacementClaim
+	seen := make(map[string]struct{})
 	for _, arg := range args[1:] {
 		candidate := arg
 		if colon := strings.IndexByte(candidate, ':'); colon >= 0 {
@@ -350,16 +361,150 @@ func daemonCommandOwner(dataRoot string, args []string) (string, error) {
 		if err != nil {
 			continue
 		}
-		branchOwner := info.BranchNodeID(selected.branch)
+		branchOwner := ""
+		placement, err := placements.Lookup(info.ID, selected.branch)
+		switch {
+		case err == nil:
+			if placement.State == cluster.PlacementMigrating {
+				return "", nil, fmt.Errorf("branch %s is migrating from %q to %q; retry after cutover", selected, placement.OwnerNode, placement.TargetNode)
+			}
+			if placement.State != cluster.PlacementUnplaced {
+				branchOwner = placement.OwnerNode
+				key := placement.FamilyID + "\x00" + placement.BranchID
+				if _, ok := seen[key]; !ok {
+					claims = append(claims, daemonPlacementClaim{
+						FamilyID: placement.FamilyID, BranchID: placement.BranchID,
+						OwnerNode: placement.OwnerNode, OwnerIncarnation: placement.OwnerIncarnation,
+						Generation: placement.Generation,
+					})
+					seen[key] = struct{}{}
+				}
+			}
+		case errors.Is(err, os.ErrNotExist):
+			// Legacy families acquire a placement record lazily at their first
+			// migration. Until then persistent branch ownership remains the
+			// compatibility routing source.
+			branchOwner = info.BranchNodeID(selected.branch)
+		default:
+			return "", nil, fmt.Errorf("resolving placement for %s: %w", selected, err)
+		}
 		if branchOwner == "" {
 			continue
 		}
 		if owner != "" && owner != branchOwner {
-			return "", fmt.Errorf("command spans cluster nodes %q and %q", owner, branchOwner)
+			return "", nil, fmt.Errorf("command spans cluster nodes %q and %q", owner, branchOwner)
 		}
 		owner = branchOwner
 	}
-	return owner, nil
+	return owner, claims, nil
+}
+
+func validateDaemonPlacementClaims(dataRoot, localNode string, claims []daemonPlacementClaim) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
+	if err != nil {
+		return err
+	}
+	for _, claim := range claims {
+		record, err := placements.Lookup(claim.FamilyID, claim.BranchID)
+		if err != nil {
+			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, err)
+		}
+		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused {
+			return fmt.Errorf("stale routed command: branch %s@%s is %s", claim.FamilyID, claim.BranchID, record.State)
+		}
+		if record.OwnerNode != localNode || record.OwnerNode != claim.OwnerNode || record.OwnerIncarnation != claim.OwnerIncarnation || record.Generation != claim.Generation {
+			return fmt.Errorf("stale routed command: branch %s@%s placement changed from %s/%s generation %d to %s/%s generation %d",
+				claim.FamilyID, claim.BranchID, claim.OwnerNode, claim.OwnerIncarnation, claim.Generation,
+				record.OwnerNode, record.OwnerIncarnation, record.Generation)
+		}
+	}
+	return nil
+}
+
+// reconcilePlacementCatalog enrolls every locally owned live branch in the
+// generation-fenced catalog and advances lifecycle generations after a local
+// pause/resume. Cold branches retain their last owner for compatibility until
+// an explicit drain or rehydration transaction claims them. Records for
+// deleted locally owned branches are reclaimed.
+func (b *runtimeBackend) reconcilePlacementCatalog() error {
+	if b == nil || b.dataRoot == "" || b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
+		return nil
+	}
+	current, err := b.distributedSource.directory.Lookup(b.nodeID)
+	if err != nil {
+		return err
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	if err != nil {
+		return err
+	}
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return err
+	}
+	known := make(map[string]struct{})
+	var result error
+	now := time.Now()
+	for _, info := range containers {
+		for _, branch := range info.Branches {
+			key := info.ID + "\x00" + branch.ID
+			known[key] = struct{}{}
+			owner := info.BranchNodeID(branch.ID)
+			state := cluster.PlacementState(normalizeLifecycleState(branch.State))
+			if owner != b.nodeID || (state != cluster.PlacementRunning && state != cluster.PlacementPaused) {
+				continue
+			}
+			record, lookupErr := placements.Lookup(info.ID, branch.ID)
+			if errors.Is(lookupErr, os.ErrNotExist) {
+				_, createErr := placements.Create(cluster.PlacementRecord{
+					FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
+				}, now)
+				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
+					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
+				}
+				continue
+			}
+			if lookupErr != nil {
+				result = errors.Join(result, lookupErr)
+				continue
+			}
+			if record.State == cluster.PlacementMigrating || record.OwnerNode != b.nodeID {
+				continue
+			}
+			if record.OwnerIncarnation != current.Incarnation {
+				record, err = placements.AdoptOwnerIncarnation(info.ID, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
+				if err != nil {
+					result = errors.Join(result, fmt.Errorf("adopting placement for %s@%s: %w", info.ID, branch.ID, err))
+					continue
+				}
+			}
+			if record.State != state {
+				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
+					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
+				}
+			}
+		}
+	}
+	records, err := placements.List()
+	if err != nil {
+		return errors.Join(result, err)
+	}
+	for _, record := range records {
+		if _, ok := known[record.FamilyID+"\x00"+record.BranchID]; ok || record.State == cluster.PlacementMigrating {
+			continue
+		}
+		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+			continue
+		}
+		if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
+			result = errors.Join(result, fmt.Errorf("removing stale placement %s@%s: %w", record.FamilyID, record.BranchID, err))
+		}
+	}
+	return result
 }
 
 func daemonCommandNeedsPlacementAdmission(args []string) bool {
@@ -482,8 +627,9 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	}
 	store := ttcbundle.Store{Root: s.dataRoot}
 	type child struct {
-		node string
-		args []string
+		node   string
+		args   []string
+		claims []daemonPlacementClaim
 	}
 	var children []child
 	for _, operand := range mutation.targets {
@@ -551,10 +697,18 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
+		if owner, claims, err := daemonCommandPlacement(s.dataRoot, child.args); err != nil {
+			return true, 1, nil, diagnostic.Bytes(), err
+		} else {
+			if owner != "" {
+				child.node = owner
+			}
+			child.claims = claims
+		}
 		childRequest := daemonRequest{
 			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, i, child.args),
 			Options: request.Options, Args: child.args, ClientTERM: request.ClientTERM,
-			DistributedLeaf: true,
+			DistributedLeaf: true, PlacementClaims: child.claims,
 		}
 		var status int
 		var stdout, stderr string
@@ -595,6 +749,9 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	defer unlock()
+	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
+		return 1, stdout.String(), stderr.String(), err
+	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
 		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
 		if err != nil {
@@ -605,6 +762,11 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 		}
 		status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
+		if status == 0 {
+			if err := backend.reconcilePlacementCatalog(); err != nil {
+				fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+			}
+		}
 		record, err = completeDaemonMutation(opts.dataRoot, record, status, stdout.Bytes(), stderr.Bytes())
 		if err != nil {
 			return 1, stdout.String(), stderr.String(), err
@@ -613,6 +775,11 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	}
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
+	if status == 0 {
+		if err := backend.reconcilePlacementCatalog(); err != nil {
+			fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+		}
+	}
 	return status, stdout.String(), stderr.String(), nil
 }
 
@@ -770,15 +937,30 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		if published {
 			return cause
 		}
-		relay.Close()
+		if relay != nil {
+			relay.Close()
+		}
+		// Tear down the source-side capture before canceling the target. Target
+		// cancellation closes the dependency connection and may otherwise make
+		// the capture session disappear before distributed-cancel can restore
+		// its bookkeeping. The target is still physically paused and placement
+		// remains fenced, so resuming the authoritative source first is safe.
+		restoreErr := restoreSource()
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		var cancelErr error
 		if current, statusErr := peer.Status(cleanupCtx, requestID); statusErr == nil {
-			_, _ = peer.Cancel(cleanupCtx, requestID, current.Revision)
+			_, cancelErr = peer.Cancel(cleanupCtx, requestID, current.Revision)
 		} else {
-			_, _ = peer.Cancel(cleanupCtx, requestID, tx.Revision)
+			_, cancelErr = peer.Cancel(cleanupCtx, requestID, tx.Revision)
 		}
 		cleanupCancel()
-		restoreErr := restoreSource()
+		if cancelErr != nil {
+			// Keep the placement intent fenced. Startup/background recovery can
+			// retry this exact transaction; publishing a stable source placement
+			// while an unpublished target runtime survived would allow the next
+			// attempt to collide with it.
+			return fmt.Errorf("%w; restoring sparse migration source: %v; canceling sparse migration target: %v", cause, restoreErr, cancelErr)
+		}
 		if _, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now()); abortErr != nil {
 			return fmt.Errorf("%w; restoring sparse migration source: %v; aborting placement: %v", cause, restoreErr, abortErr)
 		}
@@ -845,9 +1027,17 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		}
 		tx = status
 	}
-	published = true
 	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
-		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
+		return abort(fmt.Errorf("publishing migration placement: %w", err))
+	}
+	published = true
+	tx, err = peer.Activate(ctx, requestID, tx.Revision)
+	if err != nil {
+		status, statusErr := peer.Status(ctx, requestID)
+		if statusErr != nil || !status.Activated {
+			return fmt.Errorf("placement moved to %q but target activation is pending recovery: %w", targetNode, err)
+		}
+		tx = status
 	}
 	monitorBackend := *b
 	monitorBackend.stdin = strings.NewReader("")
