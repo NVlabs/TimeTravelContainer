@@ -16,6 +16,9 @@ links below to see detailed instructions for each of them:
 *   [TimeTravelContainer](./user_guide/timetravelcontainer.md): Build and use
     the rootless TTC runtime, including live fork, dehydration, and remote
     branches.
+    The [elastic cluster proposal](./proposals/ttc_elastic_cluster.md) covers
+    dynamic membership, transparent migration, draining, and memory-aware
+    placement.
 *   [Docker](./user_guide/quick_start/docker.md): The quickest and easiest way
     to get started.
 *   [Kubernetes](./user_guide/quick_start/kubernetes.md): Isolate Pods in your

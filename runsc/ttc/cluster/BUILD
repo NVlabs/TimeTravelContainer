@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "capabilities.go",
         "control.go",
+        "registry.go",
         "store.go",
         "transaction.go",
     ],
@@ -23,6 +24,7 @@ go_test(
     srcs = [
         "cluster_test.go",
         "control_test.go",
+        "registry_test.go",
     ],
     library = ":cluster",
     deps = ["//pkg/ttcremote"],
