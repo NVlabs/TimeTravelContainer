@@ -145,12 +145,15 @@ maintains one page cache per FUSE inode, writes dirty shared pages back through
 the FUSE protocol on `msync`, `fsync`, and close, and preserves both dirty state
 and 4 KiB CoW sharing between forked branches and dehydration cycles.
 
-Mounting requires `CAP_SYS_ADMIN` in the guest mount namespace. TTC does not
-grant that capability by default, so a container intended to mount FUSE should
-be created with `--cap-add SYS_ADMIN`. This is a capability interpreted by the
-Sentry's virtual kernel; neither `ttcd` nor the container needs host root.
-Guest UID 0 without this capability is not sufficient. AppImages may
-additionally require the image's `fuse3` or `fuse` package for `fusermount`:
+On a normal Linux host, an AppImage user does not need `CAP_SYS_ADMIN` or root:
+the setuid `fusermount` helper performs the privileged FUSE mount after applying
+its safety checks. TTC does not yet reproduce that narrow helper privilege.
+Because `CAP_SYS_ADMIN` is absent from the container's default capability
+bounding set, a guest `fusermount` helper cannot acquire it; TTC currently needs
+the explicit `--cap-add SYS_ADMIN` workaround below. This is a TTC compatibility
+limitation, not an inherent AppImage requirement. The capability is interpreted
+by the Sentry's virtual kernel, so neither `ttcd` nor the container needs host
+root. AppImages may additionally require the image's `fuse3` or `fuse` package:
 
 ```console
 $ ttc run -d --cap-add SYS_ADMIN --name app ubuntu:24.04 sleep infinity
