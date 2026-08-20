@@ -174,6 +174,19 @@ type connection struct {
 	// +checklocks:mu
 	connInitSuccess bool
 
+	// noAccess is set after a FUSE server rejects FUSE_ACCESS with ENOSYS.
+	// Linux treats this as an indication that the operation is unsupported and
+	// permits subsequent accesses without asking the server again.
+	//
+	// +checklocks:mu
+	noAccess bool
+
+	// noFlush is set after a FUSE server rejects FUSE_FLUSH with ENOSYS.
+	// Linux treats this as successful close and suppresses future requests.
+	//
+	// +checklocks:mu
+	noFlush bool
+
 	// aborted via sysfs, and will send ECONNABORTED to read after disconnection (instead of ENODEV).
 	// Set only if abortErr is true and via fuse control fs (not yet implemented).
 	// TODO(gvisor.dev/issue/3525): set this to true when user aborts.

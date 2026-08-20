@@ -162,6 +162,8 @@ TTC includes:
   published TCP ports, and configurable IP and MAC addresses.
 - Read-only host mounts, branch-private writable views of host paths, tmpfs,
   and managed persistent volumes.
+- In-sandbox FUSE filesystems, including executable private mappings used by
+  AppImages; the FUSE daemon, mount, and cached pages remain forkable.
 - Optional multi-node live fork using authenticated TTC peers, a shared TTC
   data root, common image content, and a page-transfer network.
 

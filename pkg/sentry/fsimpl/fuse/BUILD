@@ -96,6 +96,8 @@ go_library(
         "//pkg/sentry/kernel/pipe",
         "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/syserr",

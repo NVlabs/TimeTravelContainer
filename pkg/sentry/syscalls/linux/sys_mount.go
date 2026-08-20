@@ -149,7 +149,7 @@ func Mount(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 	if err != nil {
 		return 0, nil, err
 	}
-	if t.Kernel().LiveForkEligible && (fsType == "fuse" || fsType == "sysfs" && !opts.ReadOnly) {
+	if t.Kernel().LiveForkEligible && fsType == "sysfs" && !opts.ReadOnly {
 		return 0, nil, linuxerr.EOPNOTSUPP
 	}
 	_, err = t.Kernel().VFS().MountAt(t, creds, source, &target.pop, fsType, &opts)

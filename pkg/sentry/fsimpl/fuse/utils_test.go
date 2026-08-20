@@ -94,3 +94,26 @@ func newTestFilesystem(system *testutil.System, fd *vfs.FileDescription, maxActi
 	}
 	return fs, nil
 }
+
+func TestStatFromFUSEAttrReportsRequestedType(t *testing.T) {
+	stat := statFromFUSEAttr(linux.FUSEAttr{Mode: uint32(linux.ModeRegular | 0755)}, linux.STATX_TYPE, 1)
+	if stat.Mask&linux.STATX_TYPE == 0 {
+		t.Fatalf("stat mask %#x does not report STATX_TYPE", stat.Mask)
+	}
+	if got := linux.FileMode(stat.Mode).FileType(); got != linux.ModeRegular {
+		t.Fatalf("file type %v, want regular", got)
+	}
+}
+
+func TestLiveForkFilesystemEligibilityDistinguishesTransport(t *testing.T) {
+	conn := &connection{}
+	conn.fuseConn = &deviceConn{conn: conn}
+	fs := filesystem{conn: conn}
+	if got := fs.LiveForkFilesystemEligibility().Decision; got != vfs.LiveForkFilesystemClone {
+		t.Fatalf("in-sandbox FUSE decision %q, want clone", got)
+	}
+	conn.fuseConn = &hostConnection{}
+	if got := fs.LiveForkFilesystemEligibility().Decision; got != vfs.LiveForkFilesystemReject {
+		t.Fatalf("external FUSE decision %q, want reject", got)
+	}
+}

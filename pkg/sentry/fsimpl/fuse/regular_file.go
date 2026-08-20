@@ -15,6 +15,7 @@
 package fuse
 
 import (
+	goContext "context"
 	"io"
 	"math"
 	"sync"
@@ -22,8 +23,12 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -55,6 +60,28 @@ type regularFileFD struct {
 	//
 	// Protected by dataMu.
 	data fsutil.FileRangeSet
+}
+
+// afterLoad is invoked by stateify.
+func (fd *regularFileFD) afterLoad(ctx goContext.Context) {
+	if err := fsutil.RelocateFileRangeSet(ctx, fd.inode().fs.mf, &fd.data); err != nil {
+		panic("relocating FUSE mmap cache: " + err.Error())
+	}
+	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		return
+	}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for seg := fd.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		pgalloc.AcquireRestoreRef(ctx, fd.inode().fs.mf, seg.FileRange(), memCgID)
+	}
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *regularFileFD) Release(ctx context.Context) {
+	fd.dataMu.Lock()
+	fd.data.DropAll(fd.inode().fs.mf)
+	fd.dataMu.Unlock()
+	fd.fileDescription.Release(ctx)
 }
 
 // Seek implements vfs.FileDescriptionImpl.Allocate.
@@ -264,6 +291,21 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 	src = src.TakeFirst64(limit)
 
+	// FUSE does not currently support server-driven page-cache invalidation.
+	// Keep mmap coherent with writes performed through this Sentry by removing
+	// affected translations and cached pages before issuing FUSE_WRITE.
+	pgstart := hostarch.PageRoundDown(uint64(offset))
+	pgend, ok := hostarch.PageRoundUp(uint64(offset) + uint64(src.NumBytes()))
+	if !ok {
+		return 0, offset, linuxerr.EINVAL
+	}
+	fd.mapsMu.Lock()
+	fd.mappings.Invalidate(memmap.MappableRange{Start: pgstart, End: uint64(pgend)}, memmap.InvalidateOpts{})
+	fd.mapsMu.Unlock()
+	fd.dataMu.Lock()
+	fd.data.Drop(memmap.MappableRange{Start: pgstart, End: uint64(pgend)}, inode.fs.mf)
+	fd.dataMu.Unlock()
+
 	n, offset, err := inode.fs.Write(ctx, fd, offset, src)
 	if n == 0 {
 		// We have checked srclen != 0 previously.
@@ -284,5 +326,135 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	return linuxerr.ENOSYS
+	// Writable shared mappings need FUSE writeback-cache and invalidation
+	// support. Private executable/writable mappings (the AppImage use case) and
+	// read-only shared mappings are backed by Sentry-owned cached pages.
+	if !opts.Private && opts.MaxPerms.Write {
+		return linuxerr.EOPNOTSUPP
+	}
+	opts.SentryOwnedContent = true
+	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+}
+
+// ValidateLiveForkMapping implements memmap.LiveForkMappingValidator.
+func (fd *regularFileFD) ValidateLiveForkMapping() error {
+	if _, ok := fd.inode().fs.conn.fuseConn.(*deviceConn); !ok {
+		return linuxerr.EOPNOTSUPP
+	}
+	return nil
+}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mapsMu.Lock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *regularFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mapsMu.Lock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.mapsMu.Unlock()
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *regularFileFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// Translate implements memmap.Mappable.Translate.
+func (fd *regularFileFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
+
+	pgend, _ := hostarch.PageRoundUp(inode.size.Load())
+	var beyondEOF bool
+	if required.End > uint64(pgend) {
+		if required.Start >= uint64(pgend) {
+			return nil, &memmap.BusError{Err: io.EOF}
+		}
+		beyondEOF = true
+		required.End = uint64(pgend)
+	}
+	if optional.End > uint64(pgend) {
+		optional.End = uint64(pgend)
+	}
+	// Bound one fault's FUSE traffic. This is large enough for executable
+	// readahead while avoiding an unbounded pause behind a userspace daemon.
+	const maxReadahead = 64 << 10
+	if optional.End-required.Start > maxReadahead {
+		optional.End = required.Start + maxReadahead
+	}
+
+	fd.dataMu.Lock()
+	defer fd.dataMu.Unlock()
+	_, fillErr := fd.data.Fill(ctx, required, optional, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, fd.readToBlocksAt)
+
+	var translations []memmap.Translation
+	var translatedEnd uint64
+	for seg := fd.data.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg, _ = seg.NextNonEmpty() {
+		mr := seg.Range().Intersect(optional)
+		translations = append(translations, memmap.Translation{
+			Source: mr,
+			File:   inode.fs.mf,
+			Offset: seg.FileRangeOf(mr).Start,
+			Perms:  hostarch.AnyAccess,
+		})
+		translatedEnd = mr.End
+	}
+	if translatedEnd < required.End && fillErr != nil {
+		return translations, &memmap.BusError{Err: fillErr}
+	}
+	if beyondEOF {
+		return translations, &memmap.BusError{Err: io.EOF}
+	}
+	return translations, nil
+}
+
+// readToBlocksAt fills MemoryFile pages from FUSE_READ responses.
+// inode.attrMu is held by Translate.
+func (fd *regularFileFD) readToBlocksAt(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error) {
+	if dsts.NumBytes() > math.MaxUint32 {
+		return 0, linuxerr.EINVAL
+	}
+	buffers, n, err := fd.inode().fs.ReadInPages(ctx, fd, offset, uint32(dsts.NumBytes()))
+	if n == 0 {
+		return 0, err
+	}
+	var copied uint64
+	for _, buffer := range buffers {
+		want := uint64(len(buffer))
+		if want > dsts.NumBytes()-copied {
+			want = dsts.NumBytes() - copied
+		}
+		n, copyErr := safemem.CopySeq(dsts.DropFirst64(copied).TakeFirst64(want), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buffer[:want])))
+		copied += n
+		if copyErr != nil || copied == dsts.NumBytes() {
+			return copied, copyErr
+		}
+	}
+	if copied < dsts.NumBytes() && err == nil {
+		err = io.EOF
+	}
+	return copied, err
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. FUSE
+// cached pages can always be reconstructed by the cloned in-sandbox daemon;
+// private PMAs remain intact because InvalidatePrivate is false.
+func (fd *regularFileFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.mapsMu.Lock()
+	fd.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	fd.mapsMu.Unlock()
+	fd.dataMu.Lock()
+	fd.data.DropAll(fd.inode().fs.mf)
+	fd.dataMu.Unlock()
+	return nil
 }

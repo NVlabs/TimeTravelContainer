@@ -35,9 +35,12 @@ non-forkable for its entire lifetime.
   start from the durable sparse-memory and filesystem roots; the source remains
   dehydrated.
 - `--network=host` is intentionally outside TTC's branchable resource graph and
-  therefore requires `--waive-live-fork`. Unsupported host FD, device, FUSE,
-  io_uring/AIO, packet-ring, KCOV, writable-sysfs, and nftables creation paths
-  fail at creation in an eligible family rather than poisoning it later.
+  therefore requires `--waive-live-fork`. Unsupported host FD, device,
+  externally served FUSE, io_uring/AIO, packet-ring, KCOV, writable-sysfs, and
+  nftables creation paths fail at creation in an eligible family rather than
+  poisoning it later. FUSE filesystems served through the guest's `/dev/fuse`
+  are contained in the Sentry and are forkable; writable shared FUSE mmaps are
+  not yet supported.
 - Internal virtual-network connections are copied. The source keeps external
   connections, while the child starts with external connections disconnected
   and no inherited published host ports.

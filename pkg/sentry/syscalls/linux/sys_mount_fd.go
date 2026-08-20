@@ -45,10 +45,6 @@ func FSOpen(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 	if err != nil {
 		return 0, nil, err
 	}
-	if t.Kernel().LiveForkEligible && fsname == "fuse" {
-		return 0, nil, linuxerr.EOPNOTSUPP
-	}
-
 	vfsObj := t.Kernel().VFS()
 	fileFlags := uint32(linux.O_RDWR)
 	file, err := fsconfigfd.New(t, vfsObj, fsname, fileFlags)

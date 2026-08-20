@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -98,6 +99,11 @@ type filesystem struct {
 
 	// clock is a real-time clock used to set timestamps in file operations.
 	clock ktime.Clock
+
+	// mf backs cached pages used by FUSE mmap. This is the Sentry's main
+	// MemoryFile, so mapped FUSE pages participate in TTC's normal page-level
+	// live-fork CoW rather than being backed by a host file.
+	mf *pgalloc.MemoryFile `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -134,6 +140,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fuseFD, ok := fuseFDGeneric.Impl().(*DeviceFD)
 	if ok {
 		return fsType.getFilesystemDeviceFD(ctx, vfsObj, creds, kernelTask, fuseFD, devMinor, fsopts)
+	}
+	if kernelTask.Kernel().LiveForkEligible {
+		vfsObj.PutAnonBlockDevMinor(devMinor)
+		return nil, nil, linuxerr.EOPNOTSUPP
 	}
 
 	// Check if this is a host FD. Try the file description first (for
@@ -218,6 +228,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 		opts:     fsopts,
 		conn:     conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 
@@ -359,6 +370,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 		opts:     opts,
 		conn:     fuseFD.conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
 	return fs, nil
@@ -374,6 +386,25 @@ func (fs *filesystem) Release(ctx context.Context) {
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
 func (fs *filesystem) MountOptions() string {
 	return fs.opts.mopts
+}
+
+// LiveForkFilesystemEligibility implements
+// vfs.FilesystemImplLiveForkExtension. A FUSE daemon using /dev/fuse is part
+// of the guest kernel graph and is cloned with its mount. A host-passthrough
+// FUSE connection retains an external host descriptor and cannot be cloned.
+func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemEligibility {
+	if _, ok := fs.conn.fuseConn.(*deviceConn); !ok {
+		return vfs.LiveForkFilesystemEligibility{
+			Decision:    vfs.LiveForkFilesystemReject,
+			SourceClass: "external-fuse",
+			Reason:      "FUSE server uses an external host file descriptor",
+		}
+	}
+	return vfs.LiveForkFilesystemEligibility{
+		Decision:    vfs.LiveForkFilesystemClone,
+		SourceClass: "sentry-fuse",
+		Reason:      "FUSE server, request queues, mount state, and cached pages are contained in the Sentry",
+	}
 }
 
 func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode linux.FileMode) *kernfs.Dentry {

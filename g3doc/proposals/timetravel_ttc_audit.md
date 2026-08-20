@@ -234,7 +234,7 @@ systrap directfs and shared-filesystem variants.
   maps guest same-subnet aliases to host `127.0.0.x`; this is an explicit
   resource grant, not an implicit property of NAT-disabled `--network ttc`.
 - Live fork fails closed for unrecognized file descriptions, mappings,
-  filesystems, and network stacks. Host/directfs/FUSE resources, queued
+  filesystems, and network stacks. Host/directfs/external-FUSE resources, queued
   `SCM_RIGHTS`, AIO/io_uring and packet rings, host-bound Unix endpoints, and
   unvalidated network configuration are rejected. The reviewed opt-in
   validators recursively cover epoll and internal Unix endpoint graphs and
@@ -430,9 +430,10 @@ explicit family waiver:
 * imported host FDs, external pipes, host eventfd, host-bound Unix sockets, and
   host-backed peers are not exposed by normal eligible TTC creation/exec paths;
 * directfs and writable gofer filesystems;
-* AIO rings, io_uring rings, PACKET_MMAP, KCOV, FUSE, writable sysfs, and
-  nftables mutation fail when requested by an eligible guest;
-* host/FUSE/device mappings retained after their FD closes;
+* AIO rings, io_uring rings, PACKET_MMAP, KCOV, externally served FUSE,
+  writable sysfs, and nftables mutation fail when requested by an eligible
+  guest; an in-sandbox `/dev/fuse` server and its mappings are cloned;
+* host/external-FUSE/device mappings retained after their FD closes;
 * TPU/GPU/device proxy state and private filesystem MemoryFiles; and
 * any internal anonymous object or filesystem not implementing the live-fork
   contract is treated as an invariant violation.

@@ -68,6 +68,19 @@ type DeviceFD struct {
 	conn *connection
 }
 
+// ValidateLiveFork implements vfs.LiveForkFileDescription. The device queue
+// and its in-sandbox daemon are serialized as part of the Sentry graph.
+func (fd *DeviceFD) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if fd.conn != nil {
+		if _, ok := fd.conn.fuseConn.(*deviceConn); !ok {
+			return nil, linuxerr.EOPNOTSUPP
+		}
+	}
+	return nil, nil
+}
+
 // RegisterFileAsyncHandler implements vfs.FileDescriptionImpl.RegisterFileAsyncHandler.
 func (*DeviceFD) RegisterFileAsyncHandler(*vfs.FileDescription) error {
 	return linuxerr.EPERM

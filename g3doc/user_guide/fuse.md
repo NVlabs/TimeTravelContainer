@@ -133,4 +133,32 @@ application mounts a FUSE filesystem using the resulting file descriptor. This
 works the same as FUSE on a regular Linux system, with the gVisor kernel
 handling the FUSE protocol internally.
 
+In TTC, an in-sandbox FUSE mount is part of the branchable resource graph. A
+live fork clones the guest FUSE daemon, `/dev/fuse` request queues, mount and
+inode state, and resident mmap cache. Executable and private writable mappings
+use Sentry-owned pages, so AppImages can run and those pages retain normal
+4 KiB memory CoW across branches. Pause/resume and dehydration/rehydration also
+preserve the mount.
+
+Ordinary file I/O, read-only mappings, and private executable or writable
+mappings are supported. Writable shared mappings (`mmap(MAP_SHARED)` with
+write permission) remain unsupported because they require FUSE writeback-cache
+and server-driven invalidation semantics.
+
+Mounting requires `CAP_SYS_ADMIN` in the guest mount namespace. TTC does not
+grant that capability by default, so a container intended to mount FUSE should
+be created with `--cap-add SYS_ADMIN`. AppImages may additionally require the
+image's `fuse3` or `fuse` package for `fusermount`:
+
+```console
+$ ttc run -d --cap-add SYS_ADMIN --name app ubuntu:24.04 sleep infinity
+$ ttc exec app@main apt-get update
+$ ttc exec app@main apt-get install -y fuse3
+$ ttc exec app@main ./example.AppImage
+```
+
+An external FUSE server reached through an imported host descriptor is not
+branch-local. TTC rejects that mount in a live-fork-eligible family; use an
+in-sandbox daemon or create the family with `--waive-live-fork`.
+
 [FUSE]: https://www.kernel.org/doc/html/latest/filesystems/fuse.html

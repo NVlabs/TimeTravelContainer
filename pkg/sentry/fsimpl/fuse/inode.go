@@ -279,14 +279,14 @@ func (i *inode) getFUSEAttr() linux.FUSEAttr {
 
 // statFromFUSEAttr makes attributes from linux.FUSEAttr to linux.Statx.
 func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
-	var stat linux.Statx
+	stat := linux.Statx{Mask: mask}
 	stat.Blksize = attr.BlkSize
 	stat.DevMajor, stat.DevMinor = linux.UNNAMED_MAJOR, devMinor
 
 	rdevMajor, rdevMinor := linux.DecodeDeviceID(attr.Rdev)
 	stat.RdevMajor, stat.RdevMinor = uint32(rdevMajor), rdevMinor
 
-	if mask&linux.STATX_MODE != 0 {
+	if mask&(linux.STATX_TYPE|linux.STATX_MODE) != 0 {
 		stat.Mode = uint16(attr.Mode)
 	}
 	if mask&linux.STATX_NLINK != 0 {
@@ -487,8 +487,21 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	}
 
 	if ats.MayRead() || ats.MayWrite() || ats.MayExec() {
+		i.fs.conn.mu.Lock()
+		noAccess := i.fs.conn.noAccess
+		i.fs.conn.mu.Unlock()
+		if noAccess {
+			return nil
+		}
 		in := linux.FUSEAccessIn{Mask: uint32(ats)}
-		return i.callNoReply(ctx, linux.FUSE_ACCESS, &in)
+		err := i.callNoReply(ctx, linux.FUSE_ACCESS, &in)
+		if linuxerr.Equals(linuxerr.ENOSYS, err) {
+			i.fs.conn.mu.Lock()
+			i.fs.conn.noAccess = true
+			i.fs.conn.mu.Unlock()
+			return nil
+		}
+		return err
 	}
 	return nil
 }

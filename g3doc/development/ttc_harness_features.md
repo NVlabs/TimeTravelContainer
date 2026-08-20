@@ -117,9 +117,10 @@ workload-dependent validation failures are narrow and fail closed:
 
 - an unclassified filesystem, a writable external/shared filesystem, or a
   filesystem implementation that explicitly rejects live fork;
-- a host- or FUSE-backed descriptor, an anonymous/socket descriptor without a
-  live-fork implementation, a host-bound Unix socket, or another Unix endpoint
-  implementation outside the Sentry-owned transport graph;
+- an external host- or host-FUSE-backed descriptor, an anonymous/socket
+  descriptor without a live-fork implementation, a host-bound Unix socket, or
+  another Unix endpoint implementation outside the Sentry-owned transport
+  graph;
 - mapped legacy AIO rings, io_uring rings, `PACKET_MMAP` rings, or KCOV memory;
   these mappings do not yet have branch-local backing; and
 - a network stack without TTC containment, branch-owned endpoint, save, and

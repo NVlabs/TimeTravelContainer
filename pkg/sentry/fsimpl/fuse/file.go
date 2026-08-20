@@ -15,6 +15,8 @@
 package fuse
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -24,6 +26,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// ValidateLiveFork implements vfs.LiveForkFileDescription.
+func (fd *fileDescription) ValidateLiveFork() ([]*vfs.FileDescription, error) {
+	if _, ok := fd.inode().fs.conn.fuseConn.(*deviceConn); !ok {
+		return nil, fmt.Errorf("FUSE file uses an external host connection")
+	}
+	return nil, nil
+}
 
 // fileDescription implements vfs.FileDescriptionImpl for fuse.
 //
@@ -107,6 +117,12 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	if fd.OpenFlag&linux.FOPEN_NOFLUSH != 0 {
 		return nil
 	}
+	fs.conn.mu.Lock()
+	noFlush := fs.conn.noFlush
+	fs.conn.mu.Unlock()
+	if noFlush {
+		return nil
+	}
 
 	in := linux.FUSEFlushIn{
 		Fh:        fd.Fh,
@@ -117,7 +133,14 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return res.Error()
+	err = res.Error()
+	if linuxerr.Equals(linuxerr.ENOSYS, err) {
+		fs.conn.mu.Lock()
+		fs.conn.noFlush = true
+		fs.conn.mu.Unlock()
+		return nil
+	}
+	return err
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.

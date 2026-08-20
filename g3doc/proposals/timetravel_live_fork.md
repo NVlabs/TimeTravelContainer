@@ -442,7 +442,8 @@ bypassed its creation-time gate):
 | TTC virtual-NIC socket | Clone internal state; retain source proxy; reset external child TCP |
 | Host TCP/UDP/Unix socket outside the TTC proxy policy | Require a family-level live-fork waiver |
 | Writable or mutable gofer mount | Do not admit to an eligible family |
-| Host FD/device/FUSE/GPU | Do not admit to an eligible family |
+| Host FD/device/external FUSE/GPU | Do not admit to an eligible family |
+| In-sandbox `/dev/fuse` | Clone daemon, queues, filesystem state, and mmap cache |
 | AIO/io_uring/KCOV/packet mmap | Fail creation in an eligible family |
 | TTC-managed guest stdio | Clone |
 
@@ -598,9 +599,11 @@ live-fork validator; eligible kernels reject creation of AIO rings, io_uring
 SQ/CQ/SQE mappings, PACKET_MMAP rings, and KCOV before such mappings can enter
 the graph. A
 fallback also rejects mappings whose retained VFS identity belongs to host,
-FUSE, anonymous, dev, or devtmpfs filesystems, covering closed device FDs that
-remain reachable only through a VMA. The real-loader gate creates an AIO ring,
-checks rejection, destroys it, and then forks the same parent successfully.
+anonymous, dev, or devtmpfs filesystems, covering closed device FDs that
+remain reachable only through a VMA. In-sandbox FUSE mappings opt in after
+validating their `/dev/fuse` transport; external FUSE mappings reject. The
+real-loader gate creates an AIO ring, checks rejection, destroys it, and then
+forks the same parent successfully.
 
 The first Phase 6 slice admitted only canonical loopback. The current slice
 serializes TTC-only stack configuration, including Sentry-owned NICs, routes,

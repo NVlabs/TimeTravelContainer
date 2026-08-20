@@ -14,7 +14,11 @@
 
 package fuse
 
-import "context"
+import (
+	"context"
+
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+)
 
 func (fRes *futureResponse) afterLoad(context.Context) {
 	fRes.ch = make(chan struct{})
@@ -22,6 +26,10 @@ func (fRes *futureResponse) afterLoad(context.Context) {
 
 func (conn *connection) afterLoad(context.Context) {
 	conn.fuseConn = &deviceConn{conn: conn}
+}
+
+func (fs *filesystem) afterLoad(ctx context.Context) {
+	fs.mf = pgalloc.MemoryFileFromContext(ctx)
 }
 
 func (conn *connection) saveFullQueueCh() int {
