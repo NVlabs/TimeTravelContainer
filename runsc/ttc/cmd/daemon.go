@@ -1042,6 +1042,11 @@ type daemonStopTarget struct {
 	selector selector
 }
 
+func branchOwnedByBackend(backend backend, branch Branch) bool {
+	runtime, ok := backend.(*runtimeBackend)
+	return !ok || runtime.nodeID == "" || branch.NodeID == "" || branch.NodeID == runtime.nodeID
+}
+
 func stopDaemonContainers(backend backend) error {
 	families, err := backend.listFamilies()
 	if err != nil {
@@ -1050,6 +1055,9 @@ func stopDaemonContainers(backend backend) error {
 	var targets []daemonStopTarget
 	for _, family := range families {
 		for _, branch := range family.Branches {
+			if !branchOwnedByBackend(backend, branch) {
+				continue
+			}
 			switch branch.State {
 			case "running", "paused", "dehydrated", "restarting", "exited":
 			default:
@@ -1086,6 +1094,9 @@ func dehydrateDaemonContainers(backend backend) error {
 	}
 	for _, family := range families {
 		for _, branch := range family.Branches {
+			if !branchOwnedByBackend(backend, branch) {
+				continue
+			}
 			switch branch.State {
 			case "running", "paused":
 				if err := db.dehydrate(selector{container: family.ID, branch: branch.ID}); err != nil {
@@ -1108,6 +1119,9 @@ func rejectActiveDaemonContainers(backend backend) error {
 	var active []string
 	for _, family := range families {
 		for _, branch := range family.Branches {
+			if !branchOwnedByBackend(backend, branch) {
+				continue
+			}
 			switch branch.State {
 			case "running", "paused", "restarting", "dehydrating", "rehydrating":
 				active = append(active, selector{container: family.ID, branch: branch.ID}.String()+" ("+branch.State+")")

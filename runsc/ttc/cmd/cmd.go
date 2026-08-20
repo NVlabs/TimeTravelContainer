@@ -326,6 +326,8 @@ Commands:
   tty stat|watch TARGET --session NAME Observe or stream a named terminal
   fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
   migrate --target NODE TARGET    Move a running branch to another cluster node
+  node ls [--json]                 List elastic cluster nodes and memory load
+  node drain [--target NODE] NODE  Evacuate a node and reject new placement
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
@@ -380,6 +382,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"migrate":    "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
+			"node":       "Usage: ttc node ls [--json] | ttc node drain [--target NODE] NODE",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
@@ -463,6 +466,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runFork(args[1:], stdout, stderr, backend)
 	case "migrate":
 		err = runMigrate(args[1:], stdout, backend)
+	case "node":
+		err = runNode(args[1:], stdout, backend)
 	case "checkpoint":
 		err = runCheckpoint(args[1:], stdout, backend)
 	case "restore":
@@ -517,6 +522,76 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 
 type elasticMigrationBackend interface {
 	migrate(selector, string) error
+}
+
+type elasticNodeBackend interface {
+	clusterNodes() ([]cluster.NodeRecord, error)
+	drainNode(sourceNode, targetNode string, local bool) ([]selector, error)
+}
+
+func runNode(args []string, stdout io.Writer, backend backend) error {
+	if len(args) == 0 {
+		return errors.New("usage: ttc node ls [--json] | ttc node drain [--target NODE] NODE")
+	}
+	nodes, ok := backend.(elasticNodeBackend)
+	if !ok {
+		return errors.New("backend does not support elastic cluster nodes")
+	}
+	switch args[0] {
+	case "ls":
+		fs := flag.NewFlagSet("node ls", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		jsonOutput := fs.Bool("json", false, "write JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("usage: ttc node ls [--json]")
+		}
+		records, err := nodes.clusterNodes()
+		if err != nil {
+			return err
+		}
+		if *jsonOutput {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(records)
+		}
+		writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(writer, "NODE\tSTATE\tMEMORY\tTARGET\tRESERVED\tLEASE")
+		now := time.Now()
+		for _, record := range records {
+			lease := "expired"
+			if remaining := record.LeaseExpiresAt.Sub(now); remaining > 0 {
+				lease = remaining.Round(time.Second).String()
+			}
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", record.NodeID, record.State,
+				formatImageSize(int64(record.MemoryCurrentBytes)), formatImageSize(int64(record.MemoryTargetBytes)),
+				formatImageSize(int64(record.IncomingReservedBytes)), lease)
+		}
+		return writer.Flush()
+	case "drain":
+		fs := flag.NewFlagSet("node drain", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		target := fs.String("target", "", "force all branches to one destination node")
+		local := fs.Bool("_local", false, "execute only on the addressed daemon")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("usage: ttc node drain [--target NODE] NODE")
+		}
+		moved, err := nodes.drainNode(fs.Arg(0), *target, *local)
+		if err != nil {
+			return err
+		}
+		for _, branch := range moved {
+			fmt.Fprintln(stdout, branch)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown node command %q", args[0])
+	}
 }
 
 func runMigrate(args []string, stdout io.Writer, backend backend) error {

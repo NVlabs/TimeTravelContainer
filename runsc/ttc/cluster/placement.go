@@ -204,6 +204,41 @@ func (s *PlacementStore) BeginMigration(family, branch, owner, incarnation strin
 	return &result, nil
 }
 
+// AdoptOwnerIncarnation fences a branch to a restarted daemon that has already
+// reacquired the same node ID. NodeDirectory registration guarantees that the
+// previous incarnation's lease expired before the replacement was admitted.
+func (s *PlacementStore) AdoptOwnerIncarnation(family, branch, owner, oldIncarnation, newIncarnation string, generation uint64, now time.Time) (*PlacementRecord, error) {
+	var result PlacementRecord
+	err := s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != oldIncarnation {
+			return errors.New("stale placement cannot adopt node incarnation")
+		}
+		if record.State != PlacementRunning && record.State != PlacementPaused {
+			return fmt.Errorf("placement is %s, not stable", record.State)
+		}
+		record.OwnerIncarnation = newIncarnation
+		record.Generation++
+		record.Revision++
+		record.UpdatedAt = now
+		if err := record.validate(); err != nil {
+			return err
+		}
+		if err := s.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // CommitMigration atomically changes the runnable owner and increments the
 // fencing generation. Retrying the committed operation is idempotent.
 func (s *PlacementStore) CommitMigration(family, branch, operation, target, targetIncarnation, physicalContainer, physicalBranch string, now time.Time) (*PlacementRecord, error) {

@@ -22,11 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -135,37 +137,40 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	}
 }
 
-func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, error) {
+func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, string, error) {
 	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: requestID, Args: append([]string(nil), args...)}
 	encoded, err := json.Marshal(&request)
 	if err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
 	var response bytes.Buffer
 	if err := peer.ProxyDaemon(ctx, bytes.NewReader(append(encoded, '\n')), &response); err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
+	var stdout strings.Builder
 	var diagnostic strings.Builder
 	status := -1
 	for response.Len() != 0 {
 		typ, payload, err := readDaemonFrame(&response)
 		if err != nil {
-			return 0, diagnostic.String(), err
+			return 0, stdout.String(), diagnostic.String(), err
 		}
 		switch typ {
+		case daemonFrameStdout:
+			stdout.Write(payload)
 		case daemonFrameStderr:
 			diagnostic.Write(payload)
 		case daemonFrameStatus:
 			if len(payload) != 4 {
-				return 0, diagnostic.String(), errors.New("remote daemon returned an invalid status frame")
+				return 0, stdout.String(), diagnostic.String(), errors.New("remote daemon returned an invalid status frame")
 			}
 			status = int(binary.BigEndian.Uint32(payload))
 		}
 	}
 	if status < 0 {
-		return 0, diagnostic.String(), errors.New("remote daemon returned no status")
+		return 0, stdout.String(), diagnostic.String(), errors.New("remote daemon returned no status")
 	}
-	return status, diagnostic.String(), nil
+	return status, stdout.String(), diagnostic.String(), nil
 }
 
 // migrate implements the first identity-preserving cutover path. It uses the
@@ -221,6 +226,12 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
+	if placement.OwnerNode == b.nodeID && placement.OwnerIncarnation != sourceRecord.Incarnation {
+		placement, err = placements.AdoptOwnerIncarnation(info.ID, target.branch, b.nodeID, placement.OwnerIncarnation, sourceRecord.Incarnation, placement.Generation, time.Now())
+		if err != nil {
+			return fmt.Errorf("adopting placement after node restart: %w", err)
+		}
+	}
 	requestID, err := newDaemonRequestID()
 	if err != nil {
 		return err
@@ -246,7 +257,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err := b.containerStore().CompareAndSwapBranchNodeID(info.ID, target.branch, b.nodeID, targetNode); err != nil {
 		return abort(fmt.Errorf("transferring branch ownership: %w", err), true)
 	}
-	status, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"rehydrate", target.String()})
+	status, _, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"rehydrate", target.String()})
 	if err != nil {
 		// Delivery is uncertain. The source remains durably cold and fenced by
 		// NodeID; retrying rehydrate through any daemon is safe.
@@ -262,6 +273,169 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
 	}
 	return nil
+}
+
+func (b *runtimeBackend) clusterNodes() ([]cluster.NodeRecord, error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil {
+		return nil, errors.New("elastic node discovery is not configured")
+	}
+	return b.distributedSource.directory.List()
+}
+
+func nodeLoadLess(left, right cluster.NodeRecord) bool {
+	leftBytes := left.MemoryCurrentBytes + left.IncomingReservedBytes
+	rightBytes := right.MemoryCurrentBytes + right.IncomingReservedBytes
+	if left.MemoryTargetBytes != 0 && right.MemoryTargetBytes != 0 {
+		leftHi, leftLo := bits.Mul64(leftBytes, right.MemoryTargetBytes)
+		rightHi, rightLo := bits.Mul64(rightBytes, left.MemoryTargetBytes)
+		if leftHi != rightHi || leftLo != rightLo {
+			return leftHi < rightHi || leftHi == rightHi && leftLo < rightLo
+		}
+	} else if leftBytes != rightBytes {
+		return leftBytes < rightBytes
+	}
+	return left.NodeID < right.NodeID
+}
+
+func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, error) {
+	records, err := b.clusterNodes()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	targets := make([]cluster.NodeRecord, 0, len(records))
+	for _, record := range records {
+		if record.NodeID == b.nodeID || !record.AcceptsPlacement(now) {
+			continue
+		}
+		if forced != "" && record.NodeID != forced {
+			continue
+		}
+		targets = append(targets, record)
+	}
+	if forced != "" && len(targets) == 0 {
+		return nil, fmt.Errorf("cluster target node %q is unavailable or not accepting placement", forced)
+	}
+	sort.Slice(targets, func(i, j int) bool { return nodeLoadLess(targets[i], targets[j]) })
+	if len(targets) == 0 {
+		return nil, errors.New("no ready cluster node has capacity for drain; provision a node and retry")
+	}
+	return targets, nil
+}
+
+// drainNode implements a restart-safe conservative drain. It rejects new
+// placements first, then migrates active branches and transfers cold branch
+// ownership. A failed step leaves the node draining so retry cannot race new
+// work onto it. The daemon remains available for diagnostics until explicitly
+// stopped, at which point its membership record becomes offline.
+func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) ([]selector, error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return nil, errors.New("elastic node drain requires dynamic cluster discovery")
+	}
+	if sourceNode != b.nodeID {
+		if local {
+			return nil, fmt.Errorf("node drain reached %q, want %q", b.nodeID, sourceNode)
+		}
+		peer, err := b.distributedSource.peer(sourceNode, false)
+		if err != nil {
+			return nil, err
+		}
+		requestID, err := newDaemonRequestID()
+		if err != nil {
+			return nil, err
+		}
+		args := []string{"node", "drain", "--_local"}
+		if targetNode != "" {
+			args = append(args, "--target", targetNode)
+		}
+		args = append(args, sourceNode)
+		status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, args)
+		if err != nil {
+			return nil, err
+		}
+		if status != 0 {
+			return nil, errors.New(strings.TrimSpace(diagnostic))
+		}
+		var moved []selector
+		for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+			if line == "" {
+				continue
+			}
+			selected, err := parseSelector(line)
+			if err != nil {
+				return nil, fmt.Errorf("decoding remote drain result %q: %w", line, err)
+			}
+			moved = append(moved, selected)
+		}
+		return moved, nil
+	}
+
+	source, err := b.distributedSource.directory.Lookup(b.nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if !source.LeaseActive(time.Now()) {
+		return nil, fmt.Errorf("source node %q lease is expired or offline", b.nodeID)
+	}
+	lease := source.LeaseExpiresAt.Sub(source.UpdatedAt)
+	if source.State != cluster.NodeDraining {
+		if source.State != cluster.NodeReady && source.State != cluster.NodePressured {
+			return nil, fmt.Errorf("node %q cannot begin drain from state %s", b.nodeID, source.State)
+		}
+		if _, err := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, cluster.NodeDraining, time.Now(), lease); err != nil {
+			return nil, fmt.Errorf("cordoning node %q: %w", b.nodeID, err)
+		}
+	}
+	targets, err := b.drainTargets(targetNode)
+	if err != nil {
+		return nil, err
+	}
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return nil, err
+	}
+	type work struct {
+		target selector
+		state  string
+	}
+	var pending []work
+	for _, info := range containers {
+		name := info.Name
+		if name == "" {
+			name = info.ID
+		}
+		for _, branch := range info.Branches {
+			if info.BranchNodeID(branch.ID) == b.nodeID {
+				pending = append(pending, work{target: selector{container: name, branch: branch.ID}, state: normalizeLifecycleState(branch.State)})
+			}
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].target.String() < pending[j].target.String() })
+	moved := make([]selector, 0, len(pending))
+	for index, item := range pending {
+		destination := targets[index%len(targets)].NodeID
+		switch item.state {
+		case "running", "paused":
+			if err := b.migrate(item.target, destination); err != nil {
+				return moved, fmt.Errorf("migrating %s to %q: %w", item.target, destination, err)
+			}
+		case "created", "dehydrated", "exited", "failed", "dead":
+			if err := b.containerStore().CompareAndSwapBranchNodeID(item.target.container, item.target.branch, b.nodeID, destination); err != nil {
+				return moved, fmt.Errorf("transferring cold branch %s to %q: %w", item.target, destination, err)
+			}
+		default:
+			return moved, fmt.Errorf("branch %s is transiently %s; retry the drain after it settles", item.target, item.state)
+		}
+		moved = append(moved, item.target)
+	}
+	transactionStore, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return moved, err
+	}
+	if err := drainSourceDependencies(b, b.distributedSource, transactionStore, b.nodeID); err != nil {
+		return moved, fmt.Errorf("draining remote page dependencies: %w", err)
+	}
+	return moved, nil
 }
 
 func parseClusterAdvertise(value string) (baseURL, serverName string, err error) {

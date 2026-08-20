@@ -72,3 +72,28 @@ func TestPlacementMigrationFencesConcurrentCutovers(t *testing.T) {
 		t.Fatal("stale owner acquired migrated placement")
 	}
 }
+
+func TestPlacementAdoptsRestartedOwnerIncarnation(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(2000, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-old", State: PlacementPaused,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := store.AdoptOwnerIncarnation("family", "main", "node-a", "boot-old", "boot-new", created.Generation, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.OwnerIncarnation != "boot-new" || adopted.Generation != created.Generation+1 || adopted.State != PlacementPaused {
+		t.Fatalf("adopted=%+v", adopted)
+	}
+	if _, err := store.AdoptOwnerIncarnation("family", "main", "node-a", "boot-old", "boot-stale", created.Generation, now.Add(2*time.Second)); err == nil {
+		t.Fatal("stale incarnation adopted placement")
+	}
+}
