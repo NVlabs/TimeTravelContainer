@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -40,6 +41,66 @@ import (
 
 type daemonClusterProxy struct {
 	socket string
+}
+
+type elasticCapacityRequest struct {
+	Version         int       `json:"version"`
+	RequestID       string    `json:"request_id"`
+	Operation       string    `json:"operation"`
+	Nodes           int       `json:"nodes"`
+	MemoryBytesEach uint64    `json:"memory_bytes_each"`
+	Architecture    string    `json:"architecture"`
+	RepositoryID    string    `json:"repository_id"`
+	SourceNode      string    `json:"source_node"`
+	Reason          string    `json:"reason"`
+	CreatedAt       time.Time `json:"created_at"`
+	Deadline        time.Time `json:"deadline"`
+}
+
+// emitCapacityRequest publishes one outstanding request per node. An external
+// provisioner watches this shared directory and removes the node file after it
+// has durably accepted the request; a later pressure episode can then publish
+// a new ID. The lock makes concurrent manual and automatic rebalance attempts
+// coalesce into the same event.
+func (b *runtimeBackend) emitCapacityRequest(source cluster.NodeRecord, reason string) (string, error) {
+	dir := filepath.Join(b.dataRoot, "cluster", "capacity-requests")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, source.NodeID+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return "", err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	path := filepath.Join(dir, source.NodeID+".json")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	memory := source.MemoryTargetBytes
+	if memory == 0 {
+		memory = source.MemoryCurrentBytes
+	}
+	request := elasticCapacityRequest{
+		Version: 1, RequestID: "capacity-" + requestID, Operation: "acquire", Nodes: 1,
+		MemoryBytesEach: memory, Architecture: b.distributedSource.capabilities.Architecture,
+		RepositoryID: b.distributedSource.capabilities.RepositoryID, SourceNode: source.NodeID,
+		Reason: reason, CreatedAt: now, Deadline: now.Add(5 * time.Minute),
+	}
+	if err := writeDurableJSON(path, &request); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -450,7 +511,11 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 	}
 	targets, err := b.drainTargets(targetNode)
 	if err != nil {
-		return cluster.PlacementPlan{}, err
+		request, requestErr := b.emitCapacityRequest(*source, "memory-pressure")
+		if requestErr != nil {
+			return cluster.PlacementPlan{}, fmt.Errorf("%w; publishing capacity request: %v", err, requestErr)
+		}
+		return cluster.PlacementPlan{}, fmt.Errorf("%w; capacity request published at %s", err, request)
 	}
 	branches, shared, err := b.localPlannerResources()
 	if err != nil {
@@ -476,10 +541,14 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 		}
 	}
 	if len(best.Branches) == 0 {
-		if planErr != nil {
-			return best, fmt.Errorf("no feasible pressure-relief placement; request more capacity: %w", planErr)
+		request, requestErr := b.emitCapacityRequest(*source, "memory-pressure")
+		if requestErr != nil {
+			planErr = errors.Join(planErr, fmt.Errorf("publishing capacity request: %w", requestErr))
 		}
-		return best, errors.New("no movable branch can relieve memory pressure; request more capacity")
+		if planErr != nil {
+			return best, fmt.Errorf("no feasible pressure-relief placement; capacity request %s: %w", request, planErr)
+		}
+		return best, fmt.Errorf("no movable branch can relieve memory pressure; capacity request published at %s", request)
 	}
 	for _, value := range best.Branches {
 		target, err := parseSelector(value)
@@ -558,7 +627,11 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) ([
 	}
 	targets, err := b.drainTargets(targetNode)
 	if err != nil {
-		return nil, err
+		request, requestErr := b.emitCapacityRequest(*source, "node-drain")
+		if requestErr != nil {
+			return nil, fmt.Errorf("%w; publishing capacity request: %v", err, requestErr)
+		}
+		return nil, fmt.Errorf("%w; capacity request published at %s", err, request)
 	}
 	containers, err := b.containerStore().ListContainers()
 	if err != nil {

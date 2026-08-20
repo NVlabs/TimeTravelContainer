@@ -13,6 +13,7 @@ whereas production nodes do not.
 - daemon-incarnation adoption after a clean restart;
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
 - deterministic pressure placement and opt-in automatic rebalancing; and
+- coalesced durable capacity requests when no placement is feasible; and
 - remote live fork with 1 MiB bulk memory transfer through a shared NFS root.
 
 ## Local mixed-family migration
@@ -49,6 +50,10 @@ Sentry, gofer, listener, or test directory.
 That cleanup assertion found and fixed an owner-scope error where a running
 remote sibling prevented deletion of an otherwise empty source Sentry.
 
+The no-target path was also exercised at unit level: concurrent pressure/drain
+attempts retain one durable request ID, and removing the accepted outbox entry
+allows the next pressure episode to publish a fresh ID.
+
 ## NFS remote-fork matrix
 
 The test data root was exported by the host kernel NFS server and mounted over
@@ -84,5 +89,6 @@ The configured `kvm-node` was unreachable (`No route to host`) during this
 iteration, and the development host has no `/dev/kvm`; therefore the latest
 elastic changes have not yet been rerun on the KVM platform. Physical
 multi-host network-delay/loss, node-loss injection during every migration
-boundary, durable capacity-provider delivery, and long-running automatic
+boundary, an external provisioner's end-to-end response to the durable
+capacity outbox, and long-running automatic
 rebalance/anti-oscillation tests also remain required before production use.

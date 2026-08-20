@@ -82,10 +82,10 @@ non-forkable for its entire lifetime.
 - Elastic migration currently uses a conservative dehydrate/ownership-CAS/
   rehydrate cutover rather than the live sparse handoff planned for later.
   Automatic rebalancing uses coarse per-family shared-memory summaries until
-  exact bounded chunk-version edges are exported by the Sentry. External
-  capacity-provider hooks are not yet implemented; an unsuccessful drain or
-  rebalance reports that another ready node is required and remains safely
-  retryable.
+  exact bounded chunk-version edges are exported by the Sentry. Capacity
+  acquisition uses a durable shared-filesystem JSON outbox; native executable
+  and HTTP provider adapters are not yet included. An unsuccessful drain or
+  rebalance remains safely retryable after a requested node joins.
 
 For the detailed resource matrix, measurements, and audit evidence, see the
 [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md).

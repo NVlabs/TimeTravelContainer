@@ -149,26 +149,31 @@ latency-sensitive branches as non-dehydratable.
 
 ## Capacity events
 
-Provisioning remains outside TTC. A pluggable executable or HTTP event sink
-receives an idempotent request such as:
+Provisioning remains outside TTC. TTC publishes a durable JSON request in
+`$TTC_DATA_ROOT/cluster/capacity-requests/<source-node>.json` when pressure or
+a drain has no feasible destination. An external provisioner watches this
+shared outbox and removes the file only after durably accepting it. Manual and
+automatic retries coalesce while the file exists, and removal permits a new
+request ID. A request looks like:
 
 ```json
 {
   "version": 1,
   "request_id": "capacity-...",
   "operation": "acquire",
-  "nodes": 2,
+  "nodes": 1,
   "memory_bytes_each": 68719476736,
   "architecture": "amd64",
   "repository_id": "cluster-a",
+  "source_node": "node-a",
   "reason": "memory-pressure",
   "deadline": "2026-08-21T12:00:00Z"
 }
 ```
 
-Delivery is at least once and receivers deduplicate `request_id`. A release
-event is emitted only after a node is offline with no ownership or dependency
-records.
+Atomic publication makes the outbox safe to scan after either side restarts.
+Receivers should still deduplicate `request_id`. Native executable/HTTP
+adapters and release events are future additions.
 
 ## Graceful drain
 
@@ -227,16 +232,17 @@ state, never runs both copies, and survives retries at every boundary.
 
 ### Phase 3: draining and capacity integration
 
-**Partially implemented.** `ttc node ls` and `ttc node drain` provide dynamic
+**Implemented with a file-outbox capacity interface.** `ttc node ls` and `ttc node drain` provide dynamic
 membership diagnostics, admission fencing, active and cold branch evacuation,
 restart-safe retry, and dependency draining. A drained daemon remains online
 in the `draining` state for diagnostics until `ttc daemon stop` marks it
-offline. Executable/webhook capacity sinks and durable automatic resumption of
-an interrupted multi-branch drain remain outstanding.
+offline. Drain and rebalance publish a coalesced durable capacity request when
+there is no feasible target. Executable/webhook adapters and durable automatic
+resumption of an interrupted multi-branch drain remain outstanding.
 
 * Add `ttc node drain`, admission control, dependency draining, and offline
   verification.
-* Add executable and webhook capacity sinks with durable idempotency records.
+* Add executable and webhook adapters over the durable capacity outbox.
 * Resume incomplete drains after daemon restart.
 
 Exit: a node with mixed running, paused, and dehydrated real workloads can

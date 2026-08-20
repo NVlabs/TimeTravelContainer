@@ -462,6 +462,20 @@ configured memory targets and branch CoW accounting. Starting `ttcd` with
 `--cluster-auto-rebalance` runs this operation automatically when the node
 crosses its target, with a 10% low-water mark and cooldown to avoid oscillation.
 
+If a drain or pressure rebalance has no feasible destination, TTC writes one
+durable request per source node to:
+
+```text
+$TTC_DATA_ROOT/cluster/capacity-requests/<node-id>.json
+```
+
+An external cluster provisioner can watch this shared directory, acquire the
+requested capacity, and remove the file after it has durably accepted the
+request. The new `ttcd` joins through the normal dynamic membership protocol;
+the original operation can then be retried. Repeated manual and automatic
+attempts retain the same request while it is outstanding, preventing an event
+storm from provisioning duplicate nodes.
+
 ## Dehydrate and rehydrate
 
 Dehydration hibernates a branch inside its existing family. It is useful when

@@ -5025,6 +5025,65 @@ func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
 	}
 }
 
+func TestEmitCapacityRequestCoalescesUntilAcknowledged(t *testing.T) {
+	dataRoot := t.TempDir()
+	backend := &runtimeBackend{
+		dataRoot: dataRoot,
+		distributedSource: &distributedSourceRuntime{capabilities: cluster.Capabilities{
+			Architecture: "amd64",
+			RepositoryID: "shared-repository",
+		}},
+	}
+	source := cluster.NodeRecord{
+		NodeID:             "node-a",
+		MemoryTargetBytes:  8 << 30,
+		MemoryCurrentBytes: 9 << 30,
+	}
+	path, err := backend.emitCapacityRequest(source, "memory-pressure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() elasticCapacityRequest {
+		t.Helper()
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var request elasticCapacityRequest
+		if err := json.Unmarshal(contents, &request); err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}
+	first := read()
+	if first.Version != 1 || first.Operation != "acquire" || first.Nodes != 1 || first.MemoryBytesEach != source.MemoryTargetBytes || first.Architecture != "amd64" || first.RepositoryID != "shared-repository" || first.SourceNode != source.NodeID || first.Reason != "memory-pressure" || first.RequestID == "" || !first.Deadline.After(first.CreatedAt) {
+		t.Fatalf("capacity request=%+v", first)
+	}
+	coalescedPath, err := backend.emitCapacityRequest(source, "node-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coalescedPath != path {
+		t.Fatalf("coalesced path=%q, want %q", coalescedPath, path)
+	}
+	if got := read(); got.RequestID != first.RequestID || got.Reason != first.Reason {
+		t.Fatalf("coalesced request=%+v, want original ID and reason", got)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	newPath, err := backend.emitCapacityRequest(source, "node-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPath != path {
+		t.Fatalf("replacement path=%q, want %q", newPath, path)
+	}
+	if got := read(); got.RequestID == first.RequestID || got.Reason != "node-drain" {
+		t.Fatalf("replacement request=%+v, original=%+v", got, first)
+	}
+}
+
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	backend := &fakeBackend{}
 	var out bytes.Buffer
