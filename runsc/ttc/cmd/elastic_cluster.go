@@ -317,6 +317,26 @@ func daemonCommandOwner(dataRoot string, args []string) (string, error) {
 	if dataRoot == "" {
 		return "", nil
 	}
+	// Route node-wide mutations before taking the receiving daemon's local
+	// lifecycle lock. Otherwise an arbitrary entry node can hold its lock while
+	// the source calls back into it as a migration target, deadlocking cutover.
+	if len(args) >= 3 && args[0] == "node" && (args[1] == "drain" || args[1] == "rebalance") {
+		var positional []string
+		for i := 2; i < len(args); i++ {
+			switch {
+			case args[i] == "--target":
+				i++
+			case strings.HasPrefix(args[i], "--target=") || args[i] == "--_local":
+			case strings.HasPrefix(args[i], "-"):
+				// Let runNode diagnose unknown flags on the selected daemon.
+			default:
+				positional = append(positional, args[i])
+			}
+		}
+		if len(positional) == 1 {
+			return positional[0], nil
+		}
+	}
 	store := ttcbundle.Store{Root: dataRoot}
 	owner := ""
 	for _, arg := range args[1:] {
@@ -398,6 +418,23 @@ func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, reque
 	return status, stdout.String(), diagnostic.String(), nil
 }
 
+func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (string, error) {
+	output, err := b.command("timetravel", containerID, "branches")
+	if err != nil {
+		return "", err
+	}
+	var branches []runscBranchInfo
+	if err := json.Unmarshal(output, &branches); err != nil {
+		return "", fmt.Errorf("decoding runtime branches: %w", err)
+	}
+	for _, branch := range branches {
+		if branch.ID == branchID {
+			return normalizeLifecycleState(branch.State), nil
+		}
+	}
+	return "", fmt.Errorf("branch %q disappeared from runtime state", branchID)
+}
+
 // migrate implements the first identity-preserving cutover path. It uses the
 // durable dehydration image as the handoff, so correctness and recovery land
 // before the later live sparse-transfer optimization. Branch-local ownership
@@ -418,6 +455,18 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	state := normalizeLifecycleState(persistentBranch.State)
 	if state != "running" && state != "paused" {
 		return fmt.Errorf("branch %s is %s, not running or paused", target, state)
+	}
+	// Older interrupted rollbacks could publish stable persistent state before
+	// restoring the Sentry branch. Repair that narrow mismatch before acquiring
+	// a new migration transaction; current rollbacks remain fenced until this
+	// condition is true.
+	if runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, target.branch); runtimeErr == nil && runtimeState == "dehydrated" {
+		if err := b.rehydrate(target); err != nil {
+			return fmt.Errorf("restoring stale dehydrated source before migration: %w", err)
+		}
+		if runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, target.branch); runtimeErr != nil || runtimeState != state {
+			return fmt.Errorf("restored migration source has runtime state %q, want %q: %v", runtimeState, state, runtimeErr)
+		}
 	}
 	sourceRecord, err := b.distributedSource.directory.Lookup(b.nodeID)
 	if err != nil {
@@ -465,12 +514,18 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		return err
 	}
 	abort := func(cause error, restore bool) error {
-		_, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
 		if restore {
 			if rehydrateErr := b.rehydrate(target); rehydrateErr != nil {
-				return fmt.Errorf("%w; aborting placement: %v; restoring source: %v", cause, abortErr, rehydrateErr)
+				// Leave the placement migrating. Once this incarnation loses
+				// its lease, recovery can retry restoration without exposing a
+				// stable placement backed by a dehydrated runtime.
+				return fmt.Errorf("%w; restoring source before rollback: %v", cause, rehydrateErr)
+			}
+			if runtimeState, stateErr := b.runtimeBranchLifecycle(info.ID, target.branch); stateErr != nil || runtimeState != state {
+				return fmt.Errorf("%w; restored source runtime is %q (want %q): %v", cause, runtimeState, state, stateErr)
 			}
 		}
+		_, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
 		if abortErr != nil {
 			return fmt.Errorf("%w; aborting placement: %v", cause, abortErr)
 		}
@@ -486,18 +541,165 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		// Delivery is uncertain. The source remains durably cold and fenced by
 		// NodeID; retrying rehydrate through any daemon is safe.
-		return fmt.Errorf("migration ownership moved to %q but destination response is uncertain: %w; run `ttc rehydrate %s` to reconcile", targetNode, err, target)
+		return fmt.Errorf("migration ownership moved to %q but destination response is uncertain: %w; ttcd will reconcile operation %s", targetNode, err, requestID)
 	}
 	if status != 0 {
-		if swapErr := b.containerStore().CompareAndSwapBranchNodeID(info.ID, target.branch, targetNode, b.nodeID); swapErr != nil {
-			return fmt.Errorf("destination rejected migration: %s; ownership rollback failed: %v", strings.TrimSpace(diagnostic), swapErr)
-		}
-		return abort(fmt.Errorf("destination rejected migration: %s", strings.TrimSpace(diagnostic)), true)
+		// A nonzero response is not proof that destination execution never
+		// happened: the daemon may have restarted after restoring the branch,
+		// leaving an indeterminate mutation journal. Once ownership CAS has
+		// succeeded, never move it backward. Target-side recovery verifies the
+		// runtime and rolls the fenced transaction forward.
+		return fmt.Errorf("migration ownership moved to %q but destination returned %s; ttcd will reconcile operation %s", targetNode, strings.TrimSpace(diagnostic), requestID)
 	}
 	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
 		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
 	}
 	return nil
+}
+
+// recoverInterruptedMigrations reconciles durable migration intent after the
+// daemon that owned the cutover disappeared. It only acts after the exact
+// owner incarnation recorded by the transaction is no longer leased. The
+// bundle's BranchNodeID is the cutover fact: source ownership means rollback;
+// target ownership means roll forward.
+func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return nil, nil
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	if err != nil {
+		return nil, err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var recovered []selector
+	var result error
+	for _, placement := range records {
+		if placement.State != cluster.PlacementMigrating {
+			continue
+		}
+		oldOwner, lookupErr := b.distributedSource.directory.Lookup(placement.OwnerNode)
+		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("checking migration owner %s for %s@%s: %w", placement.OwnerNode, placement.FamilyID, placement.BranchID, lookupErr))
+			continue
+		}
+		oldOwnerActive := lookupErr == nil && oldOwner.Incarnation == placement.OwnerIncarnation && oldOwner.LeaseActive(now)
+		info, loadErr := b.containerStore().LoadContainer(placement.FamilyID)
+		if loadErr != nil {
+			result = errors.Join(result, fmt.Errorf("loading interrupted migration %s@%s: %w", placement.FamilyID, placement.BranchID, loadErr))
+			continue
+		}
+		branch, branchErr := persistentBranchInfo(info, placement.BranchID)
+		if branchErr != nil {
+			result = errors.Join(result, fmt.Errorf("loading interrupted migration branch %s@%s: %w", placement.FamilyID, placement.BranchID, branchErr))
+			continue
+		}
+		name := info.Name
+		if name == "" {
+			name = info.ID
+		}
+		target := selector{container: name, branch: placement.BranchID}
+		actualOwner := info.BranchNodeID(placement.BranchID)
+		switch actualOwner {
+		case placement.OwnerNode:
+			if oldOwnerActive {
+				// This may be an ordinary in-flight migration before cutover.
+				// Never interfere with an incarnation that still owns both the
+				// placement lease and the branch.
+				continue
+			}
+			// Only the replacement source daemon may restore and roll back a
+			// source-owned transaction. This also prevents two nodes from
+			// attempting to rehydrate the same branch concurrently.
+			if b.nodeID != placement.OwnerNode {
+				continue
+			}
+			current, lookupErr := b.distributedSource.directory.Lookup(b.nodeID)
+			if lookupErr != nil || !current.LeaseActive(time.Now()) {
+				result = errors.Join(result, fmt.Errorf("source node %q cannot recover %s: lease unavailable", b.nodeID, target))
+				continue
+			}
+			state := normalizeLifecycleState(branch.State)
+			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			if state == "dehydrated" || runtimeErr == nil && runtimeState == "dehydrated" {
+				if err := b.rehydrate(target); err != nil {
+					result = errors.Join(result, fmt.Errorf("restoring interrupted migration source %s: %w", target, err))
+					continue
+				}
+				info, loadErr = b.containerStore().LoadContainer(info.ID)
+				if loadErr != nil {
+					result = errors.Join(result, fmt.Errorf("reloading restored migration source %s: %w", target, loadErr))
+					continue
+				}
+				branch, branchErr = persistentBranchInfo(info, placement.BranchID)
+				if branchErr != nil {
+					result = errors.Join(result, branchErr)
+					continue
+				}
+				state = normalizeLifecycleState(branch.State)
+			}
+			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			if state != string(placement.ResumeState) || runtimeErr != nil || runtimeState != string(placement.ResumeState) {
+				result = errors.Join(result, fmt.Errorf("restored migration source %s has persistent state %q and runtime state %q, want %q: %v", target, state, runtimeState, placement.ResumeState, runtimeErr))
+				continue
+			}
+			if _, err := placements.RecoverSourceMigration(placement.FamilyID, placement.BranchID, placement.OperationID,
+				placement.OwnerNode, placement.OwnerIncarnation, current.Incarnation, placement.Generation, time.Now()); err != nil {
+				result = errors.Join(result, fmt.Errorf("publishing recovered migration source %s: %w", target, err))
+				continue
+			}
+			recovered = append(recovered, target)
+		case placement.TargetNode:
+			// After the ownership CAS, only the target daemon rolls forward.
+			// This is safe even while the source lease remains live: source code
+			// never rolls ownership backward after CAS, and the target mutation
+			// lock serializes recovery with an in-flight rehydrate request.
+			if b.nodeID != placement.TargetNode {
+				continue
+			}
+			current, lookupErr := b.distributedSource.directory.Lookup(b.nodeID)
+			if lookupErr != nil || !current.LeaseActive(time.Now()) {
+				result = errors.Join(result, fmt.Errorf("target node %q cannot recover %s: lease unavailable", b.nodeID, target))
+				continue
+			}
+			state := normalizeLifecycleState(branch.State)
+			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			if state == "dehydrated" || runtimeErr == nil && runtimeState == "dehydrated" {
+				if err := b.rehydrate(target); err != nil {
+					result = errors.Join(result, fmt.Errorf("restoring interrupted migration target %s: %w", target, err))
+					continue
+				}
+				info, loadErr = b.containerStore().LoadContainer(info.ID)
+				if loadErr != nil {
+					result = errors.Join(result, fmt.Errorf("reloading restored migration target %s: %w", target, loadErr))
+					continue
+				}
+				branch, branchErr = persistentBranchInfo(info, placement.BranchID)
+				if branchErr != nil {
+					result = errors.Join(result, branchErr)
+					continue
+				}
+				state = normalizeLifecycleState(branch.State)
+			}
+			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			if state != string(placement.ResumeState) || runtimeErr != nil || runtimeState != string(placement.ResumeState) {
+				result = errors.Join(result, fmt.Errorf("restored migration target %s has persistent state %q and runtime state %q, want %q: %v", target, state, runtimeState, placement.ResumeState, runtimeErr))
+				continue
+			}
+			if _, err := placements.CommitMigration(placement.FamilyID, placement.BranchID, placement.OperationID,
+				placement.TargetNode, current.Incarnation, info.ID, placement.BranchID, time.Now()); err != nil {
+				result = errors.Join(result, fmt.Errorf("publishing recovered migration target %s: %w", target, err))
+				continue
+			}
+			recovered = append(recovered, target)
+		default:
+			result = errors.Join(result, fmt.Errorf("interrupted migration %s has branch owner %q, want source %q or target %q", target, actualOwner, placement.OwnerNode, placement.TargetNode))
+		}
+	}
+	return recovered, result
 }
 
 func (b *runtimeBackend) clusterNodes() ([]cluster.NodeRecord, error) {
@@ -1055,6 +1257,9 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 		}
 		var moved []selector
 		err = serialize(func() error {
+			if _, recoverErr := backend.recoverInterruptedMigrations(); recoverErr != nil {
+				return recoverErr
+			}
 			var drainErr error
 			moved, drainErr = backend.drainNode(nodeID, intent.TargetNode, true)
 			return drainErr
@@ -1070,6 +1275,39 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 			fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s completed after moving %d remaining branches\n", intent.OperationID, nodeID, len(moved))
 		}
 		return
+	}
+}
+
+func maintainElasticMigrationRecovery(backend *runtimeBackend, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error) {
+	interval := lease / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
+		var recovered []selector
+		err := serialize(func() error {
+			var recoverErr error
+			recovered, recoverErr = backend.recoverInterruptedMigrations()
+			return recoverErr
+		})
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: elastic migration recovery needs attention: %v\n", err)
+			}
+		} else if stderr != nil && len(recovered) != 0 {
+			fmt.Fprintf(stderr, "ttcd: recovered %d interrupted elastic migrations\n", len(recovered))
+		}
+		timer.Reset(interval)
 	}
 }
 

@@ -461,6 +461,14 @@ branches remain where they are. A clean `ttc daemon stop` consumes a completed
 intent so the node ID can later join normally. Without `--target`, TTC selects
 ready nodes by reported load.
 
+If a daemon disappears during an individual migration, TTC reconciles the
+fenced transaction automatically. A branch still owned by the source waits for
+that exact source incarnation's lease to expire, then is restored and retried
+there. Once ownership has moved it is never rolled back; the target restores
+and commits the branch, including when only the destination response was lost.
+Commands may be sent through any ready daemon, including the destination of a
+drain.
+
 `ttc node rebalance node-a` performs a smaller pressure-relief move using the
 configured memory targets and branch CoW accounting. Starting `ttcd` with
 `--cluster-auto-rebalance` runs this operation automatically when the node

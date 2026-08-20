@@ -239,6 +239,52 @@ func (s *PlacementStore) AdoptOwnerIncarnation(family, branch, owner, oldIncarna
 	return &result, nil
 }
 
+// RecoverSourceMigration rolls an interrupted migration back to its source
+// while fencing the placement to the source daemon's new incarnation. The
+// caller must first prove that the old owner incarnation is no longer live and
+// restore the branch to ResumeState. Combining rollback and incarnation
+// adoption in one durable transition prevents another crash from leaving a
+// stable placement owned by a dead daemon incarnation.
+func (s *PlacementStore) RecoverSourceMigration(family, branch, operation, owner, oldIncarnation, newIncarnation string, generation uint64, now time.Time) (*PlacementRecord, error) {
+	var result PlacementRecord
+	err := s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if record.State != PlacementMigrating || record.OperationID != operation || record.Generation != generation ||
+			record.OwnerNode != owner || record.OwnerIncarnation != oldIncarnation {
+			if record.OwnerNode == owner && record.OwnerIncarnation == newIncarnation &&
+				record.LastOperationID == operation && record.OperationID == "" {
+				result = record
+				return nil
+			}
+			return errors.New("placement migration operation no longer owns source recovery")
+		}
+		record.OwnerIncarnation = newIncarnation
+		record.Generation++
+		record.State = record.ResumeState
+		record.ResumeState = ""
+		record.LastOperationID = operation
+		record.OperationID = ""
+		record.TargetNode = ""
+		record.Revision++
+		record.UpdatedAt = now
+		if err := record.validate(); err != nil {
+			return err
+		}
+		if err := s.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // CommitMigration atomically changes the runnable owner and increments the
 // fencing generation. Retrying the committed operation is idempotent.
 func (s *PlacementStore) CommitMigration(family, branch, operation, target, targetIncarnation, physicalContainer, physicalBranch string, now time.Time) (*PlacementRecord, error) {

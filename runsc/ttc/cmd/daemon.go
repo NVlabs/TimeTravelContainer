@@ -2099,6 +2099,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 		if elasticRecord != nil {
+			go maintainElasticMigrationRecovery(targetBackend, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
+				unlock := server.lockDataRoot(server.dataRoot)
+				defer unlock()
+				server.reconcile(targetBackend)
+				return run()
+			})
 			go maintainElasticDrain(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
 				unlock := server.lockDataRoot(server.dataRoot)
 				defer unlock()

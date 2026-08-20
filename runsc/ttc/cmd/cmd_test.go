@@ -5145,6 +5145,22 @@ func TestElasticCommandsTakeMutationLock(t *testing.T) {
 	}
 }
 
+func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
+	for _, args := range [][]string{
+		{"node", "drain", "--target", "node-b", "node-a"},
+		{"node", "drain", "--_local", "--target=node-b", "node-a"},
+		{"node", "rebalance", "node-a"},
+	} {
+		owner, err := daemonCommandOwner(t.TempDir(), args)
+		if err != nil {
+			t.Fatalf("daemonCommandOwner(%v): %v", args, err)
+		}
+		if owner != "node-a" {
+			t.Errorf("daemonCommandOwner(%v)=%q, want node-a", args, owner)
+		}
+	}
+}
+
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	backend := &fakeBackend{}
 	var out bytes.Buffer

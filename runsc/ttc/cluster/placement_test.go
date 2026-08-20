@@ -97,3 +97,40 @@ func TestPlacementAdoptsRestartedOwnerIncarnation(t *testing.T) {
 		t.Fatal("stale incarnation adopted placement")
 	}
 }
+
+func TestPlacementRecoversInterruptedSourceMigration(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(3000, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-old", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrating, err := store.BeginMigration("family", "main", "node-a", "boot-old", created.Generation, "move-one", "node-b", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.RecoverSourceMigration("family", "main", "move-one", "node-a", "boot-old", "boot-new", migrating.Generation, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != PlacementRunning || recovered.OwnerIncarnation != "boot-new" || recovered.Generation != created.Generation+1 || recovered.LastOperationID != "move-one" {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+	// Retrying the exact recovery after an uncertain response is idempotent.
+	retried, err := store.RecoverSourceMigration("family", "main", "move-one", "node-a", "boot-old", "boot-new", migrating.Generation, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Revision != recovered.Revision || retried.Generation != recovered.Generation {
+		t.Fatalf("retry changed placement: got %+v, want %+v", retried, recovered)
+	}
+	if _, err := store.RecoverSourceMigration("family", "main", "move-two", "node-a", "boot-old", "boot-new", migrating.Generation, now.Add(4*time.Second)); err == nil {
+		t.Fatal("unrelated operation recovered placement")
+	}
+}

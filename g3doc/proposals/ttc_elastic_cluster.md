@@ -73,6 +73,17 @@ filesystem lease, and active operation ID. Dehydrated and exited branches are
 unplaced. Rehydration chooses a compatible node and acquires a new placement
 generation. Running and paused branches have exactly one owner.
 
+Interrupted migration recovery uses three durable facts: the placement record
+is the fenced transaction intent, the branch's persistent node ID says whether
+ownership cutover happened, and the branch lifecycle says whether runtime
+restoration is required. Before ownership cutover, recovery never touches an
+operation while its exact source incarnation retains a live lease; after lease
+loss, source-owned transactions restore and atomically roll back to the
+source's new incarnation. Once ownership has moved, it is never rolled back:
+the target may restore and commit immediately, even if the source remains
+online after losing a response. Restoration is verified in the Sentry before a
+stable placement is published.
+
 ```text
 joining -> ready -> pressured -> ready
                  \-> draining -> offline
@@ -219,13 +230,16 @@ families; stale and duplicate node incarnations are detected.
 **Implemented with conservative durable cutover.** `ttc migrate` currently
 dehydrates the selected branch, transfers its fenced ownership, and rehydrates
 it under the same identity on the destination. This is slower than the planned
-live sparse cutover, but never permits two runnable owners.
+live sparse cutover, but never permits two runnable owners. Daemons reconcile
+interrupted source- and target-owned transactions after lease expiry, including
+the boundaries immediately before and after ownership CAS.
 
 * Add daemon-to-daemon command proxying with placement-generation fencing.
 * Implement `ttc migrate CONTAINER@BRANCH --target NODE` without changing
   branch identity or parent.
 * Transfer the filesystem writer lease atomically and reconnect named exec
   sessions after cutover.
+* Recover and retry migration transactions after daemon loss. **Implemented.**
 
 Exit: repeated migration between two nodes preserves process and filesystem
 state, never runs both copies, and survives retries at every boundary.

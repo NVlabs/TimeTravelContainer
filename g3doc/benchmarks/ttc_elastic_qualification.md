@@ -14,7 +14,8 @@ whereas production nodes do not.
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
 - deterministic pressure placement and opt-in automatic rebalancing;
 - coalesced durable capacity requests when no placement is feasible;
-- durable drain recovery after daemon process loss; and
+- durable drain and per-branch migration recovery after daemon process loss;
+- callback-safe routing of node-wide mutations; and
 - remote live fork with 1 MiB bulk memory transfer through a shared NFS root.
 
 ## Local mixed-family migration
@@ -53,6 +54,39 @@ Every branch was reported on `node-b`, an exec routed through the restarted
 `complete`. A clean stop marked `node-a` offline and removed the completed
 intent. Removing the family and stopping `node-b` left no test processes or
 directory.
+
+The same crash/rejoin sequence was repeated with the entire TTC data root on a
+kernel NFSv3 mount (`hard`, TCP, 1 MiB reads/writes, synchronous export, no root
+squashing). Atomic intent replacement, advisory locking, lease expiry,
+incarnation fencing, automatic three-branch evacuation, routed execution, and
+completed-intent consumption all passed. The NFS mount, export, daemons,
+Sentries, followers, and temporary roots were removed afterward.
+
+### Partial-cutover and repeated-crash recovery
+
+A 13-branch BusyBox family ran a 128 MiB prefaulted memory workload while a
+drain moved it between two dynamically discovered daemons. The source daemon
+was killed after six ownership records had changed. One branch was caught
+after its placement entered `migrating` and its durable dehydration completed,
+but before the ownership compare-and-swap. On restart, the new source
+incarnation restored that branch while it remained fenced, atomically rolled
+the transaction back and adopted the placement, then resumed the drain.
+
+The reverse drain was interrupted after ownership had moved to the target but
+before the source received a successful response. After the old source lease
+expired, the target daemon rehydrated and committed that exact operation. A
+third kill after five additional committed branches verified that a durable
+drain resumes from the remaining ownership set rather than replaying completed
+moves. All 13 placements finished stable on one node and routed `exec true`
+succeeded for every branch.
+
+This test also exposed a distributed lifecycle-lock inversion: a client entry
+daemon proxied `node drain` while holding its own mutation lock, and the source
+called that daemon back to rehydrate a target. Node-wide mutations are now
+routed to their source before any local mutation lock is taken. A final
+13-branch reverse drain invoked through the destination completed in 25.932
+seconds. Cleanup removed the family, both daemons, Sentries, gofers, console
+followers, durable intents, and the test root.
 
 ## Pressure placement and cleanup
 
@@ -128,7 +162,8 @@ python3 tools/ttc/distributed_benchmark/benchmark.py \
 The configured `kvm-node` was unreachable (`No route to host`) during this
 iteration, and the development host has no `/dev/kvm`; therefore the latest
 elastic changes have not yet been rerun on the KVM platform. Physical
-multi-host network-delay/loss, node-loss injection during every migration
-boundary, an external provisioner's end-to-end response to the durable
+multi-host network-delay/loss, exhaustive node-loss injection at every
+instruction-level migration boundary, an external provisioner's end-to-end
+response to the durable
 capacity outbox, and long-running automatic
 rebalance/anti-oscillation tests also remain required before production use.
