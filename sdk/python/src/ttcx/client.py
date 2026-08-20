@@ -484,6 +484,26 @@ class Client:
             args.extend(["--target", target_node])
         return self.command([*args, source, *destinations])
 
+    def migrate(self, target: str, target_node: str) -> Result:
+        """Move a branch to another elastic-cluster node without renaming it."""
+        return self.command(["migrate", "--target", target_node, target])
+
+    def nodes(self) -> Any:
+        """Return dynamic cluster membership and current memory accounting."""
+        return self.command(["node", "ls", "--json"], check=True).json()
+
+    def drain_node(self, node: str, *, target_node: str | None = None) -> Result:
+        args = ["node", "drain"]
+        if target_node is not None:
+            args.extend(["--target", target_node])
+        return self.command([*args, node])
+
+    def rebalance_node(self, node: str, *, target_node: str | None = None) -> Any:
+        args = ["node", "rebalance"]
+        if target_node is not None:
+            args.extend(["--target", target_node])
+        return self.command([*args, node], check=True).json()
+
     def pause(self, target: str) -> Result:
         return self.command(["pause", target])
 

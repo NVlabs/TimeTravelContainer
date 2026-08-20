@@ -50,7 +50,8 @@ result.check()
 ```
 
 The convenience API covers run, start, named exec sessions, local and remote
-batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+batch fork, elastic migration/node management, pause/resume, dehydration,
+commit, resource accounting, filesystem
 diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
 wait, and removal. For example, one source pause can create several branches:
 
@@ -59,6 +60,9 @@ ttc.fork_many(
     "demo@main",
     ["candidate-a", "candidate-b"],
 ).check()
+ttc.migrate("demo@candidate-a", "node-b").check()
+print(ttc.nodes())
+print(ttc.rebalance_node("node-a", target_node="node-b"))
 ```
 
 Harness-oriented helpers return structured JSON or ordinary command results:

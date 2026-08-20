@@ -34,7 +34,8 @@ result.check();
 ```
 
 The convenience API covers run, start, named exec sessions, local and remote
-batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+batch fork, elastic migration/node management, pause/resume, dehydration,
+commit, resource accounting, filesystem
 diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
 wait, and removal. A coordinated local fan-out uses one source pause:
 
@@ -43,6 +44,9 @@ wait, and removal. A coordinated local fan-out uses one source pause:
   "demo@main",
   ["candidate-a", "candidate-b"],
 )).check();
+(await ttc.migrate("demo@candidate-a", "node-b")).check();
+console.log(await ttc.nodes());
+console.log(await ttc.rebalanceNode("node-a", "node-b"));
 ```
 
 Harness-oriented helpers are available directly:

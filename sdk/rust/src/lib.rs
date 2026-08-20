@@ -670,6 +670,43 @@ impl Client {
         self.command(args)
     }
 
+    /// Moves a branch to another elastic-cluster node without changing its identity.
+    pub fn migrate(&self, target: &str, target_node: &str) -> Result<CommandResult, Error> {
+        self.command(["migrate", "--target", target_node, target])
+    }
+
+    /// Returns the current dynamic cluster membership and memory accounting.
+    pub fn nodes(&self) -> Result<serde_json::Value, Error> {
+        let result = self.command(["node", "ls", "--json"])?;
+        checked_json(result)
+    }
+
+    pub fn drain_node(
+        &self,
+        node: &str,
+        target_node: Option<&str>,
+    ) -> Result<CommandResult, Error> {
+        let mut args = vec!["node".to_owned(), "drain".to_owned()];
+        if let Some(target_node) = target_node {
+            args.extend(["--target".to_owned(), target_node.to_owned()]);
+        }
+        args.push(node.to_owned());
+        self.command(args)
+    }
+
+    pub fn rebalance_node(
+        &self,
+        node: &str,
+        target_node: Option<&str>,
+    ) -> Result<serde_json::Value, Error> {
+        let mut args = vec!["node".to_owned(), "rebalance".to_owned()];
+        if let Some(target_node) = target_node {
+            args.extend(["--target".to_owned(), target_node.to_owned()]);
+        }
+        args.push(node.to_owned());
+        checked_json(self.command(args)?)
+    }
+
     pub fn pause(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["pause", target])
     }
@@ -1364,6 +1401,22 @@ mod tests {
                 Some("node-b"),
             )
             .unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn elastic_migration_uses_current_cli_shape() {
+        let path = temporary_socket("migrate");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["migrate", "--target", "node-b", "demo@main"])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path).migrate("demo@main", "node-b").unwrap();
         assert!(result.ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

@@ -171,6 +171,33 @@ class ClientTest(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_elastic_cluster_helpers_use_current_cli_shape(self):
+        def migrate_handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["migrate", "--target", "node-b", "demo@main"],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", migrate_handler)
+            try:
+                self.assertTrue(Client(daemon.path).migrate("demo@main", "node-b").ok)
+            finally:
+                daemon.close()
+
+        def nodes_handler(conn, request):
+            self.assertEqual(request["args"], ["node", "ls", "--json"])
+            conn.sendall(frame(b"O", b'[{"node_id":"node-a","state":"ready"}]\n'))
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", nodes_handler)
+            try:
+                self.assertEqual(Client(daemon.path).nodes()[0]["node_id"], "node-a")
+            finally:
+                daemon.close()
+
     def test_image_helpers_use_docker_compatible_command_shapes(self):
         with self.assertRaisesRegex(ValueError, "requires input or archive"):
             Client("/unused").load()

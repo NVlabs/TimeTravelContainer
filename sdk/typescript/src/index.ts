@@ -585,6 +585,30 @@ export class Client {
     ]);
   }
 
+  migrate(target: string, targetNode: string): Promise<Result> {
+    return this.command(["migrate", "--target", targetNode, target]);
+  }
+
+  async nodes<T = unknown>(): Promise<T> {
+    return (await this.command(["node", "ls", "--json"], { check: true })).json<T>();
+  }
+
+  drainNode(node: string, targetNode?: string): Promise<Result> {
+    return this.command([
+      "node", "drain",
+      ...(targetNode ? ["--target", targetNode] : []),
+      node,
+    ]);
+  }
+
+  async rebalanceNode<T = unknown>(node: string, targetNode?: string): Promise<T> {
+    return (await this.command([
+      "node", "rebalance",
+      ...(targetNode ? ["--target", targetNode] : []),
+      node,
+    ], { check: true })).json<T>();
+  }
+
   pause(target: string): Promise<Result> {
     return this.command(["pause", target]);
   }

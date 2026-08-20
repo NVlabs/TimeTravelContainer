@@ -39,7 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The convenience API covers run, start, named exec sessions, local and remote
-batch fork, pause/resume, dehydration, commit, resource accounting, filesystem
+batch fork, elastic migration/node management, pause/resume, dehydration,
+commit, resource accounting, filesystem
 diff, copy, terminal observations, checkpoint/restore, stop/restart, signal,
 wait, and removal. A coordinated local fan-out looks like:
 
@@ -50,6 +51,9 @@ ttc.fork_many(
     false,
     None,
 )?.check()?;
+ttc.migrate("demo@candidate-a", "node-b")?.check()?;
+println!("{}", ttc.nodes()?);
+println!("{}", ttc.rebalance_node("node-a", Some("node-b"))?);
 ```
 
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable

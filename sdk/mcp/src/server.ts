@@ -285,6 +285,58 @@ export function createServer(client = new Client()): McpServer {
       ),
   );
 
+  server.registerTool(
+    "ttc_migrate",
+    {
+      description: "Move a TTC branch to another elastic-cluster node without changing its identity.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        targetNode: z.string().describe("Destination TTC node ID"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target, targetNode }) =>
+      commandResponse(await client.migrate(target, targetNode)),
+  );
+
+  server.registerTool(
+    "ttc_nodes",
+    {
+      description: "List elastic TTC nodes, leases, states, and memory load.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async () => jsonResponse(await client.nodes()),
+  );
+
+  server.registerTool(
+    "ttc_drain_node",
+    {
+      description: "Cordon a node and evacuate all of its TTC branches.",
+      inputSchema: {
+        node: z.string(),
+        targetNode: z.string().optional().describe("Restrict evacuation to one node"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ node, targetNode }) =>
+      commandResponse(await client.drainNode(node, targetNode)),
+  );
+
+  server.registerTool(
+    "ttc_rebalance_node",
+    {
+      description: "Relieve a node's configured memory pressure using CoW-aware placement.",
+      inputSchema: {
+        node: z.string(),
+        targetNode: z.string().optional().describe("Restrict placement to one node"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ node, targetNode }) =>
+      jsonResponse(await client.rebalanceNode(node, targetNode)),
+  );
+
   for (const [name, description] of [
     ["pause", "Pause a running TTC branch."],
     ["resume", "Resume a paused TTC branch."],

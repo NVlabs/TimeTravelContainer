@@ -175,6 +175,29 @@ test("batch remote fork uses the current CLI shape", async () => {
   );
 });
 
+test("elastic cluster helpers use the current CLI shape", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, ["migrate", "--target", "node-b", "demo@main"]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      assert.equal((await new Client(path).migrate("demo@main", "node-b")).ok, true);
+    },
+  );
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, ["node", "ls", "--json"]);
+      socket.write(frame("O", Buffer.from('[{"node_id":"node-a","state":"ready"}]\n')));
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      const nodes = await new Client(path).nodes<Array<{ node_id: string }>>();
+      assert.equal(nodes[0]?.node_id, "node-a");
+    },
+  );
+});
+
 test("image helpers use Docker-compatible command shapes", async () => {
   assert.throws(() => new Client("/unused").load(), /requires input or archive/);
 

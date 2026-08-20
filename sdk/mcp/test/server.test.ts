@@ -77,6 +77,10 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     const listed = await client.listTools();
     assert(listed.tools.some((tool) => tool.name === "ttc_fork"));
     assert(listed.tools.some((tool) => tool.name === "ttc_fork_many"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_migrate"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_nodes"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_drain_node"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_rebalance_node"));
     assert(listed.tools.some((tool) => tool.name === "ttc_checkpoint"));
     assert(listed.tools.some((tool) => tool.name === "ttc_restore"));
     assert(listed.tools.some((tool) => tool.name === "ttc_image_load"));
