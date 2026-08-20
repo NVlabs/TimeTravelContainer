@@ -109,6 +109,23 @@ func releaseState(t *kernel.Task, state []pollState) {
 // pollBlock returns the remaining timeout, which is always 0 on a timeout; and 0 or
 // positive if interrupted by a signal.
 func pollBlock(t *kernel.Task, pfd []linux.PollFD, timeout time.Duration) (time.Duration, uintptr, error) {
+	// Record which descriptors this wait is for. select() reaches here too,
+	// having built the same array from its bitmaps, so both are covered.
+	// Without this a shell waiting at its prompt and one waiting on a pipe are
+	// the same syscall with nothing to tell them apart.
+	if len(pfd) != 0 {
+		fds := make([]int32, 0, len(pfd))
+		for i := range pfd {
+			fds = append(fds, pfd[i].FD)
+		}
+		timeoutNS := int64(-1)
+		if timeout >= 0 {
+			timeoutNS = int64(timeout)
+		}
+		t.SetWaitInfo("poll", fds, classifyWaitFDs(t, fds, nil, true), timeoutNS)
+		defer t.ClearWaitInfo()
+	}
+
 	var ch chan struct{}
 	if timeout != 0 {
 		ch = make(chan struct{}, 1)

@@ -112,6 +112,13 @@ type Task struct {
 	// gostateSeq is owned by the task goroutine.
 	gostateSeq sync.SeqCount `state:"nosave"`
 
+	// waitInfo describes the wait the task is currently blocked in, or nil.
+	// Set by the syscalls that wait on descriptor sets, so an observer can tell
+	// which descriptors are being awaited rather than only which syscall was
+	// called.
+	waitInfo   *TaskWaitInfo     `state:"nosave"`
+	waitInfoMu taskWaitInfoMutex `state:"nosave"`
+
 	// gostate is the current scheduling state of the task goroutine.
 	//
 	// gostate is owned by the task goroutine.

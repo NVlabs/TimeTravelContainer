@@ -52,6 +52,13 @@ go_template_instance(
 )
 
 declare_mutex(
+    name = "task_wait_info_mutex",
+    out = "task_wait_info_mutex.go",
+    package = "kernel",
+    prefix = "taskWaitInfo",
+)
+
+declare_mutex(
     name = "user_counters_mutex",
     out = "user_counters_mutex.go",
     package = "kernel",
@@ -343,6 +350,7 @@ go_library(
         "timekeeper_state.go",
         "timekeeper_tcpip_timer_mutex.go",
         "tty.go",
+        "task_wait_info_mutex.go",
         "user_counters_mutex.go",
         "uts_namespace.go",
         "vdso.go",

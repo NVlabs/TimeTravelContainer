@@ -660,7 +660,11 @@ func RecvMsg(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 		flags |= linux.MSG_DONTWAIT
 	}
 
+	// Same as recvfrom: a task parked in recvmsg is waiting, and who it is
+	// waiting for is the question.
+	t.SetWaitInfo("recv", []int32{fd}, classifyWaitFDs(t, []int32{fd}, []*vfs.FileDescription{file}, false), -1)
 	n, err := recvSingleMsg(t, s, msgPtr, flags, haveDeadline, deadline)
+	t.ClearWaitInfo()
 	return n, nil, err
 }
 
@@ -923,7 +927,14 @@ func recvFrom(t *kernel.Task, fd int32, bufPtr hostarch.Addr, bufLen uint64, fla
 		flags |= linux.MSG_DONTWAIT
 	}
 
+	// Recorded like a blocking read, for the same reason: a task parked here is
+	// a task waiting for something, and which something it is — a peer in this
+	// sandbox or a machine elsewhere — is the whole question an observer is
+	// trying to answer. Without this, a display server waiting on its client
+	// looks the same as one doing work.
+	t.SetWaitInfo("recv", []int32{fd}, classifyWaitFDs(t, []int32{fd}, []*vfs.FileDescription{file}, false), -1)
 	n, _, sender, senderLen, cm, e := s.RecvMsg(t, dst, int(flags), haveDeadline, deadline, nameLenPtr != 0, 0)
+	t.ClearWaitInfo()
 	cm.Release(t)
 	if e != nil {
 		return 0, linuxerr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)

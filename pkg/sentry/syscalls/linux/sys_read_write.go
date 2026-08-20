@@ -57,7 +57,7 @@ func Read(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		return 0, nil, err
 	}
 
-	n, err := read(t, file, dst, vfs.ReadOptions{})
+	n, err := read(t, fd, file, dst, vfs.ReadOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, HandleIOError(t, n != 0, err, linuxerr.ERESTARTSYS, "read", file)
 }
@@ -80,12 +80,12 @@ func Readv(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		return 0, nil, err
 	}
 
-	n, err := read(t, file, dst, vfs.ReadOptions{})
+	n, err := read(t, fd, file, dst, vfs.ReadOptions{})
 	t.IOUsage().AccountReadSyscall(n)
 	return uintptr(n), nil, HandleIOError(t, n != 0, err, linuxerr.ERESTARTSYS, "readv", file)
 }
 
-func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+func read(t *kernel.Task, fd int32, file *vfs.FileDescription, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	n, err := file.Read(t, dst, opts)
 	if !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 		return n, err
@@ -95,6 +95,13 @@ func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opt
 	if !allowBlock {
 		return n, err
 	}
+
+	// Record what is being read. A task blocked in read(2) is the oldest shape
+	// of "waiting for a person" there is, and the syscall number alone cannot
+	// tell it apart from a task blocked reading a socket, which means work is
+	// still in flight.
+	t.SetWaitInfo("read", []int32{fd}, classifyWaitFDs(t, []int32{fd}, []*vfs.FileDescription{file}, false), -1)
+	defer t.ClearWaitInfo()
 
 	// Register for notifications.
 	w, ch := waiter.NewChannelEntry(eventMaskRead)
@@ -236,7 +243,7 @@ func Preadv2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	}
 	var n int64
 	if offset == -1 {
-		n, err = read(t, file, dst, opts)
+		n, err = read(t, fd, file, dst, opts)
 	} else {
 		n, err = pread(t, file, dst, offset, opts)
 	}

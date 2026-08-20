@@ -513,3 +513,23 @@ func (ep *EpollInstance) ReadEvents(events []linux.EpollEvent, maxEvents int) []
 	}
 	return events
 }
+
+// InterestedFDs returns the descriptor numbers registered with ep, and the
+// file each one refers to, in matching order.
+//
+// A task blocked in epoll_wait is waiting on a *set*, so the syscall it called
+// says nothing about what it is actually waiting for: a REPL idle at its
+// prompt and one with an outstanding network request make the same call. The
+// registered numbers are what distinguishes them, and the files say what kind
+// of thing each number is — a terminal, a wakeup channel, a socket.
+func (ep *EpollInstance) InterestedFDs() ([]int32, []*FileDescription) {
+	ep.interestMu.Lock()
+	defer ep.interestMu.Unlock()
+	fds := make([]int32, 0, len(ep.interest))
+	files := make([]*FileDescription, 0, len(ep.interest))
+	for key := range ep.interest {
+		fds = append(fds, key.num)
+		files = append(files, key.file)
+	}
+	return fds, files
+}

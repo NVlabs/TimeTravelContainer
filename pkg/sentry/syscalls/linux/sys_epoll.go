@@ -135,6 +135,13 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 		return 0, nil, linuxerr.EINVAL
 	}
 
+	// Record what this wait is actually for. The syscall number says only that
+	// the task called epoll_wait; the registered descriptors and the deadline
+	// are what distinguish an idle prompt from an outstanding socket read.
+	interested, files := ep.InterestedFDs()
+	t.SetWaitInfo("epoll", interested, classifyWaitFDs(t, interested, files, true), timeoutInNanos)
+	defer t.ClearWaitInfo()
+
 	// Allocate space for a few events on the stack for the common case in
 	// which we don't have too many events.
 	var (

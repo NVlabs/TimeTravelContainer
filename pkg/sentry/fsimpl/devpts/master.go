@@ -161,7 +161,12 @@ func (mfd *masterFileDescription) InternalConsoleObservation() kernel.InternalCo
 		haveForeground = true
 	}
 	namespace := tg.PIDNamespace()
-	return mfd.t.ld.observation(foregroundPGID, haveForeground, int32(namespace.IDOfSession(tg.Session())))
+	observation := mfd.t.ld.observation(foregroundPGID, haveForeground, int32(namespace.IDOfSession(tg.Session())))
+	if haveForeground {
+		observation.TaskWaits = kernel.CollectTaskWaits(namespace, kernel.ProcessGroupID(foregroundPGID))
+		observation.OtherTaskWaits = kernel.CollectOtherTaskWaits(namespace, kernel.ProcessGroupID(foregroundPGID))
+	}
+	return observation
 }
 
 // InternalConsoleObservationEventRegister registers a transient control-plane

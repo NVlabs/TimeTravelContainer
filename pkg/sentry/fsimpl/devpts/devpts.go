@@ -384,3 +384,27 @@ type implStatFS struct{}
 func (*implStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
 	return vfs.GenericStatFS(linux.DEVPTS_SUPER_MAGIC), nil
 }
+
+// TerminalFDKind reports which end of a pseudoterminal fd is, if either.
+//
+// The two ends are opposite roles and must not be confused. A task waiting on
+// a replica is being driven — that is the shape of a program waiting for a
+// person. A task waiting on a master is doing the driving: apt opens one to run
+// dpkg under, and a program waiting to hear from its own child is working, not
+// resting. Reporting both as "a terminal" would call an install complete the
+// moment apt sat down to listen to dpkg.
+//
+// Exported because the file description types that carry the distinction are
+// private to this package.
+func TerminalFDKind(fd *vfs.FileDescription) string {
+	if fd == nil {
+		return ""
+	}
+	switch fd.Impl().(type) {
+	case *replicaFileDescription:
+		return "tty"
+	case *masterFileDescription:
+		return "pty-master"
+	}
+	return ""
+}

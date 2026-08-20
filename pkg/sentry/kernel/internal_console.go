@@ -73,6 +73,67 @@ type InternalConsoleObservation struct {
 	OutputBytes              uint64 `json:"output_bytes"`
 	InputFlushGeneration     uint64 `json:"input_flush_generation"`
 	ReplicaOpenCount         uint64 `json:"replica_open_count"`
+
+	// TaskWaits describes every task in the terminal's foreground process
+	// group: whether it is running, and if it is blocked, in which syscall.
+	//
+	// The counters above answer "is anyone interested in this terminal", which
+	// is not the same question as "is this program still working". A poll
+	// registration is counted the moment an fd joins an epoll set and stays
+	// counted while the process runs, so a runtime that registers stdin once at
+	// startup — node does — looks identical whether it is idle or busy. What
+	// separates them is whether any task is actually runnable, which only the
+	// Sentry can say.
+	TaskWaits []TaskWait `json:"task_waits"`
+
+	// OtherTaskWaits is every task in the sandbox outside the foreground
+	// group, in the same shape.
+	//
+	// A program can be waiting on another process in this sandbox — a tool on
+	// its display server, a client on a helper it started. From the foreground
+	// group alone, that is indistinguishable from waiting on a machine
+	// elsewhere. With the rest of the sandbox in view, an observer can ask
+	// whether anything here can move at all, which is the only version of the
+	// question that has a general answer.
+	OtherTaskWaits []TaskWait `json:"other_task_waits,omitempty"`
+}
+
+// TaskWait is one task's scheduling state, for deciding whether the foreground
+// program is waiting for input or still doing work.
+type TaskWait struct {
+	// TID and PID are as seen from the terminal session's PID namespace.
+	TID int32 `json:"tid"`
+	PID int32 `json:"pid"`
+	// State is one of "running-app", "running-sys", "blocked",
+	// "blocked-uninterruptible", "stopped", or "unknown". Only the two running
+	// states mean work is happening; the rest need Syscall to interpret.
+	State string `json:"state"`
+	// Syscall is the syscall number the task is executing, or -1 when it is not
+	// in one. A blocked task's syscall is what it is blocked *on*: a read, an
+	// epoll_wait, a futex, a nanosleep. That distinction is the whole point —
+	// a task parked in a futex is idle, one in nanosleep or reading a socket is
+	// not, and neither is visible from the terminal's own counters.
+	Syscall int32 `json:"syscall"`
+	// Awaiting is "epoll", "poll", or "select" when the task is blocked on a
+	// set of descriptors, and empty otherwise.
+	Awaiting string `json:"awaiting,omitempty"`
+	// AwaitedFDs are the descriptors in that set, as the task numbers them.
+	AwaitedFDs []int32 `json:"awaited_fds,omitempty"`
+	// AwaitedKinds says what each of those descriptors is, in the same order:
+	// "tty", "eventfd", "self-pipe", "pipe", "timerfd", "epoll", "socket",
+	// "unix-socket", "other", or "closed".
+	//
+	// The number alone cannot settle the question this exists to answer. What
+	// separates a program that has finished from one that has not is who is
+	// able to make its descriptors ready: a terminal waits for a person, an
+	// eventfd or a self-pipe waits for a thread of this same process, and a
+	// socket waits for a machine somewhere else that is already working on a
+	// reply. Only the last is proof that the program is not done.
+	AwaitedKinds []string `json:"awaited_kinds,omitempty"`
+	// TimeoutNS is the wait's deadline, or -1 if it is indefinite. A finite
+	// deadline means something is expected to happen without any descriptor
+	// becoming ready — a pending timer — which an idle prompt never has.
+	TimeoutNS int64 `json:"timeout_ns,omitempty"`
 }
 
 // InternalConsole owns either the control-side peers of three Sentry-internal
@@ -168,9 +229,48 @@ func (k *Kernel) WatchInternalConsole(ctx context.Context, id string, coalesce, 
 		observation.Terminal = true
 		return observation
 	}
-	semantic := func(observation InternalConsoleObservation) InternalConsoleObservation {
-		observation.MonotonicNS = 0
-		return observation
+	// Compared field by field rather than with ==, because the task states are a
+	// slice and a struct containing one is not comparable. Timestamps are
+	// excluded so a heartbeat does not read as a change.
+	sameSemantics := func(a, b InternalConsoleObservation) bool {
+		// Field by field: comparability is a property of the type, so clearing
+		// the slice does not make the struct comparable.
+		if a.Version != b.Version ||
+			a.SessionEpoch != b.SessionEpoch ||
+			a.Terminal != b.Terminal ||
+			a.InputPendingBytes != b.InputPendingBytes ||
+			a.InputReadable != b.InputReadable ||
+			a.InputConsumedBytes != b.InputConsumedBytes ||
+			a.ReplicaBlockedReaders != b.ReplicaBlockedReaders ||
+			a.ReplicaReadWaiters != b.ReplicaReadWaiters ||
+			a.Canonical != b.Canonical ||
+			a.Echo != b.Echo ||
+			a.TermiosGeneration != b.TermiosGeneration ||
+			a.ForegroundPGID != b.ForegroundPGID ||
+			a.ForegroundPGIDGeneration != b.ForegroundPGIDGeneration ||
+			a.SessionLeaderPID != b.SessionLeaderPID ||
+			a.OutputBytes != b.OutputBytes ||
+			a.InputFlushGeneration != b.InputFlushGeneration ||
+			a.ReplicaOpenCount != b.ReplicaOpenCount {
+			return false
+		}
+		aTasks, bTasks := a.TaskWaits, b.TaskWaits
+		if len(aTasks) != len(bTasks) {
+			return false
+		}
+		// Order is the map iteration order of the PID namespace, so it is not
+		// stable between snapshots; compare as a set keyed by TID.
+		byTID := make(map[int32]TaskWait, len(aTasks))
+		for _, task := range aTasks {
+			byTID[task.TID] = task
+		}
+		for _, task := range bTasks {
+			other, ok := byTID[task.TID]
+			if !ok || !sameTaskWait(other, task) {
+				return false
+			}
+		}
+		return true
 	}
 	last := observe()
 	if err := emit(last); err != nil {
@@ -217,7 +317,7 @@ func (k *Kernel) WatchInternalConsole(ctx context.Context, id string, coalesce, 
 			case <-coalesceTimer.C:
 			}
 			current := observe()
-			if semantic(current) == semantic(last) {
+			if sameSemantics(current, last) {
 				continue
 			}
 			if err := emit(current); err != nil {
@@ -674,4 +774,176 @@ func (k *Kernel) releaseInternalConsoles(ctx context.Context) {
 	for _, console := range consoles {
 		releaseInternalConsole(ctx, console)
 	}
+}
+
+// CollectTaskWaits reports the scheduling state of every task in the given
+// foreground process group, as seen from ns.
+//
+// Scoped to the foreground group rather than the whole session because that is
+// the program the terminal is talking to. A backgrounded job still running is
+// not a reason to say the foreground program is busy, and a shell's other
+// children are not the shell.
+func CollectTaskWaits(ns *PIDNamespace, pgid ProcessGroupID) []TaskWait {
+	return collectTaskWaits(ns, pgid, false)
+}
+
+// CollectOtherTaskWaits reports every task outside the foreground group.
+//
+// The foreground group answers "is this program working". It cannot answer
+// "will anything happen if nobody types", because a program can be waiting on
+// another process in the same sandbox — a tool on its display server, a client
+// on a helper. Those are not in the group, and without them a waiting program
+// and a working one look the same.
+//
+// Reported separately rather than merged, so a reader that knows nothing about
+// this field sees exactly what it saw before.
+func CollectOtherTaskWaits(ns *PIDNamespace, pgid ProcessGroupID) []TaskWait {
+	return collectTaskWaits(ns, pgid, true)
+}
+
+func collectTaskWaits(ns *PIDNamespace, pgid ProcessGroupID, others bool) []TaskWait {
+	if ns == nil || pgid == 0 {
+		return nil
+	}
+	// One lock, held across the whole walk. The exported ID helpers each take
+	// this same lock, so calling them from inside would recursively acquire it
+	// for reading — which deadlocks the moment a writer is queued between the
+	// two acquisitions.
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+
+	var waits []TaskWait
+	for tg, tgid := range ns.tgids {
+		pg := tg.processGroup
+		inGroup := pg != nil && ns.pgids[pg] == pgid
+		if inGroup == others {
+			continue
+		}
+		for t := tg.tasks.Front(); t != nil; t = t.Next() {
+			wait := TaskWait{
+				TID:     int32(ns.tids[t]),
+				PID:     int32(tgid),
+				State:   taskWaitState(t.TaskGoroutineState()),
+				Syscall: taskWaitSyscall(t),
+			}
+			if info := t.WaitInfo(); info != nil {
+				wait.Awaiting = info.Kind
+				wait.AwaitedFDs = info.FDs
+				wait.AwaitedKinds = info.FDKinds
+				wait.TimeoutNS = info.TimeoutNS
+			}
+			waits = append(waits, wait)
+		}
+	}
+	return waits
+}
+
+func taskWaitState(state TaskGoroutineState) string {
+	switch state {
+	case TaskGoroutineRunningApp:
+		return "running-app"
+	case TaskGoroutineRunningSys:
+		return "running-sys"
+	case TaskGoroutineBlockedInterruptible:
+		return "blocked"
+	case TaskGoroutineBlockedUninterruptible:
+		return "blocked-uninterruptible"
+	case TaskGoroutineStopped:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// taskWaitSyscall reports the syscall a task is executing, or -1.
+//
+// Only meaningful for a task that is not running application code: while it
+// runs, the register holding the syscall number is the application's to use and
+// says nothing.
+func taskWaitSyscall(t *Task) int32 {
+	if t.TaskGoroutineState() == TaskGoroutineRunningApp {
+		return -1
+	}
+	arch := t.Arch()
+	if arch == nil {
+		return -1
+	}
+	return int32(arch.SyscallNo())
+}
+
+// TaskWaitInfo describes the wait a task is currently blocked in.
+//
+// The syscall number alone is not enough: epoll_wait and poll wait on a set of
+// descriptors, so a program idle at its terminal and one with an outstanding
+// socket read make the same call. What separates them is which descriptors are
+// in the set, and whether the wait has a deadline — a pending timer makes it
+// finite, an idle prompt leaves it indefinite.
+type TaskWaitInfo struct {
+	// Kind is "epoll", "poll", or "select".
+	Kind string
+	// FDs are the descriptor numbers being awaited, as the task numbers them.
+	FDs []int32
+	// FDKinds names what each of those descriptors is, in the same order.
+	FDKinds []string
+	// TimeoutNS is the wait's deadline in nanoseconds, or -1 if indefinite.
+	TimeoutNS int64
+}
+
+// SetWaitInfo records what t is about to block on. Cleared by ClearWaitInfo.
+func (t *Task) SetWaitInfo(kind string, fds []int32, fdKinds []string, timeoutNS int64) {
+	t.waitInfoMu.Lock()
+	t.waitInfo = &TaskWaitInfo{Kind: kind, FDs: fds, FDKinds: fdKinds, TimeoutNS: timeoutNS}
+	t.waitInfoMu.Unlock()
+}
+
+// ClearWaitInfo forgets what t was blocked on.
+func (t *Task) ClearWaitInfo() {
+	t.waitInfoMu.Lock()
+	t.waitInfo = nil
+	t.waitInfoMu.Unlock()
+}
+
+// WaitInfo returns what t is blocked on, or nil.
+func (t *Task) WaitInfo() *TaskWaitInfo {
+	t.waitInfoMu.Lock()
+	defer t.waitInfoMu.Unlock()
+	return t.waitInfo
+}
+
+// sameTaskWait compares two task observations, including the awaited set.
+//
+// The descriptors are compared as a set: they come from a map, so their order
+// is not stable between snapshots and comparing them in order would report a
+// change on every sample.
+func sameTaskWait(a, b TaskWait) bool {
+	if a.TID != b.TID || a.PID != b.PID || a.State != b.State || a.Syscall != b.Syscall ||
+		a.Awaiting != b.Awaiting || a.TimeoutNS != b.TimeoutNS || len(a.AwaitedFDs) != len(b.AwaitedFDs) {
+		return false
+	}
+	seen := make(map[awaitedFD]int, len(a.AwaitedFDs))
+	for i, fd := range a.AwaitedFDs {
+		seen[awaitedFD{fd, awaitedKind(a, i)}]++
+	}
+	for i, fd := range b.AwaitedFDs {
+		key := awaitedFD{fd, awaitedKind(b, i)}
+		seen[key]--
+		if seen[key] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// awaitedFD pairs a descriptor number with what it is, so that a number reused
+// for something else counts as a change rather than as the same wait.
+type awaitedFD struct {
+	num  int32
+	kind string
+}
+
+func awaitedKind(wait TaskWait, i int) string {
+	if i < len(wait.AwaitedKinds) {
+		return wait.AwaitedKinds[i]
+	}
+	return ""
 }
