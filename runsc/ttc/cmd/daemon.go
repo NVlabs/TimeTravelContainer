@@ -100,6 +100,10 @@ type daemonRequest struct {
 	Args           []string          `json:"args,omitempty"`
 	Stdin          bool              `json:"stdin,omitempty"`
 	Route          []string          `json:"route,omitempty"`
+	PlacementNode  string            `json:"placement_node,omitempty"`
+	// DistributedLeaf marks a coordinator-generated owner-local command. It
+	// prevents a family mutation from being expanded again on the destination.
+	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
 }
 
 type daemonServer struct {
@@ -813,6 +817,24 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			}
 			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", targetBranch)
 			if statusErr != nil {
+				// Process-free dehydration intentionally removes the target Kernel
+				// while exporting all of its pages. Do not confuse that durable
+				// lifecycle transition with an unexpected target exit.
+				if info, loadErr := r.backend.containerStore().LoadContainer(containerID); loadErr == nil {
+					if branch, branchErr := persistentBranchInfo(info, targetBranch); branchErr == nil {
+						switch normalizeLifecycleState(branch.State) {
+						case "dehydrating":
+							failedPolls = 0
+							continue
+						case "dehydrated":
+							if tx.State == cluster.TransactionIndependent {
+								return
+							}
+							failedPolls = 0
+							continue
+						}
+					}
+				}
 				failedPolls++
 				if failedPolls < 3 {
 					continue
@@ -2332,11 +2354,40 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(errors.New("empty command"))
 		return
 	}
+	if s.distributedSource != nil && s.clusterCapabilities != nil && !request.DistributedLeaf {
+		handled, status, stdout, stderr, err := s.executeDistributedFamilyMutation(request)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		if handled {
+			writeDaemonBufferedResult(conn, &writeMu, stdout, stderr, status)
+			return
+		}
+	}
 	if s.distributedSource != nil && s.clusterCapabilities != nil {
 		owner, err := daemonCommandOwner(s.dataRoot, request.Args)
 		if err != nil {
 			writeError(err)
 			return
+		}
+		if owner == "" && daemonCommandNeedsPlacementAdmission(request.Args) {
+			if request.PlacementNode != "" {
+				owner = request.PlacementNode
+			} else {
+				records, listErr := s.clusterDirectory.List()
+				if listErr != nil {
+					writeError(fmt.Errorf("selecting cluster placement: %w", listErr))
+					return
+				}
+				selected, selectErr := selectAdmissionNode(records, *s.clusterCapabilities, time.Now())
+				if selectErr != nil {
+					writeError(selectErr)
+					return
+				}
+				owner = selected.NodeID
+				request.PlacementNode = owner
+			}
 		}
 		if owner != "" && owner != s.clusterCapabilities.NodeID {
 			if slices.Contains(request.Route, owner) || slices.Contains(request.Route, s.clusterCapabilities.NodeID) {
@@ -2500,7 +2551,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "_purge-runtime", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls"
@@ -2691,6 +2742,10 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	if s.reconciled[key] {
 		return
 	}
+	// A daemon may have died after branch ownership moved but before deleting
+	// its old physical shell. Reclaim only runtimes and branches this node no
+	// longer owns; shared metadata remains authoritative.
+	_ = backend.cleanupNonOwnedRuntimeBranches()
 	// listFamilies reconciles stale persisted running/paused state against runsc.
 	families, err := backend.listFamilies()
 	if err != nil {

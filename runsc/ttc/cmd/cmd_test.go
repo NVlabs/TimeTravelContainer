@@ -5161,6 +5161,77 @@ func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 	}
 }
 
+func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
+	capabilities := func(node string) cluster.Capabilities {
+		return cluster.Capabilities{
+			NodeID: node, ProtocolMin: 1, ProtocolMax: 1, BuildID: "test", Architecture: "amd64",
+			BasePageSize: 4096, MaxTransferSize: 2 << 20, RepositoryID: "shared",
+			Features: []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
+		}
+	}
+	now := time.Unix(7000, 0).UTC()
+	record := func(node string, current, target, reserved uint64) cluster.NodeRecord {
+		return cluster.NodeRecord{
+			NodeID: node, Incarnation: "boot-" + node, State: cluster.NodeReady,
+			Capabilities: capabilities(node), MemoryCurrentBytes: current, MemoryTargetBytes: target,
+			IncomingReservedBytes: reserved, LeaseExpiresAt: now.Add(time.Minute),
+		}
+	}
+	local := capabilities("node-a")
+	incompatible := record("node-c", 1<<30, 8<<30, 0)
+	incompatible.Capabilities.Architecture = "arm64"
+	selected, err := selectAdmissionNode([]cluster.NodeRecord{
+		record("node-a", 6<<30, 8<<30, 0),
+		record("node-b", 2<<30, 8<<30, 1<<30),
+		incompatible,
+	}, local, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.NodeID != "node-b" {
+		t.Fatalf("selected %q, want least-loaded compatible node-b", selected.NodeID)
+	}
+	full := record("node-b", 7<<30, 8<<30, 1<<30)
+	if selected, err := selectAdmissionNode([]cluster.NodeRecord{full}, local, now); err == nil {
+		t.Fatalf("selected full node %+v", selected)
+	}
+}
+
+func TestParseDistributedFamilyMutation(t *testing.T) {
+	for _, test := range []struct {
+		args    []string
+		prefix  []string
+		targets []string
+		handle  bool
+	}{
+		{args: []string{"rm", "-fv", "demo"}, prefix: []string{"rm", "-fv"}, targets: []string{"demo"}, handle: true},
+		{args: []string{"stop", "--time", "2", "demo", "peer@main"}, prefix: []string{"stop", "--time", "2"}, targets: []string{"demo", "peer@main"}, handle: true},
+		{args: []string{"dehydrate", "demo"}, prefix: []string{"dehydrate"}, targets: []string{"demo"}, handle: true},
+		{args: []string{"stop", "demo@main"}, handle: false},
+		{args: []string{"pause", "demo"}, handle: false},
+		{args: []string{"rm", "--unknown", "demo"}, handle: false},
+	} {
+		got, ok := parseDistributedFamilyMutation(test.args)
+		if ok != test.handle {
+			t.Errorf("parseDistributedFamilyMutation(%v) handled=%v, want %v", test.args, ok, test.handle)
+			continue
+		}
+		if ok && (!slices.Equal(got.prefix, test.prefix) || !slices.Equal(got.targets, test.targets)) {
+			t.Errorf("parseDistributedFamilyMutation(%v)=%+v, want prefix=%v targets=%v", test.args, got, test.prefix, test.targets)
+		}
+	}
+	first := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"})
+	if _, err := daemonMutationPath(t.TempDir(), first); err != nil {
+		t.Fatalf("child request ID %q is not a valid daemon mutation ID: %v", first, err)
+	}
+	if second := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"}); first != second {
+		t.Fatalf("child request ID is not deterministic: %q != %q", first, second)
+	}
+	if other := distributedChildRequestID("parent", 3, []string{"stop", "demo@main"}); first == other {
+		t.Fatalf("different child operations collided at %q", first)
+	}
+}
+
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	backend := &fakeBackend{}
 	var out bytes.Buffer

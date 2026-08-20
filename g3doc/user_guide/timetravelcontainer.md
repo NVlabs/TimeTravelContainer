@@ -430,6 +430,11 @@ A client attached to any cluster daemon can list membership and memory load:
 ttc node ls
 ```
 
+New containers are admitted on the compatible ready node with the lowest
+normalized memory load, including outstanding placement reservations. You may
+therefore send `ttc run`, `ttc create`, and restore commands to any ready
+daemon; the chosen node is transparent in the normal CLI view.
+
 Commands naming `CONTAINER@BRANCH` are routed to the recorded owner. Move a
 branch without changing its family, branch name, filesystem identity, or
 process state with:
@@ -437,6 +442,10 @@ process state with:
 ```shell
 ttc migrate --target node-b web@candidate-a
 ```
+
+Family-wide `ttc stop FAMILY`, `ttc dehydrate FAMILY`, and `ttc rm FAMILY`
+also work when the family's branches are spread across nodes. TTC coordinates
+the owner-local operations and prints one result for the original family.
 
 The current migration path uses a durable conservative cutover: it dehydrates
 the branch, transfers its fenced ownership, then rehydrates it on the target.

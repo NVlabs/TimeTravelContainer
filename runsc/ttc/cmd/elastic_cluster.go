@@ -17,7 +17,9 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -384,6 +386,10 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 
 func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, string, error) {
 	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: requestID, Args: append([]string(nil), args...)}
+	return executeRemoteDaemonRequest(ctx, peer, request)
+}
+
+func executeRemoteDaemonRequest(ctx context.Context, peer *cluster.Client, request daemonRequest) (int, string, string, error) {
 	encoded, err := json.Marshal(&request)
 	if err != nil {
 		return 0, "", "", err
@@ -416,6 +422,206 @@ func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, reque
 		return 0, stdout.String(), diagnostic.String(), errors.New("remote daemon returned no status")
 	}
 	return status, stdout.String(), diagnostic.String(), nil
+}
+
+type distributedFamilyMutation struct {
+	prefix  []string
+	targets []string
+}
+
+// parseDistributedFamilyMutation recognizes the deliberately small set of
+// commands whose unqualified operands mean "all branches in this family".
+// It follows flag.FlagSet's ordering rule: options precede positional targets.
+func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, bool) {
+	if len(args) < 2 || (args[0] != "rm" && args[0] != "stop" && args[0] != "dehydrate") {
+		return distributedFamilyMutation{}, false
+	}
+	i := 1
+	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
+		arg := args[i]
+		switch args[0] {
+		case "rm":
+			if arg != "-f" && arg != "--force" && arg != "-v" && arg != "--volumes" && arg != "-fv" && arg != "-vf" {
+				return distributedFamilyMutation{}, false
+			}
+		case "stop":
+			if strings.HasPrefix(arg, "--time=") || strings.HasPrefix(arg, "--timeout=") || strings.HasPrefix(arg, "-t=") {
+				break
+			}
+			if arg != "--time" && arg != "--timeout" && arg != "-t" {
+				return distributedFamilyMutation{}, false
+			}
+			i++
+			if i >= len(args) {
+				return distributedFamilyMutation{}, false
+			}
+		case "dehydrate":
+			return distributedFamilyMutation{}, false
+		}
+		i++
+	}
+	if i == len(args) {
+		return distributedFamilyMutation{}, false
+	}
+	hasFamily := false
+	for _, target := range args[i:] {
+		if !strings.Contains(target, "@") {
+			hasFamily = true
+		}
+	}
+	if !hasFamily {
+		return distributedFamilyMutation{}, false
+	}
+	return distributedFamilyMutation{prefix: append([]string(nil), args[:i]...), targets: append([]string(nil), args[i:]...)}, true
+}
+
+func distributedChildRequestID(parent string, ordinal int, args []string) string {
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", parent, ordinal, strings.Join(args, "\x00"))))
+	return hex.EncodeToString(hash[:16])
+}
+
+// executeDistributedFamilyMutation coordinates family-wide lifecycle changes
+// before any daemon takes its process-local lifecycle lock. This is necessary
+// once one logical family can have physical runtimes on multiple nodes.
+func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (bool, int, []byte, []byte, error) {
+	mutation, ok := parseDistributedFamilyMutation(request.Args)
+	if !ok {
+		return false, 0, nil, nil, nil
+	}
+	store := ttcbundle.Store{Root: s.dataRoot}
+	type child struct {
+		node string
+		args []string
+	}
+	var children []child
+	for _, operand := range mutation.targets {
+		if strings.Contains(operand, "@") {
+			selected, err := parseSelector(operand)
+			if err != nil {
+				return true, 1, nil, nil, fmt.Errorf("invalid target %q: %w", operand, err)
+			}
+			info, err := store.LoadContainer(selected.container)
+			if err != nil {
+				return true, 1, nil, nil, err
+			}
+			node := info.BranchNodeID(selected.branch)
+			if node == "" {
+				node = s.clusterCapabilities.NodeID
+			}
+			children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), operand)})
+			continue
+		}
+		info, err := store.LoadContainer(operand)
+		if err != nil {
+			return true, 1, nil, nil, err
+		}
+		branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
+		sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
+		if len(branches) == 0 {
+			return true, 1, nil, nil, fmt.Errorf("container %q has no branches", operand)
+		}
+		finalNode := info.BranchNodeID(branches[len(branches)-1].ID)
+		if finalNode == "" {
+			finalNode = s.clusterCapabilities.NodeID
+		}
+		formerOwners := make(map[string]struct{})
+		for i, branch := range branches {
+			node := info.BranchNodeID(branch.ID)
+			if node == "" {
+				node = s.clusterCapabilities.NodeID
+			}
+			target := operand + "@" + branch.ID
+			// The final rm must run as a family removal so it can reclaim the
+			// family record and anonymous volumes after every peer runtime is gone.
+			if request.Args[0] == "rm" && i == len(branches)-1 {
+				target = operand
+			} else if request.Args[0] == "rm" && node != finalNode {
+				formerOwners[node] = struct{}{}
+			}
+			children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), target)})
+		}
+		if request.Args[0] == "rm" && len(formerOwners) != 0 {
+			// Run owner-local branch deletes first, then purge physical shells on
+			// former owners, and only then let the final owner delete metadata.
+			final := children[len(children)-1]
+			children = children[:len(children)-1]
+			owners := make([]string, 0, len(formerOwners))
+			for node := range formerOwners {
+				owners = append(owners, node)
+			}
+			sort.Strings(owners)
+			for _, node := range owners {
+				children = append(children, child{node: node, args: []string{"_purge-runtime", info.ID}})
+			}
+			children = append(children, final)
+		}
+	}
+
+	var diagnostic bytes.Buffer
+	for i, child := range children {
+		childRequest := daemonRequest{
+			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, i, child.args),
+			Options: request.Options, Args: child.args, ClientTERM: request.ClientTERM,
+			DistributedLeaf: true,
+		}
+		var status int
+		var stdout, stderr string
+		var err error
+		if child.node == s.clusterCapabilities.NodeID {
+			status, stdout, stderr, err = s.executeLocalDistributedCommand(childRequest)
+		} else {
+			peer, peerErr := s.distributedSource.peer(child.node, false)
+			if peerErr != nil {
+				return true, 1, nil, diagnostic.Bytes(), peerErr
+			}
+			status, stdout, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, childRequest)
+		}
+		_ = stdout // Child commands print branch-local selectors; the coordinator prints original operands.
+		diagnostic.WriteString(stderr)
+		if err != nil {
+			return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("executing family operation on node %q: %w", child.node, err)
+		}
+		if status != 0 {
+			return true, status, nil, diagnostic.Bytes(), nil
+		}
+	}
+	var output strings.Builder
+	for _, operand := range mutation.targets {
+		fmt.Fprintln(&output, operand)
+	}
+	return true, 0, []byte(output.String()), diagnostic.Bytes(), nil
+}
+
+func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (int, string, string, error) {
+	opts := s.optionsFromRequest(request.Options)
+	var stdout, stderr bytes.Buffer
+	backend := directBackend(opts, strings.NewReader(""), &stdout, &stderr)
+	s.configureVolumeBackend(backend)
+	backend.consoleSidecars = s
+	backend.distributedSource = s.distributedSource
+	backend.nodeID = s.clusterCapabilities.NodeID
+	s.reconcile(backend)
+	unlock := s.lockMutation(opts.dataRoot, request.Args)
+	defer unlock()
+	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
+		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
+		if err != nil {
+			return 1, stdout.String(), stderr.String(), err
+		}
+		if replay {
+			return record.Status, string(record.Stdout), string(record.Stderr), nil
+		}
+		status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
+		s.recordCommandEvents(opts.dataRoot, request.Args, status)
+		record, err = completeDaemonMutation(opts.dataRoot, record, status, stdout.Bytes(), stderr.Bytes())
+		if err != nil {
+			return 1, stdout.String(), stderr.String(), err
+		}
+		return record.Status, string(record.Stdout), string(record.Stderr), nil
+	}
+	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
+	s.recordCommandEvents(opts.dataRoot, request.Args, status)
+	return status, stdout.String(), stderr.String(), nil
 }
 
 func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (string, error) {
@@ -554,7 +760,103 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
 		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
 	}
+	if err := b.releaseMigratedSourceRuntime(info.ID, target.branch); err != nil && b.stderr != nil {
+		// Ownership and target execution are already committed. A stale source
+		// shell is non-runnable, so never roll back the cutover for cleanup.
+		fmt.Fprintf(b.stderr, "ttc: warning: retaining fenced source runtime for %s: %v\n", target, err)
+	}
 	return nil
+}
+
+func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID string) error {
+	info, err := b.containerStore().LoadContainer(containerID)
+	if err != nil {
+		return err
+	}
+	runtimes, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	physicalPeers := 0
+	found := false
+	for _, family := range runtimes {
+		if family.ID != info.ID {
+			continue
+		}
+		for _, branch := range family.Branches {
+			if branch.ID == branchID {
+				found = true
+			} else {
+				physicalPeers++
+			}
+		}
+		break
+	}
+	if !found {
+		return nil
+	}
+	if physicalPeers == 0 {
+		return b.purgeRuntime(info.ID)
+	}
+	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
+		families, listErr := b.listRuntimeFamilies()
+		if listErr != nil {
+			return err
+		}
+		for _, family := range families {
+			if family.ID != info.ID {
+				continue
+			}
+			for _, branch := range family.Branches {
+				if branch.ID == branchID {
+					return err
+				}
+			}
+		}
+		// An idempotent retry may observe that the branch is already absent.
+		return nil
+	}
+	return nil
+}
+
+func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
+	if b.nodeID == "" || b.dataRoot == "" {
+		return nil
+	}
+	runtimes, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, runtimeFamily := range runtimes {
+		info, err := b.containerStore().LoadContainer(runtimeFamily.ID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				result = errors.Join(result, b.purgeRuntime(runtimeFamily.ID))
+			}
+			continue
+		}
+		physicalLocalOwned := false
+		for _, branch := range runtimeFamily.Branches {
+			if info.BranchNodeID(branch.ID) == b.nodeID {
+				physicalLocalOwned = true
+				break
+			}
+		}
+		if !physicalLocalOwned {
+			result = errors.Join(result, b.purgeRuntime(info.ID))
+			continue
+		}
+		for _, runtimeBranch := range runtimeFamily.Branches {
+			if info.BranchNodeID(runtimeBranch.ID) == b.nodeID {
+				continue
+			}
+			if _, err := b.command("timetravel", info.ID, "destroy", runtimeBranch.ID); err != nil {
+				result = errors.Join(result, fmt.Errorf("purging non-owned runtime branch %s@%s: %w", info.Name, runtimeBranch.ID, err))
+			}
+		}
+	}
+	return result
 }
 
 // recoverInterruptedMigrations reconciles durable migration intent after the
@@ -722,6 +1024,36 @@ func nodeLoadLess(left, right cluster.NodeRecord) bool {
 		return leftBytes < rightBytes
 	}
 	return left.NodeID < right.NodeID
+}
+
+func selectAdmissionNode(records []cluster.NodeRecord, local cluster.Capabilities, now time.Time) (cluster.NodeRecord, error) {
+	var candidates []cluster.NodeRecord
+	var incompatibilities error
+	for _, record := range records {
+		if !record.AcceptsPlacement(now) {
+			continue
+		}
+		if record.MemoryTargetBytes != 0 {
+			if record.IncomingReservedBytes >= record.MemoryTargetBytes || record.MemoryCurrentBytes >= record.MemoryTargetBytes-record.IncomingReservedBytes {
+				continue
+			}
+		}
+		if record.NodeID != local.NodeID {
+			if _, err := cluster.Negotiate(local, record.Capabilities); err != nil {
+				incompatibilities = errors.Join(incompatibilities, fmt.Errorf("node %s: %w", record.NodeID, err))
+				continue
+			}
+		}
+		candidates = append(candidates, record)
+	}
+	if len(candidates) == 0 {
+		if incompatibilities != nil {
+			return cluster.NodeRecord{}, fmt.Errorf("no compatible ready cluster node accepts new work: %w", incompatibilities)
+		}
+		return cluster.NodeRecord{}, errors.New("no ready cluster node has capacity for new work")
+	}
+	sort.Slice(candidates, func(i, j int) bool { return nodeLoadLess(candidates[i], candidates[j]) })
+	return candidates[0], nil
 }
 
 func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, error) {

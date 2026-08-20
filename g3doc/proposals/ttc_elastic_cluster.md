@@ -108,6 +108,11 @@ carry the original request ID, expected placement generation, terminal
 metadata, and framed stdin/stdout. The owner rejects a stale generation. Named
 exec sessions and retained output allow reconnection after migration.
 
+Family-wide `stop`, `dehydrate`, and `rm` are coordinator operations. The entry
+daemon expands them into idempotent owner-local mutations before taking a
+local lifecycle lock. Removal tears down non-final branches and residual
+physical runtime shells before the final owner deletes shared family metadata.
+
 ## Identity-preserving migration
 
 Migration reuses portable Kernel capture, sparse page loading, distributed
@@ -221,6 +226,10 @@ unreferenced live filesystem writer.
 * Retain static peers as explicit overrides during transition.
 * Include remote-owned persistent families in list and inspect JSON.
 * Report membership, compatibility, lease state, and actual memory usage.
+* Route new container admission to the compatible ready node with the lowest
+  normalized current-plus-reserved memory load. **Implemented.** The selected
+  node is pinned in the proxied request so concurrent heartbeat changes cannot
+  create a routing loop.
 
 Exit: nodes can join after existing daemons start; every node sees the same
 families; stale and duplicate node incarnations are detected.
@@ -279,8 +288,8 @@ data. Cgroup memory remains the hard admission signal.
 * Implement deterministic bipartition dry runs and scoring diagnostics.
 * Add watermarks, hysteresis, cooldowns, and destination reservations.
   **Implemented.** Reservations are incarnation-fenced, atomically reject
-  concurrent overcommit, expire after source loss, and remain charged until a
-  target heartbeat publishes post-migration actual cgroup memory.
+  concurrent overcommit, expire after source loss, and remain charged through
+  migration completion and the target's next fresh heartbeat.
 * Add optional automatic rebalance and capacity requests.
 
 Exit: correlated sibling workloads use materially less cluster memory than

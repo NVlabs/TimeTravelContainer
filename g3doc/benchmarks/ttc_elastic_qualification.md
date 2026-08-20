@@ -8,6 +8,7 @@ whereas production nodes do not.
 
 - lease-bearing dynamic node join and discovery without static peer lists;
 - a unified branch namespace and daemon-to-daemon command routing;
+- least-loaded compatible routing for new container admission;
 - fenced, identity-preserving migration of one branch while siblings remain on
   their original node;
 - daemon-incarnation adoption after a clean restart;
@@ -111,9 +112,9 @@ two sources simultaneously requested the only remaining 2 GiB on an 8 GiB
 target already using 6 GiB. Exactly one reservation succeeded. An exact retry
 did not double-charge the target, heartbeat preserved the reservation, and its
 TTL reclaimed it after simulated source loss. Planner execution now installs
-this reservation before its first migration; it remains charged until target
-cgroup accounting publishes a post-migration sample, closing the stale-
-heartbeat overcommit window.
+this reservation before its first migration; completion marks it releasable
+only by the target's next fresh heartbeat, closing the stale-heartbeat
+overcommit window even when loopback nodes share one host cgroup.
 
 A live two-daemon run prefaulted 256 MiB, forked it into three BusyBox
 branches, and pressured the source. The exact-edge planner selected two
@@ -125,6 +126,29 @@ host cgroup, source release can make aggregate RSS fall during target restore;
 the completed-operation plus next-heartbeat rule was added and unit-tested to
 cover that case. Both daemons, the family, Sentry, gofer, and temporary root
 were removed after the run.
+
+New-work admission was also exercised through a deliberately pressured entry
+node. A detached BusyBox container was transparently created on the less-loaded
+peer, its branch owner metadata named that peer, and `exec` through the entry
+node succeeded. The test initially exposed a family-removal routing bug that
+could delete shared metadata while leaving the remote Sentry alive.
+
+After the fix, a two-branch family was split by identity-preserving migration.
+Both the local and remote branch remained executable through node A. A single
+`ttc rm -f FAMILY` issued to node A removed the owner-local branches, purged
+the former source runtime, delegated final metadata removal to node B, and
+left no container record, Sentry, gofer, or runtime directory. This test also
+found and fixed two physical-versus-logical counting assumptions: migration
+had retained a dehydrated source shell, and branch removal could ask runsc to
+destroy the last physical branch merely because remote logical siblings still
+existed.
+
+The split family was then exercised through the full family lifecycle. One
+command dehydrated both owners; each branch was independently rehydrated and
+executed through node A; one family-wide stop left both branches `exited`; and
+ordinary family removal reclaimed every record and process. The stop test
+found and fixed the final-physical-branch case where a successful init exit
+closed runsc's control socket before its wait reply arrived.
 
 ## Exact CoW hypergraph placement
 
@@ -167,6 +191,14 @@ transaction reached `independent`, all outstanding pages reached zero, and no
 daemon, listener, export, mount, or benchmark directory was retained after
 cleanup. Sequential targets each pulled 129 faults / 130 requests and about
 134.8 MB; random targets each used 89 faults and about 134.6 MB.
+
+A separate 64 MiB sequential run dehydrated and rehydrated the remote target
+before executing it. It completed in 5.36 seconds overall (352 ms fork,
+1.45 seconds dehydration, 327 ms rehydration), loaded 71.3 MB through 66
+faults, reached `independent`, and passed direct and routed execution. The test
+found a monitor race where intentional process-free dehydration was mistaken
+for a crashed target; `dehydrating` is now published before teardown and a
+durable dehydration image completes the remote dependency.
 
 Run the same matrix with:
 

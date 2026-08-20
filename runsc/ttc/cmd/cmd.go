@@ -456,6 +456,17 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runRemove(args[1:], stdout, stderr, backend)
 	case "_auto-remove":
 		err = runAutoRemove(args[1:], backend)
+	case "_purge-runtime":
+		if len(args) != 2 {
+			err = errors.New("internal runtime purge requires one family ID")
+			break
+		}
+		purger, ok := backend.(interface{ purgeRuntime(string) error })
+		if !ok {
+			err = errors.New("this backend does not support runtime purge")
+			break
+		}
+		err = purger.purgeRuntime(args[1])
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -4499,6 +4510,15 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
 		}
 		if err := stopBranch(target.selector, stopSignal, timeoutSeconds, backend); err != nil {
+			// The final physical branch on an elastic node tears down its control
+			// socket as the init exits. If reconciliation confirms the requested
+			// terminal state, treat the lost wait reply as a committed stop.
+			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
+			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				if discardErr := backend.discard(target.selector); discardErr == nil {
+					return nil
+				}
+			}
 			return err
 		}
 		if err := backend.discard(target.selector); err != nil {
@@ -8001,6 +8021,26 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	return nil
 }
 
+// purgeRuntime removes only this node's physical Sentry/gofer shell. Shared
+// family metadata and branch filesystems are intentionally untouched; elastic
+// migration and family-removal coordinators use this after ownership moved.
+func (b *runtimeBackend) purgeRuntime(containerID string) error {
+	families, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("listing runtimes before purging %q: %w", containerID, err)
+	}
+	for _, family := range families {
+		if family.ID != containerID {
+			continue
+		}
+		if _, err := b.command("delete", "--force", containerID); err != nil {
+			return fmt.Errorf("purging physical runtime %q: %w", containerID, err)
+		}
+		break
+	}
+	return nil
+}
+
 func (b *runtimeBackend) configuredRunscArgs() []string {
 	return b.configuredRunscArgsForNetwork("none")
 }
@@ -9884,6 +9924,8 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
 	dehydrated := false
+	originalState := normalizeLifecycleState(persistentBranch.State)
+	transitionPublished := false
 	captured := false
 	var stagingDir, finalDir string
 	finalPublished := false
@@ -9895,6 +9937,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	defer func() {
 		if dehydrated {
 			return
+		}
+		if transitionPublished {
+			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
 		}
 		if sparseRootChanged {
 			if repository, openErr := ttcchunk.OpenMemoryRepository(sparseRepositoryPath); openErr == nil {
@@ -9969,6 +10014,12 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		defer metadataFile.Close()
 	}
 	var output []byte
+	if b.dataRoot != "" {
+		if err := b.containerStore().UpdateBranchState(info.ID, target.branch, "dehydrating"); err != nil {
+			return fmt.Errorf("publishing dehydration transition for %s: %w", target, err)
+		}
+		transitionPublished = true
+	}
 	if metadataFile != nil {
 		output, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
 	} else {
@@ -10042,6 +10093,20 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
 			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
 		}
+		// A durable dehydration image contains every page needed by this
+		// branch, including pages formerly fetched from a remote fork source.
+		// Publish that fact before the process-free runtime disappears so the
+		// source may release its live snapshot without waiting for rehydration.
+		if err := b.completeDistributedTargetDehydration(info, persistentBranch); err != nil {
+			return fmt.Errorf("completing remote dependency for dehydrated %s: %w", target, err)
+		}
+		if transactionID := transactionIDForBranch(info, persistentBranch); transactionID != "" {
+			if err := b.releaseDistributedSparseRootTransaction(transactionID); err != nil && b.stderr != nil {
+				// The durable target image is already independent. Retaining the old
+				// immutable root is safe; repository maintenance may retry cleanup.
+				fmt.Fprintf(b.stderr, "ttc: warning: retaining superseded remote memory root for %s: %v\n", target, err)
+			}
+		}
 	}
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
@@ -10082,6 +10147,41 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	return nil
+}
+
+func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	transactionID := transactionIDForBranch(info, branch)
+	if transactionID == "" || b.dataRoot == "" {
+		return nil
+	}
+	store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return err
+	}
+	tx, err := store.Load(transactionID)
+	if err != nil {
+		return err
+	}
+	switch tx.State {
+	case cluster.TransactionPublished, cluster.TransactionDraining:
+		if _, err := store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now()); err != nil {
+			return err
+		}
+	case cluster.TransactionIndependent:
+		// Idempotent retry after the durable image was already published.
+	case cluster.TransactionCanceled, cluster.TransactionFailed:
+		return fmt.Errorf("distributed fork transaction %q is %s: %s", transactionID, tx.State, tx.Failure)
+	default:
+		return fmt.Errorf("distributed fork transaction %q is unexpectedly %s", transactionID, tx.State)
+	}
+	return nil
+}
+
+func transactionIDForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) string {
+	if branch.DistributedForkTransactionID != "" {
+		return branch.DistributedForkTransactionID
+	}
+	return info.DistributedForkTransactionID
 }
 
 func (b *runtimeBackend) rehydrate(target selector) error {
@@ -10597,6 +10697,22 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	destroyRuntime := func() error {
+		// Elastic placement can leave this as the last physical branch on this
+		// node while persistent siblings run elsewhere. runsc's branch destroy
+		// correctly refuses to remove a runtime's final branch, so delete this
+		// node-local runtime shell instead; shared family metadata is removed
+		// separately below only for the selected branch.
+		if families, listErr := b.listRuntimeFamilies(); listErr == nil {
+			for _, family := range families {
+				if family.ID != target.container || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
+					continue
+				}
+				if _, err := b.command("delete", "--force", target.container); err != nil {
+					return fmt.Errorf("deleting final physical runtime branch %s: %w", target, err)
+				}
+				return nil
+			}
+		}
 		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
 			return nil
 		} else {
