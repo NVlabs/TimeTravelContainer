@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -123,7 +124,14 @@ func TestDaemonStdinAcknowledgementCodec(t *testing.T) {
 	}
 }
 
-func TestDaemonClientCrashDeliversAcknowledgedStdinThenEOF(t *testing.T) {
+// A client that vanishes has its acknowledged input delivered, and then the
+// commands reading it are told it detached rather than that its input ended.
+//
+// The difference decides whether the session survives. "Input ended" is what a
+// client says when it means "keep showing me the output", so an attach told
+// that goes on waiting — holding the terminal's stdin against everyone, the
+// same client included, for as long as the session stays quiet.
+func TestDaemonClientCrashDeliversAcknowledgedStdinThenDetaches(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	stdinReader, stdinWriter := io.Pipe()
 	var serverWriteMu sync.Mutex
@@ -159,7 +167,7 @@ func TestDaemonClientCrashDeliversAcknowledgedStdinThenEOF(t *testing.T) {
 	_ = clientConn.Close()
 	select {
 	case result := <-readDone:
-		if result.err != nil || string(result.data) != "accepted" {
+		if !errors.Is(result.err, errDetached) || string(result.data) != "accepted" {
 			t.Fatalf("stdin after client crash=(%q, %v)", result.data, result.err)
 		}
 	case <-time.After(5 * time.Second):

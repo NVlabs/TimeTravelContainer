@@ -327,6 +327,7 @@ Commands:
   fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
+  rename CONTAINER@BRANCH NAME    Give a branch another name
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
   dehydrate TARGET...             Dehydrate branches or whole container families
@@ -366,6 +367,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttc pause TARGET [TARGET...]",
+			"rename":     "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
 			"resume":     "Usage: ttc resume TARGET [TARGET...]",
 			"dehydrate":  "Usage: ttc dehydrate TARGET [TARGET...]",
 			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
@@ -460,6 +462,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runCheckpoint(args[1:], stdout, backend)
 	case "restore":
 		err = runRestoreCheckpoint(args[1:], stdout, backend)
+	case "rename":
+		err = runRename(args[1:], stdout, backend)
 	case "pause":
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume", "unpause":
@@ -4213,6 +4217,21 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 	return nil
 }
 
+func runRename(args []string, stdout io.Writer, backend backend) error {
+	if len(args) != 2 {
+		return errors.New("usage: ttc rename CONTAINER@BRANCH NEW_BRANCH")
+	}
+	target, err := parseSelector(args[0])
+	if err != nil {
+		return fmt.Errorf("invalid target %q: %w", args[0], err)
+	}
+	if err := backend.renameBranch(target, args[1]); err != nil {
+		return fmt.Errorf("renaming %s: %w", target, err)
+	}
+	fmt.Fprintf(stdout, "%s@%s\n", target.container, args[1])
+	return nil
+}
+
 func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, dehydrate bool) error {
 	if len(args) == 0 {
 		if dehydrate {
@@ -5077,6 +5096,7 @@ type backend interface {
 	unpublishPort(target selector, binding ttcbundle.PortBinding) error
 	pause(target selector) error
 	resume(target selector) error
+	renameBranch(target selector, name string) error
 	prepareStop(target selector) error
 	discard(target selector) error
 	destroy(target selector, force bool) error
@@ -5319,7 +5339,7 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 	}
 	filesystemBranch := branch.FilesystemBranch
 	if filesystemBranch == "" {
-		filesystemBranch = offlineCopyBranch(info.ID, resolved.branch)
+		filesystemBranch = offlineCopyBranch(info, resolved.branch)
 	}
 	spec, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
@@ -9321,6 +9341,82 @@ func (b *runtimeBackend) resume(target selector) error {
 	return err
 }
 
+// renameBranch gives a live branch another name.
+//
+// The name is how a branch is asked for and nothing else: the memory, the
+// processes and the filesystem branch underneath are all reached through the
+// record. So the sandbox is told first — it is the thing that can refuse, for a
+// name already in use — and the durable record follows. If the record cannot be
+// written the sandbox is told to change back, because a family whose two halves
+// disagree about a branch's name is worse than one that never renamed it.
+func (b *runtimeBackend) renameBranch(target selector, name string) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	if target.branch == name {
+		return nil
+	}
+	for _, branch := range info.Branches {
+		if branch.ID == name {
+			return fmt.Errorf("branch %q already exists", name)
+		}
+	}
+	// Every console follower is stopped first — the branch's own, and one per
+	// exec session in it.
+	//
+	// A follower is a process launched with the branch it follows named on its
+	// command line, so one left running after a rename is following a branch
+	// that no longer exists. It holds its log open, so nothing looks wrong: the
+	// log is still there, the lock is still held, and the console still counts
+	// the bytes written to it — while the program on the other end waits for
+	// input that never arrives. Stopped here, the next caller starts one
+	// against the new name, and the logs it appends to are the same files.
+	store := b.containerStore()
+	if paths, err := store.BranchConsolePaths(target.container, target.branch); err == nil {
+		if err := b.stopConsoleDrain(paths); err != nil {
+			return fmt.Errorf("stopping console follower for %s: %w", target, err)
+		}
+	}
+	if sessions, err := b.execSessions(target); err == nil {
+		for _, session := range sessions {
+			paths, pathErr := store.ExecConsolePaths(target.container, target.branch, session.ID)
+			if pathErr != nil {
+				continue
+			}
+			if err := b.stopConsoleDrain(paths); err != nil {
+				return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
+			}
+		}
+	}
+	live := false
+	for _, branch := range info.Branches {
+		if branch.ID != target.branch {
+			continue
+		}
+		switch branch.State {
+		case "running", "paused", "dehydrated":
+			live = true
+		}
+	}
+	if live {
+		if _, err := b.command("timetravel", target.container, "rename", target.branch, name); err != nil {
+			return err
+		}
+	}
+	if b.dataRoot == "" {
+		return nil
+	}
+	if err := b.containerStore().RenameBranch(target.container, target.branch, name); err != nil {
+		if live {
+			_, _ = b.command("timetravel", target.container, "rename", name, target.branch)
+		}
+		return err
+	}
+	return nil
+}
+
 func (b *runtimeBackend) prepareStop(target selector) error {
 	resolved, _, err := b.resolveSelector(target)
 	if err != nil {
@@ -10236,6 +10332,19 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 		}
 	}
+	// Move the loader's bookkeeping off this branch before destroying it, the
+	// same way stopping one does. Without it, removing the branch the Sentry
+	// happens to keep its loader state on takes its siblings' terminals with
+	// it: a shell a fork inherited is left holding a console that has just been
+	// torn down, and it exits. Which made removing a family's first branch —
+	// exactly what promoting another one has to do — quietly kill the sessions
+	// in the branch being promoted.
+	switch normalizeLifecycleState(recorded.State) {
+	case "running", "restarting":
+		if _, err := b.command("timetravel", target.container, "prepare-stop", target.branch); err != nil {
+			return fmt.Errorf("preparing %s for removal: %w", target, err)
+		}
+	}
 	destroyRuntime := func() error {
 		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
 			return nil
@@ -10371,7 +10480,7 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	}
 	filesystemBranch := branch.FilesystemBranch
 	if filesystemBranch == "" {
-		filesystemBranch = offlineCopyBranch(info.ID, resolved.branch)
+		filesystemBranch = offlineCopyBranch(info, resolved.branch)
 	}
 	spec, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
@@ -10452,7 +10561,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
 		filesystemBranch := branch.FilesystemBranch
 		if filesystemBranch == "" {
-			filesystemBranch = offlineCopyBranch(info.ID, branch.ID)
+			filesystemBranch = offlineCopyBranch(info, branch.ID)
 		}
 		filesystemBranches[branch.ID] = filesystemBranch
 	}
