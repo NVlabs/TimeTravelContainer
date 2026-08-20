@@ -136,8 +136,31 @@ func (s *daemonServer) acquireStdinLease(key string, takeover bool, cancel func(
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			return nil, fmt.Errorf("timed out waiting for the previous stdin owner to detach")
+		case <-time.After(2 * time.Second):
+			// The old owner was told to let go and did not. Its client is
+			// usually already gone — a dropped ssh pipe, a laptop closed
+			// mid-turn — and whatever its handler is still blocked on, the
+			// session it holds is one nobody can reach until the lease moves.
+			//
+			// Taking it is safe because cancel() has already closed the pipe
+			// that owner writes through: it cannot reach the terminal again,
+			// whatever it does next. Its own release is a no-op once this
+			// entry is somebody else's.
+			s.stdinMu.Lock()
+			if s.stdinLeases[key] == old {
+				lease := &daemonStdinLease{cancel: cancel, done: make(chan struct{})}
+				s.stdinLeases[key] = lease
+				s.stdinMu.Unlock()
+				return func() {
+					s.stdinMu.Lock()
+					if s.stdinLeases[key] == lease {
+						delete(s.stdinLeases, key)
+						close(lease.done)
+					}
+					s.stdinMu.Unlock()
+				}, nil
+			}
+			s.stdinMu.Unlock()
 		}
 	}
 }

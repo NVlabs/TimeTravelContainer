@@ -2383,7 +2383,19 @@ func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin 
 	for {
 		typ, payload, err := readDaemonFrame(reader)
 		if err != nil {
-			fail(err)
+			// The client is gone — not "done sending input", which is the EOF
+			// frame below, but disconnected: a closed laptop, a dropped ssh
+			// pipe, a process killed mid-turn.
+			//
+			// Reported as a detach rather than as the read error it is,
+			// because that is what the commands on the other side understand.
+			// An attach told only that its stdin ended keeps running: it sits
+			// in its drain loop waiting for output that an idle session never
+			// produces, holding the terminal's stdin lock against everyone,
+			// including the same client coming back. A tool with a window open
+			// is silent for minutes at a time, and one lost connection made
+			// its session unreachable for good.
+			fail(errDetached)
 			return
 		}
 		switch typ {
