@@ -384,7 +384,8 @@ ttc daemon start \
   --cluster-key /shared/cluster/node-a.key \
   --cluster-ca /shared/cluster/ca.pem \
   --cluster-memory-target 64GiB \
-  --cluster-auto-rebalance
+  --cluster-auto-rebalance \
+  --cluster-capacity-webhook https://scheduler.example/v1/ttc-capacity
 ```
 
 Start node B with its own node ID, advertised address, and certificate.
@@ -490,12 +491,30 @@ durable request per source node to:
 $TTC_DATA_ROOT/cluster/capacity-requests/<node-id>.json
 ```
 
-An external cluster provisioner can watch this shared directory, acquire the
-requested capacity, and remove the file after it has durably accepted the
-request. The new `ttcd` joins through the normal dynamic membership protocol;
-an outstanding drain then resumes automatically. Repeated manual and automatic
-attempts retain the same request while it is outstanding, preventing an event
-storm from provisioning duplicate nodes.
+Configure exactly one delivery adapter on every daemon:
+
+```shell
+# Execute an absolute path directly, without a shell. The JSON request is stdin.
+ttc daemon start ... --cluster-capacity-command /opt/ttc/bin/request-node
+
+# Or POST the same JSON to a controller. HTTP 2xx acknowledges acceptance.
+ttc daemon start ... --cluster-capacity-webhook https://scheduler.example/v1/ttc-capacity
+```
+
+The executable receives `TTC_CAPACITY_REQUEST_ID` and
+`TTC_CAPACITY_SOURCE_NODE` in its environment. The webhook receives
+`Content-Type: application/json` and an `Idempotency-Key` header. Provisioners
+must treat the request ID idempotently: TTC retries failures and redelivers an
+accepted request after five minutes if no matching capacity joins. Attempts,
+acceptance, retry time, and the most recent error are recorded in the JSON and
+survive daemon restart.
+
+The provisioner must not remove or rewrite the outbox file. It starts a `ttcd`
+with the requested architecture, repository, and usable memory. The new daemon
+joins through normal dynamic membership; TTC removes the request only after a
+compatible ready node publishes sufficient unreserved capacity. An outstanding
+drain or automatic rebalance then resumes. Concurrent pressure events retain
+one request ID per source node, preventing duplicate provisioning.
 
 ## Dehydrate and rehydrate
 

@@ -153,6 +153,8 @@ type daemonClusterOptions struct {
 	Advertise       string
 	MemoryTarget    uint64
 	AutoRebalance   bool
+	CapacityCommand string
+	CapacityWebhook string
 	LeaseDuration   time.Duration
 	MaxTransactions int
 	PageListen      string
@@ -177,6 +179,7 @@ type daemonClusterRuntime struct {
 	nodeRecord    cluster.NodeRecord
 	lease         time.Duration
 	autoRebalance bool
+	capacitySink  elasticCapacitySink
 }
 
 type daemonTargetRuntime struct {
@@ -1609,8 +1612,10 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
 		"--cluster-repository-id": &opts.RepositoryID, "--cluster-cert": &opts.CertFile,
 		"--cluster-key": &opts.KeyFile, "--cluster-ca": &opts.CAFile,
-		"--cluster-advertise":   &opts.Advertise,
-		"--cluster-page-listen": &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
+		"--cluster-advertise":        &opts.Advertise,
+		"--cluster-capacity-command": &opts.CapacityCommand,
+		"--cluster-capacity-webhook": &opts.CapacityWebhook,
+		"--cluster-page-listen":      &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
 	} {
 		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
 			if consumed != 0 {
@@ -1759,6 +1764,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if opts.Listen == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
 		return nil, errors.New("cluster mode requires listen address, node ID, repository ID, certificate, key, and CA")
 	}
+	capacitySink, err := newElasticCapacitySink(opts.CapacityCommand, opts.CapacityWebhook)
+	if err != nil {
+		return nil, err
+	}
 	if opts.PageListen == "" {
 		return nil, errors.New("cluster page listen address is empty")
 	}
@@ -1865,7 +1874,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 			dynamicPeers: make(map[string]dynamicClusterPeer),
 			pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 		},
-		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration, autoRebalance: opts.AutoRebalance,
+		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration,
+		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink,
 	}, nil
 }
 
@@ -2140,6 +2150,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				defer unlock()
 				return run()
 			})
+		}
+		if elasticRecord != nil && clusterRuntime.capacitySink != nil && clusterRuntime.capacitySink.Configured() {
+			go maintainElasticCapacityRequests(dataRoot, elasticRecord.NodeID, clusterRuntime.directory, clusterRuntime.capacitySink, stderr, clusterDone)
 		}
 	}
 	if stdout != nil {
@@ -3150,6 +3163,12 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 		}
 		if clusterOpts.AutoRebalance {
 			commandArgs = append(commandArgs, "--cluster-auto-rebalance")
+		}
+		if clusterOpts.CapacityCommand != "" {
+			commandArgs = append(commandArgs, "--cluster-capacity-command", clusterOpts.CapacityCommand)
+		}
+		if clusterOpts.CapacityWebhook != "" {
+			commandArgs = append(commandArgs, "--cluster-capacity-webhook", clusterOpts.CapacityWebhook)
 		}
 		if clusterOpts.PageAdvertise != "" {
 			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)

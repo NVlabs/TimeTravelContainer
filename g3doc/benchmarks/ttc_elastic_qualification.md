@@ -15,7 +15,8 @@ whereas production nodes do not.
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
 - deterministic pressure placement and opt-in automatic rebalancing;
 - fenced, expiring target-memory reservations for pressure moves;
-- coalesced durable capacity requests when no placement is feasible;
+- coalesced durable capacity requests, executable/webhook delivery, persistent
+  retry state, and membership-confirmed fulfillment;
 - durable drain and per-branch migration recovery after daemon process loss;
 - callback-safe routing of node-wide mutations; and
 - remote live fork with 1 MiB bulk memory transfer through a shared NFS root.
@@ -104,8 +105,9 @@ That cleanup assertion found and fixed an owner-scope error where a running
 remote sibling prevented deletion of an otherwise empty source Sentry.
 
 The no-target path was also exercised at unit level: concurrent pressure/drain
-attempts retain one durable request ID, and removing the accepted outbox entry
-allows the next pressure episode to publish a fresh ID.
+attempts retain one durable request ID. Command and HTTP adapters preserve that
+ID across failed delivery and acceptance; TTC waits for a fresh, compatible,
+ready node with sufficient unreserved memory before consuming the request.
 
 Target reservation concurrency was exercised against the shared node catalog:
 two sources simultaneously requested the only remaining 2 GiB on an 8 GiB
@@ -149,6 +151,28 @@ executed through node A; one family-wide stop left both branches `exited`; and
 ordinary family removal reclaimed every record and process. The stop test
 found and fixed the final-physical-branch case where a successful init exit
 closed runsc's control socket before its wait reply arrived.
+
+## Capacity-provider join
+
+[`tools/ttc/elastic_capacity_smoke.py`](../../tools/ttc/elastic_capacity_smoke.py)
+starts one dynamically discovered daemon and a real BusyBox counter workload,
+forks the workload into two live branches, then drains the only node. With no
+destination, TTC emits a durable capacity request. The executable provider
+injects one scheduler outage, then accepts the retry. Both calls carry the same
+request ID. Only after a compatible second daemon joins with enough unreserved
+memory does TTC consume the request; the outstanding drain then resumes without
+another client command.
+
+The local run completed in 6.951 seconds with two provider attempts and two
+identity-preserving branch migrations. Both counters continued through routed
+execution on node B. Family removal, daemon shutdown, and the smoke harness
+removed all Sentries, gofers, sockets, request state, and test directories.
+
+Run it with:
+
+```shell
+python3 tools/ttc/elastic_capacity_smoke.py --ttc /path/to/ttc
+```
 
 ## Exact CoW hypergraph placement
 
@@ -216,7 +240,5 @@ The configured `kvm-node` was unreachable (`No route to host`) during this
 iteration, and the development host has no `/dev/kvm`; therefore the latest
 elastic changes have not yet been rerun on the KVM platform. Physical
 multi-host network-delay/loss, exhaustive node-loss injection at every
-instruction-level migration boundary, an external provisioner's end-to-end
-response to the durable
-capacity outbox, and long-running automatic
+instruction-level migration boundary, and long-running automatic
 rebalance/anti-oscillation tests also remain required before production use.

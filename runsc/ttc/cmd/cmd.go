@@ -349,6 +349,7 @@ Commands:
                 --cluster-key FILE --cluster-ca FILE]
 		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
 		       [--cluster-memory-target SIZE --cluster-auto-rebalance]
+		       [--cluster-capacity-command PATH | --cluster-capacity-webhook URL]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests

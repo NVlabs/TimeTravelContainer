@@ -46,17 +46,22 @@ type daemonClusterProxy struct {
 }
 
 type elasticCapacityRequest struct {
-	Version         int       `json:"version"`
-	RequestID       string    `json:"request_id"`
-	Operation       string    `json:"operation"`
-	Nodes           int       `json:"nodes"`
-	MemoryBytesEach uint64    `json:"memory_bytes_each"`
-	Architecture    string    `json:"architecture"`
-	RepositoryID    string    `json:"repository_id"`
-	SourceNode      string    `json:"source_node"`
-	Reason          string    `json:"reason"`
-	CreatedAt       time.Time `json:"created_at"`
-	Deadline        time.Time `json:"deadline"`
+	Version         int        `json:"version"`
+	RequestID       string     `json:"request_id"`
+	Operation       string     `json:"operation"`
+	Nodes           int        `json:"nodes"`
+	MemoryBytesEach uint64     `json:"memory_bytes_each"`
+	Architecture    string     `json:"architecture"`
+	RepositoryID    string     `json:"repository_id"`
+	SourceNode      string     `json:"source_node"`
+	Reason          string     `json:"reason"`
+	CreatedAt       time.Time  `json:"created_at"`
+	Deadline        time.Time  `json:"deadline"`
+	Attempts        uint64     `json:"attempts,omitempty"`
+	LastAttemptAt   *time.Time `json:"last_attempt_at,omitempty"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at,omitempty"`
+	AcceptedAt      *time.Time `json:"accepted_at,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
 }
 
 const (
@@ -222,50 +227,36 @@ func removeCompletedElasticDrainIntent(dataRoot, nodeID string) error {
 	})
 }
 
-// emitCapacityRequest publishes one outstanding request per node. An external
-// provisioner watches this shared directory and removes the node file after it
-// has durably accepted the request; a later pressure episode can then publish
-// a new ID. The lock makes concurrent manual and automatic rebalance attempts
-// coalesce into the same event.
+// emitCapacityRequest publishes one outstanding request per node. The daemon's
+// capacity worker delivers it to the configured provisioner and removes it only
+// after compatible capacity has appeared in the cluster directory. The lock
+// makes concurrent manual and automatic rebalance attempts coalesce into the
+// same durable event.
 func (b *runtimeBackend) emitCapacityRequest(source cluster.NodeRecord, reason string) (string, error) {
-	dir := filepath.Join(b.dataRoot, "cluster", "capacity-requests")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	lock, err := os.OpenFile(filepath.Join(dir, source.NodeID+".lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return "", err
-	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return "", err
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	path := filepath.Join(dir, source.NodeID+".json")
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	requestID, err := newDaemonRequestID()
-	if err != nil {
-		return "", err
-	}
-	now := time.Now().UTC()
-	memory := source.MemoryTargetBytes
-	if memory == 0 {
-		memory = source.MemoryCurrentBytes
-	}
-	request := elasticCapacityRequest{
-		Version: 1, RequestID: "capacity-" + requestID, Operation: "acquire", Nodes: 1,
-		MemoryBytesEach: memory, Architecture: b.distributedSource.capabilities.Architecture,
-		RepositoryID: b.distributedSource.capabilities.RepositoryID, SourceNode: source.NodeID,
-		Reason: reason, CreatedAt: now, Deadline: now.Add(5 * time.Minute),
-	}
-	if err := writeDurableJSON(path, &request); err != nil {
-		return "", err
-	}
-	return path, nil
+	var result string
+	err := withElasticCapacityRequest(b.dataRoot, source.NodeID, func(path string, request *elasticCapacityRequest) error {
+		result = path
+		if request.Version != 0 {
+			return validateElasticCapacityRequest(*request, source.NodeID)
+		}
+		requestID, err := newDaemonRequestID()
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		memory := source.MemoryTargetBytes
+		if memory == 0 {
+			memory = source.MemoryCurrentBytes
+		}
+		*request = elasticCapacityRequest{
+			Version: 1, RequestID: "capacity-" + requestID, Operation: "acquire", Nodes: 1,
+			MemoryBytesEach: memory, Architecture: b.distributedSource.capabilities.Architecture,
+			RepositoryID: b.distributedSource.capabilities.RepositoryID, SourceNode: source.NodeID,
+			Reason: reason, CreatedAt: now, Deadline: now.Add(elasticCapacityAcceptanceLease),
+		}
+		return writeDurableJSON(path, request)
+	})
+	return result, err
 }
 
 func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
