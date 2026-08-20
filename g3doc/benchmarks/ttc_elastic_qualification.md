@@ -12,8 +12,9 @@ whereas production nodes do not.
   their original node;
 - daemon-incarnation adoption after a clean restart;
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
-- deterministic pressure placement and opt-in automatic rebalancing; and
-- coalesced durable capacity requests when no placement is feasible; and
+- deterministic pressure placement and opt-in automatic rebalancing;
+- coalesced durable capacity requests when no placement is feasible;
+- durable drain recovery after daemon process loss; and
 - remote live fork with 1 MiB bulk memory transfer through a shared NFS root.
 
 ## Local mixed-family migration
@@ -36,6 +37,22 @@ This test also found and fixed two elastic-specific recovery bugs:
    siblings exited; reconciliation is now branch-owner scoped; and
 2. a placement retained the previous daemon incarnation after restart;
    adoption now increments its fencing generation before another migration.
+
+## Drain recovery after daemon loss
+
+A five-branch BusyBox family was cordoned on `node-a` while no destination
+existed. Drain failed safely, emitted one capacity request, and retained a
+durable intent. The `ttcd` process was then killed with `SIGKILL`; its Sentry,
+gofer, console followers, and guest counters continued running. After `node-b`
+joined and the old three-second lease expired, restarting `node-a` with a new
+incarnation admitted it directly as `draining`. The background reconciler
+migrated all five branches without another client command.
+
+Every branch was reported on `node-b`, an exec routed through the restarted
+`node-a` observed its counter advancing, and the intent transitioned to
+`complete`. A clean stop marked `node-a` offline and removed the completed
+intent. Removing the family and stopping `node-b` left no test processes or
+directory.
 
 ## Pressure placement and cleanup
 

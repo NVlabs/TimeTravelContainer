@@ -454,8 +454,12 @@ Drain first changes the node to `draining`, which rejects new runs, forks,
 rehydrations, and incoming migrations. It migrates running/paused branches,
 transfers cold branch placement without waking them, and makes remote page
 dependencies durable. If a step fails, the node stays cordoned and the same
-command can be retried. `--target node-b` restricts all placements to one
-destination; otherwise TTC selects ready nodes by reported load.
+command can be retried. The intent is durable: after an abnormal `ttcd` exit,
+the same node ID rejoins as `draining` and automatically resumes remaining
+work. A retry may supply a different `--target node-b`; already transferred
+branches remain where they are. A clean `ttc daemon stop` consumes a completed
+intent so the node ID can later join normally. Without `--target`, TTC selects
+ready nodes by reported load.
 
 `ttc node rebalance node-a` performs a smaller pressure-relief move using the
 configured memory targets and branch CoW accounting. Starting `ttcd` with
@@ -472,7 +476,7 @@ $TTC_DATA_ROOT/cluster/capacity-requests/<node-id>.json
 An external cluster provisioner can watch this shared directory, acquire the
 requested capacity, and remove the file after it has durably accepted the
 request. The new `ttcd` joins through the normal dynamic membership protocol;
-the original operation can then be retried. Repeated manual and automatic
+an outstanding drain then resumes automatically. Repeated manual and automatic
 attempts retain the same request while it is outstanding, preventing an event
 storm from provisioning duplicate nodes.
 

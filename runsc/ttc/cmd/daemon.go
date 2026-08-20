@@ -36,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -118,7 +119,8 @@ type daemonServer struct {
 	clusterStore          *cluster.Store
 	clusterDirectory      *cluster.NodeDirectory
 
-	stopOnce sync.Once
+	stopOnce  sync.Once
+	cleanStop atomic.Bool
 
 	reconcileMu sync.Mutex
 	reconciled  map[string]bool
@@ -1990,6 +1992,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			if _, err := clusterRuntime.directory.Transition(elasticRecord.NodeID, elasticRecord.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease); err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: publishing cluster node offline state: %v\n", err)
 			}
+			if server.cleanStop.Load() {
+				if err := removeCompletedElasticDrainIntent(dataRoot, elasticRecord.NodeID); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: consuming completed drain intent: %v\n", err)
+				}
+			}
 		}
 	}()
 	var clusterServer *http.Server
@@ -2025,17 +2032,26 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}
 			clusterRuntime.nodeRecord.ControlURL = resolved
 			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
+			drainIntent, err := loadElasticDrainIntent(dataRoot, clusterRuntime.nodeRecord.NodeID)
+			if err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("loading elastic drain recovery state: %w", err)
+			}
 			registered, err := clusterRuntime.directory.Register(clusterRuntime.nodeRecord, time.Now(), clusterRuntime.lease)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
 			}
-			ready, err := clusterRuntime.directory.Transition(registered.NodeID, registered.Incarnation, cluster.NodeReady, time.Now(), clusterRuntime.lease)
+			admittedState := cluster.NodeReady
+			if drainIntent != nil {
+				admittedState = cluster.NodeDraining
+			}
+			ready, err := clusterRuntime.directory.Transition(registered.NodeID, registered.Incarnation, admittedState, time.Now(), clusterRuntime.lease)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("admitting elastic cluster node: %w", err)
 			}
-			if ready.MemoryTargetBytes != 0 && ready.MemoryCurrentBytes > ready.MemoryTargetBytes {
+			if ready.State == cluster.NodeReady && ready.MemoryTargetBytes != 0 && ready.MemoryCurrentBytes > ready.MemoryTargetBytes {
 				ready, err = clusterRuntime.directory.Transition(ready.NodeID, ready.Incarnation, cluster.NodePressured, time.Now(), clusterRuntime.lease)
 				if err != nil {
 					clusterListener.Close()
@@ -2082,6 +2098,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}()
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
+		if elasticRecord != nil {
+			go maintainElasticDrain(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
+				unlock := server.lockDataRoot(server.dataRoot)
+				defer unlock()
+				server.reconcile(targetBackend)
+				return run()
+			})
+		}
 		if clusterRuntime.autoRebalance && elasticRecord != nil {
 			go maintainElasticRebalancer(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
 				unlock := server.lockDataRoot(server.dataRoot)
@@ -2286,6 +2310,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 		}
 		_ = writeDaemonStatus(conn, &writeMu, 0)
+		s.cleanStop.Store(true)
 		s.stopOnce.Do(func() { s.listener.Close() })
 		return
 	case "mutation-control":
@@ -2469,8 +2494,10 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
+	case "node":
+		return len(args) > 1 && args[1] != "ls"
 	case "cp":
 		_, _, _, err := parseCopyCommandArgs(args[1:])
 		return err == nil

@@ -232,18 +232,20 @@ state, never runs both copies, and survives retries at every boundary.
 
 ### Phase 3: draining and capacity integration
 
-**Implemented with a file-outbox capacity interface.** `ttc node ls` and `ttc node drain` provide dynamic
-membership diagnostics, admission fencing, active and cold branch evacuation,
-restart-safe retry, and dependency draining. A drained daemon remains online
-in the `draining` state for diagnostics until `ttc daemon stop` marks it
-offline. Drain and rebalance publish a coalesced durable capacity request when
-there is no feasible target. Executable/webhook adapters and durable automatic
-resumption of an interrupted multi-branch drain remain outstanding.
+**Implemented with a file-outbox capacity interface.** `ttc node ls` and
+`ttc node drain` provide dynamic membership diagnostics, admission fencing,
+active and cold branch evacuation, restart-safe retry, and dependency draining.
+A durable per-node intent is written before cordoning. A restarted daemon
+rejoins directly in `draining`, reconciles surviving Sentries, and resumes the
+remaining ownership scan automatically. A drained daemon remains online for
+diagnostics until `ttc daemon stop` marks it offline and consumes the completed
+intent. Drain and rebalance publish a coalesced durable capacity request when
+there is no feasible target. Executable/webhook adapters remain outstanding.
 
 * Add `ttc node drain`, admission control, dependency draining, and offline
   verification.
 * Add executable and webhook adapters over the durable capacity outbox.
-* Resume incomplete drains after daemon restart.
+* Resume incomplete drains after daemon restart. **Implemented.**
 
 Exit: a node with mixed running, paused, and dehydrated real workloads can
 leave without branch loss or repository garbage.

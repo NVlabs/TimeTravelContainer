@@ -44,7 +44,7 @@ const (
 )
 
 var nodeTransitions = map[NodeState]map[NodeState]bool{
-	NodeJoining:   {NodeReady: true, NodeOffline: true},
+	NodeJoining:   {NodeReady: true, NodeDraining: true, NodeOffline: true},
 	NodeReady:     {NodePressured: true, NodeDraining: true, NodeOffline: true},
 	NodePressured: {NodeReady: true, NodeDraining: true, NodeOffline: true},
 	NodeDraining:  {NodeOffline: true},

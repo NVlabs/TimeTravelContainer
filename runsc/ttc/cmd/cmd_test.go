@@ -5084,6 +5084,67 @@ func TestEmitCapacityRequestCoalescesUntilAcknowledged(t *testing.T) {
 	}
 }
 
+func TestElasticDrainIntentSurvivesRetryAndIsConsumedAfterCompletion(t *testing.T) {
+	dataRoot := t.TempDir()
+	first, err := beginElasticDrainIntent(dataRoot, "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != elasticDrainActive || first.Attempts != 1 || first.OperationID == "" {
+		t.Fatalf("first intent=%+v", first)
+	}
+	retry, err := beginElasticDrainIntent(dataRoot, "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.OperationID != first.OperationID || retry.Attempts != 2 {
+		t.Fatalf("retry intent=%+v, first=%+v", retry, first)
+	}
+	retargeted, err := beginElasticDrainIntent(dataRoot, "node-a", "node-c")
+	if err != nil || retargeted.OperationID != first.OperationID || retargeted.TargetNode != "node-c" || retargeted.Attempts != 3 {
+		t.Fatalf("retargeted intent=(%+v, %v)", retargeted, err)
+	}
+	attemptErr := errors.New("target temporarily unavailable")
+	if err := finishElasticDrainAttempt(dataRoot, "node-a", first.OperationID, attemptErr); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadElasticDrainIntent(dataRoot, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || loaded.State != elasticDrainActive || loaded.LastError != attemptErr.Error() || loaded.CompletedAt != nil {
+		t.Fatalf("failed intent=%+v", loaded)
+	}
+	if err := finishElasticDrainAttempt(dataRoot, "node-a", first.OperationID, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = loadElasticDrainIntent(dataRoot, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || loaded.State != elasticDrainComplete || loaded.LastError != "" || loaded.CompletedAt == nil {
+		t.Fatalf("completed intent=%+v", loaded)
+	}
+	if err := removeCompletedElasticDrainIntent(dataRoot, "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = loadElasticDrainIntent(dataRoot, "node-a")
+	if err != nil || loaded != nil {
+		t.Fatalf("consumed intent=(%+v, %v), want nil", loaded, err)
+	}
+}
+
+func TestElasticCommandsTakeMutationLock(t *testing.T) {
+	for _, args := range [][]string{{"migrate", "--target", "node-b", "demo@main"}, {"node", "drain", "node-a"}, {"node", "rebalance", "node-a"}} {
+		if !daemonCommandNeedsMutationLock(args) {
+			t.Errorf("%v does not take the mutation lock", args)
+		}
+	}
+	if daemonCommandNeedsMutationLock([]string{"node", "ls", "--json"}) {
+		t.Error("node ls unnecessarily takes the mutation lock")
+	}
+}
+
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	backend := &fakeBackend{}
 	var out bytes.Buffer

@@ -57,6 +57,169 @@ type elasticCapacityRequest struct {
 	Deadline        time.Time `json:"deadline"`
 }
 
+const (
+	elasticDrainIntentVersion = 1
+	elasticDrainActive        = "draining"
+	elasticDrainComplete      = "complete"
+)
+
+type elasticDrainIntent struct {
+	Version     int        `json:"version"`
+	OperationID string     `json:"operation_id"`
+	NodeID      string     `json:"node_id"`
+	TargetNode  string     `json:"target_node,omitempty"`
+	State       string     `json:"state"`
+	Attempts    uint64     `json:"attempts"`
+	LastError   string     `json:"last_error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+func elasticDrainIntentPath(dataRoot, nodeID string) (string, error) {
+	if nodeID == "" || filepath.Base(nodeID) != nodeID || nodeID == "." {
+		return "", fmt.Errorf("invalid drain node ID %q", nodeID)
+	}
+	dir := filepath.Join(dataRoot, "cluster", "drains")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, nodeID+".json"), nil
+}
+
+func withElasticDrainIntent(dataRoot, nodeID string, fn func(string, *elasticDrainIntent) error) error {
+	path, err := elasticDrainIntentPath(dataRoot, nodeID)
+	if err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(strings.TrimSuffix(path, ".json")+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	var intent elasticDrainIntent
+	contents, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(contents, &intent); err != nil {
+			return fmt.Errorf("decoding drain intent %q: %w", path, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return fn(path, &intent)
+}
+
+func validateElasticDrainIntent(intent elasticDrainIntent, nodeID string) error {
+	if intent.Version != elasticDrainIntentVersion || intent.OperationID == "" || intent.NodeID != nodeID ||
+		(intent.State != elasticDrainActive && intent.State != elasticDrainComplete) || intent.CreatedAt.IsZero() || intent.UpdatedAt.Before(intent.CreatedAt) {
+		return fmt.Errorf("invalid durable drain intent for node %q", nodeID)
+	}
+	return nil
+}
+
+func loadElasticDrainIntent(dataRoot, nodeID string) (*elasticDrainIntent, error) {
+	var result *elasticDrainIntent
+	err := withElasticDrainIntent(dataRoot, nodeID, func(_ string, intent *elasticDrainIntent) error {
+		if intent.Version == 0 {
+			return nil
+		}
+		if err := validateElasticDrainIntent(*intent, nodeID); err != nil {
+			return err
+		}
+		copy := *intent
+		result = &copy
+		return nil
+	})
+	return result, err
+}
+
+func beginElasticDrainIntent(dataRoot, nodeID, targetNode string) (*elasticDrainIntent, error) {
+	var result elasticDrainIntent
+	err := withElasticDrainIntent(dataRoot, nodeID, func(path string, intent *elasticDrainIntent) error {
+		now := time.Now().UTC()
+		if intent.Version != 0 {
+			if err := validateElasticDrainIntent(*intent, nodeID); err != nil {
+				return err
+			}
+			if intent.State == elasticDrainComplete {
+				if intent.TargetNode != targetNode {
+					return fmt.Errorf("completed drain %q for node %q targeted %q", intent.OperationID, nodeID, intent.TargetNode)
+				}
+				result = *intent
+				return nil
+			}
+			intent.TargetNode = targetNode
+			intent.Attempts++
+			intent.UpdatedAt = now
+			intent.LastError = ""
+		} else {
+			operationID, err := newDaemonRequestID()
+			if err != nil {
+				return err
+			}
+			*intent = elasticDrainIntent{
+				Version: elasticDrainIntentVersion, OperationID: "drain-" + operationID,
+				NodeID: nodeID, TargetNode: targetNode, State: elasticDrainActive,
+				Attempts: 1, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+		if err := writeDurableJSON(path, intent); err != nil {
+			return err
+		}
+		result = *intent
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func finishElasticDrainAttempt(dataRoot, nodeID, operationID string, attemptErr error) error {
+	return withElasticDrainIntent(dataRoot, nodeID, func(path string, intent *elasticDrainIntent) error {
+		if err := validateElasticDrainIntent(*intent, nodeID); err != nil {
+			return err
+		}
+		if intent.OperationID != operationID {
+			return fmt.Errorf("drain operation for node %q changed from %q to %q", nodeID, operationID, intent.OperationID)
+		}
+		now := time.Now().UTC()
+		intent.UpdatedAt = now
+		if attemptErr != nil {
+			intent.State = elasticDrainActive
+			intent.LastError = attemptErr.Error()
+			intent.CompletedAt = nil
+		} else {
+			intent.State = elasticDrainComplete
+			intent.LastError = ""
+			intent.CompletedAt = &now
+		}
+		return writeDurableJSON(path, intent)
+	})
+}
+
+func removeCompletedElasticDrainIntent(dataRoot, nodeID string) error {
+	return withElasticDrainIntent(dataRoot, nodeID, func(path string, intent *elasticDrainIntent) error {
+		if intent.Version == 0 {
+			return nil
+		}
+		if err := validateElasticDrainIntent(*intent, nodeID); err != nil {
+			return err
+		}
+		if intent.State != elasticDrainComplete {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
+}
+
 // emitCapacityRequest publishes one outstanding request per node. An external
 // provisioner watches this shared directory and removes the node file after it
 // has durably accepted the request; a later pressure episode can then publish
@@ -579,7 +742,7 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 // ownership. A failed step leaves the node draining so retry cannot race new
 // work onto it. The daemon remains available for diagnostics until explicitly
 // stopped, at which point its membership record becomes offline.
-func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) ([]selector, error) {
+func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (moved []selector, retErr error) {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return nil, errors.New("elastic node drain requires dynamic cluster discovery")
 	}
@@ -628,11 +791,20 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) ([
 	if !source.LeaseActive(time.Now()) {
 		return nil, fmt.Errorf("source node %q lease is expired or offline", b.nodeID)
 	}
+	if source.State != cluster.NodeReady && source.State != cluster.NodePressured && source.State != cluster.NodeDraining {
+		return nil, fmt.Errorf("node %q cannot begin drain from state %s", b.nodeID, source.State)
+	}
+	intent, err := beginElasticDrainIntent(b.dataRoot, b.nodeID, targetNode)
+	if err != nil {
+		return nil, fmt.Errorf("recording durable drain intent: %w", err)
+	}
+	defer func() {
+		if err := finishElasticDrainAttempt(b.dataRoot, b.nodeID, intent.OperationID, retErr); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("recording drain outcome: %w", err))
+		}
+	}()
 	lease := source.LeaseExpiresAt.Sub(source.UpdatedAt)
 	if source.State != cluster.NodeDraining {
-		if source.State != cluster.NodeReady && source.State != cluster.NodePressured {
-			return nil, fmt.Errorf("node %q cannot begin drain from state %s", b.nodeID, source.State)
-		}
 		if _, err := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, cluster.NodeDraining, time.Now(), lease); err != nil {
 			return nil, fmt.Errorf("cordoning node %q: %w", b.nodeID, err)
 		}
@@ -666,7 +838,7 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) ([
 		}
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].target.String() < pending[j].target.String() })
-	moved := make([]selector, 0, len(pending))
+	moved = make([]selector, 0, len(pending))
 	for index, item := range pending {
 		destination := targets[index%len(targets)].NodeID
 		switch item.state {
@@ -847,6 +1019,57 @@ func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease tim
 				fmt.Fprintf(stderr, "ttcd: elastic rebalance moved %d branches from %s to %s (estimated freed %d bytes, cut %d bytes)\n", len(plan.Branches), plan.SourceNode, plan.TargetNode, plan.EstimatedFreed, plan.EstimatedCut)
 			}
 		}
+	}
+}
+
+func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error) {
+	interval := lease / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
+		intent, err := loadElasticDrainIntent(backend.dataRoot, nodeID)
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: elastic drain recovery for node %s cannot read its intent: %v\n", nodeID, err)
+			}
+			timer.Reset(interval)
+			continue
+		}
+		if intent == nil {
+			timer.Reset(interval)
+			continue
+		}
+		if intent.State == elasticDrainComplete {
+			return
+		}
+		var moved []selector
+		err = serialize(func() error {
+			var drainErr error
+			moved, drainErr = backend.drainNode(nodeID, intent.TargetNode, true)
+			return drainErr
+		})
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s will retry: %v\n", intent.OperationID, nodeID, err)
+			}
+			timer.Reset(interval)
+			continue
+		}
+		if stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s completed after moving %d remaining branches\n", intent.OperationID, nodeID, len(moved))
+		}
+		return
 	}
 }
 

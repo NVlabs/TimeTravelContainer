@@ -124,6 +124,24 @@ func TestNodeDirectoryExpiryAndStableList(t *testing.T) {
 	}
 }
 
+func TestNodeDirectoryCanRecoverDirectlyIntoDraining(t *testing.T) {
+	directory, err := OpenNodeDirectory(filepath.Join(t.TempDir(), "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1500, 0).UTC()
+	if _, err := directory.Register(testNodeRecord("node-a", "recovery"), now, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	draining, err := directory.Transition("node-a", "recovery", NodeDraining, now.Add(time.Second), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draining.State != NodeDraining || draining.AcceptsPlacement(now.Add(2*time.Second)) {
+		t.Fatalf("recovered record=%+v", draining)
+	}
+}
+
 func TestNodeDirectoryRejectsCorruptSharedRecord(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "nodes")
 	directory, err := OpenNodeDirectory(root)
