@@ -135,6 +135,17 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
+// PrepareDistributedMigrationRestoreBundle creates a cold target bundle whose
+// bootstrap SandboxFamily already uses the migrated branch's visible identity.
+// Distributed restore later replaces that placeholder Kernel in place; it
+// must not silently fall back to the ordinary "main" bootstrap identity.
+func (s Store) PrepareDistributedMigrationRestoreBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+	if branchID == "" || filesystemBranch == "" {
+		return "", nil, errors.New("distributed migration restore branch or filesystem identity is empty")
+	}
+	return s.prepareBranchBundle(name, branchID, filesystemBranch, true, false)
+}
+
 func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
 	info, err := s.LoadContainer(name)
 	if err != nil {
@@ -164,6 +175,21 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	}
 	if distributedTarget {
 		spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
+		if branchID != "" {
+			var branch *BranchInfo
+			for i := range info.Branches {
+				if info.Branches[i].ID == branchID {
+					branch = &info.Branches[i]
+					break
+				}
+			}
+			if branch == nil {
+				return "", nil, fmt.Errorf("branch %q is not recorded", branchID)
+			}
+			spec.Annotations[specutils.AnnotationTTCInitialBranchID] = branchID
+			spec.Annotations[specutils.AnnotationTTCInitialBranchParentID] = branch.ParentID
+			spec.Annotations[specutils.AnnotationTTCInitialFilesystemBranch] = filesystemBranch
+		}
 	} else {
 		var branch *BranchInfo
 		for i := range info.Branches {
@@ -280,6 +306,8 @@ type DistributedForkOptions struct {
 	VisibleBranch   string
 	TransactionID   string
 	NodeID          string
+	SourceNode      string
+	Migration       bool
 }
 
 // BranchInfo is branch display lineage plus its last known lifecycle state.
@@ -295,6 +323,7 @@ type BranchInfo struct {
 	DistributedForkTransactionID string    `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedSparseRepository  string    `json:"distributed_sparse_repository,omitempty"`
 	DistributedSparseBranch      string    `json:"distributed_sparse_branch,omitempty"`
+	DistributedMigration         bool      `json:"distributed_migration,omitempty"`
 	State                        string    `json:"state"`
 	ForkTotalNS                  int64     `json:"fork_total_ns,omitempty"`
 	SourceDowntimeNS             int64     `json:"source_downtime_ns,omitempty"`
@@ -336,6 +365,9 @@ type DistributedForkImport struct {
 	CreatedAt        time.Time `json:"created_at"`
 	SparseRepository string    `json:"sparse_repository,omitempty"`
 	SparseBranch     string    `json:"sparse_branch,omitempty"`
+	SourceNode       string    `json:"source_node,omitempty"`
+	TargetNode       string    `json:"target_node,omitempty"`
+	Migration        bool      `json:"migration,omitempty"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
@@ -1231,6 +1263,9 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if opts.NodeID == "" {
 		return Prepared{}, errors.New("distributed fork target node ID is empty")
 	}
+	if opts.Migration && opts.SourceNode == "" {
+		return Prepared{}, errors.New("distributed migration source node ID is empty")
+	}
 	if existing, err := s.LoadDistributedForkTarget(opts.TransactionID); err == nil {
 		if existing.Name != opts.TargetName || existing.DistributedForkNodeID != opts.NodeID {
 			return Prepared{}, fmt.Errorf("distributed fork transaction %q is bound to another target", opts.TransactionID)
@@ -1262,7 +1297,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	if existingTarget != nil {
 		existing := *existingTarget
-		if existing.NodeID != "" && existing.NodeID != opts.NodeID {
+		if !opts.Migration && existing.NodeID != "" && existing.NodeID != opts.NodeID {
 			return Prepared{}, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, existing.NodeID)
 		}
 		existingFamilyID := existing.DistributedFamilyID
@@ -1272,10 +1307,21 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		if existingFamilyID != globalFamilyID {
 			return Prepared{}, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
 		}
+		branchExists := false
 		for _, branch := range existing.Branches {
-			if branch.ID == opts.VisibleBranch {
+			if branch.ID != opts.VisibleBranch {
+				continue
+			}
+			branchExists = true
+			if !opts.Migration {
 				return Prepared{}, fmt.Errorf("branch %s@%s already exists", existing.Name, opts.VisibleBranch)
 			}
+			if existing.BranchNodeID(branch.ID) != opts.SourceNode {
+				return Prepared{}, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", existing.Name, branch.ID, existing.BranchNodeID(branch.ID), opts.SourceNode)
+			}
+		}
+		if opts.Migration && !branchExists {
+			return Prepared{}, fmt.Errorf("migration source branch %s@%s does not exist", existing.Name, opts.VisibleBranch)
 		}
 		if existing.DistributedForkImports == nil {
 			existing.DistributedForkImports = make(map[string]DistributedForkImport)
@@ -1291,12 +1337,15 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		now := time.Now().UTC()
 		existing.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
 			BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
-			State: "created", CreatedAt: now,
+			State: "created", CreatedAt: now, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
 		}
 		if err := writeJSON(filepath.Join(s.Root, "containers", existing.ID, "container.json"), &existing); err != nil {
 			return Prepared{}, err
 		}
 		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
+	}
+	if opts.Migration {
+		return Prepared{}, fmt.Errorf("migration target family %q is unavailable", opts.TargetName)
 	}
 	if opts.VisibleBranch != "main" {
 		return Prepared{}, fmt.Errorf("new distributed target family %q must start with @main", opts.TargetName)
@@ -2387,19 +2436,48 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 		}
 		info.DistributedForkHidden = false
 	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		for _, branch := range info.Branches {
-			if branch.ID == pending.BranchID {
-				return ContainerInfo{}, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+		if pending.Migration {
+			found := false
+			for i := range info.Branches {
+				branch := &info.Branches[i]
+				if branch.ID != pending.BranchID {
+					continue
+				}
+				owner := branch.NodeID
+				if owner == "" {
+					owner = info.NodeID
+				}
+				if owner != pending.SourceNode {
+					return ContainerInfo{}, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
+				}
+				branch.FilesystemBranch = pending.FilesystemBranch
+				branch.NodeID = pending.TargetNode
+				branch.State = pending.State
+				branch.DistributedForkTransactionID = transactionID
+				branch.DistributedSparseRepository = pending.SparseRepository
+				branch.DistributedSparseBranch = pending.SparseBranch
+				branch.DistributedMigration = true
+				found = true
+				break
 			}
+			if !found {
+				return ContainerInfo{}, fmt.Errorf("migration branch %q disappeared before publication", pending.BranchID)
+			}
+		} else {
+			for _, branch := range info.Branches {
+				if branch.ID == pending.BranchID {
+					return ContainerInfo{}, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+				}
+			}
+			info.Branches = append(info.Branches, BranchInfo{
+				ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
+				NodeID: info.NodeID,
+				State:  pending.State, CreatedAt: pending.CreatedAt,
+				DistributedForkTransactionID: transactionID,
+				DistributedSparseRepository:  pending.SparseRepository,
+				DistributedSparseBranch:      pending.SparseBranch,
+			})
 		}
-		info.Branches = append(info.Branches, BranchInfo{
-			ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-			NodeID: info.NodeID,
-			State:  pending.State, CreatedAt: pending.CreatedAt,
-			DistributedForkTransactionID: transactionID,
-			DistributedSparseRepository:  pending.SparseRepository,
-			DistributedSparseBranch:      pending.SparseBranch,
-		})
 		delete(info.DistributedForkImports, transactionID)
 		recomputeContainerState(&info)
 	} else {
@@ -2503,13 +2581,25 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no main branch")
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		return info, BranchInfo{
-			ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-			State: pending.State, CreatedAt: pending.CreatedAt,
-			DistributedForkTransactionID: transactionID,
-			DistributedSparseRepository:  pending.SparseRepository,
-			DistributedSparseBranch:      pending.SparseBranch,
-		}, true, nil
+		branch = BranchInfo{ID: pending.BranchID, CreatedAt: pending.CreatedAt}
+		// A migration replaces an existing logical branch. Preserve its display
+		// lineage and other stable metadata while the pending import supplies the
+		// new runtime/filesystem identities.
+		if pending.Migration {
+			for _, candidate := range info.Branches {
+				if candidate.ID == pending.BranchID {
+					branch = candidate
+					break
+				}
+			}
+		}
+		branch.FilesystemBranch = pending.FilesystemBranch
+		branch.State = pending.State
+		branch.DistributedForkTransactionID = transactionID
+		branch.DistributedSparseRepository = pending.SparseRepository
+		branch.DistributedSparseBranch = pending.SparseBranch
+		branch.DistributedMigration = pending.Migration
+		return info, branch, true, nil
 	}
 	for _, candidate := range info.Branches {
 		if candidate.DistributedForkTransactionID == transactionID {
@@ -2531,16 +2621,27 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 		return err
 	}
 	if peer {
+		pendingImport, pending := info.DistributedForkImports[transactionID]
+		if !pending && branch.DistributedMigration {
+			return fmt.Errorf("published distributed migration %q cannot be canceled", transactionID)
+		}
 		if err := s.RemoveBranchFilesystems(info.ID, branch); err != nil {
 			return err
 		}
-		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
-			return err
-		}
-		if _, pending := info.DistributedForkImports[transactionID]; pending {
+		if pending {
+			// A migration import borrows the existing logical branch's console
+			// and exec artifacts. Cancel only the unpublished filesystem fork.
+			if !pendingImport.Migration {
+				if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+					return err
+				}
+			}
 			delete(info.DistributedForkImports, transactionID)
 			recomputeContainerState(&info)
 			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		}
+		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+			return err
 		}
 		return s.RemoveBranchRecord(info.ID, branch.ID)
 	}

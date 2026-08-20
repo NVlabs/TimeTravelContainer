@@ -131,6 +131,9 @@ type DistributedForkCaptureArgs struct {
 	ExternalListener bool
 	PushPolicy       ttcremote.TCPPushPolicy
 	PushHighWater    uint64
+	// LeaveSourcePaused turns a fork capture into a migration cutover capture.
+	// Errors still restore the source's original state.
+	LeaveSourcePaused bool
 }
 
 // DistributedForkCaptureChildArgs identifies one target in a coordinated
@@ -693,7 +696,7 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		SessionID: args.SessionID, TargetBranchID: args.TargetBranchID,
 		AdvertiseAddress: args.AdvertiseAddress,
 	}}
-	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener)
+	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener, args.LeaveSourcePaused)
 	if err != nil {
 		if listener != nil {
 			listener.Close()
@@ -709,10 +712,10 @@ func (f *SandboxFamily) CaptureDistributedForkMany(args *DistributedForkCaptureM
 	if args == nil {
 		return nil, errors.New("missing distributed fork batch arguments")
 	}
-	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil)
+	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil, false)
 }
 
-func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener) ([]DistributedForkSessionInfo, error) {
+func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener, leaveSourcePaused bool) ([]DistributedForkSessionInfo, error) {
 	if familyID == "" || len(children) == 0 || maxTransferBytes == 0 {
 		return nil, errors.New("distributed fork capture is missing family, children, or transfer limit")
 	}
@@ -921,13 +924,15 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			}
 		}()
 	}
-	if err := resume(); err != nil {
-		f.mu.Lock()
-		for _, child := range children {
-			delete(f.distributedSessions, child.SessionID)
+	if !leaveSourcePaused {
+		if err := resume(); err != nil {
+			f.mu.Lock()
+			for _, child := range children {
+				delete(f.distributedSessions, child.SessionID)
+			}
+			f.mu.Unlock()
+			return nil, fmt.Errorf("resuming source branch %q: %w", sourceID, err)
 		}
-		f.mu.Unlock()
-		return nil, fmt.Errorf("resuming source branch %q: %w", sourceID, err)
 	}
 	f.mu.Lock()
 	source.state = kernelBranchState(source.k)

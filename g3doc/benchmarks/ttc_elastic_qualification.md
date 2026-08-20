@@ -163,10 +163,15 @@ request ID. Only after a compatible second daemon joins with enough unreserved
 memory does TTC consume the request; the outstanding drain then resumes without
 another client command.
 
-The local run completed in 6.951 seconds with two provider attempts and two
-identity-preserving branch migrations. Both counters continued through routed
-execution on node B. Family removal, daemon shutdown, and the smoke harness
-removed all Sentries, gofers, sockets, request state, and test directories.
+After live sparse migration replaced the earlier dehydration-based cutover, the
+local run completed in 7.268 seconds with two provider attempts and two
+identity-preserving branch migrations. This wall time includes the injected
+provider failure, retry backoff, dynamic daemon startup, both cutovers, and
+source-dependency cleanup. Both counters continued through routed execution on
+node B. The target's cold bootstrap retained the migrated visible branch name
+instead of silently becoming `main`. Family removal, daemon shutdown, and the
+smoke harness removed all Sentries, gofers, sockets, request state, and test
+directories.
 
 Run it with:
 

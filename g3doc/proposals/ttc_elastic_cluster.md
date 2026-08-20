@@ -1,8 +1,8 @@
 # Elastic TimeTravelContainer clusters
 
-Status: phases 1 and 2 implemented; phase 3 drain and phase 4 placement are
-implemented with the limitations called out below. Capacity-provider sinks and
-live (non-dehydrating) migration remain follow-up work.
+Status: phases 1 through 4 are implemented with the limitations called out
+below. Identity-preserving migration now uses live sparse memory transfer;
+phase 5 physical-host and failure-injection qualification remains in progress.
 
 This document specifies an elastic TTC cluster in which compute nodes may join
 and leave without restarting existing daemons. A client connected to any
@@ -236,12 +236,13 @@ families; stale and duplicate node incarnations are detected.
 
 ### Phase 2: routed commands and manual migration
 
-**Implemented with conservative durable cutover.** `ttc migrate` currently
-dehydrates the selected branch, transfers its fenced ownership, and rehydrates
-it under the same identity on the destination. This is slower than the planned
-live sparse cutover, but never permits two runnable owners. Daemons reconcile
-interrupted source- and target-owned transactions after lease expiry, including
-the boundaries immediately before and after ownership CAS.
+**Implemented with live sparse cutover.** `ttc migrate` pauses the selected
+branch once, restores a paused target with the same visible identity, and lets
+the target demand-page from the source immediately after publication. A
+background 1 MiB sparse-chunk handoff removes the live-source dependency before
+the source runtime is reclaimed. Siblings remain live on their existing nodes.
+Daemons reconcile interrupted source- and target-owned transactions after lease
+expiry, including the boundaries immediately before and after ownership CAS.
 
 * Add daemon-to-daemon command proxying with placement-generation fencing.
 * Implement `ttc migrate CONTAINER@BRANCH --target NODE` without changing

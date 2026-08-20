@@ -258,6 +258,22 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	if _, err := family.DistributedForkSessionStatus("tx-1"); err == nil {
 		t.Fatal("canceled session remained visible")
 	}
+	migration, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
+		SessionID: "migration-1", FamilyID: "family-1", TargetBranchID: "migration-remote",
+		ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10, LeaveSourcePaused: true,
+	})
+	if err != nil {
+		t.Fatalf("migration CaptureDistributedFork: %v", err)
+	}
+	if migration.Address == "" || !parent.IsPaused() || branchStateForTest(family.List(), DefaultBranchID) != BranchPaused {
+		t.Fatalf("migration capture did not retain a paused source: info=%+v branches=%+v", migration, family.List())
+	}
+	if err := family.CancelDistributedForkSession("migration-1"); err != nil {
+		t.Fatalf("cancel migration session: %v", err)
+	}
+	if err := family.Resume(DefaultBranchID); err != nil {
+		t.Fatalf("resume migration source: %v", err)
+	}
 }
 
 func TestSandboxFamilyDistributedForkCaptureMany(t *testing.T) {

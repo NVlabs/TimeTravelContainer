@@ -172,6 +172,25 @@ func testForkIdentity() ForkIdentity {
 	}
 }
 
+func TestMigrationIdentityMustPreserveLogicalBranch(t *testing.T) {
+	identity := testForkIdentity()
+	identity.Migration = true
+	identity.TargetContainer = identity.SourceContainer
+	identity.TargetVisibleBranch = identity.SourceBranch
+	if err := identity.Validate(); err != nil {
+		t.Fatalf("valid migration identity rejected: %v", err)
+	}
+	identity.TargetContainer = "other-family"
+	if err := identity.Validate(); err == nil {
+		t.Fatal("migration into another family was accepted")
+	}
+	identity.TargetContainer = identity.SourceContainer
+	identity.TargetVisibleBranch = "other-branch"
+	if err := identity.Validate(); err == nil {
+		t.Fatal("migration that changes the branch identity was accepted")
+	}
+}
+
 func TestTransactionLifecycleAndIdempotency(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {

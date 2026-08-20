@@ -36,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -632,10 +633,11 @@ func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (s
 	return "", fmt.Errorf("branch %q disappeared from runtime state", branchID)
 }
 
-// migrate implements the first identity-preserving cutover path. It uses the
-// durable dehydration image as the handoff, so correctness and recovery land
-// before the later live sparse-transfer optimization. Branch-local ownership
-// allows siblings in the same logical family to remain on their current node.
+// migrate performs an identity-preserving sparse cutover. The source is paused
+// once, target metadata and page readers are reconstructed while it remains
+// paused, and publication atomically transfers the logical branch. The target
+// may execute immediately using live network page pulls; a background sparse
+// handoff removes that dependency before the source runtime is reclaimed.
 func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return errors.New("elastic migration requires dynamic cluster discovery")
@@ -703,60 +705,230 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			return fmt.Errorf("adopting placement after node restart: %w", err)
 		}
 	}
-	requestID, err := newDaemonRequestID()
+	requestID, err := newDistributedTransactionID()
 	if err != nil {
 		return err
 	}
 	if _, err := placements.BeginMigration(info.ID, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
 		return err
 	}
-	abort := func(cause error, restore bool) error {
-		if restore {
-			if rehydrateErr := b.rehydrate(target); rehydrateErr != nil {
-				// Leave the placement migrating. Once this incarnation loses
-				// its lease, recovery can retry restoration without exposing a
-				// stable placement backed by a dehydrated runtime.
-				return fmt.Errorf("%w; restoring source before rollback: %v", cause, rehydrateErr)
-			}
-			if runtimeState, stateErr := b.runtimeBranchLifecycle(info.ID, target.branch); stateErr != nil || runtimeState != state {
-				return fmt.Errorf("%w; restored source runtime is %q (want %q): %v", cause, runtimeState, state, stateErr)
+	if err := b.containerStore().PromoteContainerRepositories(info.ID); err != nil {
+		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		return fmt.Errorf("stabilizing migration filesystem repositories: %w", err)
+	}
+	info, err = b.containerStore().LoadContainer(info.ID)
+	if err != nil {
+		_, _ = placements.AbortMigration(target.container, target.branch, requestID, time.Now())
+		return err
+	}
+	rootfsDigest, err := distributedRootfsDigest(info, target.branch, b.distributedSource.capabilities.RepositoryID)
+	if err != nil {
+		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		return err
+	}
+	identity := cluster.ForkIdentity{
+		TransactionID: requestID, SourceNodeID: b.nodeID, TargetNodeID: targetNode,
+		SourceContainer: info.ID, SourceBranch: target.branch,
+		TargetContainer: info.ID, TargetBranch: requestID, TargetVisibleBranch: target.branch,
+		ImageDigest: info.Digest, RootfsDigest: rootfsDigest,
+		RepositoryID: b.distributedSource.capabilities.RepositoryID, Migration: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+	if err != nil {
+		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		return fmt.Errorf("reserving sparse migration target %q: %w", targetNode, err)
+	}
+
+	execSessions, sidecarErr := b.stopMigrationBranchSidecars(target, info)
+	if sidecarErr != nil {
+		_, _ = peer.Cancel(ctx, requestID, tx.Revision)
+		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		return sidecarErr
+	}
+	var relay *distributedPageRelay
+	captured := false
+	published := false
+	restoreSource := func() error {
+		var result error
+		if captured {
+			result = errors.Join(result, func() error {
+				_, err := b.command("timetravel", info.ID, "distributed-cancel", requestID)
+				return err
+			}())
+		}
+		if captured && state == "running" {
+			if _, err := b.command("timetravel", info.ID, "resume", target.branch); err != nil {
+				result = errors.Join(result, fmt.Errorf("resuming migration source: %w", err))
 			}
 		}
-		_, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
-		if abortErr != nil {
-			return fmt.Errorf("%w; aborting placement: %v", cause, abortErr)
+		result = errors.Join(result, b.restoreMigrationBranchSidecars(target, info, execSessions))
+		return result
+	}
+	abort := func(cause error) error {
+		if published {
+			return cause
+		}
+		relay.Close()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if current, statusErr := peer.Status(cleanupCtx, requestID); statusErr == nil {
+			_, _ = peer.Cancel(cleanupCtx, requestID, current.Revision)
+		} else {
+			_, _ = peer.Cancel(cleanupCtx, requestID, tx.Revision)
+		}
+		cleanupCancel()
+		restoreErr := restoreSource()
+		if _, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now()); abortErr != nil {
+			return fmt.Errorf("%w; restoring sparse migration source: %v; aborting placement: %v", cause, restoreErr, abortErr)
+		}
+		if restoreErr != nil {
+			return fmt.Errorf("%w; restoring sparse migration source: %v", cause, restoreErr)
 		}
 		return cause
 	}
-	if err := b.dehydrate(target); err != nil {
-		return abort(fmt.Errorf("dehydrating migration source: %w", err), false)
-	}
-	if err := b.containerStore().CompareAndSwapBranchNodeID(info.ID, target.branch, b.nodeID, targetNode); err != nil {
-		return abort(fmt.Errorf("transferring branch ownership: %w", err), true)
-	}
-	status, _, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"rehydrate", target.String()})
+
+	listener, err := net.Listen("tcp", b.distributedSource.pageListen)
 	if err != nil {
-		// Delivery is uncertain. The source remains durably cold and fenced by
-		// NodeID; retrying rehydrate through any daemon is safe.
-		return fmt.Errorf("migration ownership moved to %q but destination response is uncertain: %w; ttcd will reconcile operation %s", targetNode, err, requestID)
+		return abort(fmt.Errorf("opening sparse migration page listener: %w", err))
 	}
-	if status != 0 {
-		// A nonzero response is not proof that destination execution never
-		// happened: the daemon may have restarted after restoring the branch,
-		// leaving an indeterminate mutation journal. Once ownership CAS has
-		// succeeded, never move it backward. Target-side recovery verifies the
-		// runtime and rolls the fenced transaction forward.
-		return fmt.Errorf("migration ownership moved to %q but destination returned %s; ttcd will reconcile operation %s", targetNode, strings.TrimSpace(diagnostic), requestID)
+	advertise, err := resolveDistributedAdvertiseAddress(b.distributedSource.pageAdvertise, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		return abort(err)
 	}
+	relayBackend := *b
+	relayBackend.stdin = strings.NewReader("")
+	relayBackend.stdout = io.Discard
+	relayBackend.stderr = io.Discard
+	relay = newDistributedPageRelay(listener, &relayBackend, info.ID, requestID)
+	dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
+	if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+		dataPlaneMax = tx.Negotiated.MaxTransferSize
+	}
+	output, err := b.command(
+		"timetravel", "--source", target.branch,
+		"--distributed-session", requestID,
+		"--distributed-family", info.ID,
+		"--distributed-external-listener", "--distributed-advertise", advertise,
+		"--distributed-max-transfer", fmt.Sprint(dataPlaneMax),
+		"--distributed-push-policy", string(tx.Negotiated.PagingPolicy.Push),
+		"--distributed-push-high-water", fmt.Sprint(tx.Negotiated.PagingPolicy.MaxOutstandingBytes),
+		"--distributed-leave-source-paused",
+		info.ID, "distributed-capture", requestID,
+	)
+	if err != nil {
+		return abort(fmt.Errorf("capturing sparse migration source: %w", err))
+	}
+	captured = true
+	var session boot.DistributedForkSessionInfo
+	if err := json.Unmarshal(output, &session); err != nil {
+		return abort(fmt.Errorf("decoding sparse migration capture: %w", err))
+	}
+	if session.SessionID != requestID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
+		return abort(errors.New("sparse migration capture returned incomplete session metadata"))
+	}
+	descriptor := cluster.RemoteSessionDescriptor{
+		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
+		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
+		MaxTransferBytes: dataPlaneMax,
+	}
+	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)
+	if err != nil {
+		return abort(fmt.Errorf("preparing sparse migration target: %w", err))
+	}
+	tx, err = peer.Publish(ctx, requestID, tx.Revision, state == "paused")
+	if err != nil {
+		status, statusErr := peer.Status(ctx, requestID)
+		if statusErr != nil || (status.State != cluster.TransactionPublished && status.State != cluster.TransactionDraining && status.State != cluster.TransactionIndependent) {
+			return abort(fmt.Errorf("publishing sparse migration target: %w", err))
+		}
+		tx = status
+	}
+	published = true
 	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
 		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
 	}
-	if err := b.releaseMigratedSourceRuntime(info.ID, target.branch); err != nil && b.stderr != nil {
-		// Ownership and target execution are already committed. A stale source
-		// shell is non-runnable, so never roll back the cutover for cleanup.
-		fmt.Fprintf(b.stderr, "ttc: warning: retaining fenced source runtime for %s: %v\n", target, err)
-	}
+	monitorBackend := *b
+	monitorBackend.stdin = strings.NewReader("")
+	monitorBackend.stdout = io.Discard
+	monitorBackend.stderr = io.Discard
+	go monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+	go monitorBackend.monitorSparseMigrationCleanup(peer, info.ID, target.branch, requestID, relay)
 	return nil
+}
+
+func (b *runtimeBackend) stopMigrationBranchSidecars(target selector, info ttcbundle.ContainerInfo) ([]runscExecSession, error) {
+	sessions, err := b.execSessions(target)
+	if err != nil {
+		return nil, fmt.Errorf("listing migration exec sessions: %w", err)
+	}
+	store := b.containerStore()
+	paths, err := store.BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.stopConsoleDrain(paths); err != nil {
+		return nil, fmt.Errorf("stopping migration init console follower: %w", err)
+	}
+	for _, session := range sessions {
+		paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID)
+		if pathErr != nil {
+			return sessions, pathErr
+		}
+		if err := b.stopConsoleDrain(paths); err != nil {
+			_ = b.restoreMigrationBranchSidecars(target, info, sessions)
+			return sessions, fmt.Errorf("stopping migration exec console %q: %w", session.ID, err)
+		}
+	}
+	if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
+		_ = b.restoreMigrationBranchSidecars(target, info, sessions)
+		return sessions, fmt.Errorf("stopping migration published ports: %w", err)
+	}
+	return sessions, nil
+}
+
+func (b *runtimeBackend) restoreMigrationBranchSidecars(target selector, info ttcbundle.ContainerInfo, sessions []runscExecSession) error {
+	var result error
+	if _, err := b.ensureConsoleDrain(target, false); err != nil {
+		result = errors.Join(result, fmt.Errorf("restoring init console: %w", err))
+	}
+	for _, session := range sessions {
+		if session.State != "running" {
+			continue
+		}
+		if _, err := b.ensureExecConsoleDrain(target, session.ID, session.ConsoleID, false); err != nil {
+			result = errors.Join(result, fmt.Errorf("restoring exec console %q: %w", session.ID, err))
+		}
+	}
+	result = errors.Join(result, b.ensurePublishedPortsForBranch(info, target.branch))
+	return result
+}
+
+func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, containerID, branchID, transactionID string, relay *distributedPageRelay) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tx, err := peer.Status(ctx, transactionID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		switch tx.State {
+		case cluster.TransactionIndependent:
+			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
+			relay.Close()
+			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: retaining source runtime after sparse migration %s@%s: %v\n", containerID, branchID, err)
+			}
+			return
+		case cluster.TransactionCanceled, cluster.TransactionFailed:
+			// A published migration never rolls ownership backward. Retain the
+			// source snapshot for diagnostics or an explicit recovery attempt.
+			return
+		}
+	}
 }
 
 func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID string) error {
@@ -828,18 +1000,25 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 			continue
 		}
 		physicalLocalOwned := false
+		protectedMigration := false
 		for _, branch := range runtimeFamily.Branches {
 			if info.BranchNodeID(branch.ID) == b.nodeID {
 				physicalLocalOwned = true
 				break
 			}
+			if b.activeSparseMigrationSource(info.ID, branch.ID) {
+				protectedMigration = true
+			}
 		}
-		if !physicalLocalOwned {
+		if !physicalLocalOwned && !protectedMigration {
 			result = errors.Join(result, b.purgeRuntime(info.ID))
 			continue
 		}
 		for _, runtimeBranch := range runtimeFamily.Branches {
 			if info.BranchNodeID(runtimeBranch.ID) == b.nodeID {
+				continue
+			}
+			if b.activeSparseMigrationSource(info.ID, runtimeBranch.ID) {
 				continue
 			}
 			if _, err := b.command("timetravel", info.ID, "destroy", runtimeBranch.ID); err != nil {
@@ -848,6 +1027,33 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 		}
 	}
 	return result
+}
+
+func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID string) bool {
+	if b.dataRoot == "" || b.nodeID == "" {
+		return false
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	if err != nil {
+		return false
+	}
+	records, err := transactions.List()
+	if err != nil {
+		return false
+	}
+	for _, tx := range records {
+		if !tx.Identity.Migration || tx.Identity.SourceNodeID != b.nodeID || tx.Identity.SourceContainer != containerID || tx.Identity.SourceBranch != branchID ||
+			tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+			continue
+		}
+		// The live session itself is authoritative. In particular, protect the
+		// narrow interval after the target records independence but before the
+		// source releases its last page and filesystem references.
+		if _, err := b.command("timetravel", containerID, "distributed-status", tx.Identity.TransactionID); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // recoverInterruptedMigrations reconciles durable migration intent after the
@@ -864,6 +1070,10 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 		return nil, err
 	}
 	records, err := placements.List()
+	if err != nil {
+		return nil, err
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
 	if err != nil {
 		return nil, err
 	}
@@ -915,6 +1125,33 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 				result = errors.Join(result, fmt.Errorf("source node %q cannot recover %s: lease unavailable", b.nodeID, target))
 				continue
 			}
+			if tx, txErr := transactions.Load(placement.OperationID); txErr == nil && tx.Identity.Migration {
+				peer, peerErr := b.distributedSource.peer(placement.TargetNode, false)
+				if peerErr == nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if status, statusErr := peer.Status(ctx, tx.Identity.TransactionID); statusErr == nil && status.State != cluster.TransactionPublished && status.State != cluster.TransactionDraining && status.State != cluster.TransactionIndependent {
+						_, _ = peer.Cancel(ctx, tx.Identity.TransactionID, status.Revision)
+					}
+					cancel()
+				}
+				_, _ = b.command("timetravel", info.ID, "distributed-cancel", tx.Identity.TransactionID)
+				if placement.ResumeState == cluster.PlacementRunning {
+					if _, err := b.command("timetravel", info.ID, "resume", placement.BranchID); err != nil {
+						result = errors.Join(result, fmt.Errorf("resuming interrupted sparse migration source %s: %w", target, err))
+						continue
+					}
+				}
+				if refreshed, refreshErr := b.containerStore().LoadContainer(info.ID); refreshErr == nil {
+					info = refreshed
+				}
+				sessions, sessionsErr := b.execSessions(target)
+				if sessionsErr == nil {
+					if sidecarErr := b.restoreMigrationBranchSidecars(target, info, sessions); sidecarErr != nil {
+						result = errors.Join(result, fmt.Errorf("restoring sparse migration source sidecars %s: %w", target, sidecarErr))
+						continue
+					}
+				}
+			}
 			state := normalizeLifecycleState(branch.State)
 			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, placement.BranchID)
 			if state == "dehydrated" || runtimeErr == nil && runtimeState == "dehydrated" {
@@ -947,9 +1184,14 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 			recovered = append(recovered, target)
 		case placement.TargetNode:
 			// After the ownership CAS, only the target daemon rolls forward.
-			// This is safe even while the source lease remains live: source code
-			// never rolls ownership backward after CAS, and the target mutation
-			// lock serializes recovery with an in-flight rehydrate request.
+			// Persistent target metadata is installed immediately before the
+			// target resumes, but placement ownership is not cut over until the
+			// target publish RPC returns. While the old owner lease is active this
+			// can therefore be an ordinary in-flight publish, not recovery work.
+			// The source remains authoritative and will either commit or abort it.
+			if oldOwnerActive {
+				continue
+			}
 			if b.nodeID != placement.TargetNode {
 				continue
 			}

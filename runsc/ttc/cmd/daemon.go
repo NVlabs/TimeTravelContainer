@@ -218,6 +218,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
 		TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
+		SourceNode: tx.Identity.SourceNodeID, Migration: tx.Identity.Migration,
 	})
 	return err
 }
@@ -268,6 +269,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
 	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	runtimeCreated := false
 	var runtimeState struct {
 		Status string `json:"status"`
 	}
@@ -276,10 +278,20 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := json.Unmarshal(stateOutput, &runtimeState); err != nil {
 			return fmt.Errorf("decoding target runtime state: %w", err)
 		}
-	} else if peer {
-		return fmt.Errorf("distributed peer target runtime is unavailable: %w", stateErr)
 	} else {
-		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", info.BundleDir, info.ID)
+		bundleDir := info.BundleDir
+		var cleanup func()
+		if peer {
+			if !tx.Identity.Migration {
+				return fmt.Errorf("distributed peer target runtime is unavailable: %w", stateErr)
+			}
+			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedMigrationRestoreBundle(info.ID, targetBranch.ID, targetBranch.FilesystemBranch)
+			if err != nil {
+				return fmt.Errorf("preparing distributed migration target bundle: %w", err)
+			}
+			defer cleanup()
+		}
+		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
 		if err != nil {
 			return fmt.Errorf("creating distributed target runtime: %w", err)
 		}
@@ -287,11 +299,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return fmt.Errorf("creating distributed target runtime exited with status %d", status)
 		}
 		runtimeState.Status = "created"
+		runtimeCreated = true
 	}
-	if peer && runtimeState.Status != "running" {
+	if peer && runtimeState.Status != "running" && runtimeState.Status != "created" {
 		return fmt.Errorf("distributed peer target runtime is %q, want running", runtimeState.Status)
 	}
 	if runtimeState.Status == "created" || peer {
+		// A metadata peer restored into a newly created empty Sentry is its
+		// physical loader branch, not an import into an already-running family.
+		restoreArgs.Peer = peer && !runtimeCreated
 		encoded, err := json.Marshal(&restoreArgs)
 		if err != nil {
 			return err
@@ -502,7 +518,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return err
 		}
 		keepDurableTargets = true
-		if !peer {
+		if runtimeCreated {
 			status, err := r.backend.runConfiguredCommandWithArgs(configured, "start", info.ID)
 			if err != nil {
 				return fmt.Errorf("starting paused distributed target: %w", err)
@@ -523,6 +539,15 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	if err != nil {
 		return err
 	}
+	if tx.Identity.Migration {
+		// This metadata replacement is the migration ownership cutover. It must
+		// precede the first target instruction: after it succeeds recovery only
+		// rolls forward on this node.
+		info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+		if err != nil {
+			return err
+		}
+	}
 	if !paused && branch.State != "running" {
 		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
 			return fmt.Errorf("resuming distributed target: %w", err)
@@ -531,12 +556,31 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 			return err
 		}
 	}
-	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
-	if err != nil {
-		return err
+	if !tx.Identity.Migration {
+		info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+		if err != nil {
+			return err
+		}
 	}
 	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
 		return fmt.Errorf("starting distributed target console drain: %w", err)
+	}
+	sessions, err := r.backend.execSessions(selector{container: info.ID, branch: branch.ID})
+	if err != nil {
+		return fmt.Errorf("listing distributed target exec sessions: %w", err)
+	}
+	for _, session := range sessions {
+		if session.State != "running" {
+			continue
+		}
+		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, true); err != nil {
+			return fmt.Errorf("starting distributed target exec console %q: %w", session.ID, err)
+		}
+	}
+	if tx.Identity.Migration {
+		if err := r.backend.ensurePublishedPortsForBranch(info, branch.ID); err != nil {
+			return fmt.Errorf("starting migrated published ports: %w", err)
+		}
 	}
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
 	return nil
@@ -583,6 +627,11 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, branch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err == nil {
+		if tx.Identity.Migration && branch.DistributedMigration {
+			if _, pending := info.DistributedForkImports[tx.Identity.TransactionID]; !pending {
+				return fmt.Errorf("published migration %q cannot be canceled", tx.Identity.TransactionID)
+			}
+		}
 		if peer {
 			_, _ = r.backend.command("timetravel", info.ID, "destroy", branch.ID)
 		} else {

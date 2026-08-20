@@ -1347,7 +1347,15 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		monitorBackend.stdin = strings.NewReader("")
 		monitorBackend.stdout = io.Discard
 		monitorBackend.stderr = io.Discard
-		if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
+		if tx.Identity.Migration {
+			if tx.State == cluster.TransactionDraining {
+				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
+					tx.Identity.TransactionID, tx.Revision, nil)
+			} else {
+				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
+					tx.Identity.TransactionID, tx.Revision, nil)
+			}
+		} else if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
 			if tx.State == cluster.TransactionDraining {
 				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
 					tx.Identity.TransactionID, tx.Revision, nil)
@@ -1358,6 +1366,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		} else {
 			go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
 				tx.Identity.TransactionID, tx.Revision, nil)
+		}
+		if tx.Identity.Migration {
+			go monitorBackend.monitorSparseMigrationCleanup(peer, tx.Identity.SourceContainer,
+				tx.Identity.SourceBranch, tx.Identity.TransactionID, nil)
 		}
 	}
 }

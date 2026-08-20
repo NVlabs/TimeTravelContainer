@@ -99,6 +99,7 @@ type TimeTravel struct {
 	distributedPrefetchBehind     uint64
 	distributedPushPolicy         string
 	distributedPushHighWater      uint64
+	distributedLeaveSourcePaused  bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -187,6 +188,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.Uint64Var(&t.distributedPrefetchBehind, "distributed-prefetch-behind-bytes", 0, "remote-memory bytes to prefetch before a fault")
 	f.StringVar(&t.distributedPushPolicy, "distributed-push-policy", "demand-only", "reverse push policy")
 	f.Uint64Var(&t.distributedPushHighWater, "distributed-push-high-water", 0, "retained source bytes that trigger pressure push")
+	f.BoolVar(&t.distributedLeaveSourcePaused, "distributed-leave-source-paused", false, "leave a singular distributed capture paused for migration")
 }
 
 func publishConsoleFollowerPID(path string) (func(), error) {
@@ -291,6 +293,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				TargetBranchID: f.Arg(2), AdvertiseAddress: t.distributedAdvertise,
 				MaxTransferBytes: t.distributedMaxTransfer, ExternalListener: true,
 				PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
+				LeaveSourcePaused: t.distributedLeaveSourcePaused,
 			})
 			break
 		}
@@ -322,6 +325,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			SessionID:   t.distributedSessionID, Source: t.source, FamilyID: t.distributedFamilyID,
 			TargetBranchID: f.Arg(2), AdvertiseAddress: advertise, MaxTransferBytes: t.distributedMaxTransfer,
 			PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
+			LeaveSourcePaused: t.distributedLeaveSourcePaused,
 		})
 		listenerFile.Close()
 		listener.Close()

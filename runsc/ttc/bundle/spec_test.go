@@ -135,6 +135,102 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	}
 }
 
+func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created := time.Unix(1234, 0).UTC()
+	info := ContainerInfo{
+		ID: "family-id", Name: "family", DistributedFamilyID: "global-family",
+		NodeID: "node-a", State: "running", CreatedAt: created,
+		BundleDir: filepath.Join(root, "containers", "family-id", "bundle"),
+		Branches: []BranchInfo{
+			{ID: "main", NodeID: "node-a", FilesystemBranch: "fs-main", State: "running", CreatedAt: created},
+			{ID: "child", ParentID: "main", NodeID: "node-a", FilesystemBranch: "fs-child-old", State: "running", CreatedAt: created.Add(time.Second)},
+		},
+	}
+	dir := filepath.Join(root, "containers", info.ID)
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	prepare := func(transaction string) BranchInfo {
+		t.Helper()
+		if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+			SourceContainer: "family", TargetName: "family", TargetBranch: transaction,
+			VisibleBranch: "child", TransactionID: transaction, NodeID: "node-b",
+			SourceNode: "node-a", Migration: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, branch, peer, err := store.DistributedForkTargetBranch(transaction)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !peer || !branch.DistributedMigration || branch.ParentID != "main" || !branch.CreatedAt.Equal(created.Add(time.Second)) {
+			t.Fatalf("pending migration lost branch identity: peer=%t branch=%+v", peer, branch)
+		}
+		return branch
+	}
+
+	pending := prepare("tx-cancel")
+	bundleDir, cleanup, err := store.PrepareDistributedMigrationRestoreBundle("family", pending.ID, pending.FilesystemBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	var spec specs.Spec
+	encoded, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "child" {
+		t.Fatalf("cold migration branch annotation=%q, want child", got)
+	}
+	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]; got != "main" {
+		t.Fatalf("cold migration parent annotation=%q, want main", got)
+	}
+	if err := store.RemoveDistributedForkTarget("tx-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	afterCancel, err := store.LoadContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterCancel.Branches) != 2 || afterCancel.BranchNodeID("child") != "node-a" {
+		t.Fatalf("cancel changed source branch: %+v", afterCancel.Branches)
+	}
+
+	prepare("tx-publish")
+	if err := store.UpdateDistributedForkTargetState("tx-publish", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	published, err := store.PublishDistributedForkTarget("tx-publish")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Branches) != 2 {
+		t.Fatalf("migration added a branch instead of replacing it: %+v", published.Branches)
+	}
+	for _, branch := range published.Branches {
+		if branch.ID == "child" {
+			if branch.ParentID != "main" || !branch.CreatedAt.Equal(created.Add(time.Second)) || branch.NodeID != "node-b" || branch.FilesystemBranch == "fs-child-old" || !branch.DistributedMigration {
+				t.Fatalf("published migration branch=%+v", branch)
+			}
+			return
+		}
+	}
+	t.Fatal("published migration lost child branch")
+}
+
 func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	imageDir := t.TempDir()
 	rootfs := filepath.Join(imageDir, "rootfs")

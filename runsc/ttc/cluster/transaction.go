@@ -57,6 +57,10 @@ type ForkIdentity struct {
 	ImageDigest         string `json:"image_digest"`
 	RootfsDigest        string `json:"rootfs_digest"`
 	RepositoryID        string `json:"repository_id"`
+	// Migration preserves TargetContainer@TargetVisibleBranch instead of
+	// publishing an additional logical branch. The target runtime is still a
+	// fork-time snapshot internally, but ownership replaces the paused source.
+	Migration bool `json:"migration,omitempty"`
 }
 
 // VisibleTargetBranch returns the external target-family branch identity.
@@ -110,6 +114,9 @@ func (i ForkIdentity) Validate() error {
 	}
 	if i.SourceContainer == "" || i.SourceBranch == "" || i.TargetContainer == "" || i.TargetBranch == "" || i.RepositoryID == "" {
 		return errors.New("fork identity omits a container, branch, or repository field")
+	}
+	if i.Migration && (i.TargetContainer != i.SourceContainer || i.VisibleTargetBranch() != i.SourceBranch) {
+		return errors.New("migration identity must preserve its container and visible branch")
 	}
 	if err := validateSHA256Digest(i.ImageDigest); err != nil {
 		return fmt.Errorf("image digest: %w", err)
