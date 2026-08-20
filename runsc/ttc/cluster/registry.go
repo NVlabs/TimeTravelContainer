@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -53,20 +54,31 @@ var nodeTransitions = map[NodeState]map[NodeState]bool{
 // NodeRecord is the shared discovery record for one ttcd incarnation.
 // Placement ownership uses a separate, more strongly fenced catalog.
 type NodeRecord struct {
-	NodeID                string            `json:"node_id"`
-	Incarnation           string            `json:"incarnation"`
-	State                 NodeState         `json:"state"`
-	ControlURL            string            `json:"control_url"`
-	ControlServerName     string            `json:"control_server_name"`
-	Capabilities          Capabilities      `json:"capabilities"`
-	MemoryTargetBytes     uint64            `json:"memory_target_bytes,omitempty"`
-	MemoryCurrentBytes    uint64            `json:"memory_current_bytes,omitempty"`
-	IncomingReservedBytes uint64            `json:"incoming_reserved_bytes,omitempty"`
-	Labels                map[string]string `json:"labels,omitempty"`
-	Revision              uint64            `json:"revision"`
-	StartedAt             time.Time         `json:"started_at"`
-	UpdatedAt             time.Time         `json:"updated_at"`
-	LeaseExpiresAt        time.Time         `json:"lease_expires_at"`
+	NodeID                string                         `json:"node_id"`
+	Incarnation           string                         `json:"incarnation"`
+	State                 NodeState                      `json:"state"`
+	ControlURL            string                         `json:"control_url"`
+	ControlServerName     string                         `json:"control_server_name"`
+	Capabilities          Capabilities                   `json:"capabilities"`
+	MemoryTargetBytes     uint64                         `json:"memory_target_bytes,omitempty"`
+	MemoryCurrentBytes    uint64                         `json:"memory_current_bytes,omitempty"`
+	IncomingReservedBytes uint64                         `json:"incoming_reserved_bytes,omitempty"`
+	IncomingReservations  map[string]IncomingReservation `json:"incoming_reservations,omitempty"`
+	Labels                map[string]string              `json:"labels,omitempty"`
+	Revision              uint64                         `json:"revision"`
+	StartedAt             time.Time                      `json:"started_at"`
+	UpdatedAt             time.Time                      `json:"updated_at"`
+	LeaseExpiresAt        time.Time                      `json:"lease_expires_at"`
+}
+
+// IncomingReservation fences capacity promised to one placement operation.
+// It expires automatically so a failed source cannot leak target capacity.
+type IncomingReservation struct {
+	SourceNode       string    `json:"source_node"`
+	Bytes            uint64    `json:"bytes"`
+	AccountedAtBytes uint64    `json:"accounted_at_bytes"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
+	ExpiresAt        time.Time `json:"expires_at"`
 }
 
 // LeaseActive reports whether the record may be used for discovery at now.
@@ -123,6 +135,22 @@ func (r NodeRecord) Validate() error {
 		if key == "" || len(key) > 128 || len(value) > 1024 || strings.TrimSpace(key) != key {
 			return fmt.Errorf("invalid node label %q", key)
 		}
+	}
+	if len(r.IncomingReservations) > 1024 {
+		return fmt.Errorf("node has %d incoming reservations, limit is 1024", len(r.IncomingReservations))
+	}
+	var reserved uint64
+	for operation, reservation := range r.IncomingReservations {
+		if !transactionIDPattern.MatchString(operation) || !transactionIDPattern.MatchString(reservation.SourceNode) || reservation.Bytes == 0 || reservation.AccountedAtBytes == 0 || reservation.ExpiresAt.IsZero() || (!reservation.CompletedAt.IsZero() && reservation.CompletedAt.After(reservation.ExpiresAt)) {
+			return fmt.Errorf("invalid incoming reservation %q", operation)
+		}
+		if reserved > math.MaxUint64-reservation.Bytes {
+			return errors.New("incoming reservation byte total overflows")
+		}
+		reserved += reservation.Bytes
+	}
+	if len(r.IncomingReservations) != 0 && reserved != r.IncomingReservedBytes {
+		return fmt.Errorf("incoming reservation total is %d, recorded total is %d", reserved, r.IncomingReservedBytes)
 	}
 	return nil
 }
@@ -206,6 +234,8 @@ func (d *NodeDirectory) Register(record NodeRecord, now time.Time, lease time.Du
 			if current.Incarnation == record.Incarnation {
 				record.StartedAt = current.StartedAt
 				record.State = current.State
+				record.IncomingReservedBytes = current.IncomingReservedBytes
+				record.IncomingReservations = current.IncomingReservations
 			}
 		case !errors.Is(err, os.ErrNotExist):
 			return err
@@ -224,7 +254,7 @@ func (d *NodeDirectory) Register(record NodeRecord, now time.Time, lease time.Du
 
 // Heartbeat renews one live incarnation and updates its load report. Expired
 // incarnations must register again instead of silently resurrecting.
-func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current, reserved uint64, now time.Time, lease time.Duration) (*NodeRecord, error) {
+func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*NodeRecord, error) {
 	if err := validateLease(now, lease); err != nil {
 		return nil, err
 	}
@@ -241,12 +271,167 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current, reserved 
 			return fmt.Errorf("node %q lease expired at %s", nodeID, record.LeaseExpiresAt.Format(time.RFC3339Nano))
 		}
 		record.MemoryCurrentBytes = current
-		record.IncomingReservedBytes = reserved
+		pruneIncomingReservations(&record, now)
 		record.Revision++
 		record.UpdatedAt = now
 		record.LeaseExpiresAt = now.Add(lease)
 		if err := d.store(record); err != nil {
 			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func pruneIncomingReservations(record *NodeRecord, now time.Time) {
+	if len(record.IncomingReservations) == 0 {
+		record.IncomingReservations = nil
+		record.IncomingReservedBytes = 0
+		return
+	}
+	var total uint64
+	for operation, reservation := range record.IncomingReservations {
+		if !now.Before(reservation.ExpiresAt) || record.MemoryCurrentBytes >= reservation.AccountedAtBytes || (!reservation.CompletedAt.IsZero() && now.After(reservation.CompletedAt)) {
+			delete(record.IncomingReservations, operation)
+			continue
+		}
+		total += reservation.Bytes
+	}
+	if len(record.IncomingReservations) == 0 {
+		record.IncomingReservations = nil
+	}
+	record.IncomingReservedBytes = total
+}
+
+// ReserveIncoming atomically promises target memory to one placement
+// operation. Concurrent sources serialize on the target record, and retries
+// with the same operation are idempotent.
+func (d *NodeDirectory) ReserveIncoming(nodeID, incarnation, operation, sourceNode string, bytes uint64, now time.Time, ttl time.Duration) (*NodeRecord, error) {
+	if !transactionIDPattern.MatchString(operation) || !transactionIDPattern.MatchString(sourceNode) || bytes == 0 {
+		return nil, errors.New("invalid incoming reservation identity or size")
+	}
+	if now.IsZero() || ttl < time.Second || ttl > 10*time.Minute {
+		return nil, fmt.Errorf("invalid incoming reservation TTL %s", ttl)
+	}
+	var result NodeRecord
+	err := d.withLock(nodeID, func() error {
+		record, err := d.load(nodeID)
+		if err != nil {
+			return err
+		}
+		if record.Incarnation != incarnation || !record.AcceptsPlacement(now) {
+			return fmt.Errorf("node %q incarnation is unavailable for reservation", nodeID)
+		}
+		pruneIncomingReservations(&record, now)
+		if existing, ok := record.IncomingReservations[operation]; ok {
+			if existing.SourceNode != sourceNode || existing.Bytes != bytes {
+				return fmt.Errorf("incoming reservation %q was reused with different parameters", operation)
+			}
+			result = record
+			return nil
+		}
+		if len(record.IncomingReservations) >= 1024 {
+			return errors.New("target has too many incoming reservations")
+		}
+		if record.IncomingReservedBytes > math.MaxUint64-bytes || record.MemoryCurrentBytes > math.MaxUint64-record.IncomingReservedBytes-bytes {
+			return errors.New("incoming reservation byte total overflows")
+		}
+		projected := record.MemoryCurrentBytes + record.IncomingReservedBytes + bytes
+		if record.MemoryTargetBytes != 0 && projected > record.MemoryTargetBytes {
+			return fmt.Errorf("reservation would raise node %q to %d bytes above its %d-byte target", nodeID, projected, record.MemoryTargetBytes)
+		}
+		if record.IncomingReservations == nil {
+			record.IncomingReservations = make(map[string]IncomingReservation)
+		}
+		record.IncomingReservations[operation] = IncomingReservation{
+			SourceNode: sourceNode, Bytes: bytes, AccountedAtBytes: projected, ExpiresAt: now.Add(ttl),
+		}
+		record.IncomingReservedBytes += bytes
+		record.Revision++
+		record.UpdatedAt = now
+		if err := d.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ReleaseIncoming releases an operation's target reservation. Missing
+// reservations are an idempotent success.
+func (d *NodeDirectory) ReleaseIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error) {
+	if !transactionIDPattern.MatchString(operation) || now.IsZero() {
+		return nil, errors.New("invalid incoming reservation release")
+	}
+	var result NodeRecord
+	err := d.withLock(nodeID, func() error {
+		record, err := d.load(nodeID)
+		if err != nil {
+			return err
+		}
+		if record.Incarnation != incarnation {
+			return fmt.Errorf("node %q incarnation changed before reservation release", nodeID)
+		}
+		pruneIncomingReservations(&record, now)
+		if _, ok := record.IncomingReservations[operation]; !ok {
+			result = record
+			return nil
+		}
+		delete(record.IncomingReservations, operation)
+		pruneIncomingReservations(&record, now)
+		record.Revision++
+		record.UpdatedAt = now
+		if err := d.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// CompleteIncoming records that migration mutations have finished. The
+// reservation remains charged until a subsequent heartbeat publishes fresh
+// target memory, avoiding a stale-load admission window even when actual RSS
+// grows by less than the estimate due to cache reuse.
+func (d *NodeDirectory) CompleteIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error) {
+	if !transactionIDPattern.MatchString(operation) || now.IsZero() {
+		return nil, errors.New("invalid incoming reservation completion")
+	}
+	var result NodeRecord
+	err := d.withLock(nodeID, func() error {
+		record, err := d.load(nodeID)
+		if err != nil {
+			return err
+		}
+		if record.Incarnation != incarnation {
+			return fmt.Errorf("node %q incarnation changed before reservation completion", nodeID)
+		}
+		pruneIncomingReservations(&record, now)
+		reservation, ok := record.IncomingReservations[operation]
+		if !ok {
+			result = record
+			return nil
+		}
+		if reservation.CompletedAt.IsZero() {
+			reservation.CompletedAt = now
+			record.IncomingReservations[operation] = reservation
+			record.Revision++
+			record.UpdatedAt = now
+			if err := d.store(record); err != nil {
+				return err
+			}
 		}
 		result = record
 		return nil

@@ -278,6 +278,9 @@ data. Cgroup memory remains the hard admission signal.
 * Export bounded resident-sharing summaries and node actual/reserved memory.
 * Implement deterministic bipartition dry runs and scoring diagnostics.
 * Add watermarks, hysteresis, cooldowns, and destination reservations.
+  **Implemented.** Reservations are incarnation-fenced, atomically reject
+  concurrent overcommit, expire after source loss, and remain charged until a
+  target heartbeat publishes post-migration actual cgroup memory.
 * Add optional automatic rebalance and capacity requests.
 
 Exit: correlated sibling workloads use materially less cluster memory than

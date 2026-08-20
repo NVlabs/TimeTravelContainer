@@ -927,14 +927,51 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 		}
 		return best, fmt.Errorf("no movable branch can relieve memory pressure; capacity request published at %s", request)
 	}
+	reservationID, err := newDaemonRequestID()
+	if err != nil {
+		return best, err
+	}
+	targetRecord, err := b.distributedSource.directory.Lookup(best.TargetNode)
+	if err != nil {
+		return best, err
+	}
+	if best.EstimatedAdded != 0 {
+		if _, err := b.distributedSource.directory.ReserveIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, b.nodeID, best.EstimatedAdded, time.Now(), 10*time.Minute); err != nil {
+			return best, fmt.Errorf("reserving %d bytes on placement target %q: %w", best.EstimatedAdded, best.TargetNode, err)
+		}
+	}
+	var executionErr error
+	moved := 0
 	for _, value := range best.Branches {
 		target, err := parseSelector(value)
 		if err != nil {
-			return best, err
+			executionErr = err
+			break
 		}
 		if err := b.migrate(target, best.TargetNode); err != nil {
-			return best, fmt.Errorf("executing placement plan at %s: %w", target, err)
+			executionErr = fmt.Errorf("executing placement plan at %s: %w", target, err)
+			break
 		}
+		moved++
+	}
+	// Successful and partially successful reservations remain until the next
+	// target heartbeat publishes post-migration cgroup memory (or their TTL
+	// expires after source loss). This closes the stale-load window where a
+	// second source could otherwise overbook the target. If nothing moved,
+	// release now.
+	if best.EstimatedAdded != 0 {
+		var reservationErr error
+		if moved == 0 {
+			_, reservationErr = b.distributedSource.directory.ReleaseIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, time.Now())
+		} else {
+			_, reservationErr = b.distributedSource.directory.CompleteIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, time.Now())
+		}
+		if reservationErr != nil {
+			executionErr = errors.Join(executionErr, fmt.Errorf("finalizing placement reservation %s: %w", reservationID, reservationErr))
+		}
+	}
+	if executionErr != nil {
+		return best, executionErr
 	}
 	return best, nil
 }
@@ -1312,7 +1349,7 @@ func maintainElasticMigrationRecovery(backend *runtimeBackend, lease time.Durati
 }
 
 func heartbeatElasticNode(directory *cluster.NodeDirectory, record cluster.NodeRecord, current uint64, now time.Time, lease time.Duration) (cluster.NodeRecord, error) {
-	updated, err := directory.Heartbeat(record.NodeID, record.Incarnation, current, record.IncomingReservedBytes, now, lease)
+	updated, err := directory.Heartbeat(record.NodeID, record.Incarnation, current, now, lease)
 	if err != nil {
 		return cluster.NodeRecord{}, err
 	}

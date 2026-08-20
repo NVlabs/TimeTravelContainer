@@ -13,6 +13,7 @@ whereas production nodes do not.
 - daemon-incarnation adoption after a clean restart;
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
 - deterministic pressure placement and opt-in automatic rebalancing;
+- fenced, expiring target-memory reservations for pressure moves;
 - coalesced durable capacity requests when no placement is feasible;
 - durable drain and per-branch migration recovery after daemon process loss;
 - callback-safe routing of node-wide mutations; and
@@ -104,6 +105,26 @@ remote sibling prevented deletion of an otherwise empty source Sentry.
 The no-target path was also exercised at unit level: concurrent pressure/drain
 attempts retain one durable request ID, and removing the accepted outbox entry
 allows the next pressure episode to publish a fresh ID.
+
+Target reservation concurrency was exercised against the shared node catalog:
+two sources simultaneously requested the only remaining 2 GiB on an 8 GiB
+target already using 6 GiB. Exactly one reservation succeeded. An exact retry
+did not double-charge the target, heartbeat preserved the reservation, and its
+TTL reclaimed it after simulated source loss. Planner execution now installs
+this reservation before its first migration; it remains charged until target
+cgroup accounting publishes a post-migration sample, closing the stale-
+heartbeat overcommit window.
+
+A live two-daemon run prefaulted 256 MiB, forked it into three BusyBox
+branches, and pressured the source. The exact-edge planner selected two
+siblings as a zero-cut group, estimated 269,606,912 bytes freed and added, and
+published an equal 269,606,912-byte reservation on `node-b` before moving the
+first branch. The migration completed in 7.6 seconds and all three branch
+records remained running on the target. Because both loopback nodes share one
+host cgroup, source release can make aggregate RSS fall during target restore;
+the completed-operation plus next-heartbeat rule was added and unit-tested to
+cover that case. Both daemons, the family, Sentry, gofer, and temporary root
+were removed after the run.
 
 ## Exact CoW hypergraph placement
 
