@@ -46,8 +46,72 @@ import (
 type distributedSourceRuntime struct {
 	capabilities  cluster.Capabilities
 	peers         map[string]*cluster.Client
+	directory     *cluster.NodeDirectory
+	certFile      string
+	keyFile       string
+	caFile        string
+	peerMu        sync.Mutex
+	dynamicPeers  map[string]dynamicClusterPeer
 	pageListen    string
 	pageAdvertise string
+}
+
+type dynamicClusterPeer struct {
+	incarnation string
+	controlURL  string
+	serverName  string
+	client      *cluster.Client
+}
+
+func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*cluster.Client, error) {
+	if r == nil {
+		return nil, errors.New("distributed source runtime is unavailable")
+	}
+	if nodeID == r.capabilities.NodeID {
+		return nil, fmt.Errorf("cluster target node %q is the local node", nodeID)
+	}
+	if peer := r.peers[nodeID]; peer != nil {
+		return peer, nil
+	}
+	if r.directory == nil {
+		return nil, fmt.Errorf("cluster target node %q is not configured", nodeID)
+	}
+	record, err := r.directory.Lookup(nodeID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("cluster target node %q is not registered", nodeID)
+		}
+		return nil, fmt.Errorf("discovering cluster target node %q: %w", nodeID, err)
+	}
+	now := time.Now()
+	if !record.LeaseActive(now) {
+		return nil, fmt.Errorf("cluster target node %q is %s or its lease has expired", nodeID, record.State)
+	}
+	if forPlacement && !record.AcceptsPlacement(now) {
+		return nil, fmt.Errorf("cluster target node %q is not accepting placement (state=%s)", nodeID, record.State)
+	}
+	if record.Capabilities.RepositoryID != r.capabilities.RepositoryID {
+		return nil, fmt.Errorf("cluster target node %q uses repository %q, want %q", nodeID, record.Capabilities.RepositoryID, r.capabilities.RepositoryID)
+	}
+	r.peerMu.Lock()
+	defer r.peerMu.Unlock()
+	if cached, ok := r.dynamicPeers[nodeID]; ok && cached.incarnation == record.Incarnation &&
+		cached.controlURL == record.ControlURL && cached.serverName == record.ControlServerName {
+		return cached.client, nil
+	}
+	clientTLS, err := cluster.LoadClientTLSConfig(r.certFile, r.keyFile, r.caFile, record.ControlServerName)
+	if err != nil {
+		return nil, fmt.Errorf("configuring discovered cluster peer %q TLS: %w", nodeID, err)
+	}
+	client, err := cluster.NewClient(record.ControlURL, clientTLS, 2*time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("configuring discovered cluster peer %q: %w", nodeID, err)
+	}
+	r.dynamicPeers[nodeID] = dynamicClusterPeer{
+		incarnation: record.Incarnation, controlURL: record.ControlURL,
+		serverName: record.ControlServerName, client: client,
+	}
+	return client, nil
 }
 
 type distributedForkBackend interface {
@@ -277,9 +341,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if b.distributedSource == nil {
 		return selector{}, errors.New("ttcd is not configured for distributed forks")
 	}
-	peer := b.distributedSource.peers[targetNode]
-	if peer == nil {
-		return selector{}, fmt.Errorf("cluster target node %q is not configured", targetNode)
+	peer, err := b.distributedSource.peer(targetNode, true)
+	if err != nil {
+		return selector{}, err
 	}
 	target, err := parseSelector(targetDestination)
 	if err != nil {
@@ -701,9 +765,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	if b.distributedSource == nil {
 		return nil, errors.New("ttcd is not configured for distributed forks")
 	}
-	peer := b.distributedSource.peers[targetNode]
-	if peer == nil {
-		return nil, fmt.Errorf("cluster target node %q is not configured", targetNode)
+	peer, err := b.distributedSource.peer(targetNode, true)
+	if err != nil {
+		return nil, err
 	}
 	destinations := make([]selector, len(targetContainers))
 	seenTargets := make(map[string]struct{}, len(targetContainers))
@@ -1275,8 +1339,8 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
 			continue
 		}
-		peer := runtime.source.peers[tx.Identity.TargetNodeID]
-		if peer == nil {
+		peer, err := runtime.source.peer(tx.Identity.TargetNodeID, false)
+		if err != nil {
 			continue
 		}
 		monitorBackend := *backend

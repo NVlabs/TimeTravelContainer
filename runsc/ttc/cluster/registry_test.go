@@ -57,6 +57,16 @@ func TestNodeDirectoryLifecycleAndFencing(t *testing.T) {
 	if heartbeat.MemoryCurrentBytes != 7<<30 || heartbeat.IncomingReservedBytes != 512<<20 {
 		t.Fatalf("heartbeat load=%+v", heartbeat)
 	}
+	pressured, err := directory.Transition("node-a", "boot-a", NodePressured, now.Add(2500*time.Millisecond), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pressured.AcceptsPlacement(now.Add(3 * time.Second)) {
+		t.Fatal("pressured node accepts new placement")
+	}
+	if _, err := directory.Transition("node-a", "boot-a", NodeReady, now.Add(3*time.Second), 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := directory.Register(testNodeRecord("node-a", "boot-b"), now.Add(3*time.Second), 30*time.Second); err == nil {
 		t.Fatal("live node incarnation was replaced")
 	}

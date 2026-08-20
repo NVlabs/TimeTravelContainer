@@ -4028,6 +4028,48 @@ exit 2
 	}
 }
 
+func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", "remote", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+		ID: "remote", Name: "remote", NodeID: "node-b", BundleDir: bundleDir,
+		State: "running", CreatedAt: time.Now(),
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", CreatedAt: time.Now()}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "remote", "container.json"), metadata, 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a"}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 1 || families[0].ID != "remote" || families[0].NodeID != "node-b" || families[0].State != "running" {
+		t.Fatalf("remote families=%+v", families)
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != "running" {
+		t.Fatalf("remote metadata was reconciled locally: %+v", stored)
+	}
+}
+
 func TestListFamiliesReleasesSparseRootAfterRuntimeLoss(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

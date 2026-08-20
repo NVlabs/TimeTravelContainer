@@ -4748,6 +4748,7 @@ type Branch struct {
 // Family is stable family metadata returned by ttc ls --json.
 type Family struct {
 	ID               string    `json:"id"`
+	NodeID           string    `json:"node_id,omitempty"`
 	Name             string    `json:"name,omitempty"`
 	Image            string    `json:"image,omitempty"`
 	Digest           string    `json:"digest,omitempty"`
@@ -8561,15 +8562,13 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
-		if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
-			continue
-		}
 		state := normalizeLifecycleState(container.State)
 		if state == "" {
 			state = "created"
 		}
 		byID[container.ID] = Family{
 			ID:               container.ID,
+			NodeID:           container.NodeID,
 			Name:             container.Name,
 			Image:            container.Reference,
 			Digest:           container.Digest,
@@ -8594,6 +8593,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				runtimeIDs[family.ID] = struct{}{}
 			}
 			if persistent, ok := byID[family.ID]; ok {
+				family.NodeID = persistent.NodeID
 				family.Name = persistent.Name
 				family.Image = persistent.Image
 				family.Digest = persistent.Digest
@@ -8608,6 +8608,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 					}
 				}
 			} else if len(family.Branches) != 0 {
+				family.NodeID = b.nodeID
 				for _, branch := range family.Branches {
 					if branch.ID == defaultBranchID {
 						family.CreatedAt = branch.CreatedAt

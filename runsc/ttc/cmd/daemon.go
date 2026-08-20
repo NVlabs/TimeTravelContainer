@@ -115,6 +115,7 @@ type daemonServer struct {
 	clusterListen         string
 	distributedSource     *distributedSourceRuntime
 	clusterStore          *cluster.Store
+	clusterDirectory      *cluster.NodeDirectory
 
 	stopOnce sync.Once
 
@@ -142,6 +143,9 @@ type daemonClusterOptions struct {
 	CertFile        string
 	KeyFile         string
 	CAFile          string
+	Advertise       string
+	MemoryTarget    uint64
+	LeaseDuration   time.Duration
 	MaxTransactions int
 	PageListen      string
 	PageAdvertise   string
@@ -153,7 +157,7 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4
 	policy.AckInterval = time.Millisecond
-	return daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0", PagingPolicy: policy}
+	return daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy}
 }
 
 type daemonClusterRuntime struct {
@@ -161,6 +165,9 @@ type daemonClusterRuntime struct {
 	tlsConfig    *tls.Config
 	controlPlane *cluster.ControlPlane
 	source       *distributedSourceRuntime
+	directory    *cluster.NodeDirectory
+	nodeRecord   cluster.NodeRecord
+	lease        time.Duration
 }
 
 type daemonTargetRuntime struct {
@@ -1126,9 +1133,9 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 		if branchID != "" && tx.Identity.SourceBranch != branchID {
 			continue
 		}
-		peer := source.peers[tx.Identity.TargetNodeID]
-		if peer == nil {
-			return fmt.Errorf("distributed target node %q for transaction %q is not configured", tx.Identity.TargetNodeID, tx.Identity.TransactionID)
+		peer, err := source.peer(tx.Identity.TargetNodeID, false)
+		if err != nil {
+			return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		if tx.State == cluster.TransactionPublished {
@@ -1545,6 +1552,7 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
 		"--cluster-repository-id": &opts.RepositoryID, "--cluster-cert": &opts.CertFile,
 		"--cluster-key": &opts.KeyFile, "--cluster-ca": &opts.CAFile,
+		"--cluster-advertise":   &opts.Advertise,
 		"--cluster-page-listen": &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
 	} {
 		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
@@ -1589,6 +1597,18 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return consumed, nil
 	}
+	if value, consumed, matched, err := optionValue("--cluster-memory-target"); matched {
+		if err != nil {
+			return 0, err
+		}
+		parsed, err := ttcbundle.ParseShmSize(value)
+		if err != nil || parsed <= 0 {
+			return 0, fmt.Errorf("--cluster-memory-target must be a positive byte size")
+		}
+		opts.MemoryTarget = uint64(parsed)
+		opts.Configured = true
+		return consumed, nil
+	}
 	for name, dst := range map[string]*int{
 		"--cluster-max-parallel":    &opts.PagingPolicy.MaxConcurrency,
 		"--cluster-ack-batch-pages": &opts.PagingPolicy.AckBatchPages,
@@ -1617,6 +1637,18 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 			return 0, fmt.Errorf("--cluster-ack-interval must be a non-negative duration")
 		}
 		opts.PagingPolicy.AckInterval = interval
+		opts.Configured = true
+		return consumed, nil
+	}
+	if value, consumed, matched, err := optionValue("--cluster-lease"); matched {
+		if err != nil {
+			return 0, err
+		}
+		lease, err := time.ParseDuration(value)
+		if err != nil || lease < time.Second || lease > 10*time.Minute {
+			return 0, fmt.Errorf("--cluster-lease must be between 1s and 10m")
+		}
+		opts.LeaseDuration = lease
 		opts.Configured = true
 		return consumed, nil
 	}
@@ -1664,13 +1696,30 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if !opts.Configured {
 		return nil, nil
 	}
+	if opts.LeaseDuration == 0 {
+		opts.LeaseDuration = 15 * time.Second
+	}
 	if opts.Listen == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
 		return nil, errors.New("cluster mode requires listen address, node ID, repository ID, certificate, key, and CA")
 	}
 	if opts.PageListen == "" {
 		return nil, errors.New("cluster page listen address is empty")
 	}
-	if len(opts.Peers) != 0 && opts.PageAdvertise == "" {
+	var advertiseURL, advertiseServerName string
+	if opts.Advertise != "" {
+		var err error
+		advertiseURL, advertiseServerName, err = parseClusterAdvertise(opts.Advertise)
+		if err != nil {
+			return nil, err
+		}
+		if opts.PageAdvertise == "" {
+			opts.PageAdvertise, err = advertisedPageAddress(advertiseURL)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if (len(opts.Peers) != 0 || opts.Advertise != "") && opts.PageAdvertise == "" {
 		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:0")
 	}
 	if err := requireEphemeralClusterPagePort("--cluster-page-listen", opts.PageListen); err != nil {
@@ -1709,6 +1758,23 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if err := capabilities.Validate(); err != nil {
 		return nil, err
 	}
+	var directory *cluster.NodeDirectory
+	var nodeRecord cluster.NodeRecord
+	if advertiseURL != "" {
+		directory, err = cluster.OpenNodeDirectory(filepath.Join(dataRoot, "cluster", "nodes"))
+		if err != nil {
+			return nil, err
+		}
+		incarnation, err := cluster.NewNodeIncarnation()
+		if err != nil {
+			return nil, err
+		}
+		nodeRecord = cluster.NodeRecord{
+			NodeID: opts.NodeID, Incarnation: incarnation,
+			ControlURL: advertiseURL, ControlServerName: advertiseServerName,
+			Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+		}
+	}
 	clients := make(map[string]*cluster.Client, len(opts.Peers))
 	for _, peerSpec := range opts.Peers {
 		nodeID, baseURL, serverName, err := parseClusterPeer(peerSpec)
@@ -1738,8 +1804,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 		},
 		source: &distributedSourceRuntime{
 			capabilities: capabilities, peers: clients,
-			pageListen: opts.PageListen, pageAdvertise: opts.PageAdvertise,
+			directory: directory, certFile: opts.CertFile, keyFile: opts.KeyFile, caFile: opts.CAFile,
+			dynamicPeers: make(map[string]dynamicClusterPeer),
+			pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 		},
+		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration,
 	}, nil
 }
 
@@ -1877,7 +1946,19 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	defer close(maintenanceDone)
 	go maintainRepositories(dataRoot, stderr, maintenanceDone)
 	clusterDone := make(chan struct{})
-	defer close(clusterDone)
+	var elasticHeartbeatStopped <-chan struct{}
+	var elasticRecord *cluster.NodeRecord
+	defer func() {
+		close(clusterDone)
+		if elasticHeartbeatStopped != nil {
+			<-elasticHeartbeatStopped
+		}
+		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
+			if _, err := clusterRuntime.directory.Transition(elasticRecord.NodeID, elasticRecord.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: publishing cluster node offline state: %v\n", err)
+			}
+		}
+	}()
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
@@ -1900,8 +1981,36 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)
 		}
 		clusterRuntime.listen = clusterListener.Addr().String()
+		if clusterRuntime.directory != nil {
+			resolved, err := resolveClusterAdvertise(clusterRuntime.nodeRecord.ControlURL, clusterRuntime.listen)
+			if err != nil {
+				clusterListener.Close()
+				return err
+			}
+			clusterRuntime.nodeRecord.ControlURL = resolved
+			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
+			registered, err := clusterRuntime.directory.Register(clusterRuntime.nodeRecord, time.Now(), clusterRuntime.lease)
+			if err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("registering elastic cluster node: %w", err)
+			}
+			ready, err := clusterRuntime.directory.Transition(registered.NodeID, registered.Incarnation, cluster.NodeReady, time.Now(), clusterRuntime.lease)
+			if err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("admitting elastic cluster node: %w", err)
+			}
+			if ready.MemoryTargetBytes != 0 && ready.MemoryCurrentBytes > ready.MemoryTargetBytes {
+				ready, err = clusterRuntime.directory.Transition(ready.NodeID, ready.Incarnation, cluster.NodePressured, time.Now(), clusterRuntime.lease)
+				if err != nil {
+					clusterListener.Close()
+					return fmt.Errorf("marking elastic cluster node pressured: %w", err)
+				}
+			}
+			elasticRecord = ready
+		}
 		server.clusterCapabilities = &clusterRuntime.controlPlane.Capabilities
 		server.clusterStore = clusterRuntime.controlPlane.Store
+		server.clusterDirectory = clusterRuntime.directory
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
 		clusterServer = &http.Server{
@@ -1918,6 +2027,24 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			listener.Close()
 		}()
 		defer clusterServer.Close()
+		if elasticRecord != nil {
+			heartbeatFatal := make(chan error, 1)
+			heartbeatStopped := make(chan struct{})
+			elasticHeartbeatStopped = heartbeatStopped
+			go func(record cluster.NodeRecord) {
+				defer close(heartbeatStopped)
+				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, heartbeatFatal)
+			}(*elasticRecord)
+			go func() {
+				select {
+				case err := <-heartbeatFatal:
+					clusterErr <- err
+					listener.Close()
+					clusterServer.Close()
+				case <-clusterDone:
+				}
+			}()
+		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 	}
 	if stdout != nil {
@@ -2068,9 +2195,17 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"volume_device":            s.volumeCapability.Device,
 		}
 		if s.clusterCapabilities != nil {
-			status["cluster"] = map[string]any{
+			clusterStatus := map[string]any{
 				"listen": s.clusterListen, "capabilities": s.clusterCapabilities,
 			}
+			if s.clusterDirectory != nil {
+				if nodes, err := s.clusterDirectory.List(); err == nil {
+					clusterStatus["nodes"] = nodes
+				} else {
+					clusterStatus["directory_error"] = err.Error()
+				}
+			}
+			status["cluster"] = clusterStatus
 		}
 		payload, _ := json.Marshal(status)
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
@@ -2822,6 +2957,7 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 			"--cluster-cert", clusterOpts.CertFile,
 			"--cluster-key", clusterOpts.KeyFile,
 			"--cluster-ca", clusterOpts.CAFile,
+			"--cluster-lease", clusterOpts.LeaseDuration.String(),
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 			"--cluster-page-listen", clusterOpts.PageListen,
 			"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
@@ -2832,6 +2968,12 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 			"--cluster-prefetch", string(clusterOpts.PagingPolicy.Prefetch),
 			"--cluster-push", string(clusterOpts.PagingPolicy.Push),
 		)
+		if clusterOpts.Advertise != "" {
+			commandArgs = append(commandArgs, "--cluster-advertise", clusterOpts.Advertise)
+		}
+		if clusterOpts.MemoryTarget != 0 {
+			commandArgs = append(commandArgs, "--cluster-memory-target", strconv.FormatUint(clusterOpts.MemoryTarget, 10))
+		}
 		if clusterOpts.PageAdvertise != "" {
 			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
 		}
