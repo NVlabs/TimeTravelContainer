@@ -285,6 +285,9 @@ type DistributedForkOptions struct {
 // BranchInfo is branch display lineage plus its last known lifecycle state.
 type BranchInfo struct {
 	ID string `json:"id"`
+	// NodeID overrides the legacy family-wide owner for elastic placements.
+	// Empty inherits ContainerInfo.NodeID.
+	NodeID string `json:"node_id,omitempty"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
 	ParentID                     string    `json:"parent_id,omitempty"`
@@ -297,6 +300,19 @@ type BranchInfo struct {
 	SourceDowntimeNS             int64     `json:"source_downtime_ns,omitempty"`
 	KernelForkNS                 int64     `json:"kernel_fork_ns,omitempty"`
 	CreatedAt                    time.Time `json:"created_at"`
+}
+
+// BranchNodeID returns the effective cluster owner of branchID.
+func (c ContainerInfo) BranchNodeID(branchID string) string {
+	for _, branch := range c.Branches {
+		if branch.ID == branchID {
+			if branch.NodeID != "" {
+				return branch.NodeID
+			}
+			return c.NodeID
+		}
+	}
+	return ""
 }
 
 // MemoryBranchKey returns the stable directory key used for a branch's
@@ -926,7 +942,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		CreatedAt:           time.Now().UTC(),
 		NodeID:              opts.NodeID,
 	}
-	metadata.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: metadata.CreatedAt}}
+	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
 		value := DefaultStopTimeoutSeconds
 		metadata.StopTimeout = &value
@@ -1172,7 +1188,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.CreatedAt = now
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
-	metadata.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: now}}
+	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: now}}
 	metadata.NodeID = opts.NodeID
 	for index := range metadata.Volumes {
 		oldID := metadata.Volumes[index].ID
@@ -1370,7 +1386,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: "main", FilesystemBranch: childRepositoryBranch, State: "created", CreatedAt: now}}
+	target.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, State: "created", CreatedAt: now}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
@@ -2378,7 +2394,8 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 		}
 		info.Branches = append(info.Branches, BranchInfo{
 			ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-			State: pending.State, CreatedAt: pending.CreatedAt,
+			NodeID: info.NodeID,
+			State:  pending.State, CreatedAt: pending.CreatedAt,
 			DistributedForkTransactionID: transactionID,
 			DistributedSparseRepository:  pending.SparseRepository,
 			DistributedSparseBranch:      pending.SparseBranch,
@@ -2714,6 +2731,15 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 	}
 	seen := make(map[string]struct{}, len(branches))
 	for _, branch := range branches {
+		if branch.NodeID == "" {
+			if i, ok := index[branch.ID]; ok && info.Branches[i].NodeID != "" {
+				branch.NodeID = info.Branches[i].NodeID
+			} else if branch.ParentID != "" && info.BranchNodeID(branch.ParentID) != "" {
+				branch.NodeID = info.BranchNodeID(branch.ParentID)
+			} else {
+				branch.NodeID = info.NodeID
+			}
+		}
 		if err := validateObjectName("branch", branch.ID); err != nil {
 			return err
 		}
@@ -2782,6 +2808,72 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 		}
 		info.Branches[i].State = state
 		recomputeContainerState(&info)
+		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	}
+	return fmt.Errorf("branch %q is not recorded", branchID)
+}
+
+// CompareAndSwapNodeID transfers whole-family cluster ownership while the
+// family is process-free. The per-container advisory lock serializes TTC
+// daemons sharing an NFS data root; higher-level placement generations fence
+// stale callers.
+func (s Store) CompareAndSwapNodeID(name, expected, replacement string) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	info, err = s.loadContainerKey(info.ID)
+	if err != nil {
+		return err
+	}
+	if info.NodeID != expected {
+		return fmt.Errorf("container %q cluster owner changed from %q to %q", info.Name, expected, info.NodeID)
+	}
+	info.NodeID = replacement
+	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+}
+
+// CompareAndSwapBranchNodeID transfers one process-free branch without
+// changing sibling placement. Empty legacy branch owners inherit NodeID.
+func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement string) error {
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	info, err = s.loadContainerKey(info.ID)
+	if err != nil {
+		return err
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ID != branchID {
+			continue
+		}
+		owner := info.Branches[i].NodeID
+		if owner == "" {
+			owner = info.NodeID
+		}
+		if owner != expected {
+			return fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
+		}
+		info.Branches[i].NodeID = replacement
 		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 	}
 	return fmt.Errorf("branch %q is not recorded", branchID)
@@ -3013,6 +3105,14 @@ func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
 // ReconcileRuntimeUnavailable marks only branches that required the missing
 // Sentry as exited. Durable dehydrated branches remain recoverable.
 func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
+	return s.ReconcileNodeRuntimeUnavailable(name, "", exitStatus)
+}
+
+// ReconcileNodeRuntimeUnavailable marks branches whose runtime was lost on
+// nodeID as exited. An empty nodeID retains the legacy whole-family behavior.
+// Elastic families may have live siblings on other nodes, which this operation
+// must never rewrite merely because they are absent from the local runsc root.
+func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *int) error {
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
@@ -3020,6 +3120,9 @@ func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
 	changed := false
 	for i := range info.Branches {
 		branch := &info.Branches[i]
+		if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
+			continue
+		}
 		switch branch.State {
 		case "creating", "running", "paused", "dehydrating", "rehydrating":
 			branch.State = "exited"

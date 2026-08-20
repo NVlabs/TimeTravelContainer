@@ -325,6 +325,7 @@ Commands:
   stats [--json] TARGET           Show branch/family CoW resource accounting
   tty stat|watch TARGET --session NAME Observe or stream a named terminal
   fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
+  migrate --target NODE TARGET    Move a running branch to another cluster node
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
@@ -343,6 +344,7 @@ Commands:
                [--cluster-listen ADDR --cluster-node-id ID
                 --cluster-repository-id ID --cluster-cert FILE
                 --cluster-key FILE --cluster-ca FILE]
+		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -377,6 +379,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"tty":        "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
 			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
+			"migrate":    "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
 			"restore":    "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
@@ -458,6 +461,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runTTY(args[1:], stdout, backend)
 	case "fork":
 		err = runFork(args[1:], stdout, stderr, backend)
+	case "migrate":
+		err = runMigrate(args[1:], stdout, backend)
 	case "checkpoint":
 		err = runCheckpoint(args[1:], stdout, backend)
 	case "restore":
@@ -508,6 +513,35 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		return 1
 	}
 	return 0
+}
+
+type elasticMigrationBackend interface {
+	migrate(selector, string) error
+}
+
+func runMigrate(args []string, stdout io.Writer, backend backend) error {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	targetNode := fs.String("target", "", "destination cluster node")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *targetNode == "" || fs.NArg() != 1 {
+		return errors.New("usage: ttc migrate --target NODE CONTAINER@BRANCH")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	migration, ok := backend.(elasticMigrationBackend)
+	if !ok {
+		return errors.New("backend does not support elastic migration")
+	}
+	if err := migration.migrate(target, *targetNode); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, target)
+	return nil
 }
 
 func runContainerNamespace(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -4734,6 +4768,7 @@ func (s selector) String() string {
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
 	ID               string    `json:"id"`
+	NodeID           string    `json:"node_id,omitempty"`
 	ParentID         string    `json:"parent,omitempty"`
 	State            string    `json:"state"`
 	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
@@ -5252,9 +5287,6 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, err
 	}
-	if b.nodeID != "" && info.NodeID != "" && info.NodeID != b.nodeID {
-		return ttcbundle.ContainerInfo{}, fmt.Errorf("container %q belongs to cluster node %q", identifier, info.NodeID)
-	}
 	return info, nil
 }
 
@@ -5262,6 +5294,12 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 	info, err := b.resolveContainer(target.container)
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
+	}
+	if b.nodeID != "" {
+		owner := info.BranchNodeID(target.branch)
+		if owner != "" && owner != b.nodeID {
+			return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, owner)
+		}
 	}
 	target.container = info.ID
 	return target, info, nil
@@ -8550,6 +8588,37 @@ func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]b
 	return output, nil
 }
 
+func familyNodeID(info ttcbundle.ContainerInfo) string {
+	owner := ""
+	for _, branch := range info.Branches {
+		branchOwner := info.BranchNodeID(branch.ID)
+		if branchOwner == "" {
+			continue
+		}
+		if owner != "" && owner != branchOwner {
+			return ""
+		}
+		owner = branchOwner
+	}
+	if owner == "" {
+		return info.NodeID
+	}
+	return owner
+}
+
+func containerHasBranchOnNode(info ttcbundle.ContainerInfo, nodeID string) bool {
+	if nodeID == "" {
+		return true
+	}
+	for _, branch := range info.Branches {
+		owner := info.BranchNodeID(branch.ID)
+		if owner == "" || owner == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
 	if b.dataRoot == "" {
@@ -8568,7 +8637,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		}
 		byID[container.ID] = Family{
 			ID:               container.ID,
-			NodeID:           container.NodeID,
+			NodeID:           familyNodeID(container),
 			Name:             container.Name,
 			Image:            container.Reference,
 			Digest:           container.Digest,
@@ -8577,7 +8646,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			LiveForkWaiver:   container.LiveForkWaiver,
 			State:            state,
 			CreatedAt:        container.CreatedAt,
-			Branches:         persistentBranches(container.Branches),
+			Branches:         persistentBranches(container.Branches, container.NodeID),
 		}
 	}
 	if runtimeErr == nil {
@@ -8601,7 +8670,19 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				family.LiveForkEligible = persistent.LiveForkEligible
 				family.LiveForkWaiver = persistent.LiveForkWaiver
 				family.CreatedAt = persistent.CreatedAt
-				family.Branches = mergeBranchHistory(persistent.Branches, family.Branches)
+				liveLocal := make([]Branch, 0, len(family.Branches))
+				persistentByID := make(map[string]Branch, len(persistent.Branches))
+				for _, branch := range persistent.Branches {
+					persistentByID[branch.ID] = branch
+				}
+				for _, branch := range family.Branches {
+					owner := persistentByID[branch.ID].NodeID
+					if b.nodeID == "" || owner == "" || owner == b.nodeID {
+						liveLocal = append(liveLocal, branch)
+					}
+				}
+				family.Branches = mergeBranchHistory(persistent.Branches, liveLocal)
+				family.State = familyStateFromBranches(family.Branches)
 				for i := range family.Branches {
 					if family.Branches[i].ID == defaultBranchID {
 						family.Branches[i].CreatedAt = persistent.CreatedAt
@@ -8622,7 +8703,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			byID[family.ID] = family
 		}
 		for _, container := range containers {
-			if b.nodeID != "" && container.NodeID != "" && container.NodeID != b.nodeID {
+			if b.nodeID != "" && !containerHasBranchOnNode(container, b.nodeID) {
 				continue
 			}
 			if _, ok := runtimeIDs[container.ID]; ok {
@@ -8646,7 +8727,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			// also safe on NFS, where unlinking an open file creates .nfs files.
 			_ = b.stopContainerConsoleDrains(container.ID)
 			_, _ = b.command("delete", "--force", container.ID)
-			if err := store.ReconcileRuntimeUnavailable(container.ID, exitStatus); err != nil {
+			if err := store.ReconcileNodeRuntimeUnavailable(container.ID, b.nodeID, exitStatus); err != nil {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
@@ -8663,7 +8744,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
-				family.Branches = persistentBranches(reconciled.Branches)
+				family.Branches = persistentBranches(reconciled.Branches, reconciled.NodeID)
 				family.SandboxPID = 0
 				byID[container.ID] = family
 			}
@@ -8955,17 +9036,21 @@ func normalizeLifecycleState(state string) string {
 	return state
 }
 
-func persistentBranchView(info ttcbundle.BranchInfo) Branch {
+func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch {
+	nodeID := info.NodeID
+	if nodeID == "" {
+		nodeID = fallbackNode
+	}
 	return Branch{
-		ID: info.ID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
+		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
 		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 	}
 }
 
-func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
+func persistentBranches(infos []ttcbundle.BranchInfo, fallbackNode string) []Branch {
 	branches := make([]Branch, 0, len(infos))
 	for _, info := range infos {
-		branches = append(branches, persistentBranchView(info))
+		branches = append(branches, persistentBranchView(info, fallbackNode))
 	}
 	return branches
 }
@@ -9010,6 +9095,7 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			// parent itself was already process-free, so it is not authoritative
 			// for lineage reconciliation.
 			branch.ParentID = recorded.ParentID
+			branch.NodeID = recorded.NodeID
 		}
 		byID[branch.ID] = branch
 	}
@@ -9019,6 +9105,21 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
 	return merged
+}
+
+func familyStateFromBranches(branches []Branch) string {
+	priority := map[string]int{
+		"exited": 1, "failed": 2, "dead": 2, "dehydrated": 3, "created": 4,
+		"paused": 5, "dehydrating": 6, "rehydrating": 7, "creating": 8,
+		"restarting": 9, "running": 10,
+	}
+	state, best := "exited", 0
+	for _, branch := range branches {
+		if rank := priority[normalizeLifecycleState(branch.State)]; rank > best {
+			state, best = normalizeLifecycleState(branch.State), rank
+		}
+	}
+	return state
 }
 
 func memorySharingMode(shared bool) string {

@@ -15,6 +15,10 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -104,13 +109,14 @@ func daemonCommandOwner(dataRoot string, args []string) (string, error) {
 		if err != nil {
 			continue
 		}
-		if info.NodeID == "" {
+		branchOwner := info.BranchNodeID(selected.branch)
+		if branchOwner == "" {
 			continue
 		}
-		if owner != "" && owner != info.NodeID {
-			return "", fmt.Errorf("command spans cluster nodes %q and %q", owner, info.NodeID)
+		if owner != "" && owner != branchOwner {
+			return "", fmt.Errorf("command spans cluster nodes %q and %q", owner, branchOwner)
 		}
-		owner = info.NodeID
+		owner = branchOwner
 	}
 	return owner, nil
 }
@@ -127,6 +133,135 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	default:
 		return false
 	}
+}
+
+func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, error) {
+	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: requestID, Args: append([]string(nil), args...)}
+	encoded, err := json.Marshal(&request)
+	if err != nil {
+		return 0, "", err
+	}
+	var response bytes.Buffer
+	if err := peer.ProxyDaemon(ctx, bytes.NewReader(append(encoded, '\n')), &response); err != nil {
+		return 0, "", err
+	}
+	var diagnostic strings.Builder
+	status := -1
+	for response.Len() != 0 {
+		typ, payload, err := readDaemonFrame(&response)
+		if err != nil {
+			return 0, diagnostic.String(), err
+		}
+		switch typ {
+		case daemonFrameStderr:
+			diagnostic.Write(payload)
+		case daemonFrameStatus:
+			if len(payload) != 4 {
+				return 0, diagnostic.String(), errors.New("remote daemon returned an invalid status frame")
+			}
+			status = int(binary.BigEndian.Uint32(payload))
+		}
+	}
+	if status < 0 {
+		return 0, diagnostic.String(), errors.New("remote daemon returned no status")
+	}
+	return status, diagnostic.String(), nil
+}
+
+// migrate implements the first identity-preserving cutover path. It uses the
+// durable dehydration image as the handoff, so correctness and recovery land
+// before the later live sparse-transfer optimization. Branch-local ownership
+// allows siblings in the same logical family to remain on their current node.
+func (b *runtimeBackend) migrate(target selector, targetNode string) error {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return errors.New("elastic migration requires dynamic cluster discovery")
+	}
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	persistentBranch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	state := normalizeLifecycleState(persistentBranch.State)
+	if state != "running" && state != "paused" {
+		return fmt.Errorf("branch %s is %s, not running or paused", target, state)
+	}
+	sourceRecord, err := b.distributedSource.directory.Lookup(b.nodeID)
+	if err != nil {
+		return fmt.Errorf("source node lease is unavailable: %w", err)
+	}
+	if !sourceRecord.LeaseActive(time.Now()) {
+		return fmt.Errorf("source node %q lease is expired or offline", b.nodeID)
+	}
+	targetRecord, err := b.distributedSource.directory.Lookup(targetNode)
+	if err != nil {
+		return fmt.Errorf("looking up migration target: %w", err)
+	}
+	if !targetRecord.AcceptsPlacement(time.Now()) {
+		return fmt.Errorf("cluster target node %q is not accepting placement (state=%s)", targetNode, targetRecord.State)
+	}
+	peer, err := b.distributedSource.peer(targetNode, true)
+	if err != nil {
+		return err
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	if err != nil {
+		return err
+	}
+	placement, err := placements.Lookup(info.ID, target.branch)
+	if errors.Is(err, os.ErrNotExist) {
+		placement, err = placements.Create(cluster.PlacementRecord{
+			FamilyID: info.ID, BranchID: target.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
+			OwnerNode: b.nodeID, OwnerIncarnation: sourceRecord.Incarnation, State: cluster.PlacementState(state),
+		}, time.Now())
+	}
+	if err != nil {
+		return err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return err
+	}
+	if _, err := placements.BeginMigration(info.ID, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
+		return err
+	}
+	abort := func(cause error, restore bool) error {
+		_, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		if restore {
+			if rehydrateErr := b.rehydrate(target); rehydrateErr != nil {
+				return fmt.Errorf("%w; aborting placement: %v; restoring source: %v", cause, abortErr, rehydrateErr)
+			}
+		}
+		if abortErr != nil {
+			return fmt.Errorf("%w; aborting placement: %v", cause, abortErr)
+		}
+		return cause
+	}
+	if err := b.dehydrate(target); err != nil {
+		return abort(fmt.Errorf("dehydrating migration source: %w", err), false)
+	}
+	if err := b.containerStore().CompareAndSwapBranchNodeID(info.ID, target.branch, b.nodeID, targetNode); err != nil {
+		return abort(fmt.Errorf("transferring branch ownership: %w", err), true)
+	}
+	status, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"rehydrate", target.String()})
+	if err != nil {
+		// Delivery is uncertain. The source remains durably cold and fenced by
+		// NodeID; retrying rehydrate through any daemon is safe.
+		return fmt.Errorf("migration ownership moved to %q but destination response is uncertain: %w; run `ttc rehydrate %s` to reconcile", targetNode, err, target)
+	}
+	if status != 0 {
+		if swapErr := b.containerStore().CompareAndSwapBranchNodeID(info.ID, target.branch, targetNode, b.nodeID); swapErr != nil {
+			return fmt.Errorf("destination rejected migration: %s; ownership rollback failed: %v", strings.TrimSpace(diagnostic), swapErr)
+		}
+		return abort(fmt.Errorf("destination rejected migration: %s", strings.TrimSpace(diagnostic)), true)
+	}
+	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
+		return fmt.Errorf("destination is live but publishing placement failed: %w", err)
+	}
+	return nil
 }
 
 func parseClusterAdvertise(value string) (baseURL, serverName string, err error) {

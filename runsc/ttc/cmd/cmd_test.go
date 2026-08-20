@@ -85,6 +85,17 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 	}
 }
 
+func TestMigrateCommand(t *testing.T) {
+	backend := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"migrate", "--target", "node-b", "web@main"}, &stdout, &stderr, backend); status != 0 {
+		t.Fatalf("status=%d stderr=%q", status, stderr.String())
+	}
+	if backend.migrateTarget.String() != "web@main" || backend.migrateNode != "node-b" || stdout.String() != "web@main\n" {
+		t.Fatalf("migration=(%s, %q) stdout=%q", backend.migrateTarget, backend.migrateNode, stdout.String())
+	}
+}
+
 func TestTTYStatRoutesNamedSessionAndJSON(t *testing.T) {
 	backend := &fakeBackend{ttyObservation: kernel.InternalConsoleObservation{
 		Version: 1, InputPendingBytes: 7, Canonical: true, ForegroundPGID: 42,
@@ -4293,6 +4304,8 @@ type fakeBackend struct {
 	forkDestination     string
 	forkDestinations    []string
 	forkPaused          bool
+	migrateTarget       selector
+	migrateNode         string
 	publishedTarget     selector
 	publishedBinding    ttcbundle.PortBinding
 	portListContainer   string
@@ -4363,6 +4376,12 @@ type fakeBackend struct {
 	restoreSource       string
 	restoreName         string
 	renamed             []string
+}
+
+func (b *fakeBackend) migrate(target selector, node string) error {
+	b.migrateTarget = target
+	b.migrateNode = node
+	return b.err
 }
 
 func (b *fakeBackend) resourceStats(target selector) (FamilyResourceStats, error) {
