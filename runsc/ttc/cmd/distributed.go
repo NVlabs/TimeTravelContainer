@@ -470,7 +470,11 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		}
 	}()
 
-	imageDir := filepath.Join(b.dataRoot, "containers", sourceInfo.ID, "memory", "dehydrated", hex.EncodeToString([]byte(source.branch)))
+	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
+	if err != nil {
+		return selector{}, err
+	}
+	imageDir := existingMemoryBranchDir(b.dataRoot, sourceInfo.ID, "dehydrated", sourceBranch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
 	if err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated source control state: %w", err)

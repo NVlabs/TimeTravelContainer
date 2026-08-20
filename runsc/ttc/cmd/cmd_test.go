@@ -3305,11 +3305,12 @@ func TestRetainRehydrationPageSource(t *testing.T) {
 
 			var stderr bytes.Buffer
 			b := &runtimeBackend{dataRoot: dataRoot, stderr: &stderr}
+			branch := ttcbundle.BranchInfo{ID: test.branch}
 			argument := sourceDir
 			if !test.transient {
 				argument = ""
 			}
-			b.retainRehydrationPageSource(containerID, test.branch, argument)
+			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
 				t.Fatalf("retaining page source warned: %s", stderr.String())
 			}
@@ -3326,7 +3327,7 @@ func TestRetainRehydrationPageSource(t *testing.T) {
 			}
 
 			// The ownership transfer is idempotent after the source has moved.
-			b.retainRehydrationPageSource(containerID, test.branch, argument)
+			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
 				t.Fatalf("repeated retention warned: %s", stderr.String())
 			}

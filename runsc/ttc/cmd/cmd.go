@@ -8978,6 +8978,25 @@ func persistentBranchInfo(info ttcbundle.ContainerInfo, branchID string) (ttcbun
 	return ttcbundle.BranchInfo{}, fmt.Errorf("branch %q does not exist", branchID)
 }
 
+func memoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.BranchInfo) string {
+	return filepath.Join(dataRoot, "containers", containerID, "memory", kind, ttcbundle.MemoryBranchKey(branch))
+}
+
+// existingMemoryBranchDir accepts the visible-name layout written by older
+// TTC versions. New writes and any branch rename use the stable filesystem
+// identity instead.
+func existingMemoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.BranchInfo) string {
+	stable := memoryBranchDir(dataRoot, containerID, kind, branch)
+	if _, err := os.Lstat(stable); err == nil || !os.IsNotExist(err) {
+		return stable
+	}
+	legacy := filepath.Join(dataRoot, "containers", containerID, "memory", kind, hex.EncodeToString([]byte(branch.ID)))
+	if _, err := os.Lstat(legacy); err == nil || !os.IsNotExist(err) {
+		return legacy
+	}
+	return stable
+}
+
 func mergeBranchHistory(history, live []Branch) []Branch {
 	byID := make(map[string]Branch, len(history)+len(live))
 	for _, branch := range history {
@@ -9168,7 +9187,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
 	}
-	sourceDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(source.branch)))
+	sourceDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", sourceBranch)
 	controlData, err := os.ReadFile(filepath.Join(sourceDir, "control.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading dehydrated source control state: %w", err)
@@ -9391,13 +9410,35 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 		}
 	}
 	live := false
+	state := ""
 	for _, branch := range info.Branches {
 		if branch.ID != target.branch {
 			continue
 		}
+		state = normalizeLifecycleState(branch.State)
 		switch branch.State {
-		case "running", "paused", "dehydrated":
+		case "running", "paused":
 			live = true
+		}
+	}
+	// A dehydrated branch may either be a process-free durable image or a cold
+	// peer retained inside a Sentry that still runs other branches. Only the
+	// latter has an in-memory branch map to rename.
+	if state == "dehydrated" {
+		output, branchesErr := b.command("timetravel", target.container, "branches")
+		if branchesErr == nil {
+			var runtimeBranches []runscBranchInfo
+			if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+				return fmt.Errorf("decoding runtime branches before rename: %w", err)
+			}
+			for _, branch := range runtimeBranches {
+				if branch.ID == target.branch {
+					live = true
+					break
+				}
+			}
+		} else if !persistentFamilyProcessFree(info) {
+			return fmt.Errorf("checking dehydrated branch runtime before rename: %w", branchesErr)
 		}
 	}
 	if live {
@@ -9565,9 +9606,8 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 
-	encodedBranch := hex.EncodeToString([]byte(target.branch))
 	for _, kind := range []string{"active", "dehydrated"} {
-		path := filepath.Join(b.dataRoot, "containers", info.ID, "memory", kind, encodedBranch)
+		path := existingMemoryBranchDir(b.dataRoot, info.ID, kind, branch)
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
@@ -9619,6 +9659,10 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return err
 	}
 	target = resolved
+	persistentBranch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
 		return fmt.Errorf("settling remote branches before dehydrating %s: %w", target, err)
 	}
@@ -9697,7 +9741,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := os.MkdirAll(metadataDir, 0700); err != nil {
 			return fmt.Errorf("creating dehydration metadata directory: %w", err)
 		}
-		encodedBranch := hex.EncodeToString([]byte(target.branch))
+		encodedBranch := ttcbundle.MemoryBranchKey(persistentBranch)
 		finalDir = filepath.Join(metadataDir, encodedBranch)
 		stagingDir, err = os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
 		if err != nil {
@@ -9806,7 +9850,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	}
 	dehydrated = true
 	if b.dataRoot != "" {
-		activeDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(target.branch)))
+		activeDir := existingMemoryBranchDir(b.dataRoot, info.ID, "active", persistentBranch)
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
 			return fmt.Errorf("removing superseded active memory: %w", removeErr)
 		}
@@ -9904,7 +9948,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
 					return err
 				}
-				b.retainRehydrationPageSource(info.ID, target.branch, "")
+				b.retainRehydrationPageSource(info.ID, *persistentBranch, "")
 				if _, err := b.ensureConsoleDrain(target, false); err != nil {
 					return fmt.Errorf("reattaching init console: %w", err)
 				}
@@ -9937,10 +9981,10 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 //
 // Failure is a post-commit cleanup warning and must never roll back a live
 // branch or change its persistent state.
-func (b *runtimeBackend) retainRehydrationPageSource(containerID, branchID, sourceDir string) {
-	encodedBranch := hex.EncodeToString([]byte(branchID))
+func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch ttcbundle.BranchInfo, sourceDir string) {
+	branchID := branch.ID
 	if sourceDir == "" {
-		sourceDir = filepath.Join(b.dataRoot, "containers", containerID, "memory", "dehydrated", encodedBranch)
+		sourceDir = existingMemoryBranchDir(b.dataRoot, containerID, "dehydrated", branch)
 	}
 	if _, err := os.Lstat(sourceDir); os.IsNotExist(err) {
 		return
@@ -9966,7 +10010,7 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID, branchID, sour
 			return
 		}
 	}
-	activeDir := filepath.Join(b.dataRoot, "containers", containerID, "memory", "active", encodedBranch)
+	activeDir := memoryBranchDir(b.dataRoot, containerID, "active", branch)
 	if err := os.MkdirAll(activeDir, 0700); err != nil {
 		if b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
@@ -9989,7 +10033,7 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID, branchID, sour
 }
 
 func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
-	imageDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated", hex.EncodeToString([]byte(target.branch)))
+	imageDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", branch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
 	if err != nil {
 		return fmt.Errorf("reading dehydration control state: %w", err)
@@ -10123,7 +10167,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	// The live runtime and its persistent state are now committed. Failures in
 	// sidecar attachment or page-source bookkeeping must not delete it.
 	runtimeCreated = false
-	b.retainRehydrationPageSource(info.ID, target.branch, imageDir)
+	b.retainRehydrationPageSource(info.ID, branch, imageDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}
@@ -10238,7 +10282,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
 	// readers reachable and do not roll the peer back for artifact bookkeeping.
-	b.retainRehydrationPageSource(info.ID, target.branch, sourceDir)
+	b.retainRehydrationPageSource(info.ID, branch, sourceDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
 	}

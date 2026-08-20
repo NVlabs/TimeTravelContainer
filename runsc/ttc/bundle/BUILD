@@ -31,7 +31,10 @@ go_library(
 go_test(
     name = "bundle_test",
     size = "small",
-    srcs = ["spec_test.go"],
+    srcs = [
+        "spec_test.go",
+        "store_test.go",
+	],
     library = ":bundle",
     deps = [
         "//pkg/ttcvolume",

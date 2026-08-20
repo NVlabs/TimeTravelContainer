@@ -422,7 +422,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			if readErr != nil {
 				return fmt.Errorf("reading durable peer metadata: %w", readErr)
 			}
-			durableActiveDir = filepath.Join(r.backend.dataRoot, "containers", info.ID, "memory", "active", hex.EncodeToString([]byte(targetBranch.ID)))
+			durableActiveDir = memoryBranchDir(r.backend.dataRoot, info.ID, "active", targetBranch)
 			if err := os.RemoveAll(durableActiveDir); err != nil {
 				return err
 			}

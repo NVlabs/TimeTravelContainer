@@ -299,6 +299,18 @@ type BranchInfo struct {
 	CreatedAt                    time.Time `json:"created_at"`
 }
 
+// MemoryBranchKey returns the stable directory key used for a branch's
+// dehydration metadata and legacy active page sources. It deliberately uses
+// the filesystem branch identity rather than the user-visible branch name so
+// renaming a branch never changes where its durable memory is stored.
+func MemoryBranchKey(branch BranchInfo) string {
+	identity := branch.FilesystemBranch
+	if identity == "" {
+		identity = branch.ID
+	}
+	return hex.EncodeToString([]byte(identity))
+}
+
 // DistributedForkImport is a reserved but not yet visible branch imported
 // into an already-running target family.
 type DistributedForkImport struct {
@@ -2793,12 +2805,14 @@ func (s Store) RenameBranch(name, oldID, newID string) error {
 		return err
 	}
 	found := false
+	var renamedBranch BranchInfo
 	for i := range info.Branches {
 		switch info.Branches[i].ID {
 		case newID:
 			return fmt.Errorf("branch %q already exists", newID)
 		case oldID:
 			found = true
+			renamedBranch = info.Branches[i]
 		}
 	}
 	if !found {
@@ -2817,42 +2831,93 @@ func (s Store) RenameBranch(name, oldID, newID string) error {
 			info.PublishedPorts[i].BranchID = newID
 		}
 	}
-	if err := s.renameConsoleState(info.ID, oldID, newID); err != nil {
+	rollback, err := s.renameBranchArtifacts(info.ID, renamedBranch, oldID, newID)
+	if err != nil {
 		return err
 	}
 	recomputeContainerState(&info)
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		if rollbackErr := rollback(); rollbackErr != nil {
+			return fmt.Errorf("recording renamed branch: %w; rolling back branch artifacts: %v", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
 }
 
-// renameConsoleState moves the files a branch's consoles are filed under.
-func (s Store) renameConsoleState(containerID, oldID, newID string) error {
+type renamePath struct {
+	oldPath string
+	newPath string
+}
+
+// renameBranchArtifacts moves name-keyed state as one rollback-capable
+// transaction. Memory directories from older TTC versions are also promoted
+// to the stable filesystem-branch key here; current directories never move on
+// subsequent renames.
+func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldID, newID string) (func() error, error) {
+	var paths []renamePath
 	dir := filepath.Join(s.Root, "containers", containerID, "console")
 	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("reading console state: %w", err)
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if name != oldID && !strings.HasPrefix(name, oldID+".") {
-			continue
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if name != oldID && !strings.HasPrefix(name, oldID+".") {
+				continue
+			}
+			renamed := newID + strings.TrimPrefix(name, oldID)
+			paths = append(paths, renamePath{filepath.Join(dir, name), filepath.Join(dir, renamed)})
 		}
-		renamed := newID + strings.TrimPrefix(name, oldID)
-		if err := os.Rename(filepath.Join(dir, name), filepath.Join(dir, renamed)); err != nil {
-			return fmt.Errorf("renaming console state %q: %w", name, err)
-		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading console state: %w", err)
 	}
 	execDir := filepath.Join(dir, "exec", oldID)
 	if _, err := os.Stat(execDir); err == nil {
-		if err := os.Rename(execDir, filepath.Join(dir, "exec", newID)); err != nil {
-			return fmt.Errorf("renaming exec console state: %w", err)
-		}
+		paths = append(paths, renamePath{execDir, filepath.Join(dir, "exec", newID)})
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("reading exec console state: %w", err)
+		return nil, fmt.Errorf("reading exec console state: %w", err)
 	}
-	return nil
+
+	legacyKey := hex.EncodeToString([]byte(oldID))
+	stableKey := MemoryBranchKey(branch)
+	if legacyKey != stableKey {
+		for _, state := range []string{"dehydrated", "active"} {
+			oldPath := filepath.Join(s.Root, "containers", containerID, "memory", state, legacyKey)
+			if _, err := os.Lstat(oldPath); err == nil {
+				paths = append(paths, renamePath{oldPath, filepath.Join(filepath.Dir(oldPath), stableKey)})
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("checking legacy %s memory state: %w", state, err)
+			}
+		}
+	}
+
+	for _, path := range paths {
+		if _, err := os.Lstat(path.newPath); err == nil {
+			return nil, fmt.Errorf("renaming branch artifact %q: destination %q already exists", path.oldPath, path.newPath)
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("checking branch artifact destination %q: %w", path.newPath, err)
+		}
+	}
+	moved := make([]renamePath, 0, len(paths))
+	rollback := func() error {
+		var result error
+		for i := len(moved) - 1; i >= 0; i-- {
+			if err := os.Rename(moved[i].newPath, moved[i].oldPath); err != nil && !os.IsNotExist(err) {
+				result = errors.Join(result, err)
+			}
+		}
+		return result
+	}
+	for _, path := range paths {
+		if err := os.Rename(path.oldPath, path.newPath); err != nil {
+			rollbackErr := rollback()
+			if rollbackErr != nil {
+				return nil, fmt.Errorf("renaming branch artifact %q: %w; rollback: %v", path.oldPath, err, rollbackErr)
+			}
+			return nil, fmt.Errorf("renaming branch artifact %q: %w", path.oldPath, err)
+		}
+		moved = append(moved, path)
+	}
+	return rollback, nil
 }
 
 // RecordBranchStart records a fresh process incarnation for one branch. Family
