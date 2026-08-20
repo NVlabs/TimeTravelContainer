@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -104,6 +105,23 @@ type filesystem struct {
 	// MemoryFile, so mapped FUSE pages participate in TTC's normal page-level
 	// live-fork CoW rather than being backed by a host file.
 	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// cacheMu protects fileCaches.
+	cacheMu sync.Mutex `state:"nosave"`
+
+	// fileCaches contains the inode-wide page cache for regular files. FUSE
+	// identifies an inode by (node ID, generation), including through hard
+	// links, so all dentries and open descriptions for that identity use the
+	// same cache and mapping registry.
+	//
+	// +checklocks:cacheMu
+	fileCaches map[fileCacheKey]*fileCache
+}
+
+// +stateify savable
+type fileCacheKey struct {
+	nodeID     uint64
+	generation uint64
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -378,9 +396,30 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.cacheMu.Lock()
+	for _, cache := range fs.fileCaches {
+		cache.dropAll(fs.mf)
+	}
+	fs.fileCaches = nil
+	fs.cacheMu.Unlock()
 	fs.conn.fuseConn.release(ctx)
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)
+}
+
+func (fs *filesystem) fileCache(nodeID, generation uint64) *fileCache {
+	key := fileCacheKey{nodeID: nodeID, generation: generation}
+	fs.cacheMu.Lock()
+	defer fs.cacheMu.Unlock()
+	if fs.fileCaches == nil {
+		fs.fileCaches = make(map[fileCacheKey]*fileCache)
+	}
+	if cache := fs.fileCaches[key]; cache != nil {
+		return cache
+	}
+	cache := &fileCache{}
+	fs.fileCaches[key] = cache
+	return cache
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
@@ -431,6 +470,9 @@ func (fs *filesystem) newInode(ctx context.Context, out linux.FUSEEntryOut) (ker
 
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
 	i.init(&creds, linux.UNNAMED_MAJOR, fs.devMinor, out.NodeID, linux.FileMode(attr.Mode), attr.Nlink)
+	if linux.FileMode(attr.Mode).FileType() == linux.ModeRegular {
+		i.cache = fs.fileCache(out.NodeID, out.Generation)
+	}
 	i.updateAttrs(attr, int64(out.AttrValid), int64(out.AttrValidNSec))
 	i.updateEntryTime(int64(out.EntryValid), int64(out.EntryValidNSec))
 

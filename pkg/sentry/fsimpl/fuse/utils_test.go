@@ -15,12 +15,18 @@
 package fuse
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -102,6 +108,69 @@ func TestStatFromFUSEAttrReportsRequestedType(t *testing.T) {
 	}
 	if got := linux.FileMode(stat.Mode).FileType(); got != linux.ModeRegular {
 		t.Fatalf("file type %v, want regular", got)
+	}
+}
+
+func TestFileCacheUsesFUSEInodeIdentity(t *testing.T) {
+	fs := &filesystem{}
+	first := fs.fileCache(2, 7)
+	if got := fs.fileCache(2, 7); got != first {
+		t.Fatal("same FUSE inode identity received distinct mmap caches")
+	}
+	if got := fs.fileCache(2, 8); got == first {
+		t.Fatal("reused FUSE node ID with a new generation shared an mmap cache")
+	}
+}
+
+func TestFileCacheLiveForkCopyOnWrite(t *testing.T) {
+	system := setup(t)
+	mf := pgalloc.MemoryFileFromContext(system.Ctx)
+	cache := &fileCache{}
+	defer cache.dropAll(mf)
+
+	fr, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.PageCache,
+		Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte{'x'}, hostarch.PageSize)
+	ims, err := mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(want))); err != nil || n != hostarch.PageSize {
+		t.Fatalf("initializing cache: n=%d err=%v", n, err)
+	}
+	cache.data.Insert(cache.data.FindGap(0), memmap.MappableRange{Start: 0, End: hostarch.PageSize}, fr.Start)
+	original := fr.Start
+	cache.prepareLiveFork()
+
+	cache.dataMu.Lock()
+	err = cache.copyOnWriteLocked(system.Ctx, &filesystem{mf: mf}, memmap.MappableRange{Start: 0, End: hostarch.PageSize})
+	seg := cache.data.FindSegment(0)
+	empty := cache.cow.IsEmpty()
+	cache.dataMu.Unlock()
+	if err != nil {
+		t.Fatalf("copyOnWriteLocked: %v", err)
+	}
+	if !seg.Ok() || seg.Value() == original {
+		t.Fatal("FUSE mmap cache retained shared MemoryFile backing after CoW")
+	}
+	if !empty {
+		t.Fatal("FUSE mmap cache retained completed CoW metadata")
+	}
+	gotIMS, err := mf.MapInternal(seg.FileRange(), hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), gotIMS); err != nil || n != hostarch.PageSize {
+		t.Fatalf("reading CoW cache: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("FUSE mmap CoW did not preserve page contents")
 	}
 }
 

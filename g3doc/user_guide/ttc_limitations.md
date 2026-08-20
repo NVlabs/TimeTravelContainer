@@ -39,8 +39,7 @@ non-forkable for its entire lifetime.
   externally served FUSE, io_uring/AIO, packet-ring, KCOV, writable-sysfs, and
   nftables creation paths fail at creation in an eligible family rather than
   poisoning it later. FUSE filesystems served through the guest's `/dev/fuse`
-  are contained in the Sentry and are forkable; writable shared FUSE mmaps are
-  not yet supported.
+  are contained in the Sentry and are forkable.
 - Internal virtual-network connections are copied. The source keeps external
   connections, while the child starts with external connections disconnected
   and no inherited published host ports.

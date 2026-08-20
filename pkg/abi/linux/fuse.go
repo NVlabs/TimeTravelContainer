@@ -537,6 +537,12 @@ const (
 	FUSE_READ_LOCKOWNER = 1 << 1
 )
 
+// FUSE_WRITE flags, consistent with include/uapi/linux/fuse.h.
+const (
+	FUSE_WRITE_CACHE     = 1 << 0
+	FUSE_WRITE_LOCKOWNER = 1 << 1
+)
+
 // FUSEReadIn is the request sent by the kernel to the daemon
 // for FUSE_READ.
 //

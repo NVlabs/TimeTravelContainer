@@ -208,11 +208,12 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 		Fh:         fd.Fh,
 		FsyncFlags: syncFlags,
 	}
-	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)
-	// The reply will be ignored since no callback is defined in asyncCallBack().
-	fs.conn.CallAsync(ctx, req)
-	return nil
+	res, err := fs.conn.Call(ctx, req)
+	if err != nil {
+		return err
+	}
+	return res.Error()
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.

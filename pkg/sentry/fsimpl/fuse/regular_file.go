@@ -16,6 +16,7 @@ package fuse
 
 import (
 	goContext "context"
+	"fmt"
 	"io"
 	"math"
 	"sync"
@@ -33,6 +34,182 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// fileCache is shared by all descriptions and hard links for a regular FUSE
+// inode. This is required for Linux MAP_SHARED coherence.
+//
+// +stateify savable
+type fileCache struct {
+	// mapsMu protects mappings.
+	mapsMu   sync.Mutex `state:"nosave"`
+	mappings memmap.MappingSet
+
+	// dataMu protects data and dirty.
+	dataMu sync.RWMutex `state:"nosave"`
+	data   fsutil.FileRangeSet
+	dirty  fsutil.DirtySet
+
+	// cow contains data ranges whose MemoryFile pages are still shared with
+	// another live-fork branch. Values mirror data's MemoryFile offsets.
+	cow fsutil.FileRangeSet
+
+	// handles is reconstructed from open regularFileFDs after restore and is
+	// used to select a writable FUSE handle for inode-wide page writeback.
+	handlesMu sync.Mutex                  `state:"nosave"`
+	handles   map[*regularFileFD]struct{} `state:"nosave"`
+}
+
+func (cache *fileCache) afterLoad(ctx goContext.Context) {
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	if err := fsutil.RelocateFileRangeSet(ctx, mf, &cache.data); err != nil {
+		panic("relocating FUSE mmap cache: " + err.Error())
+	}
+	if err := fsutil.RelocateFileRangeSet(ctx, mf, &cache.cow); err != nil {
+		panic("relocating FUSE mmap CoW metadata: " + err.Error())
+	}
+	if cache.handles == nil {
+		cache.handles = make(map[*regularFileFD]struct{})
+	}
+	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+		return
+	}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for seg := cache.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		pgalloc.AcquireRestoreRef(ctx, mf, seg.FileRange(), memCgID)
+	}
+}
+
+func (cache *fileCache) register(fd *regularFileFD) {
+	cache.handlesMu.Lock()
+	if cache.handles == nil {
+		cache.handles = make(map[*regularFileFD]struct{})
+	}
+	cache.handles[fd] = struct{}{}
+	cache.handlesMu.Unlock()
+}
+
+func (cache *fileCache) unregister(fd *regularFileFD) {
+	cache.handlesMu.Lock()
+	delete(cache.handles, fd)
+	cache.handlesMu.Unlock()
+}
+
+func (cache *fileCache) writableHandle(preferred *regularFileFD) (*regularFileFD, bool) {
+	if preferred != nil && preferred.statusFlags()&linux.O_ACCMODE != linux.O_RDONLY {
+		return preferred, false
+	}
+	cache.handlesMu.Lock()
+	defer cache.handlesMu.Unlock()
+	for fd := range cache.handles {
+		if fd.statusFlags()&linux.O_ACCMODE == linux.O_RDONLY {
+			continue
+		}
+		if !fd.vfsfd.TryIncRef() {
+			delete(cache.handles, fd)
+			continue
+		}
+		return fd, true
+	}
+	return nil, false
+}
+
+func (cache *fileCache) dropAll(mf *pgalloc.MemoryFile) {
+	cache.dataMu.Lock()
+	cache.data.DropAll(mf)
+	cache.cow.RemoveAll()
+	cache.dirty.RemoveAllAndAccount()
+	cache.dataMu.Unlock()
+}
+
+func (cache *fileCache) truncate(newSize, oldSize uint64, mf *pgalloc.MemoryFile) {
+	if newSize >= oldSize {
+		return
+	}
+	oldPageEnd, _ := hostarch.PageRoundUp(oldSize)
+	newPageEnd, _ := hostarch.PageRoundUp(newSize)
+	if oldPageEnd != newPageEnd {
+		cache.mapsMu.Lock()
+		cache.mappings.Invalidate(memmap.MappableRange{Start: uint64(newPageEnd), End: uint64(oldPageEnd)}, memmap.InvalidateOpts{InvalidatePrivate: true})
+		cache.mapsMu.Unlock()
+	}
+	cache.dataMu.Lock()
+	cache.data.Truncate(newSize, mf)
+	if oldPageEnd != newPageEnd {
+		truncated := memmap.MappableRange{Start: uint64(newPageEnd), End: uint64(oldPageEnd)}
+		cache.cow.RemoveRange(truncated)
+		cache.dirty.KeepClean(truncated)
+	}
+	cache.dataMu.Unlock()
+}
+
+// prepareLiveFork revokes current translations and records every cached page
+// as shared with the impending child branch.
+func (cache *fileCache) prepareLiveFork() {
+	cache.mapsMu.Lock()
+	cache.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	cache.dataMu.Lock()
+	cache.cow.RemoveAll()
+	for seg := cache.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		cache.cow.Insert(cache.cow.FindGap(seg.Start()), seg.Range(), seg.Value())
+	}
+	cache.dataMu.Unlock()
+	cache.mapsMu.Unlock()
+}
+
+// copyOnWriteLocked gives this branch private MemoryFile pages for shared
+// cached ranges before they are translated again.
+//
+// Preconditions: cache.dataMu is locked for writing and mr is page-aligned.
+func (cache *fileCache) copyOnWriteLocked(ctx context.Context, fs *filesystem, mr memmap.MappableRange) error {
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	for cowSeg := cache.cow.LowerBoundSegment(mr.Start); cowSeg.Ok() && cowSeg.Start() < mr.End; {
+		if cowSeg.End() <= mr.Start {
+			cowSeg = cowSeg.NextSegment()
+			continue
+		}
+		cowRange := cowSeg.Range().Intersect(mr)
+		cowSeg = cache.cow.Isolate(cowSeg, cowRange)
+		dataSeg := cache.data.FindSegment(cowRange.Start)
+		if !dataSeg.Ok() || !dataSeg.Range().IsSupersetOf(cowRange) {
+			return fmt.Errorf("FUSE live-fork CoW range %v has no cache segment", cowRange)
+		}
+		dataSeg = cache.data.Isolate(dataSeg, cowRange)
+		oldRange := dataSeg.FileRange()
+		newRange, err := fs.mf.Allocate(cowRange.Length(), pgalloc.AllocOpts{
+			Kind:    usage.PageCache,
+			MemCgID: memCgID,
+			Mode:    pgalloc.AllocateAndWritePopulate,
+		})
+		if err != nil {
+			return err
+		}
+		oldIMS, err := fs.mf.MapInternal(oldRange, hostarch.Read)
+		if err != nil {
+			fs.mf.DecRef(newRange)
+			return err
+		}
+		newIMS, err := fs.mf.MapInternal(newRange, hostarch.Write)
+		if err != nil {
+			fs.mf.DecRef(newRange)
+			return err
+		}
+		if n, err := safemem.CopySeq(newIMS, oldIMS); err != nil || n != cowRange.Length() {
+			fs.mf.DecRef(newRange)
+			if err != nil {
+				return err
+			}
+			return io.ErrUnexpectedEOF
+		}
+		dataSeg.SetValue(newRange.Start)
+		fs.mf.DecRef(oldRange)
+		gap := cache.cow.Remove(cowSeg)
+		if !gap.Ok() {
+			break
+		}
+		cowSeg = gap.NextSegment()
+	}
+	return nil
+}
+
 // +stateify savable
 type regularFileFD struct {
 	fileDescription
@@ -43,45 +220,110 @@ type regularFileFD struct {
 	// off is the file offset.
 	// +checklocks:offMu
 	off int64
-
-	// mapsMu protects mappings.
-	mapsMu sync.Mutex `state:"nosave"`
-
-	// mappings tracks mappings of the file into memmap.MappingSpaces.
-	//
-	// Protected by mapsMu.
-	mappings memmap.MappingSet
-
-	// dataMu protects the fields below.
-	dataMu sync.RWMutex `state:"nosave"`
-
-	// data maps offsets into the file to offsets into memFile that store
-	// the file's data.
-	//
-	// Protected by dataMu.
-	data fsutil.FileRangeSet
 }
 
 // afterLoad is invoked by stateify.
 func (fd *regularFileFD) afterLoad(ctx goContext.Context) {
-	if err := fsutil.RelocateFileRangeSet(ctx, fd.inode().fs.mf, &fd.data); err != nil {
-		panic("relocating FUSE mmap cache: " + err.Error())
-	}
-	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
-		return
-	}
-	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
-	for seg := fd.data.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		pgalloc.AcquireRestoreRef(ctx, fd.inode().fs.mf, seg.FileRange(), memCgID)
-	}
+	fd.inode().cache.register(fd)
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *regularFileFD) Release(ctx context.Context) {
-	fd.dataMu.Lock()
-	fd.data.DropAll(fd.inode().fs.mf)
-	fd.dataMu.Unlock()
+	fd.inode().cache.unregister(fd)
+	if err := fd.writebackAll(ctx); err != nil {
+		ctx.Warningf("writing back FUSE mmap data on release: %v", err)
+	}
 	fd.fileDescription.Release(ctx)
+}
+
+// OnClose implements vfs.FileDescriptionImpl.OnClose.
+func (fd *regularFileFD) OnClose(ctx context.Context) error {
+	if err := fd.writebackAll(ctx); err != nil {
+		return err
+	}
+	return fd.fileDescription.OnClose(ctx)
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (fd *regularFileFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
+	if err := fd.writebackAll(ctx); err != nil {
+		return err
+	}
+	return fd.fileDescription.Sync(ctx, opts)
+}
+
+func (fd *regularFileFD) writebackAll(ctx context.Context) error {
+	writer, decRef := fd.inode().cache.writableHandle(fd)
+	if writer == nil {
+		return nil
+	}
+	if decRef {
+		defer writer.vfsfd.DecRef(ctx)
+	}
+	return writer.writebackAllUsingHandle(ctx)
+}
+
+func (fd *regularFileFD) writebackAllUsingHandle(ctx context.Context) error {
+	inode := fd.inode()
+	cache := inode.cache
+	cache.dataMu.Lock()
+	defer cache.dataMu.Unlock()
+	return fsutil.SyncDirtyAll(ctx, &cache.data, &cache.dirty, inode.size.Load(), inode.fs.mf, fd.writeFromBlocksAt)
+}
+
+func (fd *regularFileFD) writebackRange(ctx context.Context, mr memmap.MappableRange) error {
+	inode := fd.inode()
+	cache := inode.cache
+	cache.dataMu.Lock()
+	defer cache.dataMu.Unlock()
+	return fsutil.SyncDirty(ctx, mr, &cache.data, &cache.dirty, inode.size.Load(), inode.fs.mf, fd.writeFromBlocksAt)
+}
+
+// writeFromBlocksAt writes cached mmap pages through the FUSE handle.
+func (fd *regularFileFD) writeFromBlocksAt(ctx context.Context, srcs safemem.BlockSeq, offset uint64) (uint64, error) {
+	fs := fd.inode().fs
+	maxWrite := uint32(fs.conn.maxPages) << hostarch.PageShift
+	if maxWrite > fs.conn.maxWrite {
+		maxWrite = fs.conn.maxWrite
+	}
+	var done uint64
+	for !srcs.IsEmpty() {
+		writeSize := srcs.NumBytes()
+		if writeSize > uint64(maxWrite) {
+			writeSize = uint64(maxWrite)
+		}
+		if !fs.conn.bigWrites && writeSize > hostarch.PageSize {
+			writeSize = hostarch.PageSize
+		}
+		data := make([]byte, writeSize)
+		n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data)), srcs.TakeFirst64(writeSize))
+		if err != nil {
+			return done, err
+		}
+		in := linux.FUSEWritePayloadIn{
+			Header: linux.FUSEWriteIn{
+				Fh:         fd.Fh,
+				Offset:     offset + done,
+				Size:       uint32(n),
+				WriteFlags: linux.FUSE_WRITE_CACHE,
+				Flags:      fd.statusFlags(),
+			},
+			Payload: data[:n],
+		}
+		var out linux.FUSEWriteOut
+		if err := fd.inode().call(ctx, linux.FUSE_WRITE, &in, &out); err != nil {
+			return done, err
+		}
+		if out.Size > uint32(n) {
+			return done, linuxerr.EIO
+		}
+		done += uint64(out.Size)
+		srcs = srcs.DropFirst64(uint64(out.Size))
+		if out.Size != uint32(n) {
+			return done, io.ErrShortWrite
+		}
+	}
+	return done, nil
 }
 
 // Seek implements vfs.FileDescriptionImpl.Allocate.
@@ -183,23 +425,22 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	if uint64(offset+size) > fileSize {
 		size = int64(fileSize) - offset
 	}
+	if fd.DirectIO {
+		return fd.preadDirect(ctx, dst, uint64(offset), size)
+	}
 
-	buffers, n, err := inode.fs.ReadInPages(ctx, fd, uint64(offset), uint32(size))
+	reader := fuseCacheReader{ctx: ctx, fd: fd, off: uint64(offset)}
+	return dst.TakeFirst64(size).CopyOutFrom(ctx, &reader)
+}
+
+func (fd *regularFileFD) preadDirect(ctx context.Context, dst usermem.IOSequence, offset uint64, size int64) (int64, error) {
+	buffers, n, err := fd.inode().fs.ReadInPages(ctx, fd, offset, uint32(size))
 	if err != nil {
 		return 0, err
 	}
-
-	// TODO(gvisor.dev/issue/3237): support indirect IO (e.g. caching),
-	// store the bytes that were read ahead.
-
-	// Update the number of bytes to copy for short read.
 	if n < uint32(size) {
 		size = int64(n)
 	}
-
-	// Copy the bytes read to the dst.
-	// This loop is intended for fragmented reads.
-	// For the majority of reads, this loop only execute once.
 	var copied int64
 	for _, buffer := range buffers {
 		toCopy := int64(len(buffer))
@@ -215,8 +456,57 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		}
 		copied += toCopy
 	}
-
 	return copied, nil
+}
+
+type fuseCacheReader struct {
+	ctx context.Context
+	fd  *regularFileFD
+	off uint64
+}
+
+// ReadToBlocks implements safemem.Reader.ReadToBlocks.
+func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+	if dsts.IsEmpty() {
+		return 0, nil
+	}
+	inode := r.fd.inode()
+	end := inode.size.Load()
+	if r.off >= end {
+		return 0, io.EOF
+	}
+	if requestedEnd := r.off + dsts.NumBytes(); requestedEnd > r.off && requestedEnd < end {
+		end = requestedEnd
+	}
+	pageEnd, _ := hostarch.PageRoundUp(end)
+	required := memmap.MappableRange{Start: hostarch.PageRoundDown(r.off), End: uint64(pageEnd)}
+	cache := inode.cache
+	cache.dataMu.Lock()
+	defer cache.dataMu.Unlock()
+	_, fillErr := cache.data.Fill(r.ctx, required, required, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: pgalloc.MemoryCgroupIDFromContext(r.ctx),
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, r.fd.readToBlocksAt)
+
+	var done uint64
+	for seg := cache.data.FindSegment(r.off); seg.Ok() && seg.Start() < end; seg, _ = seg.NextNonEmpty() {
+		mr := seg.Range().Intersect(memmap.MappableRange{Start: r.off, End: end})
+		ims, err := inode.fs.mf.MapInternal(seg.FileRangeOf(mr), hostarch.Read)
+		if err != nil {
+			return done, err
+		}
+		n, err := safemem.CopySeq(dsts.DropFirst64(done), ims)
+		done += n
+		r.off += n
+		if err != nil {
+			return done, err
+		}
+	}
+	if r.off < end && fillErr != nil {
+		return done, fillErr
+	}
+	return done, nil
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -291,20 +581,34 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 	src = src.TakeFirst64(limit)
 
-	// FUSE does not currently support server-driven page-cache invalidation.
-	// Keep mmap coherent with writes performed through this Sentry by removing
-	// affected translations and cached pages before issuing FUSE_WRITE.
+	// Write back dirty mmap pages that overlap this write, then remove the
+	// affected cache pages and translations. This preserves ordering between
+	// MAP_SHARED stores and write(2), while private mappings retain their CoW
+	// pages as required by Linux.
 	pgstart := hostarch.PageRoundDown(uint64(offset))
 	pgend, ok := hostarch.PageRoundUp(uint64(offset) + uint64(src.NumBytes()))
 	if !ok {
 		return 0, offset, linuxerr.EINVAL
 	}
-	fd.mapsMu.Lock()
-	fd.mappings.Invalidate(memmap.MappableRange{Start: pgstart, End: uint64(pgend)}, memmap.InvalidateOpts{})
-	fd.mapsMu.Unlock()
-	fd.dataMu.Lock()
-	fd.data.Drop(memmap.MappableRange{Start: pgstart, End: uint64(pgend)}, inode.fs.mf)
-	fd.dataMu.Unlock()
+	mr := memmap.MappableRange{Start: pgstart, End: uint64(pgend)}
+	if err := fd.writebackRange(ctx, mr); err != nil {
+		return 0, offset, err
+	}
+	cache := inode.cache
+	var freed []memmap.FileRange
+	cache.dataMu.Lock()
+	cache.dirty.KeepClean(mr)
+	cache.cow.RemoveRange(mr)
+	cache.data.RemoveRangeWith(mr, func(seg fsutil.FileRangeIterator) {
+		freed = append(freed, seg.FileRange())
+	})
+	cache.dataMu.Unlock()
+	cache.mapsMu.Lock()
+	cache.mappings.Invalidate(mr, memmap.InvalidateOpts{})
+	cache.mapsMu.Unlock()
+	for _, fr := range freed {
+		inode.fs.mf.DecRef(fr)
+	}
 
 	n, offset, err := inode.fs.Write(ctx, fd, offset, src)
 	if n == 0 {
@@ -326,12 +630,6 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	// Writable shared mappings need FUSE writeback-cache and invalidation
-	// support. Private executable/writable mappings (the AppImage use case) and
-	// read-only shared mappings are backed by Sentry-owned cached pages.
-	if !opts.Private && opts.MaxPerms.Write {
-		return linuxerr.EOPNOTSUPP
-	}
 	opts.SentryOwnedContent = true
 	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
 }
@@ -346,17 +644,27 @@ func (fd *regularFileFD) ValidateLiveForkMapping() error {
 
 // AddMapping implements memmap.Mappable.AddMapping.
 func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
-	fd.mapsMu.Lock()
-	fd.mappings.AddMapping(ms, ar, offset, writable)
-	fd.mapsMu.Unlock()
+	cache := fd.inode().cache
+	cache.mapsMu.Lock()
+	cache.mappings.AddMapping(ms, ar, offset, writable)
+	cache.mapsMu.Unlock()
 	return nil
 }
 
 // RemoveMapping implements memmap.Mappable.RemoveMapping.
 func (fd *regularFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
-	fd.mapsMu.Lock()
-	fd.mappings.RemoveMapping(ms, ar, offset, writable)
-	fd.mapsMu.Unlock()
+	cache := fd.inode().cache
+	cache.mapsMu.Lock()
+	unmapped := cache.mappings.RemoveMapping(ms, ar, offset, writable)
+	cache.mapsMu.Unlock()
+	if len(unmapped) == 0 {
+		return
+	}
+	cache.dataMu.Lock()
+	for _, mr := range unmapped {
+		cache.dirty.AllowClean(mr)
+	}
+	cache.dataMu.Unlock()
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
@@ -367,6 +675,7 @@ func (fd *regularFileFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace
 // Translate implements memmap.Mappable.Translate.
 func (fd *regularFileFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	inode := fd.inode()
+	cache := inode.cache
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
 
@@ -389,9 +698,12 @@ func (fd *regularFileFD) Translate(ctx context.Context, required, optional memma
 		optional.End = required.Start + maxReadahead
 	}
 
-	fd.dataMu.Lock()
-	defer fd.dataMu.Unlock()
-	_, fillErr := fd.data.Fill(ctx, required, optional, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
+	cache.dataMu.Lock()
+	defer cache.dataMu.Unlock()
+	if err := cache.copyOnWriteLocked(ctx, inode.fs, required); err != nil {
+		return nil, &memmap.BusError{Err: err}
+	}
+	_, fillErr := cache.data.Fill(ctx, required, optional, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
 		Kind:    usage.PageCache,
 		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
 		Mode:    pgalloc.AllocateAndWritePopulate,
@@ -399,13 +711,27 @@ func (fd *regularFileFD) Translate(ctx context.Context, required, optional memma
 
 	var translations []memmap.Translation
 	var translatedEnd uint64
-	for seg := fd.data.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg, _ = seg.NextNonEmpty() {
-		mr := seg.Range().Intersect(optional)
+	translateRange := optional
+	if !cache.cow.IsEmpty() {
+		// Do not return translations for adjacent pages that have not detached
+		// from another branch yet.
+		translateRange = required
+	}
+	for seg := cache.data.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg, _ = seg.NextNonEmpty() {
+		mr := seg.Range().Intersect(translateRange)
+		perms := hostarch.ReadExecute
+		if at.Write {
+			// We cannot observe individual host stores. Keep pages dirty while
+			// they have writable translations, then write them through FUSE on
+			// msync/fsync/unmap/save.
+			cache.dirty.KeepDirty(mr)
+			perms.Write = true
+		}
 		translations = append(translations, memmap.Translation{
 			Source: mr,
 			File:   inode.fs.mf,
 			Offset: seg.FileRangeOf(mr).Start,
-			Perms:  hostarch.AnyAccess,
+			Perms:  perms,
 		})
 		translatedEnd = mr.End
 	}
@@ -446,15 +772,14 @@ func (fd *regularFileFD) readToBlocksAt(ctx context.Context, dsts safemem.BlockS
 	return copied, err
 }
 
-// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. FUSE
-// cached pages can always be reconstructed by the cloned in-sandbox daemon;
-// private PMAs remain intact because InvalidatePrivate is false.
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable. Cached
+// pages and dirty state are serializable Sentry memory. In particular, this
+// method must not issue FUSE requests: save runs after guest tasks, including
+// the FUSE daemon, have been paused.
 func (fd *regularFileFD) InvalidateUnsavable(ctx context.Context) error {
-	fd.mapsMu.Lock()
-	fd.mappings.InvalidateAll(memmap.InvalidateOpts{})
-	fd.mapsMu.Unlock()
-	fd.dataMu.Lock()
-	fd.data.DropAll(fd.inode().fs.mf)
-	fd.dataMu.Unlock()
+	cache := fd.inode().cache
+	cache.mapsMu.Lock()
+	cache.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	cache.mapsMu.Unlock()
 	return nil
 }

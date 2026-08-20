@@ -111,6 +111,10 @@ type inode struct {
 
 	// +checklocks:attrMu
 	blockSize atomicbitops.Uint32 // 0 if unknown.
+
+	// cache is shared by every dentry and open file description for this FUSE
+	// inode identity. It is non-nil only for regular files.
+	cache *fileCache
 }
 
 func (i *inode) Mode() linux.FileMode {
@@ -395,6 +399,7 @@ type fhOptions struct {
 
 // +checklocks:i.attrMu
 func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions, fhOpts fhOptions) error {
+	oldSize := i.size.Load()
 	// We should retain the original file type when assigning a new mode.
 	fattrMask := fattrMaskFromStats(opts.Stat.Mask)
 	if fhOpts.useFh {
@@ -425,6 +430,9 @@ func (i *inode) setAttr(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		return err
 	}
 	i.updateAttrs(out.Attr, int64(out.AttrValid), int64(out.AttrValidNsec))
+	if opts.Stat.Mask&linux.STATX_SIZE != 0 && i.cache != nil {
+		i.cache.truncate(i.size.Load(), oldSize, i.fs.mf)
+	}
 	return nil
 }
 
@@ -591,10 +599,14 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 			fd.Fh = out.Fh
 			// Open was successful. Update inode's size if atomicOTrunc && O_TRUNC.
 			if truncateRegFile && i.fs.conn.atomicOTrunc {
+				oldSize := i.size.Load()
 				i.fs.conn.mu.Lock()
 				i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 				i.fs.conn.mu.Unlock()
 				i.size.Store(0)
+				if i.cache != nil {
+					i.cache.truncate(0, oldSize, i.fs.mf)
+				}
 				i.touchCMtime()
 			}
 		}
@@ -614,6 +626,12 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 	if err := fd.vfsfd.Init(fdImpl, opts.Flags, rp.Credentials(), rp.Mount(), d.VFSDentry(), fdOptions); err != nil {
 		return nil, err
+	}
+	if _, ok := fdImpl.(*regularFileFD); ok {
+		if i.cache == nil {
+			i.cache = i.fs.fileCache(i.nodeID, i.generation)
+		}
+		i.cache.register(fdImpl.(*regularFileFD))
 	}
 	return &fd.vfsfd, nil
 }

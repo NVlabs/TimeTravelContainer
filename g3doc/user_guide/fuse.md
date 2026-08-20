@@ -140,15 +140,17 @@ use Sentry-owned pages, so AppImages can run and those pages retain normal
 4 KiB memory CoW across branches. Pause/resume and dehydration/rehydration also
 preserve the mount.
 
-Ordinary file I/O, read-only mappings, and private executable or writable
-mappings are supported. Writable shared mappings (`mmap(MAP_SHARED)` with
-write permission) remain unsupported because they require FUSE writeback-cache
-and server-driven invalidation semantics.
+Ordinary file I/O and private or shared memory mappings are supported. TTC
+maintains one page cache per FUSE inode, writes dirty shared pages back through
+the FUSE protocol on `msync`, `fsync`, and close, and preserves both dirty state
+and 4 KiB CoW sharing between forked branches and dehydration cycles.
 
 Mounting requires `CAP_SYS_ADMIN` in the guest mount namespace. TTC does not
 grant that capability by default, so a container intended to mount FUSE should
-be created with `--cap-add SYS_ADMIN`. AppImages may additionally require the
-image's `fuse3` or `fuse` package for `fusermount`:
+be created with `--cap-add SYS_ADMIN`. This is a capability interpreted by the
+Sentry's virtual kernel; neither `ttcd` nor the container needs host root.
+Guest UID 0 without this capability is not sufficient. AppImages may
+additionally require the image's `fuse3` or `fuse` package for `fusermount`:
 
 ```console
 $ ttc run -d --cap-add SYS_ADMIN --name app ubuntu:24.04 sleep infinity

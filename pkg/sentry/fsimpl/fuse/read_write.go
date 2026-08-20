@@ -124,8 +124,12 @@ func (fs *filesystem) ReadCallback(ctx context.Context, i *inode, off uint64, si
 		newSize := off + uint64(sizeRead)
 		fs.conn.mu.Lock()
 		if attributeVersion == i.attrVersion.Load() && newSize < i.size.Load() {
+			oldSize := i.size.Load()
 			i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 			i.size.Store(newSize)
+			if i.cache != nil {
+				i.cache.truncate(newSize, oldSize, i.fs.mf)
+			}
 		}
 		fs.conn.mu.Unlock()
 	}

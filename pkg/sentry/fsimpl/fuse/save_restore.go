@@ -15,27 +15,57 @@
 package fuse
 
 import (
-	"context"
+	goContext "context"
 
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-func (fRes *futureResponse) afterLoad(context.Context) {
+var _ vfs.FilesystemImplSaveRestoreExtension = (*filesystem)(nil)
+
+func (fRes *futureResponse) afterLoad(goContext.Context) {
 	fRes.ch = make(chan struct{})
 }
 
-func (conn *connection) afterLoad(context.Context) {
+func (conn *connection) afterLoad(goContext.Context) {
 	conn.fuseConn = &deviceConn{conn: conn}
 }
 
-func (fs *filesystem) afterLoad(ctx context.Context) {
+func (fs *filesystem) afterLoad(ctx goContext.Context) {
 	fs.mf = pgalloc.MemoryFileFromContext(ctx)
+	if fs.fileCaches == nil {
+		fs.fileCaches = make(map[fileCacheKey]*fileCache)
+	}
+}
+
+// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension. Before a
+// live fork, revoke file-backed translations and mark every cached page for
+// lazy branch-local CoW on its next fault.
+func (fs *filesystem) PrepareSave(ctx context.Context) error {
+	if !pgalloc.IsLiveForkSource(ctx) {
+		return nil
+	}
+	fs.cacheMu.Lock()
+	for _, cache := range fs.fileCaches {
+		cache.prepareLiveFork()
+	}
+	fs.cacheMu.Unlock()
+	return nil
+}
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.
+func (fs *filesystem) BeforeResume(context.Context) {}
+
+// CompleteRestore implements vfs.FilesystemImplSaveRestoreExtension.
+func (fs *filesystem) CompleteRestore(context.Context, vfs.CompleteRestoreOptions) error {
+	return nil
 }
 
 func (conn *connection) saveFullQueueCh() int {
 	return cap(conn.fullQueueCh)
 }
 
-func (conn *connection) loadFullQueueCh(_ context.Context, capacity int) {
+func (conn *connection) loadFullQueueCh(_ goContext.Context, capacity int) {
 	conn.fullQueueCh = make(chan struct{}, capacity)
 }
