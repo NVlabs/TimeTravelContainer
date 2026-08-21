@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "capabilities.go",
         "control.go",
+		"fixed_terminal_planner.go",
         "placement.go",
 		"planner.go",
         "registry.go",
@@ -26,6 +27,7 @@ go_test(
     srcs = [
         "cluster_test.go",
         "control_test.go",
+		"fixed_terminal_planner_test.go",
         "placement_test.go",
 		"planner_test.go",
         "registry_test.go",

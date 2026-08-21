@@ -27,15 +27,20 @@ type BranchResource struct {
 	NodeID       string `json:"node_id"`
 	PrivateBytes uint64 `json:"private_bytes"`
 	Movable      bool   `json:"movable"`
+	// Cohort is an optional hard co-location constraint. All branches with the
+	// same non-empty cohort are contracted into one movable solver vertex.
+	Cohort       string   `json:"cohort,omitempty"`
+	AllowedNodes []string `json:"allowed_nodes,omitempty"`
 }
 
 // SharedResource is a coarse memory or disk version referenced by branches.
 // TTC normally exports 1 MiB memory chunk identities here, not individual
 // 4 KiB pages.
 type SharedResource struct {
-	ID       string   `json:"id"`
-	Bytes    uint64   `json:"bytes"`
-	Branches []string `json:"branches"`
+	ID         string   `json:"id"`
+	Bytes      uint64   `json:"bytes"`
+	Branches   []string `json:"branches"`
+	FixedNodes []string `json:"fixed_nodes,omitempty"`
 }
 
 type NodeResource struct {
