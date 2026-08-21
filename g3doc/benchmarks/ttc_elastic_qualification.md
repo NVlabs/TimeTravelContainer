@@ -14,6 +14,7 @@ whereas production nodes do not.
 - daemon-incarnation adoption after a clean restart;
 - node cordon/drain, cold-branch transfer, and page-dependency draining;
 - deterministic pressure placement and opt-in automatic rebalancing;
+- reduced global fixed-terminal placement across several destinations;
 - fenced, expiring target-memory reservations for pressure moves;
 - coalesced durable capacity requests, executable/webhook delivery, persistent
   retry state, and membership-confirmed fulfillment;
@@ -92,6 +93,28 @@ seconds. Cleanup removed the family, both daemons, Sentries, gofers, console
 followers, durable intents, and the test root.
 
 ## Pressure placement and cleanup
+
+### Three-node fixed-terminal retirement
+
+A five-branch family held a 128 MiB prefaulted anonymous mapping. Branch `b`
+overwrote the first 32 MiB and branch `c` overwrote the next 32 MiB; `b2` and
+`c2` were then forked from those differentiated states. `b` migrated to
+`node-b`, `c` migrated to `node-c`, and `main`, `b2`, and `c2` remained on
+`node-a`.
+
+Draining `node-a` built one global fixed-terminal problem. It placed `b2` with
+`b` on `node-b`, `c2` with `c` on `node-c`, and the remaining `main` branch on
+`node-b`. All five routed exec checks passed after cutover. The 136 MiB
+resident branch on `node-b` required only 27 stable version runs in its planner
+response. Family removal, image removal, and all three daemon stops left no
+test Sentry, socket, or temporary root.
+
+The ordinary two-daemon capacity-provider smoke also passed with the new
+retirement planner in 7.165 seconds. The same test completed with its data root
+on a loopback NFSv3 mount using hard TCP, 1 MiB reads/writes, synchronous
+export, and no root squashing. NFS qualification exposed a capped diagnostic
+writer that padded short provider errors to 4 KiB with NUL bytes; the writer
+now copies only the bytes supplied and has a regression test.
 
 A 64 MiB prefaulted process was forked into two fully shared branches on a
 pressured source. The planner selected both siblings as one zero-cut group,

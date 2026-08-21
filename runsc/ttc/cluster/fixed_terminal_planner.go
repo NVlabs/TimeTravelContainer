@@ -97,7 +97,9 @@ type fixedPlanner struct {
 	edgeOccupancy     []map[string]int
 	edgesByBranch     map[string][]int
 	connectivityBytes uint64
+	migrationBytes    uint64
 	units             []plannerUnit
+	unitByBranch      map[string]int
 	forbidden         map[string]bool
 }
 
@@ -138,7 +140,7 @@ func newFixedPlanner(problem FixedTerminalProblem) (*fixedPlanner, error) {
 	p := &fixedPlanner{
 		problem: problem, nodes: make(map[string]NodeResource), branches: make(map[string]BranchResource),
 		location: make(map[string]string), load: make(map[string]uint64), forbidden: make(map[string]bool),
-		edgesByBranch: make(map[string][]int),
+		edgesByBranch: make(map[string][]int), unitByBranch: make(map[string]int),
 	}
 	for _, id := range problem.ForbiddenNodes {
 		p.forbidden[id] = true
@@ -217,6 +219,11 @@ func newFixedPlanner(problem FixedTerminalProblem) (*fixedPlanner, error) {
 		p.units = append(p.units, plannerUnit{id: cohort, branches: ids, allowed: allowed})
 	}
 	sort.Slice(p.units, func(i, j int) bool { return p.units[i].id < p.units[j].id })
+	for index, unit := range p.units {
+		for _, branch := range unit.branches {
+			p.unitByBranch[branch] = index
+		}
+	}
 	for _, edge := range problem.Shared {
 		converted, err := p.edge(edge.ID, edge.Bytes, edge.Branches, edge.FixedNodes, true)
 		if err != nil {
@@ -294,7 +301,7 @@ type proposedMove struct {
 func (p *fixedPlanner) bestRepairMove() (proposedMove, bool) {
 	var best proposedMove
 	found := false
-	for _, unit := range p.units {
+	for _, unit := range p.repairUnits() {
 		from := p.unitLocation(unit)
 		if from != p.problem.SourceNode {
 			continue
@@ -313,6 +320,65 @@ func (p *fixedPlanner) bestRepairMove() (proposedMove, bool) {
 		}
 	}
 	return best, found
+}
+
+// repairUnits adds bounded whole-hyperedge groups to the contracted hard
+// cohorts. This avoids rejecting the first apparently expensive sibling move
+// when moving all incident siblings together releases or reuses the edge.
+func (p *fixedPlanner) repairUnits() []plannerUnit {
+	result := append([]plannerUnit(nil), p.units...)
+	seen := make(map[string]bool, len(result))
+	for _, unit := range result {
+		seen[stringsForIDs(unit.branches)] = true
+	}
+	for _, edge := range p.edges {
+		if !edge.load {
+			continue
+		}
+		unitIDs := make(map[int]bool)
+		allOnSource := true
+		for _, branch := range edge.branches {
+			if p.location[branch] != p.problem.SourceNode {
+				allOnSource = false
+				break
+			}
+			unitIDs[p.unitByBranch[branch]] = true
+		}
+		if !allOnSource || len(unitIDs) <= 1 || len(unitIDs) > 64 {
+			continue
+		}
+		indexes := make([]int, 0, len(unitIDs))
+		for index := range unitIDs {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		group := plannerUnit{id: "edge:" + edge.id, allowed: make(map[string]bool)}
+		first := true
+		for _, index := range indexes {
+			unit := p.units[index]
+			group.branches = append(group.branches, unit.branches...)
+			if first {
+				for node, ok := range unit.allowed {
+					group.allowed[node] = ok
+				}
+				first = false
+			} else {
+				for node := range group.allowed {
+					if !unit.allowed[node] {
+						delete(group.allowed, node)
+					}
+				}
+			}
+		}
+		sort.Strings(group.branches)
+		key := stringsForIDs(group.branches)
+		if len(group.allowed) != 0 && !seen[key] {
+			seen[key] = true
+			result = append(result, group)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].id < result[j].id })
+	return result
 }
 
 func betterRepair(candidate, best proposedMove) bool {
@@ -390,9 +456,9 @@ func (p *fixedPlanner) evaluate(unit plannerUnit, to string) (proposedMove, bool
 		return proposedMove{}, false
 	}
 	beforeLoad := cloneLoads(p.load)
-	beforeCost := p.connectivity()
+	beforeCost := p.objective()
 	p.apply(unit, to)
-	afterCost := p.connectivity()
+	afterCost := p.objective()
 	valid := p.load[to] <= p.nodes[to].TargetBytes
 	afterLoad := cloneLoads(p.load)
 	p.apply(unit, from)
@@ -431,6 +497,12 @@ func (p *fixedPlanner) apply(unit plannerUnit, to string) {
 	}
 	for _, id := range unit.branches {
 		branch := p.branches[id]
+		if from == branch.NodeID {
+			p.migrationBytes = saturatingAdd(p.migrationBytes, branch.PrivateBytes)
+		}
+		if to == branch.NodeID {
+			p.migrationBytes = saturatingSub(p.migrationBytes, branch.PrivateBytes)
+		}
 		p.load[from] = saturatingSub(p.load[from], branch.PrivateBytes)
 		p.load[to] = saturatingAdd(p.load[to], branch.PrivateBytes)
 		p.location[id] = to
@@ -472,6 +544,10 @@ func occupiedNodes(occupancy map[string]int) map[string]bool {
 
 func (p *fixedPlanner) connectivity() uint64 {
 	return p.connectivityBytes
+}
+
+func (p *fixedPlanner) objective() uint64 {
+	return saturatingAdd(p.connectivityBytes, p.migrationBytes)
 }
 
 func edgeConnectivity(weight uint64, occupancy map[string]int) uint64 {

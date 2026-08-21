@@ -240,6 +240,9 @@ func BuildFixedTerminalProblem(mode PlacementMode, source string, nodes []NodeRe
 }
 
 func sortedBoolKeys(values map[string]bool) []string {
+	if len(values) == 0 {
+		return nil
+	}
 	result := make([]string, 0, len(values))
 	for value, present := range values {
 		if present {

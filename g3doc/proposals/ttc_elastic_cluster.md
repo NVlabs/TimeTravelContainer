@@ -1,8 +1,9 @@
 # Elastic TimeTravelContainer clusters
 
-Status: phases 1 through 4 are implemented with the limitations called out
-below. Identity-preserving migration now uses live sparse memory transfer;
-phase 5 physical-host and failure-injection qualification remains in progress.
+Status: phases 1 through 4 are implemented. Identity-preserving migration uses
+live sparse memory transfer, and placement uses a cluster-global hypergraph
+with event-local movable vertices and fixed node terminals. Phase 5
+physical-host and failure-injection qualification remains in progress.
 
 This document specifies an elastic TTC cluster in which compute nodes may join
 and leave without restarting existing daemons. A client connected to any
@@ -52,9 +53,10 @@ replicated.
    remote target is source-independent and every durable publication is done.
 7. **Idempotent operations:** join, heartbeat, reserve, cutover, drain,
    capacity request, retry, cancellation, and cleanup use stable operation IDs.
-8. **Bounded metadata:** placement planning must not require a permanent
-   object per 4 KiB page. Coarse summaries may guide scheduling without
-   changing page-level correctness.
+8. **Compressed metadata:** placement planning must not require a permanent
+   object per 4 KiB page. Resident page-version sequences are interval
+   compressed in control responses and swept into exact weighted edges only
+   for the current event window.
 
 ## Identities and records
 
@@ -164,17 +166,54 @@ Sentry heap and unmapped-cache memory. Nodes report both actual use and
 branch/family accounting. Targets use configurable high and low watermarks,
 incoming reservations, cooldowns, and hysteresis to prevent oscillation.
 
-Branches are vertices in a sharing hypergraph. A shared page version is a
-hyperedge connecting every referencing branch; cutting it predicts duplicated
-residency. Exact 4 KiB graphs are too large to rebuild continuously, so the
-first planner uses stable 1 MiB chunk/version identities and splits unusually
-sparse chunks only when measurements justify it.
+Branches are vertices in a sharing hypergraph. A shared 4 KiB page version is
+a hyperedge connecting every referencing branch; cutting it predicts
+duplicated residency. Sentries export stable page-version runs rather than one
+record per page. The scheduler interval-sweeps runs from every live node and
+coalesces intervals with identical membership into weighted hyperedges.
 
-The objective combines memory-target imbalance, shared-chunk cut bytes,
-private bytes migrated, expected demand-fault traffic, destination-resident
-chunk reuse, and fixed per-family Sentry overhead. An incremental deterministic
-greedy/FM-style bipartitioner is implemented in Go first so TTC's static
-binaries do not acquire a native solver dependency.
+Each scheduling event creates a reduced global problem. Branches on the
+pressured or retiring node are movable. Every branch elsewhere remains fixed
+and is collapsed to one terminal per incident node. Fixed-only edges are
+dropped. This preserves the global CoW objective without creating variables
+for hundreds of unrelated branches. The measured cgroup load on each node is
+the baseline; moving a vertex applies exact marginal private-byte and edge
+occupancy deltas.
+
+The native Go solver first repairs the hard pressure or evacuation constraint,
+considering both contracted vertices and bounded whole-hyperedge groups. It
+then runs deterministic FM-style refinement. Its objective combines
+connectivity bytes and private migration bytes; target capacities and incoming
+reservations remain hard constraints. Incremental occupancy and gain state
+means a proposed move touches only incident edges. One solve can select
+several destinations and TTC reserves all of them before the first migration.
+
+An optional shared policy at
+`$TTC_DATA_ROOT/cluster/placement-policy.json` adds exact-selector allowed-node
+sets, hard co-location groups, and weighted soft affinities. Policy branches
+outside the movable window become fixed node terminals. The current schema is:
+
+```json
+{
+  "version": 1,
+  "allowed_nodes": {"agent@latency-sensitive": ["node-a", "node-b"]},
+  "hard_co_location": [
+    {"id": "service-pair", "branches": ["app@api", "app@database"]}
+  ],
+  "soft_affinity": [
+    {
+      "id": "reuse-warm-state",
+      "branches": ["agent@candidate", "agent@warm-peer"],
+      "nodes": ["node-c"],
+      "weight_bytes": 268435456
+    }
+  ]
+}
+```
+
+The document is strict JSON, dynamically reloaded for every placement event,
+and limited to 1 MiB. A hard group already split across multiple fixed nodes
+is diagnosed rather than silently weakened.
 
 Pressure policy may migrate, dehydrate an inactive branch, request capacity,
 or temporarily reject fan-out. TTH supplies policy weights and may mark
@@ -211,8 +250,9 @@ adapters and release events are future additions.
 ## Graceful drain
 
 1. Atomically mark the node draining and reject incoming work.
-2. Unplace dehydrated and exited branches.
-3. Reserve destinations and migrate running and paused partitions.
+2. Build one fixed-terminal evacuation window for all active source branches.
+3. Reserve every selected destination and migrate running and paused
+   partitions; then transfer zero-resident cold branch ownership.
 4. Drain volatile page dependencies to shared chunks.
 5. Transfer filesystem and network leases.
 6. Verify no branch, transaction, chunk lease, port listener, or session proxy
@@ -299,22 +339,21 @@ leave without branch loss or repository garbage.
 
 ### Phase 4: placement planner
 
-**Implemented as an initial bounded planner.** `ttc node rebalance` and the
-opt-in `--cluster-auto-rebalance` loop use cgroup memory as the hard signal and
-exact per-family resident-sharing hyperedges for move selection. The Sentry
-coalesces physical 4 KiB page versions with identical branch membership into
-one weighted edge; this preserves exact placement costs without returning one
-JSON object per page. Responses are bounded at 4,096 distinct membership sets
-and report truncation explicitly instead of silently planning from incomplete
-data. Cgroup memory remains the hard admission signal.
+**Implemented as a reduced global fixed-terminal planner.** `ttc node
+rebalance`, `ttc node drain`, and the opt-in `--cluster-auto-rebalance` loop use
+cgroup memory as the hard signal and stable resident page-version identity for
+move selection. Only source branches are variables; all other live nodes are
+queried and represented as fixed terminals even when they are not legal
+destinations. Cgroup memory remains the hard admission signal.
 
 * Export bounded resident-sharing summaries and node actual/reserved memory.
-* Implement deterministic bipartition dry runs and scoring diagnostics.
+* Implement deterministic multi-destination repair and FM refinement.
 * Add watermarks, hysteresis, cooldowns, and destination reservations.
   **Implemented.** Reservations are incarnation-fenced, atomically reject
   concurrent overcommit, expire after source loss, and remain charged through
   migration completion and the target's next fresh heartbeat.
-* Add optional automatic rebalance and capacity requests.
+* Add optional automatic rebalance, capacity requests, and cluster-shared
+  hard/soft affinity policy.
 
 Exit: correlated sibling workloads use materially less cluster memory than
 random placement and do not oscillate under a stable workload.

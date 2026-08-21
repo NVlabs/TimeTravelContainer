@@ -30,6 +30,20 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
+func TestCappedCapacityOutputDoesNotPadShortWrites(t *testing.T) {
+	var output cappedCapacityOutput
+	buffer := make([]byte, elasticCapacityErrorLimit)
+	copy(buffer, "short diagnostic")
+	written, err := output.Write(buffer[:len("short diagnostic")])
+	if err != nil || written != len("short diagnostic") || output.String() != "short diagnostic" {
+		t.Fatalf("Write()=(%d, %v), output=%q", written, err, output.String())
+	}
+	written, err = output.Write(make([]byte, elasticCapacityErrorLimit*2))
+	if err != nil || written != elasticCapacityErrorLimit*2 || len(output.String()) != elasticCapacityErrorLimit {
+		t.Fatalf("capped Write()=(%d, %v), output length=%d", written, err, len(output.String()))
+	}
+}
+
 func testElasticCapacityCapabilities(node string) cluster.Capabilities {
 	return cluster.Capabilities{
 		NodeID: node, ProtocolMin: 1, ProtocolMax: 1, BuildID: "test", Architecture: "amd64",

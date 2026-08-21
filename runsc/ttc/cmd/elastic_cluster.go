@@ -1513,85 +1513,6 @@ func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, erro
 	return targets, nil
 }
 
-func (b *runtimeBackend) localPlannerResources() ([]cluster.BranchResource, []cluster.SharedResource, error) {
-	containers, err := b.containerStore().ListContainers()
-	if err != nil {
-		return nil, nil, err
-	}
-	var branches []cluster.BranchResource
-	var shared []cluster.SharedResource
-	for _, info := range containers {
-		name := info.Name
-		if name == "" {
-			name = info.ID
-		}
-		var local []ttcbundle.BranchInfo
-		for _, branch := range info.Branches {
-			state := normalizeLifecycleState(branch.State)
-			if info.BranchNodeID(branch.ID) == b.nodeID && (state == "running" || state == "paused") {
-				local = append(local, branch)
-			}
-		}
-		if len(local) == 0 {
-			continue
-		}
-		output, err := b.command("timetravel", info.ID, "stats", local[0].ID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("accounting resident memory for %q: %w", name, err)
-		}
-		var resident boot.FamilyResidentMemory
-		if err := json.Unmarshal(output, &resident); err != nil {
-			return nil, nil, fmt.Errorf("decoding resident memory for %q: %w", name, err)
-		}
-		byID := make(map[string]boot.BranchResidentMemory, len(resident.Branches))
-		for _, memory := range resident.Branches {
-			byID[memory.ID] = memory
-		}
-		if resident.SharingEdgesTruncated {
-			return nil, nil, fmt.Errorf("resident sharing summary for %q exceeded its bound and omitted %d bytes", name, resident.SharingEdgesOmittedBytes)
-		}
-		localIDs := make(map[string]string, len(local))
-		for _, branch := range local {
-			memory, ok := byID[branch.ID]
-			if !ok {
-				return nil, nil, fmt.Errorf("runtime omitted resident accounting for %s@%s", name, branch.ID)
-			}
-			id := selector{container: name, branch: branch.ID}.String()
-			localIDs[branch.ID] = id
-			branches = append(branches, cluster.BranchResource{
-				ID: id, NodeID: b.nodeID, PrivateBytes: memory.PrivateBytes, Movable: true,
-			})
-		}
-		accountedShared := make(map[string]uint64, len(local))
-		for _, edge := range resident.SharingEdges {
-			ids := make([]string, 0, len(edge.Branches))
-			for _, branchID := range edge.Branches {
-				id, ok := localIDs[branchID]
-				if !ok {
-					continue
-				}
-				ids = append(ids, id)
-				accountedShared[branchID] += edge.Bytes
-			}
-			if len(ids) != len(edge.Branches) {
-				return nil, nil, fmt.Errorf("resident sharing edge %q for %q includes a branch outside local placement metadata", edge.ID, name)
-			}
-			if len(ids) > 1 && edge.Bytes != 0 {
-				shared = append(shared, cluster.SharedResource{
-					ID: info.ID + "@" + edge.ID, Bytes: edge.Bytes, Branches: ids,
-				})
-			}
-		}
-		for _, branch := range local {
-			memory := byID[branch.ID]
-			if accountedShared[branch.ID] != memory.SharedBytes {
-				return nil, nil, fmt.Errorf("resident sharing summary for %s@%s accounts %d shared bytes, want %d", name, branch.ID, accountedShared[branch.ID], memory.SharedBytes)
-			}
-		}
-	}
-	return branches, shared, nil
-}
-
 func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error) {
 	snapshot := cluster.PlannerSnapshot{NodeID: b.nodeID}
 	containers, err := b.containerStore().ListContainers()
@@ -1695,22 +1616,50 @@ func (b *runtimeBackend) plannerSnapshot(node string, local bool) (cluster.Plann
 }
 
 func (b *runtimeBackend) placementWindow(source cluster.NodeRecord, targets []cluster.NodeRecord, mode cluster.PlacementMode) (cluster.FixedTerminalPlan, map[string]cluster.NodeRecord, error) {
-	records := make(map[string]cluster.NodeRecord, len(targets)+1)
-	records[source.NodeID] = source
-	nodes := []cluster.NodeResource{{
-		ID: source.NodeID, CurrentBytes: source.MemoryCurrentBytes, TargetBytes: source.MemoryTargetBytes,
-		ReservedBytes: source.IncomingReservedBytes,
-	}}
+	all, err := b.clusterNodes()
+	if err != nil {
+		return cluster.FixedTerminalPlan{}, nil, err
+	}
+	records := make(map[string]cluster.NodeRecord, len(all))
 	allowed := make([]string, 0, len(targets))
+	allowedSet := make(map[string]bool, len(targets))
 	for _, target := range targets {
-		records[target.NodeID] = target
 		allowed = append(allowed, target.NodeID)
-		nodes = append(nodes, cluster.NodeResource{
-			ID: target.NodeID, CurrentBytes: target.MemoryCurrentBytes, TargetBytes: target.MemoryTargetBytes,
-			ReservedBytes: target.IncomingReservedBytes,
-		})
+		allowedSet[target.NodeID] = true
 	}
 	sort.Strings(allowed)
+	now := time.Now()
+	byID := make(map[string]cluster.NodeRecord, len(all)+1)
+	byID[source.NodeID] = source
+	for _, record := range all {
+		if record.NodeID == source.NodeID || !record.LeaseActive(now) {
+			continue
+		}
+		byID[record.NodeID] = record
+	}
+	nodeIDs := make([]string, 0, len(byID))
+	for node := range byID {
+		nodeIDs = append(nodeIDs, node)
+	}
+	sort.Strings(nodeIDs)
+	nodes := make([]cluster.NodeResource, 0, len(nodeIDs))
+	for _, node := range nodeIDs {
+		record := byID[node]
+		targetBytes := record.MemoryTargetBytes
+		if targetBytes == 0 {
+			targetBytes = ^uint64(0)
+		}
+		records[node] = record
+		nodes = append(nodes, cluster.NodeResource{
+			ID: node, CurrentBytes: record.MemoryCurrentBytes, TargetBytes: targetBytes,
+			ReservedBytes: record.IncomingReservedBytes,
+		})
+	}
+	for target := range allowedSet {
+		if _, ok := records[target]; !ok {
+			return cluster.FixedTerminalPlan{}, records, fmt.Errorf("placement target %q lost its active lease", target)
+		}
+	}
 	snapshots := make([]cluster.PlannerSnapshot, 0, len(nodes))
 	for _, node := range nodes {
 		snapshot, err := b.plannerSnapshot(node.ID, node.ID == b.nodeID)
@@ -1722,6 +1671,13 @@ func (b *runtimeBackend) placementWindow(source cluster.NodeRecord, targets []cl
 	problem, err := cluster.BuildFixedTerminalProblem(mode, source.NodeID, nodes, snapshots, allowed)
 	if err != nil {
 		return cluster.FixedTerminalPlan{}, records, err
+	}
+	policy, err := cluster.LoadPlacementPolicy(filepath.Join(b.dataRoot, "cluster", "placement-policy.json"))
+	if err != nil {
+		return cluster.FixedTerminalPlan{}, records, fmt.Errorf("loading placement policy: %w", err)
+	}
+	if err := cluster.ApplyPlacementPolicy(&problem, snapshots, policy); err != nil {
+		return cluster.FixedTerminalPlan{}, records, fmt.Errorf("applying placement policy: %w", err)
 	}
 	plan, err := cluster.PlanFixedTerminals(problem)
 	return plan, records, err

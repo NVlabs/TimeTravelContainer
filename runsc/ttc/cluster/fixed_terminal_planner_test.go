@@ -24,7 +24,7 @@ func TestFixedTerminalPressureUsesMultipleDestinations(t *testing.T) {
 	problem := FixedTerminalProblem{
 		Mode: PlacementRelievePressure, SourceNode: "node-a",
 		Nodes: []NodeResource{
-			{ID: "node-a", CurrentBytes: 1800 * mib, TargetBytes: 1200 * mib},
+			{ID: "node-a", CurrentBytes: 1800 * mib, TargetBytes: 700 * mib},
 			{ID: "node-b", CurrentBytes: 700 * mib, TargetBytes: 1400 * mib},
 			{ID: "node-c", CurrentBytes: 700 * mib, TargetBytes: 1400 * mib},
 		},
@@ -51,8 +51,37 @@ func TestFixedTerminalPressureUsesMultipleDestinations(t *testing.T) {
 	if !reflect.DeepEqual(plan.Moves, want) {
 		t.Fatalf("moves=%+v, want %+v", plan.Moves, want)
 	}
-	if got := plan.NodeAfterBytes["node-a"]; got != 1200*mib {
-		t.Fatalf("source after=%d, want %d", got, 1200*mib)
+	if got := plan.NodeAfterBytes["node-a"]; got != 600*mib {
+		t.Fatalf("source after=%d, want %d", got, 600*mib)
+	}
+}
+
+func TestFixedTerminalPressureEvaluatesWholeSharingGroup(t *testing.T) {
+	problem := FixedTerminalProblem{
+		Mode: PlacementRelievePressure, SourceNode: "a",
+		Nodes: []NodeResource{
+			{ID: "a", CurrentBytes: 1250, TargetBytes: 1000},
+			{ID: "b", CurrentBytes: 800, TargetBytes: 2000},
+		},
+		Branches: []BranchResource{
+			{ID: "sibling-1", NodeID: "a", PrivateBytes: 100, Movable: true},
+			{ID: "sibling-2", NodeID: "a", PrivateBytes: 100, Movable: true},
+			{ID: "solo", NodeID: "a", PrivateBytes: 250, Movable: true},
+		},
+		Shared: []SharedResource{{
+			ID: "warm", Bytes: 800, Branches: []string{"sibling-1", "sibling-2"}, FixedNodes: []string{"b"},
+		}},
+	}
+	plan, err := PlanFixedTerminals(problem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PlacementMove{
+		{Branch: "sibling-1", FromNode: "a", ToNode: "b"},
+		{Branch: "sibling-2", FromNode: "a", ToNode: "b"},
+	}
+	if !reflect.DeepEqual(plan.Moves, want) {
+		t.Fatalf("moves=%+v, want %+v", plan.Moves, want)
 	}
 }
 

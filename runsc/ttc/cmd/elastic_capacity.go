@@ -139,14 +139,16 @@ type cappedCapacityOutput struct {
 }
 
 func (w *cappedCapacityOutput) Write(data []byte) (int, error) {
+	written := len(data)
 	remaining := elasticCapacityErrorLimit - len(w.data)
 	if remaining > 0 {
-		if len(data) > remaining {
-			remaining = len(data[:remaining])
+		copyBytes := len(data)
+		if copyBytes > remaining {
+			copyBytes = remaining
 		}
-		w.data = append(w.data, data[:remaining]...)
+		w.data = append(w.data, data[:copyBytes]...)
 	}
-	return len(data), nil
+	return written, nil
 }
 
 func (w *cappedCapacityOutput) String() string { return string(w.data) }
