@@ -110,11 +110,11 @@ response. Family removal, image removal, and all three daemon stops left no
 test Sentry, socket, or temporary root.
 
 The ordinary two-daemon capacity-provider smoke also passed with the new
-retirement planner in 7.165 seconds. The same test completed with its data root
-on a loopback NFSv3 mount using hard TCP, 1 MiB reads/writes, synchronous
-export, and no root squashing. NFS qualification exposed a capped diagnostic
-writer that padded short provider errors to 4 KiB with NUL bytes; the writer
-now copies only the bytes supplied and has a regression test.
+retirement planner in 7.165 seconds. The same test completed in 11.684 seconds
+with its data root on a loopback NFSv3 mount using hard TCP, 1 MiB reads/writes,
+synchronous export, and no root squashing. NFS qualification exposed a capped
+diagnostic writer that padded short provider errors to 4 KiB with NUL bytes;
+the writer now copies only the bytes supplied and has a regression test.
 
 A 64 MiB prefaulted process was forked into two fully shared branches on a
 pressured source. The planner selected both siblings as one zero-cut group,
