@@ -113,16 +113,29 @@ func pollBlock(t *kernel.Task, pfd []linux.PollFD, timeout time.Duration) (time.
 	// having built the same array from its bitmaps, so both are covered.
 	// Without this a shell waiting at its prompt and one waiting on a pipe are
 	// the same syscall with nothing to tell them apart.
+	timeoutNS := int64(-1)
+	if timeout >= 0 {
+		timeoutNS = int64(timeout)
+	}
 	if len(pfd) != 0 {
 		fds := make([]int32, 0, len(pfd))
 		for i := range pfd {
 			fds = append(fds, pfd[i].FD)
 		}
-		timeoutNS := int64(-1)
-		if timeout >= 0 {
-			timeoutNS = int64(timeout)
-		}
 		t.SetWaitInfo("poll", fds, classifyWaitFDs(t, fds, nil, true), timeoutNS)
+		defer t.ClearWaitInfo()
+	} else if timeout != 0 {
+		// select() and poll() with nothing to watch: a portable sleep, and one
+		// that is used. A Qt-based tool shell keeps a thread here for its
+		// timers, and reporting nothing for it made that thread
+		// indistinguishable from a task this runtime knows nothing about —
+		// which is what a reader has to assume when it is told nothing.
+		//
+		// Named rather than left blank. What it wakes on is a deadline and no
+		// descriptor, and saying so is the difference between "asleep" and "no
+		// information", which are not the same answer to "is this program
+		// working".
+		t.SetWaitInfo("sleep", nil, nil, timeoutNS)
 		defer t.ClearWaitInfo()
 	}
 

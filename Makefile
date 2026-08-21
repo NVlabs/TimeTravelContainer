@@ -214,8 +214,14 @@ PARTITION        ?= 1
 TOTAL_PARTITIONS ?= 1
 PARTITIONS       := --test_env=PARTITION=$(PARTITION) --test_env=TOTAL_PARTITIONS=$(TOTAL_PARTITIONS)
 
+# The optimisation flag belongs in the options rather than in the target list:
+# the macro builds a list and then asks cquery where the results landed, and
+# cquery is given the options but not the list. Passing -c opt positionally
+# built one configuration and printed the paths of another — a build that
+# succeeded and handed back binaries from an older one.
+ttc: BAZEL_OPTIONS += -c opt
 ttc: ## Builds the TimeTravelContainer client and service/runtime binaries.
-	@$(call build,-c opt //runsc/ttc //runsc/ttcd)
+	@$(call build,//runsc/ttc //runsc/ttcd,set(//runsc/ttc //runsc/ttcd))
 .PHONY: ttc
 
 nogo-tests:
