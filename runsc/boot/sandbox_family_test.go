@@ -91,6 +91,22 @@ func TestResidentMemorySharingEdgesExactAndBounded(t *testing.T) {
 	}
 }
 
+func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
+	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
+	file1 := &pgalloc.MemoryFile{}
+	file2 := &pgalloc.MemoryFile{}
+	pages := map[mm.ResidentPageVersion]struct{}{
+		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 7}}:  {},
+		{File: file2, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 7}}:  {},
+		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 8}}:  {},
+		{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 10}}: {},
+	}
+	runs := residentMemoryVersionRuns([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
+	if len(runs) != 2 || runs[0].Branch != "main" || runs[0].FirstSequence != 7 || runs[0].Pages != 2 || runs[1].FirstSequence != 10 || runs[1].Pages != 1 {
+		t.Fatalf("runs=%+v", runs)
+	}
+}
+
 type testDistributedBranchResource struct {
 	removed []string
 }

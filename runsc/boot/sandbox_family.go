@@ -17,6 +17,7 @@ package boot
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -292,9 +293,21 @@ type BranchResidentMemory struct {
 type FamilyResidentMemory struct {
 	Branches                 []BranchResidentMemory      `json:"branches"`
 	SharingEdges             []ResidentMemorySharingEdge `json:"sharing_edges,omitempty"`
+	VersionRuns              []ResidentMemoryVersionRun  `json:"version_runs,omitempty"`
 	SharingEdgesTruncated    bool                        `json:"sharing_edges_truncated,omitempty"`
 	SharingEdgesOmittedBytes uint64                      `json:"sharing_edges_omitted_bytes,omitempty"`
 	UniqueBytes              uint64                      `json:"unique_bytes"`
+}
+
+// ResidentMemoryVersionRun is a compressed stable identity range for resident
+// mapped pages in one branch. Imported and remotely forked pages retain these
+// identities, allowing a cluster planner to match CoW sharing across Sentries
+// without exporting one control record per 4 KiB page.
+type ResidentMemoryVersionRun struct {
+	Branch        string `json:"branch"`
+	Allocator     string `json:"allocator"`
+	FirstSequence uint64 `json:"first_sequence"`
+	Pages         uint64 `json:"pages"`
 }
 
 // ResidentMemorySharingEdge is an exact weighted hyperedge. It coalesces all
@@ -2520,6 +2533,48 @@ func residentMemorySharingEdges(branchIDs []string, branchPages []map[mm.Residen
 	return edges, truncated, omitted, counts
 }
 
+func residentMemoryVersionRuns(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}) []ResidentMemoryVersionRun {
+	if len(branchIDs) != len(branchPages) {
+		panic("resident memory branch identity/page count mismatch")
+	}
+	type version struct {
+		allocator pgalloc.LogicalAllocatorID
+		sequence  uint64
+	}
+	var result []ResidentMemoryVersionRun
+	for index, pages := range branchPages {
+		// File identity distinguishes physical sharing inside one Sentry, while
+		// stable version identity describes reusable content across nodes. An
+		// alias of the same stable version is exported only once per branch.
+		versions := make(map[version]struct{}, len(pages))
+		for page := range pages {
+			versions[version{allocator: page.Version.Allocator, sequence: page.Version.Sequence}] = struct{}{}
+		}
+		ordered := make([]version, 0, len(versions))
+		for page := range versions {
+			ordered = append(ordered, page)
+		}
+		sort.Slice(ordered, func(i, j int) bool {
+			if ordered[i].allocator != ordered[j].allocator {
+				return string(ordered[i].allocator[:]) < string(ordered[j].allocator[:])
+			}
+			return ordered[i].sequence < ordered[j].sequence
+		})
+		for cursor := 0; cursor < len(ordered); {
+			end := cursor + 1
+			for end < len(ordered) && ordered[end].allocator == ordered[cursor].allocator && ordered[end].sequence == ordered[end-1].sequence+1 {
+				end++
+			}
+			result = append(result, ResidentMemoryVersionRun{
+				Branch: branchIDs[index], Allocator: hex.EncodeToString(ordered[cursor].allocator[:]),
+				FirstSequence: ordered[cursor].sequence, Pages: uint64(end - cursor),
+			})
+			cursor = end
+		}
+	}
+	return result
+}
+
 // ResidentMemory accounts mapped resident guest pages across live branches.
 // It deliberately excludes Sentry Go heap and unmapped page-cache objects.
 func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
@@ -2569,6 +2624,7 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}
 	var counts map[mm.ResidentPageVersion]uint32
 	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes, counts = residentMemorySharingEdges(heldIDs, heldPages, maxResidentMemorySharingEdges)
+	out.VersionRuns = residentMemoryVersionRuns(heldIDs, heldPages)
 	out.Branches = make([]BranchResidentMemory, 0, len(ids))
 	const pageBytes = uint64(hostarch.PageSize)
 	for _, id := range ids {

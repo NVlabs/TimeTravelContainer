@@ -2766,7 +2766,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "_purge-runtime", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
 	case "node":
-		return len(args) > 1 && args[1] != "ls"
+		return len(args) > 1 && args[1] != "ls" && args[1] != "_planner-resources"
 	case "cp":
 		_, _, _, err := parseCopyCommandArgs(args[1:])
 		return err == nil

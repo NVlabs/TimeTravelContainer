@@ -541,7 +541,8 @@ type elasticMigrationBackend interface {
 type elasticNodeBackend interface {
 	clusterNodes() ([]cluster.NodeRecord, error)
 	drainNode(sourceNode, targetNode string, local bool) ([]selector, error)
-	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.PlacementPlan, error)
+	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.FixedTerminalPlan, error)
+	plannerSnapshot(node string, local bool) (cluster.PlannerSnapshot, error)
 }
 
 func runNode(args []string, stdout io.Writer, backend backend) error {
@@ -622,6 +623,21 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(plan)
+	case "_planner-resources":
+		fs := flag.NewFlagSet("node _planner-resources", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		local := fs.Bool("_local", false, "execute only on the addressed daemon")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("usage: ttc node _planner-resources --_local NODE")
+		}
+		snapshot, err := nodes.plannerSnapshot(fs.Arg(0), *local)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(stdout).Encode(snapshot)
 	default:
 		return fmt.Errorf("unknown node command %q", args[0])
 	}

@@ -14,10 +14,14 @@ go_library(
         "placement.go",
 		"planner.go",
         "registry.go",
+		"resource_window.go",
         "store.go",
         "transaction.go",
     ],
-    deps = ["//pkg/ttcremote"],
+    deps = [
+		"//pkg/hostarch",
+		"//pkg/ttcremote",
+	],
     visibility = ["//visibility:public"],
 )
 
@@ -31,7 +35,8 @@ go_test(
         "placement_test.go",
 		"planner_test.go",
         "registry_test.go",
+		"resource_window_test.go",
     ],
     library = ":cluster",
-    deps = ["//pkg/ttcremote"],
+	deps = ["//pkg/ttcremote"],
 )

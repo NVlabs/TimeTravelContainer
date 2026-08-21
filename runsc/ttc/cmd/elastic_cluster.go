@@ -319,7 +319,7 @@ func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPla
 	// Route node-wide mutations before taking the receiving daemon's local
 	// lifecycle lock. Otherwise an arbitrary entry node can hold its lock while
 	// the source calls back into it as a migration target, deadlocking cutover.
-	if len(args) >= 3 && args[0] == "node" && (args[1] == "drain" || args[1] == "rebalance") {
+	if len(args) >= 3 && args[0] == "node" && (args[1] == "drain" || args[1] == "rebalance" || args[1] == "_planner-resources") {
 		var positional []string
 		for i := 2; i < len(args); i++ {
 			switch {
@@ -1592,34 +1592,233 @@ func (b *runtimeBackend) localPlannerResources() ([]cluster.BranchResource, []cl
 	return branches, shared, nil
 }
 
-func betterPlacementPlan(candidate, best cluster.PlacementPlan) bool {
-	if len(best.Branches) == 0 {
-		return true
+func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error) {
+	snapshot := cluster.PlannerSnapshot{NodeID: b.nodeID}
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return snapshot, err
 	}
-	if candidate.EstimatedCut != best.EstimatedCut {
-		return candidate.EstimatedCut < best.EstimatedCut
+	for _, info := range containers {
+		name := info.Name
+		if name == "" {
+			name = info.ID
+		}
+		var local []ttcbundle.BranchInfo
+		for _, branch := range info.Branches {
+			state := normalizeLifecycleState(branch.State)
+			if info.BranchNodeID(branch.ID) == b.nodeID && (state == "running" || state == "paused") {
+				local = append(local, branch)
+			}
+		}
+		if len(local) == 0 {
+			continue
+		}
+		output, err := b.command("timetravel", info.ID, "stats", local[0].ID)
+		if err != nil {
+			return snapshot, fmt.Errorf("accounting resident memory for %q: %w", name, err)
+		}
+		var resident boot.FamilyResidentMemory
+		if err := json.Unmarshal(output, &resident); err != nil {
+			return snapshot, fmt.Errorf("decoding resident memory for %q: %w", name, err)
+		}
+		byID := make(map[string]boot.BranchResidentMemory, len(resident.Branches))
+		for _, memory := range resident.Branches {
+			byID[memory.ID] = memory
+		}
+		localIDs := make(map[string]string, len(local))
+		for _, branch := range local {
+			memory, ok := byID[branch.ID]
+			if !ok {
+				return snapshot, fmt.Errorf("runtime omitted resident accounting for %s@%s", name, branch.ID)
+			}
+			id := selector{container: name, branch: branch.ID}.String()
+			localIDs[branch.ID] = id
+			snapshot.Branches = append(snapshot.Branches, cluster.PlannerBranchSnapshot{ID: id, TotalBytes: memory.TotalBytes})
+		}
+		for _, run := range resident.VersionRuns {
+			id, ok := localIDs[run.Branch]
+			if !ok {
+				continue
+			}
+			snapshot.VersionRuns = append(snapshot.VersionRuns, cluster.PlannerVersionRun{
+				Branch: id, Allocator: run.Allocator, FirstSequence: run.FirstSequence, Pages: run.Pages,
+			})
+		}
 	}
-	if candidate.EstimatedAdded != best.EstimatedAdded {
-		return candidate.EstimatedAdded < best.EstimatedAdded
-	}
-	return candidate.TargetNode < best.TargetNode
+	sort.Slice(snapshot.Branches, func(i, j int) bool { return snapshot.Branches[i].ID < snapshot.Branches[j].ID })
+	sort.Slice(snapshot.VersionRuns, func(i, j int) bool {
+		left, right := snapshot.VersionRuns[i], snapshot.VersionRuns[j]
+		if left.Allocator != right.Allocator {
+			return left.Allocator < right.Allocator
+		}
+		if left.FirstSequence != right.FirstSequence {
+			return left.FirstSequence < right.FirstSequence
+		}
+		return left.Branch < right.Branch
+	})
+	return snapshot, nil
 }
 
-func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool) (cluster.PlacementPlan, error) {
+func (b *runtimeBackend) plannerSnapshot(node string, local bool) (cluster.PlannerSnapshot, error) {
+	if node == b.nodeID {
+		return b.localPlannerSnapshot()
+	}
+	if local {
+		return cluster.PlannerSnapshot{}, fmt.Errorf("planner resource request reached node %q, want %q", b.nodeID, node)
+	}
+	if b.distributedSource == nil {
+		return cluster.PlannerSnapshot{}, errors.New("planner resource request requires cluster discovery")
+	}
+	peer, err := b.distributedSource.peer(node, false)
+	if err != nil {
+		return cluster.PlannerSnapshot{}, err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return cluster.PlannerSnapshot{}, err
+	}
+	status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"node", "_planner-resources", "--_local", node})
+	if err != nil {
+		return cluster.PlannerSnapshot{}, err
+	}
+	if status != 0 {
+		return cluster.PlannerSnapshot{}, errors.New(strings.TrimSpace(diagnostic))
+	}
+	var snapshot cluster.PlannerSnapshot
+	if err := json.Unmarshal([]byte(output), &snapshot); err != nil {
+		return snapshot, fmt.Errorf("decoding planner resources from node %q: %w", node, err)
+	}
+	if snapshot.NodeID != node {
+		return snapshot, fmt.Errorf("planner resource response identifies node %q, want %q", snapshot.NodeID, node)
+	}
+	return snapshot, nil
+}
+
+func (b *runtimeBackend) placementWindow(source cluster.NodeRecord, targets []cluster.NodeRecord, mode cluster.PlacementMode) (cluster.FixedTerminalPlan, map[string]cluster.NodeRecord, error) {
+	records := make(map[string]cluster.NodeRecord, len(targets)+1)
+	records[source.NodeID] = source
+	nodes := []cluster.NodeResource{{
+		ID: source.NodeID, CurrentBytes: source.MemoryCurrentBytes, TargetBytes: source.MemoryTargetBytes,
+		ReservedBytes: source.IncomingReservedBytes,
+	}}
+	allowed := make([]string, 0, len(targets))
+	for _, target := range targets {
+		records[target.NodeID] = target
+		allowed = append(allowed, target.NodeID)
+		nodes = append(nodes, cluster.NodeResource{
+			ID: target.NodeID, CurrentBytes: target.MemoryCurrentBytes, TargetBytes: target.MemoryTargetBytes,
+			ReservedBytes: target.IncomingReservedBytes,
+		})
+	}
+	sort.Strings(allowed)
+	snapshots := make([]cluster.PlannerSnapshot, 0, len(nodes))
+	for _, node := range nodes {
+		snapshot, err := b.plannerSnapshot(node.ID, node.ID == b.nodeID)
+		if err != nil {
+			return cluster.FixedTerminalPlan{}, records, fmt.Errorf("collecting planner resources from node %q: %w", node.ID, err)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	problem, err := cluster.BuildFixedTerminalProblem(mode, source.NodeID, nodes, snapshots, allowed)
+	if err != nil {
+		return cluster.FixedTerminalPlan{}, records, err
+	}
+	plan, err := cluster.PlanFixedTerminals(problem)
+	return plan, records, err
+}
+
+func (b *runtimeBackend) executePlacementPlan(plan cluster.FixedTerminalPlan, records map[string]cluster.NodeRecord) error {
+	type reservation struct {
+		node        string
+		incarnation string
+		operation   string
+		moved       int
+	}
+	var reservations []reservation
+	for node, after := range plan.NodeAfterBytes {
+		if node == plan.SourceNode {
+			continue
+		}
+		record, ok := records[node]
+		if !ok {
+			return fmt.Errorf("placement plan references unknown node %q", node)
+		}
+		baseline := record.MemoryCurrentBytes + record.IncomingReservedBytes
+		if baseline < record.MemoryCurrentBytes {
+			baseline = ^uint64(0)
+		}
+		if after <= baseline {
+			continue
+		}
+		operation, err := newDaemonRequestID()
+		if err != nil {
+			return err
+		}
+		bytes := after - baseline
+		if _, err := b.distributedSource.directory.ReserveIncoming(node, record.Incarnation, operation, b.nodeID, bytes, time.Now(), 10*time.Minute); err != nil {
+			for _, held := range reservations {
+				_, _ = b.distributedSource.directory.ReleaseIncoming(held.node, held.incarnation, held.operation, time.Now())
+			}
+			return fmt.Errorf("reserving %d bytes on placement target %q: %w", bytes, node, err)
+		}
+		reservations = append(reservations, reservation{node: node, incarnation: record.Incarnation, operation: operation})
+	}
+	byNode := make(map[string]*reservation, len(reservations))
+	for index := range reservations {
+		byNode[reservations[index].node] = &reservations[index]
+	}
+	var executionErr error
+	for _, move := range plan.Moves {
+		target, err := parseSelector(move.Branch)
+		if err != nil {
+			executionErr = err
+			break
+		}
+		if err := b.migrate(target, move.ToNode); err != nil {
+			executionErr = fmt.Errorf("executing placement move %s to %s: %w", target, move.ToNode, err)
+			break
+		}
+		if reservation := byNode[move.ToNode]; reservation != nil {
+			reservation.moved++
+		}
+	}
+	for _, held := range reservations {
+		var err error
+		if held.moved == 0 {
+			_, err = b.distributedSource.directory.ReleaseIncoming(held.node, held.incarnation, held.operation, time.Now())
+		} else {
+			_, err = b.distributedSource.directory.CompleteIncoming(held.node, held.incarnation, held.operation, time.Now())
+		}
+		if err != nil {
+			executionErr = errors.Join(executionErr, fmt.Errorf("finalizing placement reservation %s on %s: %w", held.operation, held.node, err))
+		}
+	}
+	return executionErr
+}
+
+func placementDestinationCount(moves []cluster.PlacementMove) int {
+	nodes := make(map[string]struct{})
+	for _, move := range moves {
+		nodes[move.ToNode] = struct{}{}
+	}
+	return len(nodes)
+}
+
+func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool) (cluster.FixedTerminalPlan, error) {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
-		return cluster.PlacementPlan{}, errors.New("elastic rebalance requires dynamic cluster discovery")
+		return cluster.FixedTerminalPlan{}, errors.New("elastic rebalance requires dynamic cluster discovery")
 	}
 	if sourceNode != b.nodeID {
 		if local {
-			return cluster.PlacementPlan{}, fmt.Errorf("node rebalance reached %q, want %q", b.nodeID, sourceNode)
+			return cluster.FixedTerminalPlan{}, fmt.Errorf("node rebalance reached %q, want %q", b.nodeID, sourceNode)
 		}
 		peer, err := b.distributedSource.peer(sourceNode, false)
 		if err != nil {
-			return cluster.PlacementPlan{}, err
+			return cluster.FixedTerminalPlan{}, err
 		}
 		requestID, err := newDaemonRequestID()
 		if err != nil {
-			return cluster.PlacementPlan{}, err
+			return cluster.FixedTerminalPlan{}, err
 		}
 		args := []string{"node", "rebalance", "--_local"}
 		if targetNode != "" {
@@ -1628,115 +1827,50 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 		args = append(args, sourceNode)
 		status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, args)
 		if err != nil {
-			return cluster.PlacementPlan{}, err
+			return cluster.FixedTerminalPlan{}, err
 		}
 		if status != 0 {
-			return cluster.PlacementPlan{}, errors.New(strings.TrimSpace(diagnostic))
+			return cluster.FixedTerminalPlan{}, errors.New(strings.TrimSpace(diagnostic))
 		}
-		var plan cluster.PlacementPlan
+		var plan cluster.FixedTerminalPlan
 		if err := json.Unmarshal([]byte(output), &plan); err != nil {
-			return cluster.PlacementPlan{}, fmt.Errorf("decoding remote placement plan: %w", err)
+			return cluster.FixedTerminalPlan{}, fmt.Errorf("decoding remote placement plan: %w", err)
 		}
 		return plan, nil
 	}
 	source, err := b.distributedSource.directory.Lookup(sourceNode)
 	if err != nil {
-		return cluster.PlacementPlan{}, err
+		return cluster.FixedTerminalPlan{}, err
 	}
 	if !source.LeaseActive(time.Now()) || source.MemoryTargetBytes == 0 {
-		return cluster.PlacementPlan{}, fmt.Errorf("source node %q has no active lease or memory target", sourceNode)
+		return cluster.FixedTerminalPlan{}, fmt.Errorf("source node %q has no active lease or memory target", sourceNode)
 	}
 	if source.MemoryCurrentBytes <= source.MemoryTargetBytes {
-		return cluster.PlacementPlan{SourceNode: sourceNode, SourceAfterBytes: source.MemoryCurrentBytes}, nil
+		return cluster.FixedTerminalPlan{SourceNode: sourceNode, NodeAfterBytes: map[string]uint64{sourceNode: source.MemoryCurrentBytes}}, nil
 	}
 	targets, err := b.drainTargets(targetNode)
 	if err != nil {
 		request, requestErr := b.emitCapacityRequest(*source, "memory-pressure")
 		if requestErr != nil {
-			return cluster.PlacementPlan{}, fmt.Errorf("%w; publishing capacity request: %v", err, requestErr)
+			return cluster.FixedTerminalPlan{}, fmt.Errorf("%w; publishing capacity request: %v", err, requestErr)
 		}
-		return cluster.PlacementPlan{}, fmt.Errorf("%w; capacity request published at %s", err, request)
+		return cluster.FixedTerminalPlan{}, fmt.Errorf("%w; capacity request published at %s", err, request)
 	}
-	branches, shared, err := b.localPlannerResources()
-	if err != nil {
-		return cluster.PlacementPlan{}, err
-	}
-	var best cluster.PlacementPlan
-	var planErr error
-	for _, target := range targets {
-		if target.MemoryTargetBytes == 0 {
-			continue
-		}
-		plan, err := cluster.PlanPressureRelief(
-			cluster.NodeResource{ID: source.NodeID, CurrentBytes: source.MemoryCurrentBytes, TargetBytes: source.MemoryTargetBytes},
-			cluster.NodeResource{ID: target.NodeID, CurrentBytes: target.MemoryCurrentBytes, TargetBytes: target.MemoryTargetBytes, ReservedBytes: target.IncomingReservedBytes},
-			branches, shared,
-		)
-		if err != nil {
-			planErr = errors.Join(planErr, fmt.Errorf("target %s: %w", target.NodeID, err))
-			continue
-		}
-		if len(plan.Branches) != 0 && betterPlacementPlan(plan, best) {
-			best = plan
-		}
-	}
-	if len(best.Branches) == 0 {
+	plan, records, planErr := b.placementWindow(*source, targets, cluster.PlacementRelievePressure)
+	if planErr != nil || len(plan.Moves) == 0 {
 		request, requestErr := b.emitCapacityRequest(*source, "memory-pressure")
 		if requestErr != nil {
 			planErr = errors.Join(planErr, fmt.Errorf("publishing capacity request: %w", requestErr))
 		}
 		if planErr != nil {
-			return best, fmt.Errorf("no feasible pressure-relief placement; capacity request %s: %w", request, planErr)
+			return plan, fmt.Errorf("no feasible pressure-relief placement; capacity request %s: %w", request, planErr)
 		}
-		return best, fmt.Errorf("no movable branch can relieve memory pressure; capacity request published at %s", request)
+		return plan, fmt.Errorf("no movable branch can relieve memory pressure; capacity request published at %s", request)
 	}
-	reservationID, err := newDaemonRequestID()
-	if err != nil {
-		return best, err
+	if err := b.executePlacementPlan(plan, records); err != nil {
+		return plan, err
 	}
-	targetRecord, err := b.distributedSource.directory.Lookup(best.TargetNode)
-	if err != nil {
-		return best, err
-	}
-	if best.EstimatedAdded != 0 {
-		if _, err := b.distributedSource.directory.ReserveIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, b.nodeID, best.EstimatedAdded, time.Now(), 10*time.Minute); err != nil {
-			return best, fmt.Errorf("reserving %d bytes on placement target %q: %w", best.EstimatedAdded, best.TargetNode, err)
-		}
-	}
-	var executionErr error
-	moved := 0
-	for _, value := range best.Branches {
-		target, err := parseSelector(value)
-		if err != nil {
-			executionErr = err
-			break
-		}
-		if err := b.migrate(target, best.TargetNode); err != nil {
-			executionErr = fmt.Errorf("executing placement plan at %s: %w", target, err)
-			break
-		}
-		moved++
-	}
-	// Successful and partially successful reservations remain until the next
-	// target heartbeat publishes post-migration cgroup memory (or their TTL
-	// expires after source loss). This closes the stale-load window where a
-	// second source could otherwise overbook the target. If nothing moved,
-	// release now.
-	if best.EstimatedAdded != 0 {
-		var reservationErr error
-		if moved == 0 {
-			_, reservationErr = b.distributedSource.directory.ReleaseIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, time.Now())
-		} else {
-			_, reservationErr = b.distributedSource.directory.CompleteIncoming(best.TargetNode, targetRecord.Incarnation, reservationID, time.Now())
-		}
-		if reservationErr != nil {
-			executionErr = errors.Join(executionErr, fmt.Errorf("finalizing placement reservation %s: %w", reservationID, reservationErr))
-		}
-	}
-	if executionErr != nil {
-		return best, executionErr
-	}
-	return best, nil
+	return plan, nil
 }
 
 // drainNode implements a restart-safe conservative drain. It rejects new
@@ -1819,6 +1953,24 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 		}
 		return nil, fmt.Errorf("%w; capacity request published at %s", err, request)
 	}
+	plan, records, err := b.placementWindow(*source, targets, cluster.PlacementEvacuate)
+	if err != nil {
+		request, requestErr := b.emitCapacityRequest(*source, "node-drain")
+		if requestErr != nil {
+			return nil, fmt.Errorf("planning active branch evacuation: %w; publishing capacity request: %v", err, requestErr)
+		}
+		return nil, fmt.Errorf("planning active branch evacuation: %w; capacity request published at %s", err, request)
+	}
+	if err := b.executePlacementPlan(plan, records); err != nil {
+		return nil, err
+	}
+	for _, move := range plan.Moves {
+		selected, err := parseSelector(move.Branch)
+		if err != nil {
+			return moved, err
+		}
+		moved = append(moved, selected)
+	}
 	containers, err := b.containerStore().ListContainers()
 	if err != nil {
 		return nil, err
@@ -1840,14 +1992,12 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 		}
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].target.String() < pending[j].target.String() })
-	moved = make([]selector, 0, len(pending))
+	moved = append(make([]selector, 0, len(moved)+len(pending)), moved...)
 	for index, item := range pending {
 		destination := targets[index%len(targets)].NodeID
 		switch item.state {
 		case "running", "paused":
-			if err := b.migrate(item.target, destination); err != nil {
-				return moved, fmt.Errorf("migrating %s to %q: %w", item.target, destination, err)
-			}
+			return moved, fmt.Errorf("active branch %s remained on drained node after placement execution", item.target)
 		case "created", "dehydrated", "exited", "failed", "dead":
 			if err := b.containerStore().CompareAndSwapBranchNodeID(item.target.container, item.target.branch, b.nodeID, destination); err != nil {
 				return moved, fmt.Errorf("transferring cold branch %s to %q: %w", item.target, destination, err)
@@ -2005,7 +2155,7 @@ func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease tim
 				continue
 			}
 			lastAttempt = now
-			var plan cluster.PlacementPlan
+			var plan cluster.FixedTerminalPlan
 			err = serialize(func() error {
 				var planErr error
 				plan, planErr = backend.rebalanceNode(nodeID, "", true)
@@ -2017,8 +2167,8 @@ func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease tim
 				}
 				continue
 			}
-			if stderr != nil && len(plan.Branches) != 0 {
-				fmt.Fprintf(stderr, "ttcd: elastic rebalance moved %d branches from %s to %s (estimated freed %d bytes, cut %d bytes)\n", len(plan.Branches), plan.SourceNode, plan.TargetNode, plan.EstimatedFreed, plan.EstimatedCut)
+			if stderr != nil && len(plan.Moves) != 0 {
+				fmt.Fprintf(stderr, "ttcd: elastic rebalance moved %d branches from %s across %d destinations (estimated connectivity %d bytes)\n", len(plan.Moves), plan.SourceNode, placementDestinationCount(plan.Moves), plan.EstimatedConnectivity)
 			}
 		}
 	}
