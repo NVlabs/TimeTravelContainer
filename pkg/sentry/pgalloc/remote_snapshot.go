@@ -1098,6 +1098,13 @@ type remoteSnapshotReaderAt struct {
 type RemoteLoadRange struct {
 	Target       memmap.FileRange
 	StreamOffset uint64
+
+	// logicalChunk is populated only for process-local relocated imports. It
+	// preserves the source's exact packed-stream residency groups when existing
+	// target chunks make physical destination order unrelated to stream order.
+	// Wire/checkpoint load ranges leave it nil and reconstruct grouping from
+	// logical page metadata.
+	logicalChunk *logicalChunkLoad
 }
 
 // AttachRemotePageLoad marks existing target pages as unloaded and attaches
@@ -1134,61 +1141,79 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 	attached := make([]attachedRange, 0, len(ranges))
 	var logicalChunks []*logicalChunkLoad
 	if pages.logicalChunkDemand {
-		type chunkBuild struct {
-			chunk *logicalChunkLoad
-			used  [4]uint64
-		}
-		current := make(map[LogicalChunkID]*chunkBuild)
+		providedGroups := true
 		for _, load := range ranges {
-			cursor := load.Target.Start
-			for _, logical := range f.LogicalPageRanges(load.Target) {
-				if logical.Range.Start != cursor {
-					return fmt.Errorf("logical chunk load range %v has a metadata gap at %#x", load.Target, cursor)
-				}
-				for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
-					firstSlot := sequence % logicalPagesPerChunk
-					pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
-					id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
-					remaining := pageCount
-					for remaining != 0 {
-						build := current[id]
-						if build == nil {
-							build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
-							current[id] = build
-							logicalChunks = append(logicalChunks, build.chunk)
-						}
-						slot := sequence % logicalPagesPerChunk
-						if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
-							build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
-							current[id] = build
-							logicalChunks = append(logicalChunks, build.chunk)
-						}
-						startSlot := slot
-						var taken uint64
-						for taken < remaining {
-							currentSlot := startSlot + taken
-							if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
-								break
-							}
-							build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
-							taken++
-						}
-						length := taken * hostarch.PageSize
-						piece := RemoteLoadRange{
-							Target:       memmap.FileRange{Start: offset, End: offset + length},
-							StreamOffset: load.StreamOffset + offset - load.Target.Start,
-						}
-						build.chunk.ranges = append(build.chunk.ranges, piece)
-						attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
-						offset += length
-						sequence += taken
-						cursor += length
-						remaining -= taken
-					}
+			if load.logicalChunk == nil {
+				providedGroups = false
+				break
+			}
+		}
+		if providedGroups {
+			seen := make(map[*logicalChunkLoad]struct{})
+			for _, load := range ranges {
+				attached = append(attached, attachedRange{load: load, chunk: load.logicalChunk})
+				if _, ok := seen[load.logicalChunk]; !ok {
+					seen[load.logicalChunk] = struct{}{}
+					logicalChunks = append(logicalChunks, load.logicalChunk)
 				}
 			}
-			if cursor != load.Target.End {
-				return fmt.Errorf("logical chunk metadata ends at %#x for load range %v", cursor, load.Target)
+		} else {
+			type chunkBuild struct {
+				chunk *logicalChunkLoad
+				used  [4]uint64
+			}
+			current := make(map[LogicalChunkID]*chunkBuild)
+			for _, load := range ranges {
+				cursor := load.Target.Start
+				for _, logical := range f.LogicalPageRanges(load.Target) {
+					if logical.Range.Start != cursor {
+						return fmt.Errorf("logical chunk load range %v has a metadata gap at %#x", load.Target, cursor)
+					}
+					for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
+						firstSlot := sequence % logicalPagesPerChunk
+						pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
+						id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
+						remaining := pageCount
+						for remaining != 0 {
+							build := current[id]
+							if build == nil {
+								build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
+								current[id] = build
+								logicalChunks = append(logicalChunks, build.chunk)
+							}
+							slot := sequence % logicalPagesPerChunk
+							if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+								build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
+								current[id] = build
+								logicalChunks = append(logicalChunks, build.chunk)
+							}
+							startSlot := slot
+							var taken uint64
+							for taken < remaining {
+								currentSlot := startSlot + taken
+								if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
+									break
+								}
+								build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
+								taken++
+							}
+							length := taken * hostarch.PageSize
+							piece := RemoteLoadRange{
+								Target:       memmap.FileRange{Start: offset, End: offset + length},
+								StreamOffset: load.StreamOffset + offset - load.Target.Start,
+							}
+							build.chunk.ranges = append(build.chunk.ranges, piece)
+							attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
+							offset += length
+							sequence += taken
+							cursor += length
+							remaining -= taken
+						}
+					}
+				}
+				if cursor != load.Target.End {
+					return fmt.Errorf("logical chunk metadata ends at %#x for load range %v", cursor, load.Target)
+				}
 			}
 		}
 		for _, chunk := range logicalChunks {
@@ -1286,58 +1311,76 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 	attached := make([]attachedRange, 0, len(ranges))
 	var logicalChunks []*logicalChunkLoad
 	if pages.logicalChunkDemand {
-		type chunkBuild struct {
-			chunk *logicalChunkLoad
-			used  [4]uint64
-		}
-		current := make(map[LogicalChunkID]*chunkBuild)
+		providedGroups := true
 		for _, load := range ranges {
-			cursor := load.Target.Start
-			for _, logical := range f.LogicalPageRanges(load.Target) {
-				if logical.Range.Start != cursor {
-					return fmt.Errorf("sparse logical chunk range %v has a metadata gap at %#x", load.Target, cursor)
-				}
-				for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
-					firstSlot := sequence % logicalPagesPerChunk
-					pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
-					id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
-					remaining := pageCount
-					for remaining != 0 {
-						build := current[id]
-						if build == nil {
-							build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
-							current[id] = build
-							logicalChunks = append(logicalChunks, build.chunk)
-						}
-						slot := sequence % logicalPagesPerChunk
-						if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
-							build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
-							current[id] = build
-							logicalChunks = append(logicalChunks, build.chunk)
-						}
-						startSlot := slot
-						var taken uint64
-						for taken < remaining {
-							currentSlot := startSlot + taken
-							if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
-								break
-							}
-							build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
-							taken++
-						}
-						length := taken * hostarch.PageSize
-						piece := RemoteLoadRange{Target: memmap.FileRange{Start: offset, End: offset + length}, StreamOffset: load.StreamOffset + offset - load.Target.Start}
-						build.chunk.ranges = append(build.chunk.ranges, piece)
-						attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
-						offset += length
-						sequence += taken
-						cursor += length
-						remaining -= taken
-					}
+			if load.logicalChunk == nil {
+				providedGroups = false
+				break
+			}
+		}
+		if providedGroups {
+			seen := make(map[*logicalChunkLoad]struct{})
+			for _, load := range ranges {
+				attached = append(attached, attachedRange{load: load, chunk: load.logicalChunk})
+				if _, ok := seen[load.logicalChunk]; !ok {
+					seen[load.logicalChunk] = struct{}{}
+					logicalChunks = append(logicalChunks, load.logicalChunk)
 				}
 			}
-			if cursor != load.Target.End {
-				return fmt.Errorf("sparse logical metadata ends at %#x for %v", cursor, load.Target)
+		} else {
+			type chunkBuild struct {
+				chunk *logicalChunkLoad
+				used  [4]uint64
+			}
+			current := make(map[LogicalChunkID]*chunkBuild)
+			for _, load := range ranges {
+				cursor := load.Target.Start
+				for _, logical := range f.LogicalPageRanges(load.Target) {
+					if logical.Range.Start != cursor {
+						return fmt.Errorf("sparse logical chunk range %v has a metadata gap at %#x", load.Target, cursor)
+					}
+					for offset, sequence := logical.Range.Start, logical.First.Sequence; offset < logical.Range.End; {
+						firstSlot := sequence % logicalPagesPerChunk
+						pageCount := min((logical.Range.End-offset)/hostarch.PageSize, logicalPagesPerChunk-firstSlot)
+						id := LogicalChunkID{Allocator: logical.First.Allocator, Sequence: sequence / logicalPagesPerChunk}
+						remaining := pageCount
+						for remaining != 0 {
+							build := current[id]
+							if build == nil {
+								build = &chunkBuild{chunk: &logicalChunkLoad{id: id}}
+								current[id] = build
+								logicalChunks = append(logicalChunks, build.chunk)
+							}
+							slot := sequence % logicalPagesPerChunk
+							if build.used[slot/64]&(uint64(1)<<(slot%64)) != 0 {
+								build = &chunkBuild{chunk: &logicalChunkLoad{id: id, instance: build.chunk.instance + 1}}
+								current[id] = build
+								logicalChunks = append(logicalChunks, build.chunk)
+							}
+							startSlot := slot
+							var taken uint64
+							for taken < remaining {
+								currentSlot := startSlot + taken
+								if build.used[currentSlot/64]&(uint64(1)<<(currentSlot%64)) != 0 {
+									break
+								}
+								build.used[currentSlot/64] |= uint64(1) << (currentSlot % 64)
+								taken++
+							}
+							length := taken * hostarch.PageSize
+							piece := RemoteLoadRange{Target: memmap.FileRange{Start: offset, End: offset + length}, StreamOffset: load.StreamOffset + offset - load.Target.Start}
+							build.chunk.ranges = append(build.chunk.ranges, piece)
+							attached = append(attached, attachedRange{load: piece, chunk: build.chunk})
+							offset += length
+							sequence += taken
+							cursor += length
+							remaining -= taken
+						}
+					}
+				}
+				if cursor != load.Target.End {
+					return fmt.Errorf("sparse logical metadata ends at %#x for %v", cursor, load.Target)
+				}
 			}
 		}
 		for _, chunk := range logicalChunks {

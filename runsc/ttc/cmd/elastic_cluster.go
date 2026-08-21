@@ -784,13 +784,9 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 }
 
 func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (string, error) {
-	output, err := b.command("timetravel", containerID, "branches")
+	branches, err := b.runtimeBranches(containerID)
 	if err != nil {
 		return "", err
-	}
-	var branches []runscBranchInfo
-	if err := json.Unmarshal(output, &branches); err != nil {
-		return "", fmt.Errorf("decoding runtime branches: %w", err)
 	}
 	for _, branch := range branches {
 		if branch.ID == branchID {
@@ -798,6 +794,18 @@ func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (s
 		}
 	}
 	return "", fmt.Errorf("branch %q disappeared from runtime state", branchID)
+}
+
+func (b *runtimeBackend) runtimeBranches(containerID string) ([]runscBranchInfo, error) {
+	output, err := b.command("timetravel", containerID, "branches")
+	if err != nil {
+		return nil, err
+	}
+	var branches []runscBranchInfo
+	if err := json.Unmarshal(output, &branches); err != nil {
+		return nil, fmt.Errorf("decoding runtime branches: %w", err)
+	}
+	return branches, nil
 }
 
 // migrate performs an identity-preserving sparse cutover. The source is paused

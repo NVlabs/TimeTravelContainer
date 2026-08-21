@@ -25,6 +25,11 @@ TTC protocol features, and reliable host networking. Images may be cached
 locally by digest. Branch filesystems, managed volumes, dehydration metadata,
 and immutable memory chunks live in the shared repository.
 
+Each node must keep `TTC_RUNTIME_DIR`, the daemon socket, and runsc's live state
+on node-local storage. These paths contain Unix sockets, advisory locks, and
+host-process state and are not portable repository data. `ttcd` rejects an NFS
+runtime path at startup; an NFS `TTC_DATA_ROOT` remains supported.
+
 Unexpected node loss is distinct from graceful elasticity. A clean drain is
 lossless. A branch that still depends exclusively on volatile pages from a
 failed source is recoverable only if those pages were already made durable or
@@ -317,8 +322,8 @@ random placement and do not oscillate under a stable workload.
 ### Phase 5: qualification
 
 **In progress.** See [Elastic cluster qualification](../benchmarks/ttc_elastic_qualification.md)
-for completed local, migration, and NFS cases and remaining physical-node/KVM
-coverage.
+for completed local, migration, capacity-provider, real Rocky Linux package,
+and NFS cases, plus the remaining physical-node/KVM coverage.
 
 Run unit, race, fuzz, and crash injection; multi-daemon loopback and local NFS
 tests under delay, loss, and restart; systrap and KVM package-build,

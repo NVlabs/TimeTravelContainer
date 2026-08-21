@@ -781,6 +781,13 @@ func (c *ControlPlane) cancel(w http.ResponseWriter, r *http.Request, id, peer s
 			return
 		}
 	}
+	// Failed preparation is already terminal, but cancellation still has to
+	// reclaim any partially created runtime and filesystem import. Successful
+	// cleanup is idempotent and does not rewrite the diagnostic terminal state.
+	if tx.State == TransactionFailed {
+		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
 	tx, err = c.Store.Advance(id, request.Revision, TransactionCanceled, "", c.Now())
 	if err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())

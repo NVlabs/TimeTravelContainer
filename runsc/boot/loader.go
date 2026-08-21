@@ -1537,6 +1537,17 @@ func (l *Loader) run() error {
 			return err
 		}
 	}
+	if l.distributedRestore {
+		// The first branch imported into a newly created target replaces the
+		// placeholder Kernel. Rebind runtime-only networking after StartPaused:
+		// unlike peer imports, the placeholder-to-restored startup transition can
+		// otherwise leave TTC's serialized guest NIC attached to an obsolete
+		// in-process proxy endpoint. The target is still hidden and paused here,
+		// so no guest packet can observe the replacement.
+		if err := l.configureNetwork(l.k, l.k.RootNetworkNamespace().Stack()); err != nil {
+			return fmt.Errorf("reattaching distributed target network after start: %w", err)
+		}
+	}
 	l.family.MarkDefaultStarted()
 	if l.dehydrationRestore {
 		if err := l.family.WatchRestoredLoaderExecSessions(); err != nil {

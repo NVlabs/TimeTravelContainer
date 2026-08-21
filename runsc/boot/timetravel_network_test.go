@@ -142,6 +142,38 @@ func TestTimeTravelNetworkTCPNAT(t *testing.T) {
 	}
 }
 
+func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		serverErr <- err
+	}()
+
+	s := newTimeTravelNetworkTestStack(t, true)
+	if err := s.Stack.RemoveNIC(timeTravelNICID); err != nil {
+		t.Fatalf("RemoveNIC: %v", err)
+	}
+	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false); err != nil {
+		t.Fatalf("reattaching TTC network: %v", err)
+	}
+	conn, err := dialTimeTravelGateway(t, s, uint16(listener.Addr().(*net.TCPAddr).Port), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial after runtime-link reattachment: %v", err)
+	}
+	conn.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("host accept after runtime-link reattachment: %v", err)
+	}
+}
+
 func TestTimeTravelNetworkUDPNATAndHostAlias(t *testing.T) {
 	hostAddress := net.IPv4(127, 0, 0, 53)
 	hostConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: hostAddress})

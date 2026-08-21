@@ -89,23 +89,59 @@ def wait_for(description, predicate, timeout=180):
     raise RuntimeError(f"timed out waiting for {description}; last={last!r}")
 
 
+def remove_tree(path):
+    # Images legitimately contain mode-000 files and non-writable directories.
+    # Deletion depends on each parent directory's write bit, not the child's.
+    for current, directories, _files in os.walk(path, topdown=True):
+        if not os.path.islink(current):
+            os.chmod(current, 0o700)
+        for directory in directories:
+            child = os.path.join(current, directory)
+            if not os.path.islink(child):
+                os.chmod(child, 0o700)
+    shutil.rmtree(path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ttc", required=True, type=pathlib.Path)
     parser.add_argument("--work-dir", type=pathlib.Path)
+    parser.add_argument(
+        "--data-dir", type=pathlib.Path,
+        help="shared TTC data root (defaults to WORK_DIR/data)",
+    )
     parser.add_argument("--image", default="busybox:1.36")
+    parser.add_argument("--network", choices=("none", "ttc"), default="none")
+    parser.add_argument("--nat", action="store_true")
+    parser.add_argument(
+        "--prepare-command",
+        help="shell command to run in the source before forking",
+    )
+    parser.add_argument(
+        "--verify-command",
+        help="shell command to run independently in every migrated branch",
+    )
+    parser.add_argument("--command-timeout", type=int, default=600)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--preserve-on-failure", action="store_true",
+        help="leave daemons and workloads running when qualification fails",
+    )
     args = parser.parse_args()
+    if args.nat and args.network != "ttc":
+        parser.error("--nat requires --network=ttc")
     args.ttc = args.ttc.resolve()
     root = args.work_dir or pathlib.Path(tempfile.mkdtemp(prefix="ttc-elastic-capacity-"))
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    data = root / "data"
+    data = (args.data_dir or (root / "data")).resolve()
+    if args.data_dir is not None and data.exists():
+        parser.error("--data-dir must name a new, dedicated test directory")
     runtime_a = root / "runtime-a"
     runtime_b = root / "runtime-b"
     for path in (data, runtime_a, runtime_b):
-        path.mkdir(mode=0o700)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
     make_certificates(root)
     provider = pathlib.Path(__file__).resolve()
     provider.chmod(0o755)
@@ -132,6 +168,7 @@ def main():
     ]
     started_a = False
     started_b = False
+    succeeded = False
     began = time.monotonic()
     try:
         ttc(runtime_a, "daemon", "start", *common,
@@ -142,8 +179,22 @@ def main():
             "--cluster-memory-target", "512GiB",
             "--cluster-capacity-command", provider)
         started_a = True
-        ttc(runtime_a, "run", "-d", "--name", "capacity-smoke", args.image,
-            "sh", "-c", "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done")
+        run_args = ["run", "-d", "--name", "capacity-smoke"]
+        if args.network == "ttc":
+            run_args.append("--network=ttc")
+        if args.nat:
+            run_args.append("--nat")
+        run_args.extend([
+            args.image, "sh", "-c",
+            "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done",
+        ])
+        ttc(runtime_a, *run_args, timeout=args.command_timeout)
+        prepare_seconds = None
+        if args.prepare_command:
+            prepare_began = time.monotonic()
+            ttc(runtime_a, "exec", "capacity-smoke@main", "sh", "-lc",
+                args.prepare_command, timeout=args.command_timeout)
+            prepare_seconds = round(time.monotonic() - prepare_began, 3)
         ttc(runtime_a, "fork", "capacity-smoke@main", "child")
 
         drain = ttc(runtime_a, "node", "drain", "node-a", check=False)
@@ -175,10 +226,16 @@ def main():
         branches = inspected["TTC"]["container"]["branches"]
         if {branch["id"]: branch.get("node_id") for branch in branches} != {"main": "node-b", "child": "node-b"}:
             raise RuntimeError(f"unexpected placements after drain: {branches!r}")
+        verification_seconds = {}
         for branch in ("main", "child"):
             counter = ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "cat", "/tmp/counter").stdout.strip()
             if not counter.isdigit() or int(counter) <= 0:
                 raise RuntimeError(f"branch {branch} counter did not survive: {counter!r}")
+            if args.verify_command:
+                verify_began = time.monotonic()
+                ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "sh", "-lc",
+                    args.verify_command, timeout=args.command_timeout)
+                verification_seconds[branch] = round(time.monotonic() - verify_began, 3)
         calls = [json.loads(line) for line in (root / "provider-calls.jsonl").read_text(encoding="utf-8").splitlines()]
         if len(calls) < 2 or {call["request_id"] for call in calls} != {accepted["request_id"]}:
             raise RuntimeError(f"provider retries were not idempotent: {calls!r}")
@@ -190,9 +247,23 @@ def main():
             "migrated_branches": 2,
             "image": args.image,
         }
+        if prepare_seconds is not None:
+            result["prepare_seconds"] = prepare_seconds
+        if verification_seconds:
+            result["verification_seconds"] = verification_seconds
         print(json.dumps(result, indent=2, sort_keys=True))
         ttc(runtime_a, "rm", "-f", "capacity-smoke")
+        succeeded = True
     finally:
+        if args.preserve_on_failure and not succeeded:
+            print(f"preserved failed qualification at {root}", file=sys.stderr)
+            return
+        if started_a:
+            # Remove image-owned mapped-UID trees while the daemon can still
+            # enter its extraction namespace. A plain host rmtree may not own
+            # those inodes, even in unsafe-no-host-isolation test mode.
+            ttc(runtime_a, "rm", "-f", "capacity-smoke", check=False, timeout=30)
+            ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=30)
         if started_b:
             ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=30)
         if started_a:
@@ -207,7 +278,9 @@ def main():
                 timeout=30,
             )
             time.sleep(1)
-            shutil.rmtree(root, ignore_errors=True)
+            remove_tree(root)
+            if args.data_dir is not None and data.exists():
+                remove_tree(data)
 
 
 if __name__ == "__main__":

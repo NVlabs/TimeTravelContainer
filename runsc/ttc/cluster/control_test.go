@@ -42,6 +42,8 @@ type testTargetRuntime struct {
 	handedOff     int
 	canceled      int
 	independent   int
+	prepareErr    error
+	cancelErr     error
 }
 
 func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error { return nil }
@@ -50,7 +52,7 @@ func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSession
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.prepared++
-	return nil
+	return r.prepareErr
 }
 
 func (r *testTargetRuntime) Publish(_ context.Context, _ *Transaction, paused bool) error {
@@ -86,7 +88,7 @@ func (r *testTargetRuntime) Cancel(context.Context, *Transaction) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.canceled++
-	return nil
+	return r.cancelErr
 }
 
 func (r *testTargetRuntime) MarkIndependent(context.Context, *Transaction) error {
@@ -219,6 +221,62 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	// A lost cancel response is also idempotent with the original revision.
 	if again, err := client.Cancel(context.Background(), tx.Identity.TransactionID, tx.Revision); err != nil || again.Revision != canceled.Revision {
 		t.Fatalf("idempotent cancel=%+v err=%v", again, err)
+	}
+}
+
+func TestCancelFailedPreparationReclaimsTargetWithoutRewritingFailure(t *testing.T) {
+	files := newTestTLSFiles(t)
+	serverTLS, err := LoadServerTLSConfig(files.serverCert, files.serverKey, files.ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS, err := LoadClientTLSConfig(files.clientCert, files.clientKey, files.ca, "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &testTargetRuntime{prepareErr: context.DeadlineExceeded}
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		Now: time.Now, TargetRuntime: runtime,
+	}
+	server := httptest.NewUnstartedServer(control)
+	server.TLS = serverTLS
+	server.StartTLS()
+	defer server.Close()
+	client, err := NewClient(server.URL, clientTLS, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := RemoteSessionDescriptor{
+		Address: "10.0.0.1:12345", SnapshotToken: strings.Repeat("ab", 16),
+		MetadataBytes: 1 << 20, StreamBytes: 8 << 20, MaxTransferBytes: 64 << 10,
+	}
+	if _, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session); err == nil {
+		t.Fatal("Prepare unexpectedly succeeded")
+	}
+	failed, err := client.Status(context.Background(), tx.Identity.TransactionID)
+	if err != nil || failed.State != TransactionFailed || failed.Failure == "" {
+		t.Fatalf("failed transaction=%+v err=%v", failed, err)
+	}
+	cleaned, err := client.Cancel(context.Background(), failed.Identity.TransactionID, failed.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleaned.State != TransactionFailed || cleaned.Failure != failed.Failure || cleaned.Revision != failed.Revision {
+		t.Fatalf("cleanup rewrote failed transaction: before=%+v after=%+v", failed, cleaned)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.canceled != 1 {
+		t.Fatalf("target cleanup calls=%d, want 1", runtime.canceled)
 	}
 }
 

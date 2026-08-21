@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -184,6 +185,40 @@ func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
 	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
 	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "supported platforms are systrap and kvm") {
 		t.Fatalf("unsupported platform: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
+func TestPrepareDaemonRuntimeStorageRejectsNFS(t *testing.T) {
+	original := daemonStatfs
+	t.Cleanup(func() { daemonStatfs = original })
+	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
+		statfs.Type = unix.NFS_SUPER_MAGIC
+		return nil
+	}
+	dir := t.TempDir()
+	err := prepareDaemonRuntimeStorage(filepath.Join(dir, "runtime", "ttcd.sock"), filepath.Join(dir, "runsc"))
+	if err == nil || !strings.Contains(err.Error(), "node-local storage") || !strings.Contains(err.Error(), "TTC_DATA_ROOT") {
+		t.Fatalf("prepareDaemonRuntimeStorage on NFS: %v", err)
+	}
+}
+
+func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
+	original := daemonStatfs
+	t.Cleanup(func() { daemonStatfs = original })
+	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
+		statfs.Type = unix.TMPFS_MAGIC
+		return nil
+	}
+	dir := t.TempDir()
+	socketDir := filepath.Join(dir, "runtime")
+	root := filepath.Join(dir, "runsc")
+	if err := prepareDaemonRuntimeStorage(filepath.Join(socketDir, "ttcd.sock"), root); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{socketDir, root} {
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("runtime path %q: info=%v err=%v", path, info, err)
+		}
 	}
 }
 

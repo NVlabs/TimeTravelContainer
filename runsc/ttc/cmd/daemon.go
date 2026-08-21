@@ -80,6 +80,7 @@ var (
 	daemonEffectiveUID        = os.Geteuid
 	daemonKernelRelease       = currentHostKernelRelease
 	daemonPlatformPreflight   = preflightDaemonPlatform
+	daemonStatfs              = unix.Statfs
 )
 
 type daemonWireOptions struct {
@@ -694,8 +695,21 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			}
 		}
 		if peer {
-			if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
-				return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
+			branches, listErr := r.backend.runtimeBranches(info.ID)
+			if listErr != nil {
+				return fmt.Errorf("checking canceled distributed target branch %q: %w", branch.ID, listErr)
+			}
+			present := false
+			for _, runtimeBranch := range branches {
+				if runtimeBranch.ID == branch.ID {
+					present = true
+					break
+				}
+			}
+			if present {
+				if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
+					return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
+				}
 			}
 		} else {
 			if _, deleteErr := r.backend.command("delete", "--force", info.ID); deleteErr != nil {
@@ -1662,6 +1676,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
+	if err := prepareDaemonRuntimeStorage(socket, daemonRoot); err != nil {
+		fmt.Fprintf(stderr, "ttcd: preparing node-local runtime storage: %v\n", err)
+		return 1
+	}
 	manager, err := ttcvolume.OpenManager(daemonDataRoot, allowSlowVolumeCopy)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
@@ -2075,6 +2093,39 @@ func secureDaemonDirectory(dir string) error {
 	}
 	if info.Mode().Perm()&0077 != 0 {
 		return fmt.Errorf("socket directory %q permissions %04o allow access by other users", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
+// prepareDaemonRuntimeStorage ensures that control sockets and runsc's live
+// state remain on node-local storage. TTC_DATA_ROOT may intentionally be
+// shared through NFS, but runsc state contains Unix sockets, locks, and other
+// host-local objects whose semantics are not safe on NFS.
+func prepareDaemonRuntimeStorage(socket, root string) error {
+	paths := []struct {
+		name string
+		path string
+	}{
+		{name: "socket directory", path: filepath.Dir(socket)},
+		{name: "runsc state root", path: root},
+	}
+	checked := make(map[string]struct{}, len(paths))
+	for _, candidate := range paths {
+		clean := filepath.Clean(candidate.path)
+		if _, ok := checked[clean]; ok {
+			continue
+		}
+		checked[clean] = struct{}{}
+		if err := os.MkdirAll(clean, 0700); err != nil {
+			return fmt.Errorf("creating %s %q: %w", candidate.name, clean, err)
+		}
+		var statfs unix.Statfs_t
+		if err := daemonStatfs(clean, &statfs); err != nil {
+			return fmt.Errorf("checking %s filesystem %q: %w", candidate.name, clean, err)
+		}
+		if int64(statfs.Type) == int64(unix.NFS_SUPER_MAGIC) {
+			return fmt.Errorf("%s %q is on NFS; use node-local storage for TTC_RUNTIME_DIR and runsc state, and keep only TTC_DATA_ROOT on shared storage", candidate.name, clean)
+		}
 	}
 	return nil
 }

@@ -173,13 +173,19 @@ instead of silently becoming `main`. Family removal, daemon shutdown, and the
 smoke harness removed all Sentries, gofers, sockets, request state, and test
 directories.
 
-The same capacity-provider/drain smoke was then run with the complete shared
-data root on a loopback kernel NFSv3 mount (`hard`, TCP, 1 MiB reads/writes,
-`sync`, no root squashing). Both live sparse migrations, placement-generation
-fencing, catalog snapshot locks, provider retry, routed counters, and cleanup
-passed in 11.869 seconds. Removing the family reclaimed every placement JSON
-record; only the bounded catalog and two hash-shard lock files existed before
-the test mount and export were removed.
+The same capacity-provider/drain smoke was then run with its shared data root
+on a loopback kernel NFSv3 mount (`hard`, TCP, 1 MiB reads/writes, `sync`, no
+root squashing) and separate node-local runtime directories. Both live sparse
+migrations, placement-generation fencing, catalog snapshot locks, provider
+retry, routed counters, and cleanup passed in 11.922 seconds. Removing the
+family reclaimed every placement JSON record; only the bounded catalog and two
+hash-shard lock files existed before the test mount and export were removed.
+
+Putting the daemon sockets and runsc runtime roots on the NFS mount is an
+invalid layout: a later sibling import can observe unsafe live-runtime
+semantics rather than shared-repository semantics. TTC now detects NFS at
+daemon startup and rejects that layout with instructions to keep only
+`TTC_DATA_ROOT` shared.
 
 A follow-up cutover-hardening run completed locally in 7.306 seconds. It
 verified that a prepared migration remains physically paused and hidden while
@@ -188,10 +194,32 @@ resumes the target only after the ownership CAS. This run caught an attempted
 pre-cutover sidecar lookup that the new generation fence correctly rejected;
 moving sidecar activation behind the CAS removed the retry loop.
 
+The smoke was also expanded from a counter into a nontrivial Rocky Linux 8.9
+network and filesystem workload. The source ran `yum makecache` over TTC NAT,
+then both branches were migrated and independently installed
+`adwaita-icon-theme`, checked an installed path, and wrote and synchronized a
+32 MiB file. The run passed in 52.395 seconds: source preparation took 24.434
+seconds and post-migration verification took 9.775 seconds for `main` and
+8.230 seconds for `child`. This test exposed and fixed two issues that the
+counter did not reach: repeated logical chunks could be reordered by their new
+physical offsets during a second sibling import, and the first restored TTC
+network stack on a cold target retained an obsolete runtime link until it was
+reattached after Sentry startup.
+
 Run it with:
 
 ```shell
 python3 tools/ttc/elastic_capacity_smoke.py --ttc /path/to/ttc
+```
+
+To keep runtime state local while qualifying a shared repository, use separate
+paths explicitly:
+
+```shell
+python3 tools/ttc/elastic_capacity_smoke.py \
+  --ttc /path/to/ttc \
+  --work-dir /node-local/ttc-smoke \
+  --data-dir /shared/nfs/ttc-smoke-data
 ```
 
 ## Exact CoW hypergraph placement

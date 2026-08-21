@@ -107,7 +107,9 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 	relocation := NewSparseRelocation()
 	newRanges := transaction.NewRanges()
 	var loads []RemoteLoadRange
-	for _, install := range installs {
+	for i, install := range installs {
+		key := chunks[i]
+		chunkLoad := &logicalChunkLoad{id: key.id, instance: key.instance}
 		resident, ok := f.SparseChunkRange(install.Object)
 		if !ok {
 			return nil, nil, nil, fmt.Errorf("installed live chunk %x has no resident range", install.Object)
@@ -119,24 +121,35 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 				return nil, nil, nil, err
 			}
 			if isNew {
-				loads = append(loads, RemoteLoadRange{Target: memmap.FileRange{Start: target, End: target + hostarch.PageSize}, StreamOffset: binding.StreamOffset})
+				load := RemoteLoadRange{Target: memmap.FileRange{Start: target, End: target + hostarch.PageSize}, StreamOffset: binding.StreamOffset, logicalChunk: chunkLoad}
+				loads = append(loads, load)
+				chunkLoad.ranges = append(chunkLoad.ranges, load)
 			}
 		}
 	}
-	sort.Slice(loads, func(i, j int) bool { return loads[i].Target.Start < loads[j].Target.Start })
+	loads = orderAndCoalesceRemoteLoads(loads)
+	committed = true
+	return transaction, relocation, loads, nil
+}
+
+func orderAndCoalesceRemoteLoads(loads []RemoteLoadRange) []RemoteLoadRange {
+	// The async reader consumes one contiguous packed-stream interval and may
+	// scatter it into discontiguous destination ranges. Existing resident
+	// chunks make destination allocation order unrelated to stream order, so
+	// sorting by Target would split or interleave atomic logical chunks.
+	sort.Slice(loads, func(i, j int) bool { return loads[i].StreamOffset < loads[j].StreamOffset })
 	coalesced := loads[:0]
 	for _, load := range loads {
 		if len(coalesced) != 0 {
 			last := &coalesced[len(coalesced)-1]
-			if last.Target.End == load.Target.Start && last.StreamOffset+last.Target.Length() == load.StreamOffset {
+			if last.logicalChunk == load.logicalChunk && last.Target.End == load.Target.Start && last.StreamOffset+last.Target.Length() == load.StreamOffset {
 				last.Target.End = load.Target.End
 				continue
 			}
 		}
 		coalesced = append(coalesced, load)
 	}
-	committed = true
-	return transaction, relocation, coalesced, nil
+	return coalesced
 }
 
 const SparseChunkBytes = logicalPagesPerChunk * hostarch.PageSize

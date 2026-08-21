@@ -102,6 +102,9 @@ func TestInstallRemoteBindingsReusesPageVersionChunk(t *testing.T) {
 	if len(loads) != 1 || loads[0].Target.Length() != 2*hostarch.PageSize {
 		t.Fatalf("first load ranges=%+v", loads)
 	}
+	if loads[0].logicalChunk == nil || len(loads[0].logicalChunk.ranges) != len(bindings) {
+		t.Fatalf("first load lost exact logical-chunk membership: %+v", loads)
+	}
 	firstOffset, ok := relocation.Page(checkpoint.ResourceID{}, 0)
 	if !ok {
 		t.Fatal("first relocation is missing")
@@ -133,6 +136,37 @@ func TestInstallRemoteBindingsReusesPageVersionChunk(t *testing.T) {
 	}
 	if err := third.Abort(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRemoteLoadsPreservePackedStreamOrder(t *testing.T) {
+	page := uint64(hostarch.PageSize)
+	firstChunk := &logicalChunkLoad{}
+	secondChunk := &logicalChunkLoad{}
+	thirdChunk := &logicalChunkLoad{}
+	loads := []RemoteLoadRange{
+		{Target: memmap.FileRange{Start: 30 * page, End: 31 * page}, StreamOffset: 2 * page, logicalChunk: thirdChunk},
+		{Target: memmap.FileRange{Start: 50 * page, End: 51 * page}, StreamOffset: 0, logicalChunk: firstChunk},
+		{Target: memmap.FileRange{Start: 10 * page, End: 11 * page}, StreamOffset: page, logicalChunk: secondChunk},
+		{Target: memmap.FileRange{Start: 31 * page, End: 32 * page}, StreamOffset: 3 * page, logicalChunk: thirdChunk},
+	}
+	got := orderAndCoalesceRemoteLoads(loads)
+	if len(got) != 3 {
+		t.Fatalf("ordered loads=%+v, want three ranges", got)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].StreamOffset+got[i-1].Target.Length() != got[i].StreamOffset {
+			t.Fatalf("packed stream is not contiguous: %+v", got)
+		}
+	}
+	if got[0].Target.Start != 50*page || got[1].Target.Start != 10*page {
+		t.Fatalf("loads were ordered by destination instead of stream: %+v", got)
+	}
+	if got[2].Target != (memmap.FileRange{Start: 30 * page, End: 32 * page}) {
+		t.Fatalf("adjacent destination and stream ranges were not coalesced: %+v", got)
+	}
+	if got[0].logicalChunk != firstChunk || got[1].logicalChunk != secondChunk || got[2].logicalChunk != thirdChunk {
+		t.Fatalf("logical chunk grouping was not preserved: %+v", got)
 	}
 }
 

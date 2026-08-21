@@ -194,6 +194,10 @@ runtime state and daemon socket. Otherwise, the default runtime root is
 daemon socket. Both locations are writable only by the invoking user. Explicit
 paths remain available for independent installations or test runs:
 
+Keep `TTC_RUNTIME_DIR` and the runsc state root on node-local storage. They
+must not be placed on NFS; `ttcd` rejects that configuration at startup. In a
+cluster, share `TTC_DATA_ROOT` instead.
+
 ```shell
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/ttc-$UID}"
 
