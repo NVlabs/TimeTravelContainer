@@ -61,6 +61,15 @@ type Stack struct {
 	// new link/proxy realm in the child; reset then drops only inherited flows
 	// that crossed that link.
 	liveForkNetwork *LiveForkNetworkHooks `state:"nosave"`
+
+	// liveForkQuarantine asks the runtime hooks to give this stack a link with
+	// nothing on the other end of it.
+	//
+	// For a child forked to be asked a question and then destroyed. Its
+	// connections stay up as far as the programs holding them can tell, what
+	// they write is accepted and goes nowhere, what they read never arrives,
+	// and nothing outside the sandbox learns that the copy existed at all.
+	liveForkQuarantine bool `state:"nosave"`
 }
 
 // LiveForkNetworkHooks integrates a contained runtime link with live fork.
@@ -79,6 +88,17 @@ func (s *Stack) SetLiveForkNetworkHooks(hooks *LiveForkNetworkHooks) {
 		s.liveForkNetwork.Close()
 	}
 	s.liveForkNetwork = hooks
+}
+
+// SetLiveForkQuarantine marks a child stack as one that must be cut off from
+// the outside world. Set before the runtime hooks rebuild its links.
+func (s *Stack) SetLiveForkQuarantine(quarantine bool) {
+	s.liveForkQuarantine = quarantine
+}
+
+// LiveForkQuarantine reports whether this stack is a quarantined child.
+func (s *Stack) LiveForkQuarantine() bool {
+	return s.liveForkQuarantine
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.

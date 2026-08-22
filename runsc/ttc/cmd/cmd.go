@@ -324,7 +324,7 @@ Commands:
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
   stats [--json] TARGET           Show branch/family CoW resource accounting
   tty stat|watch TARGET --session NAME Observe or stream a named terminal
-  fork [--paused] SOURCE [DEST...] Fork SOURCE into one or more live branches
+  fork [--paused] [--quarantine] SOURCE [DEST...] Fork SOURCE into live branches
   migrate --target NODE TARGET    Move a running branch to another cluster node
   node ls [--json]                 List elastic cluster nodes and memory load
   node drain [--target NODE] NODE  Evacuate a node and reject new placement
@@ -4247,12 +4247,13 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("fork", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
+	quarantine := fs.Bool("quarantine", false, "cut the child off from outside the sandbox: its connections stay up and lead nowhere, and nothing outside can tell it exists")
 	targetNode := fs.String("target", "", "fork into a container on another configured ttcd node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: ttc fork [--paused] [--target NODE] SOURCE [DEST...]")
+		return errors.New("usage: ttc fork [--paused] [--quarantine] [--target NODE] SOURCE [DEST...]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -4299,7 +4300,10 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		destinations[i] = destination
 		destinationBranches[i] = destination.branch
 	}
-	branches, err := backend.forkMany(source, destinationBranches, *paused)
+	if *quarantine && *targetNode != "" {
+		return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
+	}
+	branches, err := backend.forkMany(source, destinationBranches, *paused, *quarantine)
 	if err != nil {
 		return fmt.Errorf("forking %s as %s: %w", source, strings.Join(destinationValues, ", "), err)
 	}
@@ -5259,7 +5263,7 @@ type backend interface {
 	rootfsSize(target selector) (uint64, error)
 	diff(target selector) ([]BranchPathChange, error)
 	fork(source selector, destination string, paused bool) (Branch, error)
-	forkMany(source selector, destinations []string, paused bool) ([]Branch, error)
+	forkMany(source selector, destinations []string, paused, quarantine bool) ([]Branch, error)
 	publishPort(target selector, binding ttcbundle.PortBinding) error
 	listPorts(container string) ([]ttcbundle.PortBinding, error)
 	unpublishPort(target selector, binding ttcbundle.PortBinding) error
@@ -9349,14 +9353,14 @@ func branchView(info runscBranchInfo) Branch {
 }
 
 func (b *runtimeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
-	branches, err := b.forkMany(source, []string{destination}, paused)
+	branches, err := b.forkMany(source, []string{destination}, paused, false)
 	if err != nil {
 		return Branch{}, err
 	}
 	return branches[0], nil
 }
 
-func (b *runtimeBackend) forkMany(source selector, destinations []string, paused bool) ([]Branch, error) {
+func (b *runtimeBackend) forkMany(source selector, destinations []string, paused, quarantine bool) ([]Branch, error) {
 	if len(destinations) == 0 {
 		return nil, errors.New("at least one fork destination is required")
 	}
@@ -9385,11 +9389,17 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		return nil, err
 	}
 	if normalizeLifecycleState(sourceRecord.State) == "dehydrated" {
+		if quarantine {
+			return nil, errors.New("a dehydrated branch cannot be forked into quarantine: it has no connections to keep and nothing to ask")
+		}
 		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused)
 	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
+	}
+	if quarantine {
+		args = append(args, "--quarantine")
 	}
 	args = append(args, source.container, "fork")
 	args = append(args, destinations...)

@@ -4576,7 +4576,7 @@ func (b *fakeBackend) fork(source selector, destination string, paused bool) (Br
 	return branches[0], nil
 }
 
-func (b *fakeBackend) forkMany(source selector, destinations []string, paused bool) ([]Branch, error) {
+func (b *fakeBackend) forkMany(source selector, destinations []string, paused, quarantine bool) ([]Branch, error) {
 	b.forkSource = source
 	b.forkDestinations = append([]string(nil), destinations...)
 	b.forkDestination = ""

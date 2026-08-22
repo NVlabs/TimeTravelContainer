@@ -178,6 +178,17 @@ type LiveForkStackChildResetter interface {
 	ResetLiveForkChild() error
 }
 
+// LiveForkQuarantinable is a stack that can be cut off from the outside world
+// for the life of one child.
+//
+// A quarantined child is forked to be asked something and then destroyed. Its
+// connections stay up as far as its own programs can tell — a licensed tool
+// does not learn that it has been copied — and nothing it sends leaves the
+// sandbox, so nothing outside learns either.
+type LiveForkQuarantinable interface {
+	SetLiveForkQuarantine(bool)
+}
+
 // LiveForkDanglingEndpointOwner identifies globally tracked transport
 // endpoints that belong to one stack. The ordinary checkpoint path assumes one
 // Kernel per Sentry, but live fork keeps multiple Kernels in one process and

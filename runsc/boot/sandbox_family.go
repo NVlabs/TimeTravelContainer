@@ -103,6 +103,13 @@ type ForkBranchArgs struct {
 	ID string
 	// Paused leaves the new branch stopped after creation.
 	Paused bool
+	// Quarantine cuts the new branch off from everything outside the sandbox.
+	//
+	// For a copy made to be asked a question and then destroyed. Its
+	// connections are left up rather than reset, so nothing inside notices it
+	// is a copy; what it writes is accepted and dropped and what it reads never
+	// arrives, so nothing outside notices it exists.
+	Quarantine bool
 }
 
 // ForkBranchesArgs selects one source and multiple sibling destinations for a
@@ -114,6 +121,8 @@ type ForkBranchesArgs struct {
 	IDs []string
 	// Paused leaves every new branch stopped after creation.
 	Paused bool
+	// Quarantine cuts every new branch off from outside the sandbox.
+	Quarantine bool
 }
 
 // DistributedForkCaptureArgs starts a remotely readable snapshot session.
@@ -1527,9 +1536,10 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return nil, fmt.Errorf("missing live-fork arguments")
 	}
 	infos, err := f.ForkMany(&ForkBranchesArgs{
-		Source: args.Source,
-		IDs:    []string{args.ID},
-		Paused: args.Paused,
+		Source:     args.Source,
+		IDs:        []string{args.ID},
+		Paused:     args.Paused,
+		Quarantine: args.Quarantine,
 	})
 	if err != nil {
 		return nil, err
@@ -1663,6 +1673,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			ChildBranchID:                  f.volumeBranchID(childBranch.id),
 			AllowNetworkStack:              f.allowNetworkStack,
 			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+			Quarantine:                     args.Quarantine,
 			Metrics:                        &metrics[i].Kernel,
 		}
 	}

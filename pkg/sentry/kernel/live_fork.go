@@ -40,6 +40,15 @@ import (
 
 // LiveForkOptions controls an experimental in-memory Kernel clone.
 type LiveForkOptions struct {
+	// Quarantine cuts the child off from everything outside the sandbox.
+	//
+	// Its links are rebuilt with nothing on the other end: what its programs
+	// write is accepted and discarded, what they read never comes, and no new
+	// connection can be made. Existing connections are left up rather than
+	// reset, because a child forked to be asked one question and then destroyed
+	// should not be able to tell that it is a copy — and nothing outside should
+	// be able to tell that it existed.
+	Quarantine bool
 	// Clocks is the host clock source installed in the cloned Timekeeper.
 	Clocks sentrytime.Clocks
 
@@ -425,6 +434,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := injectLiveForkFailure(opts, LiveForkStageVDSOPrivatized); err != nil {
 			return err
 		}
+		child.liveForkQuarantine = opts.Quarantine
 		if err := child.restoreLiveForkNetworkStacks(k.rootNetworkNamespace.Stack()); err != nil {
 			return err
 		}
@@ -865,6 +875,11 @@ func (k *Kernel) restoreLiveForkNetworkStacks(rootConfigSource inet.Stack) error
 		if ns.IsRoot() {
 			if rootConfigSource == nil {
 				return fmt.Errorf("live fork network configuration source is unavailable")
+			}
+			// Said before the links are rebuilt, because it decides what they
+			// are rebuilt as.
+			if quarantinable, ok := stack.(inet.LiveForkQuarantinable); ok {
+				quarantinable.SetLiveForkQuarantine(k.liveForkQuarantine)
 			}
 			cloner, ok := rootConfigSource.(inet.LiveForkStackConfigCloner)
 			if !ok {

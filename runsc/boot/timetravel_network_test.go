@@ -48,7 +48,7 @@ func newTimeTravelNetworkTestStackWithConfig(t *testing.T, cfg TimeTravelNetwork
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        true,
 	}), 1)
-	if err := configureTimeTravelNetwork(s, cfg, true); err != nil {
+	if err := configureTimeTravelNetwork(s, cfg, true, false); err != nil {
 		t.Fatalf("configureTimeTravelNetwork(%+v): %v", cfg, err)
 	}
 	t.Cleanup(s.Destroy)
@@ -161,7 +161,7 @@ func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
 	if err := s.Stack.RemoveNIC(timeTravelNICID); err != nil {
 		t.Fatalf("RemoveNIC: %v", err)
 	}
-	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false); err != nil {
+	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false, false); err != nil {
 		t.Fatalf("reattaching TTC network: %v", err)
 	}
 	conn, err := dialTimeTravelGateway(t, s, uint16(listener.Addr().(*net.TCPAddr).Port), 2*time.Second)

@@ -181,6 +181,11 @@ type Kernel struct {
 	// fork. It is canceled during Release, after users of mf have dropped their
 	// references and before mf itself is destroyed.
 	remotePageLoad *pgalloc.AsyncPagesFileLoad `state:"nosave"`
+	// liveForkQuarantine marks a child forked to be asked a question and then
+	// destroyed: its links are rebuilt with nothing on the other end, so that
+	// neither its own programs nor anything outside the sandbox can tell it
+	// was ever there.
+	liveForkQuarantine bool `state:"nosave"`
 	// remoteLoadRanges retain the packed-stream layout while remotePageLoad may
 	// be handed from a live source to shared sparse chunks.
 	remoteLoadRanges []pgalloc.RemoteLoadRange `state:"nosave"`

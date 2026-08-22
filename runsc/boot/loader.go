@@ -1106,7 +1106,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 					return fmt.Errorf("removing restored TTC interface: %v", err)
 				}
 			}
-			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false)
+			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false)
 		}
 		return nil
 	}
@@ -1118,7 +1118,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 		return err
 	}
 	if networkArgs.TimeTravel != nil {
-		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false); err != nil {
+		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false); err != nil {
 			return err
 		}
 	}

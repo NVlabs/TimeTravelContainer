@@ -49,6 +49,7 @@ type TimeTravel struct {
 	containerLoader
 	source                        string
 	paused                        bool
+	quarantine                    bool
 	pid                           int
 	execID                        string
 	signal                        int
@@ -138,6 +139,7 @@ func (*TimeTravel) Usage() string {
 func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.source, "source", boot.DefaultBranchID, "source branch for fork")
 	f.BoolVar(&t.paused, "paused", false, "leave a forked branch paused")
+	f.BoolVar(&t.quarantine, "quarantine", false, "fork a branch that is cut off from outside the sandbox: connections stay up and go nowhere, and nothing outside can tell it exists")
 	f.IntVar(&t.pid, "pid", 0, "virtual process ID; 0 selects the container init")
 	f.StringVar(&t.execID, "exec-id", "", "stable branch-local exec session ID")
 	f.IntVar(&t.signal, "signal", int(linux.SIGTERM), "signal number for the signal action")
@@ -269,15 +271,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		destinations := f.Args()[2:]
 		if len(destinations) == 1 {
 			output, err = cont.Sandbox.ForkBranch(&boot.ForkBranchArgs{
-				Source: t.source,
-				ID:     destinations[0],
-				Paused: t.paused,
+				Source:     t.source,
+				ID:         destinations[0],
+				Paused:     t.paused,
+				Quarantine: t.quarantine,
 			})
 		} else {
 			output, err = cont.Sandbox.ForkBranches(&boot.ForkBranchesArgs{
-				Source: t.source,
-				IDs:    destinations,
-				Paused: t.paused,
+				Source:     t.source,
+				IDs:        destinations,
+				Paused:     t.paused,
+				Quarantine: t.quarantine,
 			})
 		}
 	case "distributed-capture":

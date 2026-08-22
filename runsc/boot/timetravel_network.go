@@ -348,7 +348,16 @@ func (r *proxyRealm) installUDPForwarder(gateway *stack.Stack) {
 	gateway.SetTransportProtocolHandler(udp.ProtocolNumber, forwarder.HandlePacket)
 }
 
-func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetworkConfig, reset bool) (retErr error) {
+// configureTimeTravelNetwork gives a stack the TTC link.
+//
+// quarantine builds the same link with nothing on the other end of it: the
+// guest keeps its interface, its address and its routes, and the cable runs
+// into the dark. What the guest writes is accepted and dropped, what it waits
+// to read never comes, and a new connection gets as far as a SYN and no
+// further. That is what a child forked to be asked one question and then
+// destroyed should look like — from inside, a machine whose network has gone
+// quiet; from outside, a machine that was never there.
+func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetworkConfig, reset, quarantine bool) (retErr error) {
 	guestAddress, gatewayAddress, guestMAC, gatewayMAC := cfg.addresses()
 	ensureTimeTravelIPTables(dst)
 	if reset {
@@ -376,6 +385,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		}
 	}()
 	guestEP, gatewayEP := newTimeTravelLink(timeTravelMTU)
+	_ = gatewayEP
 	guestEP.SetLinkAddress(guestMAC)
 	gatewayEP.SetLinkAddress(gatewayMAC)
 	if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
@@ -402,6 +412,26 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	}
 	routes = append(routes, tcpip.Route{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID})
 	dst.Stack.SetRouteTable(routes)
+
+	if quarantine {
+		// No proxy at the other end, and nothing to close: the guest half of
+		// the cable delivers to a peer with no dispatcher, which drops what it
+		// is given and reports it sent. Every existing connection stays exactly
+		// as it was — no reset, nothing for a program to notice.
+		//
+		// The gateway's address is given a fixed answer so that packets for it
+		// are built and sent rather than held back. Without it the first thing
+		// out is an ARP request nobody answers, and a new connection fails
+		// immediately with "no route to host" — which a program can see and
+		// report. With it, the SYN goes into the dark and the connection
+		// attempt simply waits, which is what being cut off should look like
+		// from inside.
+		if err := dst.Stack.AddStaticNeighbor(timeTravelNICID, ipv4.ProtocolNumber, gatewayAddress, tcpip.LinkAddress(gatewayMAC)); err != nil {
+			return fmt.Errorf("pinning the quarantined gateway address: %v", err)
+		}
+		realm.close()
+		return nil
+	}
 
 	gateway := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
@@ -452,9 +482,16 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 					return fmt.Errorf("removing inherited TTC interface: %v", err)
 				}
 			}
-			return configureTimeTravelNetwork(child, cfg, false)
+			return configureTimeTravelNetwork(child, cfg, false, child.LiveForkQuarantine())
 		},
 		ResetChild: func(child *sentrynetstack.Stack) error {
+			if child.LiveForkQuarantine() {
+				// Deliberately not reset. A reset is how a fork tells the world
+				// it happened: the peer sees an RST, the program sees its
+				// connection die, and a licensed tool may say so out loud. A
+				// quarantined child keeps its connections and finds them silent.
+				return nil
+			}
 			return resetTimeTravelChildConnections(child, guestAddress)
 		},
 		Close: realm.close,
