@@ -254,23 +254,11 @@ func (k *Kernel) WatchInternalConsole(ctx context.Context, id string, coalesce, 
 			a.ReplicaOpenCount != b.ReplicaOpenCount {
 			return false
 		}
-		aTasks, bTasks := a.TaskWaits, b.TaskWaits
-		if len(aTasks) != len(bTasks) {
-			return false
-		}
-		// Order is the map iteration order of the PID namespace, so it is not
-		// stable between snapshots; compare as a set keyed by TID.
-		byTID := make(map[int32]TaskWait, len(aTasks))
-		for _, task := range aTasks {
-			byTID[task.TID] = task
-		}
-		for _, task := range bTasks {
-			other, ok := byTID[task.TID]
-			if !ok || !sameTaskWait(other, task) {
-				return false
-			}
-		}
-		return true
+		// Both sets, because both are in the payload and both are read. An
+		// observation whose only change is a task elsewhere in the sandbox is
+		// not the same observation: whether anything else can still run is
+		// exactly the question the rest proof asks of that field.
+		return sameTaskWaitSet(a.TaskWaits, b.TaskWaits) && sameTaskWaitSet(a.OtherTaskWaits, b.OtherTaskWaits)
 	}
 	last := observe()
 	if err := emit(last); err != nil {
@@ -928,6 +916,28 @@ func sameTaskWait(a, b TaskWait) bool {
 		key := awaitedFD{fd, awaitedKind(b, i)}
 		seen[key]--
 		if seen[key] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// sameTaskWaitSet compares two sets of task waits.
+//
+// By TID rather than by position: the order is the map iteration order of the
+// PID namespace, which is not stable between snapshots, so a straight
+// comparison reports a change every time nothing has happened.
+func sameTaskWaitSet(a, b []TaskWait) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	byTID := make(map[int32]TaskWait, len(a))
+	for _, task := range a {
+		byTID[task.TID] = task
+	}
+	for _, task := range b {
+		other, ok := byTID[task.TID]
+		if !ok || !sameTaskWait(other, task) {
 			return false
 		}
 	}
