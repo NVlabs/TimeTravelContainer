@@ -2024,18 +2024,32 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 		if inode.Type == "socket" {
 			return nil
 		}
+		// Overlayfs stores a whiteout in its writable layer as a 0:0 character
+		// device at the hidden entry's name. OCI layers encode the same operation
+		// as an empty regular file named .wh.<entry>.
+		whiteout := inode.Type == "char" && inode.Mode&07777 == 0 && inode.DevMajor == 0 && inode.DevMinor == 0
+		archiveName := name
+		if whiteout {
+			archiveName = whiteoutArchiveName(name)
+		}
 		header := &tar.Header{
-			Name: name, Mode: int64(inode.Mode), Uid: int(inode.UID), Gid: int(inode.GID),
+			Name: archiveName, Mode: int64(inode.Mode), Uid: int(inode.UID), Gid: int(inode.GID),
 			ModTime: time.Unix(0, inode.MtimeNsec), AccessTime: time.Unix(0, inode.AtimeNsec),
 			ChangeTime: time.Unix(0, inode.CtimeNsec), Format: tar.FormatPAX,
 		}
-		if len(inode.Xattrs) != 0 {
+		opaque := inode.Type == "directory" && isOverlayOpaque(inode.Xattrs)
+		if !whiteout && len(inode.Xattrs) != 0 {
 			header.PAXRecords = make(map[string]string, len(inode.Xattrs))
 			for key, value := range inode.Xattrs {
+				if isOverlayOpaqueXattr(key) {
+					continue
+				}
 				header.PAXRecords["SCHILY.xattr."+key] = value
 			}
+			if len(header.PAXRecords) == 0 {
+				header.PAXRecords = nil
+			}
 		}
-		whiteout := strings.HasPrefix(pathBase(name), ".wh.")
 		switch {
 		case whiteout:
 			header.Typeflag = tar.TypeReg
@@ -2072,6 +2086,22 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 		}
 		if err := writer.WriteHeader(header); err != nil {
 			return err
+		}
+		if opaque {
+			opaqueHeader := &tar.Header{
+				Name:       opaqueWhiteoutArchiveName(name),
+				Mode:       0600,
+				Uid:        int(inode.UID),
+				Gid:        int(inode.GID),
+				ModTime:    time.Unix(0, inode.MtimeNsec),
+				AccessTime: time.Unix(0, inode.AtimeNsec),
+				ChangeTime: time.Unix(0, inode.CtimeNsec),
+				Typeflag:   tar.TypeReg,
+				Format:     tar.FormatPAX,
+			}
+			if err := writer.WriteHeader(opaqueHeader); err != nil {
+				return err
+			}
 		}
 		if inode.Type == "regular" && !whiteout && header.Typeflag != tar.TypeLink {
 			file, err := r.openObject(inode.Object, os.O_RDONLY)
@@ -2131,12 +2161,32 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 	return writer.Close()
 }
 
-func pathBase(name string) string {
-	name = strings.TrimSuffix(name, "/")
+func whiteoutArchiveName(name string) string {
 	if index := strings.LastIndexByte(name, '/'); index >= 0 {
-		return name[index+1:]
+		return name[:index+1] + ".wh." + name[index+1:]
 	}
-	return name
+	return ".wh." + name
+}
+
+func opaqueWhiteoutArchiveName(directory string) string {
+	directory = strings.TrimSuffix(directory, "/")
+	if directory == "." || directory == "" {
+		return ".wh..wh..opq"
+	}
+	return directory + "/.wh..wh..opq"
+}
+
+func isOverlayOpaque(xattrs map[string]string) bool {
+	for key, value := range xattrs {
+		if isOverlayOpaqueXattr(key) && value == "y" {
+			return true
+		}
+	}
+	return false
+}
+
+func isOverlayOpaqueXattr(name string) bool {
+	return name == "trusted.overlay.opaque" || name == "user.overlay.opaque"
 }
 
 func metadataPaths(state *branchMetadata) (map[string]Inode, error) {

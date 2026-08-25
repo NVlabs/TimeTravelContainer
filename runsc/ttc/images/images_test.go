@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,6 +34,7 @@ import (
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
 func TestContentReuse(t *testing.T) {
@@ -170,9 +172,10 @@ func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	}
 	store.close()
 
+	layerData := make([]byte, 1024)
 	info, err := Commit(ctx, CommitOptions{
 		Root: root, BaseDigest: target.Digest.String(), Reference: "session:v1",
-		Layer: bytes.NewReader(make([]byte, 1024)), Author: "TTC Harness <ttc@example.com>", Message: "prepared session",
+		Layer: bytes.NewReader(layerData), Author: "TTC Harness <ttc@example.com>", Message: "prepared session",
 		Changes: []string{
 			"LABEL override=new timetravel.usage=prompt",
 			"ENV SESSION_MODE=review",
@@ -197,6 +200,28 @@ func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	if len(committedManifest.Layers) != 1 {
 		t.Fatalf("committed layers=%d, want 1", len(committedManifest.Layers))
 	}
+	committedLayer := committedManifest.Layers[0]
+	if committedLayer.MediaType != ocispec.MediaTypeImageLayerGzip || committedLayer.Size >= int64(len(layerData)) {
+		t.Fatalf("committed layer=%+v, want compressed layer smaller than %d bytes", committedLayer, len(layerData))
+	}
+	compressedLayer, err := content.ReadBlob(ctx, store.content, committedLayer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzipReader, err := gzip.NewReader(bytes.NewReader(compressedLayer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncompressedLayer, err := io.ReadAll(gzipReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipReader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(uncompressedLayer, layerData) {
+		t.Fatal("committed layer changed while compressing")
+	}
 	committedConfigData, err := content.ReadBlob(ctx, store.content, committedManifest.Config)
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +233,8 @@ func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	if committedConfig.Config.Labels["base"] != "kept" || committedConfig.Config.Labels["override"] != "new" ||
 		committedConfig.Config.Labels["timetravel.usage"] != "prompt" || committedConfig.Author != "TTC Harness <ttc@example.com>" ||
 		!reflect.DeepEqual(committedConfig.Config.Cmd, []string{"agent", "run"}) || !slices.Contains(committedConfig.Config.Env, "SESSION_MODE=review") ||
-		len(committedConfig.RootFS.DiffIDs) != 1 || committedConfig.History[len(committedConfig.History)-1].Comment != "prepared session" {
+		len(committedConfig.RootFS.DiffIDs) != 1 || committedConfig.RootFS.DiffIDs[0] != algorithm.FromBytes(layerData) ||
+		committedConfig.History[len(committedConfig.History)-1].Comment != "prepared session" {
 		t.Fatalf("committed config=%+v", committedConfig)
 	}
 	alias := record
@@ -287,6 +313,168 @@ func TestCommitAppliesDockerChangesAndArchiveRoundTrips(t *testing.T) {
 	wantReferences := []string{"docker.io/library/session:review", "docker.io/library/session:v1"}
 	if !reflect.DeepEqual(references, wantReferences) {
 		t.Fatalf("loaded references=%q, want %q", references, wantReferences)
+	}
+}
+
+func TestCommittedWhiteoutsSurviveSaveLoadAndMaterialize(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	algorithm := ocispec.Descriptor{Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}.Digest.Algorithm()
+	baseLayerData := makeLayer(t, false, []tarEntry{
+		{name: "keep", body: "base", mode: 0644},
+		{name: "deleted", body: "remove me", mode: 0644},
+		{name: "tree/", mode: 0755},
+		{name: "tree/old", body: "remove tree", mode: 0644},
+		{name: "opaque/", mode: 0755},
+		{name: "opaque/old", body: "remove child", mode: 0644},
+	})
+	baseLayer := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer,
+		Digest:    algorithm.FromBytes(baseLayerData),
+		Size:      int64(len(baseLayerData)),
+	}
+	config := ocispec.Image{
+		Platform: ocispec.Platform{Architecture: "amd64", OS: "linux"},
+		RootFS:   ocispec.RootFS{Type: "layers"},
+	}
+	config.RootFS.DiffIDs = append(config.RootFS.DiffIDs, baseLayer.Digest)
+	configData, err := json.Marshal(&config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDescriptor := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageConfig,
+		Digest:    algorithm.FromBytes(configData),
+		Size:      int64(len(configData)),
+	}
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    configDescriptor,
+		Layers:    []ocispec.Descriptor{baseLayer},
+	}
+	manifest.SchemaVersion = 2
+	manifestData, err := json.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    algorithm.FromBytes(manifestData),
+		Size:      int64(len(manifestData)),
+	}
+	store, err := openNativeStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, blob := range map[string]struct {
+		data       []byte
+		descriptor ocispec.Descriptor
+	}{
+		"base-layer":    {baseLayerData, baseLayer},
+		"base-config":   {configData, configDescriptor},
+		"base-manifest": {manifestData, target},
+	} {
+		if err := content.WriteBlob(ctx, store.content, name, bytes.NewReader(blob.data), blob.descriptor); err != nil {
+			store.close()
+			t.Fatal(err)
+		}
+	}
+	baseReference := "docker.io/library/whiteout-base:latest"
+	store.catalog.Images[baseReference] = imageRecord{
+		Info:   Info{Reference: baseReference, Digest: target.Digest.String(), Platform: "linux/amd64"},
+		Target: target,
+	}
+	if err := store.saveCatalog(); err != nil {
+		store.close()
+		t.Fatal(err)
+	}
+	store.close()
+
+	manager, err := ttcvolume.OpenManager(filepath.Join(t.TempDir(), "volumes"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("upper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletions := []string{"deleted", "tree"}
+	for _, name := range deletions {
+		if _, err := repository.CreateSpecial(ttcvolume.MainBranch, ttcvolume.RootInode, name, "char", 0, 0, 0, 0, 0); err != nil {
+			repository.Close()
+			t.Fatal(err)
+		}
+	}
+	opaque, err := repository.CreateDirectory(ttcvolume.MainBranch, ttcvolume.RootInode, "opaque", 0755, 0, 0)
+	if err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	opaqueMeta, err := repository.Inode(ttcvolume.MainBranch, opaque)
+	if err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	opaqueMeta.Xattrs = map[string]string{"trusted.overlay.opaque": "y"}
+	if err := repository.UpdateMetadata(ttcvolume.MainBranch, opaqueMeta); err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	newFile, err := repository.CreateRegular(ttcvolume.MainBranch, opaque, "new", 0644, 0, 0)
+	if err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, newFile, []byte("new child"), 0); err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	var upperLayer bytes.Buffer
+	if err := repository.WriteLayerTar(ttcvolume.MainBranch, &upperLayer); err != nil {
+		repository.Close()
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Commit(ctx, CommitOptions{
+		Root: root, BaseDigest: target.Digest.String(), Reference: "whiteout-roundtrip:latest",
+		Layer: bytes.NewReader(upperLayer.Bytes()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var imageArchive bytes.Buffer
+	if err := Save(ctx, SaveOptions{Root: root, Archive: &imageArchive, Images: []string{"whiteout-roundtrip:latest"}}); err != nil {
+		t.Fatal(err)
+	}
+	loadedRoot := t.TempDir()
+	loaded, err := Load(ctx, LoadOptions{Root: loadedRoot, Archive: bytes.NewReader(imageArchive.Bytes()), Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded images=%d, want 1", len(loaded))
+	}
+	materialized := filepath.Join(t.TempDir(), "rootfs")
+	if _, err := MaterializeImportedRootFS(ctx, RootFSOptions{
+		StoreRoot: loadedRoot, Root: materialized, Platform: "linux/amd64",
+	}, loaded[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishLoaded(ctx, loadedRoot, loaded); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(materialized, "keep")); err != nil || string(got) != "base" {
+		t.Fatalf("unchanged base file=%q, err=%v", got, err)
+	}
+	for _, removed := range []string{"deleted", "tree", "opaque/old"} {
+		if _, err := os.Lstat(filepath.Join(materialized, removed)); !os.IsNotExist(err) {
+			t.Fatalf("deleted path %q survived commit/load: %v", removed, err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(materialized, "opaque/new")); err != nil || string(got) != "new child" {
+		t.Fatalf("opaque replacement file=%q, err=%v", got, err)
 	}
 }
 

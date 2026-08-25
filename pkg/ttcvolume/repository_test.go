@@ -1239,7 +1239,29 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 	if err := repository.Link(MainBranch, RootInode, "hard", ino); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.CreateSpecial(MainBranch, RootInode, ".wh.removed", "char", 0, 0, 0, 0, 0); err != nil {
+	if _, err := repository.CreateSpecial(MainBranch, RootInode, "removed", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	nested, err := repository.CreateDirectory(MainBranch, RootInode, "nested", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateSpecial(MainBranch, nested, "removed", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	opaque, err := repository.CreateDirectory(MainBranch, RootInode, "opaque", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opaqueMeta, err := repository.Inode(MainBranch, opaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opaqueMeta.Xattrs = map[string]string{
+		"trusted.overlay.opaque": "y",
+		"user.test":              "present",
+	}
+	if err := repository.UpdateMetadata(MainBranch, opaqueMeta); err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
@@ -1283,5 +1305,20 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 	}
 	if whiteout := headers[".wh.removed"]; whiteout == nil || whiteout.Typeflag != tar.TypeReg || whiteout.Size != 0 {
 		t.Fatalf("whiteout=%+v", whiteout)
+	}
+	if headers["removed"] != nil {
+		t.Fatalf("overlay whiteout exported as a device: %+v", headers["removed"])
+	}
+	if whiteout := headers["nested/.wh.removed"]; whiteout == nil || whiteout.Typeflag != tar.TypeReg || whiteout.Size != 0 {
+		t.Fatalf("nested whiteout=%+v", whiteout)
+	}
+	if marker := headers["opaque/.wh..wh..opq"]; marker == nil || marker.Typeflag != tar.TypeReg || marker.Size != 0 {
+		t.Fatalf("opaque marker=%+v", marker)
+	}
+	if got := headers["opaque"].PAXRecords["SCHILY.xattr.user.test"]; got != "present" {
+		t.Fatalf("opaque directory user xattr=%q, want present", got)
+	}
+	if _, ok := headers["opaque"].PAXRecords["SCHILY.xattr.trusted.overlay.opaque"]; ok {
+		t.Fatalf("opaque implementation xattr leaked into layer: %+v", headers["opaque"].PAXRecords)
 	}
 }

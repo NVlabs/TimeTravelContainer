@@ -40,6 +40,7 @@ go_test(
     ],
     library = ":images",
     deps = [
+        "//pkg/ttcvolume",
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_containerd_v2//core/images",
         "@com_github_containerd_containerd_v2//core/images/archive",

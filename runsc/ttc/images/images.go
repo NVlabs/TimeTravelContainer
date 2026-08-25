@@ -17,6 +17,7 @@ package images
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -836,18 +837,28 @@ func Commit(ctx context.Context, opts CommitOptions) (Info, error) {
 		temporary.Close()
 		return Info{}, fmt.Errorf("base image uses unavailable digest algorithm %q", algorithm)
 	}
-	digester := algorithm.Digester()
-	layerSize, copyErr := io.Copy(io.MultiWriter(temporary, digester.Hash()), opts.Layer)
-	if copyErr != nil {
+	blobDigester := algorithm.Digester()
+	diffDigester := algorithm.Digester()
+	// OCI identifies the stored gzip blob separately from the uncompressed tar
+	// stream recorded in config.RootFS.DiffIDs.
+	compressor := gzip.NewWriter(io.MultiWriter(temporary, blobDigester.Hash()))
+	_, copyErr := io.Copy(compressor, io.TeeReader(opts.Layer, diffDigester.Hash()))
+	closeErr := compressor.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
 		temporary.Close()
-		return Info{}, fmt.Errorf("reading committed layer: %w", copyErr)
+		return Info{}, fmt.Errorf("compressing committed layer: %w", err)
+	}
+	layerSize, err := temporary.Seek(0, io.SeekCurrent)
+	if err != nil {
+		temporary.Close()
+		return Info{}, err
 	}
 	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
 		temporary.Close()
 		return Info{}, err
 	}
 	layer := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageLayer, Digest: digester.Digest(), Size: layerSize,
+		MediaType: ocispec.MediaTypeImageLayerGzip, Digest: blobDigester.Digest(), Size: layerSize,
 	}
 	if err := content.WriteBlob(ctx, store.content, "ttc-commit-layer-"+layer.Digest.Encoded(), temporary, layer); err != nil {
 		temporary.Close()
@@ -860,7 +871,7 @@ func Commit(ctx context.Context, opts CommitOptions) (Info, error) {
 	now := time.Now().UTC()
 	config.Created = &now
 	config.RootFS.Type = "layers"
-	config.RootFS.DiffIDs = append(config.RootFS.DiffIDs, layer.Digest)
+	config.RootFS.DiffIDs = append(config.RootFS.DiffIDs, diffDigester.Digest())
 	if opts.Author != "" {
 		config.Author = opts.Author
 	}
