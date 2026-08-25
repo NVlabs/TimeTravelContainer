@@ -274,10 +274,9 @@ func (c *Client) CloseFD(ctx context.Context, fd FDID, flush bool) {
 	}
 
 	// Flush the cache. We should not hold fdsMu while making an RPC, so be sure
-	// to copy the fdsToClose to another buffer before unlocking fdsMu.
-	var toCloseArr [fdsToCloseBatchSize]FDID
-	toClose := toCloseArr[:len(c.fdsToClose)]
-	copy(toClose, c.fdsToClose)
+	// to copy the fdsToClose to another buffer before unlocking fdsMu. The
+	// queue can exceed fdsToCloseBatchSize after a failed Close RPC is retried.
+	toClose := append([]FDID(nil), c.fdsToClose...)
 
 	// Clear fdsToClose so other FDIDs can be appended.
 	c.fdsToClose = c.fdsToClose[:0]
@@ -290,6 +289,40 @@ func (c *Client) CloseFD(ctx context.Context, fd FDID, flush bool) {
 	ctx.UninterruptibleSleepFinish()
 	if err != nil {
 		log.Warningf("lisafs: batch closing FDs returned error: %v", err)
+		// Close is idempotent: the server ignores unknown FDIDs. Retaining the
+		// IDs is therefore safe if the request succeeded but its response was
+		// lost, and lets a live connection recover from a transient RPC error.
+		c.fdsMu.Lock()
+		c.fdsToClose = append(c.fdsToClose, toClose...)
+		c.fdsMu.Unlock()
+	}
+}
+
+// FlushCloseFDs closes all server FDs that were queued by CloseFD. This is
+// needed when a user of a shared Client has released a complete ownership
+// domain: the Client itself remains live, so connection teardown cannot be
+// relied upon to discard the queued server resources.
+func (c *Client) FlushCloseFDs(ctx context.Context) {
+	c.fdsMu.Lock()
+	if len(c.fdsToClose) == 0 {
+		c.fdsMu.Unlock()
+		return
+	}
+
+	toClose := append([]FDID(nil), c.fdsToClose...)
+	c.fdsToClose = c.fdsToClose[:0]
+	c.fdsMu.Unlock()
+
+	req := CloseReq{FDs: toClose}
+	var resp CloseResp
+	ctx.UninterruptibleSleepStart()
+	err := c.SndRcvMessage(Close, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
+	ctx.UninterruptibleSleepFinish()
+	if err != nil {
+		log.Warningf("lisafs: flushing closed FDs returned error: %v", err)
+		c.fdsMu.Lock()
+		c.fdsToClose = append(c.fdsToClose, toClose...)
+		c.fdsMu.Unlock()
 	}
 }
 
@@ -382,6 +415,7 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal marshalFunc,
 	// Success. The payload must be unmarshalled *before* comm is released.
 	if _, ok := respUnmarshal(comm.PayloadBuf(respPayloadLen)); !ok {
 		log.Warningf("server response unmarshalling for %d message failed", respM)
+		closeFDs(respFDs)
 		return unix.EIO
 	}
 	debugf("recv", comm, respString)

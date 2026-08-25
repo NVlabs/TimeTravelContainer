@@ -82,6 +82,14 @@ type liveForkFilesystemResource struct {
 func (r *liveForkFilesystemResource) preserveSharedConnection() {
 	if r.source != nil {
 		r.source.iopts.LeakConnection = true
+		// The root FDID is the one server handle intentionally shared by all
+		// live-fork filesystems on this connection. Transfer its ownership to
+		// the Sentry process before any source branch can be destroyed.
+		if r.source.root != nil && r.source.root.inode != nil {
+			if root, ok := r.source.root.inode.impl.(*lisafsInode); ok {
+				root.borrowedControlFD = true
+			}
+		}
 	}
 }
 
@@ -593,6 +601,9 @@ func (fd *specialFileFD) completeRestore(ctx context.Context) error {
 	fd.haveQueue = (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && fd.handle.fd >= 0
 	if fd.haveQueue {
 		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
+			fd.mmapFile.SetFD(-1)
+			fd.handle = noHandle
+			h.close(ctx)
 			return fmt.Errorf("failed to add FD to fdnotified for %q: %w", genericDebugPathname(d.inode.fs, d), err)
 		}
 	}

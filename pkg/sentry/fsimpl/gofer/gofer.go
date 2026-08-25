@@ -764,11 +764,13 @@ func (fs *filesystem) Release(ctx context.Context) {
 	fs.syncMu.Unlock()
 
 	// If leak checking is enabled, release all outstanding references in the
-	// filesystem. We deliberately avoid doing this outside of leak checking; we
-	// have released all external resources above rather than relying on dentry
-	// destructors. fs.root may be nil if creating the client or initializing the
-	// root dentry failed in GetFilesystem.
-	if refs.GetLeakMode() != refs.NoLeakChecking && fs.root != nil {
+	// filesystem. A shared live-fork connection requires the same traversal in
+	// production: closing the connection is intentionally deferred until Sentry
+	// exit, so dentry destructors are the only mechanism that releases this
+	// branch's server-side control and open FDs. fs.root may be nil if creating
+	// the client or initializing the root dentry failed in GetFilesystem.
+	releaseDentries := refs.GetLeakMode() != refs.NoLeakChecking || fs.iopts.LeakConnection
+	if releaseDentries && fs.root != nil {
 		fs.renameMu.Lock()
 		fs.root.releaseExtraRefsRecursiveLocked(ctx)
 		fs.evictAllCachedDentriesLocked(ctx)
@@ -779,7 +781,14 @@ func (fs *filesystem) Release(ctx context.Context) {
 		fs.root.DecRef(ctx)
 	}
 
-	if !fs.iopts.LeakConnection {
+	if fs.iopts.LeakConnection {
+		// Dentry destruction batches Close RPCs. Since this connection remains
+		// live, drain the final partial batch now instead of retaining up to 99
+		// dead branch handles until unrelated later activity.
+		if fs.client != nil {
+			fs.client.FlushCloseFDs(ctx)
+		}
+	} else {
 		// Close the connection to the server. This implicitly closes all FDs.
 		if fs.client != nil {
 			fs.client.Close()
