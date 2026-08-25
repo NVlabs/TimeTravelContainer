@@ -4569,7 +4569,7 @@ func (b *fakeBackend) diff(target selector) ([]BranchPathChange, error) {
 }
 
 func (b *fakeBackend) fork(source selector, destination string, paused bool) (Branch, error) {
-	branches, err := b.forkMany(source, []string{destination}, paused)
+	branches, err := b.forkMany(source, []string{destination}, paused, false)
 	if err != nil {
 		return Branch{}, err
 	}
