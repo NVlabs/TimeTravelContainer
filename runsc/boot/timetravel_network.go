@@ -294,7 +294,7 @@ func (r *proxyRealm) hostAddress(addr tcpip.Address, port uint16) string {
 		if addr == r.gatewayAddress {
 			last = 1
 		}
-		ip = net.IPv4(127, 0, 0, last)
+		ip = timeTravelHostLoopbackAddress(last)
 	}
 	return net.JoinHostPort(ip.String(), fmt.Sprint(port))
 }

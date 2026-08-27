@@ -56,10 +56,6 @@ import (
 
 const (
 	daemonAPIVersion       = 4
-	defaultRuntimePlatform = "systrap"
-	kvmGetAPIVersion       = uintptr(0xae00)
-	kvmCreateVM            = uintptr(0xae01)
-	kvmAPIVersion          = uintptr(12)
 	daemonFrameStdin       = byte('I')
 	daemonFrameStdinAck    = byte('A')
 	daemonFrameEOF         = byte('C')
@@ -81,6 +77,8 @@ var (
 	daemonKernelRelease       = currentHostKernelRelease
 	daemonPlatformPreflight   = preflightDaemonPlatform
 	daemonStatfs              = unix.Statfs
+	daemonClientExecutable    = os.Executable
+	daemonExecutableLookPath  = exec.LookPath
 )
 
 type daemonWireOptions struct {
@@ -1524,13 +1522,7 @@ func siblingTTCExecutable() string {
 }
 
 func normalizeRuntimePlatform(value string) (string, error) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
-	case "systrap", "kvm":
-		return value, nil
-	default:
-		return "", fmt.Errorf("unsupported runtime platform %q; supported platforms are systrap and kvm", value)
-	}
+	return normalizeHostRuntimePlatform(strings.ToLower(strings.TrimSpace(value)))
 }
 
 func runtimePlatformFromEnvironment() string {
@@ -1541,34 +1533,8 @@ func runtimePlatformFromEnvironment() string {
 	return defaultRuntimePlatform
 }
 
-func preflightDaemonPlatform(runtimePlatform string) error {
-	if runtimePlatform != "kvm" {
-		return nil
-	}
-	device, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("runtime platform kvm requires read/write access to /dev/kvm: %w", err)
-	}
-	defer device.Close()
-	version, _, errno := unix.Syscall(unix.SYS_IOCTL, device.Fd(), kvmGetAPIVersion, 0)
-	if errno != 0 {
-		return fmt.Errorf("querying /dev/kvm API version: %w", errno)
-	}
-	if version != kvmAPIVersion {
-		return fmt.Errorf("unsupported /dev/kvm API version %d; want %d", version, kvmAPIVersion)
-	}
-	vmFD, _, errno := unix.Syscall(unix.SYS_IOCTL, device.Fd(), kvmCreateVM, 0)
-	if errno != 0 {
-		return fmt.Errorf("creating a KVM VM: %w", errno)
-	}
-	if err := unix.Close(int(vmFD)); err != nil {
-		return fmt.Errorf("closing KVM preflight VM: %w", err)
-	}
-	return nil
-}
-
-// RunDaemon serves the versioned TTC local API. It is used by the standalone
-// ttcd binary and by ttc's private daemon entry point.
+// RunDaemon serves the versioned TTC local API from the standalone ttcd
+// binary.
 func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
 		return 0
@@ -1597,7 +1563,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			args = args[1:]
 		case args[0] == "--platform":
 			if len(args) < 2 || args[1] == "" {
-				fmt.Fprintln(stderr, "ttcd: --platform requires systrap or kvm")
+				fmt.Fprintf(stderr, "ttcd: --platform requires %s\n", runtimePlatformFlagUsage())
 				return 2
 			}
 			runtimePlatform = args[1]
@@ -1662,13 +1628,13 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: detecting host Linux kernel release: %v\n", err)
 		return 1
 	}
-	kernelCompatibility, err := evaluateHostKernelCompatibility(kernelRelease)
+	kernelCompatibility, err := evaluateCurrentHostCompatibility(kernelRelease)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
-	if kernelCompatibility.disableHostGSO {
-		fmt.Fprintf(stderr, "ttcd: warning: host Linux kernel %s predates 4.14.77; disabling host GSO for compatibility; network performance, especially for large payloads, will be reduced\n", kernelRelease)
+	if warning := currentHostCompatibilityWarning(kernelCompatibility); warning != "" {
+		fmt.Fprintf(stderr, "ttcd: warning: %s\n", warning)
 	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
@@ -2043,40 +2009,6 @@ func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err err
 	return nodeID, baseURL, serverName, nil
 }
 
-func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
-	if unsafeNoHostIsolation || daemonEffectiveUID() == 0 {
-		return nil
-	}
-	if err := createDaemonRootlessProbe(); err != nil {
-		hint := "permit unprivileged user namespaces in the host kernel and LSM policy"
-		if data, readErr := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); readErr == nil && strings.TrimSpace(string(data)) == "1" {
-			hint = "the host AppArmor policy restricts unprivileged user namespaces; grant userns permission to TTC/runsc"
-		}
-		return fmt.Errorf("rootless mode is unavailable: creating a disposable user/mount namespace: %w; %s, or restart with --unsafe-no-host-isolation for trusted workloads", err, hint)
-	}
-	return nil
-}
-
-func createRootlessProbe() error {
-	command := exec.Command("/proc/self/exe", daemonRootlessProbeArg)
-	command.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-		UidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-		},
-		Credential:                 &syscall.Credential{Uid: 0, Gid: 0},
-		GidMappingsEnableSetgroups: false,
-		Pdeathsig:                  syscall.SIGKILL,
-	}
-	if err := command.Run(); err != nil {
-		return err
-	}
-	return nil
-}
-
 func secureDaemonDirectory(dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating socket directory: %w", err)
@@ -2123,7 +2055,7 @@ func prepareDaemonRuntimeStorage(socket, root string) error {
 		if err := daemonStatfs(clean, &statfs); err != nil {
 			return fmt.Errorf("checking %s filesystem %q: %w", candidate.name, clean, err)
 		}
-		if int64(statfs.Type) == int64(unix.NFS_SUPER_MAGIC) {
+		if daemonStatfsIsNFS(&statfs) {
 			return fmt.Errorf("%s %q is on NFS; use node-local storage for TTC_RUNTIME_DIR and runsc state, and keep only TTC_DATA_ROOT on shared storage", candidate.name, clean)
 		}
 	}
@@ -2402,34 +2334,6 @@ func collectSparseMemoryRepositories(dataRoot string) error {
 		result = errors.Join(result, err)
 	}
 	return result
-}
-
-func checkDaemonPeer(conn net.Conn) error {
-	unixConn, ok := conn.(*net.UnixConn)
-	if !ok {
-		return fmt.Errorf("non-Unix daemon connection %T", conn)
-	}
-	raw, err := unixConn.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var credential *syscall.Ucred
-	var socketErr error
-	if err := raw.Control(func(fd uintptr) {
-		credential, socketErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); err != nil {
-		return err
-	}
-	if socketErr != nil {
-		return socketErr
-	}
-	if credential == nil {
-		return errors.New("daemon peer credentials are unavailable")
-	}
-	if int(credential.Uid) != os.Geteuid() {
-		return fmt.Errorf("daemon peer UID %d does not match server UID %d", credential.Uid, os.Geteuid())
-	}
-	return nil
 }
 
 func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
@@ -3314,22 +3218,42 @@ func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
 }
 
-func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
-	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
-		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
+func findDaemonExecutable(clientExecutable, runsc string, lookPath func(string) (string, error)) (string, error) {
+	candidates := []string{filepath.Join(filepath.Dir(clientExecutable), "ttcd")}
+	if filepath.Base(runsc) == "ttcd" {
+		candidates = append(candidates, runsc)
 	}
-	executable, err := os.Executable()
+	candidates = append(candidates, "ttcd")
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" || candidate == clientExecutable {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		resolved, err := lookPath(candidate)
+		if err == nil {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("cannot find ttcd executable; install ttcd beside %q or in PATH", clientExecutable)
+}
+
+func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
+	clientExecutable, err := daemonClientExecutable()
 	if err != nil {
 		return "", nil, fmt.Errorf("finding ttc executable: %w", err)
 	}
-	commandName := executable
-	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
-	if sibling := filepath.Join(filepath.Dir(executable), "ttcd"); sibling != executable {
-		if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-			commandName = sibling
-			commandArgs = []string{"--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
-		}
+	commandName, err := findDaemonExecutable(clientExecutable, runsc, daemonExecutableLookPath)
+	if err != nil {
+		return "", nil, err
 	}
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
+		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
+	}
+	commandArgs := []string{"--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
 	if unsafeNoHostIsolation {
 		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 	}
@@ -3443,7 +3367,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			switch {
 			case startArgs[0] == "--platform":
 				if len(startArgs) < 2 || startArgs[1] == "" {
-					fmt.Fprintln(stderr, "ttc: --platform requires systrap or kvm")
+					fmt.Fprintf(stderr, "ttc: --platform requires %s\n", runtimePlatformFlagUsage())
 					return 2
 				}
 				opts.runtimePlatform = startArgs[1]
@@ -3498,7 +3422,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		args = args[:1]
 	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve")
+		fmt.Fprintf(stderr, "ttc: usage: ttc daemon start [--platform %s] [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve\n", runtimePlatformFlagUsage())
 		return 2
 	}
 	action := args[0]

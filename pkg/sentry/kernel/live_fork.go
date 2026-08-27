@@ -26,9 +26,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
@@ -541,12 +543,22 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 			}
 		}
 	}
-	if sourceReady != nil {
-		if err := sourceReady(); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("making live-fork source ready: %w", err)
+	// The primary child is already the requested result for a one-child fork.
+	// Capturing it again exists only to amortize metadata serialization across
+	// additional siblings.
+	if len(opts) == 1 {
+		if sourceReady != nil {
+			if err := sourceReady(); err != nil {
+				cleanup()
+				return nil, fmt.Errorf("making live-fork source ready: %w", err)
+			}
 		}
+		return children, nil
 	}
+	// captureLiveForkMetadata uses process-wide quiescence mechanisms such as
+	// fdnotifier.Pause. Finish the reusable child capture before sourceReady
+	// resumes another Kernel in this Sentry. Only decoding the additional
+	// children is safe to overlap with source execution.
 	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:]); err != nil {
 		cleanup()
 		return nil, err
@@ -558,6 +570,12 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	}
 	if opts[0].Metrics != nil {
 		opts[0].Metrics.MetadataBytes = int64(len(serialized))
+	}
+	if sourceReady != nil {
+		if err := sourceReady(); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("making live-fork source ready: %w", err)
+		}
 	}
 	var networkConfigSource inet.Stack
 	if rootNS := primary.rootNetworkNamespace; rootNS != nil {
@@ -1164,14 +1182,33 @@ func (k *Kernel) validateLiveForkResources() error {
 // privatizeLiveForkVDSOParamPage gives the child Timekeeper a branch-private
 // VVAR page. The VDSO code remains shared and immutable.
 func (k *Kernel) privatizeLiveForkVDSOParamPage() error {
-	fr, err := k.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.System})
+	fr, err := k.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.System,
+		Mode: pgalloc.AllocateAndWritePopulate,
+	})
 	if err != nil {
 		return fmt.Errorf("allocating live-fork VDSO parameter page: %w", err)
 	}
+	blocks, mappingLease, err := memmap.MapInternalWithLease(k.mf, fr, hostarch.ReadWrite)
+	if err != nil {
+		k.mf.DecRef(fr)
+		return fmt.Errorf("mapping live-fork VDSO parameter page: %w", err)
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
+	}
+	if n, err := safemem.ZeroSeq(blocks); err != nil {
+		k.mf.DecRef(fr)
+		return fmt.Errorf("zeroing live-fork VDSO parameter page after %d bytes: %w", n, err)
+	} else if n != hostarch.PageSize {
+		k.mf.DecRef(fr)
+		return fmt.Errorf("zeroing live-fork VDSO parameter page wrote %d bytes, want %d", n, hostarch.PageSize)
+	}
 	k.vdso.ParamPage.RebindMemoryFileRange(k.mf, fr)
-	k.vdsoParams.mf = k.mf
-	k.vdsoParams.fr = fr
-	k.vdsoParams.seq = 0
+	// Do not mutate the deserialized wrapper in place. State graphs created by
+	// older TTC branches may contain a stale cross-branch wrapper reference,
+	// and VDSO sequence state is an execution cache rather than branch state.
+	k.vdsoParams = NewVDSOParamPage(k.mf, fr)
 	return nil
 }
 

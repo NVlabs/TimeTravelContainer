@@ -10,11 +10,16 @@ go_library(
     srcs = [
         "caps.go",
         "caps_unsafe.go",
+        "caps_unsafe_darwin.go",
         "fdmappings.go",
         "flags.go",
         "fs.go",
+        "fs_darwin.go",
+        "fs_linux.go",
         "gofer_mount.go",
+        "gofer_mount_darwin.go",
         "process.go",
+        "process_darwin.go",
     ],
     visibility = ["//visibility:public"],
     deps = [

@@ -813,6 +813,12 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	defer pagesCleanup.Clean()
 
 	return k.quiescePausedAnd(ctx, func() error {
+		if coherent, ok := k.Platform.(platform.CheckpointCoherence); ok {
+			if err := coherent.FlushForCheckpoint(ctx); err != nil {
+				return fmt.Errorf("failed to flush platform memory before checkpoint: %w", err)
+			}
+		}
+
 		// Discard unsavable mappings, such as those for host file descriptors.
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
@@ -994,6 +1000,9 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 	invalidated := make(map[*mm.MemoryManager]struct{})
 	k.tasks.mu.RLock()
 	defer k.tasks.mu.RUnlock()
+	if k.tasks.Root == nil {
+		return nil
+	}
 	for t := range k.tasks.Root.tids {
 		// We can skip locking Task.mu here since the kernel is paused.
 		if memMgr := t.image.MemoryManager; memMgr != nil {
@@ -1009,6 +1018,37 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 			if err := r.image.MemoryManager.InvalidateUnsavable(ctx); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// DropInternalMappingsForCompaction drains task activity and discards every
+// MemoryManager's cached Sentry host mappings. Application PMAs and platform
+// stage-1 mappings remain intact. All Kernels sharing the platform must be
+// paused before the platform begins physical frame relocation.
+func (k *Kernel) DropInternalMappingsForCompaction() error {
+	if !k.IsPaused() {
+		return errors.New("memory compaction requires a paused kernel")
+	}
+	k.tasks.waitForExternalStop()
+	seen := make(map[*mm.MemoryManager]struct{})
+	drop := func(memMgr *mm.MemoryManager) {
+		if memMgr == nil {
+			return
+		}
+		if _, ok := seen[memMgr]; ok {
+			return
+		}
+		memMgr.DropInternalMappingsForCompaction()
+		seen[memMgr] = struct{}{}
+	}
+	k.tasks.mu.RLock()
+	defer k.tasks.mu.RUnlock()
+	for t := range k.tasks.Root.tids {
+		drop(t.image.MemoryManager)
+		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
+			drop(r.image.MemoryManager)
 		}
 	}
 	return nil

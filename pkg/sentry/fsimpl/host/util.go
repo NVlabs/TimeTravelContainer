@@ -15,31 +15,8 @@
 package host
 
 import (
-	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
-
-func toTimespec(ts linux.StatxTimestamp, omit bool) unix.Timespec {
-	if omit {
-		return unix.Timespec{
-			Sec:  0,
-			Nsec: unix.UTIME_OMIT,
-		}
-	}
-	return unix.Timespec{
-		Sec:  ts.Sec,
-		Nsec: int64(ts.Nsec),
-	}
-}
-
-func unixToLinuxStatxTimestamp(ts unix.StatxTimestamp) linux.StatxTimestamp {
-	return linux.StatxTimestamp{Sec: ts.Sec, Nsec: ts.Nsec}
-}
-
-func timespecToStatxTimestamp(ts unix.Timespec) linux.StatxTimestamp {
-	return linux.StatxTimestamp{Sec: int64(ts.Sec), Nsec: uint32(ts.Nsec)}
-}
 
 // isBlockError checks if an error is EAGAIN or EWOULDBLOCK.
 // If so, they can be transformed into linuxerr.ErrWouldBlock.

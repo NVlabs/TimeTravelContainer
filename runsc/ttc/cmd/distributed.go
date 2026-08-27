@@ -29,7 +29,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -168,14 +167,15 @@ func (r *distributedPageRelay) serveFile(file *os.File) {
 	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
 		return
 	}
-	command := runscCommand(r.backend.runsc,
-		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
+	args := append(r.backend.runtimeControlArgs(),
+		"timetravel", "--distributed-connection-fd=3",
 		r.source, "distributed-serve", r.session)
+	command := runscCommand(r.backend.runsc, args...)
 	command.ExtraFiles = []*os.File{file}
 	command.Stdin = strings.NewReader("")
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	setTTCCommandParentDeathSignal(command)
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

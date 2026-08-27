@@ -539,6 +539,48 @@ type File interface {
 	FD() int
 }
 
+// InternalMappingLease pins a host mapping returned by
+// MapInternalWithLease. Release must be called exactly once after the caller
+// has stopped using every Block in the mapping. A nil lease denotes a mapping
+// whose validity continues to be governed solely by File page references.
+//
+// VM-backed files use leases to exclude relocation while Sentry code is
+// dereferencing host addresses. The ordinary File.MapInternal contract cannot
+// provide this boundary because it has no corresponding release operation.
+type InternalMappingLease interface {
+	Release()
+}
+
+type internalMappingLeaser interface {
+	MapInternalWithLease(FileRange, hostarch.AccessType) (safemem.BlockSeq, InternalMappingLease, error)
+}
+
+type pmaInternalMapper interface {
+	MapInternalForPMA(FileRange, hostarch.AccessType) (safemem.BlockSeq, error)
+}
+
+// MapInternalWithLease maps fr and, for relocatable implementations, returns
+// a lease that keeps the returned host addresses stable. Callers must release
+// a non-nil lease after their final access.
+func MapInternalWithLease(file File, fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, InternalMappingLease, error) {
+	if file, ok := file.(internalMappingLeaser); ok {
+		return file.MapInternalWithLease(fr, at)
+	}
+	blocks, err := file.MapInternal(fr, at)
+	return blocks, nil, err
+}
+
+// MapInternalForPMA obtains a mapping that may be cached only inside a
+// MemoryManager PMA. It is intentionally separate from MapInternalWithLease:
+// the VM compaction coordinator quiesces the MemoryManager and drops all PMA
+// caches before relocating frames.
+func MapInternalForPMA(file File, fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if file, ok := file.(pmaInternalMapper); ok {
+		return file.MapInternalForPMA(fr, at)
+	}
+	return file.MapInternal(fr, at)
+}
+
 // MemoryFileRange identifies one range whose ownership is serialized as part
 // of a Mappable. It is used by TTC branch-scoped sparse memory capture; it is
 // distinct from transient translations cached in PMAs.

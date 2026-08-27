@@ -44,7 +44,6 @@ import (
 	"text/template"
 	"time"
 
-	mobysignal "github.com/moby/sys/signal"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -97,9 +96,6 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
 		return 0
-	}
-	if len(args) != 0 && args[0] == "_daemon-serve" {
-		return RunDaemon(args[1:], stdout, stderr)
 	}
 	opts, args, done, err := parseGlobalOptions(args, stdout)
 	if err != nil {
@@ -284,7 +280,7 @@ func dataRoot() string {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: ttc [GLOBAL OPTIONS] COMMAND
+	usage := `Usage: ttc [GLOBAL OPTIONS] COMMAND
 
 Manage TimeTravelContainer container families and live branches.
 
@@ -358,7 +354,8 @@ Commands:
 Branch selectors must use CONTAINER@BRANCH. Local fork destinations are branch
 names in the source family. Forked branches run immediately unless --paused is
 set; omitting DEST generates a branch ID.
-`)
+`
+	fmt.Fprint(w, strings.ReplaceAll(usage, "systrap|kvm", runtimePlatformFlagUsage()))
 }
 
 func printCustomCommandHelp(args []string, stdout io.Writer) bool {
@@ -370,8 +367,9 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"save":       "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
 			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
+			"volume":     "Usage: ttc volume create|ls|inspect|rm [OPTIONS]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
+			"daemon":     fmt.Sprintf("Usage: ttc daemon start [--platform %s] [isolation/volume/cluster options]|status|stop|requests|request", runtimePlatformFlagUsage()),
 			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":      "Usage: ttc pause TARGET [TARGET...]",
 			"rename":     "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
@@ -404,6 +402,12 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+			"volume create":     "Usage: ttc volume create NAME",
+			"volume ls":         "Usage: ttc volume ls",
+			"volume list":       "Usage: ttc volume ls",
+			"volume inspect":    "Usage: ttc volume inspect NAME [NAME...]",
+			"volume rm":         "Usage: ttc volume rm [--force] NAME [NAME...]",
+			"volume remove":     "Usage: ttc volume rm [--force] NAME [NAME...]",
 			"exec wait":         "Usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID",
 		}
 		if text, ok := usage[args[0]+" "+args[1]]; ok {
@@ -4732,11 +4736,36 @@ func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend
 }
 
 func parseSignal(value string) (int, error) {
-	signal, err := mobysignal.ParseSignal(value)
-	if err != nil || !mobysignal.ValidSignalForPlatform(signal) {
+	if signal, err := strconv.Atoi(value); err == nil {
+		if signal >= 1 && signal <= 64 {
+			return signal, nil
+		}
 		return 0, fmt.Errorf("unknown signal %q", value)
 	}
-	return int(signal), nil
+	name := strings.ToUpper(value)
+	name = strings.TrimPrefix(name, "SIG")
+	if signal, ok := linuxSignalNames[name]; ok {
+		return int(signal), nil
+	}
+	return 0, fmt.Errorf("unknown signal %q", value)
+}
+
+// linuxSignalNames is deliberately independent of GOOS. TTC controls Linux
+// guest processes even when its host process runs on Darwin, whose SIGUSR1,
+// SIGUSR2, and several other signal numbers differ from Linux.
+var linuxSignalNames = map[string]linux.Signal{
+	"HUP": linux.SIGHUP, "INT": linux.SIGINT, "QUIT": linux.SIGQUIT,
+	"ILL": linux.SIGILL, "TRAP": linux.SIGTRAP, "ABRT": linux.SIGABRT,
+	"IOT": linux.SIGIOT, "BUS": linux.SIGBUS, "FPE": linux.SIGFPE,
+	"KILL": linux.SIGKILL, "USR1": linux.SIGUSR1, "SEGV": linux.SIGSEGV,
+	"USR2": linux.SIGUSR2, "PIPE": linux.SIGPIPE, "ALRM": linux.SIGALRM,
+	"TERM": linux.SIGTERM, "STKFLT": linux.SIGSTKFLT, "CHLD": linux.SIGCHLD,
+	"CLD": linux.SIGCLD, "CONT": linux.SIGCONT, "STOP": linux.SIGSTOP,
+	"TSTP": linux.SIGTSTP, "TTIN": linux.SIGTTIN, "TTOU": linux.SIGTTOU,
+	"URG": linux.SIGURG, "XCPU": linux.SIGXCPU, "XFSZ": linux.SIGXFSZ,
+	"VTALRM": linux.SIGVTALRM, "PROF": linux.SIGPROF, "WINCH": linux.SIGWINCH,
+	"IO": linux.SIGIO, "POLL": linux.SIGPOLL, "PWR": linux.SIGPWR,
+	"SYS": linux.SIGSYS, "UNUSED": linux.SIGUNUSED,
 }
 
 func portBindingSpec(binding ttcbundle.PortBinding) string {
@@ -6405,7 +6434,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			return 1, err
 		}
 	}
-	args := []string{"--root", b.root, "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch}
+	args := append(b.runtimeControlArgs(), "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch)
 	consoleID := ""
 	execID := request.execID
 	if execID == "" {
@@ -7339,8 +7368,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		return ttcbundle.ConsolePaths{}, fmt.Errorf("creating console readiness pipe: %w", err)
 	}
 	defer readyReader.Close()
-	commandArgs := []string{
-		"--root", b.root,
+	commandArgs := append(b.runtimeControlArgs(),
 		"timetravel", "--console", consoleID,
 		"--console-log", paths.Log,
 		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
@@ -7348,8 +7376,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		"--console-wait-status", paths.WaitStatus,
 		"--console-retention-stats", paths.RetentionStats,
 		"--console-pid-file", paths.PID,
-		"--console-ready-fd", "4",
-	}
+		"--console-ready-fd", "4")
 	if execID != "" {
 		commandArgs = append(commandArgs, "--exec-id", execID)
 	}
@@ -8066,6 +8093,18 @@ func (b *runtimeBackend) configuredRunscArgs() []string {
 	return b.configuredRunscArgsForNetwork("none")
 }
 
+// runtimeControlArgs returns the global arguments required by runsc commands
+// that operate on an existing sandbox. The daemon's trusted-mode decision is
+// process-wide configuration on Darwin, so it must be carried by sidecars and
+// read-only lifecycle commands just as it is by create and start.
+func (b *runtimeBackend) runtimeControlArgs() []string {
+	args := []string{"--root", b.root}
+	if b.unsafeNoHostIsolation {
+		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
+	}
+	return args
+}
+
 func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []string {
 	return b.configuredRunscArgsForNetworkNAT(networkMode, false)
 }
@@ -8729,8 +8768,7 @@ func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 }
 
 func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]byte, error) {
-	global := []string{"--root", b.root}
-	command := runscCommand(b.runsc, append(global, args...)...)
+	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), args...)...)
 	command.ExtraFiles = files
 	var stderr strings.Builder
 	command.Stderr = &stderr

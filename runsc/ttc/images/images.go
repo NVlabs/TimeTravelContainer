@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -247,7 +248,11 @@ func NormalizeReference(input string) (string, error) {
 
 func platformMatcher(value string) (platforms.MatchComparer, error) {
 	if value == "" {
-		return platforms.DefaultStrict(), nil
+		// TTC always executes a Linux guest ABI. containerd's DefaultStrict
+		// derives the OS from the host, which would select darwin/* when TTC is
+		// running natively on macOS.
+		guest := platforms.Normalize(ocispec.Platform{OS: "linux", Architecture: runtime.GOARCH})
+		return platforms.OnlyStrict(guest), nil
 	}
 	parsed, err := platforms.Parse(value)
 	if err != nil {

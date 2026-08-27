@@ -49,13 +49,29 @@ def go_proto_library(name, **kwargs):
 def go_grpc_and_proto_libraries(name, **kwargs):
     _go_proto_or_grpc_library(_go_grpc_library, name, **kwargs)
 
+def _set_pure(kwargs, pure):
+    """Applies an optional rules_go pure-mode override.
+
+    Most gVisor targets use the repository-wide default. Passing True preserves
+    the historical behavior of forcing pure mode; passing "off" lets the small
+    number of host-integrating binaries require cgo even when .bazelrc selects
+    pure mode globally.
+    """
+    if type(pure) == "select":
+        kwargs["pure"] = pure
+    elif pure == "off":
+        kwargs["pure"] = "off"
+    elif pure:
+        kwargs["pure"] = "on"
+
 def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
     """Build a go binary.
 
     Args:
         name: name of the target.
         static: build a static binary.
-        pure: build without cgo.
+        pure: True forces a cgo-free build; "off" forces cgo; False inherits
+            the repository configuration.
         x_defs: additional definitions.
         **kwargs: rest of the arguments are passed to _go_binary.
     """
@@ -65,8 +81,7 @@ def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
 
     if static:
         kwargs["static"] = "on"
-    if pure:
-        kwargs["pure"] = "on"
+    _set_pure(kwargs, pure)
     gc_goopts = select({
         "//conditions:default": kwargs.pop("gc_goopts", []),
         "//tools:debug": kwargs.pop("gc_goopts", []) + ["-N", "-l"],
@@ -115,12 +130,12 @@ def go_test(name, static = False, pure = False, library = None, **kwargs):
     Args:
         name: name of the output binary.
         static: build a static binary.
-        pure: should it be built without cgo.
+        pure: True forces a cgo-free build; "off" forces cgo; False inherits
+            the repository configuration.
         library: the library to embed.
         **kwargs: rest of the arguments to pass to _go_test.
     """
-    if pure:
-        kwargs["pure"] = "on"
+    _set_pure(kwargs, pure)
     if static:
         kwargs["static"] = "on"
     if library:

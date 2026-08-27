@@ -138,11 +138,7 @@ func touchRelative(rootFD int, path string) error {
 		return err
 	}
 	defer file.Close()
-	_, _, errno := unix.Syscall6(unix.SYS_UTIMENSAT, file.Fd(), 0, 0, 0, 0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return touchFD(int(file.Fd()))
 }
 
 func writeImmutableRelative(rootFD int, dirPath, finalName string, data []byte) error {

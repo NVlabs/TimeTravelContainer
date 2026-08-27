@@ -18,6 +18,7 @@ go_library(
         "extra_filters_race.go",
         "extra_filters_race_amd64.go",
         "extra_filters_race_arm64.go",
+        "filter_darwin.go",
         "filter.go",
     ],
     visibility = [

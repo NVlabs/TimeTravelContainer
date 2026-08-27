@@ -245,7 +245,7 @@ func syncDirtyRange(ctx context.Context, mr memmap.MappableRange, cache *FileRan
 		if max < wbr.Start {
 			break
 		}
-		ims, err := mem.MapInternal(cseg.FileRangeOf(wbr), hostarch.Read)
+		ims, mappingLease, err := memmap.MapInternalWithLease(mem, cseg.FileRangeOf(wbr), hostarch.Read)
 		if err != nil {
 			return err
 		}
@@ -256,10 +256,16 @@ func syncDirtyRange(ctx context.Context, mr memmap.MappableRange, cache *FileRan
 		for !ims.IsEmpty() {
 			n, err := writeAt(ctx, ims, offset)
 			if err != nil {
+				if mappingLease != nil {
+					mappingLease.Release()
+				}
 				return err
 			}
 			offset += n
 			ims = ims.DropFirst64(n)
+		}
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 	}
 	return nil

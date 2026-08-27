@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	time2 "time"
@@ -39,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -55,8 +57,8 @@ import (
 )
 
 const (
-	// VersionKey is the key used to save runsc version in the save metadata and compare
-	// it across checkpoint restore.
+	// VersionKey is diagnostic build information. Portable checkpoint
+	// compatibility is determined by checkpoint.PortableContract instead.
 	VersionKey = "runsc_version"
 	// ContainerCountKey is the key used to save number of containers in the save metadata.
 	ContainerCountKey = "container_count"
@@ -113,6 +115,11 @@ const (
 
 	networkKey = "network"
 )
+
+var portableSentryCapabilities = []string{
+	"logical-memory-4k",
+	"portable-state-v1",
+}
 
 // GetAnnotationCheckpointPath returns the checkpoint path specified in the
 // container annotation. Return empty string if no annotation is specified.
@@ -380,9 +387,18 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	r.timer.Reached("specs validated")
 
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID)
-	if err != nil {
-		return fmt.Errorf("creating platform: %v", err)
+	var (
+		p        platform.Platform
+		reusable platform.RestoreReuser
+		err      error
+	)
+	if candidate, ok := l.k.Platform.(platform.RestoreReuser); ok {
+		reusable = candidate
+	} else {
+		p, err = createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID)
+		if err != nil {
+			return fmt.Errorf("creating platform: %v", err)
+		}
 	}
 
 	// Start the old watchdog before replacing it with a new one below.
@@ -393,6 +409,12 @@ func (r *restorer) restore(l *Loader) error {
 	if l.k != nil {
 		oldNvidiaDriverVersion = l.k.NvidiaDriverVersion
 		l.k.Release()
+	}
+	if reusable != nil {
+		if err := reusable.PrepareRestore(); err != nil {
+			return fmt.Errorf("preparing platform for restore: %w", err)
+		}
+		p = reusable
 	}
 	l.k = &kernel.Kernel{
 		Platform: p,
@@ -763,6 +785,20 @@ func (l *Loader) saveKernelWithOpts(k *kernel.Kernel, dog *watchdog.Watchdog, ex
 
 	// Save runsc version.
 	saveOpts.Metadata[VersionKey] = version.Version()
+	resources, hostBoundReasons := classifyPortableResources(l.root.conf, l.GetContainerSpecs())
+	if len(hostBoundReasons) != 0 {
+		log.Warningf("Checkpoint is host-bound: %s", strings.Join(hostBoundReasons, "; "))
+	}
+	contract := checkpoint.NewPortableContract(
+		version.Version(),
+		runtime.GOARCH,
+		strings.Fields(k.FeatureSet().FlagString()),
+		resources,
+		portableSentryCapabilities,
+	)
+	if err := contract.AddToMetadata(saveOpts.Metadata); err != nil {
+		return fmt.Errorf("adding portable checkpoint contract: %w", err)
+	}
 
 	saveOpts.Metadata[networkKey] = l.root.conf.Network.String()
 

@@ -12,6 +12,8 @@ go_library(
         "cgo_enabled.go",
         "config.go",
         "config_bundles.go",
+        "config_host_darwin.go",
+        "config_host_linux.go",
         "flags.go",
         "flags_graveyard.go",
     ],
@@ -30,6 +32,7 @@ go_test(
     name = "config_test",
     size = "small",
     srcs = [
+        "config_host_darwin_test.go",
         "config_test.go",
     ],
     library = ":config",

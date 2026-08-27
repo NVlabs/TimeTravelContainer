@@ -17,7 +17,9 @@ package kernel
 import (
 	"context"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // beforeSave is invoked by stateify.
@@ -44,5 +46,21 @@ func (t *Timekeeper) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (t *Timekeeper) afterLoad(context.Context) {
+	// StateLoad is allowed to decode into an existing root object. More
+	// importantly, execution-only fields must never survive a second state
+	// cycle (for example dehydrate -> rehydrate -> live fork). Reconstruct the
+	// complete unsaved portion of Timekeeper here instead of relying on the
+	// decoder having allocated zeroed storage.
+	t.clocks = nil
+	t.monotonicOffset = 0
+	t.monotonicLowerBound = atomicbitops.Int64{}
+	t.mu = sync.Mutex{}
+	t.stop = nil
+	t.wg = sync.WaitGroup{}
+	t.updaterState = atomicbitops.Int32{}
+	t.refs = atomicbitops.Int64{}
+	t.updateMu = sync.Mutex{}
+	t.timer = nil
+	t.params = nil
 	t.restored = make(chan struct{})
 }

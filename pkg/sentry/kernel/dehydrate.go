@@ -632,7 +632,7 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 	child.remotePageLoad = loads[0]
 	child.auxiliaryRemotePageLoads = append(child.auxiliaryRemotePageLoads, loads[1:]...)
 	loaded = true
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing dehydrated VDSO parameter page: %w", err)
 	}
@@ -795,7 +795,7 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		child.remotePageLoad = pages
 		pagesOwned = false
 	}
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing sparse dehydrated VDSO parameter page: %w", err)
 	}

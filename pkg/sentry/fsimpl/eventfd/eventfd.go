@@ -132,19 +132,19 @@ func (efd *EventFileDescription) HostFD() (int, error) {
 		flags |= linux.EFD_SEMAPHORE
 	}
 
-	fd, _, errno := unix.Syscall(unix.SYS_EVENTFD2, uintptr(efd.val), uintptr(flags), 0)
-	if errno != 0 {
-		return -1, errno
+	fd, err := createHostEventFD(efd.val, flags)
+	if err != nil {
+		return -1, err
 	}
 
 	if err := fdnotifier.AddFD(int32(fd), &efd.queue); err != nil {
-		if closeErr := unix.Close(int(fd)); closeErr != nil {
+		if closeErr := unix.Close(fd); closeErr != nil {
 			log.Warningf("close(%d) eventfd failed: %v", fd, closeErr)
 		}
 		return -1, err
 	}
 
-	efd.hostfd = int(fd)
+	efd.hostfd = fd
 	efd.sentryOwnedHostfd = true
 	return efd.hostfd, nil
 }

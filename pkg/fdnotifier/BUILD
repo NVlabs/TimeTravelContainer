@@ -8,7 +8,9 @@ package(
 go_library(
     name = "fdnotifier",
     srcs = [
+        "fdnotifier_darwin.go",
         "fdnotifier.go",
+        "poll_darwin.go",
         "poll_unsafe.go",
     ],
     visibility = ["//:sandbox"],

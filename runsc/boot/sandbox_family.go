@@ -504,6 +504,10 @@ type sandboxBranch struct {
 	// Destroy marks the branch destroying, terminates its tasks, then waits for
 	// these operations before releasing the Kernel.
 	controlOps sync.WaitGroup
+	// compactionOps is the subset of controlOps that may access application
+	// memory. Persistent process/console waiters hold Kernel lifetime without
+	// blocking a stop-the-world GuestRAM compaction.
+	compactionOps sync.WaitGroup
 
 	id string
 	// parentID is display-only fork provenance, never an ownership edge. When
@@ -1548,9 +1552,11 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 }
 
 // ForkMany creates sibling children from one source snapshot. The source is
-// paused once and becomes runnable again as soon as the primary child has
-// pinned the captured MemoryFile ranges. Remaining siblings are reconstructed
-// concurrently without extending source downtime.
+// paused once. A single primary child pins the captured MemoryFile ranges and
+// can immediately release the source. For a sibling batch, the reusable child
+// metadata is also captured before resuming the source because state capture
+// uses process-wide quiescence; sibling decoding then proceeds concurrently
+// with source execution.
 func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	forkStarted := time.Now()
 	if args == nil {
@@ -2022,6 +2028,15 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		f.mu.Unlock()
 		return fmt.Errorf("persisting dehydrated memory: %w", err)
 	}
+	if err := f.compactPlatformMemory(p, b); err != nil {
+		_ = image.Close()
+		f.mu.Lock()
+		b.state = BranchFailed
+		b.dehydration = nil
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("compacting platform memory after dehydration: %w", err)
+	}
 	f.mu.Lock()
 	b.state = BranchDehydrated
 	f.stateChanged.Broadcast()
@@ -2032,6 +2047,80 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	b.opMu.Unlock()
 	dehydrated = true
 	return nil
+}
+
+// compactPlatformMemory pauses every live sibling sharing p, drops their
+// unleased PMA host mappings, and invokes optional physical compaction. The
+// caller holds dehydrationMu and excluded.opMu. Locking all other branch
+// operation mutexes prevents new memory-accessing controls; compactionOps then
+// drains those already in flight. dehydrationMu prevents a concurrent fork
+// from publishing an unquiesced sibling into the shared VM.
+func (f *SandboxFamily) compactPlatformMemory(p platform.Platform, excluded *sandboxBranch) error {
+	compactor, ok := p.(platform.MemoryCompactor)
+	if !ok {
+		return nil
+	}
+	var branches []*sandboxBranch
+	for {
+		f.mu.Lock()
+		branches = branches[:0]
+		for _, branch := range f.branches {
+			if branch != excluded && branch.k != nil && branch.k.Platform == p {
+				branches = append(branches, branch)
+			}
+		}
+		f.mu.Unlock()
+		sort.Slice(branches, func(i, j int) bool { return branches[i].id < branches[j].id })
+		for _, branch := range branches {
+			branch.opMu.Lock()
+		}
+		f.mu.Lock()
+		stable := 0
+		for _, branch := range f.branches {
+			if branch != excluded && branch.k != nil && branch.k.Platform == p {
+				stable++
+			}
+		}
+		f.mu.Unlock()
+		if stable == len(branches) {
+			break
+		}
+		for i := len(branches) - 1; i >= 0; i-- {
+			branches[i].opMu.Unlock()
+		}
+	}
+	defer func() {
+		for i := len(branches) - 1; i >= 0; i-- {
+			branches[i].opMu.Unlock()
+		}
+	}()
+	for _, branch := range branches {
+		// Cancel transient console accesses, then drain only operations that may
+		// touch application memory. Process-lifetime waiters remain registered to
+		// keep the Kernel alive, but are quiescent while blocked and final console
+		// drains serialize on opMu.
+		f.cancelConsoleWaits(branch)
+		branch.compactionOps.Wait()
+	}
+	resume := make([]*kernel.Kernel, 0, len(branches))
+	for _, branch := range branches {
+		if !branch.k.IsPaused() {
+			branch.k.Pause()
+			resume = append(resume, branch.k)
+		}
+	}
+	defer func() {
+		for _, k := range resume {
+			k.Unpause()
+		}
+	}()
+	for _, branch := range branches {
+		if err := branch.k.DropInternalMappingsForCompaction(); err != nil {
+			return fmt.Errorf("dropping branch %q internal mappings: %w", branch.id, err)
+		}
+	}
+	_, err := compactor.CompactMemory(context.Background())
+	return err
 }
 
 // DehydrationInfo reports the durable memory streams for an already
@@ -2613,6 +2702,7 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 		f.mu.Lock()
 		if branch.k != nil && branch.state != BranchCreating && branch.state != BranchDestroying && branch.state != BranchFailed {
 			branch.controlOps.Add(1)
+			branch.compactionOps.Add(1)
 			held = append(held, heldBranch{branch: branch})
 		}
 		f.mu.Unlock()
@@ -2620,6 +2710,7 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}
 	defer func() {
 		for _, branch := range held {
+			branch.branch.compactionOps.Done()
 			branch.branch.controlOps.Done()
 		}
 	}()
@@ -2764,27 +2855,7 @@ func (f *SandboxFamily) Wait(id, cid string, pid int32) (uint32, error) {
 // exits because Kernel retains GlobalInit and its terminal wait status until
 // branch destruction.
 func (f *SandboxFamily) beginWaitControl(id string) (*sandboxBranch, func(), error) {
-	b, err := f.branch(id)
-	if err != nil {
-		return nil, nil, err
-	}
-	b.opMu.Lock()
-	f.mu.Lock()
-	if f.controlsQuiesced {
-		f.mu.Unlock()
-		b.opMu.Unlock()
-		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
-	}
-	if b.state != BranchRunning && b.state != BranchPaused && b.state != BranchExited {
-		state := b.state
-		f.mu.Unlock()
-		b.opMu.Unlock()
-		return nil, nil, fmt.Errorf("branch %q is %s", id, state)
-	}
-	b.controlOps.Add(1)
-	f.mu.Unlock()
-	b.opMu.Unlock()
-	return b, b.controlOps.Done, nil
+	return f.beginLifetimeControl(id, true)
 }
 
 func (f *SandboxFamily) execSession(args *ExecSessionArgs) (*sandboxBranch, *execSession, func(), error) {
@@ -2834,11 +2905,20 @@ func (f *SandboxFamily) ExecSessions(args *ExecSessionsArgs) ([]ExecSessionInfo,
 
 // WaitExecSession waits for one exec process and retains its exit status.
 func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan struct{}) (uint32, error) {
-	b, session, done, err := f.execSession(args)
+	if args == nil || args.ExecID == "" {
+		return 0, fmt.Errorf("exec session ID must not be empty")
+	}
+	b, done, err := f.beginWaitControl(args.BranchID)
 	if err != nil {
 		return 0, err
 	}
 	defer done()
+	f.mu.Lock()
+	session := b.execSessions[args.ExecID]
+	f.mu.Unlock()
+	if session == nil {
+		return 0, fmt.Errorf("exec session %q does not exist in branch %q", args.ExecID, args.BranchID)
+	}
 	if session.tg == nil {
 		return 0, fmt.Errorf("exec session %q is not published", args.ExecID)
 	}
@@ -2895,7 +2975,7 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 // the client may begin ConsoleRead calls. The lease remains held until output is
 // drained, preventing Sentry shutdown from racing the client's final reads.
 func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, attached func() error, exited func(uint32) error, released func() error) (uint32, error) {
-	b, done, err := f.beginControl(id)
+	b, done, err := f.beginLifetimeControl(id, false)
 	if err != nil {
 		return 0, err
 	}
@@ -3254,6 +3334,7 @@ func (f *SandboxFamily) beginConsoleWait(id string) (*sandboxBranch, *consoleWai
 	}
 	b.consoleWaits[lease] = struct{}{}
 	b.controlOps.Add(1)
+	b.compactionOps.Add(1)
 	f.mu.Unlock()
 	b.opMu.Unlock()
 	finish := func() {
@@ -3261,6 +3342,7 @@ func (f *SandboxFamily) beginConsoleWait(id string) (*sandboxBranch, *consoleWai
 		delete(b.consoleWaits, lease)
 		f.mu.Unlock()
 		close(lease.done)
+		b.compactionOps.Done()
 		b.controlOps.Done()
 	}
 	return b, lease, finish, nil
@@ -3281,7 +3363,34 @@ func (f *SandboxFamily) cancelConsoleWaits(b *sandboxBranch) {
 	}
 }
 
-// beginControl acquires a Kernel-lifetime lease for a branch-local operation.
+// beginLifetimeControl acquires a Kernel-lifetime lease that does not access
+// application memory while blocked. Such waiters survive physical compaction.
+func (f *SandboxFamily) beginLifetimeControl(id string, allowExited bool) (*sandboxBranch, func(), error) {
+	b, err := f.branch(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	b.opMu.Lock()
+	f.mu.Lock()
+	if f.controlsQuiesced {
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+	}
+	if b.state != BranchRunning && b.state != BranchPaused && (!allowExited || b.state != BranchExited) {
+		state := b.state
+		f.mu.Unlock()
+		b.opMu.Unlock()
+		return nil, nil, fmt.Errorf("branch %q is %s, unavailable for lifetime control", id, state)
+	}
+	b.controlOps.Add(1)
+	f.mu.Unlock()
+	b.opMu.Unlock()
+	return b, b.controlOps.Done, nil
+}
+
+// beginControl acquires a Kernel-lifetime and memory-access lease for a
+// branch-local operation.
 func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) {
 	b, err := f.branch(id)
 	if err != nil {
@@ -3301,9 +3410,13 @@ func (f *SandboxFamily) beginControl(id string) (*sandboxBranch, func(), error) 
 		return nil, nil, fmt.Errorf("branch %q is %s", id, state)
 	}
 	b.controlOps.Add(1)
+	b.compactionOps.Add(1)
 	f.mu.Unlock()
 	b.opMu.Unlock()
-	return b, b.controlOps.Done, nil
+	return b, func() {
+		b.compactionOps.Done()
+		b.controlOps.Done()
+	}, nil
 }
 
 // beginRunningControl acquires the branch operation lock and a Kernel-lifetime
@@ -3328,8 +3441,10 @@ func (f *SandboxFamily) beginRunningControl(id string) (*sandboxBranch, func(), 
 		return nil, nil, fmt.Errorf("branch %q is %s, not running", id, state)
 	}
 	b.controlOps.Add(1)
+	b.compactionOps.Add(1)
 	f.mu.Unlock()
 	return b, func() {
+		b.compactionOps.Done()
 		b.controlOps.Done()
 		b.opMu.Unlock()
 	}, nil
@@ -3358,15 +3473,18 @@ func (f *SandboxFamily) beginPausedManagementControl(id string) (*sandboxBranch,
 		return nil, nil, fmt.Errorf("branch %q is %s, not paused", id, state)
 	}
 	b.controlOps.Add(1)
+	b.compactionOps.Add(1)
 	f.mu.Unlock()
 	restorePause, err := b.k.BeginPausedManagementExecution()
 	if err != nil {
+		b.compactionOps.Done()
 		b.controlOps.Done()
 		b.opMu.Unlock()
 		return nil, nil, fmt.Errorf("opening paused management execution in branch %q: %w", id, err)
 	}
 	return b, func() {
 		restorePause()
+		b.compactionOps.Done()
 		b.controlOps.Done()
 		b.opMu.Unlock()
 	}, nil

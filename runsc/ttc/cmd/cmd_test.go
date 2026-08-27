@@ -65,6 +65,8 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 		{"commit", []string{"commit", "--help"}, "Usage: ttc commit"},
 		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttc exec wait"},
 		{"daemon", []string{"daemon", "--help"}, "Usage: ttc daemon"},
+		{"volume", []string{"volume", "--help"}, "Usage: ttc volume"},
+		{"volume create", []string{"volume", "create", "--help"}, "Usage: ttc volume create"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -3224,15 +3226,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHardened := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHost := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
+	wantTTCNAT := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -3241,11 +3243,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
 	wantUnsafe := []string{
-		"--root", "/runtime", "--platform=systrap", "--rootless=false", "--unsafe-no-host-isolation=true",
+		"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
 	}
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
+	}
+	wantUnsafeControl := []string{"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true"}
+	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).runtimeControlArgs(); !reflect.DeepEqual(got, wantUnsafeControl) {
+		t.Errorf("unsafe runsc control args=%q, want %q", got, wantUnsafeControl)
 	}
 	wantOldKernel := append(append([]string(nil), wantHardened...), "--gso=false")
 	if got := (&runtimeBackend{root: "/runtime", disableHostGSO: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantOldKernel) {
@@ -4875,6 +4881,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		imageList:       []ImageInfo{{Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc"}},
 		execSessionList: []runscExecSession{{ID: "exec-123", State: "running"}},
 	}
+	platformCompletions := runtimePlatformCompletions()
 	tests := []struct {
 		args    []string
 		want    []string
@@ -4882,7 +4889,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
 		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--allow-slow-volume-copy", "--platform", "--unsafe-no-host-isolation"}},
-		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: []string{"kvm", "systrap"}},
+		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: platformCompletions},
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},

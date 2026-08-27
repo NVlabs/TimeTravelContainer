@@ -9,11 +9,12 @@ package(
 go_library(
     name = "p9",
     srcs = [
+        "host_stat_darwin.go",
+        "host_stat_linux.go",
         "p9.go",
     ],
     deps = [
         "//pkg/abi/linux",
-        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

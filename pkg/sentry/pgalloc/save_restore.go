@@ -126,7 +126,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	var amfs *asyncMemoryFileSave
 	if opts.PagesFile != nil {
 		var sf stateio.SourceFile
-		if opts.PagesFile.aw.NeedRegisterSourceFD() {
+		if opts.PagesFile.aw.NeedRegisterSourceFD() && f.file != nil {
 			fileSize := uint64(len(f.chunksLoad())) * chunkSize
 			var err error
 			sf, err = opts.PagesFile.aw.RegisterSourceFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
@@ -330,11 +330,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}
 			continue
 		}
-		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			bs := chunk.sliceAt(chunkFR)
+		scanOffset := fr.Start
+		if err := f.withMappingSlices(fr, hostarch.Read, func(bs []byte) error {
 			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
 				pg := bs[pgoff : pgoff+hostarch.PageSize]
-				off := chunkFR.Start + uint64(pgoff)
+				off := scanOffset + uint64(pgoff)
 				isZeroed := bytes.Equal(pg, zeroPage)
 				if isZeroed {
 					if !wasCommitted {
@@ -359,8 +359,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			// case that nothing is concurrently trying to mutate f.
 			f.mu.Unlock()
 			f.mu.Lock()
-			return true
-		})
+			scanOffset += uint64(len(bs))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("mapping MemoryFile pages for save: %w", err)
+		}
 		// We need to flush batched updates to f.memAcct whenever potentially
 		// reaching the end of a segment, in order to maintain the invariant
 		// that updatePendingFR corresponds to a single segment.
@@ -424,15 +427,11 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 				return err
 			}
 			// Write out data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
-				}
-				_, ioErr = w.Write(s)
-			})
-			if ioErr != nil {
-				return ioErr
+			if err := f.withMappingSlices(maFR, hostarch.Read, func(s []byte) error {
+				_, err := w.Write(s)
+				return err
+			}); err != nil {
+				return err
 			}
 		}
 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
@@ -551,6 +550,10 @@ type apsOp struct {
 
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
+
+	// leases keep relocatable platform-backed mappings referenced by iovecs
+	// stable until the asynchronous write completes.
+	leases []memmap.InternalMappingLease
 }
 
 // StartAsyncPagesFileSave constructs asynchronous saving state for the pages
@@ -582,6 +585,7 @@ func StartAsyncPagesFileSave(aw stateio.AsyncWriter, doneCallback func(error)) (
 		op := &apfs.ops[i]
 		op.frs = make([]memmap.FileRange, 0, maxRanges)
 		op.iovecs = make([]unix.Iovec, 0, maxRanges)
+		op.leases = make([]memmap.InternalMappingLease, 0, maxRanges)
 	}
 	apfs.stStatus.Init()
 	go apfs.main()
@@ -633,7 +637,7 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 // - apfs.canEnqueue() == true.
 // - mfr.Length() > 0.
 // - mfr must be page-aligned.
-func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
+func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) (uint64, error) {
 	for {
 		if apfs.curOp == nil {
 			id, err := apfs.opsBusy.FirstZero(0)
@@ -645,17 +649,21 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 			op.total = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
+			op.leases = op.leases[:0]
 			apfs.curOp = op
 			apfs.curOpID = id
 		}
-		n := apfs.combine(mfr)
+		n, err := apfs.combine(mfr)
+		if err != nil {
+			return 0, err
+		}
 		if n > 0 {
-			return n
+			return n, nil
 		}
 		// Flush the existing (conflicting) op and try again with a new one.
 		apfs.enqueueCurOp()
 		if !apfs.canEnqueue() {
-			return 0
+			return 0, nil
 		}
 	}
 }
@@ -666,17 +674,17 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 // Preconditions:
 // - mfr.Length() > 0.
 // - mfr must be page-aligned.
-func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
+func (apfs *AsyncPagesFileSave) combine(mfr apsRange) (uint64, error) {
 	op := apfs.curOp
 	if op.total != 0 {
 		if op.amfs != mfr.amfs {
 			// Differing MemoryFile.
-			return 0
+			return 0, nil
 		}
 		if len(op.frs) == cap(op.frs) && op.frs[len(op.frs)-1].End != mfr.Start {
 			// Non-contiguous in the MemoryFile, and we're out of space for
 			// FileRanges.
-			return 0
+			return 0, nil
 		}
 	}
 
@@ -686,21 +694,34 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 		n = apfs.maxWriteBytes - op.total
 	}
 	if n == 0 {
-		return 0
+		return 0, nil
 	}
 	mfr.End = mfr.Start + n
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	mfr.amfs.f.forEachMappingSlice(mfr.FileRange, func(bs []byte) {
+	blocks, mappingLease, err := mfr.amfs.f.MapInternalWithLease(mfr.FileRange, hostarch.Read)
+	if err != nil {
+		return 0, err
+	}
+	for !blocks.IsEmpty() {
+		block := blocks.Head()
+		if block.NeedSafecopy() {
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
+			return 0, fmt.Errorf("async platform MemoryFile mapping unexpectedly requires safecopy")
+		}
+		bs := block.ToSlice()
 		if len(op.iovecs) > 0 {
 			if canMergeIovecAndSlice(op.iovecs[len(op.iovecs)-1], bs) {
 				op.iovecs[len(op.iovecs)-1].Len += uint64(len(bs))
 				n += uint64(len(bs))
-				return
+				blocks = blocks.Tail()
+				continue
 			}
 			if len(op.iovecs) == cap(op.iovecs) {
-				return
+				break
 			}
 		}
 		op.iovecs = append(op.iovecs, unix.Iovec{
@@ -708,9 +729,16 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 			Len:  uint64(len(bs)),
 		})
 		n += uint64(len(bs))
-	})
+		blocks = blocks.Tail()
+	}
 	if n == 0 {
-		return 0
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
+		return 0, nil
+	}
+	if mappingLease != nil {
+		op.leases = append(op.leases, mappingLease)
 	}
 	mfr.End = mfr.Start + n
 
@@ -724,11 +752,21 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 	} else {
 		op.frs = append(op.frs, mfr.FileRange)
 	}
-	return n
+	return n, nil
+}
+
+func releaseAPSOpLeases(op *apsOp) {
+	for _, lease := range op.leases {
+		lease.Release()
+	}
+	op.leases = op.leases[:0]
 }
 
 func (apfs *AsyncPagesFileSave) main() {
 	defer func() {
+		for i := range apfs.ops {
+			releaseAPSOpLeases(&apfs.ops[i])
+		}
 		if apfs.err != nil {
 			log.Warningf("Async page saving failed: %v", apfs.err)
 		}
@@ -807,7 +845,12 @@ func (apfs *AsyncPagesFileSave) main() {
 		apfs.aw.Reserve(apfs.saveOff)
 		for !apfs.unsaved.Empty() {
 			mfr := apfs.unsaved.PeekFrontPtr()
-			n := apfs.enqueueRange(*mfr)
+			n, err := apfs.enqueueRange(*mfr)
+			if err != nil {
+				apfs.mu.Unlock()
+				apfs.err = fmt.Errorf("mapping pages for asynchronous save: %w", err)
+				return
+			}
 			if n == mfr.Length() {
 				apfs.unsaved.RemoveFront()
 			} else if n != 0 {
@@ -887,6 +930,7 @@ func (apfs *AsyncPagesFileSave) main() {
 		apfs.mu.Lock()
 		for _, c := range completions {
 			op := &apfs.ops[c.ID]
+			releaseAPSOpLeases(op)
 			apfs.opsBusy.Remove(uint32(c.ID))
 			apfs.qavail++
 			if c.Err != nil {
@@ -970,16 +1014,31 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
 	fileSize := uint64(len(chunks)) * chunkSize
-	if err := f.file.Truncate(int64(fileSize)); err != nil {
-		return fmt.Errorf("failed to truncate MemoryFile: %w", err)
-	}
 	// Obtain chunk mappings, then madvise them concurrently with loading data.
 	var (
 		madviseEnd  atomicbitops.Uint64
 		madviseChan = make(chan struct{}, 1)
 		madviseWG   sync.WaitGroup
 	)
-	if len(chunks) != 0 {
+	if f.backing != nil {
+		for i := range chunks {
+			oldSize := uint64(i) * chunkSize
+			mappings, err := f.backing.Grow(oldSize, oldSize+chunkSize, chunks[i].huge)
+			if err != nil {
+				return fmt.Errorf("growing platform MemoryFile backing for chunk %d: %w", i, err)
+			}
+			if len(mappings) != 1 {
+				return fmt.Errorf("platform MemoryFile backing returned %d mappings for chunk %d, want 1", len(mappings), i)
+			}
+			chunks[i].mapping = mappings[0]
+		}
+		// Platform mappings don't require host madvise. Individual committed
+		// ranges are materialized below before checkpoint data is copied in.
+		madviseEnd.Store(fileSize)
+	} else if len(chunks) != 0 {
+		if err := f.file.Truncate(int64(fileSize)); err != nil {
+			return fmt.Errorf("failed to truncate MemoryFile: %w", err)
+		}
 		m, _, errno := unix.Syscall6(
 			unix.SYS_MMAP,
 			0,
@@ -1019,6 +1078,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	if opts.PagesFile != nil {
 		var df stateio.DestinationFile
 		if opts.PagesFile.ar.NeedRegisterDestinationFD() {
+			if f.backing != nil {
+				return fmt.Errorf("pages reader requires a host destination FD for platform-backed MemoryFile")
+			}
 			var err error
 			df, err = opts.PagesFile.ar.RegisterDestinationFD(int32(f.file.Fd()), fileSize, f.getClientFileRangeSettings(fileSize))
 			if err != nil {
@@ -1076,6 +1138,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 		maFR := maseg.Range()
 		amount := maFR.Length()
+		if f.backing != nil {
+			if err := f.backing.Commit(maFR); err != nil {
+				return fmt.Errorf("committing restored platform MemoryFile pages %v: %w", maFR, err)
+			}
+		}
 		// Wait for all chunks spanned by this segment to be madvised.
 		for madviseEnd.Load() < maFR.End {
 			<-madviseChan
@@ -1108,12 +1175,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				return fmt.Errorf("mismatched segment: expected %d, got %d", amount, length)
 			}
 			// Read data.
-			var ioErr error
-			f.forEachMappingSlice(maFR, func(s []byte) {
-				if ioErr != nil {
-					return
-				}
-				_, ioErr = io.ReadFull(r, s)
+			ioErr := f.withMappingSlicesNoWait(maFR, hostarch.Write, func(s []byte) error {
+				_, err := io.ReadFull(r, s)
+				return err
 			})
 			if ioErr != nil {
 				return fmt.Errorf("failed to read pages: %w", ioErr)
@@ -1399,6 +1463,10 @@ type aplOp struct {
 	// iovecs contains mappings of frs.
 	iovecs []unix.Iovec
 
+	// leases keep relocatable platform-backed mappings referenced by iovecs
+	// stable until the asynchronous read completes.
+	leases []memmap.InternalMappingLease
+
 	// If tempRef is true, a temporary reference is held on pages in frs that
 	// should be dropped after completion.
 	tempRef bool
@@ -1546,6 +1614,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		op := &apfl.ops[i]
 		op.frs = make([]memmap.FileRange, 0, maxRanges)
 		op.iovecs = make([]unix.Iovec, 0, maxRanges)
+		op.leases = make([]memmap.InternalMappingLease, 0, maxRanges)
 	}
 	apfl.lfStatus.Init()
 	go apfl.main()
@@ -1771,9 +1840,14 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 					dataStart := load.StreamOffset - streamOffset
 					dataEnd := dataStart + load.Target.Length()
 					copied := 0
-					amfl.f.forEachMappingSlice(seg.Range(), func(dst []byte) {
+					if err := amfl.f.withMappingSlicesNoWait(seg.Range(), hostarch.Write, func(dst []byte) error {
 						copied += copy(dst, data[dataStart+uint64(copied):dataEnd])
-					})
+						return nil
+					}); err != nil {
+						apfl.mu.Unlock()
+						amfl.f.mu.Unlock()
+						return RemotePageInstallBusy, fmt.Errorf("mapping pushed logical chunk: %w", err)
+					}
 					if uint64(copied) != load.Target.Length() {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
@@ -1838,9 +1912,14 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 			ulseg = amfl.unloaded.SplitBefore(ulseg, targetStart)
 			ulseg = amfl.unloaded.SplitAfter(ulseg, targetStart+length)
 			copied := 0
-			amfl.f.forEachMappingSlice(ulseg.Range(), func(dst []byte) {
+			if err := amfl.f.withMappingSlicesNoWait(ulseg.Range(), hostarch.Write, func(dst []byte) error {
 				copied += copy(dst, data[copied:])
-			})
+				return nil
+			}); err != nil {
+				apfl.mu.Unlock()
+				amfl.f.mu.Unlock()
+				return RemotePageInstallBusy, fmt.Errorf("mapping pushed remote range: %w", err)
+			}
 			if uint64(copied) != length {
 				apfl.mu.Unlock()
 				amfl.f.mu.Unlock()
@@ -2131,7 +2210,7 @@ func (apfl *AsyncPagesFileLoad) enqueueCurOp() {
 // - apfl.canEnqueue() == true.
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) uint64 {
+func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) (uint64, error) {
 	for {
 		if apfl.curOp == nil {
 			id, err := apfl.opsBusy.FirstZero(0)
@@ -2143,17 +2222,21 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			op.total = 0
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
+			op.leases = op.leases[:0]
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
-		n := apfl.combine(amfl, fr, off, tempRef, logicalChunk)
+		n, err := apfl.combine(amfl, fr, off, tempRef, logicalChunk)
+		if err != nil {
+			return 0, err
+		}
 		if n > 0 {
-			return n
+			return n, nil
 		}
 		// Flush the existing (conflicting) op and try again with a new one.
 		apfl.enqueueCurOp()
 		if !apfl.canEnqueue() {
-			return 0
+			return 0, nil
 		}
 	}
 }
@@ -2164,31 +2247,31 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 // Preconditions:
 // - fr.Length() > 0.
 // - fr must be page-aligned.
-func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) uint64 {
+func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.FileRange, off uint64, tempRef bool, logicalChunk *logicalChunkLoad) (uint64, error) {
 	op := apfl.curOp
 	if op.total != 0 {
 		if op.end != off {
 			// Non-contiguous in the pages file.
-			return 0
+			return 0, nil
 		}
 		if op.amfl != amfl {
 			// Differing MemoryFile.
-			return 0
+			return 0, nil
 		}
 		if len(op.frs) == cap(op.frs) && op.frs[len(op.frs)-1].End != fr.Start {
 			// Non-contiguous in the MemoryFile, and we're out of space for
 			// FileRanges.
-			return 0
+			return 0, nil
 		}
 		if op.tempRef != tempRef {
 			// Incompatible reference-counting semantics. We could handle this
 			// by making tempRef per-FileRange, but it's very unlikely that an
 			// awaited load (tempRef=false) will happen to be followed by an
 			// unawaited load (tempRef=true) at the correct offset.
-			return 0
+			return 0, nil
 		}
 		if op.logicalChunk != logicalChunk {
-			return 0
+			return 0, nil
 		}
 	}
 
@@ -2198,21 +2281,34 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 		n = apfl.maxReadBytes - op.total
 	}
 	if n == 0 {
-		return 0
+		return 0, nil
 	}
 	fr.End = fr.Start + n
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	amfl.f.forEachMappingSlice(fr, func(bs []byte) {
+	blocks, mappingLease, err := amfl.f.mapInternalWithLeaseNoWait(fr, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+	for !blocks.IsEmpty() {
+		block := blocks.Head()
+		if block.NeedSafecopy() {
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
+			return 0, fmt.Errorf("async platform MemoryFile mapping unexpectedly requires safecopy")
+		}
+		bs := block.ToSlice()
 		if len(op.iovecs) > 0 {
 			if canMergeIovecAndSlice(op.iovecs[len(op.iovecs)-1], bs) {
 				op.iovecs[len(op.iovecs)-1].Len += uint64(len(bs))
 				n += uint64(len(bs))
-				return
+				blocks = blocks.Tail()
+				continue
 			}
 			if len(op.iovecs) == cap(op.iovecs) {
-				return
+				break
 			}
 		}
 		op.iovecs = append(op.iovecs, unix.Iovec{
@@ -2220,9 +2316,16 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 			Len:  uint64(len(bs)),
 		})
 		n += uint64(len(bs))
-	})
+		blocks = blocks.Tail()
+	}
 	if n == 0 {
-		return 0
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
+		return 0, nil
+	}
+	if mappingLease != nil {
+		op.leases = append(op.leases, mappingLease)
 	}
 	fr.End = fr.Start + n
 
@@ -2240,7 +2343,14 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 	} else {
 		op.frs = append(op.frs, fr)
 	}
-	return n
+	return n, nil
+}
+
+func releaseAPLOpLeases(op *aplOp) {
+	for _, lease := range op.leases {
+		lease.Release()
+	}
+	op.leases = op.leases[:0]
 }
 
 func (apfl *AsyncPagesFileLoad) main() {
@@ -2250,6 +2360,9 @@ func (apfl *AsyncPagesFileLoad) main() {
 			// Completed reads are complete irrespective of err, so log err
 			// rather than propagating it.
 			log.Warningf("Async page loading: stateio.AsyncReader.Close failed: %v", err)
+		}
+		for i := range apfl.ops {
+			releaseAPLOpLeases(&apfl.ops[i])
 		}
 		apfl.timeline.End()
 		// Wake up any remaining waiters so that they can observe apfl.err().
@@ -2311,6 +2424,46 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 	}
 	defer dropDelayedDecRefs()
+
+	// discardEmptyLoads removes destinations whose remaining pages became
+	// waste before they were demanded. DecRef cancels those ranges while
+	// holding MemoryFile.mu, so final list removal is deferred to this goroutine
+	// to preserve the amflsMu -> MemoryFile.mu -> mu lock order.
+	discardEmptyLoads := func() bool {
+		var callbacks []func(error)
+		apfl.amflsMu.Lock()
+		for amfl := apfl.amfls.Front(); amfl != nil; {
+			next := amfl.Next()
+			amfl.f.mu.Lock()
+			apfl.mu.Lock()
+			empty := amfl.lfDone && amfl.unloaded.IsEmpty()
+			if empty {
+				amfl.minUnloaded.Store(math.MaxUint64)
+				apfl.amfls.Remove(amfl)
+			}
+			apfl.mu.Unlock()
+			if empty {
+				if !amfl.sparse {
+					amfl.f.asyncPageLoad.Store(nil)
+				} else {
+					amfl.f.removeSparseAsyncLoad(amfl)
+				}
+				amfl.timeline.End()
+				if amfl.doneCallback != nil {
+					callbacks = append(callbacks, amfl.doneCallback)
+					amfl.doneCallback = nil
+				}
+			}
+			amfl.f.mu.Unlock()
+			amfl = next
+		}
+		empty := apfl.amfls.Empty()
+		apfl.amflsMu.Unlock()
+		for _, callback := range callbacks {
+			callback(nil)
+		}
+		return empty
+	}
 
 	// Don't start timing until we have pages to load.
 	apfl.lfStatus.Wait()
@@ -2393,6 +2546,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 			continue
 		}
+		noLoads := discardEmptyLoads()
 		// Enqueue as many reads as possible.
 		if !apfl.canEnqueue() {
 			panic("main loop invariant failed")
@@ -2419,7 +2573,12 @@ func (apfl *AsyncPagesFileLoad) main() {
 				// fr.amfl.awaitLoad() precondition), so they can't become
 				// waste (which would allow them to be racily released or
 				// recycled).
-				n := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */, ul.logicalChunk)
+				n, err := apfl.enqueueRange(fr.amfl, ulFR, ul.off, false /* tempRef */, ul.logicalChunk)
+				if err != nil {
+					apfl.errVal.Store(fmt.Errorf("mapping pages for asynchronous load: %w", err))
+					apfl.mu.Unlock()
+					return
+				}
 				if n == 0 {
 					// Try again in the next iteration of the main loop, when
 					// we have space in the queue again.
@@ -2472,7 +2631,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 					loadFR := ulFR.Intersect(prefetch.FileRange)
 					ulseg = amfl.unloaded.SplitBefore(ulseg, loadFR.Start)
 					ul = ulseg.ValuePtr()
-					n := apfl.enqueueRange(amfl, loadFR, ul.off, true /* tempRef */, ul.logicalChunk)
+					n, err := apfl.enqueueRange(amfl, loadFR, ul.off, true /* tempRef */, ul.logicalChunk)
+					if err != nil {
+						apfl.errVal.Store(fmt.Errorf("mapping pages for asynchronous prefetch: %w", err))
+						apfl.mu.Unlock()
+						amfl.f.mu.Unlock()
+						apfl.amflsMu.Unlock()
+						return
+					}
 					if n == 0 {
 						break
 					}
@@ -2516,7 +2682,14 @@ func (apfl *AsyncPagesFileLoad) main() {
 					// We need to take page references during reading to
 					// prevent pages from becoming waste due to concurrent
 					// dropping of the last reference.
-					n := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */, ul.logicalChunk)
+					n, err := apfl.enqueueRange(amfl, ulFR, ul.off, true /* tempRef */, ul.logicalChunk)
+					if err != nil {
+						apfl.errVal.Store(fmt.Errorf("mapping pages for asynchronous background load: %w", err))
+						apfl.mu.Unlock()
+						amfl.f.mu.Unlock()
+						apfl.amflsMu.Unlock()
+						return
+					}
 					if n == 0 {
 						apfl.mu.Unlock()
 						amfl.f.mu.Unlock()
@@ -2549,7 +2722,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 				continue
 			}
 			// We are out of work to do.
-			if memoryFilesDone && !apfl.demandOnly.Load() {
+			if memoryFilesDone && (noLoads || !apfl.demandOnly.Load()) {
 				// Successfully completed all loading for all MemoryFiles.
 				durTotal := time.Duration(gohacks.Nanotime() - timeStart)
 				apfl.mu.Lock()
@@ -2592,6 +2765,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		apfl.mu.Lock()
 		for _, c := range completions {
 			op := &apfl.ops[c.ID]
+			releaseAPLOpLeases(op)
 			apfl.opsBusy.Remove(uint32(c.ID))
 			apfl.qavail++
 			if op.tempRef {
@@ -2700,7 +2874,6 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 	}
 
 	amfl.pf.mu.Lock()
-	defer amfl.pf.mu.Unlock()
 	amfl.unloaded.RemoveRangeWith(fr, func(ulseg aplUnloadedIterator) {
 		ul := ulseg.ValuePtr()
 		if ul.started {
@@ -2714,6 +2887,15 @@ func (amfl *asyncMemoryFileLoad) cancelWasteLoad(fr memmap.FileRange) {
 			panic(fmt.Sprintf("pages %v becoming waste with %d async load waiters", ulseg.Range(), n))
 		}
 	})
+	if amfl.unloaded.IsEmpty() {
+		amfl.minUnloaded.Store(math.MaxUint64)
+	} else {
+		amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
+	}
+	amfl.pf.mu.Unlock()
+	// Wake the loader so it can detach an empty destination and close its
+	// reader when no other destination has outstanding pages.
+	amfl.pf.lfStatus.Notify(aplLFPending)
 }
 
 type aplUnloadedSetFunctions struct{}

@@ -171,6 +171,7 @@ go_template_instance(
 go_library(
     name = "pgalloc",
     srcs = [
+        "backing.go",
         "amfl_list.go",
         "amfls_mutex.go",
         "apfl_mutex.go",
@@ -180,7 +181,9 @@ go_library(
         "debug.go",
         "evictable_range.go",
         "evictable_range_set.go",
-		"logical_capture.go",
+        "host_ops_darwin.go",
+        "host_ops_linux.go",
+        "logical_capture.go",
         "logical_page_set.go",
         "memacct_set.go",
         "memory_file_mutex.go",
@@ -188,7 +191,7 @@ go_library(
         "pgalloc_unsafe.go",
         "remote_snapshot.go",
         "save_restore.go",
-		"sparse_import.go",
+        "sparse_import.go",
         "unfree_set.go",
         "unwaste_set.go",
     ],
@@ -230,7 +233,7 @@ go_test(
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "remote_snapshot_test.go",
-		"sparse_import_test.go",
+        "sparse_import_test.go",
     ],
     library = ":pgalloc",
     deps = [

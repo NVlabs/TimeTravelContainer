@@ -45,7 +45,7 @@ const (
 	// PidsLimitAnnotation enables TTC Sentry-side enforcement of linux.resources.pids.
 	PidsLimitAnnotation = "dev.timetravelcontainer.resource.pids-limit"
 	// InternalMountsAnnotation identifies TTC-generated implementation mounts.
-	InternalMountsAnnotation = "dev.timetravelcontainer.config.internal-mounts"
+	InternalMountsAnnotation = specutils.AnnotationTTCInternalMounts
 	// ImmutableHostMountsAnnotation records user-attested immutable host sources.
 	ImmutableHostMountsAnnotation = "dev.timetravelcontainer.config.immutable-host-mounts"
 	// ManagedCoWHostMountsAnnotation records host binds with branch-local

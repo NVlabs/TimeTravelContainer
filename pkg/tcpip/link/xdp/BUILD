@@ -1,5 +1,5 @@
 load("//pkg/sync/locking:locking.bzl", "declare_rwmutex")
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -17,8 +17,10 @@ go_library(
     name = "xdp",
     srcs = [
         "endpoint.go",
+        "endpoint_darwin.go",
         "endpoint_mutex.go",
     ],
+    force_add_state_pkg = True,
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/buffer",
@@ -30,9 +32,8 @@ go_library(
         "//pkg/tcpip/link/qdisc/fifo",
         "//pkg/tcpip/link/stopfd",
         "//pkg/tcpip/stack",
-        "//pkg/xdp",
         "@org_golang_x_sys//unix:go_default_library",
-    ],
+    ] + select_system(linux = ["//pkg/xdp"]),
 )
 
 go_test(

@@ -82,6 +82,11 @@ const (
 	// repository directories donated to the Sentry.
 	AnnotationTTCVolumeRepositories = "dev.timetravelcontainer.volume-repositories"
 
+	// AnnotationTTCInternalMounts lists bind-mount destinations generated and
+	// owned by TTC. Portable TTC checkpoints snapshot and rehome these paths;
+	// the annotation must never be applied to user-provided host mounts.
+	AnnotationTTCInternalMounts = "dev.timetravelcontainer.config.internal-mounts"
+
 	// AnnotationTTCMemoryFile identifies obsolete pathname-backed application
 	// memory created by older TTC versions. It is retained only so upgraded
 	// bundles can discard it safely; runtimes must never open the path.
@@ -132,7 +137,7 @@ const (
 
 // ExePath must point to runsc binary, which is normally the same binary. It's
 // changed in tests that aren't linked in the same binary.
-var ExePath = "/proc/self/exe"
+var ExePath = hostExecutablePath()
 
 // Version is the supported spec version.
 var Version = specs.Version
@@ -705,42 +710,7 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 // As the name implies, `pid` must not be a child of the current process.
 // Returns immediately if the process does not exist.
 func WaitForNonChildExit(pid int, timeout time.Duration) error {
-	if pid <= 0 {
-		return fmt.Errorf("invalid pid: %d", pid)
-	}
-	pidfd, err := unix.PidfdOpen(pid, 0)
-	if err == unix.ESRCH {
-		return nil // Already gone.
-	}
-	if err != nil {
-		// pidfd_open failed (Linux < 5.3). Fall back to polling.
-		b := backoff.WithMaxRetries(backoff.NewConstantBackOff(10*time.Millisecond), uint64(timeout/(10*time.Millisecond)))
-		return backoff.Retry(func() error {
-			if err := unix.Kill(pid, 0); err == nil {
-				return fmt.Errorf("process %d is still running", pid)
-			}
-			return nil
-		}, b)
-	}
-	defer unix.Close(pidfd)
-	deadline := time.Now().Add(timeout)
-	for {
-		timeoutMS := int(time.Until(deadline).Milliseconds())
-		if timeoutMS <= 0 {
-			return fmt.Errorf("process %d is still running after %v", pid, timeout)
-		}
-		pfds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
-		n, err := unix.Poll(pfds, timeoutMS)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("polling pidfd for process %d: %v", pid, err)
-		}
-		if n > 0 {
-			return nil // The pidfd becomes "readable" when the process exits.
-		}
-	}
+	return waitForNonChildExit(pid, timeout)
 }
 
 // OpenDebugLogFile opens a log file using 'logPattern' as location. If 'logPattern'
@@ -898,33 +868,7 @@ type ErrSymlinkMount struct {
 // normal case with a destination consisting of a known root (/proc/root) and
 // symlink-free path (from resolveSymlink).
 func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) error {
-	// Open the destination.
-	fd, err := unix.Open(dst, unix.O_PATH|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("failed to safely mount: Open(%s, _, _): %w", dst, err)
-	}
-	defer unix.Close(fd)
-
-	// Use /proc/self/fd/ to verify that we opened the intended destination. This
-	// guards against dst being a symlink, in which case we could accidentally
-	// mount over the symlink's target.
-	if procPath == "" {
-		procPath = "/proc"
-	}
-	safePath := filepath.Join(procPath, "self/fd", strconv.Itoa(fd))
-	target, err := os.Readlink(safePath)
-	if err != nil {
-		return fmt.Errorf("failed to safely mount: Readlink(%s): %w", safePath, err)
-	}
-	if dst != target {
-		return &ErrSymlinkMount{fmt.Errorf("failed to safely mount: expected to open %s, but found %s", dst, target)}
-	}
-
-	mountErr := unix.Mount(src, safePath, fstype, flags, data)
-	if mountErr != nil {
-		return fmt.Errorf("mount(%q, %q, %q, %#x, %q) failed: %w", src, safePath, fstype, flags, data, mountErr)
-	}
-	return nil
+	return safeMount(src, dst, fstype, flags, data, procPath)
 }
 
 // RetryEintr retries the function until an error different than EINTR is
@@ -940,11 +884,7 @@ func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
 
 // GetOOMScoreAdj reads the given process' oom_score_adj
 func GetOOMScoreAdj(pid int) (int, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
+	return hostOOMScoreAdj(pid)
 }
 
 // EnvVar looks for a variable value in the env slice assuming the following

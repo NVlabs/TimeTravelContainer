@@ -51,6 +51,8 @@ go_library(
         "common.go",
         "common_unsafe.go",
         "destinationfile_atomicptrmap_unsafe.go",
+        "host_ops_darwin.go",
+        "host_ops_linux.go",
         "server.go",
         "sourcefile_atomicptrmap_unsafe.go",
         "stateipc.go",

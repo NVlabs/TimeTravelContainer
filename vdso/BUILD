@@ -31,7 +31,16 @@ genrule(
     outs = [
         "vdso.so",
     ],
-    cmd = "$(CC) $(CC_FLAGS) " +
+    cmd = "if [ \"$$(uname -s)\" = Darwin ]; then " +
+          "$(location //vdso/minimal:minimal_vdso) " +
+          select_arch(
+              amd64 = "-arch=amd64 ",
+              arm64 = "-arch=arm64 ",
+              no_match_error = "unsupported architecture",
+          ) +
+          "-output=$(location vdso.so); " +
+          "else " +
+          "$(CC) $(CC_FLAGS) " +
           "-I. " +
           "-O2 " +
           "-std=c++11 " +
@@ -55,12 +64,14 @@ genrule(
           ) +
           "-o $(location vdso.so) " +
           "$(location vdso.cc) " +
-          "$(location vdso_time.cc)",
+          "$(location vdso_time.cc); " +
+          "fi",
     features = ["-pie"],
     toolchains = [
         cc_toolchain,
         ":no_pie_cc_flags",
     ],
+    tools = ["//vdso/minimal:minimal_vdso"],
     visibility = ["//:sandbox"],
 )
 

@@ -82,7 +82,7 @@ func (h *handle) allocate(ctx context.Context, mode, offset, length uint64) erro
 		return h.fdLisa.Allocate(ctx, mode, offset, length)
 	}
 	if h.fd >= 0 {
-		return unix.Fallocate(int(h.fd), uint32(mode), int64(offset), int64(length))
+		return directfsFallocate(int(h.fd), uint32(mode), int64(offset), int64(length))
 	}
 	return nil
 }
@@ -105,7 +105,7 @@ func (h *handle) sync(ctx context.Context) error {
 func (h *handle) syncData(ctx context.Context) error {
 	if h.fd >= 0 {
 		ctx.UninterruptibleSleepStart()
-		err := unix.Fdatasync(int(h.fd))
+		err := goferDataSync(int(h.fd))
 		ctx.UninterruptibleSleepFinish()
 		return err
 	}

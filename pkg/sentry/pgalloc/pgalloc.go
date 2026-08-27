@@ -242,6 +242,12 @@ type MemoryFile struct {
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
+	// backing is an optional platform-owned replacement for file. It provides
+	// stable host mappings while allowing a VM platform to associate every
+	// logical 4 KiB page with guest RAM. It is recreated with the platform and
+	// is never checkpointed.
+	backing Backing `state:"nosave"`
+
 	// chunks holds metadata for each usable chunk in the backing file.
 	//
 	// chunks is at the end of MemoryFile in hopes of placing it on a relatively
@@ -304,9 +310,13 @@ func (f *MemoryFile) unregisterRemoteSnapshot(snapshot *RemoteSnapshot) {
 
 const (
 	chunkShift = 30
-	chunkSize  = 1 << chunkShift // 1 GB
-	chunkMask  = chunkSize - 1
-	maxChunks  = math.MaxInt64 / chunkSize // because file size is int64
+	// BackingChunkSize is the size of each stable host mapping requested from
+	// Backing. It is exported so platform providers can reserve matching
+	// virtual-address regions without depending on pgalloc internals.
+	BackingChunkSize = 1 << chunkShift // 1 GB
+	chunkSize        = BackingChunkSize
+	chunkMask        = chunkSize - 1
+	maxChunks        = math.MaxInt64 / chunkSize // because file size is int64
 )
 
 // chunkInfo is the value type of MemoryFile.chunks.
@@ -656,6 +666,11 @@ type evictableMemoryUserInfo struct {
 
 // MemoryFileOpts provides options to NewMemoryFile.
 type MemoryFileOpts struct {
+	// BackingProvider supplies platform-owned storage instead of a host file.
+	// VM platforms use this to make GuestRAM the coherent data plane. If this
+	// is non-nil, the file argument to NewMemoryFile must be nil.
+	BackingProvider BackingProvider `state:"nosave"`
+
 	// DelayedEviction controls the extent to which the MemoryFile may delay
 	// eviction of evictable allocations.
 	DelayedEviction DelayedEvictionType
@@ -747,13 +762,29 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		return nil, fmt.Errorf("invalid MemoryFileOpts.DelayedEviction: %v", opts.DelayedEviction)
 	}
 
-	// Truncate the file to 0 bytes first to ensure that it's empty.
-	if err := file.Truncate(0); err != nil {
-		return nil, err
+	var backing Backing
+	if opts.BackingProvider != nil {
+		if file != nil {
+			return nil, fmt.Errorf("pgalloc backing provider cannot be combined with a host file")
+		}
+		var err error
+		backing, err = opts.BackingProvider.NewBacking()
+		if err != nil {
+			return nil, fmt.Errorf("creating pgalloc backing: %w", err)
+		}
+	} else {
+		if file == nil {
+			return nil, fmt.Errorf("pgalloc MemoryFile requires a host file or backing provider")
+		}
+		// Truncate the file to 0 bytes first to ensure that it's empty.
+		if err := file.Truncate(0); err != nil {
+			return nil, err
+		}
 	}
 	f := &MemoryFile{
-		opts: opts,
-		file: file,
+		opts:    opts,
+		file:    file,
+		backing: backing,
 	}
 	f.initFields()
 
@@ -774,7 +805,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 
 	go f.releaserMain() // S/R-SAFE: f.mu
 
-	if !opts.DisableIMAWorkAround {
+	if file != nil && !opts.DisableIMAWorkAround {
 		IMAWorkAroundForMemFile(file.Fd())
 	}
 	return f, nil
@@ -874,6 +905,18 @@ func (f *MemoryFile) Destroy() {
 func (f *MemoryFile) releaserDestroyLocked() {
 	if !f.destroyed {
 		panic("destroyed is no longer set")
+	}
+
+	if f.backing != nil {
+		if err := f.backing.Destroy(); err != nil {
+			log.Warningf("Failed to destroy platform MemoryFile backing: %v", err)
+		}
+		f.backing = nil
+		chunks := f.chunksLoad()
+		for i := range chunks {
+			chunks[i].mapping = 0
+		}
+		return
 	}
 
 	if f.opts.DecommitOnDestroy {
@@ -1007,7 +1050,15 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 		return fr, err
 	}
 
-	var dsts safemem.BlockSeq
+	var (
+		dsts         safemem.BlockSeq
+		mappingLease memmap.InternalMappingLease
+	)
+	defer func() {
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
+	}()
 	if alloc.willCommit {
 		needHugeTouch := false
 		if alloc.recycled {
@@ -1058,7 +1109,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 				return memmap.FileRange{}, err
 			}
 		case AllocateAndWritePopulate:
-			dsts, err = f.MapInternal(fr, hostarch.Write)
+			dsts, mappingLease, err = f.MapInternalWithLease(fr, hostarch.Write)
 			if err != nil {
 				f.DecRef(fr)
 				return memmap.FileRange{}, err
@@ -1076,14 +1127,18 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			if alloc.recycled {
 				// The contents of recycled waste pages are initially unknown, so we
 				// need to zero them.
-				f.manuallyZero(fr)
+				if _, err := safemem.ZeroSeq(dsts); err != nil {
+					f.DecRef(fr)
+					return memmap.FileRange{}, err
+				}
 			} else if needHugeTouch {
 				// We only need to touch a single byte in each huge page.
-				f.forEachMappingSlice(fr, func(bs []byte) {
+				for rem := dsts; !rem.IsEmpty(); rem = rem.Tail() {
+					bs := rem.Head().ToSlice()
 					for i := 0; i < len(bs); i += hostarch.HugePageSize {
 						bs[i] = 0
 					}
-				})
+				}
 			}
 		default:
 			panic(fmt.Sprintf("unknown AllocOpts.Mode %d", alloc.opts.Mode))
@@ -1091,7 +1146,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 	}
 	if alloc.opts.ReaderFunc != nil {
 		if dsts.IsEmpty() {
-			dsts, err = f.MapInternal(fr, hostarch.Write)
+			dsts, mappingLease, err = f.MapInternalWithLease(fr, hostarch.Write)
 			if err != nil {
 				f.DecRef(fr)
 				return memmap.FileRange{}, err
@@ -1266,8 +1321,20 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	// mm/shmem.c:shmem_get_unmapped_area().
 	//
 	// In tests, f.file may be nil.
-	var mapStart uintptr
-	if f.file != nil {
+	var (
+		mapStart        uintptr
+		backingMappings []uintptr
+	)
+	if f.backing != nil {
+		var err error
+		backingMappings, err = f.backing.Grow(oldFileSize, newFileSize, alloc.huge)
+		if err != nil {
+			return err
+		}
+		if got, want := len(backingMappings), int(incNrChunks); got != want {
+			return fmt.Errorf("platform backing returned %d chunk mappings, want %d", got, want)
+		}
+	} else if f.file != nil {
 		if err := f.file.Truncate(int64(newFileSize)); err != nil {
 			return err
 		}
@@ -1292,7 +1359,9 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	m := mapStart
 	for i := oldNrChunks; i < newNrChunks; i++ {
 		newChunks[i].huge = alloc.huge
-		if f.file != nil {
+		if f.backing != nil {
+			newChunks[i].mapping = backingMappings[i-oldNrChunks]
+		} else if f.file != nil {
 			newChunks[i].mapping = m
 			m += chunkSize
 		}
@@ -1309,54 +1378,13 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 }
 
 func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
-	if huge {
-		if f.opts.AdviseHugepage {
-			_, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, len, unix.MADV_HUGEPAGE)
-			if errno != 0 {
-				// Log this failure but continue.
-				log.Warningf("madvise(%#x, %d, MADV_HUGEPAGE) failed: %s", addr, len, errno)
-			}
-		}
-	} else {
-		if f.opts.AdviseNoHugepage {
-			_, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, len, unix.MADV_NOHUGEPAGE)
-			if errno != 0 {
-				// Log this failure but continue.
-				log.Warningf("madvise(%#x, %d, MADV_NOHUGEPAGE) failed: %s", addr, len, errno)
-			}
-		}
-	}
+	adviseChunkMapping(addr, len, huge, f.opts.AdviseHugepage, f.opts.AdviseNoHugepage)
 }
 
 var mlockDisabled atomicbitops.Uint32
-var madvPopulateWriteDisabled atomicbitops.Uint32
 
 func canPopulate() bool {
-	return mlockDisabled.Load() == 0 || madvPopulateWriteDisabled.Load() == 0
-}
-
-func tryPopulateMadv(b safemem.Block) bool {
-	if madvPopulateWriteDisabled.Load() != 0 {
-		return false
-	}
-	// Only call madvise(MADV_POPULATE_WRITE) if >=2 pages are being populated.
-	// 1 syscall overhead >= 1 page fault overhead. This is because syscalls are
-	// susceptible to additional overheads like seccomp-bpf filters and auditing.
-	if b.Len() <= hostarch.PageSize {
-		return true
-	}
-	_, _, errno := unix.Syscall(unix.SYS_MADVISE, b.Addr(), uintptr(b.Len()), unix.MADV_POPULATE_WRITE)
-	if errno != 0 {
-		if errno == unix.EINVAL {
-			// EINVAL is expected if MADV_POPULATE_WRITE is not supported (Linux <5.14).
-			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
-		} else {
-			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
-		}
-		madvPopulateWriteDisabled.Store(1)
-		return false
-	}
-	return true
+	return mlockDisabled.Load() == 0 || canPopulateMadv()
 }
 
 func tryPopulateMlock(b safemem.Block) bool {
@@ -1451,30 +1479,31 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
+	if f.backing != nil {
+		return f.backing.Commit(fr)
+	}
 	// "The default operation (i.e., mode is zero) of fallocate() allocates the
 	// disk space within the range specified by offset and len." - fallocate(2)
-	return unix.Fallocate(
-		int(f.file.Fd()),
-		0, // mode
-		int64(fr.Start),
-		int64(fr.Length()))
+	return commitHostFile(int(f.file.Fd()), fr)
 }
 
 func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
+	if f.backing != nil {
+		return f.backing.Decommit(fr)
+	}
 	// "After a successful call, subsequent reads from this range will
 	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
 	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
-	return unix.Fallocate(
-		int(f.file.Fd()),
-		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
-		int64(fr.Start),
-		int64(fr.Length()))
+	return decommitHostFile(int(f.file.Fd()), fr)
 }
 
 func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
-	f.forEachMappingSlice(fr, func(bs []byte) {
+	if err := f.withMappingSlices(fr, hostarch.Write, func(bs []byte) error {
 		clear(bs)
-	})
+		return nil
+	}); err != nil {
+		log.Warningf("Failed to map %v for manual zeroing: %v", fr, err)
+	}
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
@@ -1586,6 +1615,11 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 				// Cancel any pending async load on waste pages.
 				if apl := f.asyncPageLoad.Load(); apl != nil {
 					apl.cancelWasteLoad(wasteFR)
+				}
+				if apls := f.sparseAsyncLoads.Load(); apls != nil {
+					for _, apl := range *apls {
+						apl.cancelWasteLoad(wasteFR)
+					}
 				}
 			}
 			return true
@@ -1798,7 +1832,13 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 			}
 		}
 	}
+	if f.backing != nil {
+		return safemem.BlockSeq{}, fmt.Errorf("platform MemoryFile mappings require a relocation lease")
+	}
+	return f.mapInternalNoWait(fr)
+}
 
+func (f *MemoryFile) mapInternalNoWait(fr memmap.FileRange) (safemem.BlockSeq, error) {
 	chunks := ((fr.End + chunkMask) / chunkSize) - (fr.Start / chunkSize)
 	if chunks == 1 {
 		// Avoid an unnecessary slice allocation.
@@ -1815,6 +1855,93 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 	return safemem.BlockSeqFromSlice(blocks), nil
 }
 
+// MapInternalWithLease implements memmap's optional leaseable mapping
+// interface. Platform-backed mappings must use this form outside of PMA
+// caches so GuestRAM can wait for all Sentry host accesses before relocating
+// frames.
+func (f *MemoryFile) MapInternalWithLease(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, memmap.InternalMappingLease, error) {
+	if err := f.awaitInternalMappingLoads(fr, at); err != nil {
+		return safemem.BlockSeq{}, nil, err
+	}
+	return f.mapInternalWithLeaseNoWait(fr, at)
+}
+
+// mapInternalWithLeaseNoWait is used by asynchronous page loaders after they
+// have committed and exclusively claimed the destination range. Unlike the
+// public mapping methods, it must not wait for that same load to complete.
+func (f *MemoryFile) mapInternalWithLeaseNoWait(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, memmap.InternalMappingLease, error) {
+	if f.backing == nil {
+		blocks, err := f.mapInternalNoWait(fr)
+		return blocks, nil, err
+	}
+	aligned, err := pageAlignFileRange(fr)
+	if err != nil {
+		return safemem.BlockSeq{}, nil, err
+	}
+	frames, lease, err := f.backing.AcquireMapping(aligned, at)
+	if err != nil {
+		return safemem.BlockSeq{}, nil, err
+	}
+	blocks, err := blockSeqFromBackingFrames(fr, aligned.Start, frames)
+	if err != nil {
+		lease.Release()
+		return safemem.BlockSeq{}, nil, err
+	}
+	return blocks, lease, nil
+}
+
+// MapInternalForPMA implements memmap's PMA-only mapping interface. PMA
+// mappings are invalidated by the family compaction coordinator while every
+// MemoryManager is quiescent, so they do not hold a long-lived GuestRAM lease.
+func (f *MemoryFile) MapInternalForPMA(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if f.backing == nil {
+		return f.MapInternal(fr, at)
+	}
+	if err := f.awaitInternalMappingLoads(fr, at); err != nil {
+		return safemem.BlockSeq{}, err
+	}
+	aligned, err := pageAlignFileRange(fr)
+	if err != nil {
+		return safemem.BlockSeq{}, err
+	}
+	frames, err := f.backing.ResolveFrames(aligned, at)
+	if err != nil {
+		return safemem.BlockSeq{}, err
+	}
+	return blockSeqFromBackingFrames(fr, aligned.Start, frames)
+}
+
+func (f *MemoryFile) awaitInternalMappingLoads(fr memmap.FileRange, at hostarch.AccessType) error {
+	if !fr.WellFormed() || fr.Length() == 0 {
+		panic(fmt.Sprintf("invalid range: %v", fr))
+	}
+	if at.Execute {
+		return linuxerr.EACCES
+	}
+	if amfl := f.asyncPageLoad.Load(); amfl != nil {
+		if err := amfl.awaitLoad(fr); err != nil {
+			return err
+		}
+	}
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			if err := amfl.awaitLoad(fr); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func pageAlignFileRange(fr memmap.FileRange) (memmap.FileRange, error) {
+	start := fr.Start &^ uint64(hostarch.PageSize-1)
+	if fr.End > math.MaxUint64-uint64(hostarch.PageSize-1) {
+		return memmap.FileRange{}, fmt.Errorf("mapping range %v cannot be page-aligned", fr)
+	}
+	end := (fr.End + uint64(hostarch.PageSize-1)) &^ uint64(hostarch.PageSize-1)
+	return memmap.FileRange{Start: start, End: end}, nil
+}
+
 // forEachMappingSlice invokes fn on a sequence of byte slices that
 // collectively map all bytes in fr.
 func (f *MemoryFile) forEachMappingSlice(fr memmap.FileRange, fn func([]byte)) {
@@ -1822,6 +1949,39 @@ func (f *MemoryFile) forEachMappingSlice(fr memmap.FileRange, fn func([]byte)) {
 		fn(chunk.sliceAt(chunkFR))
 		return true
 	})
+}
+
+// withMappingSlices invokes fn for host mappings of fr while holding any
+// relocation lease required by the platform backing. Slices must not escape
+// fn or remain in use after this method returns.
+func (f *MemoryFile) withMappingSlices(fr memmap.FileRange, at hostarch.AccessType, fn func([]byte) error) error {
+	blocks, lease, err := f.MapInternalWithLease(fr, at)
+	return withMappedBlockSlices(blocks, lease, err, fn)
+}
+
+func (f *MemoryFile) withMappingSlicesNoWait(fr memmap.FileRange, at hostarch.AccessType, fn func([]byte) error) error {
+	blocks, lease, err := f.mapInternalWithLeaseNoWait(fr, at)
+	return withMappedBlockSlices(blocks, lease, err, fn)
+}
+
+func withMappedBlockSlices(blocks safemem.BlockSeq, lease memmap.InternalMappingLease, mappingErr error, fn func([]byte) error) error {
+	if mappingErr != nil {
+		return mappingErr
+	}
+	if lease != nil {
+		defer lease.Release()
+	}
+	for !blocks.IsEmpty() {
+		block := blocks.Head()
+		if block.NeedSafecopy() {
+			return fmt.Errorf("platform MemoryFile mapping unexpectedly requires safecopy")
+		}
+		if err := fn(block.ToSlice()); err != nil {
+			return err
+		}
+		blocks = blocks.Tail()
+	}
+	return nil
 }
 
 // MarkEvictable allows f to request memory deallocation by calling
@@ -2133,6 +2293,9 @@ func (updateUsageDuringSaveErr) Error() string {
 // Mapped (which is external to MemoryFile). This is generally much cheaper
 // than UpdateUsage, but will not provide a fine-grained breakdown.
 func (f *MemoryFile) TotalUsage() (uint64, error) {
+	if f.backing != nil {
+		return f.backing.TotalUsage()
+	}
 	// Stat the underlying file to discover the underlying usage. stat(2)
 	// always reports the allocated block count in units of 512 bytes. This
 	// includes pages in the page cache and swapped pages.
@@ -2169,11 +2332,17 @@ func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
 			}
 		}
 	}
+	if f.backing != nil {
+		return f.backing.DataFD(fr)
+	}
 	return f.FD(), nil
 }
 
 // FD implements memmap.File.FD.
 func (f *MemoryFile) FD() int {
+	if f.file == nil {
+		return -1
+	}
 	return int(f.file.Fd())
 }
 
@@ -2203,10 +2372,13 @@ func (f *MemoryFile) SyncAndDropUniqueCache(candidates []memmap.FileRange) error
 // syncAndDropCache evicts candidate subranges only when their complete
 // MemoryFile reference count is accounted for by dehydration reservations.
 func (f *MemoryFile) syncAndDropCache(candidates []cacheDropCandidate) error {
-	if f.file == nil {
-		return fmt.Errorf("MemoryFile has no backing file")
-	}
-	if err := f.file.Sync(); err != nil {
+	if f.backing != nil {
+		if err := f.backing.Sync(); err != nil {
+			return fmt.Errorf("syncing platform MemoryFile backing: %w", err)
+		}
+	} else if f.file == nil {
+		return fmt.Errorf("MemoryFile has no backing")
+	} else if err := f.file.Sync(); err != nil {
 		return fmt.Errorf("syncing MemoryFile: %w", err)
 	}
 	var unique []memmap.FileRange
@@ -2233,6 +2405,14 @@ func (f *MemoryFile) syncAndDropCache(candidates []cacheDropCandidate) error {
 		})
 	}
 	f.mu.Unlock()
+	if f.backing != nil {
+		for _, fr := range unique {
+			if err := f.backing.DropCache(fr); err != nil {
+				return fmt.Errorf("dropping platform MemoryFile cache for %v: %w", fr, err)
+			}
+		}
+		return nil
+	}
 	for _, fr := range unique {
 		var dropErr error
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {

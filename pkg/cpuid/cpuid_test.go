@@ -15,10 +15,15 @@
 package cpuid
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"math/rand"
 	"os"
+	"runtime"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 func TestFeatureFromString(t *testing.T) {
@@ -80,14 +85,40 @@ func TestReadHwCap(t *testing.T) {
 		t.Errorf("c.hwCap1 got %d, want %d", c.hwCap1, hwCap1Val)
 	}
 	if c.hwCap2 != hwCap2Val {
-		t.Errorf("c.hwCap2 got %d, want %d", c.hwCap1, hwCap1Val)
+		t.Errorf("c.hwCap2 got %d, want %d", c.hwCap2, hwCap2Val)
 	}
 }
 
 func TestReadingSelfProcAuxv(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/proc/self/auxv is Linux-specific")
+	}
 	_, err := readHWCap("/proc/self/auxv")
 	if err != nil {
 		t.Errorf("got %v, expected nil", err)
+	}
+}
+
+func TestFeatureSetStateRoundTripIncludesHWCap(t *testing.T) {
+	source := &FeatureSet{
+		hwCap:      hwCap{hwCap1: 0x123456789abcdef0, hwCap2: 0xfedcba9876543210},
+		cpuFreqMHz: 2400,
+		cpuImplHex: 0x61,
+		cpuArchDec: 8,
+		cpuVarHex:  2,
+		cpuPartHex: 0x23,
+		cpuRevDec:  1,
+	}
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, source); err != nil {
+		t.Fatalf("saving FeatureSet: %v", err)
+	}
+	restored := &FeatureSet{}
+	if _, err := state.Load(context.Background(), bytes.NewReader(image.Bytes()), restored); err != nil {
+		t.Fatalf("loading FeatureSet: %v", err)
+	}
+	if *restored != *source {
+		t.Fatalf("restored FeatureSet = %+v, want %+v", *restored, *source)
 	}
 }
 

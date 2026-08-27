@@ -77,22 +77,6 @@ func (v *virtualOwner) atomicMode() uint32 {
 	return v.mode.Load()
 }
 
-func isEpollable(fd int) bool {
-	epollfd, err := unix.EpollCreate1(0)
-	if err != nil {
-		// This shouldn't happen. If it does, just say file doesn't support epoll.
-		return false
-	}
-	defer unix.Close(epollfd)
-
-	event := unix.EpollEvent{
-		Fd:     int32(fd),
-		Events: unix.EPOLLIN,
-	}
-	err = unix.EpollCtl(epollfd, unix.EPOLL_CTL_ADD, fd, &event)
-	return err == nil
-}
-
 // inode implements kernfs.Inode.
 //
 // +stateify savable
@@ -201,7 +185,7 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, res
 	seekable := !linuxerr.Equals(linuxerr.ESPIPE, err)
 	// We expect regular files to be seekable, as this is required for them to
 	// be memory-mappable.
-	if !seekable && fileType == unix.S_IFREG {
+	if !seekable && fileType == linux.S_IFREG {
 		ctx.Infof("host.newInode: host FD %d is a non-seekable regular file", hostFD)
 		return nil, linuxerr.ESPIPE
 	}
@@ -317,7 +301,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	fileType := linux.FileMode(stat.Mode).FileType()
-	if fileType == 0 && isHostEventFdDevice(stat.Dev) {
+	if fileType == 0 && isHostEventFdDevice(uint64(stat.Dev)) {
 		// This is an event fd. No inode needed.
 		vfsObj := mnt.Filesystem().VirtualFilesystem()
 		return eventfd.NewFromHost(ctx, vfsObj, hostFD, flags)
@@ -330,7 +314,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 		i.virtualOwner.enabled = true
 		i.virtualOwner.uid = atomicbitops.FromUint32(uint32(opts.UID))
 		i.virtualOwner.gid = atomicbitops.FromUint32(uint32(opts.GID))
-		i.virtualOwner.mode = atomicbitops.FromUint32(stat.Mode)
+		i.virtualOwner.mode = atomicbitops.FromUint32(uint32(stat.Mode))
 	}
 	i.restorable = opts.Restorable
 
@@ -450,122 +434,39 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 		return linux.Statx{}, linuxerr.EINVAL
 	}
 
-	// Limit our host call only to known flags.
-	mask := opts.Mask & linux.STATX_ALL
-	var s unix.Statx_t
-	err := unix.Statx(i.hostFD, "", int(unix.AT_EMPTY_PATH|opts.Sync), int(mask), &s)
-	if linuxerr.Equals(linuxerr.ENOSYS, err) {
-		// Fallback to fstat(2), if statx(2) is not supported on the host.
-		//
-		// TODO(b/151263641): Remove fallback.
-		return i.statxFromStat(i.devMinor)
-	}
+	ls, err := hostStatx(i.hostFD, opts.Mask&linux.STATX_ALL, opts.Sync)
 	if err != nil {
 		return linux.Statx{}, err
 	}
 
-	// Unconditionally fill blksize, attributes, and device numbers, as
-	// indicated by /include/uapi/linux/stat.h. Inode number is always
-	// available, since we use our own rather than the host's.
-	ls := linux.Statx{
-		Mask:           linux.STATX_INO,
-		Blksize:        s.Blksize,
-		Attributes:     s.Attributes,
-		Ino:            i.ino,
-		AttributesMask: s.Attributes_mask,
-		DevMajor:       linux.UNNAMED_MAJOR,
-		DevMinor:       i.devMinor,
-	}
-
-	// Copy other fields that were returned by the host. RdevMajor/RdevMinor
-	// are never copied (and therefore left as zero), so as not to expose host
-	// device numbers.
-	ls.Mask |= s.Mask & linux.STATX_ALL
-	if s.Mask&linux.STATX_TYPE != 0 {
+	// Never expose host inode, device, or represented-device numbers.
+	ls.Mask |= linux.STATX_INO
+	ls.Ino = i.ino
+	ls.DevMajor = linux.UNNAMED_MAJOR
+	ls.DevMinor = i.devMinor
+	ls.RdevMajor = 0
+	ls.RdevMinor = 0
+	if ls.Mask&linux.STATX_TYPE != 0 {
 		if i.virtualOwner.enabled {
-			ls.Mode |= uint16(i.virtualOwner.atomicMode()) & linux.S_IFMT
-		} else {
-			ls.Mode |= s.Mode & linux.S_IFMT
+			ls.Mode = (ls.Mode &^ linux.S_IFMT) | (uint16(i.virtualOwner.atomicMode()) & linux.S_IFMT)
 		}
 	}
-	if s.Mask&linux.STATX_MODE != 0 {
+	if ls.Mask&linux.STATX_MODE != 0 {
 		if i.virtualOwner.enabled {
-			ls.Mode |= uint16(i.virtualOwner.atomicMode()) &^ linux.S_IFMT
-		} else {
-			ls.Mode |= s.Mode &^ linux.S_IFMT
+			ls.Mode = (ls.Mode & linux.S_IFMT) | (uint16(i.virtualOwner.atomicMode()) &^ linux.S_IFMT)
 		}
 	}
-	if s.Mask&linux.STATX_NLINK != 0 {
-		ls.Nlink = s.Nlink
-	}
-	if s.Mask&linux.STATX_UID != 0 {
+	if ls.Mask&linux.STATX_UID != 0 {
 		if i.virtualOwner.enabled {
 			ls.UID = i.virtualOwner.atomicUID()
-		} else {
-			ls.UID = s.Uid
 		}
 	}
-	if s.Mask&linux.STATX_GID != 0 {
+	if ls.Mask&linux.STATX_GID != 0 {
 		if i.virtualOwner.enabled {
 			ls.GID = i.virtualOwner.atomicGID()
-		} else {
-			ls.GID = s.Gid
 		}
 	}
-	if s.Mask&linux.STATX_ATIME != 0 {
-		ls.Atime = unixToLinuxStatxTimestamp(s.Atime)
-	}
-	if s.Mask&linux.STATX_BTIME != 0 {
-		ls.Btime = unixToLinuxStatxTimestamp(s.Btime)
-	}
-	if s.Mask&linux.STATX_CTIME != 0 {
-		ls.Ctime = unixToLinuxStatxTimestamp(s.Ctime)
-	}
-	if s.Mask&linux.STATX_MTIME != 0 {
-		ls.Mtime = unixToLinuxStatxTimestamp(s.Mtime)
-	}
-	if s.Mask&linux.STATX_SIZE != 0 {
-		ls.Size = s.Size
-	}
-	if s.Mask&linux.STATX_BLOCKS != 0 {
-		ls.Blocks = s.Blocks
-	}
-
 	return ls, nil
-}
-
-// statxFromStat is a best-effort fallback for inode.Stat() if the host does not
-// support statx(2).
-//
-// We ignore the mask and sync flags in opts and simply supply
-// STATX_BASIC_STATS, as fstat(2) itself does not allow the specification
-// of a mask or sync flags. fstat(2) does not provide any metadata
-// equivalent to Statx.Attributes, Statx.AttributesMask, or Statx.Btime, so
-// those fields remain empty.
-func (i *inode) statxFromStat(devMinor uint32) (linux.Statx, error) {
-	var s unix.Stat_t
-	if err := i.stat(&s); err != nil {
-		return linux.Statx{}, err
-	}
-
-	// As with inode.Stat(), we always use internal device and inode numbers,
-	// and never expose the host's represented device numbers.
-	return linux.Statx{
-		Mask:     linux.STATX_BASIC_STATS,
-		Blksize:  uint32(s.Blksize),
-		Nlink:    uint32(s.Nlink),
-		UID:      s.Uid,
-		GID:      s.Gid,
-		Mode:     uint16(s.Mode),
-		Ino:      i.ino,
-		Size:     uint64(s.Size),
-		Blocks:   uint64(s.Blocks),
-		Atime:    timespecToStatxTimestamp(s.Atim),
-		Ctime:    timespecToStatxTimestamp(s.Ctim),
-		Mtime:    timespecToStatxTimestamp(s.Mtim),
-		DevMajor: linux.UNNAMED_MAJOR,
-		DevMinor: devMinor,
-	}, nil
 }
 
 func (i *inode) stat(stat *unix.Stat_t) error {
@@ -573,9 +474,7 @@ func (i *inode) stat(stat *unix.Stat_t) error {
 		return err
 	}
 	if i.virtualOwner.enabled {
-		stat.Uid = i.virtualOwner.atomicUID()
-		stat.Gid = i.virtualOwner.atomicGID()
-		stat.Mode = i.virtualOwner.atomicMode()
+		setStatVirtualOwner(stat, i.virtualOwner.atomicUID(), i.virtualOwner.atomicGID(), i.virtualOwner.atomicMode())
 	}
 	return nil
 }
@@ -649,11 +548,7 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		}
 	}
 	if m&(linux.STATX_ATIME|linux.STATX_MTIME) != 0 {
-		ts := [2]unix.Timespec{
-			toTimespec(s.Atime, m&linux.STATX_ATIME == 0),
-			toTimespec(s.Mtime, m&linux.STATX_MTIME == 0),
-		}
-		if err := setTimestamps(i.hostFD, &ts); err != nil {
+		if err := setTimestamps(i.hostFD, s.Atime, m&linux.STATX_ATIME == 0, s.Mtime, m&linux.STATX_MTIME == 0); err != nil {
 			return err
 		}
 	}
@@ -830,7 +725,7 @@ func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uin
 	if f.inode.readonly {
 		return linuxerr.EPERM
 	}
-	return unix.Fallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
+	return hostFallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -970,7 +865,7 @@ func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSeque
 				return int64(n), syncErr
 			}
 		} else if statusFlags&linux.O_DSYNC != 0 {
-			if syncErr := unix.Fdatasync(hostFD); syncErr != nil {
+			if syncErr := hostDataSync(hostFD); syncErr != nil {
 				return int64(n), syncErr
 			}
 		}
@@ -1049,7 +944,7 @@ func (f *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error 
 		return linuxerr.EPERM
 	}
 	if opts.DataOnly {
-		return unix.Fdatasync(f.inode.hostFD)
+		return hostDataSync(f.inode.hostFD)
 	}
 	return unix.Fsync(f.inode.hostFD)
 }
@@ -1154,29 +1049,4 @@ func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintp
 	}
 
 	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, sysno, args)
-}
-
-// hostEventFdDevice is the host device that host event fds are associated
-// with. It is calculated once lazily.
-var hostEventFdDevice uint64
-var hostEventFdDeviceOnce sync.Once
-
-// isHostEventFdDevice initializes hostEventFdDevice and compares it to the
-// given host device id.
-func isHostEventFdDevice(dev uint64) bool {
-	hostEventFdDeviceOnce.Do(func() {
-		efd, _, err := unix.RawSyscall(unix.SYS_EVENTFD2, 0, 0, 0)
-		if err != 0 {
-			log.Warningf("failed to create dummy eventfd: %v. Importing eventfds will fail", error(err))
-			return
-		}
-		defer unix.Close(int(efd))
-		var stat unix.Stat_t
-		if err := unix.Fstat(int(efd), &stat); err != nil {
-			log.Warningf("failed to stat dummy eventfd: %v. Importing eventfds will fail", error(err))
-			return
-		}
-		hostEventFdDevice = stat.Dev
-	})
-	return dev == hostEventFdDevice
 }

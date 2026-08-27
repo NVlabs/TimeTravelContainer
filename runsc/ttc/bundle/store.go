@@ -1816,7 +1816,11 @@ func copyHostRegularIntoRepository(repository *ttcvolume.Repository, ino uint64,
 	if err != nil {
 		return err
 	}
-	cloneErr := unix.IoctlFileClone(int(destination.Fd()), int(source.Fd()))
+	destinationPath := filepath.Join(repository.HostPath(), destination.Name())
+	destination, cloneErr := cloneOpenFile(destination, source, destinationPath)
+	if destination == nil {
+		return cloneErr
+	}
 	if cloneErr != nil {
 		if err := destination.Truncate(0); err != nil {
 			destination.Close()

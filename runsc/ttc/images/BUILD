@@ -37,6 +37,8 @@ go_test(
     srcs = [
         "images_test.go",
         "rootfs_test.go",
+        "xattr_test_darwin.go",
+        "xattr_test_linux.go",
     ],
     library = ":images",
     deps = [

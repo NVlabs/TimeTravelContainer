@@ -7,6 +7,8 @@ licenses(["notice"])
 go_library(
     name = "util",
     srcs = [
+        "host_mmap_darwin.go",
+        "host_mmap_linux.go",
         "ioctl_unsafe.go",
         "util.go",
     ],

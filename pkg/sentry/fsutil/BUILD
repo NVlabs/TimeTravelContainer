@@ -125,6 +125,8 @@ go_library(
         "mmap_file_state.go",
         "mmap_no_internal_file.go",
         "mmap_precise_file.go",
+        "mmap_precise_host_darwin.go",
+        "mmap_precise_host_linux.go",
         "mmap_unsafe.go",
         "refs_mutex.go",
         "refs_set.go",

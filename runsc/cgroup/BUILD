@@ -9,6 +9,8 @@ go_library(
     name = "cgroup",
     srcs = [
         "cgroup.go",
+        "cgroup_host_darwin.go",
+        "cgroup_host_linux.go",
         "cgroup_v2.go",
         "systemd.go",
     ],

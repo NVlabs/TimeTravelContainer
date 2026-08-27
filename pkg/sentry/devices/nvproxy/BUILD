@@ -42,6 +42,7 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "caps.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
@@ -49,6 +50,8 @@ go_library(
         "frontend_mmap_unsafe.go",
         "frontend_unsafe.go",
         "handlers.go",
+        "host_mmap_darwin.go",
+        "host_mmap_linux.go",
         "nvproxy.go",
         "nvproxy_unsafe.go",
         "object.go",
@@ -59,6 +62,7 @@ go_library(
         "save_restore.go",
         "save_restore_unsafe.go",
         "seccomp_filters.go",
+        "seccomp_filters_darwin.go",
         "uvm.go",
         "uvm_mmap.go",
         "uvm_unsafe.go",

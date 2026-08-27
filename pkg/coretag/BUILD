@@ -9,6 +9,7 @@ go_library(
     name = "coretag",
     srcs = [
         "coretag.go",
+        "coretag_darwin.go",
         "coretag_unsafe.go",
     ],
     visibility = ["//:sandbox"],

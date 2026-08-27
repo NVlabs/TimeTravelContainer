@@ -271,7 +271,7 @@ go_library(
         "cgroup_v2_mutex.go",
         "context.go",
         "distributed_fork.go",
-		"dehydrate.go",
+        "dehydrate.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
@@ -430,7 +430,7 @@ go_library(
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
-		"//pkg/sentry/ttcchunk",
+        "//pkg/sentry/ttcchunk",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",
@@ -458,7 +458,6 @@ go_test(
         "fd_table_test.go",
         "table_test.go",
         "task_test.go",
-        "timekeeper_test.go",
     ],
     library = ":kernel",
     deps = [
@@ -481,6 +480,22 @@ go_test(
 )
 
 go_test(
+    name = "timekeeper_test",
+    size = "small",
+    srcs = ["timekeeper_test.go"],
+    library = ":kernel",
+    deps = [
+        "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
+        "//pkg/memutil",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/time",
+        "//pkg/sentry/usage",
+        "//pkg/state",
+    ],
+)
+
+go_test(
     name = "live_fork_test",
     size = "small",
     srcs = ["live_fork_test.go"],
@@ -488,12 +503,12 @@ go_test(
     deps = [
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
-		"//pkg/sentry/pgalloc",
-		"//pkg/sentry/state/stateio",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/state/stateio",
         "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
-		"//pkg/sentry/ttcchunk",
-		"//pkg/sentry/ttcremote",
+        "//pkg/sentry/ttcchunk",
+        "//pkg/sentry/ttcremote",
     ],
 )
 
@@ -510,10 +525,10 @@ go_test(
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/platform/systrap",
-		"//pkg/sentry/pgalloc",
-		"//pkg/sentry/state/stateio",
+        "//pkg/sentry/pgalloc",
+        "//pkg/sentry/state/stateio",
         "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
-		"//pkg/sentry/ttcremote",
+        "//pkg/sentry/ttcremote",
     ],
 )

@@ -182,20 +182,30 @@ func (cache *fileCache) copyOnWriteLocked(ctx context.Context, fs *filesystem, m
 		if err != nil {
 			return err
 		}
-		oldIMS, err := fs.mf.MapInternal(oldRange, hostarch.Read)
+		oldIMS, oldLease, err := memmap.MapInternalWithLease(fs.mf, oldRange, hostarch.Read)
 		if err != nil {
 			fs.mf.DecRef(newRange)
 			return err
 		}
-		newIMS, err := fs.mf.MapInternal(newRange, hostarch.Write)
+		newIMS, newLease, err := memmap.MapInternalWithLease(fs.mf, newRange, hostarch.Write)
 		if err != nil {
+			if oldLease != nil {
+				oldLease.Release()
+			}
 			fs.mf.DecRef(newRange)
 			return err
 		}
-		if n, err := safemem.CopySeq(newIMS, oldIMS); err != nil || n != cowRange.Length() {
+		n, copyErr := safemem.CopySeq(newIMS, oldIMS)
+		if newLease != nil {
+			newLease.Release()
+		}
+		if oldLease != nil {
+			oldLease.Release()
+		}
+		if copyErr != nil || n != cowRange.Length() {
 			fs.mf.DecRef(newRange)
-			if err != nil {
-				return err
+			if copyErr != nil {
+				return copyErr
 			}
 			return io.ErrUnexpectedEOF
 		}
@@ -492,11 +502,14 @@ func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	var done uint64
 	for seg := cache.data.FindSegment(r.off); seg.Ok() && seg.Start() < end; seg, _ = seg.NextNonEmpty() {
 		mr := seg.Range().Intersect(memmap.MappableRange{Start: r.off, End: end})
-		ims, err := inode.fs.mf.MapInternal(seg.FileRangeOf(mr), hostarch.Read)
+		ims, mappingLease, err := memmap.MapInternalWithLease(inode.fs.mf, seg.FileRangeOf(mr), hostarch.Read)
 		if err != nil {
 			return done, err
 		}
 		n, err := safemem.CopySeq(dsts.DropFirst64(done), ims)
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
 		done += n
 		r.off += n
 		if err != nil {

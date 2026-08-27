@@ -57,7 +57,7 @@ func writev(fd int, srcs []unix.Iovec) (uint64, error) {
 
 func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	switch cmd := uintptr(args[1].Int()); cmd {
-	case unix.TIOCINQ, unix.TIOCOUTQ:
+	case linux.TIOCINQ, linux.TIOCOUTQ:
 		var val int32
 		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), cmd, uintptr(unsafe.Pointer(&val))); errno != 0 {
 			return 0, translateIOSyscallError(errno)
@@ -188,11 +188,7 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 }
 
 func accept4(fd int, addr *byte, addrlen *uint32, flags int) (int, error) {
-	afd, _, errno := unix.Syscall6(unix.SYS_ACCEPT4, uintptr(fd), uintptr(unsafe.Pointer(addr)), uintptr(unsafe.Pointer(addrlen)), uintptr(flags), 0, 0)
-	if errno != 0 {
-		return 0, translateIOSyscallError(errno)
-	}
-	return int(afd), nil
+	return hostAccept4(fd, addr, addrlen, flags)
 }
 
 func getsockopt(fd int, level, name int, opt []byte) ([]byte, error) {

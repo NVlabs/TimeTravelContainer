@@ -175,7 +175,7 @@ func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
 }
 
 func TestTimeTravelNetworkUDPNATAndHostAlias(t *testing.T) {
-	hostAddress := net.IPv4(127, 0, 0, 53)
+	hostAddress := timeTravelHostLoopbackAddress(53)
 	hostConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: hostAddress})
 	if err != nil {
 		t.Fatalf("net.ListenUDP: %v", err)

@@ -70,31 +70,31 @@ var AllowAllProtocols = -1
 // syscall filters.
 var AllowedSocketTypes = []AllowedSocketType{
 	// Family, Type, Protocol.
-	{unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_TCP},
-	{unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_UDP},
-	{unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_ICMP},
+	{linux.AF_INET, int(linux.SOCK_STREAM), linux.IPPROTO_TCP},
+	{linux.AF_INET, int(linux.SOCK_DGRAM), linux.IPPROTO_UDP},
+	{linux.AF_INET, int(linux.SOCK_DGRAM), linux.IPPROTO_ICMP},
 
-	{unix.AF_INET6, unix.SOCK_STREAM, unix.IPPROTO_TCP},
-	{unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_UDP},
-	{unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_ICMPV6},
+	{linux.AF_INET6, int(linux.SOCK_STREAM), linux.IPPROTO_TCP},
+	{linux.AF_INET6, int(linux.SOCK_DGRAM), linux.IPPROTO_UDP},
+	{linux.AF_INET6, int(linux.SOCK_DGRAM), linux.IPPROTO_ICMPV6},
 }
 
 // AllowedRawSocketTypes are the socket types which are supported by hostinet
 // with raw sockets enabled.
 var AllowedRawSocketTypes = []AllowedSocketType{
-	{unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW},
-	{unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_TCP},
-	{unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_UDP},
-	{unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP},
+	{linux.AF_INET, int(linux.SOCK_RAW), linux.IPPROTO_RAW},
+	{linux.AF_INET, int(linux.SOCK_RAW), linux.IPPROTO_TCP},
+	{linux.AF_INET, int(linux.SOCK_RAW), linux.IPPROTO_UDP},
+	{linux.AF_INET, int(linux.SOCK_RAW), linux.IPPROTO_ICMP},
 
-	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_RAW},
-	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_TCP},
-	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_UDP},
-	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6},
+	{linux.AF_INET6, int(linux.SOCK_RAW), linux.IPPROTO_RAW},
+	{linux.AF_INET6, int(linux.SOCK_RAW), linux.IPPROTO_TCP},
+	{linux.AF_INET6, int(linux.SOCK_RAW), linux.IPPROTO_UDP},
+	{linux.AF_INET6, int(linux.SOCK_RAW), linux.IPPROTO_ICMPV6},
 
 	// AF_PACKET do not allow Write or SendMsg.
-	{unix.AF_PACKET, unix.SOCK_DGRAM, AllowAllProtocols},
-	{unix.AF_PACKET, unix.SOCK_RAW, AllowAllProtocols},
+	{linux.AF_PACKET, int(linux.SOCK_DGRAM), AllowAllProtocols},
+	{linux.AF_PACKET, int(linux.SOCK_RAW), AllowAllProtocols},
 }
 
 // Socket implements socket.Socket (and by extension, vfs.FileDescriptionImpl)
@@ -314,12 +314,11 @@ func (p *socketProvider) Socket(t *kernel.Task, stypeflags linux.SockType, proto
 
 	// Conservatively ignore all flags specified by the application and add
 	// SOCK_NONBLOCK since socketOperations requires it.
-	st := int(stype) | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC
-	fd, err := unix.Socket(p.family, st, protocol)
+	fd, err := newHostSocket(p.family, int(stype), protocol)
 	if err != nil {
 		return nil, syserr.FromError(err)
 	}
-	return newSocket(t, p.family, stype, protocol, fd, uint32(stypeflags&unix.SOCK_NONBLOCK))
+	return newSocket(t, p.family, stype, protocol, fd, uint32(stypeflags&linux.SOCK_NONBLOCK))
 }
 
 // Pair implements socket.Provider.Pair.
@@ -478,7 +477,7 @@ func (s *Socket) Accept(t *kernel.Task, peerRequested bool, flags int, blocking 
 
 	// Conservatively ignore all flags specified by the application and add
 	// SOCK_NONBLOCK since socketOpsCommon requires it.
-	fd, syscallErr := accept4(s.fd, peerAddrPtr, peerAddrlenPtr, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+	fd, syscallErr := accept4(s.fd, peerAddrPtr, peerAddrlenPtr, linux.SOCK_NONBLOCK|linux.SOCK_CLOEXEC)
 	if blocking {
 		var ch chan struct{}
 		for linuxerr.Equals(linuxerr.ErrWouldBlock, syscallErr) {
@@ -492,7 +491,7 @@ func (s *Socket) Accept(t *kernel.Task, peerRequested bool, flags int, blocking 
 				s.EventRegister(&e)
 				defer s.EventUnregister(&e)
 			}
-			fd, syscallErr = accept4(s.fd, peerAddrPtr, peerAddrlenPtr, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+			fd, syscallErr = accept4(s.fd, peerAddrPtr, peerAddrlenPtr, linux.SOCK_NONBLOCK|linux.SOCK_CLOEXEC)
 		}
 	}
 
@@ -507,7 +506,7 @@ func (s *Socket) Accept(t *kernel.Task, peerRequested bool, flags int, blocking 
 		kfd  int32
 		kerr error
 	)
-	f, err := newSocket(t, s.family, s.stype, s.protocol, fd, uint32(flags&unix.SOCK_NONBLOCK))
+	f, err := newSocket(t, s.family, s.stype, s.protocol, fd, uint32(flags&linux.SOCK_NONBLOCK))
 	if err != nil {
 		_ = unix.Close(fd)
 		return 0, nil, 0, err
@@ -515,7 +514,7 @@ func (s *Socket) Accept(t *kernel.Task, peerRequested bool, flags int, blocking 
 	defer f.DecRef(t)
 
 	kfd, kerr = t.NewFDFrom(0, f, kernel.FDFlags{
-		CloseOnExec: flags&unix.SOCK_CLOEXEC != 0,
+		CloseOnExec: flags&linux.SOCK_CLOEXEC != 0,
 	})
 	t.Kernel().RecordSocket(f)
 
@@ -573,7 +572,7 @@ func (s *Socket) recvMsgFromHost(iovs []unix.Iovec, flags int, senderRequested b
 	msg := unix.Msghdr{}
 	if len(iovs) > 0 {
 		msg.Iov = &iovs[0]
-		msg.Iovlen = uint64(len(iovs))
+		msg.SetIovlen(len(iovs))
 	}
 	var senderAddrBuf []byte
 	if senderRequested {
@@ -588,18 +587,18 @@ func (s *Socket) recvMsgFromHost(iovs []unix.Iovec, flags int, senderRequested b
 		}
 		controlBuf = make([]byte, controlLen)
 		msg.Control = &controlBuf[0]
-		msg.Controllen = controlLen
+		msg.SetControllen(int(controlLen))
 	}
 	n, err := recvmsg(s.fd, &msg, sysflags)
 	if err != nil {
 		return 0 /* n */, 0 /* mFlags */, nil /* senderAddrBuf */, nil /* controlBuf */, err
 	}
-	return n, int(msg.Flags), senderAddrBuf[:msg.Namelen], controlBuf[:msg.Controllen], err
+	return n, int(msg.Flags), senderAddrBuf[:msg.Namelen], controlBuf[:int(msg.Controllen)], err
 }
 
 const allowedRecvMsgFlags = unix.MSG_CTRUNC |
 	unix.MSG_DONTWAIT |
-	unix.MSG_ERRQUEUE |
+	linux.MSG_ERRQUEUE |
 	unix.MSG_OOB |
 	unix.MSG_PEEK |
 	unix.MSG_TRUNC |
@@ -647,7 +646,7 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 	n, err := copyToDst()
 
 	// recv*(MSG_ERRQUEUE) never blocks, even without MSG_DONTWAIT.
-	if flags&(unix.MSG_DONTWAIT|unix.MSG_ERRQUEUE) == 0 {
+	if flags&(unix.MSG_DONTWAIT|linux.MSG_ERRQUEUE) == 0 {
 		for linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
 			// We only expect blocking to come from the actual syscall, in which
 			// case it can't have returned any data.
@@ -731,7 +730,7 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 				addr.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.OriginalDstAddress = &addr
 
-			case unix.IP_RECVERR:
+			case linux.IP_RECVERR:
 				var errCmsg linux.SockErrCMsgIPv4
 				errCmsg.UnmarshalBytes(unixCmsg.Data)
 				controlMessages.IP.SockErr = &errCmsg
@@ -762,7 +761,7 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 				addr.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.OriginalDstAddress = &addr
 
-			case unix.IPV6_RECVERR:
+			case linux.IPV6_RECVERR:
 				var errCmsg linux.SockErrCMsgIPv6
 				errCmsg.UnmarshalBytes(unixCmsg.Data)
 				controlMessages.IP.SockErr = &errCmsg
@@ -783,8 +782,8 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 
 const allowedSendMsgFlags = unix.MSG_DONTWAIT |
 	unix.MSG_EOR |
-	unix.MSG_FASTOPEN |
-	unix.MSG_MORE |
+	linux.MSG_FASTOPEN |
+	linux.MSG_MORE |
 	unix.MSG_NOSIGNAL |
 	unix.MSG_OOB
 
@@ -850,17 +849,15 @@ func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flag
 		}
 
 		iovs := safemem.IovecsFromBlockSeq(srcs)
-		msg := unix.Msghdr{
-			Iov:    &iovs[0],
-			Iovlen: uint64(len(iovs)),
-		}
+		msg := unix.Msghdr{Iov: &iovs[0]}
+		msg.SetIovlen(len(iovs))
 		if len(to) != 0 {
 			msg.Name = &to[0]
 			msg.Namelen = uint32(len(to))
 		}
 		if len(controlBuf) != 0 {
 			msg.Control = &controlBuf[0]
-			msg.Controllen = uint64(len(controlBuf))
+			msg.SetControllen(len(controlBuf))
 		}
 		return sendmsg(s.fd, &msg, sysflags)
 	})
@@ -912,7 +909,7 @@ func (s *Socket) State() uint32 {
 	info := linux.TCPInfo{}
 	buf := make([]byte, linux.SizeOfTCPInfo)
 	var err error
-	buf, err = getsockopt(s.fd, unix.SOL_TCP, unix.TCP_INFO, buf)
+	buf, err = getsockopt(s.fd, linux.SOL_TCP, linux.TCP_INFO, buf)
 	if err != nil {
 		if err != unix.ENOPROTOOPT {
 			log.Warningf("Failed to get TCP socket info from %+v: %v", s, err)

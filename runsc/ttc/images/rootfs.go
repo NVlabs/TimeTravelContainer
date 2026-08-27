@@ -32,7 +32,6 @@ import (
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
-	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -96,13 +95,9 @@ func materializeRootFSRecord(ctx context.Context, opts RootFSOptions, store *nat
 		return RootFSInfo{}, err
 	}
 	reference := record.Info.Reference
-	matcher := platforms.DefaultStrict()
-	if opts.Platform != "" {
-		platform, err := platforms.Parse(opts.Platform)
-		if err != nil {
-			return RootFSInfo{}, fmt.Errorf("invalid platform %q: %w", opts.Platform, err)
-		}
-		matcher = platforms.OnlyStrict(platform)
+	matcher, err := platformMatcher(opts.Platform)
+	if err != nil {
+		return RootFSInfo{}, err
 	}
 	manifest, err := containerdimages.Manifest(ctx, store.content, record.Target, matcher)
 	if err != nil {

@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -147,14 +146,14 @@ func TestApplyLayerVirtualizesXattrs(t *testing.T) {
 	if !ok || string(value) != "capability-data" {
 		t.Fatalf("virtual capability=%q, ok=%t", value, ok)
 	}
-	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !errors.Is(err, unix.ENODATA) {
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !isMissingXattr(err) {
 		t.Fatalf("physical security.capability unexpectedly exists: %v", err)
 	}
 	value, ok = manifest.LookupXattr("usr/bin/newgidmap", "user.image-metadata")
 	if !ok || string(value) != "portable-data" {
 		t.Fatalf("virtual user xattr=%q, ok=%t", value, ok)
 	}
-	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "user.image-metadata", nil); !errors.Is(err, unix.ENODATA) {
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "user.image-metadata", nil); !isMissingXattr(err) {
 		t.Fatalf("physical user.image-metadata unexpectedly exists: %v", err)
 	}
 	if _, ok := manifest.LookupXattr("replace", "security.capability"); ok {

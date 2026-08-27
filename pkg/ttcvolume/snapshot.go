@@ -310,18 +310,26 @@ func snapshotCopyFile(source, destination string, reflink bool) error {
 	}
 	keep := false
 	defer func() {
-		_ = dst.Close()
+		if dst != nil {
+			_ = dst.Close()
+		}
 		if !keep {
 			_ = os.Remove(destination)
 		}
 	}()
 	if reflink {
-		if err := unix.IoctlFileClone(int(dst.Fd()), int(src.Fd())); err == nil {
+		if cloned, err := cloneFile(src, dst, unix.AT_FDCWD, destination); err == nil {
+			dst = cloned
 			if err := dst.Sync(); err != nil {
 				return err
 			}
 			keep = true
 			return nil
+		} else {
+			dst = cloned
+			if dst == nil {
+				return err
+			}
 		}
 	}
 	if _, err := io.Copy(dst, src); err != nil {

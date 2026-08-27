@@ -16,10 +16,6 @@
 package processutil
 
 import (
-	"fmt"
-	"os"
-	"strings"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -30,22 +26,11 @@ func IsRunning(pid int) bool {
 	if pid <= 0 || unix.Kill(pid, 0) != nil {
 		return false
 	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		// The process was observable by kill(2), but procfs may be unavailable
-		// or restricted. Preserve the conservative result.
-		return true
+	if zombie, known := processZombieState(pid); known {
+		return !zombie
 	}
-	// comm is parenthesized and may itself contain spaces or ')'. The state is
-	// the byte after the final ") ".
-	end := strings.LastIndex(string(stat), ") ")
-	if end < 0 || end+2 >= len(stat) {
-		return true
-	}
-	switch stat[end+2] {
-	case 'Z', 'X', 'x':
-		return false
-	default:
-		return true
-	}
+	// The process was observable by kill(2), but the host-specific process
+	// state interface may be unavailable or restricted. Preserve the
+	// conservative result.
+	return true
 }

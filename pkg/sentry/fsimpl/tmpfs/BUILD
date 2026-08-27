@@ -88,6 +88,8 @@ go_library(
         "filesystem_mutex.go",
         "fscheckpoint.go",
         "fstree.go",
+        "host_sync_darwin.go",
+        "host_sync_linux.go",
         "inode_mutex.go",
         "inode_refs.go",
         "iter_mutex.go",

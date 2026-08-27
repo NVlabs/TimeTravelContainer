@@ -403,13 +403,16 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 		switch {
 		case seg.Ok():
 			// Get internal mappings from the cache.
-			ims, err := mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
+			ims, mappingLease, err := memmap.MapInternalWithLease(mf, seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
 			if err != nil {
 				return done, err
 			}
 
 			// Copy from internal mappings.
 			n, err := safemem.CopySeq(dsts, ims)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			done += n
 			rw.off += n
 			dsts = dsts.DropFirst64(n)
@@ -517,7 +520,7 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 		case seg.Ok():
 			// Get internal mappings from the cache.
 			segMR := seg.Range().Intersect(mr)
-			ims, err := mf.MapInternal(seg.FileRangeOf(segMR), hostarch.Write)
+			ims, mappingLease, err := memmap.MapInternalWithLease(mf, seg.FileRangeOf(segMR), hostarch.Write)
 			if err != nil {
 				retErr = err
 				goto exitLoop
@@ -525,6 +528,9 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 
 			// Copy to internal mappings.
 			n, err := safemem.CopySeq(ims, srcs)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			done += n
 			rw.off += n
 			srcs = srcs.DropFirst64(n)

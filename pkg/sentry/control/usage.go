@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -42,14 +43,19 @@ type MemoryUsageOpts struct {
 
 // MemoryUsage is a memory usage structure.
 type MemoryUsage struct {
-	Unknown   uint64 `json:"Unknown"`
-	System    uint64 `json:"System"`
-	Anonymous uint64 `json:"Anonymous"`
-	PageCache uint64 `json:"PageCache"`
-	Mapped    uint64 `json:"Mapped"`
-	Tmpfs     uint64 `json:"Tmpfs"`
-	Ramdiskfs uint64 `json:"Ramdiskfs"`
-	Total     uint64 `json:"Total"`
+	Unknown              uint64 `json:"Unknown"`
+	System               uint64 `json:"System"`
+	Anonymous            uint64 `json:"Anonymous"`
+	PageCache            uint64 `json:"PageCache"`
+	Mapped               uint64 `json:"Mapped"`
+	Tmpfs                uint64 `json:"Tmpfs"`
+	Ramdiskfs            uint64 `json:"Ramdiskfs"`
+	Total                uint64 `json:"Total"`
+	GuestRAMLogical      uint64 `json:"GuestRAMLogical,omitempty"`
+	GuestRAMHostResident uint64 `json:"GuestRAMHostResident,omitempty"`
+	GuestRAMIPAConsumed  uint64 `json:"GuestRAMIPAConsumed,omitempty"`
+	GuestRAMLogicalLimit uint64 `json:"GuestRAMLogicalLimit,omitempty"`
+	GuestRAMVMEpoch      uint64 `json:"GuestRAMVMEpoch,omitempty"`
 }
 
 // MemoryUsageFileOpts contains usage file options.
@@ -72,6 +78,9 @@ func (u *Usage) UsageFD(opts *MemoryUsageFileOpts, out *MemoryUsageFile) error {
 	}
 
 	mf := u.Kernel.MemoryFile()
+	if mf.File() == nil {
+		return fmt.Errorf("usage FD is unavailable for platform-owned memory; use Usage.Collect")
+	}
 	*out = MemoryUsageFile{
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{
@@ -120,6 +129,14 @@ func (u *Usage) Collect(opts *MemoryUsageOpts, out *MemoryUsage) error {
 			Total:   total + snapshot.Mapped,
 		}
 
+	}
+	if accounting, ok := u.Kernel.Platform.(platform.MemoryAccounting); ok {
+		usage := accounting.PlatformMemoryUsage()
+		out.GuestRAMLogical = usage.LogicalBytes
+		out.GuestRAMHostResident = usage.HostResidentBytes
+		out.GuestRAMIPAConsumed = usage.IPABytesConsumed
+		out.GuestRAMLogicalLimit = usage.LogicalLimitBytes
+		out.GuestRAMVMEpoch = usage.VMEpoch
 	}
 
 	return nil

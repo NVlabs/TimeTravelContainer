@@ -261,6 +261,16 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	if err := restored.StartPaused(); err != nil {
 		t.Fatalf("starting rehydrated distributed target: %v", err)
 	}
+	grandchild, err := restored.LiveFork(restored.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		t.Fatalf("live-forking rehydrated distributed target: %v", err)
+	}
+	if err := grandchild.StartPaused(); err != nil {
+		t.Fatalf("starting live fork of rehydrated distributed target: %v", err)
+	}
+	grandchild.Release()
 	restored.Release()
 	parent.Release()
 }

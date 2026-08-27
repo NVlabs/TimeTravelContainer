@@ -96,7 +96,7 @@ func (v *VDSOParamPage) afterLoad(ctx context.Context) {
 //     ownership of fr; it must remain allocated for the lifetime of the
 //     VDSOParamPage.
 //   - VDSOParamPage must be the only writer to fr.
-//   - mf.MapInternal(fr) must return a single safemem.Block.
+//   - mf.MapInternalWithLease(fr) must return a single safemem.Block.
 func NewVDSOParamPage(mf *pgalloc.MemoryFile, fr memmap.FileRange) *VDSOParamPage {
 	return &VDSOParamPage{
 		mf:                mf,
@@ -106,15 +106,26 @@ func NewVDSOParamPage(mf *pgalloc.MemoryFile, fr memmap.FileRange) *VDSOParamPag
 }
 
 // access returns a mapping of the param page.
-func (v *VDSOParamPage) access() (safemem.Block, error) {
-	bs, err := v.mf.MapInternal(v.fr, hostarch.ReadWrite)
+func (v *VDSOParamPage) access() (safemem.Block, memmap.InternalMappingLease, error) {
+	bs, mappingLease, err := memmap.MapInternalWithLease(v.mf, v.fr, hostarch.ReadWrite)
 	if err != nil {
-		return safemem.Block{}, err
+		return safemem.Block{}, nil, err
 	}
 	if bs.NumBlocks() != 1 {
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
 		panic(fmt.Sprintf("Multiple blocks (%d) in VDSO param BlockSeq", bs.NumBlocks()))
 	}
-	return bs.Head(), nil
+	return bs.Head(), mappingLease, nil
+}
+
+func (v *VDSOParamPage) materialize() error {
+	_, mappingLease, err := v.access()
+	if mappingLease != nil {
+		mappingLease.Release()
+	}
+	return err
 }
 
 // incrementSeq increments the sequence counter in the param page.
@@ -138,9 +149,12 @@ func (v *VDSOParamPage) incrementSeq(paramPage safemem.Block) error {
 // Write starts a write block, calls f to get the new parameters, writes
 // out the new parameters, then ends the write block.
 func (v *VDSOParamPage) Write(f func() vdsoParams) error {
-	paramPage, err := v.access()
+	paramPage, mappingLease, err := v.access()
 	if err != nil {
 		return err
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 
 	// Write begin.

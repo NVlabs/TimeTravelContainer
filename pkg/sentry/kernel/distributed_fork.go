@@ -469,7 +469,7 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 		child.remotePageLoad = pages
 		pagesOwned = false
 	}
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing sparse distributed-fork VDSO parameter page: %w", err)
 	}
@@ -589,7 +589,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	// allocation. Materialize the old page first so its pull is acknowledged;
 	// otherwise a target that never faults VVAR retains exactly one source page
 	// forever and cannot complete a drain.
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing distributed-fork VDSO parameter page: %w", err)
 	}
@@ -699,7 +699,7 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), packedLoadRanges...)
 		pagesOwned = false
 	}
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing relocated distributed VDSO parameter page: %w", err)
 	}

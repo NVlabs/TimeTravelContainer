@@ -358,13 +358,13 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 		return err
 	}
 	defer helper.Close()
-	args := []string{
-		"--root", b.root, "exec", "--branch", resolved.branch,
+	args := append(b.runtimeControlArgs(),
+		"exec", "--branch", resolved.branch,
 		"--user", "0:0",
 		"--cap", "CAP_CHOWN", "--cap", "CAP_DAC_OVERRIDE",
 		"--cap", "CAP_FOWNER", "--cap", "CAP_MKNOD",
 		"--exec-fd", "3",
-	}
+	)
 	if paused {
 		args = append(args, "--paused-management", "--exec-id", execID)
 	}

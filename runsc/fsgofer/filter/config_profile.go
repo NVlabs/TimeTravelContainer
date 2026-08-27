@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
+
 package filter
 
 import (
@@ -28,8 +30,8 @@ var profileFilters = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_SETITIMER: seccomp.MatchAll{},
 	unix.SYS_TIMER_CREATE: seccomp.PerArg{
 		seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
-		seccomp.AnyValue{}, /* sevp */
-		seccomp.AnyValue{}, /* timerid */
+		seccomp.AnyValue{},                            /* sevp */
+		seccomp.AnyValue{},                            /* timerid */
 	},
 	unix.SYS_TIMER_DELETE: seccomp.MatchAll{},
 	unix.SYS_TIMER_SETTIME: seccomp.PerArg{

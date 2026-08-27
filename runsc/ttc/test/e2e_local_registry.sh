@@ -23,6 +23,12 @@ REGISTRY_FIXTURE=${REGISTRY_FIXTURE:-}
 FIXTURE_BINARY=${FIXTURE_BINARY:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+FIXTURE_GUEST_ARCH=${FIXTURE_GUEST_ARCH:-$(uname -m)}
+
+case "$FIXTURE_GUEST_ARCH" in
+  aarch64) FIXTURE_GUEST_ARCH=arm64 ;;
+  x86_64) FIXTURE_GUEST_ARCH=amd64 ;;
+esac
 
 fail() {
   echo "ttc local registry: $*" >&2
@@ -79,7 +85,11 @@ else
   ttc daemon start
 fi
 
-"$REGISTRY_FIXTURE" --binary "$FIXTURE_BINARY" --address-file "$ADDRESS_FILE" &
+"$REGISTRY_FIXTURE" \
+  --binary "$FIXTURE_BINARY" \
+  --address-file "$ADDRESS_FILE" \
+  --guest-os linux \
+  --guest-arch "$FIXTURE_GUEST_ARCH" &
 REGISTRY_PID=$!
 i=0
 while [ ! -s "$ADDRESS_FILE" ] && [ "$i" -lt 100 ]; do

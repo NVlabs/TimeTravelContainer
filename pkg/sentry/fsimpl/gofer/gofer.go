@@ -581,6 +581,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		ctx.Warningf("gofer.FilesystemType.GetFilesystem: regularFilesUseSpecialFileFD and overlayfsStaleRead options are not supported together.")
 		return nil, nil, linuxerr.EINVAL
 	}
+	if fsopts.directfs.enabled && !directfsSupported() {
+		ctx.Warningf("gofer.FilesystemType.GetFilesystem: directfs is not supported on this host; use the lisafs gofer path")
+		return nil, nil, linuxerr.EOPNOTSUPP
+	}
 
 	// Handle internal options.
 	iopts, ok := opts.InternalData.(InternalFilesystemOptions)
@@ -840,19 +844,11 @@ func inoKeyFromStatx(stat *lisafs.Statx) inoKey {
 	}
 }
 
-func inoKeyFromUnixStatx(stat *unix.Statx_t) inoKey {
-	return inoKey{
-		ino:      stat.Ino,
-		devMinor: stat.Dev_minor,
-		devMajor: stat.Dev_major,
-	}
-}
-
 func inoKeyFromStat(stat *unix.Stat_t) inoKey {
 	return inoKey{
 		ino:      stat.Ino,
-		devMinor: unix.Minor(stat.Dev),
-		devMajor: unix.Major(stat.Dev),
+		devMinor: unix.Minor(uint64(stat.Dev)),
+		devMajor: unix.Major(uint64(stat.Dev)),
 	}
 }
 
@@ -1242,15 +1238,14 @@ func (d *dentry) refreshSizeLocked(ctx context.Context) error {
 		return d.inode.updateMetadataLocked(ctx, noHandle)
 	}
 
-	// Using statx(2) with a minimal mask is faster than fstat(2).
-	var stat unix.Statx_t
+	var stat unix.Stat_t
 	// Can use RacyLoad() because handleMu is locked.
-	err := unix.Statx(int(d.inode.writeFD.RacyLoad()), "", unix.AT_EMPTY_PATH, unix.STATX_SIZE, &stat)
+	err := unix.Fstat(int(d.inode.writeFD.RacyLoad()), &stat)
 	d.inode.handleMu.RUnlock() // must be released before updateSizeLocked()
 	if err != nil {
 		return err
 	}
-	d.inode.updateSizeLocked(stat.Size)
+	d.inode.updateSizeLocked(uint64(stat.Size))
 	return nil
 }
 
@@ -2115,7 +2110,7 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 				// make the old file descriptor refer to the new file
 				// description, then close the new file descriptor (which is no
 				// longer needed).
-				if err := unix.Dup3(int(h.fd), int(d.inode.readFD.RacyLoad()), unix.O_CLOEXEC); err != nil {
+				if err := dupToCloseOnExec(int(h.fd), int(d.inode.readFD.RacyLoad())); err != nil {
 					oldFD := d.inode.readFD.RacyLoad()
 					d.inode.handleMu.Unlock()
 					ctx.Warningf("gofer.dentry.ensureSharedHandle: failed to dup fd %d to fd %d: %v", h.fd, oldFD, err)

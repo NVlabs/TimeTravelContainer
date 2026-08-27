@@ -42,8 +42,9 @@ archs = [
 ]
 
 oses = [
-    "_linux",
-    "_nonlinux",
+	"_darwin",
+	"_linux",
+	"_nonlinux",
 ]
 
 generic = [

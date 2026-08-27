@@ -8,6 +8,8 @@ package(
 go_library(
     name = "fsgofer",
     srcs = [
+        "host_ops_darwin.go",
+        "host_ops_linux.go",
         "lisafs.go",
     ],
     visibility = ["//runsc:__subpackages__"],
@@ -47,4 +49,12 @@ go_test(
         "//runsc/ttc/ownership",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "trusted_ownership_test",
+    size = "small",
+    srcs = ["trusted_ownership_darwin_test.go"],
+    library = ":fsgofer",
+    deps = ["//pkg/lisafs"],
 )

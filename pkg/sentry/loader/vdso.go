@@ -220,10 +220,13 @@ func PrepareVDSO(mf *pgalloc.MemoryFile) (*VDSO, error) {
 		return nil, fmt.Errorf("unable to allocate VDSO memory: %v", err)
 	}
 
-	ims, err := mf.MapInternal(vdso, hostarch.ReadWrite)
+	ims, mappingLease, err := memmap.MapInternalWithLease(mf, vdso, hostarch.ReadWrite)
 	if err != nil {
 		mf.DecRef(vdso)
 		return nil, fmt.Errorf("unable to map VDSO memory: %v", err)
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 
 	_, err = safemem.CopySeq(ims, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(vdsodata.Binary)))

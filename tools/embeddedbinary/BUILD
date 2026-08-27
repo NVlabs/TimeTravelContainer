@@ -22,6 +22,12 @@ go_template(
     ],
 )
 
+go_template(
+    name = "embeddedbinary_template_darwin",
+    srcs = ["embeddedbinary_template_darwin.go"],
+    visibility = ["//:sandbox"],
+)
+
 config_setting(
     name = "compilation_mode_opt",
     values = {

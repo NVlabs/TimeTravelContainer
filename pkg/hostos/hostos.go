@@ -19,7 +19,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,16 +87,6 @@ func KernelVersion() (Version, error) {
 	})
 
 	return semVersion, unameErr
-}
-
-// TotalSystemMemory extracts "MemTotal" from "/proc/meminfo".
-func TotalSystemMemory() (uint64, error) {
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	return parseTotalSystemMemory(f)
 }
 
 func parseTotalSystemMemory(r io.Reader) (uint64, error) {

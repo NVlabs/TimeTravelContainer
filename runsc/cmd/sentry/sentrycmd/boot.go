@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostmem"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/prometheus"
@@ -341,8 +342,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	conf := args[0].(*config.Config)
 
-	if hostPageSize := unix.Getpagesize(); hostPageSize != hostarch.PageSize {
-		util.Fatalf("host page size (%d) does not match compiled page size (%d)", hostPageSize, hostarch.PageSize)
+	if hostGranule := hostmem.AllocationGranule(); hostGranule%hostarch.PageSize != 0 {
+		util.Fatalf("host allocation granule (%d) is not a multiple of the Linux page size (%d)", hostGranule, hostarch.PageSize)
 	}
 
 	// Set traceback level
@@ -393,7 +394,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		// Ensure this process is killed after parent process terminates when
 		// attached mode is enabled. In the unfortunate event that the parent
 		// terminates before this point, this process leaks.
-		if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
+		if err := armParentDeathSignal(); err != nil {
 			util.Fatalf("error setting parent death signal: %v", err)
 		}
 	}
@@ -555,7 +556,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			// cleared it. (A pure capability drop should not clear it, but
 			// re-arming is free and preserves the re-exec path's behavior,
 			// which re-arms after the exec.)
-			if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
+			if err := armParentDeathSignal(); err != nil {
 				util.Fatalf("error setting parent death signal: %v", err)
 			}
 		}

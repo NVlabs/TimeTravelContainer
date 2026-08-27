@@ -23,9 +23,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const maxErrno = 107
+// maxErrno sizes both the host-to-Linux table and the Linux ABI backwards
+// table in syserr.go. It must therefore cover Linux's errno namespace even
+// though Darwin currently defines fewer host errno values.
+const maxErrno = 134
 
 var darwinHostTranslations [maxErrno]*Error
+
+func init() {
+	// Darwin reports a missing extended attribute as ENOATTR. Linux exposes
+	// the same condition as ENODATA; lisafs carries host errno values across
+	// its trusted gofer transport before converting them here.
+	addHostTranslation(unix.ENOATTR, ErrNoDataAvailable)
+}
 
 func getHostTranslation(err unix.Errno) *Error {
 	if uint64(err) >= uint64(len(darwinHostTranslations)) {

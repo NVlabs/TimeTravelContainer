@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -113,20 +114,37 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	} else if len(args.FilePayload.Files) != 2 || metadata.SparseManifest == (ttcchunk.ManifestID{}) {
 		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
-	if l.distributedMemoryFile == nil {
-		return nil, errors.New("dehydration target has no reserved application memory file")
+	var (
+		p        platform.Platform
+		reusable platform.RestoreReuser
+		mainMF   *pgalloc.MemoryFile
+	)
+	if candidate, ok := l.k.Platform.(platform.RestoreReuser); ok {
+		reusable = candidate
+		p = candidate
+		// Process-scoped VM platforms use GuestRAM rather than the reserved
+		// memfd. The latter is retained for Linux platforms and older targets.
+		if l.distributedMemoryFile != nil {
+			_ = l.distributedMemoryFile.Close()
+			l.distributedMemoryFile = nil
+		}
+		mainMF, err = createMemoryFileForPlatform(p, l.root.conf.AppHugePages, l.hostTHP)
+	} else {
+		if l.distributedMemoryFile == nil {
+			return nil, errors.New("dehydration target has no reserved application memory file")
+		}
+		reservedMemoryFile := l.distributedMemoryFile
+		l.distributedMemoryFile = nil
+		mainMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
+		if err == nil {
+			p, err = createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+		}
 	}
-	reservedMemoryFile := l.distributedMemoryFile
-	l.distributedMemoryFile = nil
-	mainMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 	if err != nil {
-		return nil, fmt.Errorf("creating dehydration application memory file: %w", err)
-	}
-
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
-	if err != nil {
-		mainMF.Destroy()
-		return nil, fmt.Errorf("creating dehydration platform: %w", err)
+		if mainMF != nil {
+			mainMF.Destroy()
+		}
+		return nil, fmt.Errorf("creating dehydration platform and application memory: %w", err)
 	}
 	restoreMnts := restoreMounts{
 		fdmap:     make(map[checkpoint.ResourceID]int),
@@ -200,7 +218,6 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
 		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
 	}
-	fdmapOwned = false // Kernel load and VFS CompleteRestore consume descriptors.
 	loadOptions := kernel.DurableDehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 		SparseBranch:               args.FilesystemBranch,
@@ -209,6 +226,26 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 			return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
 		},
 	}
+	loadCtx := l.k.SupervisorContext()
+	old := l.k
+	bootstrapReleased := false
+	if reusable != nil {
+		// Hypervisor.framework permits one VM per process. Release every
+		// bootstrap AddressSpace, then reuse the existing VM/monitor cache for
+		// the durable Kernel just as ordinary checkpoint restore does.
+		old.Release()
+		bootstrapReleased = true
+		if err := reusable.PrepareRestore(); err != nil {
+			for i := range loadMemories {
+				if loadMemories[i].Reader != nil {
+					_ = loadMemories[i].Reader.Close()
+				}
+				loadMemories[i].MemoryFile.Destroy()
+			}
+			return nil, fmt.Errorf("preparing platform for dehydration restore: %w", err)
+		}
+	}
+	fdmapOwned = false // Kernel load and VFS CompleteRestore consume descriptors.
 	var child *kernel.Kernel
 	if args.Sparse {
 		repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
@@ -219,9 +256,9 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 			return nil, openErr
 		}
 		loadOptions.OwnSparseRepository = true
-		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
+		child, err = kernel.LoadSparseDurableDehydration(loadCtx, p, metadata, memoryFiles, repository, loadOptions)
 	} else {
-		child, err = kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, loadOptions)
+		child, err = kernel.LoadDurableDehydration(loadCtx, p, metadata, loadMemories, loadOptions)
 	}
 	if err != nil {
 		return nil, err
@@ -243,13 +280,16 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		return nil, err
 	}
 	newWatchdog := watchdog.New(child, dogOpts)
-	old := l.k
-	old.Pause()
-	if err := old.StartPaused(); err != nil {
-		return nil, fmt.Errorf("starting dehydration placeholder for release: %w", err)
+	if !bootstrapReleased {
+		old.Pause()
+		if err := old.StartPaused(); err != nil {
+			return nil, fmt.Errorf("starting dehydration placeholder for release: %w", err)
+		}
 	}
 	if err := l.family.ReplaceLoaderBranchFromDehydration(args.ID, args.ParentID, args.FilesystemBranch, child, newWatchdog, args.ExecSessions); err != nil {
-		old.Release()
+		if !bootstrapReleased {
+			old.Release()
+		}
 		return nil, err
 	}
 	l.k = child
@@ -259,7 +299,9 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	l.restoreDone = sync.NewCond(&l.mu)
 	l.dehydrationRestore = true
 	l.state = restoringUnstarted
-	old.Release()
+	if !bootstrapReleased {
+		old.Release()
+	}
 	childOwned = false
 	return &DurableDehydrationRestoreInfo{ID: args.ID, MemoryFiles: len(metadata.Memories)}, nil
 }

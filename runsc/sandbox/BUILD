@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -7,12 +7,16 @@ package(
 
 go_library(
     name = "sandbox",
+    force_add_state_pkg = True,
     srcs = [
         "network.go",
+        "network_darwin.go",
         "network_unsafe.go",
         "no_xdp.go",
         "process_state.go",
         "sandbox.go",
+        "sandbox_host_darwin.go",
+        "sandbox_host_linux.go",
         "xdp.go",
     ],
     visibility = [
@@ -47,7 +51,6 @@ go_library(
         "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
         "//pkg/urpc",
-        "//pkg/xdp",
         "//runsc/boot",
         "//runsc/boot/procfs",
         "//runsc/cgroup",
@@ -58,17 +61,19 @@ go_library(
         "//runsc/hostsettings",
         "//runsc/profile",
         "//runsc/processutil",
-        "//runsc/sandbox/bpf",
         "//runsc/specutils",
         "//runsc/starttime",
-        "//tools/xdp/cmd",
-        "@com_github_cilium_ebpf//:go_default_library",
-        "@com_github_cilium_ebpf//link:go_default_library",
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_vishvananda_netlink//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
-    ],
+    ] + select_system(linux = [
+        "//pkg/xdp",
+        "//runsc/sandbox/bpf",
+        "//tools/xdp/cmd",
+        "@com_github_cilium_ebpf//:go_default_library",
+        "@com_github_cilium_ebpf//link:go_default_library",
+    ]),
 )
 
 go_test(

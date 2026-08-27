@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -20,15 +20,20 @@ go_library(
         "fscheckpoint.go",
         "limits.go",
         "loader.go",
+        "loader_host_darwin.go",
+        "loader_host_linux.go",
         "mount_hints.go",
         "network.go",
         "nvproxy.go",
+        "portable_resources.go",
         "restore.go",
         "sandbox_family.go",
         "seccheck.go",
         "seccomp.go",
         "strace.go",
         "timetravel_network.go",
+        "timetravel_network_host_darwin.go",
+        "timetravel_network_host_linux.go",
         "tpuproxy.go",
         "vfs.go",
     ],
@@ -122,8 +127,8 @@ go_library(
         "//pkg/sentry/state/stateipc",
         "//pkg/sentry/strace",
         "//pkg/sentry/time",
-		"//pkg/sentry/ttcchunk",
-		"//pkg/sentry/ttcremote",
+        "//pkg/sentry/ttcchunk",
+        "//pkg/sentry/ttcremote",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",
         "//pkg/sentry/usage",
@@ -179,11 +184,15 @@ go_test(
     size = "small",
     srcs = [
         "compat_test.go",
-        "loader_test.go",
         "mount_hints_test.go",
-        "timetravel_network_test.go",
         "vfs_test.go",
-    ],
+    ] + select_system(linux = [
+        # These inherited tests depend on Linux host capabilities, abstract
+        # Unix sockets, and host eventfd. Native Darwin lifecycle coverage is
+        # provided by the TTC/HVF integration matrix instead.
+        "loader_host_test_linux.go",
+        "loader_test.go",
+    ]),
     library = ":boot",
     deps = [
         "//pkg/abi/linux",
@@ -232,6 +241,42 @@ go_test(
         "@com_github_moby_sys_capability//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "timetravel_network_test",
+    size = "small",
+    srcs = ["timetravel_network_test.go"],
+    library = ":boot",
+    deps = [
+        "//pkg/context",
+        "//pkg/sentry/socket/netstack",
+        "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/link/ethernet",
+        "//pkg/tcpip/link/veth",
+        "//pkg/tcpip/network/arp",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/network/ipv6",
+        "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/udp",
+        "//runsc/boot/portforward",
+    ],
+)
+
+go_test(
+    name = "portable_resources_test",
+    size = "small",
+    srcs = ["portable_resources_test.go"],
+    library = ":boot",
+    deps = [
+        "//pkg/sentry/checkpoint",
+        "//runsc/config",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
 )
 

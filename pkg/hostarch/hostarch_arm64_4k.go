@@ -16,10 +16,8 @@
 
 package hostarch
 
-import "golang.org/x/sys/unix"
-
 const (
-	// PageShift is the binary log of the system page size.
+	// PageShift is the binary log of the Linux ABI page size.
 	// 4K pages: 2^12 = 4096
 	PageShift = 12
 
@@ -28,9 +26,3 @@ const (
 	// This gives 2MB huge pages.
 	HugePageShift = 21
 )
-
-func init() {
-	if size := unix.Getpagesize(); size != PageSize {
-		println("WARNING: host page size mismatch - running on non-4K host")
-	}
-}

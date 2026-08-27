@@ -17,4 +17,7 @@
 
 package platforms
 
-// This file makes the platforms package buildable on Darwin.
+import (
+	// HVF is the native Apple Silicon VM platform.
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/hvf"
+)

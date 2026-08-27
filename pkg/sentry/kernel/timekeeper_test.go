@@ -17,11 +17,12 @@ package kernel
 import (
 	"bytes"
 	"context"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -55,8 +56,17 @@ func (c *mockClocks) GetTime(id sentrytime.ClockID) (int64, error) {
 // stateTestClocklessTimekeeper returns a test Timekeeper which has not had
 // SetClocks called.
 func stateTestClocklessTimekeeper(tb testing.TB) (*Timekeeper, *VDSOParamPage) {
-	ctx := contexttest.Context(tb)
-	mf := pgalloc.MemoryFileFromContext(ctx)
+	const memfileName = "timekeeper-test-memory"
+	memfd, err := memutil.CreateMemFD(memfileName, 0)
+	if err != nil {
+		tb.Fatalf("creating application memory file: %v", err)
+	}
+	mf, err := pgalloc.NewMemoryFile(os.NewFile(uintptr(memfd), memfileName), pgalloc.MemoryFileOpts{
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		tb.Fatalf("initializing application memory file: %v", err)
+	}
 	fr, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		tb.Fatalf("failed to allocate memory: %v", err)
@@ -69,6 +79,31 @@ func stateTestTimekeeper(tb testing.TB) *Timekeeper {
 	t, params := stateTestClocklessTimekeeper(tb)
 	t.SetClocks(sentrytime.NewCalibratedClocks(), params)
 	return t
+}
+
+func TestTimekeeperLoadClearsExecutionState(t *testing.T) {
+	source := stateTestTimekeeper(t)
+	source.PauseUpdates()
+	defer source.Destroy()
+	var image bytes.Buffer
+	if _, err := state.Save(context.Background(), &image, source); err != nil {
+		t.Fatalf("saving Timekeeper: %v", err)
+	}
+
+	target, params := stateTestClocklessTimekeeper(t)
+	target.SetClocks(sentrytime.NewCalibratedClocks(), params)
+	target.PauseUpdates()
+	if _, err := state.Load(context.Background(), bytes.NewReader(image.Bytes()), target); err != nil {
+		t.Fatalf("loading Timekeeper over initialized target: %v", err)
+	}
+	if target.clocks != nil {
+		t.Fatal("restored Timekeeper retained its previous clock source")
+	}
+	if target.stop != nil || target.timer != nil || target.params != nil {
+		t.Fatal("restored Timekeeper retained updater state")
+	}
+	target.SetClocks(sentrytime.NewCalibratedClocks(), params)
+	target.Destroy()
 }
 
 func TestTimekeeperClockStateCanonicalizesKernel(t *testing.T) {

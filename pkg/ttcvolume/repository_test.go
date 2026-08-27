@@ -27,6 +27,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 func openTestManager(t *testing.T) *Manager {
@@ -1123,7 +1125,7 @@ func TestListDirectoryItemsAndBranchUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantBytes := uint64(2 * os.Getpagesize())
+	wantBytes := uint64(2 * hostarch.PageSize)
 	if inodes != 3 || bytes != wantBytes {
 		t.Fatalf("BranchUsage=(%d, %d), want (3, %d)", inodes, bytes, wantBytes)
 	}
@@ -1159,7 +1161,7 @@ func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := uint64(os.Getpagesize())
+	page := uint64(hostarch.PageSize)
 	if usage.UniqueBytes != 3*page || len(usage.Branches) != 2 {
 		t.Fatalf("usage=%+v, want three unique pages and two branches", usage)
 	}

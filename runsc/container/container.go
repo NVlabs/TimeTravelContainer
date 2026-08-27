@@ -26,7 +26,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -1363,7 +1362,7 @@ func shouldSpawnGofer(spec *specs.Spec, conf *config.Config, goferConfs []specut
 // createLisafsSocketPair creates a socket pair for Lisafs communication and
 // appends the sandbox end to sandEnds while donating the gofer end.
 func createLisafsSocketPair(sandEnds *[]*os.File, donations *donation.Agency) error {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := containerHostSocketPair()
 	if err != nil {
 		return err
 	}
@@ -1573,7 +1572,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	}
 	var devSandEnd *os.File
 	if shouldCreateDeviceGofer(c.Spec, conf) {
-		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		fds, err := containerHostSocketPair()
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -1584,7 +1583,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	if attached {
 		// The gofer is attached to the lifetime of this process, so it
 		// should synchronously die when this process dies.
-		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
+		setGoferParentDeathSignal(cmd)
 	}
 
 	// Enter new namespaces to isolate from the rest of the system. Don't unshare
@@ -1595,7 +1594,12 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		{Type: specs.PIDNamespace},
 		{Type: specs.UTSNamespace},
 	}
-	goferNetNS, goferNetNSFile, pinGoferNetNS := goferNetworkNamespace(conf)
+	var goferNetNS *specs.LinuxNamespace
+	var goferNetNSFile *os.File
+	var pinGoferNetNS bool
+	if !conf.UnsafeNoHostIsolation {
+		goferNetNS, goferNetNSFile, pinGoferNetNS = goferNetworkNamespace(conf)
+	}
 	if goferNetNSFile != nil {
 		// goferNetNS.Path must remain open until the gofer has started.
 		defer goferNetNSFile.Close()
@@ -1618,7 +1622,9 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 			nss = append(nss, userNS)
 			specutils.SetUIDGIDMappings(cmd, c.Spec)
 			// We need to set UID and GID to have capabilities in a new user namespace.
-			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+			if err := setGoferCommandCredential(cmd, 0, 0); err != nil {
+				return nil, nil, nil, nil, err
+			}
 		}
 	} else {
 		userNS, ok := specutils.GetNS(specs.UserNamespace, c.Spec)
@@ -1628,7 +1634,9 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		nss = append(nss, userNS)
 		if sandbox.CanUseUnprivilegedMapping(c.Spec) {
 			specutils.SetUIDGIDMappings(cmd, c.Spec)
-			cmd.SysProcAttr.GidMappingsEnableSetgroups = false
+			if err := disableGoferSetgroupsForIDMapping(cmd); err != nil {
+				return nil, nil, nil, nil, err
+			}
 		} else {
 			setUserMappings = true
 		}
@@ -1647,7 +1655,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	}
 
 	// Create synchronization FD for chroot.
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := containerHostSocketPair()
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -1913,24 +1921,7 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 // /proc must be available and mounted read-write. scoreAdj should be between
 // -1000 and 1000. It's a noop if the process has already exited.
 func setOOMScoreAdj(pid int, scoreAdj int) error {
-	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), os.O_WRONLY, 0644)
-	if err != nil {
-		// Ignore NotExist errors because it can race with process exit.
-		if os.IsNotExist(err) {
-			log.Warningf("Process (%d) not found setting oom_score_adj", pid)
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(strconv.Itoa(scoreAdj)); err != nil {
-		if errors.Is(err, unix.ESRCH) {
-			log.Warningf("Process (%d) exited while setting oom_score_adj", pid)
-			return nil
-		}
-		return fmt.Errorf("setting oom_score_adj to %d: %v", scoreAdj, err)
-	}
-	return nil
+	return hostSetOOMScoreAdj(pid, scoreAdj)
 }
 
 // populateStats populates event with stats estimates based on cgroups and the

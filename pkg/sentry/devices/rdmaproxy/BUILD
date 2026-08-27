@@ -9,11 +9,14 @@ go_library(
     name = "rdmaproxy",
     srcs = [
         "driver.go",
+        "host_mmap_darwin.go",
+        "host_mmap_linux.go",
         "ioctl.go",
         "ioctl_unsafe.go",
         "rdmaproxy.go",
         "schema.go",
         "seccomp_filter.go",
+        "seccomp_filter_darwin.go",
     ],
     visibility = [
         "//pkg/sentry:internal",

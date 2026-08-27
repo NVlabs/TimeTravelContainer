@@ -22,7 +22,6 @@ import (
 	"runtime"
 	"strings"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
@@ -192,7 +191,7 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 func SeccompOptions(opt Options) seccomp.ProgramOptions {
 	// futex(2) is unequivocally the most-frequently-used syscall by the
 	// Sentry across all platforms.
-	hotSyscalls := []uintptr{unix.SYS_FUTEX}
+	hotSyscalls := hostHotSyscalls()
 	// ... Then comes the platform-specific hot syscalls which are typically
 	// part of the syscall interception hot path.
 	hotSyscalls = append(hotSyscalls, opt.Platform.HottestSyscalls()...)

@@ -589,7 +589,7 @@ func (c *Config) Validate() error {
 	if unsupported := allowedCaps & ^nvconf.SupportedDriverCaps; unsupported != 0 {
 		return fmt.Errorf("--nvproxy-allowed-driver-capabilities=%q: unsupported capabilities: %v", c.NVProxyAllowedDriverCapabilities, unsupported)
 	}
-	return nil
+	return validateHostConfig(c)
 }
 
 // Log logs important aspects of the configuration to the given log function.

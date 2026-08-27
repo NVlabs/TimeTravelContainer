@@ -11,6 +11,8 @@ go_library(
         "portforward.go",
         "portforward_fd_rw.go",
         "portforward_hostinet.go",
+        "socket_darwin.go",
+        "socket_linux.go",
         "portforward_netstack.go",
         "portforward_test_util.go",
     ],

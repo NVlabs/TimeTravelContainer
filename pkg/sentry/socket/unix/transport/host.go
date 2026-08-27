@@ -113,7 +113,7 @@ func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
 		return nil
 	}
 
-	family, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_DOMAIN)
+	family, err := hostSocketDomain(c.fd)
 	if err != nil {
 		return syserr.FromError(err)
 	}
@@ -137,14 +137,14 @@ func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
 		return syserr.FromError(err)
 	}
 
-	passcred, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_PASSCRED)
+	passcred, err := hostSocketPasscred(c.fd)
 	if err != nil {
 		return syserr.FromError(err)
 	}
 
 	c.stype = linux.SockType(stype)
 	c.sndbuf.Store(int64(sndbuf))
-	c.passcred = passcred != 0
+	c.passcred = passcred
 
 	return nil
 }

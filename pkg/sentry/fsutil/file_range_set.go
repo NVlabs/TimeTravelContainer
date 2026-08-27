@@ -270,7 +270,7 @@ func (s *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) uint64 {
 	if seg.Ok() {
 		fr := seg.FileRange()
 		fr.Start += end - seg.Start()
-		ims, err := mf.MapInternal(fr, hostarch.Write)
+		ims, mappingLease, err := memmap.MapInternalWithLease(mf, fr, hostarch.Write)
 		if err != nil {
 			// There's no good recourse from here. This means
 			// that we can't keep cached memory consistent with
@@ -283,7 +283,13 @@ func (s *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) uint64 {
 			panic(fmt.Sprintf("Failed to map %v: %v", fr, err))
 		}
 		if _, err := safemem.ZeroSeq(ims); err != nil {
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			panic(fmt.Sprintf("Zeroing %v failed: %v", fr, err))
+		}
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 	}
 	return pagesFreed

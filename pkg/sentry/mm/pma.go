@@ -915,6 +915,18 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 	return safemem.BlockSeqFromSlice(ims)
 }
 
+// DropInternalMappingsForCompaction discards cached Sentry host mappings
+// without changing PMAs or application page tables. Callers must stop every
+// task that can use mm before calling this method; activeMu then drains any
+// in-progress Sentry I/O that is using one of the cached slices.
+func (mm *MemoryManager) DropInternalMappingsForCompaction() {
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	for pseg := mm.pmas.FirstSegment(); pseg.Ok(); pseg = pseg.NextSegment() {
+		pseg.ValuePtr().internalMappings = safemem.BlockSeq{}
+	}
+}
+
 // vecInternalMappingsLocked returns cached internal mappings for addresses in
 // ars.
 //
@@ -1040,7 +1052,7 @@ func (pseg pmaIterator) getInternalMappingsLocked() error {
 		perms := pma.maxPerms
 		// We will never execute application code through an internal mapping.
 		perms.Execute = false
-		ims, err := pma.file.MapInternal(pseg.fileRange(), perms)
+		ims, err := memmap.MapInternalForPMA(pma.file, pseg.fileRange(), perms)
 		if err != nil {
 			return err
 		}

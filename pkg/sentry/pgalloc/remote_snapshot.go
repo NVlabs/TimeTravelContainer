@@ -83,11 +83,7 @@ func (s *RemoteSnapshot) ExportPackedSnapshot(dst *os.File, allowCopy bool) erro
 	for _, region := range regions {
 		source := region.lease.File().File()
 		fr := region.lease.Range()
-		clone := unix.FileCloneRange{
-			Src_fd: int64(source.Fd()), Src_offset: fr.Start,
-			Src_length: fr.Length(), Dest_offset: region.streamStart,
-		}
-		if err := unix.IoctlFileCloneRange(int(dst.Fd()), &clone); err == nil {
+		if err := cloneHostFileRange(dst, source, fr.Start, fr.Length(), region.streamStart); err == nil {
 			continue
 		} else if !allowCopy {
 			return fmt.Errorf("reflinking packed remote snapshot range %v: %w", fr, err)
@@ -1495,7 +1491,7 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		if err != nil {
 			return written, err
 		}
-		src, err := lease.File().MapInternal(lease.Range(), hostarch.Read)
+		src, mappingLease, err := memmap.MapInternalWithLease(lease.File(), lease.Range(), hostarch.Read)
 		if err != nil {
 			lease.Close()
 			return written, err
@@ -1504,6 +1500,9 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		copied, copyErr := safemem.CopySeq(dstSeq, src)
 		if copyErr == nil && copied != length {
 			copyErr = io.ErrUnexpectedEOF
+		}
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 		lease.Close()
 		written += int(copied)
@@ -1548,7 +1547,10 @@ func (s *RemoteSnapshot) EnsureResident() error {
 			if err != nil {
 				return err
 			}
-			blocks, mapErr := lease.File().MapInternal(lease.Range(), hostarch.Read)
+			blocks, mappingLease, mapErr := memmap.MapInternalWithLease(lease.File(), lease.Range(), hostarch.Read)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			lease.Close()
 			if mapErr != nil {
 				return mapErr

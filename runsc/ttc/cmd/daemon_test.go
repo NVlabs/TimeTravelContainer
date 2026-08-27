@@ -32,6 +32,16 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
+func shortDaemonTestSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ttc-daemon-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "ttcd.sock")
+}
+
 func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
 	wire := wireOptions(options{clientExecutable: "/opt/ttc/bin/ttc"})
 	if got := wire.ClientExecutable; got != "/opt/ttc/bin/ttc" {
@@ -144,16 +154,23 @@ func TestHostKernelCompatibility(t *testing.T) {
 }
 
 func TestRuntimePlatformValidation(t *testing.T) {
-	for _, test := range []struct {
+	tests := []struct {
 		value string
 		want  string
 		ok    bool
 	}{
-		{value: "systrap", want: "systrap", ok: true},
-		{value: "KVM", want: "kvm", ok: true},
+		{value: defaultRuntimePlatform, want: defaultRuntimePlatform, ok: true},
 		{value: "ptrace"},
 		{value: ""},
-	} {
+	}
+	if testLinuxHost {
+		tests = append(tests, struct {
+			value string
+			want  string
+			ok    bool
+		}{value: "KVM", want: "kvm", ok: true})
+	}
+	for _, test := range tests {
 		got, err := normalizeRuntimePlatform(test.value)
 		if test.ok {
 			if err != nil || got != test.want {
@@ -166,6 +183,9 @@ func TestRuntimePlatformValidation(t *testing.T) {
 }
 
 func TestDaemonKVMPreflightFailure(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("KVM preflight is Linux-specific")
+	}
 	original := daemonPlatformPreflight
 	defer func() { daemonPlatformPreflight = original }()
 	var gotPlatform string
@@ -183,7 +203,7 @@ func TestDaemonKVMPreflightFailure(t *testing.T) {
 func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
-	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "supported platforms are systrap and kvm") {
+	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "unsupported runtime platform") {
 		t.Fatalf("unsupported platform: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 }
@@ -192,7 +212,7 @@ func TestPrepareDaemonRuntimeStorageRejectsNFS(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
 	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
-		statfs.Type = unix.NFS_SUPER_MAGIC
+		setTestNFSStatfs(statfs)
 		return nil
 	}
 	dir := t.TempDir()
@@ -206,7 +226,7 @@ func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
 	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
-		statfs.Type = unix.TMPFS_MAGIC
+		setTestLocalStatfs(statfs)
 		return nil
 	}
 	dir := t.TempDir()
@@ -223,6 +243,9 @@ func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
 }
 
 func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux host-kernel compatibility is Linux-specific")
+	}
 	original := daemonKernelRelease
 	defer func() {
 		daemonKernelRelease = original
@@ -248,6 +271,9 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 }
 
 func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux host-GSO fallback is Linux-specific")
+	}
 	original := daemonKernelRelease
 	defer func() {
 		daemonKernelRelease = original
@@ -281,6 +307,54 @@ func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	status := Run([]string{"--daemon-socket", socket, "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "start it explicitly with 'ttc daemon start'") {
 		t.Fatalf("missing daemon: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
+
+func TestDaemonStartFailsImmediatelyWithoutTTCD(t *testing.T) {
+	originalExecutable := daemonClientExecutable
+	originalLookPath := daemonExecutableLookPath
+	defer func() {
+		daemonClientExecutable = originalExecutable
+		daemonExecutableLookPath = originalLookPath
+	}()
+	dir := t.TempDir()
+	daemonClientExecutable = func() (string, error) {
+		return filepath.Join(dir, "bin", "ttc"), nil
+	}
+	daemonExecutableLookPath = func(string) (string, error) {
+		return "", exec.ErrNotFound
+	}
+
+	socket := filepath.Join(dir, "runtime", "ttcd.sock")
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--daemon-socket", socket, "daemon", "start", "--unsafe-no-host-isolation"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "cannot find ttcd executable") {
+		t.Fatalf("missing ttcd: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("missing ttcd created daemon socket: %v", err)
+	}
+	if _, err := os.Stat(daemonLogPath(socket)); !os.IsNotExist(err) {
+		t.Fatalf("missing ttcd created startup log: %v", err)
+	}
+}
+
+func TestFindDaemonExecutablePrefersSiblingTTCD(t *testing.T) {
+	client := filepath.Join(t.TempDir(), "bin", "ttc")
+	sibling := filepath.Join(filepath.Dir(client), "ttcd")
+	var candidates []string
+	got, err := findDaemonExecutable(client, "/configured/runsc", func(candidate string) (string, error) {
+		candidates = append(candidates, candidate)
+		if candidate == sibling {
+			return "/resolved/ttcd", nil
+		}
+		return "", exec.ErrNotFound
+	})
+	if err != nil || got != "/resolved/ttcd" {
+		t.Fatalf("findDaemonExecutable() = (%q, %v), want sibling", got, err)
+	}
+	if len(candidates) != 1 || candidates[0] != sibling {
+		t.Fatalf("lookup candidates = %q, want sibling first", candidates)
 	}
 }
 
@@ -365,6 +439,9 @@ func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 }
 
 func TestRootlessDaemonStartupPreflight(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux rootless namespace preflight is Linux-specific")
+	}
 	original := createDaemonRootlessProbe
 	originalEUID := daemonEffectiveUID
 	defer func() {
@@ -659,11 +736,11 @@ func TestDaemonAttachTakeoverParsing(t *testing.T) {
 }
 
 func TestDaemonVersionedCommandTransport(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	socket := shortDaemonTestSocket(t)
 	dataRoot := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, "kvm", true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, "/runtime", "/runsc", ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
+		done <- serveDaemon(socket, defaultRuntimePlatform, true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, "/runtime", "/runsc", ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -705,7 +782,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 
 	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
 	if status != 0 ||
-		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
+		!strings.Contains(stdout, `"runtime_platform":"`+defaultRuntimePlatform+`"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
 		!strings.Contains(stdout, `"host_kernel_release":"6.8.0"`) ||

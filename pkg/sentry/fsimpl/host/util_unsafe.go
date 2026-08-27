@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,14 +20,22 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
-func setTimestamps(fd int, ts *[2]unix.Timespec) error {
+func setTimestamps(fd int, atime linux.StatxTimestamp, omitAtime bool, mtime linux.StatxTimestamp, omitMtime bool) error {
+	toTimespec := func(ts linux.StatxTimestamp, omit bool) unix.Timespec {
+		if omit {
+			return unix.Timespec{Nsec: unix.UTIME_OMIT}
+		}
+		return unix.Timespec{Sec: ts.Sec, Nsec: int64(ts.Nsec)}
+	}
+	ts := [2]unix.Timespec{toTimespec(atime, omitAtime), toTimespec(mtime, omitMtime)}
 	_, _, errno := unix.Syscall6(
 		unix.SYS_UTIMENSAT,
 		uintptr(fd),
 		0, /* path */
-		uintptr(unsafe.Pointer(ts)),
+		uintptr(unsafe.Pointer(&ts)),
 		0, /* flags */
 		0, 0)
 	if errno != 0 {

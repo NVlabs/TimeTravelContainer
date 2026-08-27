@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -7,9 +7,11 @@ package(
 
 go_library(
     name = "safecopy",
+    force_add_state_pkg = True,
     srcs = [
         "atomic_amd64.s",
         "atomic_arm64.s",
+        "mach_fault_addr_darwin.s",
         "memclr_amd64.s",
         "memclr_arm64.s",
         "memcpy_amd64.s",
@@ -17,6 +19,9 @@ go_library(
         "safecopy.go",
         "safecopy_amd64_unsafe.go",
         "safecopy_arm64.go",
+        "safecopy_darwin.go",
+        "safecopy_darwin_nocgo.go",
+        "safecopy_linux.go",
         "safecopy_unsafe.go",
         "sighandler_amd64.s",
         "sighandler_arm64.s",
@@ -28,7 +33,7 @@ go_library(
         "//pkg/errors/linuxerr",
         "//pkg/sighandling",
         "@org_golang_x_sys//unix:go_default_library",
-    ],
+    ] + select_system(linux = [], darwin = ["//pkg/safecopy/machexc"]),
 )
 
 go_test(
@@ -36,6 +41,8 @@ go_test(
     srcs = [
         "safecopy_test.go",
     ],
+    # Darwin fault recovery uses the Mach exception server in machexc.
+    pure = select_system(darwin = "off", linux = "auto"),
     library = ":safecopy",
     deps = [
         "@org_golang_x_sys//unix:go_default_library",

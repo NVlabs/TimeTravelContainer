@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 const (
@@ -143,8 +144,13 @@ func probeCapability(root string, allowSlowCopy bool) (Capability, error) {
 	}
 	cloneName := clone.Name()
 	defer os.Remove(cloneName)
-	defer clone.Close()
-	if err := unix.IoctlFileClone(int(clone.Fd()), int(source.Fd())); err != nil {
+	defer func() {
+		if clone != nil {
+			clone.Close()
+		}
+	}()
+	clone, err = cloneFile(source, clone, unix.AT_FDCWD, cloneName)
+	if err != nil {
 		if allowSlowCopy {
 			capability.Mode = CopyModeFull
 			return capability, nil
@@ -1590,7 +1596,7 @@ func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error 
 	}
 	defer file.Close()
 	if dataOnly {
-		return unix.Fdatasync(int(file.Fd()))
+		return syncFileData(file)
 	}
 	if err := file.Sync(); err != nil {
 		return err
@@ -1770,7 +1776,7 @@ func (r *Repository) AllocateWithCoW(branchID string, ino uint64, offset, length
 		if err != nil {
 			return err
 		}
-		err = unix.Fallocate(int(file.Fd()), 0, offset, length)
+		err = allocateFile(file, offset, length)
 		closeErr := file.Close()
 		if err != nil {
 			return err
@@ -1841,7 +1847,7 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	var bytes uint64
-	pageSize := uint64(os.Getpagesize())
+	pageSize := uint64(hostarch.PageSize)
 	for _, inode := range state.inodes {
 		if inode.Type == "regular" && inode.Size > 0 {
 			size := uint64(inode.Size)
@@ -1880,7 +1886,7 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 	snapshots := make(map[string]snapshot, len(ids))
 	objectBranches := make(map[string]uint64)
 	objectSizes := make(map[string]uint64)
-	pageSize := uint64(os.Getpagesize())
+	pageSize := uint64(hostarch.PageSize)
 	for _, id := range ids {
 		if _, exists := snapshots[id]; exists {
 			return BranchSetDataUsage{}, fmt.Errorf("duplicate branch %q in usage set", id)
@@ -2278,7 +2284,9 @@ func (r *Repository) createObject(source string) (string, error) {
 	}
 	keep := false
 	defer func() {
-		dst.Close()
+		if dst != nil {
+			dst.Close()
+		}
 		if !keep {
 			_ = r.unlink(destination)
 		}
@@ -2290,7 +2298,7 @@ func (r *Repository) createObject(source string) (string, error) {
 		}
 		switch r.copyMode {
 		case CopyModeReflink:
-			err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
+			dst, err = cloneFile(src, dst, int(r.dir.Fd()), destination)
 		case CopyModeFull:
 			// Avoid os.File's copy_file_range fast path. Full-copy mode is the
 			// explicit portability fallback and the Sentry's host seccomp

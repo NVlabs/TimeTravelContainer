@@ -1,0 +1,162 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef GVISOR_PKG_SENTRY_PLATFORM_HVF_MONITOR_LAYOUT_H_
+#define GVISOR_PKG_SENTRY_PLATFORM_HVF_MONITOR_LAYOUT_H_
+
+#ifndef __ASSEMBLER__
+#include <stdint.h>
+#define TTC_MONITOR_MAGIC UINT64_C(0x3130554d4d435454)
+#else
+#define TTC_MONITOR_MAGIC 0x3130554d4d435454
+#endif
+#define TTC_MONITOR_VERSION 1
+#define TTC_MONITOR_PAGE_SIZE UINT64_C(4096)
+#define TTC_MONITOR_HOST_SLAB_SIZE UINT64_C(16384)
+#define TTC_MONITOR_MAX_OPERATIONS 256
+#define TTC_MONITOR_MAX_ADDRESS_SPACES 128
+#define TTC_MONITOR_MAX_POOL_REGIONS 64
+
+#define TTC_MONITOR_COMMAND_MAX_SIZE (64 + TTC_MONITOR_MAX_OPERATIONS * 40)
+
+// Per-vCPU state-page offsets. The command buffer and application register
+// image intentionally share one permanently mapped 16 KiB page; monitor
+// commands are serialized and never execute while that vCPU is in EL0.
+#define TTC_STATE_CONTROL_VA_OFFSET 0x0000
+#define TTC_STATE_CONTROL_GPA_OFFSET 0x0008
+#define TTC_STATE_COMMAND_LENGTH_OFFSET 0x0010
+#define TTC_STATE_COMMAND_OFFSET 0x0040
+#define TTC_STATE_RESPONSE_OFFSET 0x2880
+#define TTC_STATE_ADDRESS_SPACE_ID_OFFSET 0x2900
+#define TTC_STATE_X0_OFFSET 0x2908
+#define TTC_STATE_SP_OFFSET 0x2a00
+#define TTC_STATE_PC_OFFSET 0x2a08
+#define TTC_STATE_PSTATE_OFFSET 0x2a10
+#define TTC_STATE_TPIDR_OFFSET 0x2a18
+#define TTC_STATE_ESR_OFFSET 0x2a20
+#define TTC_STATE_FAR_OFFSET 0x2a28
+#define TTC_STATE_EXIT_KIND_OFFSET 0x2a30
+#define TTC_STATE_INTERNAL_ESR_OFFSET 0x2a38
+#define TTC_STATE_INTERNAL_FAR_OFFSET 0x2a40
+#define TTC_STATE_INTERNAL_ELR_OFFSET 0x2a48
+#define TTC_STATE_INTERNAL_VECTOR_OFFSET 0x2a50
+#define TTC_STATE_INTERNAL_INPUT_PSTATE_OFFSET 0x2a58
+#define TTC_STATE_HOST_INPUT_PSTATE_OFFSET 0x2a60
+#define TTC_STATE_HOST_INPUT_PC_OFFSET 0x2a68
+#define TTC_STATE_HOST_INPUT_ADDRESS_SPACE_OFFSET 0x2a70
+#define TTC_STATE_STACK_TOP 0x4000
+
+#define TTC_APP_SP_OFFSET 0x00f8
+#define TTC_APP_PC_OFFSET 0x0100
+#define TTC_APP_PSTATE_OFFSET 0x0108
+#define TTC_APP_TPIDR_OFFSET 0x0110
+#define TTC_APP_ESR_OFFSET 0x0118
+#define TTC_APP_FAR_OFFSET 0x0120
+#define TTC_APP_EXIT_KIND_OFFSET 0x0128
+
+#define TTC_EXIT_NONE 0
+#define TTC_EXIT_SYSCALL 1
+#define TTC_EXIT_FAULT 2
+#define TTC_EXIT_INTERRUPTED 3
+#define TTC_EXIT_EXCEPTION 4
+
+#ifndef __ASSEMBLER__
+
+enum ttc_monitor_opcode {
+  TTC_OPCODE_INVALID = 0,
+  TTC_OPCODE_CREATE_ADDRESS_SPACE = 1,
+  TTC_OPCODE_DESTROY_ADDRESS_SPACE = 2,
+  TTC_OPCODE_APPLY = 3,
+  TTC_OPCODE_ACTIVATE = 4,
+  TTC_OPCODE_EXPAND_PAGE_TABLE_POOL = 5,
+};
+
+enum ttc_monitor_operation_type {
+  TTC_OPERATION_INVALID = 0,
+  TTC_OPERATION_MAP = 1,
+  TTC_OPERATION_UNMAP = 2,
+  TTC_OPERATION_PROTECT = 3,
+};
+
+enum ttc_monitor_access {
+  TTC_ACCESS_READ = 1,
+  TTC_ACCESS_WRITE = 2,
+  TTC_ACCESS_EXECUTE = 4,
+};
+
+enum ttc_monitor_status {
+  TTC_STATUS_OK = 0,
+  TTC_STATUS_MALFORMED = 1,
+  TTC_STATUS_UNSUPPORTED = 2,
+  TTC_STATUS_NO_MEMORY = 3,
+  TTC_STATUS_NOT_FOUND = 4,
+  TTC_STATUS_CONFLICT = 5,
+  TTC_STATUS_INTERNAL = 6,
+};
+
+struct ttc_monitor_pool_region {
+  uint64_t gpa;
+  uint64_t va;
+  uint64_t length;
+  uint64_t used;
+};
+
+struct ttc_monitor_address_space {
+  uint64_t id;
+  uint64_t root_gpa;
+  uint16_t asid;
+  uint16_t active;
+  uint32_t reserved;
+};
+
+struct ttc_monitor_mutation {
+  uint64_t pte_va;
+  uint64_t new_pte;
+  uint64_t va;
+};
+
+// ttc_monitor_control is initialized by the host before bootstrap, then owned
+// by the monitor. Host fields describe only permanently leased stage-2 memory;
+// they are not page-table contents.
+struct ttc_monitor_control {
+  uint64_t magic;
+  uint64_t version;
+  uint64_t code_gpa;
+  uint64_t code_va;
+  uint64_t code_length;
+  uint64_t control_gpa;
+  uint64_t control_va;
+  uint64_t states_gpa;
+  uint64_t states_va;
+  uint64_t state_count;
+  uint64_t ttbr1_gpa;
+  uint64_t next_pool_va;
+  uint64_t pool_aperture_length;
+  uint64_t next_asid;
+  uint64_t pool_region_count;
+  uint64_t command_entry_va;
+  uint64_t application_entry_va;
+  uint64_t vector_va;
+  uint64_t reserved[2];
+  struct ttc_monitor_pool_region pool[TTC_MONITOR_MAX_POOL_REGIONS];
+  struct ttc_monitor_address_space spaces[TTC_MONITOR_MAX_ADDRESS_SPACES];
+  struct ttc_monitor_mutation mutations[TTC_MONITOR_MAX_OPERATIONS];
+};
+
+_Static_assert(sizeof(struct ttc_monitor_control) <= TTC_MONITOR_HOST_SLAB_SIZE,
+               "monitor control must fit in one host slab");
+
+#endif  // !__ASSEMBLER__
+
+#endif  // GVISOR_PKG_SENTRY_PLATFORM_HVF_MONITOR_LAYOUT_H_

@@ -7,7 +7,11 @@ package(
 
 go_library(
     name = "hostos",
-    srcs = ["hostos.go"],
+    srcs = [
+        "hostos.go",
+        "memory_darwin.go",
+        "memory_linux.go",
+    ],
     visibility = ["//:sandbox"],
     deps = [
         "@org_golang_x_mod//semver:go_default_library",

@@ -25,9 +25,6 @@ package pagetables
 // selects whether the top 8 bits of the ASID are used.
 var limitPCID uint16
 
-// GetASIDBits return the system ASID bits, 8 or 16 bits.
-func GetASIDBits() uint8
-
 func init() {
-	limitPCID = uint16(1)<<GetASIDBits() - 1
+	limitPCID = uint16(1)<<archASIDBits() - 1
 }

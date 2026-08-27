@@ -22,7 +22,9 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	gtime "time"
 
@@ -31,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
@@ -39,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -802,7 +806,11 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 
 	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	if _, ok := cm.l.k.Platform.(platform.RestoreReuser); ok {
+		cm.restorer.mainMF, err = createMemoryFileForPlatform(cm.l.k.Platform, cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	} else {
+		cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	}
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}
@@ -863,10 +871,24 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 	cm.restorer.checkpointedSpecs = specs
 
+	contract, err := checkpoint.PortableContractFromMetadata(cm.restorer.metadata)
+	if err != nil {
+		return fmt.Errorf("invalid portable checkpoint: %w", err)
+	}
+	if err := contract.ValidateDestination(
+		version.Version(),
+		runtime.GOARCH,
+		strings.Fields(cpuid.HostFeatureSet().FlagString()),
+		portableSentryCapabilities,
+	); err != nil {
+		return fmt.Errorf("portable checkpoint is incompatible: %w", err)
+	}
+	if !contract.IsCrossHostPortable() {
+		log.Warningf("Restoring a host-bound checkpoint; cross-host restore is not supported for its resource profile")
+	}
 	checkpointVersion := cm.restorer.metadata[VersionKey]
-	currentVersion := version.Version()
-	if checkpointVersion != currentVersion {
-		return fmt.Errorf("runsc version does not match across checkpoint restore, checkpoint: %v current: %v", checkpointVersion, currentVersion)
+	if checkpointVersion != "" && checkpointVersion != version.Version() {
+		log.Infof("Checkpoint diagnostic runsc version is %q; current build is %q", checkpointVersion, version.Version())
 	}
 	timer.Reached("restorer initialized")
 	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)

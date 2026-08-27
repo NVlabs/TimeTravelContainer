@@ -99,7 +99,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("strace-event", false, "send strace to event.")
 
 	// Flags that control sandbox runtime behavior.
-	flagSet.String("platform", "systrap", "specifies which platform to use: systrap (default), ptrace, kvm.")
+	flagSet.String("platform", hostDefaultPlatform, "specifies which execution platform to use")
 	flagSet.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
 	flagSet.String("watchdog-action", "log", "sets what action the watchdog takes when triggered: log (default), panic.")
 	flagSet.Int("panic-signal", -1, "register signal handling that panics. Usually set to SIGUSR2(12) to troubleshoot hangs. -1 disables it.")
@@ -146,22 +146,22 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("gvisor-marker-file", false, "enable the presence of the /proc/gvisor/kernel_is_gvisor file that can be used by applications to detect that gVisor is in use")
 	flagSet.String("override-procs", "", "comma-separated list of proc files to override with stubs (e.g. kallsyms)")
 
-	flagSet.Bool("ignore-cgroups", false, "don't configure cgroups.")
+	flagSet.Bool("ignore-cgroups", hostDefaultIgnoreCgroups, "don't configure cgroups.")
 	flagSet.Bool(flagMountCgroupV2, false, "EXPERIMENTAL. Mount cgroup v2 instead of cgroup v1 inside the sandbox. cgroup v2 support in gVisor is experimental and incomplete. Do not use for production workloads.")
 	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
-	flagSet.Bool("directfs", true, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
+	flagSet.Bool("directfs", hostDefaultDirectFS, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
 	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")
 
 	// Flags that control sandbox runtime behavior: network related.
-	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none, ttc. Using network inside the sandbox is more secure because it's isolated from the host network.")
-	ttcNetworkNAT := flagSet.Bool("ttc-network-nat", false, "enable rootless user-mode TCP/UDP NAT for --network=ttc")
+	flagSet.Var(networkTypePtr(hostDefaultNetwork), "network", "specifies which network to use: sandbox, host, none, ttc")
+	ttcNetworkNAT := flagSet.Bool("ttc-network-nat", hostDefaultTTCNetworkNAT, "enable rootless user-mode TCP/UDP NAT for --network=ttc")
 	ttcNetworkIP := flagSet.String("ttc-network-ip", "", "IPv4 address for the --network=ttc virtual NIC (default 10.0.2.15)")
 	ttcNetworkMAC := flagSet.String("ttc-network-mac", "", "MAC address for the --network=ttc virtual NIC")
 	// Keep old low-level runsc arguments working for bundles and launchers
 	// produced before the TimeTravelContainer rename.
-	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", false, "deprecated alias for --ttc-network-nat")
+	flagSet.BoolVar(ttcNetworkNAT, "ttos-network-nat", hostDefaultTTCNetworkNAT, "deprecated alias for --ttc-network-nat")
 	flagSet.StringVar(ttcNetworkIP, "ttos-network-ip", "", "deprecated alias for --ttc-network-ip")
 	flagSet.StringVar(ttcNetworkMAC, "ttos-network-mac", "", "deprecated alias for --ttc-network-mac")
 	flagSet.Var(goferNetworkNamespacePtr(GoferNetworkNamespaceNull), "gofer-network-namespace", "network namespace for gofers: null (default; an empty namespace shared by all gofers using the same --shared-root, which defaults to --root), new (a new empty namespace per gofer), host (the current namespace), or an absolute path to an existing namespace.")
@@ -194,7 +194,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
-	flagSet.Bool("unsafe-no-host-isolation", false, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelContainer workloads")
+	flagSet.Bool("unsafe-no-host-isolation", hostDefaultUnsafeNoHostIsolation, "UNSAFE: run Sentry and gofer as the current user without host namespaces or chroots; intended only for trusted TimeTravelContainer workloads")
 
 	// Test flags, not to be used outside tests, ever.
 	flagSet.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")
@@ -354,6 +354,15 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 		// If not set, set default root dir to something (hopefully) user-writeable.
 		conf.RootDir = DefaultRootDir()
 	}
+	// NAT is the default for TTC networking on hosts that require a userspace
+	// data plane. Selecting another network mode without explicitly setting a
+	// NAT flag derives the only meaningful value instead of making --network
+	// none require an unrelated --ttc-network-nat=false.
+	if conf.Network != NetworkTimeTravel &&
+		!isFlagExplicitlySet(flagSet, "ttc-network-nat") &&
+		!isFlagExplicitlySet(flagSet, "ttos-network-nat") {
+		conf.TimeTravelNetworkNAT = false
+	}
 
 	if err := conf.Validate(); err != nil {
 		return nil, err
@@ -389,6 +398,12 @@ func (c *Config) keyVals(flagSet *flag.FlagSet, onlyIfSet bool) map[string]strin
 			continue
 		}
 		val := getVal(obj.Field(i))
+		if name == "ttc-network-nat" && c.Network != NetworkTimeTravel {
+			_, explicit := c.explicitlySet[name]
+			if !explicit {
+				continue
+			}
+		}
 
 		fl := flagSet.Lookup(name)
 		if fl == nil {

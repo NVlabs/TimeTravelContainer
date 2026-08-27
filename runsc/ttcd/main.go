@@ -32,7 +32,7 @@ func main() {
 		os.Args = append([]string{"ttcd-runsc"}, os.Args[2:]...)
 	}
 	if runscMode {
-		// runsc re-executes /proc/self/exe for sandbox helpers. The marker makes
+		// runsc re-executes its own host path for sandbox helpers. The marker makes
 		// those children return to the embedded runtime instead of starting the
 		// TTC control daemon.
 		_ = os.Setenv("TTC_EMBEDDED_RUNTIME", "1")

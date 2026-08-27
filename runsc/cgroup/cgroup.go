@@ -122,7 +122,7 @@ func IsOnlyV2() bool {
 		// It's not used for anything important, assume not V2 on failure.
 		return false
 	}
-	return stat.Type == unix.CGROUP2_SUPER_MAGIC
+	return isCgroup2FS(&stat)
 }
 
 func setOptionalValueInt(path, name string, val *int64) error {

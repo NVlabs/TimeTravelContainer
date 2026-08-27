@@ -21,6 +21,7 @@ import (
 	"slices"
 
 	"golang.org/x/sys/unix"
+	linuxerrno "gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -186,7 +187,7 @@ func (c *Connection) service(ch *channel) error {
 	return nil
 }
 
-func (c *Connection) respondError(comm Communicator, err unix.Errno) (MID, uint32, []int) {
+func (c *Connection) respondError(comm Communicator, err linuxerrno.Errno) (MID, uint32, []int) {
 	resp := &ErrorResp{errno: uint32(err)}
 	respLen := uint32(resp.SizeBytes())
 	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
@@ -196,11 +197,11 @@ func (c *Connection) respondError(comm Communicator, err unix.Errno) (MID, uint3
 func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (retM MID, retPayloadLen uint32, retFDs []int) {
 	if payloadLen > c.maxMessageSize {
 		log.Warningf("received payload is too large: %d bytes", payloadLen)
-		return c.respondError(comm, unix.EIO)
+		return c.respondError(comm, linuxerrno.EIO)
 	}
 	if !c.reqGate.Enter() {
 		// c.close() has been called; the connection is shutting down.
-		return c.respondError(comm, unix.ECONNRESET)
+		return c.respondError(comm, linuxerrno.ECONNRESET)
 	}
 	defer func() {
 		c.reqGate.Leave()
@@ -213,20 +214,20 @@ func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (ret
 			// Wrap in an EREMOTEIO error; we don't really have a better way to
 			// describe this kind of error. EREMOTEIO is appropriate for a generic
 			// failed RPC message.
-			retM, retPayloadLen, retFDs = c.respondError(comm, unix.EREMOTEIO)
+			retM, retPayloadLen, retFDs = c.respondError(comm, linuxerrno.EREMOTEIO)
 		}
 	}()
 
 	// Check if the message is supported for forward compatibility.
 	if int(m) >= len(c.server.handlers) || c.server.handlers[m] == nil {
 		log.Warningf("received request which is not supported by the server, MID = %d", m)
-		return c.respondError(comm, unix.EOPNOTSUPP)
+		return c.respondError(comm, linuxerrno.EOPNOTSUPP)
 	}
 
 	// Check if the message is supported by the connection.
 	if int(m) >= len(c.supported) || !c.supported[m] {
 		log.Warningf("received request which is not supported on this connection, MID = %d", m)
-		return c.respondError(comm, unix.EOPNOTSUPP)
+		return c.respondError(comm, linuxerrno.EOPNOTSUPP)
 	}
 
 	// Try handling the request.
@@ -234,12 +235,12 @@ func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (ret
 	fds := comm.ReleaseFDs()
 	if err != nil {
 		closeFDs(fds)
-		return c.respondError(comm, ExtractErrno(err))
+		return c.respondError(comm, extractLinuxErrno(err))
 	}
 	if respPayloadLen > c.maxMessageSize {
 		log.Warningf("handler for message %d responded with payload which is too large: %d bytes", m, respPayloadLen)
 		closeFDs(fds)
-		return c.respondError(comm, unix.EIO)
+		return c.respondError(comm, linuxerrno.EIO)
 	}
 
 	return m, respPayloadLen, fds

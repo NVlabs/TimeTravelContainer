@@ -13,6 +13,8 @@ go_library(
         "bufwriter.go",
         "fdreader.go",
         "fdwriter.go",
+        "fdwriter_darwin.go",
+        "fdwriter_linux.go",
         "ioreader.go",
         "iowriter.go",
         "pagesfile.go",
