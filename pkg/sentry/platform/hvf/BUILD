@@ -29,6 +29,8 @@ go_library(
         "backend_unsupported.go",
         ":monitor_image_go",
         "monitor_darwin_arm64.go",
+        "ring0_darwin_arm64.go",
+        "ring0_engine_darwin_arm64.go",
     ],
     bazel_cgo = True,
     bazel_cdeps = select_system(
@@ -42,14 +44,24 @@ go_library(
     ],
     stateify = False,
     visibility = ["//pkg/sentry:internal"],
-    deps = ["//pkg/sentry/platform/vmplatform/vmm"],
+    deps = [
+        "//pkg/hosttid",
+        "//pkg/sentry/platform/hvf/ring0asm",
+        "//pkg/sentry/platform/vmplatform",
+        "//pkg/sentry/platform/vmplatform/monitorabi",
+        "//pkg/sentry/platform/vmplatform/vmm",
+    ],
 )
 
 go_test(
     name = "hvf_test",
     size = "small",
+    pure = "off",
     srcs = select_system(
-        darwin = ["backend_darwin_arm64_test.go"],
+        darwin = [
+            "backend_darwin_arm64_test.go",
+            "ring0_engine_darwin_arm64_test.go",
+        ],
         linux = [],
     ),
     library = ":hvf",
@@ -62,6 +74,7 @@ go_test(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/vmplatform",
+        "//pkg/sentry/platform/hvf/ring0asm",
         "//pkg/sentry/platform/vmplatform/arm64",
         "//pkg/sentry/platform/vmplatform/monitorabi",
         "//pkg/sentry/platform/vmplatform/vmm",

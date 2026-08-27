@@ -1038,6 +1038,7 @@ func (p *epochRebindPlan) frameGPA(id pgalloc.FrameID) (uint64, bool) {
 	return gpa, ok
 }
 
+// +checklocksignore: beginEpochRebind transfers ram.mu ownership to this plan.
 func (p *epochRebindPlan) commit() error {
 	if p == nil || p.done {
 		return fmt.Errorf("GuestRAM epoch plan is already completed")
@@ -1054,6 +1055,7 @@ func (p *epochRebindPlan) commit() error {
 	return nil
 }
 
+// +checklocksignore: beginEpochRebind transfers ram.mu ownership to this plan.
 func (p *epochRebindPlan) abort() error {
 	if p == nil || p.done {
 		return fmt.Errorf("GuestRAM epoch plan is already completed")

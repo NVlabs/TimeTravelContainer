@@ -41,7 +41,6 @@ func (*relocationTestVM) Close() error { return nil }
 
 type relocationTestVCPU struct{ vm *relocationTestVM }
 
-func (relocationTestVCPU) Run(context.Context, any) (Exit, error) { return Exit{}, nil }
 func (v relocationTestVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
 	command, err := monitorabi.UnmarshalCommand(encoded)
 	if err != nil {
@@ -84,6 +83,7 @@ func TestPreForkDoesNotBlockAddressSpaceMutation(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		as.mu.Lock()
+		_ = as.released
 		as.mu.Unlock()
 		close(done)
 	}()
@@ -100,9 +100,10 @@ func newAddressSpaceTestPlatform(t *testing.T, vm *relocationTestVM) (*Platform,
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine := newWorkerPoolTestEngine(pool)
 	p := &Platform{
-		pool:    pool,
-		monitor: NewMonitor(pool),
+		engine:  engine,
+		monitor: NewMonitor(engine, monitorPoolExpander(vm)),
 		ram:     &GuestRAM{frames: make(map[pgalloc.FrameID]*guestFrame)},
 		spaces:  make(map[uint64]*addressSpace),
 	}
@@ -170,7 +171,8 @@ func TestRelocateFramesReplacesEveryReverseMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	p := &Platform{pool: pool, monitor: NewMonitor(pool), spaces: make(map[uint64]*addressSpace)}
+	engine := newWorkerPoolTestEngine(pool)
+	p := &Platform{engine: engine, monitor: NewMonitor(engine, monitorPoolExpander(vm)), spaces: make(map[uint64]*addressSpace)}
 	frame := pgalloc.FrameID(44)
 	for id, va := range map[uint64]hostarch.Addr{1: 0x4000, 2: 0x8000} {
 		p.spaces[id] = &addressSpace{id: id, platform: p, mappings: map[hostarch.Addr]addressMapping{
@@ -205,7 +207,8 @@ func TestRelocateFramesRollsBackCompletedRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	p := &Platform{pool: pool, monitor: NewMonitor(pool), spaces: make(map[uint64]*addressSpace)}
+	engine := newWorkerPoolTestEngine(pool)
+	p := &Platform{engine: engine, monitor: NewMonitor(engine, monitorPoolExpander(vm)), spaces: make(map[uint64]*addressSpace)}
 	frame := pgalloc.FrameID(45)
 	for id, va := range map[uint64]hostarch.Addr{1: 0x4000, 2: 0x8000} {
 		p.spaces[id] = &addressSpace{id: id, platform: p, mappings: map[hostarch.Addr]addressMapping{

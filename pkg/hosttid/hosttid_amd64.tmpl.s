@@ -18,6 +18,8 @@
 
 #define M_OFFSET      {{ Offset (Import "runtime") "g.m" }}
 #define PROCID_OFFSET {{ Offset (Import "runtime") "m.procid" }}
+#define P_OFFSET      {{ Offset (Import "runtime") "m.p" }}
+#define MCACHE_OFFSET {{ Offset (Import "runtime") "p.mcache" }}
 
 TEXT ·Current(SB),NOSPLIT|NOFRAME,$0-8
 	// procid is in getg().m.procid.
@@ -25,5 +27,22 @@ TEXT ·Current(SB),NOSPLIT|NOFRAME,$0-8
 	MOVQ 0(AX)(TLS*1), AX
 	MOVQ M_OFFSET(AX), AX // gp.m
 	MOVQ PROCID_OFFSET(AX), AX // mp.procid
+	MOVQ AX, ret+0(FP)
+	RET
+
+TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-32
+	MOVQ TLS, AX
+	MOVQ 0(AX)(TLS*1), AX
+	MOVQ AX, gp+0(FP)
+	MOVQ M_OFFSET(AX), CX
+	MOVQ CX, mp+8(FP)
+	MOVQ P_OFFSET(CX), DX
+	MOVQ DX, pp+16(FP)
+	MOVQ MCACHE_OFFSET(DX), BX
+	MOVQ BX, mcachep+24(FP)
+	RET
+
+TEXT ·RuntimeTLSBase(SB),NOSPLIT|NOFRAME,$0-8
+	MOVQ TLS, AX
 	MOVQ AX, ret+0(FP)
 	RET

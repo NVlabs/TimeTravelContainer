@@ -41,16 +41,6 @@ type fakeVCPU struct {
 	once    sync.Once
 }
 
-func (v *fakeVCPU) Run(ctx context.Context, _ any) (Exit, error) {
-	v.once.Do(func() { close(v.started) })
-	select {
-	case <-v.exit:
-		return Exit{Reason: ExitInterrupted}, nil
-	case <-ctx.Done():
-		return Exit{}, ctx.Err()
-	}
-}
-
 func (*fakeVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
 	command, err := monitorabi.UnmarshalCommand(encoded)
 	if err != nil {
@@ -69,7 +59,7 @@ func (v *fakeVCPU) RequestExit() error {
 
 func (*fakeVCPU) Close() error { return nil }
 
-func TestMonitorInterruptsApplicationWorker(t *testing.T) {
+func TestWorkerPoolCancellationInterruptsWorker(t *testing.T) {
 	vm := &fakeVM{started: make(chan struct{})}
 	pool, err := NewWorkerPool(vm, 1)
 	if err != nil {
@@ -77,93 +67,30 @@ func TestMonitorInterruptsApplicationWorker(t *testing.T) {
 	}
 	defer pool.Close()
 
-	applicationDone := make(chan Exit, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
 	go func() {
-		exit, _ := pool.RunApplication(context.Background(), nil)
-		applicationDone <- exit
+		_, err := pool.Do(ctx, func(ctx context.Context, vcpu VCPU) (any, error) {
+			fake := vcpu.(*fakeVCPU)
+			fake.once.Do(func() { close(fake.started) })
+			<-fake.exit
+			return nil, ctx.Err()
+		})
+		done <- err
 	}()
 	select {
 	case <-vm.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("application vCPU did not start")
+		t.Fatal("worker did not start")
 	}
-
-	monitor := NewMonitor(pool)
-	if err := monitor.Execute(context.Background(), monitorabi.Command{
-		Opcode:         monitorabi.OpcodeCreateAddressSpace,
-		AddressSpaceID: 1,
-	}); err != nil {
-		t.Fatalf("monitor.Execute: %v", err)
-	}
-	select {
-	case exit := <-applicationDone:
-		if exit.Reason != ExitInterrupted {
-			t.Fatalf("application exit reason = %v, want interrupted", exit.Reason)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("monitor did not interrupt application worker")
-	}
-}
-
-type synchronousExitRaceVM struct {
-	started chan struct{}
-}
-
-func (*synchronousExitRaceVM) MapStage2(uint64, uintptr, uint64, Stage2Access) error {
-	return nil
-}
-func (*synchronousExitRaceVM) UnmapStage2(uint64, uint64) error { return nil }
-func (v *synchronousExitRaceVM) CreateVCPU(int) (VCPU, error) {
-	return &synchronousExitRaceVCPU{started: v.started, exit: make(chan struct{})}, nil
-}
-func (*synchronousExitRaceVM) Close() error { return nil }
-
-type synchronousExitRaceVCPU struct {
-	started chan struct{}
-	exit    chan struct{}
-	once    sync.Once
-}
-
-func (v *synchronousExitRaceVCPU) Run(context.Context, any) (Exit, error) {
-	close(v.started)
-	<-v.exit
-	return Exit{Reason: ExitSyscall}, nil
-}
-func (*synchronousExitRaceVCPU) RunMonitor(context.Context, []byte) ([]byte, error) {
-	return nil, nil
-}
-func (v *synchronousExitRaceVCPU) RequestExit() error {
-	v.once.Do(func() { close(v.exit) })
-	return nil
-}
-func (*synchronousExitRaceVCPU) Close() error { return nil }
-
-func TestSynchronousApplicationExitWinsContextCancellation(t *testing.T) {
-	vm := &synchronousExitRaceVM{started: make(chan struct{})}
-	pool, err := NewWorkerPool(vm, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan workerResult, 1)
-	go func() {
-		exit, err := pool.RunApplication(ctx, nil)
-		done <- workerResult{value: exit, err: err}
-	}()
-	<-vm.started
 	cancel()
 	select {
-	case result := <-done:
-		if result.err != nil {
-			t.Fatalf("RunApplication returned cancellation instead of synchronous exit: %v", result.err)
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("worker error = %v, want context.Canceled", err)
 		}
-		exit := result.value.(Exit)
-		if exit.Reason != ExitSyscall {
-			t.Fatalf("exit reason = %d, want syscall", exit.Reason)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("RunApplication did not resolve cancellation/exit race")
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not interrupt worker")
 	}
 }
 
@@ -174,7 +101,7 @@ func TestMonitorRejectsWrongSequence(t *testing.T) {
 		t.Fatalf("NewWorkerPool: %v", err)
 	}
 	defer pool.Close()
-	err = NewMonitor(pool).Execute(context.Background(), monitorabi.Command{
+	err = NewMonitor(newWorkerPoolTestEngine(pool), monitorPoolExpander(vm)).Execute(context.Background(), monitorabi.Command{
 		Opcode:         monitorabi.OpcodeActivate,
 		AddressSpaceID: 1,
 	})
@@ -189,7 +116,6 @@ func (*wrongSequenceVM) CreateVCPU(int) (VCPU, error) { return wrongSequenceVCPU
 
 type wrongSequenceVCPU struct{}
 
-func (wrongSequenceVCPU) Run(context.Context, any) (Exit, error) { return Exit{}, nil }
 func (wrongSequenceVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
 	command, err := monitorabi.UnmarshalCommand(encoded)
 	if err != nil {
@@ -236,7 +162,6 @@ func (v *expandingVM) CompleteMonitorPoolExpansion(expansion MonitorPoolExpansio
 
 type expandingVCPU struct{ vm *expandingVM }
 
-func (expandingVCPU) Run(context.Context, any) (Exit, error) { return Exit{}, nil }
 func (v expandingVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
 	command, err := monitorabi.UnmarshalCommand(encoded)
 	if err != nil {
@@ -262,7 +187,7 @@ func TestMonitorExpandsPoolAndRetries(t *testing.T) {
 		t.Fatalf("NewWorkerPool: %v", err)
 	}
 	defer pool.Close()
-	if err := NewMonitor(pool).Execute(context.Background(), monitorabi.Command{
+	if err := NewMonitor(newWorkerPoolTestEngine(pool), monitorPoolExpander(vm)).Execute(context.Background(), monitorabi.Command{
 		Opcode:         monitorabi.OpcodeCreateAddressSpace,
 		AddressSpaceID: 1,
 	}); err != nil {

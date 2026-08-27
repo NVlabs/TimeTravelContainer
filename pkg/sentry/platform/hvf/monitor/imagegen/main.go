@@ -27,17 +27,10 @@ import (
 )
 
 var requiredSymbols = map[string]string{
-	"_ttc_monitor_bootstrap":            "embeddedMonitorBootstrapOffset",
-	"_ttc_monitor_cancel_application":   "embeddedMonitorCancelOffset",
-	"_ttc_monitor_command_entry":        "embeddedMonitorCommandOffset",
-	"_ttc_monitor_application_entry":    "embeddedMonitorApplicationOffset",
-	"_ttc_monitor_vectors":              "embeddedMonitorVectorOffset",
-	"_ttc_monitor_vectors_end":          "embeddedMonitorVectorEndOffset",
-	"_ttc_monitor_el0_sync_handler":     "embeddedMonitorSyncHandlerOffset",
-	"_ttc_monitor_el0_sync_handler_end": "embeddedMonitorSyncHandlerEndOffset",
-	"_ttc_monitor_el0_irq_handler":      "embeddedMonitorIRQHandlerOffset",
-	"_ttc_monitor_el0_irq_handler_end":  "embeddedMonitorIRQHandlerEndOffset",
-	"_ttc_monitor_unexpected_handler":   "embeddedMonitorUnexpectedHandlerOffset",
+	"_ttc_monitor_bootstrap":               "embeddedMonitorBootstrapOffset",
+	"_ttc_monitor_command_entry":           "embeddedMonitorCommandOffset",
+	"_ttc_monitor_ring0_application_entry": "embeddedMonitorRing0ApplicationOffset",
+	"_ttc_monitor_vectors":                 "embeddedMonitorVectorOffset",
 }
 
 func main() {

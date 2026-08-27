@@ -21,14 +21,6 @@ import (
 	"sync"
 )
 
-// Priority determines worker queue ordering.
-type Priority uint8
-
-const (
-	PriorityApplication Priority = iota
-	PriorityMonitor
-)
-
 type workerResult struct {
 	value any
 	err   error
@@ -40,10 +32,9 @@ type workerInitialized struct {
 }
 
 type workerJob struct {
-	ctx      context.Context
-	priority Priority
-	run      func(context.Context, VCPU) (any, error)
-	done     chan workerResult
+	ctx  context.Context
+	run  func(context.Context, VCPU) (any, error)
+	done chan workerResult
 
 	mu       sync.Mutex
 	assigned *vcpuWorker
@@ -93,43 +84,51 @@ func (w *vcpuWorker) runningJob() *workerJob {
 	return w.running
 }
 
-// WorkerPool is a fixed set of thread-affine vCPU workers shared by
-// application execution and high-priority monitor transactions.
+// WorkerPool is a fixed set of thread-affine monitor vCPU workers. Application
+// execution belongs to the host VMEngine because a sentry-at-EL1 engine must
+// preserve the calling Sentry thread's continuation.
 type WorkerPool struct {
-	vm VM
+	vm     VM
+	idBase int
 
-	high   chan *workerJob
-	normal chan *workerJob
-	stop   chan struct{}
+	jobs chan *workerJob
+	stop chan struct{}
 
 	mu      sync.Mutex
 	workers []*vcpuWorker
-	idle    int
 	closed  bool
-	next    int
 
 	wg sync.WaitGroup
 }
 
 // NewWorkerPool creates count vCPUs on count permanently locked OS threads.
 func NewWorkerPool(vm VM, count int) (*WorkerPool, error) {
+	return NewWorkerPoolWithIDBase(vm, count, 0)
+}
+
+// NewWorkerPoolWithIDBase creates count thread-affine workers whose VMM IDs
+// start at idBase. Execution engines use this to reserve disjoint monitor and
+// application vCPU state slots without changing the portable worker policy.
+func NewWorkerPoolWithIDBase(vm VM, count, idBase int) (*WorkerPool, error) {
 	if vm == nil {
 		return nil, fmt.Errorf("nil VM")
 	}
 	if count <= 0 {
 		return nil, fmt.Errorf("invalid vCPU worker count %d", count)
 	}
+	if idBase < 0 || idBase > int(^uint(0)>>1)-count {
+		return nil, fmt.Errorf("invalid vCPU worker ID base %d for count %d", idBase, count)
+	}
 	p := &WorkerPool{
 		vm:     vm,
-		high:   make(chan *workerJob, count*2),
-		normal: make(chan *workerJob),
+		idBase: idBase,
+		jobs:   make(chan *workerJob),
 		stop:   make(chan struct{}),
-		idle:   count,
 	}
 	ready := make(chan workerInitialized, count)
 	for i := 0; i < count; i++ {
 		p.wg.Add(1)
-		go p.workerMain(i, ready)
+		go p.workerMain(idBase+i, ready)
 	}
 	for i := 0; i < count; i++ {
 		result := <-ready
@@ -158,69 +157,41 @@ func (p *WorkerPool) workerMain(id int, ready chan<- workerInitialized) {
 	defer vcpu.Close()
 
 	for {
-		var job *workerJob
 		select {
-		case job = <-p.high:
-		default:
-			select {
-			case job = <-p.high:
-			case job = <-p.normal:
-			case <-p.stop:
-				return
+		case job := <-p.jobs:
+			if job == nil {
+				continue
 			}
-		}
-		if job == nil {
-			continue
-		}
-		p.markBusy()
-		w.setRunning(job)
-		job.assign(w)
-		value, err := job.run(job.ctx, vcpu)
-		job.unassign(w)
-		w.setRunning(nil)
-		p.markIdle()
-		select {
-		case job.done <- workerResult{value: value, err: err}:
-		default:
+			w.setRunning(job)
+			job.assign(w)
+			value, err := job.run(job.ctx, vcpu)
+			job.unassign(w)
+			w.setRunning(nil)
+			select {
+			case job.done <- workerResult{value: value, err: err}:
+			default:
+			}
+		case <-p.stop:
+			return
 		}
 	}
 }
 
-func (p *WorkerPool) markBusy() {
-	p.mu.Lock()
-	p.idle--
-	p.mu.Unlock()
-}
-
-func (p *WorkerPool) markIdle() {
-	p.mu.Lock()
-	p.idle++
-	p.mu.Unlock()
-}
-
-// Do runs fn on a worker. A pending monitor job interrupts one application
-// worker if no worker is idle.
-func (p *WorkerPool) Do(ctx context.Context, priority Priority, fn func(context.Context, VCPU) (any, error)) (any, error) {
+// Do runs fn on a thread-affine monitor vCPU worker.
+func (p *WorkerPool) Do(ctx context.Context, fn func(context.Context, VCPU) (any, error)) (any, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("nil vCPU job")
 	}
-	job := &workerJob{ctx: ctx, priority: priority, run: fn, done: make(chan workerResult, 1)}
+	job := &workerJob{ctx: ctx, run: fn, done: make(chan workerResult, 1)}
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("vCPU worker pool is closed")
 	}
-	if priority == PriorityMonitor && p.idle == 0 {
-		p.interruptApplicationLocked()
-	}
 	p.mu.Unlock()
 
-	queue := p.normal
-	if priority == PriorityMonitor {
-		queue = p.high
-	}
 	select {
-	case queue <- job:
+	case p.jobs <- job:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-p.stop:
@@ -232,18 +203,7 @@ func (p *WorkerPool) Do(ctx context.Context, priority Priority, fn func(context.
 	case <-ctx.Done():
 		job.interrupt()
 		select {
-		case result := <-job.done:
-			// Cancellation and a synchronous guest exit may race. If the
-			// syscall/fault HVC won, its PC and register state are already
-			// architecturally committed and must be delivered; reporting only
-			// context cancellation would resume after the instruction without
-			// emulating it. A monitor-recorded interrupted exit is the only
-			// application result that cancellation supersedes.
-			if result.err == nil {
-				if exit, ok := result.value.(Exit); ok && exit.Reason != ExitInterrupted {
-					return result.value, nil
-				}
-			}
+		case <-job.done:
 			return nil, ctx.Err()
 		case <-p.stop:
 			return nil, ctx.Err()
@@ -251,48 +211,6 @@ func (p *WorkerPool) Do(ctx context.Context, priority Priority, fn func(context.
 	case <-p.stop:
 		job.interrupt()
 		return nil, fmt.Errorf("vCPU worker pool is closed")
-	}
-}
-
-// RunApplication executes one application vCPU job.
-func (p *WorkerPool) RunApplication(ctx context.Context, state any) (Exit, error) {
-	value, err := p.Do(ctx, PriorityApplication, func(ctx context.Context, vcpu VCPU) (any, error) {
-		return vcpu.Run(ctx, state)
-	})
-	if err != nil {
-		return Exit{}, err
-	}
-	exit, ok := value.(Exit)
-	if !ok {
-		return Exit{}, fmt.Errorf("application vCPU returned result of type %T, want vmplatform.Exit", value)
-	}
-	return exit, nil
-}
-
-func (p *WorkerPool) interruptApplicationLocked() {
-	if len(p.workers) == 0 {
-		return
-	}
-	for i := 0; i < len(p.workers); i++ {
-		index := (p.next + i) % len(p.workers)
-		if job := p.workers[index].runningJob(); job != nil && job.priority == PriorityApplication {
-			p.next = (index + 1) % len(p.workers)
-			job.interrupt()
-			return
-		}
-	}
-}
-
-// InterruptApplications requests an exit from every application job. Monitor
-// jobs are never interrupted because their acknowledged mutations must run to
-// completion.
-func (p *WorkerPool) InterruptApplications() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, worker := range p.workers {
-		if job := worker.runningJob(); job != nil && job.priority == PriorityApplication {
-			job.interrupt()
-		}
 	}
 }
 

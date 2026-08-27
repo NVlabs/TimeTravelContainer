@@ -36,6 +36,15 @@ const (
 	ResponseSize  = 32
 )
 
+// Address-space creation flags describe the privilege domain whose stage-1
+// mappings the monitor owns. Application address spaces are accessible from
+// EL0. A Sentry address space is EL1-only and is used by ring0 execution
+// engines to preserve the Sentry continuation across application syscalls.
+const (
+	AddressSpaceFlagSentry uint64 = 1 << iota
+	addressSpaceFlagsMask         = AddressSpaceFlagSentry
+)
+
 // Opcode is a monitor transaction type.
 type Opcode uint16
 
@@ -196,7 +205,7 @@ func (c Command) Validate() error {
 	}
 	switch c.Opcode {
 	case OpcodeCreateAddressSpace:
-		if c.AddressSpaceID == 0 || c.Flags != 0 || c.PoolGPA != 0 || c.PoolLength != 0 || len(c.Operations) != 0 {
+		if c.AddressSpaceID == 0 || c.Flags & ^addressSpaceFlagsMask != 0 || c.PoolGPA != 0 || c.PoolLength != 0 || len(c.Operations) != 0 {
 			return fmt.Errorf("invalid create-address-space command")
 		}
 	case OpcodeDestroyAddressSpace, OpcodeActivate:

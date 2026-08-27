@@ -38,6 +38,11 @@ type HostMemory = vmm.HostMemory
 type MonitorPoolExpansion = vmm.MonitorPoolExpansion
 type MonitorPoolExpander = vmm.MonitorPoolExpander
 
+func monitorPoolExpander(vm VM) MonitorPoolExpander {
+	expander, _ := vm.(MonitorPoolExpander)
+	return expander
+}
+
 const (
 	ExitUnknown     = vmm.ExitUnknown
 	ExitSyscall     = vmm.ExitSyscall

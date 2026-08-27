@@ -6127,6 +6127,10 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
 	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, runtimeID)
 	if err != nil {
 		return fmt.Errorf("creating paused bootstrap for %s: %w", target, err)
@@ -6505,6 +6509,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			}()
 		}
 	}
+	started := time.Now()
 	if err := command.Start(); err != nil {
 		return 1, fmt.Errorf("starting runsc exec: %w", err)
 	}
@@ -6515,6 +6520,9 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	if err := command.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			if diagnostic := b.runtimeDiagnosticSince(request.target.container, started); diagnostic != "" && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: sandbox diagnostic: %s\n", diagnostic)
+			}
 			return exitErr.ExitCode(), nil
 		}
 		return 1, fmt.Errorf("executing runsc: %w", err)
@@ -8149,6 +8157,54 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	return args
 }
 
+func (b *runtimeBackend) withRuntimeDiagnostics(args []string, containerID string) ([]string, error) {
+	if b.dataRoot == "" || containerID == "" {
+		return args, nil
+	}
+	directory := filepath.Join(b.dataRoot, "containers", containerID, "runtime")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, fmt.Errorf("creating runtime diagnostic directory for %q: %w", containerID, err)
+	}
+	return append(args, "--panic-log="+filepath.Join(directory, "panic.log")), nil
+}
+
+func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.Time) string {
+	if b.dataRoot == "" || containerID == "" {
+		return ""
+	}
+	path := filepath.Join(b.dataRoot, "containers", containerID, "runtime", "panic.log")
+	info, err := os.Stat(path)
+	if err != nil || info.ModTime().Before(since.Add(-time.Second)) {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	const tailBytes = int64(64 << 10)
+	start := max(int64(0), info.Size()-tailBytes)
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(file, tailBytes))
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "ttc ring0 bridge error:") ||
+			strings.HasPrefix(line, "ttc hvf application error:") {
+			if len(line) > 4096 {
+				line = line[:4096]
+			}
+			return line
+		}
+	}
+	return ""
+}
+
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
 	return b.runConfiguredCommandForNetwork("none", args...)
 }
@@ -8344,6 +8400,11 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (int, error) {
 	name := info.ID
 	configuredArgs := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	var err error
+	configuredArgs, err = b.withRuntimeDiagnostics(configuredArgs, info.ID)
+	if err != nil {
+		return 1, err
+	}
 	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
@@ -10508,6 +10569,10 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	defer cleanupBundle()
 	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
 	if err != nil {
 		return fmt.Errorf("creating dehydration runtime: %w", err)

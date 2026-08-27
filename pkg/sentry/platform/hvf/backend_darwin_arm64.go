@@ -24,6 +24,7 @@ package hvf
 #cgo LDFLAGS: -framework Hypervisor -framework CoreFoundation -mmacosx-version-min=15.0
 #include <Hypervisor/Hypervisor.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <string.h>
 
@@ -34,6 +35,14 @@ static void *ttc_mmap_anon(size_t length) {
 
 static int ttc_madvise_free(void *address, size_t length) {
 	return madvise(address, length, MADV_DONTNEED);
+}
+
+// Accept the host VA as an integer so cgo does not treat a Go heap arena as a
+// Go pointer crossing into C. Hypervisor.framework retains the VM mapping,
+// not a Go object reference; ownership remains with the Sentry host VM map.
+static hv_return_t ttc_hv_vm_map(uintptr_t address, hv_ipa_t gpa,
+		size_t length, hv_memory_flags_t flags) {
+	return hv_vm_map((void *)address, gpa, length, flags);
 }
 */
 import "C"
@@ -93,8 +102,8 @@ func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access
 	if v.closed {
 		return fmt.Errorf("HVF VM is closed")
 	}
-	if gpa < GuestRAMIPAStart {
-		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, GuestRAMIPAStart)
+	if gpa < SentryMirrorIPAStart {
+		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, SentryMirrorIPAStart)
 	}
 	return v.mapStage2Locked(gpa, hostAddress, length, access)
 }
@@ -115,7 +124,7 @@ func (v *hvfVM) mapStage2Locked(gpa uint64, hostAddress uintptr, length uint64, 
 	if access&vmm.Stage2Execute != 0 {
 		flags |= C.HV_MEMORY_EXEC
 	}
-	if status := C.hv_vm_map(unsafe.Pointer(hostAddress), C.hv_ipa_t(gpa), C.size_t(length), flags); status != C.HV_SUCCESS {
+	if status := C.ttc_hv_vm_map(C.uintptr_t(hostAddress), C.hv_ipa_t(gpa), C.size_t(length), flags); status != C.HV_SUCCESS {
 		return fmt.Errorf("hv_vm_map(gpa=%#x, length=%#x) failed: %d", gpa, length, status)
 	}
 	return nil
@@ -127,8 +136,8 @@ func (v *hvfVM) UnmapStage2(gpa, length uint64) error {
 	if v.closed {
 		return fmt.Errorf("HVF VM is closed")
 	}
-	if gpa < GuestRAMIPAStart {
-		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, GuestRAMIPAStart)
+	if gpa < SentryMirrorIPAStart {
+		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, SentryMirrorIPAStart)
 	}
 	return v.unmapStage2Locked(gpa, length)
 }
@@ -188,7 +197,7 @@ func (v *hvfVM) PrepareMonitorPoolExpansion(ctx context.Context) (vmm.MonitorPoo
 		return vmm.MonitorPoolExpansion{}, fmt.Errorf("another monitor pool expansion is pending")
 	}
 	gpa := monitorPoolGPA + uint64(len(m.pools))*monitorPoolLength
-	if gpa > GuestRAMIPAStart-monitorPoolLength {
+	if gpa > SentryMirrorIPAStart-monitorPoolLength {
 		return vmm.MonitorPoolExpansion{}, fmt.Errorf("private EL1 monitor pool aperture is exhausted")
 	}
 	host, err := (hostMemory{}).Reserve(monitorPoolLength)
@@ -295,6 +304,25 @@ func (v *hvfVCPU) Close() error {
 		return nil
 	}
 	if status := C.hv_vcpu_destroy(v.handle); status != C.HV_SUCCESS {
+		return fmt.Errorf("hv_vcpu_destroy failed: %d", status)
+	}
+	v.closed = true
+	return nil
+}
+
+// closeStaleOwner retires a vCPU after an architectural CurrentEL probe has
+// proven that its recorded guest residency is stale on the owning host thread.
+// The one-shot ring0 bridge may already have destroyed the HVF object before
+// publishing its final bookkeeping through signal return; HV_BAD_ARGUMENT is
+// idempotent only in this narrowly qualified path.
+func (v *hvfVCPU) closeStaleOwner() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return nil
+	}
+	status := C.hv_vcpu_destroy(v.handle)
+	if status != C.HV_SUCCESS && status != C.HV_BAD_ARGUMENT {
 		return fmt.Errorf("hv_vcpu_destroy failed: %d", status)
 	}
 	v.closed = true

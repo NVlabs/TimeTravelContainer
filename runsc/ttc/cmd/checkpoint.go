@@ -454,6 +454,10 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		prepared.Container.NetworkIP,
 		prepared.Container.NetworkMAC,
 	)
+	configured, err = b.withRuntimeDiagnostics(configured, id)
+	if err != nil {
+		return "", err
+	}
 	status, err := b.runConfiguredCommandWithArgs(
 		configured,
 		"restore",

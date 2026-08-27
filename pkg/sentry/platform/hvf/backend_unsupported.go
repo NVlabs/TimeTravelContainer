@@ -20,18 +20,28 @@ import (
 	"context"
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
 )
 
 // Backend is unavailable outside Apple Silicon Darwin.
 type Backend struct{}
 
-// GuestRAMIPAStart is retained in pure-Go build-host configurations so that
-// platform registration code compiles. Runnable Darwin sentries use the cgo
-// backend and the monitor's identical private-range boundary.
-const GuestRAMIPAStart = uint64(0x10000000)
+// SentryMirrorIPAStart and GuestRAMIPAStart retain the VM aperture contract in
+// pure-Go analysis builds. Runnable Darwin sentries use the cgo definitions.
+const SentryMirrorIPAStart = uint64(0x10000000)
+
+const GuestRAMIPAStart = uint64(1 << 39)
 
 func NewBackend() *Backend { return &Backend{} }
+
+// NewVMEngine retains the engine-factory surface for analysis and pure-Go
+// build configurations. A runnable Darwin binary must enable cgo so the real
+// Hypervisor.framework implementation replaces this explicit failure.
+func NewVMEngine(vmm.VM, int) (vmplatform.VMEngine, error) {
+	return nil, fmt.Errorf("the HVF ring0 engine requires cgo on Apple Silicon Darwin")
+}
+
 func (*Backend) CreateVM(context.Context) (vmm.VM, error) {
 	return nil, fmt.Errorf("Hypervisor.framework is supported only on Apple Silicon Darwin")
 }

@@ -59,16 +59,15 @@ type MonitorPoolExpander interface {
 }
 
 type VCPU interface {
-	Run(context.Context, any) (Exit, error)
 	RunMonitor(context.Context, []byte) ([]byte, error)
 	RequestExit() error
 	Close() error
 }
 
-// ApplicationState is the architecture-neutral envelope passed to VCPU.Run.
-// Registers must be one of the architecture state types supported by the
-// backend. Neither field is checkpointed as platform state; the sentry's
-// arch.Context64 remains authoritative.
+// ApplicationState is the architecture-neutral envelope passed to a
+// vmplatform VMEngine. Registers must be one of the architecture state types
+// supported by the backend. Neither field is checkpointed as platform state;
+// the sentry's arch.Context64 remains authoritative.
 type ApplicationState struct {
 	AddressSpaceID uint64
 	Registers      any

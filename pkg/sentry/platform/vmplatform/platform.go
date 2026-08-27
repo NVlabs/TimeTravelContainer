@@ -43,6 +43,9 @@ type Config struct {
 	MaxUser      hostarch.Addr
 	PlatformName string
 	Rollover     func(*GuestRAM) error
+	// VMEngineFactory selects the VM host execution policy independently from
+	// the VM memory and address-space implementation.
+	VMEngineFactory VMEngineFactory
 }
 
 // Platform implements sentryplatform.Platform using an EL1 monitor and
@@ -51,16 +54,17 @@ type Platform struct {
 	sentryplatform.NoCPUPreemptionDetection
 	sentryplatform.NoCPUNumbers
 
-	vm      VM
-	arch    Architecture
-	pool    *WorkerPool
-	monitor *Monitor
-	ram     *GuestRAM
-	staging *stagingCache
-	maxUser hostarch.Addr
-	name    string
-	newVM   func(stdcontext.Context) (VM, error)
-	vcpus   int
+	vm        VM
+	arch      Architecture
+	engine    VMEngine
+	monitor   *Monitor
+	ram       *GuestRAM
+	staging   *stagingCache
+	maxUser   hostarch.Addr
+	name      string
+	newVM     func(stdcontext.Context) (VM, error)
+	newEngine VMEngineFactory
+	vcpus     int
 
 	// epochMu excludes every stage-1 operation and application vCPU while an
 	// HVF VM epoch is replaced. rebuildMu serializes rebuild and close.
@@ -91,7 +95,12 @@ func New(config Config) (*Platform, error) {
 			return nil, err
 		}
 	}
-	pool, err := NewWorkerPool(config.VM, config.VCPUs)
+	engineFactory := config.VMEngineFactory
+	if engineFactory == nil {
+		_ = config.VM.Close()
+		return nil, fmt.Errorf("vmplatform requires a VM engine factory")
+	}
+	engine, err := engineFactory(config.VM, config.VCPUs)
 	if err != nil {
 		_ = config.VM.Close()
 		return nil, err
@@ -104,13 +113,13 @@ func New(config Config) (*Platform, error) {
 		Rollover: config.Rollover,
 	})
 	if err != nil {
-		pool.Close()
+		_ = engine.Close()
 		_ = config.VM.Close()
 		return nil, err
 	}
 	staging, err := newStagingCache(ram)
 	if err != nil {
-		pool.Close()
+		_ = engine.Close()
 		_ = config.VM.Close()
 		return nil, err
 	}
@@ -123,17 +132,18 @@ func New(config Config) (*Platform, error) {
 		name = "vmplatform"
 	}
 	p := &Platform{
-		vm:      config.VM,
-		arch:    config.Architecture,
-		pool:    pool,
-		monitor: NewMonitor(pool),
-		ram:     ram,
-		staging: staging,
-		maxUser: maxUser,
-		name:    name,
-		newVM:   config.NewVM,
-		vcpus:   config.VCPUs,
-		spaces:  make(map[uint64]*addressSpace),
+		vm:        config.VM,
+		arch:      config.Architecture,
+		engine:    engine,
+		monitor:   NewMonitor(engine, monitorPoolExpander(config.VM)),
+		ram:       ram,
+		staging:   staging,
+		maxUser:   maxUser,
+		name:      name,
+		newVM:     config.NewVM,
+		newEngine: engineFactory,
+		vcpus:     config.VCPUs,
+		spaces:    make(map[uint64]*addressSpace),
 	}
 	ram.SetRevoker(p)
 	ram.SetRelocator(p)
@@ -182,7 +192,7 @@ func (p *Platform) CompactMemory(ctx context.Context) (sentryplatform.MemoryComp
 		return sentryplatform.MemoryCompaction{}, fmt.Errorf("vmplatform VM epoch is transitioning")
 	}
 	p.mu.Unlock()
-	p.pool.InterruptApplications()
+	p.engine.InterruptApplications()
 	p.epochMu.Lock()
 	defer p.epochMu.Unlock()
 	result, err := p.ram.Compact(ctx)
@@ -201,11 +211,15 @@ func (*Platform) GlobalMemoryBarrier() error {
 func (*Platform) MapUnit() uint64                 { return 16 << 20 }
 func (*Platform) MinUserAddress() hostarch.Addr   { return hostarch.PageSize }
 func (p *Platform) MaxUserAddress() hostarch.Addr { return p.maxUser }
+
+// ConcurrencyCount returns the application concurrency of the selected
+// execution engine.
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (p *Platform) ConcurrencyCount() int {
 	if err := p.lockEpoch(stdcontext.Background()); err != nil {
 		return 0
 	}
-	count := len(p.pool.workers)
+	count := p.engine.ConcurrencyCount()
 	p.epochMu.RUnlock()
 	return count
 }
@@ -213,6 +227,8 @@ func (p *Platform) SeccompInfo() sentryplatform.SeccompInfo {
 	return sentryplatform.StaticSeccompInfo{PlatformName: p.name}
 }
 
+// NewAddressSpace creates a monitor-owned application translation root.
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (p *Platform) NewAddressSpace() (sentryplatform.AddressSpace, error) {
 	if err := p.lockEpoch(stdcontext.Background()); err != nil {
 		return nil, err
@@ -245,6 +261,7 @@ func (p *Platform) NewContext(context.Context) sentryplatform.Context {
 
 // FlushForCheckpoint implements sentryplatform.CheckpointCoherence. The kernel
 // is quiesced before this call; GuestRAM itself is already coherent.
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (p *Platform) FlushForCheckpoint(context.Context) error {
 	if err := p.lockEpoch(stdcontext.Background()); err != nil {
 		return err
@@ -297,10 +314,17 @@ func (p *Platform) Close() error {
 	}
 	p.closed = true
 	p.mu.Unlock()
-	p.pool.Close()
+	engineErr := p.engine.Close()
 	p.epochMu.Lock()
 	defer p.epochMu.Unlock()
-	return p.vm.Close()
+	vmErr := p.vm.Close()
+	if engineErr != nil {
+		if vmErr != nil {
+			return fmt.Errorf("closing execution engine: %v; closing VM: %w", engineErr, vmErr)
+		}
+		return fmt.Errorf("closing execution engine: %w", engineErr)
+	}
+	return vmErr
 }
 
 func (p *Platform) lockEpoch(ctx stdcontext.Context) error {
@@ -356,7 +380,7 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 	p.transitioning = true
 	p.transitionDone = make(chan struct{})
 	done := p.transitionDone
-	oldPool := p.pool
+	oldEngine := p.engine
 	oldVM := p.vm
 	p.mu.Unlock()
 
@@ -373,7 +397,9 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 	// Closing the worker pool interrupts every running application and waits
 	// for any non-cancelable monitor transaction to acknowledge. New users see
 	// transitioning=true and wait before taking epochMu.
-	oldPool.Close()
+	if err := oldEngine.Close(); err != nil {
+		return fmt.Errorf("closing old execution engine: %w", err)
+	}
 	p.epochMu.Lock()
 	defer p.epochMu.Unlock()
 	if err := oldVM.Close(); err != nil {
@@ -384,15 +410,15 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("creating replacement VM epoch: %w", err)
 	}
-	newPool, err := NewWorkerPool(newVM, p.vcpus)
+	newEngine, err := p.newEngine(newVM, p.vcpus)
 	if err != nil {
 		_ = newVM.Close()
-		return fmt.Errorf("creating replacement vCPU pool: %w", err)
+		return fmt.Errorf("creating replacement execution engine: %w", err)
 	}
-	newMonitor := NewMonitor(newPool)
+	newMonitor := NewMonitor(newEngine, monitorPoolExpander(newVM))
 	plan, err := ram.beginEpochRebind(newVM)
 	if err != nil {
-		newPool.Close()
+		_ = newEngine.Close()
 		_ = newVM.Close()
 		return err
 	}
@@ -400,7 +426,7 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 	defer func() {
 		if abort {
 			_ = plan.abort()
-			newPool.Close()
+			_ = newEngine.Close()
 			_ = newVM.Close()
 		}
 	}()
@@ -467,7 +493,7 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 	abort = false
 	p.mu.Lock()
 	p.vm = newVM
-	p.pool = newPool
+	p.engine = newEngine
 	p.monitor = newMonitor
 	p.mu.Unlock()
 	return nil
@@ -495,6 +521,7 @@ type addressSpace struct {
 	stickyWriteback error
 }
 
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.FileRange, at hostarch.AccessType, _ bool) error {
 	if addr%hostarch.PageSize != 0 || fr.Start%hostarch.PageSize != 0 || fr.Length() == 0 || fr.End%hostarch.PageSize != 0 {
 		return fmt.Errorf("invalid vmplatform mapping addr=%#x range=%v", addr, fr)
@@ -581,6 +608,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 	return nil
 }
 
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	if length == 0 {
 		return
@@ -652,6 +680,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	}
 }
 
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (as *addressSpace) Release() {
 	if err := as.platform.lockEpoch(stdcontext.Background()); err != nil {
 		as.mu.Lock()
@@ -731,6 +760,7 @@ func monitorAccess(at hostarch.AccessType) monitorabi.Access {
 
 // RevokeFrames implements FrameRevoker. It is a last-line correctness path;
 // ordinary MM teardown removes reverse mappings before pgalloc decommit.
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (p *Platform) RevokeFrames(_ stdcontext.Context, refs map[pgalloc.FrameID][]MappingRef) error {
 	if err := p.lockEpoch(stdcontext.Background()); err != nil {
 		return err
@@ -795,6 +825,7 @@ type relocationOperation struct {
 // RelocateFrames implements FrameRelocator. GuestRAM calls this only while
 // CompactMemory holds epochMu for writing, so no AddressSpace mutation or
 // application execution can race with these break-before-make replacements.
+// +checklocksignore: address-space locks are selected and ordered dynamically.
 func (p *Platform) RelocateFrames(ctx stdcontext.Context, relocations map[pgalloc.FrameID]FrameRelocation) error {
 	byAddressSpace := make(map[uint64][]relocationOperation)
 	for frame, relocation := range relocations {
@@ -905,6 +936,7 @@ type platformContext struct {
 	released    bool
 }
 
+// +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
 func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryManager, ac *arch.Context64, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as, ok := mm.AddressSpace().(*addressSpace)
 	if !ok || as.platform != c.platform {
@@ -935,7 +967,7 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 		cancel()
 		return nil, hostarch.NoAccess, err
 	}
-	exit, err := c.platform.pool.RunApplication(runCtx, ApplicationState{AddressSpaceID: as.id, Registers: c.registers})
+	exit, err := c.platform.engine.RunApplication(runCtx, ApplicationState{AddressSpaceID: as.id, Registers: c.registers})
 	c.mu.Lock()
 	wasInterrupted := c.interrupted
 	c.interrupted = false
@@ -972,6 +1004,11 @@ func (c *platformContext) Interrupt() {
 		c.cancel()
 	}
 	c.mu.Unlock()
+	// VM engines run the Sentry continuation at EL1 on the application vCPU;
+	// canceling the Go context alone cannot wake an EL0 task. Request an
+	// architected guest exit after publishing interrupted so Switch observes a
+	// coherent register snapshot.
+	c.platform.engine.InterruptApplications()
 }
 func (c *platformContext) Preempt() { c.Interrupt() }
 func (c *platformContext) Release() {

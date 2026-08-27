@@ -18,15 +18,21 @@
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 #define TTC_MONITOR_MAGIC UINT64_C(0x3130554d4d435454)
+#define TTC_MONITOR_CODE_VA UINT64_C(0xffff000000000000)
 #else
 #define TTC_MONITOR_MAGIC 0x3130554d4d435454
+#define TTC_MONITOR_CODE_VA 0xffff000000000000
 #endif
+#define TTC_MONITOR_CODE_CAPACITY 0x00010000
 #define TTC_MONITOR_VERSION 1
 #define TTC_MONITOR_PAGE_SIZE UINT64_C(4096)
 #define TTC_MONITOR_HOST_SLAB_SIZE UINT64_C(16384)
 #define TTC_MONITOR_MAX_OPERATIONS 256
 #define TTC_MONITOR_MAX_ADDRESS_SPACES 128
 #define TTC_MONITOR_MAX_POOL_REGIONS 64
+
+#define TTC_ADDRESS_SPACE_SENTRY UINT64_C(1)
+#define TTC_ADDRESS_SPACE_FLAGS_MASK TTC_ADDRESS_SPACE_SENTRY
 
 #define TTC_MONITOR_COMMAND_MAX_SIZE (64 + TTC_MONITOR_MAX_OPERATIONS * 40)
 
@@ -52,9 +58,31 @@
 #define TTC_STATE_INTERNAL_ELR_OFFSET 0x2a48
 #define TTC_STATE_INTERNAL_VECTOR_OFFSET 0x2a50
 #define TTC_STATE_INTERNAL_INPUT_PSTATE_OFFSET 0x2a58
-#define TTC_STATE_HOST_INPUT_PSTATE_OFFSET 0x2a60
-#define TTC_STATE_HOST_INPUT_PC_OFFSET 0x2a68
-#define TTC_STATE_HOST_INPUT_ADDRESS_SPACE_OFFSET 0x2a70
+#define TTC_STATE_CANCEL_REQUESTED_OFFSET 0x2a60
+#define TTC_STATE_SENTRY_TTBR0_OFFSET 0x2a80
+#define TTC_STATE_SENTRY_X0_OFFSET 0x2a88
+#define TTC_STATE_SENTRY_SP_OFFSET 0x2b80
+#define TTC_STATE_SENTRY_PC_OFFSET 0x2b88
+#define TTC_STATE_SENTRY_PSTATE_OFFSET 0x2b90
+#define TTC_STATE_SENTRY_TPIDR_OFFSET 0x2b98
+#define TTC_STATE_SENTRY_FP_OFFSET 0x2c00
+#define TTC_STATE_APPLICATION_FP_OFFSET 0x3000
+#define TTC_STATE_HOST_GATE_PC_OFFSET 0x3300
+#define TTC_STATE_HOST_GATE_PSTATE_OFFSET 0x3308
+#define TTC_STATE_HOST_GATE_ESR_OFFSET 0x3310
+#define TTC_STATE_HOST_GATE_FAR_OFFSET 0x3318
+#define TTC_STATE_SENTRY_TPIDRRO_OFFSET 0x3320
+#define TTC_STATE_HOST_GATE_X16_OFFSET 0x3328
+#define TTC_STATE_HOST_GATE_X17_OFFSET 0x3330
+#define TTC_STATE_HOST_GATE_SP_OFFSET 0x3338
+#define TTC_STATE_RING0_ENTRY_OFFSET 0x3340
+// The Go-side entry trampoline records the Sentry continuation's stack here
+// before switching to the permanently mapped per-vCPU monitor stack. The
+// monitor must never make its first memory access through a movable Go stack:
+// stack growth can occur after the host mirror was sampled.
+#define TTC_STATE_RING0_SENTRY_SP_OFFSET 0x3348
+#define TTC_STATE_FP_Q0_OFFSET 0x0008
+
 #define TTC_STATE_STACK_TOP 0x4000
 
 #define TTC_APP_SP_OFFSET 0x00f8
@@ -117,7 +145,7 @@ struct ttc_monitor_address_space {
   uint64_t root_gpa;
   uint16_t asid;
   uint16_t active;
-  uint32_t reserved;
+  uint32_t flags;
 };
 
 struct ttc_monitor_mutation {
@@ -145,10 +173,7 @@ struct ttc_monitor_control {
   uint64_t pool_aperture_length;
   uint64_t next_asid;
   uint64_t pool_region_count;
-  uint64_t command_entry_va;
-  uint64_t application_entry_va;
-  uint64_t vector_va;
-  uint64_t reserved[2];
+  uint64_t reserved[5];
   struct ttc_monitor_pool_region pool[TTC_MONITOR_MAX_POOL_REGIONS];
   struct ttc_monitor_address_space spaces[TTC_MONITOR_MAX_ADDRESS_SPACES];
   struct ttc_monitor_mutation mutations[TTC_MONITOR_MAX_OPERATIONS];

@@ -3382,6 +3382,33 @@ exit 0
 	}
 }
 
+func TestRuntimeDiagnostics(t *testing.T) {
+	dataRoot := t.TempDir()
+	b := &runtimeBackend{dataRoot: dataRoot}
+	configured, err := b.withRuntimeDiagnostics([]string{"--root", "/runtime"}, "container-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	panicLog := filepath.Join(dataRoot, "containers", "container-id", "runtime", "panic.log")
+	want := []string{"--root", "/runtime", "--panic-log=" + panicLog}
+	if !reflect.DeepEqual(configured, want) {
+		t.Fatalf("diagnostic arguments=%q, want %q", configured, want)
+	}
+	started := time.Now()
+	contents := "unrelated runtime text\n" +
+		"ttc ring0 bridge error: status=0xfae94003 phase=0x100\n" +
+		"ttc hvf application error: owner continuation publication raced host return\n"
+	if err := os.WriteFile(panicLog, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b.runtimeDiagnosticSince("container-id", started), "ttc hvf application error: owner continuation publication raced host return"; got != want {
+		t.Fatalf("runtime diagnostic=%q, want %q", got, want)
+	}
+	if got := b.runtimeDiagnosticSince("missing", started); got != "" {
+		t.Fatalf("missing runtime diagnostic=%q, want empty", got)
+	}
+}
+
 func TestRuntimeBackendUsesRunscCLI(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

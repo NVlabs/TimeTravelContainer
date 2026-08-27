@@ -65,6 +65,26 @@ func TestPoolExpansionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSentryAddressSpaceRoundTrip(t *testing.T) {
+	want := Command{
+		Sequence:       10,
+		Opcode:         OpcodeCreateAddressSpace,
+		AddressSpaceID: 4,
+		Flags:          AddressSpaceFlagSentry,
+	}
+	b, err := MarshalCommand(want)
+	if err != nil {
+		t.Fatalf("MarshalCommand: %v", err)
+	}
+	got, err := UnmarshalCommand(b)
+	if err != nil {
+		t.Fatalf("UnmarshalCommand: %v", err)
+	}
+	if got.Sequence != want.Sequence || got.Opcode != want.Opcode || got.AddressSpaceID != want.AddressSpaceID || got.Flags != want.Flags {
+		t.Fatalf("round trip got %+v, want %+v", got, want)
+	}
+}
+
 func TestMalformedCommands(t *testing.T) {
 	tests := []Command{
 		{Sequence: 0, Opcode: OpcodeCreateAddressSpace, AddressSpaceID: 1},
@@ -73,6 +93,7 @@ func TestMalformedCommands(t *testing.T) {
 		{Sequence: 1, Opcode: OpcodeApply, AddressSpaceID: 1, Operations: []Operation{{Type: OperationUnmap, Access: AccessRead, VA: 0x1000, Length: 0x1000}}},
 		{Sequence: 1, Opcode: OpcodeExpandPageTablePool, PoolGPA: 0x1000},
 		{Sequence: 1, Opcode: OpcodeExpandPageTablePool, PoolGPA: 1, PoolLength: 0x4000},
+		{Sequence: 1, Opcode: OpcodeCreateAddressSpace, AddressSpaceID: 1, Flags: 1 << 63},
 	}
 	for _, test := range tests {
 		if _, err := MarshalCommand(test); err == nil {

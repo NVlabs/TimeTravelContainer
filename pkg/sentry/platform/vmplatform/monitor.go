@@ -22,18 +22,21 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
 )
 
-// Monitor serializes all v1 page-table transactions and executes them at high
-// priority on the shared vCPU worker pool.
+// Monitor serializes all v1 page-table transactions and executes them through
+// the selected VM execution engine.
 type Monitor struct {
-	pool *WorkerPool
+	executor MonitorExecutor
+	expander MonitorPoolExpander
 
 	mu       sync.Mutex
 	sequence uint64
 }
 
-// NewMonitor constructs a monitor client.
-func NewMonitor(pool *WorkerPool) *Monitor {
-	return &Monitor{pool: pool}
+// NewMonitor constructs a backend-independent monitor client. executor owns
+// how a monitor command reaches EL1; expander owns only the host stage-2 lease
+// required when the monitor's page-table pool grows.
+func NewMonitor(executor MonitorExecutor, expander MonitorPoolExpander) *Monitor {
+	return &Monitor{executor: executor, expander: expander}
 }
 
 // Execute applies a transaction and returns only after the monitor's
@@ -74,15 +77,9 @@ func (m *Monitor) executeLocked(ctx context.Context, command monitorabi.Command)
 	if err != nil {
 		return monitorabi.Response{}, err
 	}
-	value, err := m.pool.Do(ctx, PriorityMonitor, func(ctx context.Context, vcpu VCPU) (any, error) {
-		return vcpu.RunMonitor(ctx, encoded)
-	})
+	encodedResponse, err := m.executor.RunMonitor(ctx, encoded)
 	if err != nil {
 		return monitorabi.Response{}, err
-	}
-	encodedResponse, ok := value.([]byte)
-	if !ok {
-		return monitorabi.Response{}, fmt.Errorf("monitor returned response of type %T, want []byte", value)
 	}
 	response, err := monitorabi.UnmarshalResponse(encodedResponse)
 	if err != nil {
@@ -95,8 +92,8 @@ func (m *Monitor) executeLocked(ctx context.Context, command monitorabi.Command)
 }
 
 func (m *Monitor) expandPoolLocked(ctx context.Context) error {
-	expander, ok := m.pool.vm.(MonitorPoolExpander)
-	if !ok {
+	expander := m.expander
+	if expander == nil {
 		return fmt.Errorf("VM backend does not support monitor pool expansion")
 	}
 	expansion, err := expander.PrepareMonitorPoolExpansion(ctx)

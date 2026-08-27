@@ -43,16 +43,18 @@ func (*constructor) New(opts sentryplatform.Options) (sentryplatform.Platform, e
 	if vcpus > 64 {
 		vcpus = 64
 	}
-	return vmplatform.New(vmplatform.Config{
-		NewVM:        backend.CreateVM,
-		HostMemory:   backend.HostMemory(),
-		Architecture: vmarm64.Architecture{},
-		VCPUs:        vcpus,
-		IPAStart:     hvfbackend.GuestRAMIPAStart,
-		IPASize:      hvfIPASize - hvfbackend.GuestRAMIPAStart,
-		MaxUser:      hostarch.Addr(1 << 48),
-		PlatformName: "hvf",
-	})
+	config := vmplatform.Config{
+		NewVM:           backend.CreateVM,
+		HostMemory:      backend.HostMemory(),
+		Architecture:    vmarm64.Architecture{},
+		VCPUs:           vcpus,
+		IPAStart:        hvfbackend.GuestRAMIPAStart,
+		IPASize:         hvfIPASize - hvfbackend.GuestRAMIPAStart,
+		MaxUser:         hostarch.Addr(1 << 48),
+		PlatformName:    "hvf",
+		VMEngineFactory: hvfbackend.NewVMEngine,
+	}
+	return vmplatform.New(config)
 }
 
 func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {

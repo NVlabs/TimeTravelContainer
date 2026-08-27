@@ -8,10 +8,12 @@ package(
 go_library(
     name = "vmplatform",
     srcs = [
+        "doc.go",
+        "engine.go",
         "guest_ram.go",
         "monitor.go",
         "platform.go",
-        "staging.go",
+        "staging_unsafe.go",
         "vmm.go",
         "worker_pool.go",
     ],
@@ -35,6 +37,7 @@ go_test(
     name = "vmplatform_test",
     size = "small",
     srcs = [
+        "engine_test.go",
         "guest_ram_test.go",
         "platform_test.go",
         "staging_test.go",

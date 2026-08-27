@@ -36,10 +36,10 @@
 extern void ttc_monitor_hvc_boot(void) MONITOR_NORETURN;
 extern void ttc_monitor_hvc_command(void) MONITOR_NORETURN;
 extern void ttc_monitor_hvc_internal(void) MONITOR_NORETURN;
-extern void ttc_monitor_enter_application_asm(uint8_t*) MONITOR_NORETURN;
 extern void ttc_monitor_dsb_ishst(void);
 extern void ttc_monitor_dsb_ish(void);
 extern void ttc_monitor_isb(void);
+extern void ttc_monitor_prepare_mmu(void);
 extern void ttc_monitor_tlbi_vae1is(uint64_t);
 extern void ttc_monitor_tlbi_aside1is(uint64_t);
 extern void ttc_monitor_write_ttbr0(uint64_t);
@@ -160,6 +160,11 @@ void MONITOR_CODE ttc_monitor_bootstrap(struct ttc_monitor_control* ctl) {
     }
   }
   ttc_monitor_dsb_ishst();
+  // This vCPU has executed the bootstrap with stage-1 and both caches off.
+  // Invalidate its instruction cache before the host enables SCTLR.I; without
+  // this, a first exception into a monitor page not touched by bootstrap may
+  // execute stale pre-copy contents indefinitely.
+  ttc_monitor_prepare_mmu();
   ttc_monitor_isb();
   ttc_monitor_hvc_boot();
 }
@@ -247,16 +252,36 @@ static uint64_t* MONITOR_CODE find_leaf(struct ttc_monitor_control* ctl,
   return &((uint64_t*)(uintptr_t)table_va)[(va >> 12) & 511];
 }
 
-static MONITOR_INLINE uint64_t user_leaf(uint64_t gpa, uint8_t access) {
+static MONITOR_INLINE uint64_t stage1_leaf(
+    const struct ttc_monitor_address_space* space, uint64_t gpa,
+    uint8_t access) {
   uint64_t pte = (gpa & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE | PTE_AF |
-                 PTE_SH_INNER | PTE_NG | PTE_AP_EL0 | PTE_PXN;
+                 PTE_SH_INNER | PTE_NG;
+  if ((space->flags & TTC_ADDRESS_SPACE_SENTRY) == 0) {
+    // Application pages are accessible at EL0. EL1 must never execute them.
+    pte |= PTE_AP_EL0 | PTE_PXN;
+  } else {
+    // Sentry pages are accessible only at EL1. EL0 must never execute them.
+    pte |= PTE_UXN;
+  }
   if ((access & TTC_ACCESS_WRITE) == 0) {
     pte |= PTE_AP_RO;
   }
   if ((access & TTC_ACCESS_EXECUTE) == 0) {
-    pte |= PTE_UXN;
+    pte |= PTE_PXN | PTE_UXN;
   }
   return pte;
+}
+
+static MONITOR_INLINE int leaf_executable(
+    const struct ttc_monitor_address_space* space, uint64_t pte) {
+  if (pte == 0) {
+    return 0;
+  }
+  if ((space->flags & TTC_ADDRESS_SPACE_SENTRY) != 0) {
+    return (pte & PTE_PXN) == 0;
+  }
+  return (pte & PTE_UXN) == 0;
 }
 
 static MONITOR_INLINE void clean_data_to_pou(uint64_t va, uint64_t length) {
@@ -367,8 +392,9 @@ static uint32_t MONITOR_CODE expand_pool(struct ttc_monitor_control* ctl,
 }
 
 static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
-                                          uint64_t id) {
-  if (id == 0 || find_space(ctl, id) != 0) {
+                                          uint64_t id, uint64_t flags) {
+  if (id == 0 || (flags & ~TTC_ADDRESS_SPACE_FLAGS_MASK) != 0 ||
+      find_space(ctl, id) != 0) {
     return TTC_STATUS_CONFLICT;
   }
   for (uint64_t i = 0; i < TTC_MONITOR_MAX_ADDRESS_SPACES; ++i) {
@@ -387,6 +413,7 @@ static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
       ctl->spaces[i].id = id;
       ctl->spaces[i].root_gpa = root;
       ctl->spaces[i].asid = (uint16_t)asid;
+      ctl->spaces[i].flags = (uint32_t)flags;
       ttc_monitor_dsb_ishst();
       *(volatile uint8_t*)&ctl->spaces[i].active = 1;
       ttc_monitor_dsb_ish();
@@ -414,6 +441,7 @@ static uint32_t MONITOR_CODE destroy_space(struct ttc_monitor_control* ctl,
   space->id = 0;
   space->root_gpa = 0;
   space->asid = 0;
+  space->flags = 0;
   return TTC_STATUS_OK;
 }
 
@@ -481,13 +509,14 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
       uint64_t old = *leaf;
       uint64_t next = 0;
       if (type == TTC_OPERATION_MAP) {
-        next = user_leaf(gpa + page * TTC_MONITOR_PAGE_SIZE, access);
+        next = stage1_leaf(space, gpa + page * TTC_MONITOR_PAGE_SIZE,
+                           access);
       } else if (type == TTC_OPERATION_PROTECT) {
         if ((old & PTE_VALID) == 0) {
           *detail = op_index;
           return TTC_STATUS_NOT_FOUND;
         }
-        next = user_leaf(old & PTE_ADDR_MASK, access);
+        next = stage1_leaf(space, old & PTE_ADDR_MASK, access);
       }
       if (old != next) {
         ctl->mutations[mutation_count].pte_va = (uint64_t)(uintptr_t)leaf;
@@ -520,8 +549,7 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
   ttc_monitor_dsb_ishst();
   uint32_t executable_mutations = 0;
   for (uint32_t i = 0; i < mutation_count; ++i) {
-    if (ctl->mutations[i].new_pte != 0 &&
-        (ctl->mutations[i].new_pte & PTE_UXN) == 0) {
+    if (leaf_executable(space, ctl->mutations[i].new_pte)) {
       ++executable_mutations;
     }
   }
@@ -531,8 +559,7 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
     ttc_monitor_write_ttbr0(space->root_gpa |
                             ((uint64_t)space->asid << 48));
     for (uint32_t i = 0; i < mutation_count; ++i) {
-      if (ctl->mutations[i].new_pte != 0 &&
-          (ctl->mutations[i].new_pte & PTE_UXN) == 0) {
+      if (leaf_executable(space, ctl->mutations[i].new_pte)) {
         clean_data_to_pou(ctl->mutations[i].va, TTC_MONITOR_PAGE_SIZE);
       }
     }
@@ -566,11 +593,11 @@ static void MONITOR_CODE execute_command(uint8_t* state) {
     return;
   }
   if (opcode == TTC_OPCODE_CREATE_ADDRESS_SPACE) {
-    if (count != 0 || flags != 0 || space_id == 0 || pool_gpa != 0 ||
-        pool_length != 0) {
+    if (count != 0 || (flags & ~TTC_ADDRESS_SPACE_FLAGS_MASK) != 0 ||
+        space_id == 0 || pool_gpa != 0 || pool_length != 0) {
       status = TTC_STATUS_MALFORMED;
     } else {
-      status = create_space(ctl, space_id);
+      status = create_space(ctl, space_id, flags);
     }
   } else if (opcode == TTC_OPCODE_DESTROY_ADDRESS_SPACE) {
     if (count != 0 || flags != 0 || space_id == 0 || pool_gpa != 0 ||
@@ -587,7 +614,8 @@ static void MONITOR_CODE execute_command(uint8_t* state) {
     } else if (space == 0) {
       status = TTC_STATUS_NOT_FOUND;
     } else {
-      ttc_monitor_write_ttbr0(space->root_gpa | ((uint64_t)space->asid << 48));
+      // Activation validates that the root still exists. Sentry-at-EL1
+      // application entry selects and installs it immediately before ERET.
       status = TTC_STATUS_OK;
     }
   } else if (opcode == TTC_OPCODE_APPLY) {
@@ -621,13 +649,17 @@ void MONITOR_CODE ttc_monitor_command_entry(uint8_t* state) {
   ttc_monitor_hvc_command();
 }
 
-void MONITOR_CODE ttc_monitor_application_entry(uint8_t* state) {
+// ttc_monitor_ring0_application_ttbr validates the application root selected
+// by a Sentry continuation. The assembly wrapper saves the complete Sentry
+// context before calling this helper and performs the TTBR0 switch only after
+// the helper has returned, so its C stack remains addressable throughout.
+uint64_t MONITOR_CODE ttc_monitor_ring0_application_ttbr(uint8_t* state) {
   struct ttc_monitor_control* ctl = control_from_state(state);
   uint64_t id = load64(state + TTC_STATE_ADDRESS_SPACE_ID_OFFSET);
   struct ttc_monitor_address_space* space = find_space(ctl, id);
-  if (space == 0) {
-    ttc_monitor_hvc_internal();
+  if (space == 0 ||
+      (space->flags & TTC_ADDRESS_SPACE_SENTRY) != 0) {
+    return 0;
   }
-  ttc_monitor_write_ttbr0(space->root_gpa | ((uint64_t)space->asid << 48));
-  ttc_monitor_enter_application_asm(state);
+  return space->root_gpa | ((uint64_t)space->asid << 48);
 }

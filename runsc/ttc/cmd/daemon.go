@@ -282,6 +282,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
 	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured, err = r.backend.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	runtimeCreated := false
 	var runtimeState struct {
 		Status string `json:"status"`

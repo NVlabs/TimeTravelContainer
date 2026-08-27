@@ -14,6 +14,56 @@
 
 #include "monitor_layout.h"
 
+.macro SAVE_FP_STATE base
+  mrs x16, fpsr
+  str w16, [\base, #0]
+  mrs x16, fpcr
+  str w16, [\base, #4]
+  add \base, \base, #TTC_STATE_FP_Q0_OFFSET
+  stp q0, q1, [\base, #16 * 0]
+  stp q2, q3, [\base, #16 * 2]
+  stp q4, q5, [\base, #16 * 4]
+  stp q6, q7, [\base, #16 * 6]
+  stp q8, q9, [\base, #16 * 8]
+  stp q10, q11, [\base, #16 * 10]
+  stp q12, q13, [\base, #16 * 12]
+  stp q14, q15, [\base, #16 * 14]
+  stp q16, q17, [\base, #16 * 16]
+  stp q18, q19, [\base, #16 * 18]
+  stp q20, q21, [\base, #16 * 20]
+  stp q22, q23, [\base, #16 * 22]
+  stp q24, q25, [\base, #16 * 24]
+  stp q26, q27, [\base, #16 * 26]
+  stp q28, q29, [\base, #16 * 28]
+  stp q30, q31, [\base, #16 * 30]
+  sub \base, \base, #TTC_STATE_FP_Q0_OFFSET
+.endm
+
+.macro LOAD_FP_STATE base
+  ldr w16, [\base, #0]
+  msr fpsr, x16
+  ldr w16, [\base, #4]
+  msr fpcr, x16
+  add \base, \base, #TTC_STATE_FP_Q0_OFFSET
+  ldp q0, q1, [\base, #16 * 0]
+  ldp q2, q3, [\base, #16 * 2]
+  ldp q4, q5, [\base, #16 * 4]
+  ldp q6, q7, [\base, #16 * 6]
+  ldp q8, q9, [\base, #16 * 8]
+  ldp q10, q11, [\base, #16 * 10]
+  ldp q12, q13, [\base, #16 * 12]
+  ldp q14, q15, [\base, #16 * 14]
+  ldp q16, q17, [\base, #16 * 16]
+  ldp q18, q19, [\base, #16 * 18]
+  ldp q20, q21, [\base, #16 * 20]
+  ldp q22, q23, [\base, #16 * 22]
+  ldp q24, q25, [\base, #16 * 24]
+  ldp q26, q27, [\base, #16 * 26]
+  ldp q28, q29, [\base, #16 * 28]
+  ldp q30, q31, [\base, #16 * 30]
+  sub \base, \base, #TTC_STATE_FP_Q0_OFFSET
+.endm
+
 .section __TEXT,__ttcmon,regular,pure_instructions
 .p2align 14
 
@@ -51,6 +101,14 @@ _ttc_monitor_isb:
   isb
   ret
 
+.globl _ttc_monitor_prepare_mmu
+_ttc_monitor_prepare_mmu:
+  dsb sy
+  ic iallu
+  dsb sy
+  isb
+  ret
+
 .globl _ttc_monitor_tlbi_vae1is
 _ttc_monitor_tlbi_vae1is:
   tlbi vae1is, x0
@@ -67,17 +125,65 @@ _ttc_monitor_write_ttbr0:
   isb
   ret
 
-// ttc_monitor_enter_application_asm restores the complete EL0 GP image from
-// x0 and enters at the supplied ELR/SPSR. FP/SIMD state is transported by the
-// architecture-specific HVF register adapter.
-.globl _ttc_monitor_enter_application_asm
-_ttc_monitor_enter_application_asm:
-  // A fixed worker vCPU may run a different Linux task on every entry. An
-  // exclusive reservation belongs to that execution context, not to the
-  // physical vCPU; retaining it across contexts can make an unrelated STXR
-  // succeed and corrupt userspace atomics.
+// ttc_monitor_ring0_application_entry saves the running Sentry continuation,
+// switches from its EL1-only TTBR0 to the selected application root, and
+// enters EL0. The lower-EL vectors restore this continuation directly after a
+// syscall or fault, without an HVF exit.
+.globl _ttc_monitor_ring0_application_entry
+_ttc_monitor_ring0_application_entry:
   clrex
-  mov x18, x0
+  sub sp, sp, #32
+  stp x16, x17, [sp, #0]
+  stp x18, x19, [sp, #16]
+  mrs x16, tpidr_el1
+  add x17, x16, #2, lsl #12
+  add x17, x17, #0xa88
+  stp x0, x1, [x17, #0x00]
+  stp x2, x3, [x17, #0x10]
+  stp x4, x5, [x17, #0x20]
+  stp x6, x7, [x17, #0x30]
+  stp x8, x9, [x17, #0x40]
+  stp x10, x11, [x17, #0x50]
+  stp x12, x13, [x17, #0x60]
+  stp x14, x15, [x17, #0x70]
+  ldp x0, x1, [sp, #0]
+  stp x0, x1, [x17, #0x80]
+  ldp x0, x1, [sp, #16]
+  stp x0, x1, [x17, #0x90]
+  stp x20, x21, [x17, #0xa0]
+  stp x22, x23, [x17, #0xb0]
+  stp x24, x25, [x17, #0xc0]
+  stp x26, x27, [x17, #0xd0]
+  stp x28, x29, [x17, #0xe0]
+  str x30, [x17, #0xf0]
+  // The entry trampoline has already switched away from the movable Go
+  // stack. Restore records from the original stack value, not this private
+  // monitor stack.
+  ldr x0, [x16, #TTC_STATE_RING0_SENTRY_SP_OFFSET]
+  str x0, [x16, #TTC_STATE_SENTRY_SP_OFFSET]
+  str x30, [x16, #TTC_STATE_SENTRY_PC_OFFSET]
+  mrs x0, nzcv
+  mov x1, #0x3c5
+  orr x0, x0, x1
+  str x0, [x16, #TTC_STATE_SENTRY_PSTATE_OFFSET]
+  mrs x0, tpidr_el0
+  str x0, [x16, #TTC_STATE_SENTRY_TPIDR_OFFSET]
+  mrs x0, tpidrro_el0
+  str x0, [x16, #TTC_STATE_SENTRY_TPIDRRO_OFFSET]
+  mrs x0, ttbr0_el1
+  str x0, [x16, #TTC_STATE_SENTRY_TTBR0_OFFSET]
+  add x17, x16, #2, lsl #12
+  add x17, x17, #0xc00
+  SAVE_FP_STATE x17
+  mrs x0, tpidr_el1
+  bl _ttc_monitor_ring0_application_ttbr
+  mrs x16, tpidr_el1
+  cbz x0, _ttc_monitor_hvc_internal
+  msr ttbr0_el1, x0
+  isb
+  mrs x18, tpidr_el1
+  add x17, x18, #3, lsl #12
+  LOAD_FP_STATE x17
   add x18, x18, #2, lsl #12
   add x18, x18, #0x908
   ldr x16, [x18, #TTC_APP_SP_OFFSET]
@@ -88,6 +194,14 @@ _ttc_monitor_enter_application_asm:
   msr spsr_el1, x16
   ldr x16, [x18, #TTC_APP_TPIDR_OFFSET]
   msr tpidr_el0, x16
+  // TPIDRRO_EL0 is Darwin host TLS for the running Go thread. It is not part
+  // of the Linux application register image and must not be exposed at EL0.
+  msr tpidrro_el0, xzr
+  mrs x16, tpidr_el1
+  ldr x17, [x16, #TTC_STATE_CANCEL_REQUESTED_OFFSET]
+  cbnz x17, _ttc_monitor_cancel_before_application
+  add x17, x16, #TTC_STATE_STACK_TOP
+  mov sp, x17
   ldp x0, x1, [x18, #0x00]
   ldp x2, x3, [x18, #0x10]
   ldp x4, x5, [x18, #0x20]
@@ -106,31 +220,46 @@ _ttc_monitor_enter_application_asm:
   ldr x18, [x18, #0x90]
   eret
 
-// Host cancellation may catch application entry while EL1 still has DAIF
-// masked. HVF samples and clears pending-interrupt inputs on each run, so an
-// IRQ injected in that state can be lost before the subsequent ERET reaches
-// EL0. Since no application instruction has executed yet, preserve the input
-// register image and acknowledge the interruption directly from EL1.
-.globl _ttc_monitor_cancel_application
-_ttc_monitor_cancel_application:
-  mov x16, #TTC_EXIT_INTERRUPTED
-  str x16, [x0, #TTC_STATE_EXIT_KIND_OFFSET]
-  dsb ishst
-  hvc #0x72
-1: b 1b
+_ttc_monitor_cancel_before_application:
+  mov x17, #TTC_EXIT_INTERRUPTED
+  str x17, [x16, #TTC_STATE_EXIT_KIND_OFFSET]
+  b _ttc_monitor_finish_application_exit
 
-// Exception vectors. Only lower-EL AArch64 synchronous exceptions are normal;
-// every other vector exits as an internal monitor failure.
+// Exception vectors. The Sentry continuation runs at EL1h, so synchronous
+// exceptions taken from current EL using SP_EL1 are host-service gates. Lower
+// EL synchronous exceptions and IRQs remain application exits. Every other
+// vector is an internal monitor failure.
 .p2align 11
 .globl _ttc_monitor_vectors
 _ttc_monitor_vectors:
-.set ttc_vector_number, 0
-.rept 8
-  mov x16, #ttc_vector_number
+  // Current EL using SP_EL0.
+  mov x16, #0
   b _ttc_monitor_unexpected_handler
   .space 120
-  .set ttc_vector_number, ttc_vector_number + 1
-.endr
+  mov x16, #1
+  b _ttc_monitor_unexpected_handler
+  .space 120
+  mov x16, #2
+  b _ttc_monitor_unexpected_handler
+  .space 120
+  mov x16, #3
+  b _ttc_monitor_unexpected_handler
+  .space 120
+
+  // Current EL using SP_EL1, synchronous vector at VBAR+0x200.
+_ttc_monitor_el1_sync:
+  b _ttc_monitor_el1_sync_handler
+  .space 124
+
+  mov x16, #5
+  b _ttc_monitor_unexpected_handler
+  .space 120
+  mov x16, #6
+  b _ttc_monitor_unexpected_handler
+  .space 120
+  mov x16, #7
+  b _ttc_monitor_unexpected_handler
+  .space 120
 
 // Lower EL, AArch64 synchronous vector at VBAR+0x400.
 _ttc_monitor_el0_sync:
@@ -155,6 +284,67 @@ _ttc_monitor_el0_irq:
 
 .globl _ttc_monitor_vectors_end
 _ttc_monitor_vectors_end:
+
+// A Sentry continuation executes directly at EL1 with a host identity mirror
+// in TTBR0. Darwin services are intentionally absent from that stage-1 map:
+// entering an external executable therefore takes a current-EL instruction
+// abort. Direct Darwin SVCs take a current-EL SVC exception. In both cases,
+// publish the original host instruction and redpill. The host signal bridge
+// copies the complete architectural continuation out of the vCPU and resumes
+// the interrupted thread at host EL0. A later application entry bluepills the
+// same continuation again after refreshing the identity mirror.
+.globl _ttc_monitor_el1_sync_handler
+_ttc_monitor_el1_sync_handler:
+  // The faulting Sentry SP may itself be the unmapped address that caused this
+  // exception (for example, a newly grown Go stack). Do not touch it before
+  // switching to the permanently mapped per-vCPU emergency stack. SP_EL0 is
+  // scratch while Sentry runs at EL1h; application entry reloads it from the
+  // canonical register image.
+  msr sp_el0, x18
+  mrs x18, tpidr_el1
+  str x16, [x18, #TTC_STATE_HOST_GATE_X16_OFFSET]
+  str x17, [x18, #TTC_STATE_HOST_GATE_X17_OFFSET]
+  mov x17, sp
+  str x17, [x18, #TTC_STATE_HOST_GATE_SP_OFFSET]
+  add x17, x18, #4, lsl #12
+  mov sp, x17
+  mrs x17, esr_el1
+  str x17, [x18, #TTC_STATE_HOST_GATE_ESR_OFFSET]
+  lsr x17, x17, #26
+  cmp x17, #0x15
+  b.eq 1f
+  cmp x17, #0x21
+  b.eq 2f
+  cmp x17, #0x25
+  b.ne 3f
+2:
+  // Instruction and data abort ELRs identify the faulting instruction.
+  mrs x17, far_el1
+  str x17, [x18, #TTC_STATE_HOST_GATE_FAR_OFFSET]
+  mrs x17, elr_el1
+  b 4f
+1:
+  // SVC ELR identifies the following instruction. Reexecute the SVC under
+  // Darwin after returning to host EL0.
+  str xzr, [x18, #TTC_STATE_HOST_GATE_FAR_OFFSET]
+  mrs x17, elr_el1
+  sub x17, x17, #4
+4:
+  str x17, [x18, #TTC_STATE_HOST_GATE_PC_OFFSET]
+  mrs x17, spsr_el1
+  str x17, [x18, #TTC_STATE_HOST_GATE_PSTATE_OFFSET]
+  dsb ishst
+  ldr x16, [x18, #TTC_STATE_HOST_GATE_SP_OFFSET]
+  mov sp, x16
+  ldr x16, [x18, #TTC_STATE_HOST_GATE_X16_OFFSET]
+  ldr x17, [x18, #TTC_STATE_HOST_GATE_X17_OFFSET]
+  mrs x18, sp_el0
+  hvc #0x74
+5:
+  b 5b
+3:
+  mov x16, #4
+  b _ttc_monitor_unexpected_handler
 
 .globl _ttc_monitor_el0_sync_handler
 _ttc_monitor_el0_sync_handler:
@@ -201,8 +391,7 @@ _ttc_monitor_el0_sync_handler:
   mov x18, #TTC_EXIT_SYSCALL
   csel x17, x18, x17, eq
   str x17, [x16, #TTC_APP_EXIT_KIND_OFFSET]
-  hvc #0x72
-1: b 1b
+  b _ttc_monitor_finish_application_exit
 .globl _ttc_monitor_el0_sync_handler_end
 _ttc_monitor_el0_sync_handler_end:
 
@@ -245,8 +434,48 @@ _ttc_monitor_el0_irq_handler:
   str xzr, [x16, #TTC_APP_FAR_OFFSET]
   mov x17, #TTC_EXIT_INTERRUPTED
   str x17, [x16, #TTC_APP_EXIT_KIND_OFFSET]
-  hvc #0x72
-1: b 1b
+  b _ttc_monitor_finish_application_exit
+
+_ttc_monitor_finish_application_exit:
+  mrs x17, tpidr_el1
+  str xzr, [x17, #TTC_STATE_CANCEL_REQUESTED_OFFSET]
+  add x18, x17, #3, lsl #12
+  SAVE_FP_STATE x18
+  ldr x16, [x17, #TTC_STATE_SENTRY_TTBR0_OFFSET]
+  msr ttbr0_el1, x16
+  isb
+  add x18, x17, #2, lsl #12
+  add x18, x18, #0xc00
+  LOAD_FP_STATE x18
+  ldr x16, [x17, #TTC_STATE_SENTRY_SP_OFFSET]
+  mov sp, x16
+  ldr x16, [x17, #TTC_STATE_SENTRY_PC_OFFSET]
+  msr elr_el1, x16
+  ldr x16, [x17, #TTC_STATE_SENTRY_PSTATE_OFFSET]
+  msr spsr_el1, x16
+  ldr x16, [x17, #TTC_STATE_SENTRY_TPIDR_OFFSET]
+  msr tpidr_el0, x16
+  ldr x16, [x17, #TTC_STATE_SENTRY_TPIDRRO_OFFSET]
+  msr tpidrro_el0, x16
+  add x18, x17, #2, lsl #12
+  add x18, x18, #0xa88
+  ldp x0, x1, [x18, #0x00]
+  ldp x2, x3, [x18, #0x10]
+  ldp x4, x5, [x18, #0x20]
+  ldp x6, x7, [x18, #0x30]
+  ldp x8, x9, [x18, #0x40]
+  ldp x10, x11, [x18, #0x50]
+  ldp x12, x13, [x18, #0x60]
+  ldp x14, x15, [x18, #0x70]
+  ldp x16, x17, [x18, #0x80]
+  ldp x19, x20, [x18, #0x98]
+  ldp x21, x22, [x18, #0xa8]
+  ldp x23, x24, [x18, #0xb8]
+  ldp x25, x26, [x18, #0xc8]
+  ldp x27, x28, [x18, #0xd8]
+  ldp x29, x30, [x18, #0xe8]
+  ldr x18, [x18, #0x90]
+  eret
 .globl _ttc_monitor_el0_irq_handler_end
 _ttc_monitor_el0_irq_handler_end:
 

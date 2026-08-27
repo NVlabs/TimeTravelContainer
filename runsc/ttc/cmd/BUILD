@@ -61,6 +61,7 @@ go_test(
     size = "small",
     srcs = [
         "cmd_test.go",
+        "cmd_host_darwin_test.go",
         "cp_test.go",
         "daemon_statfs_test_darwin.go",
         "daemon_statfs_test_linux.go",

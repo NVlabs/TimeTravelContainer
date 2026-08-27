@@ -47,7 +47,13 @@ func evaluateCurrentHostCompatibility(release string) (hostKernelCompatibility, 
 	if err != nil {
 		return hostKernelCompatibility{}, err
 	}
-	return hostKernelCompatibility{release: release, version: version, disableHostGSO: true}, nil
+	// disableHostGSO is a Linux-kernel compatibility workaround for hosts older
+	// than 4.14.77. Applying it unconditionally on Darwin changes Sentry's
+	// networking execution path even for --network=none and, on the HVF engine,
+	// can terminate the sandbox while starting an exec process. Darwin's
+	// userspace netstack/NAT selects its own supported offloads; leave the
+	// generic runsc default intact here.
+	return hostKernelCompatibility{release: release, version: version}, nil
 }
 
 func currentHostCompatibilityWarning(hostKernelCompatibility) string { return "" }

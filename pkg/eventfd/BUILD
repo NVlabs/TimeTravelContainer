@@ -12,7 +12,7 @@ go_library(
         "eventfd_darwin.go",
         "eventfd_linux.go",
         "eventfd_mmio_darwin.go",
-        "eventfd_mmio_linux.go",
+        "eventfd_mmio_linux_unsafe.go",
         "eventfd_unsafe.go",
     ],
     visibility = [
