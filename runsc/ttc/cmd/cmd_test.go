@@ -3224,15 +3224,21 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	// The dentry cache is sized from this process's descriptor limit, so what
+	// it should be is asked for rather than written down.
+	dcache := []string(nil)
+	if size, known := dentryCacheSize(); known {
+		dcache = []string{"--dcache=" + strconv.Itoa(size)}
+	}
+	wantHardened := append([]string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHost := append([]string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := []string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
+	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=systrap", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...), "--ttc-network-nat=true")
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -3240,10 +3246,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkConfig("ttc", true, "192.0.2.44", "02:aa:bb:cc:dd:ee"); !reflect.DeepEqual(got, wantCustomNIC) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
-	wantUnsafe := []string{
+	wantUnsafe := append([]string{
 		"--root", "/runtime", "--platform=systrap", "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
-	}
+	}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
 	}
@@ -3256,6 +3262,58 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
 		t.Errorf("KVM runsc args=%q, want %q", got, wantKVM)
 	}
+}
+
+// The cache a sandbox is allowed fits in the descriptors it will be given.
+//
+// This is the whole of the fix: a login node hands its processes 8191
+// descriptors and no more, the gofer spends close to two of them on every
+// dentry the sentry holds, and the per-mount default of a thousand each meant a
+// seven-mount sandbox was permitted a cache it could not pay for. It reached
+// EMFILE with its caches still filling, and a gofer at EMFILE never recovers —
+// nothing evicts on a descriptor shortage.
+func TestTheDentryCacheFitsInTheDescriptorsTheGoferWillHave(t *testing.T) {
+	size, known := dentryCacheSize()
+	if !known {
+		t.Skip("this process cannot read its own descriptor limit")
+	}
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+	// What a full cache costs the gofer, against what the gofer has. The
+	// margin is the point: the other half is for the files the workload is
+	// holding open, which are not cache and cannot be evicted.
+	cost := size * goferFDsPerDentry
+	if uint64(cost) >= limit.Cur && size < maxDentryCache {
+		t.Fatalf("a full cache of %d dentries costs %d descriptors of %d", size, cost, limit.Cur)
+	}
+	if size < minDentryCache {
+		t.Fatalf("cache of %d dentries is too small to be worth having", size)
+	}
+	if size > maxDentryCache {
+		t.Fatalf("cache of %d dentries is past the ceiling of %d", size, maxDentryCache)
+	}
+}
+
+// The sandbox is told the size, so that one cache serves every mount.
+//
+// Without the flag the sentry gives each mount its own thousand, which is what
+// made the budget grow with the number of things mounted rather than staying
+// inside what the gofer can hold.
+func TestTheSandboxIsGivenOneCacheForAllOfItsMounts(t *testing.T) {
+	size, known := dentryCacheSize()
+	if !known {
+		t.Skip("this process cannot read its own descriptor limit")
+	}
+	args := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs()
+	want := "--dcache=" + strconv.Itoa(size)
+	for _, arg := range args {
+		if arg == want {
+			return
+		}
+	}
+	t.Fatalf("runsc args %q do not carry %q", args, want)
 }
 
 func TestDehydrationNetworkArgs(t *testing.T) {

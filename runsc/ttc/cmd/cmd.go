@@ -8062,6 +8062,55 @@ func (b *runtimeBackend) purgeRuntime(containerID string) error {
 	return nil
 }
 
+// The gofer holds host descriptors for the dentries the sentry is holding —
+// close to two apiece — and it inherits this process's descriptor limit.
+//
+// Left alone the sentry caches a thousand dentries per mount, which is a budget
+// with no relationship to that limit. A sandbox with seven mounts may cache
+// seven thousand dentries and so ask its gofer for some twelve thousand
+// descriptors; on a login node whose hard limit is 8192 the gofer reaches
+// EMFILE long before the caches are full. There is no way back from that.
+// Nothing evicts on a descriptor shortage, so from then until the sandbox is
+// restarted every path in it fails — and fails as a missing file rather than as
+// a shortage, because a lookup that cannot reach the gofer is indistinguishable
+// from one that found nothing.
+//
+// So the cache is sized from the budget rather than from the number of mounts:
+// half the descriptors for cached dentries, the other half left for the files
+// the workload is actually holding open.
+const (
+	goferFDsPerDentry = 2
+	// Room for the workload, in the same units: the cache may have one of
+	// every dentryCacheShare descriptors.
+	dentryCacheShare = 2
+	// Below this a cache is not worth having, and above it the sandbox is
+	// bounded by something other than descriptors. Both ends only bite on
+	// hosts far away from the one this exists for.
+	minDentryCache = 256
+	maxDentryCache = 8000
+)
+
+// dentryCacheSize is how many dentries a sandbox may cache, in descriptors it
+// can actually have.
+//
+// The second result is whether the budget could be read at all. When it cannot
+// be, nothing is passed and the per-mount default stands: a number invented
+// here would be worse than the one that is already there.
+func dentryCacheSize() (int, bool) {
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		return 0, false
+	}
+	size := int(limit.Cur) / (goferFDsPerDentry * dentryCacheShare)
+	if size < minDentryCache {
+		size = minDentryCache
+	}
+	if size > maxDentryCache {
+		size = maxDentryCache
+	}
+	return size, true
+}
+
 func (b *runtimeBackend) configuredRunscArgs() []string {
 	return b.configuredRunscArgsForNetwork("none")
 }
@@ -8095,6 +8144,11 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// compatibility with Docker images that use helpers such as sudo.
 		"--allow-suid=true",
 		"--overlay2=all:memory")
+	if size, known := dentryCacheSize(); known {
+		// One cache for the sandbox rather than one per mount, so that what it
+		// costs the gofer does not grow with the number of things mounted.
+		args = append(args, "--dcache="+strconv.Itoa(size))
+	}
 	if b.disableHostGSO {
 		args = append(args, "--gso=false")
 	}
