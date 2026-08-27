@@ -1989,7 +1989,27 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	for path := range all {
 		currentInode, currentOK := currentPaths[path]
 		baseInode, baseOK := basePaths[path]
+		// A whiteout is an entry that says a name is not there. It is present
+		// in the layer, so without reading it as what it means every deletion
+		// of a directory looked like a character device being added.
+		currentGone := currentOK && isWhiteout(currentInode)
+		baseGone := baseOK && isWhiteout(baseInode)
 		switch {
+		case currentGone && baseGone:
+			// Hidden before and hidden now: nothing happened to it here.
+		case currentGone:
+			// What went away is what the layer underneath had. When that is
+			// below the branch entirely — an image's own directory, say — the
+			// deletion is still certain and the type is not, so it is left
+			// unsaid rather than reported as the whiteout's own.
+			gone := PathChange{Path: path, Kind: "delete"}
+			if baseOK {
+				gone.Type = baseInode.Type
+			}
+			changes = append(changes, gone)
+		case baseGone && currentOK:
+			// It was hidden and now it is not, which is the path coming back.
+			changes = append(changes, PathChange{Path: path, Kind: "add", Type: currentInode.Type})
 		case currentOK && !baseOK:
 			changes = append(changes, PathChange{Path: path, Kind: "add", Type: currentInode.Type})
 		case !currentOK && baseOK:
@@ -2027,7 +2047,7 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 		// Overlayfs stores a whiteout in its writable layer as a 0:0 character
 		// device at the hidden entry's name. OCI layers encode the same operation
 		// as an empty regular file named .wh.<entry>.
-		whiteout := inode.Type == "char" && inode.Mode&07777 == 0 && inode.DevMajor == 0 && inode.DevMinor == 0
+		whiteout := isWhiteout(inode)
 		archiveName := name
 		if whiteout {
 			archiveName = whiteoutArchiveName(name)
@@ -2174,6 +2194,19 @@ func opaqueWhiteoutArchiveName(directory string) string {
 		return ".wh..wh..opq"
 	}
 	return directory + "/.wh..wh..opq"
+}
+
+// isWhiteout reports whether an inode is overlayfs's way of saying a name is
+// gone: a character device with device number 0:0 and no permission bits.
+//
+// Named rather than written out where it is needed. It was written out in one
+// place — the layer writer, which learned to turn these into `.wh.` entries —
+// and not in the other, so `diff` went on reporting a deleted directory as the
+// character device it literally is. A deletion that a person cannot see in
+// `diff` is a deletion they go looking for somewhere else.
+func isWhiteout(inode Inode) bool {
+	return inode.Type == "char" && inode.Mode&07777 == 0 &&
+		inode.DevMajor == 0 && inode.DevMinor == 0
 }
 
 func isOverlayOpaque(xattrs map[string]string) bool {

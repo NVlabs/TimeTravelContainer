@@ -1170,6 +1170,104 @@ func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
 	}
 }
 
+// A whiteout is a deletion, and diff says so.
+//
+// Overlayfs hides a name by putting a 0:0 character device where it was. The
+// entry is present, so a diff that only asks "is this path in the layer" sees
+// something added or changed and never a deletion — which is how a session that
+// had lost its whole /tmp was reported as having a modified character device
+// there, and how the person reading it went looking somewhere else.
+func TestBranchDiffReadsAWhiteoutAsTheDeletionItIs(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-whiteout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	// A directory the branch will hide, and a file beside it for contrast.
+	if _, err := repository.CreateDirectory(MainBranch, RootInode, "gone", 0755, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "stays", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveDirectory("child", RootInode, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateSpecial("child", RootInode, "gone", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// And one that hides something the branch never had an entry for, which is
+	// what deleting a directory the image brought looks like.
+	if _, err := repository.CreateSpecial("child", RootInode, "fromtheimage", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]PathChange{}
+	for _, change := range changes {
+		byPath[change.Path] = change
+	}
+	if got := byPath["/gone"]; got.Kind != "delete" {
+		t.Fatalf("a hidden directory is reported as %+v, not a deletion", got)
+	}
+	if got := byPath["/gone"]; got.Type != "directory" {
+		t.Fatalf("the deletion names %q as what went away, not the directory it was", got.Type)
+	}
+	// Nothing underneath says what it was, so nothing is claimed about it.
+	if got := byPath["/fromtheimage"]; got.Kind != "delete" {
+		t.Fatalf("hiding a path the branch never held is reported as %+v", got)
+	}
+	if got := byPath["/fromtheimage"]; got.Type != "" {
+		t.Fatalf("a type of %q was invented for a path nothing under the branch describes", got.Type)
+	}
+	if _, ok := byPath["/stays"]; ok {
+		t.Fatalf("an untouched file appears in the diff: %+v", byPath["/stays"])
+	}
+}
+
+// A name that comes back is an addition, not a modification of the whiteout.
+func TestBranchDiffReadsAReplacedWhiteoutAsThePathReturning(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-returns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateSpecial(MainBranch, RootInode, "back", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Unlink("child", RootInode, "back"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular("child", RootInode, "back", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path != "/back" {
+			continue
+		}
+		if change.Kind != "add" || change.Type != "regular" {
+			t.Fatalf("a path that came back is reported as %+v", change)
+		}
+		return
+	}
+	t.Fatal("the path coming back is not in the diff at all")
+}
+
 func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("diff")
