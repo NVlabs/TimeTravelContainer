@@ -798,15 +798,19 @@ func New(args Args) (*Loader, error) {
 		LiveForkEligible:    liveForkEligible,
 	}
 
-	// Distributed and cold-dehydration targets need an unused MemoryFile backing
-	// that survives their bootstrap Kernel. Keep it anonymous: durable page data
-	// belongs in TTC's immutable chunk repository, never in the live allocator.
+	// Non-VM distributed and cold-dehydration targets need an unused MemoryFile
+	// backing that survives their bootstrap Kernel. Process-scoped VM platforms
+	// instead reuse the bootstrap platform and allocate the replacement
+	// MemoryFile directly from GuestRAM.
 	if specutils.TTCDistributedTarget(args.Spec) {
-		fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
-		if err != nil {
-			return nil, fmt.Errorf("creating reserved application memory file: %w", err)
+		_, reusesPlatform := p.(platform.RestoreReuser)
+		if !reusesPlatform {
+			fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
+			if err != nil {
+				return nil, fmt.Errorf("creating reserved application memory file: %w", err)
+			}
+			l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
 		}
-		l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
 	}
 	mf, err := createMemoryFileForPlatform(p, args.Conf.AppHugePages, args.HostTHP)
 	if err != nil {

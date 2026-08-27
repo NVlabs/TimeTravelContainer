@@ -1912,11 +1912,18 @@ func (f *MemoryFile) MapInternalForPMA(fr memmap.FileRange, at hostarch.AccessTy
 }
 
 func (f *MemoryFile) awaitInternalMappingLoads(fr memmap.FileRange, at hostarch.AccessType) error {
-	if !fr.WellFormed() || fr.Length() == 0 {
-		panic(fmt.Sprintf("invalid range: %v", fr))
-	}
 	if at.Execute {
 		return linuxerr.EACCES
+	}
+	return f.awaitBackingLoads(fr)
+}
+
+// awaitBackingLoads waits for page contents independently of host mapping
+// permissions. Unlike MapInternal, a VM AddressSpace may legitimately resolve
+// executable frames after the remote bytes have arrived.
+func (f *MemoryFile) awaitBackingLoads(fr memmap.FileRange) error {
+	if !fr.WellFormed() || fr.Length() == 0 {
+		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
 		if err := amfl.awaitLoad(fr); err != nil {

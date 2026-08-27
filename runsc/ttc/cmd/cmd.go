@@ -8162,15 +8162,24 @@ func (b *runtimeBackend) runConfiguredCommandForNetworkNAT(networkMode string, n
 }
 
 func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args ...string) (int, error) {
+	status, _, err := b.runConfiguredCommandWithArgsAndDiagnostic(configured, args...)
+	return status, err
+}
+
+// runConfiguredCommandWithArgsAndDiagnostic is the cluster-control variant of
+// runConfiguredCommandWithArgs. Cluster target operations have no attached TTC
+// client stream, so their peer response must retain the launch diagnostic
+// instead of reducing every runtime failure to an opaque exit status.
+func (b *runtimeBackend) runConfiguredCommandWithArgsAndDiagnostic(configured []string, args ...string) (int, string, error) {
 	args = append(configured, args...)
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
-		return 1, fmt.Errorf("opening runsc launch stdout: %w", err)
+		return 1, "", fmt.Errorf("opening runsc launch stdout: %w", err)
 	}
 	defer stdout.Close()
 	stderr, err := os.CreateTemp("", "ttc-runsc-launch-*.log")
 	if err != nil {
-		return 1, fmt.Errorf("creating runsc launch stderr: %w", err)
+		return 1, "", fmt.Errorf("creating runsc launch stderr: %w", err)
 	}
 	stderrName := stderr.Name()
 	defer os.Remove(stderrName)
@@ -8184,21 +8193,30 @@ func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args 
 	command.Stderr = stderr
 	runErr := command.Run()
 	if _, err := stderr.Seek(0, io.SeekStart); err != nil {
-		return 1, fmt.Errorf("rewinding runsc launch stderr: %w", err)
+		return 1, "", fmt.Errorf("rewinding runsc launch stderr: %w", err)
 	}
+	const maxLaunchDiagnosticBytes = 64 << 10
+	diagnosticBytes, err := io.ReadAll(io.LimitReader(stderr, maxLaunchDiagnosticBytes))
+	if err != nil {
+		return 1, "", fmt.Errorf("reading runsc launch stderr: %w", err)
+	}
+	diagnostic := strings.TrimSpace(string(diagnosticBytes))
 	if b.stderr != nil {
+		if _, err := stderr.Seek(0, io.SeekStart); err != nil {
+			return 1, diagnostic, fmt.Errorf("rewinding runsc launch stderr for replay: %w", err)
+		}
 		if _, err := io.Copy(b.stderr, stderr); err != nil {
-			return 1, fmt.Errorf("replaying runsc launch stderr: %w", err)
+			return 1, diagnostic, fmt.Errorf("replaying runsc launch stderr: %w", err)
 		}
 	}
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
-			return exitErr.ExitCode(), nil
+			return exitErr.ExitCode(), diagnostic, nil
 		}
-		return 1, fmt.Errorf("starting runsc: %w", runErr)
+		return 1, diagnostic, fmt.Errorf("starting runsc: %w", runErr)
 	}
-	return 0, nil
+	return 0, diagnostic, nil
 }
 
 func verifyCgroupV2Resources(pid int, procCgroup []byte, mountRoot, expectedPath string, resources *specs.LinuxResources) error {

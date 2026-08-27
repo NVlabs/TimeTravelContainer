@@ -82,6 +82,7 @@ go_test(
     srcs = [
         "network_test.go",
         "process_state_test.go",
+        "sandbox_test.go",
     ],
     library = ":sandbox",
     deps = [

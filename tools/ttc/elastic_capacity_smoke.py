@@ -257,30 +257,30 @@ def main():
     finally:
         if args.preserve_on_failure and not succeeded:
             print(f"preserved failed qualification at {root}", file=sys.stderr)
-            return
-        if started_a:
-            # Remove image-owned mapped-UID trees while the daemon can still
-            # enter its extraction namespace. A plain host rmtree may not own
-            # those inodes, even in unsafe-no-host-isolation test mode.
-            ttc(runtime_a, "rm", "-f", "capacity-smoke", check=False, timeout=30)
-            ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=30)
-        if started_b:
-            ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=30)
-        if started_a:
-            ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=30)
-        if not args.keep:
-            # The stop response precedes the serving goroutine's final durable
-            # intent cleanup by a small interval. Wait for both sockets to
-            # disappear so that cleanup cannot recreate the test root.
-            wait_for(
-                "daemon shutdown",
-                lambda: not (runtime_a / "ttcd.sock").exists() and not (runtime_b / "ttcd.sock").exists(),
-                timeout=30,
-            )
-            time.sleep(1)
-            remove_tree(root)
-            if args.data_dir is not None and data.exists():
-                remove_tree(data)
+        else:
+            if started_a:
+                # Remove image-owned mapped-UID trees while the daemon can still
+                # enter its extraction namespace. A plain host rmtree may not own
+                # those inodes, even in unsafe-no-host-isolation test mode.
+                ttc(runtime_a, "rm", "-f", "capacity-smoke", check=False, timeout=30)
+                ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=30)
+            if started_b:
+                ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=30)
+            if started_a:
+                ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=30)
+            if not args.keep:
+                # The stop response precedes the serving goroutine's final durable
+                # intent cleanup by a small interval. Wait for both sockets to
+                # disappear so that cleanup cannot recreate the test root.
+                wait_for(
+                    "daemon shutdown",
+                    lambda: not (runtime_a / "ttcd.sock").exists() and not (runtime_b / "ttcd.sock").exists(),
+                    timeout=30,
+                )
+                time.sleep(1)
+                remove_tree(root)
+                if args.data_dir is not None and data.exists():
+                    remove_tree(data)
 
 
 if __name__ == "__main__":

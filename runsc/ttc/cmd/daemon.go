@@ -303,12 +303,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			}
 			defer cleanup()
 		}
-		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
+		status, diagnostic, err := r.backend.runConfiguredCommandWithArgsAndDiagnostic(configured, "create", "--bundle", bundleDir, info.ID)
 		if err != nil {
 			return fmt.Errorf("creating distributed target runtime: %w", err)
 		}
 		if status != 0 {
-			return fmt.Errorf("creating distributed target runtime exited with status %d", status)
+			if diagnostic != "" {
+				return fmt.Errorf("creating distributed target runtime exited with status %d: %s", status, diagnostic)
+			}
+			return fmt.Errorf("creating distributed target runtime exited with status %d without a diagnostic", status)
 		}
 		runtimeState.Status = "created"
 		runtimeCreated = true

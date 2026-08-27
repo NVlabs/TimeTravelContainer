@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -129,4 +130,42 @@ func checkDaemonPeer(conn net.Conn) error {
 
 func setTTCCommandParentDeathSignal(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+}
+
+// currentNodeMemoryBytes prefers the containing cgroup because Sentries are
+// daemon siblings rather than children whose RSS can be summed reliably.
+func currentNodeMemoryBytes() (uint64, error) {
+	if cgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		for _, line := range strings.Split(string(cgroup), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) != 3 || parts[0] != "0" || parts[1] != "" {
+				continue
+			}
+			path := "/sys/fs/cgroup/" + strings.TrimPrefix(parts[2], "/")
+			if value, err := readUintFile(path + "/memory.current"); err == nil {
+				return value, nil
+			}
+		}
+	}
+	statm, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(statm))
+	if len(fields) < 2 {
+		return 0, errors.New("/proc/self/statm has no resident page count")
+	}
+	residentPages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return residentPages * uint64(os.Getpagesize()), nil
+}
+
+func readUintFile(path string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }

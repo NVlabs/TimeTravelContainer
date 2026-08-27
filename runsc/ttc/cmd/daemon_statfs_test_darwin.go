@@ -16,7 +16,11 @@
 
 package cmd
 
-import "golang.org/x/sys/unix"
+import (
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
 
 const testLinuxHost = false
 
@@ -34,5 +38,15 @@ func setTestFilesystemName(statfs *unix.Statfs_t, name string) {
 	}
 	for i := 0; i < len(name) && i < len(statfs.Fstypename); i++ {
 		statfs.Fstypename[i] = name[i]
+	}
+}
+
+func TestCurrentNodeMemoryBytesDarwin(t *testing.T) {
+	resident, err := currentNodeMemoryBytes()
+	if err != nil {
+		t.Fatalf("currentNodeMemoryBytes: %v", err)
+	}
+	if resident == 0 {
+		t.Fatal("currentNodeMemoryBytes returned zero")
 	}
 }

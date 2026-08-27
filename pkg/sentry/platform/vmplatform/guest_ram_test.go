@@ -499,6 +499,77 @@ func TestGuestRAMMemoryFileAsyncSaveRestoreUsesLeasedMappings(t *testing.T) {
 	source.Destroy()
 }
 
+func TestGuestRAMResolveBackingFramesWaitsForRemotePage(t *testing.T) {
+	newMemoryFile := func() *pgalloc.MemoryFile {
+		ram, err := NewGuestRAM(GuestRAMConfig{
+			VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+			BackingProvider: ram, DelayedEviction: pgalloc.DelayedEvictionDisabled, DisableMemoryAccounting: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mf
+	}
+
+	source := newMemoryFile()
+	sourceFR, err := source.Allocate(GuestFrameSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte{0xa7}, int(GuestFrameSize))
+	blocks, lease, err := memmap.MapInternalWithLease(source, sourceFR, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(want))); err != nil || n != GuestFrameSize {
+		lease.Release()
+		t.Fatalf("populating source: n=%d err=%v", n, err)
+	}
+	lease.Release()
+	snapshot, err := pgalloc.NewRemoteSnapshot([]pgalloc.RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := newMemoryFile()
+	targetFR, err := target.Allocate(GuestFrameSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateUncommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := pgalloc.NewLoopbackRemoteReader(snapshot, GuestFrameSize, 1, 1)
+	pages, err := pgalloc.StartAsyncPagesFileLoadWithOpts(reader, nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, []pgalloc.RemoteLoadRange{{Target: targetFR}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	// This is the path used by VM AddressSpace.Map, including executable
+	// mappings. It must not expose the target's initially empty GuestRAM frame.
+	frames, err := target.ResolveBackingFrames(targetFR, hostarch.Execute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := unsafe.Slice((*byte)(unsafe.Pointer(frames[0].HostAddress)), int(GuestFrameSize))
+	if !bytes.Equal(got, want) {
+		t.Fatal("ResolveBackingFrames exposed a frame before its remote contents were installed")
+	}
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	target.DecRef(targetFR)
+	target.Destroy()
+	source.DecRef(sourceFR)
+	source.Destroy()
+}
+
 func TestGuestRAMReclaimsOnlyEmptySlabAndRetiresGPA(t *testing.T) {
 	ram, backing, vm, _, revoker := newRAMTestBacking(t, 1<<20)
 	frames, err := backing.ResolveFrames(memmap.FileRange{0, HostSlabSize}, hostarch.Read)

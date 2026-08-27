@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,6 +91,15 @@ func controlSocketName(id string) string {
 	return fmt.Sprintf("runsc-%s.sock", id)
 }
 
+// fallbackControlSocketName keeps fallback paths short and namespaces them by
+// runsc root. Two ttcd instances on one host may intentionally manage the same
+// logical container ID in different node-local roots during a remote fork or
+// migration; the historical ID-only /tmp name made those sandboxes collide.
+func fallbackControlSocketName(rootDir, id string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(rootDir) + "\x00" + id))
+	return fmt.Sprintf("runsc-%x.sock", digest[:16])
+}
+
 // createControlSocket finds a location and creates the socket used to
 // communicate with the sandbox. The socket is a UDS on the host filesystem.
 //
@@ -97,10 +107,20 @@ func controlSocketName(id string) string {
 // them. There is no file mode protecting abstract sockets.
 func createControlSocket(rootDir, id string) (string, int, error) {
 	name := controlSocketName(id)
+	fallbackName := fallbackControlSocketName(rootDir, id)
 
 	// Only use absolute paths to guarantee resolution from anywhere.
-	for _, dir := range []string{rootDir, "/var/run", "/run", "/tmp"} {
-		path := filepath.Join(dir, name)
+	locations := []struct {
+		dir  string
+		name string
+	}{
+		{dir: rootDir, name: name},
+		{dir: "/var/run", name: fallbackName},
+		{dir: "/run", name: fallbackName},
+		{dir: "/tmp", name: fallbackName},
+	}
+	for _, location := range locations {
+		path := filepath.Join(location.dir, location.name)
 		log.Debugf("Attempting to create socket file %q", path)
 		fd, err := server.CreateSocket(path)
 		if err == nil {

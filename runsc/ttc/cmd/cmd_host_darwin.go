@@ -106,3 +106,19 @@ func checkDaemonPeer(conn net.Conn) error {
 func setTTCCommandParentDeathSignal(command *exec.Cmd) {
 	command.SysProcAttr = &unix.SysProcAttr{}
 }
+
+// currentNodeMemoryBytes reports the daemon's resident high-water mark as a
+// conservative process-local proxy. macOS has no Linux-style memory cgroup
+// encompassing the daemon and its Sentry siblings. ru_maxrss is measured in
+// bytes on Darwin; branch GuestRAM accounting remains authoritative for guest
+// memory.
+func currentNodeMemoryBytes() (uint64, error) {
+	var usage unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err != nil {
+		return 0, fmt.Errorf("reading current process memory usage: %w", err)
+	}
+	if usage.Maxrss <= 0 {
+		return 0, fmt.Errorf("current process maximum resident memory is %d", usage.Maxrss)
+	}
+	return uint64(usage.Maxrss), nil
+}

@@ -1104,9 +1104,9 @@ type RemoteLoadRange struct {
 }
 
 // AttachRemotePageLoad marks existing target pages as unloaded and attaches
-// them to pages. Access through MapInternal or DataFD blocks until the relevant
-// remote ranges have been installed. The caller must call
-// AsyncPagesFileLoad.MemoryFilesDone after attaching every destination
+// them to pages. Access through MapInternal, ResolveBackingFrames, or DataFD
+// blocks until the relevant remote ranges have been installed. The caller must
+// call AsyncPagesFileLoad.MemoryFilesDone after attaching every destination
 // MemoryFile.
 //
 // The target ranges must already be allocated with at least one reference.

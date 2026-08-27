@@ -65,6 +65,13 @@ func (f *MemoryFile) ResolveBackingFrames(fr memmap.FileRange, at hostarch.Acces
 	if f.backing == nil {
 		return nil, &NoPlatformBackingError{}
 	}
+	// VM AddressSpaces resolve GuestRAM frames directly instead of obtaining a
+	// host mapping through MapInternal. They must nevertheless observe the same
+	// remote-restore interlock: resolving an unloaded sparse page would allocate
+	// and map a zero frame before the asynchronous loader installs its contents.
+	if err := f.awaitBackingLoads(fr); err != nil {
+		return nil, err
+	}
 	return f.backing.ResolveFrames(fr, at)
 }
 
