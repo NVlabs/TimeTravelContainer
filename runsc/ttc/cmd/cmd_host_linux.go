@@ -83,6 +83,8 @@ func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
 	return nil
 }
 
+func preflightDaemonExecutable(string) error { return nil }
+
 func createRootlessProbe() error {
 	command := exec.Command("/proc/self/exe", daemonRootlessProbeArg)
 	command.SysProcAttr = &syscall.SysProcAttr{

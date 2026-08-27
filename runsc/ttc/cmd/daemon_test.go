@@ -339,6 +339,40 @@ func TestDaemonStartFailsImmediatelyWithoutTTCD(t *testing.T) {
 	}
 }
 
+func TestDaemonStartFailsImmediatelyWhenTTCDCannotExecute(t *testing.T) {
+	originalExecutable := daemonClientExecutable
+	originalLookPath := daemonExecutableLookPath
+	originalPreflight := daemonExecutablePreflight
+	defer func() {
+		daemonClientExecutable = originalExecutable
+		daemonExecutableLookPath = originalLookPath
+		daemonExecutablePreflight = originalPreflight
+	}()
+	dir := t.TempDir()
+	daemonClientExecutable = func() (string, error) {
+		return filepath.Join(dir, "bin", "ttc"), nil
+	}
+	daemonExecutableLookPath = func(string) (string, error) {
+		return filepath.Join(dir, "bin", "ttcd"), nil
+	}
+	daemonExecutablePreflight = func(string) error {
+		return errors.New("signal: killed")
+	}
+
+	socket := filepath.Join(dir, "runtime", "ttcd.sock")
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--daemon-socket", socket, "daemon", "start", "--unsafe-no-host-isolation"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "validating ttcd executable") || !strings.Contains(stderr.String(), "signal: killed") {
+		t.Fatalf("unexecutable ttcd: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("unexecutable ttcd created daemon socket: %v", err)
+	}
+	if _, err := os.Stat(daemonLogPath(socket)); !os.IsNotExist(err) {
+		t.Fatalf("unexecutable ttcd created startup log: %v", err)
+	}
+}
+
 func TestFindDaemonExecutablePrefersSiblingTTCD(t *testing.T) {
 	client := filepath.Join(t.TempDir(), "bin", "ttc")
 	sibling := filepath.Join(filepath.Dir(client), "ttcd")

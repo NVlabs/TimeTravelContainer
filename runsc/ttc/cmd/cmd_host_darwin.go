@@ -59,6 +59,14 @@ func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
 	return nil
 }
 
+func preflightDaemonExecutable(path string) error {
+	command := exec.Command(path, daemonRootlessProbeArg)
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("cannot execute: %w; ad-hoc macOS builds must be signed at their final installed path with the com.apple.security.hypervisor entitlement", err)
+	}
+	return nil
+}
+
 func createRootlessProbe() error {
 	return fmt.Errorf("Linux user namespaces are unavailable on native macOS: %w", unix.EOPNOTSUPP)
 }

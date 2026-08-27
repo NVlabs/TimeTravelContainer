@@ -87,19 +87,24 @@ allocation slabs, and does not boot a Linux VM. This first backend is a trusted
 workload mode: it deliberately omits Linux host namespaces, seccomp, and
 cgroups, and therefore makes no macOS host-security-boundary claim.
 
-Build and ad-hoc sign the runtime after every rebuild:
+Build the runtime, copy it to its final location, and then ad-hoc sign the
+installed `ttcd`. Signing before a copy is insufficient on macOS versions that
+validate the installed inode independently:
 
 ```sh
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd
+mkdir -p bin
+cp bazel-bin/runsc/ttc/ttc_/ttc bin/ttc
+cp bazel-bin/runsc/ttcd/ttcd_/ttcd bin/ttcd
 codesign --force --sign - \
   --entitlements runsc/hvf.entitlements \
-  bazel-bin/runsc/ttcd/ttcd_/ttcd
+  bin/ttcd
 ```
 
 Start the daemon only with the explicit trusted-mode opt-in:
 
 ```sh
-bazel-bin/runsc/ttc/ttc_/ttc daemon start --unsafe-no-host-isolation
+bin/ttc daemon start --unsafe-no-host-isolation
 ```
 
 For OCI-runtime integration, invoke the embedded runtime as `ttcd runsc ...`,

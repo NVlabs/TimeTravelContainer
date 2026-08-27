@@ -79,6 +79,7 @@ var (
 	daemonStatfs              = unix.Statfs
 	daemonClientExecutable    = os.Executable
 	daemonExecutableLookPath  = exec.LookPath
+	daemonExecutablePreflight = preflightDaemonExecutable
 )
 
 type daemonWireOptions struct {
@@ -3252,6 +3253,9 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 	commandName, err := findDaemonExecutable(clientExecutable, runsc, daemonExecutableLookPath)
 	if err != nil {
 		return "", nil, err
+	}
+	if err := daemonExecutablePreflight(commandName); err != nil {
+		return "", nil, fmt.Errorf("validating ttcd executable %q: %w", commandName, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
