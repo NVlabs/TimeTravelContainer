@@ -2160,7 +2160,8 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 		}
 	}()
 
-	// Reused mincore buffer.
+	// Reused page commitment buffer. Host-file backings populate this through
+	// mincore; platform backings provide the equivalent logical-page view.
 	var buf []byte
 
 	maseg := f.memAcct.FirstSegment()
@@ -2200,22 +2201,27 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 		}
 		var checkErr error
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
-			s := chunk.sliceAt(chunkFR)
-
 			// Ensure that we have sufficient buffer for the call (one byte per
-			// page). The length of s must be page-aligned.
-			bufLen := len(s) / hostarch.PageSize
+			// page). chunkFR must be page-aligned.
+			bufLen := int(chunkFR.Length() / hostarch.PageSize)
 			if len(buf) < bufLen {
 				buf = make([]byte, bufLen)
 			}
 
-			// Query for new pages in core.
+			// Query for newly committed pages.
 			// NOTE(b/165896008): mincore might take a really long time. So
-			// unlock f.mu while mincore runs.
+			// unlock f.mu while the commitment query runs. Relocatable platform
+			// backings have no stable chunk mapping for mincore, so they report
+			// logical page commitment directly.
 			lastCommitSeq := f.commitSeq
 			f.commitSeq++
 			f.mu.Unlock() // +checklocksforce
-			err := mincore(s, buf)
+			var err error
+			if f.backing != nil {
+				err = f.backing.QueryCommitment(chunkFR, buf[:bufLen])
+			} else {
+				err = mincore(chunk.sliceAt(chunkFR), buf[:bufLen])
+			}
 			f.mu.Lock()
 			if err != nil {
 				checkErr = err

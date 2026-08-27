@@ -253,6 +253,27 @@ func (b *guestBacking) Commit(fr memmap.FileRange) error {
 	return err
 }
 
+func (b *guestBacking) QueryCommitment(fr memmap.FileRange, committed []byte) error {
+	if err := validateFrameRange(fr); err != nil {
+		return err
+	}
+	if uint64(len(committed)) != fr.Length()/GuestFrameSize {
+		return fmt.Errorf("GuestRAM commitment bitmap has length %d for range %v", len(committed), fr)
+	}
+	b.ram.mu.Lock()
+	defer b.ram.mu.Unlock()
+	if b.destroyed || fr.End > b.size {
+		return fmt.Errorf("invalid GuestRAM commitment query %v", fr)
+	}
+	for i, offset := 0, fr.Start; offset < fr.End; i, offset = i+1, offset+GuestFrameSize {
+		committed[i] = 0
+		if frame := b.frames[offset]; frame != nil && frame.active {
+			committed[i] = 1
+		}
+	}
+	return nil
+}
+
 func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, error) {
 	if err := validateFrameRange(fr); err != nil {
 		return nil, err

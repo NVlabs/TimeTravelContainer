@@ -163,6 +163,88 @@ func newRAMTestBacking(t *testing.T, ipaSize uint64) (*GuestRAM, pgalloc.Backing
 	return ram, backing, vm, host, revoker
 }
 
+func TestGuestRAMQueryCommitment(t *testing.T) {
+	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	fr := memmap.FileRange{Start: 0, End: 4 * GuestFrameSize}
+	committed := bytes.Repeat([]byte{0xff}, 4)
+	if err := backing.QueryCommitment(fr, committed); err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0, 0, 0, 0}; !bytes.Equal(committed, want) {
+		t.Fatalf("initial commitment = %v, want %v", committed, want)
+	}
+	for _, offset := range []uint64{0, 2 * GuestFrameSize} {
+		if _, err := backing.ResolveFrames(memmap.FileRange{Start: offset, End: offset + GuestFrameSize}, hostarch.Read); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := backing.QueryCommitment(fr, committed); err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{1, 0, 1, 0}; !bytes.Equal(committed, want) {
+		t.Fatalf("commitment = %v, want %v", committed, want)
+	}
+	if err := backing.Decommit(memmap.FileRange{Start: 0, End: GuestFrameSize}); err != nil {
+		t.Fatal(err)
+	}
+	committed = bytes.Repeat([]byte{0xff}, 4)
+	if err := backing.QueryCommitment(fr, committed); err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0, 0, 1, 0}; !bytes.Equal(committed, want) {
+		t.Fatalf("commitment after decommit = %v, want %v", committed, want)
+	}
+	if err := backing.QueryCommitment(fr, committed[:3]); err == nil {
+		t.Fatal("QueryCommitment accepted a short bitmap")
+	}
+}
+
+func TestGuestRAMMemoryFileUpdateUsage(t *testing.T) {
+	ram, err := NewGuestRAM(GuestRAMConfig{
+		VM: &ramTestVM{}, Host: newRAMTestHost(), IPAStart: 0x100000, IPASize: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+		BackingProvider:         ram,
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	fr, err := mf.Allocate(4*GuestFrameSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateUncommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.DecRef(fr)
+
+	for _, offset := range []uint64{fr.Start, fr.Start + 2*GuestFrameSize} {
+		page := memmap.FileRange{Start: offset, End: offset + GuestFrameSize}
+		if _, err := mf.ResolveBackingFrames(page, hostarch.Read); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// /proc/meminfo calls UpdateUsage before reading global accounting. A
+	// relocatable GuestRAM MemoryFile has no stable chunk mapping for mincore.
+	if err := mf.UpdateUsage(map[uint32]struct{}{0: {}}); err != nil {
+		t.Fatalf("UpdateUsage with sparse GuestRAM commitment: %v", err)
+	}
+	if got, err := mf.TotalUsage(); err != nil || got != 2*GuestFrameSize {
+		t.Fatalf("TotalUsage = (%d, %v), want (%d, nil)", got, err, 2*GuestFrameSize)
+	}
+
+	page := memmap.FileRange{Start: fr.Start + GuestFrameSize, End: fr.Start + 2*GuestFrameSize}
+	if _, err := mf.ResolveBackingFrames(page, hostarch.Read); err != nil {
+		t.Fatal(err)
+	}
+	if err := mf.UpdateUsage(map[uint32]struct{}{0: {}}); err != nil {
+		t.Fatalf("UpdateUsage after additional GuestRAM commitment: %v", err)
+	}
+}
+
 func TestGuestRAMFourFramesShareSlab(t *testing.T) {
 	ram, backing, vm, _, _ := newRAMTestBacking(t, 1<<20)
 	fr := memmap.FileRange{Start: 0, End: HostSlabSize}

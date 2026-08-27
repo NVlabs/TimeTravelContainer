@@ -46,6 +46,11 @@ type Backing interface {
 	Grow(oldSize, newSize uint64, huge bool) ([]uintptr, error)
 	Commit(fr memmap.FileRange) error
 	Decommit(fr memmap.FileRange) error
+	// QueryCommitment stores the commitment state of each logical page in fr
+	// in committed, using one byte per hostarch.PageSize page. The low bit is
+	// set for committed pages and clear for uncommitted pages. Implementations
+	// must overwrite every byte in committed.
+	QueryCommitment(fr memmap.FileRange, committed []byte) error
 	TotalUsage() (uint64, error)
 	Sync() error
 	DropCache(fr memmap.FileRange) error
