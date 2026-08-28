@@ -46,6 +46,7 @@ go_library(
     stateify = False,
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        "//pkg/hostarch",
         "//pkg/hosttid",
         "//pkg/sentry/platform/hvf/ring0asm",
         "//pkg/sentry/platform/vmplatform",

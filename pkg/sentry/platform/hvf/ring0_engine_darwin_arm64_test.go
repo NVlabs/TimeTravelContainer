@@ -154,6 +154,32 @@ func TestFlushHostExecutionCacheReleasesAllocatorMappings(t *testing.T) {
 	runtime.KeepAlive(allocation)
 }
 
+func TestStage1FaultAccess(t *testing.T) {
+	const (
+		instructionAbort = uint64(0x20) << 26
+		dataAbort        = uint64(0x24) << 26
+		write            = uint64(1) << 6
+		cacheMaintenance = uint64(1) << 8
+	)
+	tests := []struct {
+		name     string
+		syndrome uint64
+		want     vmm.Stage2Access
+	}{
+		{name: "instruction", syndrome: instructionAbort, want: vmm.Stage2Execute},
+		{name: "load", syndrome: dataAbort, want: vmm.Stage2Read},
+		{name: "store", syndrome: dataAbort | write, want: vmm.Stage2Write},
+		{name: "cache maintenance", syndrome: dataAbort | write | cacheMaintenance, want: vmm.Stage2Read},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stage1FaultAccess(test.syndrome); got != test.want {
+				t.Fatalf("stage1FaultAccess(%#x) = %#x, want %#x", test.syndrome, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeResumeTrapAddress(t *testing.T) {
 	if got, want := ring0asm.NativeResumeTrapAddress(), ring0asm.NativeResumeAddress()+4; got != want {
 		t.Fatalf("native-resume trap address = %#x, want %#x", got, want)

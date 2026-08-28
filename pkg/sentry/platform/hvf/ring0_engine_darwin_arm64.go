@@ -30,6 +30,7 @@ import (
 	"time"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
@@ -719,14 +720,7 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 	case 1:
 		return vmm.Exit{Reason: vmm.ExitSyscall, Syndrome: syndrome}, nil
 	case 2:
-		ec := syndrome >> 26 & 0x3f
-		access := vmm.Stage2Read
-		if ec == 0x20 || ec == 0x21 {
-			access = vmm.Stage2Execute
-		} else if syndrome&(1<<6) != 0 {
-			access = vmm.Stage2Write
-		}
-		return vmm.Exit{Reason: vmm.ExitFault, Syndrome: syndrome, Address: address, Access: access}, nil
+		return vmm.Exit{Reason: vmm.ExitFault, Syndrome: syndrome, Address: address, Access: stage1FaultAccess(syndrome)}, nil
 	case 3:
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	case 4:
@@ -740,6 +734,26 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		}
 		return vmm.Exit{}, errors.New("EL1 monitor returned no ring0 application exit state")
 	}
+}
+
+// stage1FaultAccess decodes the access represented by an ARM64 stage-1 abort.
+// Cache-maintenance instructions set both ESR_ELx.WnR and ESR_ELx.CM even
+// though their translation fault must be resolved as a read. Treating WnR in
+// isolation causes legitimate JIT cache invalidation on an RX page to be
+// rejected as a write protection fault.
+func stage1FaultAccess(syndrome uint64) vmm.Stage2Access {
+	accessType := hostarch.ESRAccessType(syndrome)
+	var access vmm.Stage2Access
+	if accessType.Read {
+		access |= vmm.Stage2Read
+	}
+	if accessType.Write {
+		access |= vmm.Stage2Write
+	}
+	if accessType.Execute {
+		access |= vmm.Stage2Execute
+	}
+	return access
 }
 
 func (e *ring0Engine) applicationMode(addressSpaceID uint64) *ring0ApplicationMode {
