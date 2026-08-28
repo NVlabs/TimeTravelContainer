@@ -87,6 +87,38 @@ type Command struct {
 	Operations     []Operation
 }
 
+// CommandView is a validated, allocation-free view of an encoded Command.
+// VM execution engines use it while a language-runtime continuation is
+// resident in a guest privilege level, where allocating an Operations slice
+// could itself require a host service. The encoded bytes must remain immutable
+// for the lifetime of the view.
+type CommandView struct {
+	encoded        []byte
+	Sequence       uint64
+	Opcode         Opcode
+	AddressSpaceID uint64
+	Flags          uint64
+	PoolGPA        uint64
+	PoolLength     uint64
+	OperationCount int
+}
+
+// Operation returns the operation at index. The view was fully validated when
+// constructed, so callers may iterate [0, OperationCount) without errors.
+func (v CommandView) Operation(index int) Operation {
+	if index < 0 || index >= v.OperationCount {
+		panic("monitor command operation index out of range")
+	}
+	off := HeaderSize + index*OperationSize
+	return Operation{
+		Type:   OperationType(v.encoded[off]),
+		Access: Access(v.encoded[off+1]),
+		VA:     binary.LittleEndian.Uint64(v.encoded[off+8 : off+16]),
+		GPA:    binary.LittleEndian.Uint64(v.encoded[off+16 : off+24]),
+		Length: binary.LittleEndian.Uint64(v.encoded[off+24 : off+32]),
+	}
+}
+
 // Operation describes a page-aligned virtual range. GPA is required only for
 // OperationMap. Replacements and permission reductions are performed by the
 // monitor using architected break-before-make and synchronous TLB invalidation.
@@ -145,85 +177,84 @@ func MarshalCommand(c Command) ([]byte, error) {
 	return b, nil
 }
 
-// UnmarshalCommand decodes and validates a command.
-func UnmarshalCommand(b []byte) (Command, error) {
+// UnmarshalCommandView validates b without allocating an Operations slice.
+func UnmarshalCommandView(b []byte) (CommandView, error) {
 	if len(b) < HeaderSize {
-		return Command{}, fmt.Errorf("monitor command is %d bytes, want at least %d", len(b), HeaderSize)
+		return CommandView{}, fmt.Errorf("monitor command is %d bytes, want at least %d", len(b), HeaderSize)
 	}
 	if magic := binary.LittleEndian.Uint64(b[0:8]); magic != Magic {
-		return Command{}, fmt.Errorf("invalid monitor magic %#x", magic)
+		return CommandView{}, fmt.Errorf("invalid monitor magic %#x", magic)
 	}
 	if version := binary.LittleEndian.Uint16(b[8:10]); version != Version {
-		return Command{}, fmt.Errorf("unsupported monitor ABI version %d", version)
+		return CommandView{}, fmt.Errorf("unsupported monitor ABI version %d", version)
 	}
 	if !allZero(b[56:HeaderSize]) {
-		return Command{}, fmt.Errorf("monitor command has nonzero reserved header bytes")
+		return CommandView{}, fmt.Errorf("monitor command has nonzero reserved header bytes")
 	}
 	count := int(binary.LittleEndian.Uint32(b[12:16]))
 	if count > MaxOperations {
-		return Command{}, fmt.Errorf("monitor operation count %d exceeds maximum %d", count, MaxOperations)
+		return CommandView{}, fmt.Errorf("monitor operation count %d exceeds maximum %d", count, MaxOperations)
 	}
 	want := HeaderSize + count*OperationSize
 	if len(b) != want {
-		return Command{}, fmt.Errorf("monitor command is %d bytes, header requires %d", len(b), want)
+		return CommandView{}, fmt.Errorf("monitor command is %d bytes, header requires %d", len(b), want)
 	}
-	c := Command{
+	v := CommandView{
+		encoded:        b,
 		Opcode:         Opcode(binary.LittleEndian.Uint16(b[10:12])),
 		Sequence:       binary.LittleEndian.Uint64(b[16:24]),
 		AddressSpaceID: binary.LittleEndian.Uint64(b[24:32]),
 		Flags:          binary.LittleEndian.Uint64(b[32:40]),
 		PoolGPA:        binary.LittleEndian.Uint64(b[40:48]),
 		PoolLength:     binary.LittleEndian.Uint64(b[48:56]),
-		Operations:     make([]Operation, count),
+		OperationCount: count,
 	}
-	for i := range c.Operations {
+	if err := validateCommandHeader(v.Sequence, v.Opcode, v.AddressSpaceID, v.Flags, v.PoolGPA, v.PoolLength, v.OperationCount); err != nil {
+		return CommandView{}, err
+	}
+	totalPages := uint64(0)
+	for i := 0; i < v.OperationCount; i++ {
 		off := HeaderSize + i*OperationSize
 		if !allZero(b[off+2:off+8]) || !allZero(b[off+32:off+OperationSize]) {
-			return Command{}, fmt.Errorf("monitor operation %d has nonzero reserved bytes", i)
+			return CommandView{}, fmt.Errorf("monitor operation %d has nonzero reserved bytes", i)
 		}
-		c.Operations[i] = Operation{
-			Type:   OperationType(b[off]),
-			Access: Access(b[off+1]),
-			VA:     binary.LittleEndian.Uint64(b[off+8 : off+16]),
-			GPA:    binary.LittleEndian.Uint64(b[off+16 : off+24]),
-			Length: binary.LittleEndian.Uint64(b[off+24 : off+32]),
+		op := v.Operation(i)
+		if err := op.Validate(); err != nil {
+			return CommandView{}, fmt.Errorf("monitor operation %d: %w", i, err)
+		}
+		totalPages += op.Length / LogicalPageSize
+		if totalPages > MaxOperations {
+			return CommandView{}, fmt.Errorf("monitor command mutates %d pages, maximum is %d", totalPages, MaxOperations)
 		}
 	}
-	if err := c.Validate(); err != nil {
+	return v, nil
+}
+
+// UnmarshalCommand decodes and validates a command.
+func UnmarshalCommand(b []byte) (Command, error) {
+	v, err := UnmarshalCommandView(b)
+	if err != nil {
 		return Command{}, err
+	}
+	c := Command{
+		Opcode:         v.Opcode,
+		Sequence:       v.Sequence,
+		AddressSpaceID: v.AddressSpaceID,
+		Flags:          v.Flags,
+		PoolGPA:        v.PoolGPA,
+		PoolLength:     v.PoolLength,
+		Operations:     make([]Operation, v.OperationCount),
+	}
+	for i := range c.Operations {
+		c.Operations[i] = v.Operation(i)
 	}
 	return c, nil
 }
 
 // Validate rejects malformed input before either side mutates page tables.
 func (c Command) Validate() error {
-	if c.Sequence == 0 {
-		return fmt.Errorf("monitor sequence is zero")
-	}
-	if len(c.Operations) > MaxOperations {
-		return fmt.Errorf("monitor operation count %d exceeds maximum %d", len(c.Operations), MaxOperations)
-	}
-	switch c.Opcode {
-	case OpcodeCreateAddressSpace:
-		if c.AddressSpaceID == 0 || c.Flags & ^addressSpaceFlagsMask != 0 || c.PoolGPA != 0 || c.PoolLength != 0 || len(c.Operations) != 0 {
-			return fmt.Errorf("invalid create-address-space command")
-		}
-	case OpcodeDestroyAddressSpace, OpcodeActivate:
-		if c.AddressSpaceID == 0 || c.Flags != 0 || c.PoolGPA != 0 || c.PoolLength != 0 || len(c.Operations) != 0 {
-			return fmt.Errorf("invalid address-space command")
-		}
-	case OpcodeApply:
-		if c.AddressSpaceID == 0 || c.Flags != 0 || c.PoolGPA != 0 || c.PoolLength != 0 || len(c.Operations) == 0 {
-			return fmt.Errorf("invalid apply command")
-		}
-	case OpcodeExpandPageTablePool:
-		if c.AddressSpaceID != 0 || c.Flags != 0 || len(c.Operations) != 0 ||
-			c.PoolGPA%LogicalPageSize != 0 || c.PoolLength == 0 || c.PoolLength%LogicalPageSize != 0 ||
-			c.PoolGPA > ^uint64(0)-c.PoolLength {
-			return fmt.Errorf("invalid page-table-pool expansion command")
-		}
-	default:
-		return fmt.Errorf("unsupported monitor opcode %d", c.Opcode)
+	if err := validateCommandHeader(c.Sequence, c.Opcode, c.AddressSpaceID, c.Flags, c.PoolGPA, c.PoolLength, len(c.Operations)); err != nil {
+		return err
 	}
 	totalPages := uint64(0)
 	for i, op := range c.Operations {
@@ -234,6 +265,38 @@ func (c Command) Validate() error {
 		if totalPages > MaxOperations {
 			return fmt.Errorf("monitor command mutates %d pages, maximum is %d", totalPages, MaxOperations)
 		}
+	}
+	return nil
+}
+
+func validateCommandHeader(sequence uint64, opcode Opcode, addressSpaceID, flags, poolGPA, poolLength uint64, operationCount int) error {
+	if sequence == 0 {
+		return fmt.Errorf("monitor sequence is zero")
+	}
+	if operationCount > MaxOperations {
+		return fmt.Errorf("monitor operation count %d exceeds maximum %d", operationCount, MaxOperations)
+	}
+	switch opcode {
+	case OpcodeCreateAddressSpace:
+		if addressSpaceID == 0 || flags & ^addressSpaceFlagsMask != 0 || poolGPA != 0 || poolLength != 0 || operationCount != 0 {
+			return fmt.Errorf("invalid create-address-space command")
+		}
+	case OpcodeDestroyAddressSpace, OpcodeActivate:
+		if addressSpaceID == 0 || flags != 0 || poolGPA != 0 || poolLength != 0 || operationCount != 0 {
+			return fmt.Errorf("invalid address-space command")
+		}
+	case OpcodeApply:
+		if addressSpaceID == 0 || flags != 0 || poolGPA != 0 || poolLength != 0 || operationCount == 0 {
+			return fmt.Errorf("invalid apply command")
+		}
+	case OpcodeExpandPageTablePool:
+		if addressSpaceID != 0 || flags != 0 || operationCount != 0 ||
+			poolGPA%LogicalPageSize != 0 || poolLength == 0 || poolLength%LogicalPageSize != 0 ||
+			poolGPA > ^uint64(0)-poolLength {
+			return fmt.Errorf("invalid page-table-pool expansion command")
+		}
+	default:
+		return fmt.Errorf("unsupported monitor opcode %d", opcode)
 	}
 	return nil
 }

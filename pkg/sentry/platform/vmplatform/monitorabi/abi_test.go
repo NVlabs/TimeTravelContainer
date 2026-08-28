@@ -45,6 +45,42 @@ func TestCommandRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCommandViewIsAllocationFree(t *testing.T) {
+	want := Command{
+		Sequence:       11,
+		Opcode:         OpcodeApply,
+		AddressSpaceID: 5,
+		Operations: []Operation{
+			{Type: OperationMap, Access: AccessRead | AccessExecute, VA: 0x8000, GPA: 0x18000, Length: 0x2000},
+			{Type: OperationProtect, Access: AccessRead, VA: 0x8000, Length: 0x1000},
+		},
+	}
+	encoded, err := MarshalCommand(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := UnmarshalCommandView(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sequence != want.Sequence || view.Opcode != want.Opcode ||
+		view.AddressSpaceID != want.AddressSpaceID || view.OperationCount != len(want.Operations) {
+		t.Fatalf("command view got %+v, want %+v", view, want)
+	}
+	for i, operation := range want.Operations {
+		if got := view.Operation(i); got != operation {
+			t.Errorf("view operation %d got %+v, want %+v", i, got, operation)
+		}
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if _, err := UnmarshalCommandView(encoded); err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("UnmarshalCommandView allocated %g objects per call, want 0", allocations)
+	}
+}
+
 func TestPoolExpansionRoundTrip(t *testing.T) {
 	want := Command{
 		Sequence:   9,

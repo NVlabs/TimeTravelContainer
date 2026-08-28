@@ -37,6 +37,10 @@
 #define TTC_RING0_HVC_REDPILL 0x73
 #define TTC_RING0_HVC_HOST_GATE 0x74
 #define TTC_RING0_HVC_INTERRUPT_ACK 0x75
+// Cache maintenance for bytes written through a Darwin HVA. The bridge
+// services this HVC in-place and resumes the same EL1 continuation without a
+// redpill or full register transfer.
+#define TTC_RING0_HVC_CACHE_SYNC 0x76
 
 #define TTC_ADDRESS_SPACE_SENTRY UINT64_C(1)
 #define TTC_ADDRESS_SPACE_FLAGS_MASK TTC_ADDRESS_SPACE_SENTRY
@@ -111,6 +115,10 @@
 #define TTC_STATE_TIMEBASE_NUMER_OFFSET 0x3378
 #define TTC_STATE_TIMEBASE_DENOM_OFFSET 0x3380
 #define TTC_STATE_REALTIME_OFFSET_NS_OFFSET 0x3388
+// Nonzero while a resident Sentry continuation is executing monitor code that
+// has no valid Darwin EL0 representation. The native cancellation bridge must
+// resume the vCPU until this critical section has returned to ordinary Go.
+#define TTC_STATE_GUEST_CRITICAL_OFFSET 0x3390
 #define TTC_STATE_FP_Q0_OFFSET 0x0008
 
 #define TTC_STATE_STACK_TOP 0x4000

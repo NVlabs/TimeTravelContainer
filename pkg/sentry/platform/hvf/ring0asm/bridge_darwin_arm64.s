@@ -51,6 +51,31 @@ TEXT ·SwitchApplicationGuest(SB),NOSPLIT|NOFRAME,$0
 	MOVD R20, R30
 	RET
 
+// RunMonitorGuest switches off the movable Go stack before entering the
+// freestanding C monitor. AAPCS64 preserves R19/R20 across the indirect call,
+// so they retain the original Go SP and return PC.
+TEXT ·RunMonitorGuest(SB),NOSPLIT|NOFRAME,$0-16
+	MOVD monitorEntry+0(FP), R1
+	MOVD stateVA+8(FP), R0
+	MOVD RSP, R19
+	MOVD R30, R20
+	ADD $0x4000, R0, R2
+	MOVD R2, RSP
+	CALL (R1)
+	MOVD R19, RSP
+	MOVD R20, R30
+	RET
+
+TEXT ·SyncGuestCode(SB),NOSPLIT|NOFRAME,$0-16
+	MOVD address+0(FP), R0
+	MOVD length+8(FP), R1
+	HVC $0x76
+	RET
+
+TEXT ·Yield(SB),NOSPLIT|NOFRAME,$0
+	YIELD
+	RET
+
 TEXT ·SwitchApplicationGuestAddress(SB),NOSPLIT,$0-8
 	MOVD $·SwitchApplicationGuest(SB), R0
 	MOVD R0, ret+0(FP)

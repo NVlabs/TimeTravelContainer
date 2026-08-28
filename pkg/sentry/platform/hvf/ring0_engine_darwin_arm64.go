@@ -53,6 +53,7 @@ const (
 	stateTimebaseNumer          = 0x3378
 	stateTimebaseDenom          = 0x3380
 	stateRealtimeOffsetNS       = 0x3388
+	stateGuestCritical          = 0x3390
 	applicationResidencyQuantum = time.Millisecond
 )
 
@@ -275,6 +276,12 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 }
 
 func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, error) {
+	mutatesTranslations := monitorCommandMutatesTranslations(encoded)
+	if mutatesTranslations {
+		if response, ran, err := e.tryRunResidentMonitor(ctx, encoded); ran {
+			return response, err
+		}
+	}
 	// Monitor work normally runs on a dedicated host worker. A retained,
 	// owner-affine application vCPU may execute it directly to avoid another
 	// host-thread handoff. A Sentry continuation may call this while handling a
@@ -286,7 +293,7 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 	// cross-vCPU TLB rendezvous on every supported macOS 15 machine. Kick every
 	// active reader before publishing a translation mutation. Application vCPUs
 	// additionally perform one local generation flush after the transaction.
-	if !monitorCommandMutatesTranslations(encoded) {
+	if !mutatesTranslations {
 		return e.runMonitorCommand(ctx, encoded)
 	}
 	if err := e.lockApplicationEntries(ctx); err != nil {
@@ -294,6 +301,157 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 	}
 	defer e.unlockApplicationEntries()
 	return e.runMonitorCommand(ctx, encoded)
+}
+
+// tryRunResidentMonitor executes an uncontended page-table transaction on the
+// current Sentry-at-EL1 vCPU. Independent address spaces need neither a
+// redpill nor a second hv_vcpu_run: entryBlocked prevents a new application
+// reader from entering, and the owner table proves that no other existing vCPU
+// is currently executing the root being changed. CPUs retaining dormant TLB
+// entries observe mmuGeneration and flush locally before their next entry.
+//
+// Executable mutations issue a lightweight native cache-maintenance HVC before
+// entering the monitor. Any lock contention is delegated to the host path so a
+// resident continuation never parks while holding a guest-only critical
+// section.
+func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte) ([]byte, bool, error) {
+	if len(encoded) == 0 || len(encoded) > monitorCommandMax || ring0asm.CurrentEL() == 0 {
+		return nil, false, nil
+	}
+	command, err := monitorabi.UnmarshalCommandView(encoded)
+	if err != nil || (command.Opcode != monitorabi.OpcodeApply &&
+		command.Opcode != monitorabi.OpcodeDestroyAddressSpace) {
+		return nil, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	lockedEntries := false
+	// Monitor transactions are short and globally serialized. A bounded
+	// processor-yield loop lets independent guest-resident writers hand the
+	// lock directly to one another without redpilling merely because their
+	// calls overlapped by a few microseconds. Longer contention still falls back
+	// to the host path, where waiting and cancellation may use the Go scheduler.
+	for spin := 0; spin < 4096; spin++ {
+		if e.entryMutationMu.TryLock() {
+			lockedEntries = true
+			break
+		}
+		ring0asm.Yield()
+	}
+	if !lockedEntries {
+		return nil, false, nil
+	}
+	e.entryBlocked.Store(true)
+	defer func() {
+		e.entryBlocked.Store(false)
+		e.entryMutationMu.Unlock()
+	}()
+	if !e.monitorMu.TryLock() {
+		return nil, false, nil
+	}
+	defer e.monitorMu.Unlock()
+
+	value, ok := e.cpusByTID.Load(hosttid.Current())
+	if !ok {
+		return nil, false, nil
+	}
+	cpu := value.(*ring0ApplicationCPU)
+	if !cpu.tryPin() {
+		return nil, false, nil
+	}
+	defer e.releaseApplicationCPU(cpu)
+	if e.closed.Load() || cpu.retiring.Load() || cpu.entryActive.Load() ||
+		!cpu.bridge.inGuest() || cpu.bridge.destroyed() {
+		return nil, false, nil
+	}
+	if conflicting, inspected := e.residentMonitorConflicts(command.AddressSpaceID, cpu); !inspected || conflicting {
+		return nil, false, nil
+	}
+	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
+	binary.LittleEndian.PutUint32(state[stateCommandLength:], uint32(len(encoded)))
+	copy(state[stateCommand:stateCommand+len(encoded)], encoded)
+	clear(state[stateResponse : stateResponse+32])
+
+	needsCacheSync := e.residentCommandNeedsCacheSync(command)
+	vmLocked := false
+	if needsCacheSync {
+		if !e.vm.mu.TryLock() {
+			return nil, false, nil
+		}
+		vmLocked = true
+	}
+	if vmLocked && e.vm.closed {
+		e.vm.mu.Unlock()
+		return nil, true, fmt.Errorf("HVF VM is closed")
+	}
+	if err := e.validateResidentExecutableMappings(command); err != nil {
+		if vmLocked {
+			e.vm.mu.Unlock()
+		}
+		return nil, true, err
+	}
+	critical := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateGuestCritical))
+	atomic.StoreUint64(critical, 1)
+	// A cancellation may have safely exported this Go continuation while it
+	// acquired the ordinary locks above. Once critical is published, a second
+	// CurrentEL check closes that race: later cancellations resume the vCPU
+	// until the guest-only cache and monitor calls have returned.
+	if ring0asm.CurrentEL() == 0 {
+		atomic.StoreUint64(critical, 0)
+		if vmLocked {
+			e.vm.mu.Unlock()
+		}
+		return nil, false, nil
+	}
+
+	if needsCacheSync {
+		e.syncResidentExecutableMappings(command)
+	}
+	ring0asm.RunMonitorGuest(
+		monitorCodeVA+cpu.vcpu.monitor.commandCallOffset,
+		cpu.vcpu.stateVA,
+	)
+	if vmLocked {
+		e.vm.mu.Unlock()
+	}
+	atomic.StoreUint64(critical, 0)
+	// A cancellation that arrived inside the critical section remains
+	// published. Complete its requested host transfer now that every PC and
+	// stack address again has a valid Darwin representation.
+	if cpu.bridge.externalInterruptRequested() || cpu.bridge.destroyRequested() {
+		ring0asm.EnsureHost()
+	}
+	if err := cpu.bridge.error("HVF resident EL1 monitor command failed"); err != nil {
+		return nil, true, err
+	}
+	response := make([]byte, 32)
+	copy(response, state[stateResponse:stateResponse+32])
+	e.recordMonitorCommandView(command, response, true)
+	return response, true, nil
+}
+
+// residentMonitorConflicts reports whether another application vCPU is
+// actively executing the address space that a direct monitor command will
+// mutate. The caller has already published entryBlocked, so an inactive vCPU
+// cannot become a new reader until after mmuGeneration is advanced. TryLock is
+// deliberate: direct EL1 execution must fall back instead of parking on a Go
+// mutex while its continuation is guest-resident.
+func (e *ring0Engine) residentMonitorConflicts(addressSpaceID uint64, current *ring0ApplicationCPU) (conflicting, inspected bool) {
+	if !e.cpuMu.TryLock() {
+		return false, false
+	}
+	defer e.cpuMu.Unlock()
+	for _, cpu := range e.cpusByID {
+		if cpu == nil || cpu == current || !cpu.entryActive.Load() {
+			continue
+		}
+		stateAddressSpace := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateAddressSpaceID))
+		if atomic.LoadUint64(stateAddressSpace) == addressSpaceID {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // lockApplicationEntries serializes translation writers and prevents a
@@ -375,22 +533,40 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 			return nil, fmt.Errorf("HVF ring0 monitor returned %T, want []byte", value)
 		}
 	}
-	if commandErr == nil {
+	e.recordMonitorCommand(command, response, commandErr == nil, monitorCommandMutatesTranslations(encoded))
+	return response, nil
+}
+
+func (e *ring0Engine) recordMonitorCommand(command monitorabi.Command, response []byte, validCommand, mutatesTranslations bool) {
+	if validCommand {
 		if decoded, err := monitorabi.UnmarshalResponse(response); err == nil && decoded.Status == monitorabi.StatusOK {
 			e.updateApplicationGPARecords(command)
 		}
 	}
-	if monitorCommandMutatesTranslations(encoded) {
+	if mutatesTranslations {
 		e.mmuGeneration.Add(1)
 	}
-	return response, nil
 }
 
-// synchronizeExecutableMappings completes the Darwin writer-side cache
-// protocol before the monitor publishes an executable stage-1 leaf. Map
-// operations carry their GPA directly; protect operations resolve it from
-// acknowledged host records plus earlier operations in the same ordered batch.
-func (e *ring0Engine) synchronizeExecutableMappings(command monitorabi.Command) error {
+func (e *ring0Engine) recordMonitorCommandView(command monitorabi.CommandView, response []byte, mutatesTranslations bool) {
+	if decoded, err := monitorabi.UnmarshalResponse(response); err == nil && decoded.Status == monitorabi.StatusOK {
+		e.updateApplicationGPARecordsView(command)
+	}
+	if mutatesTranslations {
+		e.mmuGeneration.Add(1)
+	}
+}
+
+type ring0ExecutableGuestRange struct {
+	va     uint64
+	gpa    uint64
+	length uint64
+}
+
+// executableGuestRanges resolves every range that will newly gain execute
+// access. Protect operations use acknowledged mappings plus earlier operations
+// in the same ordered batch.
+func (e *ring0Engine) executableGuestRanges(command monitorabi.Command) []ring0ExecutableGuestRange {
 	if command.Opcode != monitorabi.OpcodeApply || command.Flags&monitorabi.AddressSpaceFlagSentry != 0 {
 		return nil
 	}
@@ -407,13 +583,14 @@ func (e *ring0Engine) synchronizeExecutableMappings(command monitorabi.Command) 
 		gpa, ok := space[va]
 		return gpa, ok
 	}
+	var executable []ring0ExecutableGuestRange
 	for _, operation := range command.Operations {
 		switch operation.Type {
 		case monitorabi.OperationMap:
 			if operation.Access&monitorabi.AccessExecute != 0 && operation.GPA >= GuestRAMIPAStart {
-				if err := e.vm.invalidateGuestCode(operation.GPA, operation.Length); err != nil {
-					return fmt.Errorf("synchronizing executable guest mapping at VA %#x: %w", operation.VA, err)
-				}
+				executable = append(executable, ring0ExecutableGuestRange{
+					va: operation.VA, gpa: operation.GPA, length: operation.Length,
+				})
 			}
 			for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
 				pending[operation.VA+offset] = pendingGPA{gpa: operation.GPA + offset, mapped: true}
@@ -431,13 +608,153 @@ func (e *ring0Engine) synchronizeExecutableMappings(command monitorabi.Command) 
 				if !ok || gpa < GuestRAMIPAStart {
 					continue
 				}
-				if err := e.vm.invalidateGuestCode(gpa, vmm.LogicalPageSize); err != nil {
-					return fmt.Errorf("synchronizing executable guest protection at VA %#x: %w", operation.VA+offset, err)
+				executable = append(executable, ring0ExecutableGuestRange{
+					va: operation.VA + offset, gpa: gpa, length: vmm.LogicalPageSize,
+				})
+			}
+		}
+	}
+	return executable
+}
+
+// synchronizeExecutableMappings completes the Darwin writer-side cache
+// protocol before the host-run monitor publishes an executable stage-1 leaf.
+func (e *ring0Engine) synchronizeExecutableMappings(command monitorabi.Command) error {
+	for _, executable := range e.executableGuestRanges(command) {
+		if err := e.vm.invalidateGuestCode(executable.gpa, executable.length); err != nil {
+			return fmt.Errorf("synchronizing executable guest mapping at VA %#x: %w", executable.va, err)
+		}
+	}
+	return nil
+}
+
+// residentCommandNeedsCacheSync reports whether a direct command may grant
+// execute access to GuestRAM. It intentionally does no allocation: heap growth
+// while this continuation is resident could require a Darwin service and turn
+// a direct command back into the host path.
+func (e *ring0Engine) residentCommandNeedsCacheSync(command monitorabi.CommandView) bool {
+	if command.Opcode != monitorabi.OpcodeApply || command.Flags&monitorabi.AddressSpaceFlagSentry != 0 {
+		return false
+	}
+	for index := 0; index < command.OperationCount; index++ {
+		operation := command.Operation(index)
+		if operation.Access&monitorabi.AccessExecute == 0 {
+			continue
+		}
+		if operation.Type == monitorabi.OperationProtect ||
+			(operation.Type == monitorabi.OperationMap && operation.GPA >= GuestRAMIPAStart) {
+			return true
+		}
+	}
+	return false
+}
+
+// residentExecutableGPA resolves va using operations preceding before in the
+// current ordered batch, then the last acknowledged host mapping record.
+func (e *ring0Engine) residentExecutableGPA(command monitorabi.CommandView, before int, va uint64) (uint64, bool) {
+	for index := before - 1; index >= 0; index-- {
+		operation := command.Operation(index)
+		if va < operation.VA || va-operation.VA >= operation.Length {
+			continue
+		}
+		switch operation.Type {
+		case monitorabi.OperationMap:
+			return operation.GPA + va - operation.VA, true
+		case monitorabi.OperationUnmap:
+			return 0, false
+		}
+	}
+	gpa, ok := e.applicationGPAs[command.AddressSpaceID][va]
+	return gpa, ok
+}
+
+// visitResidentExecutableMappings walks executable GuestRAM ranges without
+// allocating. Returning false stops the walk.
+func (e *ring0Engine) visitResidentExecutableMappings(command monitorabi.CommandView, visit func(gpa, length uint64) bool) {
+	if command.Opcode != monitorabi.OpcodeApply || command.Flags&monitorabi.AddressSpaceFlagSentry != 0 {
+		return
+	}
+	for index := 0; index < command.OperationCount; index++ {
+		operation := command.Operation(index)
+		if operation.Access&monitorabi.AccessExecute == 0 {
+			continue
+		}
+		switch operation.Type {
+		case monitorabi.OperationMap:
+			if operation.GPA >= GuestRAMIPAStart && !visit(operation.GPA, operation.Length) {
+				return
+			}
+		case monitorabi.OperationProtect:
+			for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+				gpa, ok := e.residentExecutableGPA(command, index, operation.VA+offset)
+				if ok && gpa >= GuestRAMIPAStart && !visit(gpa, vmm.LogicalPageSize) {
+					return
 				}
 			}
 		}
 	}
+}
+
+// validateResidentExecutableMappings verifies every stage-2 lookup before the
+// guest-critical section. The caller holds e.vm.mu, so the subsequent HVC walk
+// observes the same stable host mappings and cannot need an error path.
+func (e *ring0Engine) validateResidentExecutableMappings(command monitorabi.CommandView) error {
+	var missing uint64
+	e.visitResidentExecutableMappings(command, func(gpa, length uint64) bool {
+		for current, end := gpa, gpa+length; current < end; current = (current &^ (vmm.HostSlabSize - 1)) + vmm.HostSlabSize {
+			if _, ok := e.vm.stage2[current&^(vmm.HostSlabSize-1)]; !ok {
+				missing = current
+				return false
+			}
+		}
+		return true
+	})
+	if missing != 0 {
+		return fmt.Errorf("executable guest GPA %#x has no tracked stage-2 slab", missing)
+	}
 	return nil
+}
+
+type ring0ExecutableCacheBatch struct {
+	address uintptr
+	length  uint64
+}
+
+func (b *ring0ExecutableCacheBatch) flush() {
+	if b.length != 0 {
+		ring0asm.SyncGuestCode(b.address, b.length)
+		b.address = 0
+		b.length = 0
+	}
+}
+
+// syncResidentExecutableMappings performs the writer-side Darwin cache
+// protocol through the native bridge. The caller holds e.vm.mu and has already
+// validated every lookup, published guest-critical state, and rechecked EL1.
+func (e *ring0Engine) syncResidentExecutableMappings(command monitorabi.CommandView) {
+	var batch ring0ExecutableCacheBatch
+	e.visitResidentExecutableMappings(command, func(gpa, length uint64) bool {
+		for current, end := gpa, gpa+length; current < end; {
+			slabGPA := current &^ (vmm.HostSlabSize - 1)
+			slab := e.vm.stage2[slabGPA]
+			offset := current - slabGPA
+			chunk := vmm.HostSlabSize - offset
+			if remaining := end - current; chunk > remaining {
+				chunk = remaining
+			}
+			hostAddress := slab.host + uintptr(offset)
+			if batch.length != 0 && batch.address+uintptr(batch.length) != hostAddress {
+				batch.flush()
+			}
+			if batch.length == 0 {
+				batch.address = hostAddress
+			}
+			batch.length += chunk
+			current += chunk
+		}
+		return true
+	})
+	batch.flush()
 }
 
 func (e *ring0Engine) updateApplicationGPARecords(command monitorabi.Command) {
@@ -454,6 +771,31 @@ func (e *ring0Engine) updateApplicationGPARecords(command monitorabi.Command) {
 			return
 		}
 		for _, operation := range command.Operations {
+			switch operation.Type {
+			case monitorabi.OperationMap:
+				for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+					space[operation.VA+offset] = operation.GPA + offset
+				}
+			case monitorabi.OperationUnmap:
+				for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+					delete(space, operation.VA+offset)
+				}
+			}
+		}
+	}
+}
+
+func (e *ring0Engine) updateApplicationGPARecordsView(command monitorabi.CommandView) {
+	switch command.Opcode {
+	case monitorabi.OpcodeDestroyAddressSpace:
+		delete(e.applicationGPAs, command.AddressSpaceID)
+	case monitorabi.OpcodeApply:
+		space := e.applicationGPAs[command.AddressSpaceID]
+		if space == nil {
+			return
+		}
+		for index := 0; index < command.OperationCount; index++ {
+			operation := command.Operation(index)
 			switch operation.Type {
 			case monitorabi.OperationMap:
 				for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
@@ -1883,8 +2225,12 @@ func (e *ring0Engine) retireHostMirrorRange(ctx context.Context, address uintptr
 	end := address + uintptr(length)
 	var addresses []uintptr
 	pages := make(map[uint64]struct{})
-	for slabAddress := range e.stage2Slabs {
-		if slabAddress < address || slabAddress >= end {
+	// stage2Slabs is keyed by HVA slab base. Retirement ranges are aligned, so
+	// walk only the requested range instead of scanning the entire Sentry
+	// mirror. GuestRAM commonly retires one 16 KiB slab at a time; an O(total
+	// mirrored heap) scan here otherwise dominates process-exit churn.
+	for slabAddress := address; slabAddress < end; slabAddress += uintptr(vmm.HostSlabSize) {
+		if _, mapped := e.stage2Slabs[slabAddress]; !mapped {
 			continue
 		}
 		addresses = append(addresses, slabAddress)

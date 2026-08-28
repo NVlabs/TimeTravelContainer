@@ -74,6 +74,29 @@ func TestApplicationWaiterQueuePreservesFIFO(t *testing.T) {
 	}
 }
 
+func TestResidentMonitorConflictsOnlyWithActiveSameAddressSpace(t *testing.T) {
+	states := make([]byte, 2*vmm.HostSlabSize)
+	current := &ring0ApplicationCPU{vcpu: &hvfVCPU{stateHost: uintptr(unsafe.Pointer(&states[0]))}}
+	other := &ring0ApplicationCPU{vcpu: &hvfVCPU{stateHost: uintptr(unsafe.Pointer(&states[vmm.HostSlabSize]))}}
+	engine := &ring0Engine{}
+	engine.cpusByID[0] = current
+	engine.cpusByID[1] = other
+	atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(other.vcpu.stateHost), stateAddressSpaceID)), 17)
+	other.entryActive.Store(true)
+
+	if conflict, inspected := engine.residentMonitorConflicts(17, current); !inspected || !conflict {
+		t.Fatalf("active address-space conflict = (%t, %t), want (true, true)", conflict, inspected)
+	}
+	if conflict, inspected := engine.residentMonitorConflicts(18, current); !inspected || conflict {
+		t.Fatalf("independent address-space conflict = (%t, %t), want (false, true)", conflict, inspected)
+	}
+	other.entryActive.Store(false)
+	if conflict, inspected := engine.residentMonitorConflicts(17, current); !inspected || conflict {
+		t.Fatalf("inactive address-space conflict = (%t, %t), want (false, true)", conflict, inspected)
+	}
+	runtime.KeepAlive(states)
+}
+
 func TestRequestHostMirrorIgnoresAddressesOutsideSentryVA(t *testing.T) {
 	engine := &ring0Engine{pendingMirror: make(map[uintptr]struct{})}
 	engine.requestHostMirror(0)
@@ -990,6 +1013,17 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
 		}},
 	})
+	residentMonitorCommand, err := monitorabi.MarshalCommand(monitorabi.Command{
+		Sequence: 2, Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA + vmm.LogicalPageSize, GPA: GuestRAMIPAStart + vmm.LogicalPageSize,
+			Length: vmm.LogicalPageSize,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	registers := &vmm.ARM64State{}
 	for i := 0; i < calls; i++ {
 		registers.PC = codeVA
@@ -1032,6 +1066,37 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		})
 		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
 			t.Fatalf("demand-import re-entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+		}
+		stats = value.(*ring0ApplicationCPU).bridge.stats()
+	}
+	beforeResidentMonitor := stats
+	responseBytes, err := engine.RunMonitor(context.Background(), residentMonitorCommand)
+	stats = value.(*ring0ApplicationCPU).bridge.stats()
+	if err != nil {
+		t.Fatalf("resident monitor command: %v", err)
+	}
+	if stats.cacheSyncs != beforeResidentMonitor.cacheSyncs+1 {
+		t.Fatalf("executable monitor mutation did not use exactly one native cache-sync HVC: before=%+v after=%+v", beforeResidentMonitor, stats)
+	}
+	if stats.redpills != beforeResidentMonitor.redpills {
+		t.Fatalf("resident monitor mutation redpilled the continuation: before=%+v after=%+v", beforeResidentMonitor, stats)
+	}
+	response, err := monitorabi.UnmarshalResponse(responseBytes)
+	if err != nil || response.Sequence != 2 || response.Status != monitorabi.StatusOK {
+		t.Fatalf("resident monitor response=%+v err=%v", response, err)
+	}
+	// Go runtime maintenance after the acknowledged direct transaction may
+	// independently require a Darwin host service. Restore residency before
+	// measuring the explicit service gate below; cacheSyncs above proves the
+	// executable monitor transaction itself used the in-place HVC path.
+	if ring0asm.CurrentEL() == 0 {
+		registers.PC = codeVA
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
+			t.Fatalf("post-monitor residency re-entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
 		}
 		stats = value.(*ring0ApplicationCPU).bridge.stats()
 	}

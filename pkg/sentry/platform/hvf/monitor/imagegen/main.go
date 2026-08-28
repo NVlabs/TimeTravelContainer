@@ -28,6 +28,7 @@ import (
 
 var requiredSymbols = map[string]string{
 	"_ttc_monitor_bootstrap":               "embeddedMonitorBootstrapOffset",
+	"_ttc_monitor_command_call":            "embeddedMonitorCommandCallOffset",
 	"_ttc_monitor_command_entry":           "embeddedMonitorCommandOffset",
 	"_ttc_monitor_ring0_application_entry": "embeddedMonitorRing0ApplicationOffset",
 	"_ttc_monitor_vectors":                 "embeddedMonitorVectorOffset",

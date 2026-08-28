@@ -254,6 +254,7 @@ type monitorMemory struct {
 	vtimerOffset uint64
 
 	bootstrapOffset        uint64
+	commandCallOffset      uint64
 	commandOffset          uint64
 	ring0ApplicationOffset uint64
 	vectorOffset           uint64
@@ -284,11 +285,13 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 		vtimerOffset: uint64(C.ttc_monitor_vtimer_offset()),
 	}
 	m.bootstrapOffset = embeddedMonitorBootstrapOffset
+	m.commandCallOffset = embeddedMonitorCommandCallOffset
 	m.commandOffset = embeddedMonitorCommandOffset
 	m.ring0ApplicationOffset = embeddedMonitorRing0ApplicationOffset
 	m.vectorOffset = embeddedMonitorVectorOffset
 	for name, offset := range map[string]uint64{
 		"bootstrap":         m.bootstrapOffset,
+		"command-call":      m.commandCallOffset,
 		"command":           m.commandOffset,
 		"ring0-application": m.ring0ApplicationOffset,
 		"vectors":           m.vectorOffset,

@@ -28,6 +28,7 @@ package hvf
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach_time.h>
+#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -396,6 +397,7 @@ struct ttc_ring0_bridge {
 	_Atomic uint64_t host_gate_count;
 	_Atomic uint64_t redpill_count;
 	_Atomic uint64_t host_return_count;
+	_Atomic uint64_t cache_sync_count;
 	uint64_t owner_tid;
 	_Atomic uint64_t entry_tid;
 	ucontext_t host_context;
@@ -1211,6 +1213,8 @@ static bool ttc_ring0_pc_in_entry_trampoline(
 	offsetof(struct ttc_ring0_bridge, redpill_count)
 #define TTC_RING0_BRIDGE_HOST_RETURN_COUNT_OFFSET \
 	offsetof(struct ttc_ring0_bridge, host_return_count)
+#define TTC_RING0_BRIDGE_CACHE_SYNC_COUNT_OFFSET \
+	offsetof(struct ttc_ring0_bridge, cache_sync_count)
 
 static uintptr_t ttc_ring0_get_pc(const arm_thread_state64_t *ss) {
 	return __darwin_arm_thread_state64_get_pc(*ss);
@@ -1593,11 +1597,16 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 					&host_ns, (uint32_t)status, TTC_RING0_PHASE_RUN);
 		}
 		if (bridge->exit->reason == HV_EXIT_REASON_CANCELED) {
+			_Atomic uint64_t *guest_critical = (_Atomic uint64_t *)(
+					bridge->state_host + TTC_STATE_GUEST_CRITICAL_OFFSET);
 			if (atomic_load_explicit(&domain->critical,
+					memory_order_acquire) != 0 ||
+					atomic_load_explicit(guest_critical,
 					memory_order_acquire) != 0) {
 				// The stopped PC is inside a guest-only native callback. Any
 				// external interrupt, destroy request, or MMU pause remains
-				// published; resume until the callback reaches a host-safe PC.
+				// published; resume until the callback or direct monitor command
+				// reaches a host-safe PC.
 				continue;
 			}
 			// A Go runtime mapping mutation is a process-wide secondary-MMU
@@ -1736,6 +1745,38 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 						&host_ns, (uint32_t)status,
 						TTC_RING0_PHASE_CANCEL_IRQ);
 			}
+			continue;
+		}
+		if (bridge->exit->reason == HV_EXIT_REASON_EXCEPTION &&
+				((bridge->exit->exception.syndrome >> 26) & 0x3f) == 0x16 &&
+				hvc == TTC_RING0_HVC_CACHE_SYNC) {
+			uint64_t address;
+			uint64_t length;
+			status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_X0, &address);
+			if (status == HV_SUCCESS) {
+				status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_X1, &length);
+			}
+			struct ttc_ring0_region region;
+			if (status != HV_SUCCESS || length == 0 ||
+					address + length < address ||
+					ttc_ring0_region_at(address, &region) != KERN_SUCCESS ||
+					region.address > address ||
+					address - region.address > region.length ||
+					length > region.length - (address - region.address) ||
+					region.external_pager != 0 ||
+					region.user_tag != VM_MEMORY_APPLICATION_SPECIFIC_3 ||
+					(region.protection & VM_PROT_READ) == 0) {
+				ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+						&host_ns, UINT32_MAX,
+						TTC_RING0_PHASE_UNEXPECTED_EXIT);
+			}
+			// This runs at Darwin EL0 on the vCPU owner thread, but resumes the
+			// stopped EL1 PC directly. Unlike a host-service gate it needs no
+			// architectural context copy or signal return.
+			sys_dcache_flush((void *)(uintptr_t)address, (size_t)length);
+			sys_icache_invalidate((void *)(uintptr_t)address, (size_t)length);
+			atomic_fetch_add_explicit(&bridge->cache_sync_count, 1,
+					memory_order_relaxed);
 			continue;
 		}
 		if (bridge->exit->reason != HV_EXIT_REASON_EXCEPTION ||
@@ -2106,6 +2147,7 @@ const (
 	ring0BridgeHostGateCountOffset     = uintptr(C.TTC_RING0_BRIDGE_HOST_GATE_COUNT_OFFSET)
 	ring0BridgeRedpillCountOffset      = uintptr(C.TTC_RING0_BRIDGE_REDPILL_COUNT_OFFSET)
 	ring0BridgeHostReturnCountOffset   = uintptr(C.TTC_RING0_BRIDGE_HOST_RETURN_COUNT_OFFSET)
+	ring0BridgeCacheSyncCountOffset    = uintptr(C.TTC_RING0_BRIDGE_CACHE_SYNC_COUNT_OFFSET)
 )
 
 type ring0HostRegion struct {
@@ -2313,8 +2355,16 @@ func (b *ring0Bridge) requestDestroy() {
 	b.requestExternalInterrupt()
 }
 
+func (b *ring0Bridge) destroyRequested() bool {
+	return atomic.LoadUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeDestroyRequestedOffset))) != 0
+}
+
 func (b *ring0Bridge) requestExternalInterrupt() {
 	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeExternalInterruptOffset)), 1)
+}
+
+func (b *ring0Bridge) externalInterruptRequested() bool {
+	return atomic.LoadUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeExternalInterruptOffset))) != 0
 }
 
 func (b *ring0Bridge) clearExternalInterrupt() {
@@ -2426,6 +2476,7 @@ type ring0BridgeStats struct {
 	hostGates    uint64
 	redpills     uint64
 	hostReturns  uint64
+	cacheSyncs   uint64
 }
 
 func (b *ring0Bridge) stats() ring0BridgeStats {
@@ -2434,6 +2485,7 @@ func (b *ring0Bridge) stats() ring0BridgeStats {
 		hostGates:    atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeHostGateCountOffset))),
 		redpills:     atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeRedpillCountOffset))),
 		hostReturns:  atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeHostReturnCountOffset))),
+		cacheSyncs:   atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeCacheSyncCountOffset))),
 	}
 }
 

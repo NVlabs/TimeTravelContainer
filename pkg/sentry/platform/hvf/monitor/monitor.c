@@ -42,6 +42,7 @@ extern void ttc_monitor_isb(void);
 extern void ttc_monitor_prepare_mmu(void);
 extern void ttc_monitor_tlbi_vae1is(uint64_t);
 extern void ttc_monitor_tlbi_aside1is(uint64_t);
+extern uint64_t ttc_monitor_read_ttbr0(void);
 extern void ttc_monitor_write_ttbr0(uint64_t);
 
 static MONITOR_INLINE uint16_t load16(const uint8_t* p) {
@@ -628,6 +629,10 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
   if (executable_mutations != 0) {
     // Cache maintenance by VA uses the affected stage-1 address space. This
     // vCPU may most recently have run an unrelated application address space.
+    // Preserve its current root: the resident-Sentry command entry returns to
+    // the calling EL1 continuation, whose identity mappings belong to the
+    // Sentry root rather than the application root being updated.
+    uint64_t previous_ttbr0 = ttc_monitor_read_ttbr0();
     ttc_monitor_write_ttbr0(space->root_gpa |
                             ((uint64_t)space->asid << 48));
     for (uint32_t i = 0; i < mutation_count; ++i) {
@@ -636,6 +641,7 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
       }
     }
     synchronize_instruction_caches();
+    ttc_monitor_write_ttbr0(previous_ttbr0);
   } else {
     ttc_monitor_isb();
   }
@@ -712,12 +718,22 @@ static void MONITOR_CODE execute_command(uint8_t* state) {
   respond(state, sequence, status, detail);
 }
 
-void MONITOR_CODE ttc_monitor_command_entry(uint8_t* state) {
+// ttc_monitor_command_call executes on an application vCPU whose Sentry
+// continuation is already resident at EL1. Unlike command_entry it returns to
+// that continuation directly, avoiding a redpill plus a second hv_vcpu_run for
+// uncontended page-table transactions.
+void MONITOR_CODE ttc_monitor_command_call(uint8_t* state) {
+  // The caller populated the command through its Sentry identity alias.
+  ttc_monitor_dsb_ish();
   execute_command(state);
   // Publish both the command response and any monitor metadata mutation to
-  // the host and to application entries running on other vCPUs before the
-  // synchronous acknowledgement becomes observable.
+  // the Sentry alias and to later application entries before the synchronous
+  // acknowledgement becomes observable.
   ttc_monitor_dsb_ish();
+}
+
+void MONITOR_CODE ttc_monitor_command_entry(uint8_t* state) {
+  ttc_monitor_command_call(state);
   ttc_monitor_hvc_command();
 }
 

@@ -125,6 +125,11 @@ _ttc_monitor_write_ttbr0:
   isb
   ret
 
+.globl _ttc_monitor_read_ttbr0
+_ttc_monitor_read_ttbr0:
+  mrs x0, ttbr0_el1
+  ret
+
 // ttc_monitor_ring0_application_entry saves the running Sentry continuation,
 // switches from its EL1-only TTBR0 to the selected application root, and
 // enters EL0. The lower-EL vectors restore its architectural register image

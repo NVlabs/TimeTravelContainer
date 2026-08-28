@@ -32,6 +32,19 @@ func Bluepill(bridge unsafe.Pointer, stateVA uint64)
 // Sentry continuation is already resident on its owner vCPU at EL1.
 func SwitchApplicationGuest()
 
+// RunMonitorGuest executes the monitor's returning command entry on the
+// current resident EL1 vCPU. The caller must serialize monitor commands,
+// exclude other application readers, and publish the guest-critical marker.
+func RunMonitorGuest(monitorEntry, stateVA uint64)
+
+// SyncGuestCode asks the native bridge to perform Darwin's writer-side cache
+// maintenance for a GuestRAM HVA, then resumes this EL1 continuation in place.
+func SyncGuestCode(address uintptr, length uint64)
+
+// Yield emits the ARM64 processor-yield hint without entering the Go
+// scheduler. It is used only for bounded guest-resident lock acquisition.
+func Yield()
+
 // SwitchApplicationGuestAddress returns the first instruction of the
 // already-resident application-entry trampoline.
 func SwitchApplicationGuestAddress() uintptr
