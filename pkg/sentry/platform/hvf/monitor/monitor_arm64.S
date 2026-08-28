@@ -133,6 +133,10 @@ _ttc_monitor_write_ttbr0:
 .globl _ttc_monitor_ring0_application_entry
 _ttc_monitor_ring0_application_entry:
   clrex
+  // Sentry populated the application image through its identity alias. Make
+  // those stores visible before the monitor consumes the same physical state
+  // page through its private TTBR1 alias.
+  dsb ish
   sub sp, sp, #32
   stp x16, x17, [sp, #0]
   stp x18, x19, [sp, #16]
@@ -176,17 +180,11 @@ _ttc_monitor_ring0_application_entry:
   add x17, x16, #2, lsl #12
   add x17, x17, #0xc00
   SAVE_FP_STATE x17
-.globl _ttc_monitor_ring0_application_fast_entry
-_ttc_monitor_ring0_application_fast_entry:
-  // The shared entry has saved the Sentry register image and switched to the
-  // permanent per-vCPU stack. Keep this symbol until the embedded monitor ABI
-  // clean break removes the former direct-entry offset.
   mrs x0, tpidr_el1
   bl _ttc_monitor_ring0_application_ttbr
   mrs x16, tpidr_el1
   cbz x0, _ttc_monitor_hvc_internal
-  msr ttbr0_el1, x0
-  isb
+  str x0, [x16, #TTC_STATE_APPLICATION_TTBR0_OFFSET]
   mrs x18, tpidr_el1
   add x17, x18, #3, lsl #12
   LOAD_FP_STATE x17
@@ -229,10 +227,21 @@ _ttc_monitor_ring0_application_fast_entry:
   // VMALLE1 form can leave an old application leaf resident across vCPU reuse.
   tlbi vmalle1is
   dsb ish
+  // The monitor transaction broadcasts IALLUIS, but HVF does not reliably
+  // propagate that maintenance to every dormant application vCPU either.
+  // Invalidate this worker's instruction cache before it executes through a
+  // freshly published executable leaf. Without the local fallback, a recycled
+  // worker can sporadically decode the zero-filled line that preceded the host
+  // writer's executable mapping.
+  ic iallu
+  dsb ish
   isb
 1:
   ldr x17, [x16, #TTC_STATE_CANCEL_REQUESTED_OFFSET]
   cbnz x17, _ttc_monitor_cancel_before_application
+  ldr x17, [x16, #TTC_STATE_APPLICATION_TTBR0_OFFSET]
+  msr ttbr0_el1, x17
+  isb
   add x17, x16, #TTC_STATE_STACK_TOP
   mov sp, x17
   ldp x0, x1, [x18, #0x00]
@@ -307,8 +316,15 @@ _ttc_monitor_el0_irq:
   b _ttc_monitor_el0_irq_handler
   .space 124
 
-.set ttc_vector_number, 10
-.rept 6
+// Lower EL, AArch64 FIQ vector at VBAR+0x500. HVF cancellation currently uses
+// IRQ plus a monitor-owned exit-kind word; retain a complete FIQ snapshot path
+// so an unexpected asserted FIQ still returns a precise external interruption.
+_ttc_monitor_el0_fiq:
+  b _ttc_monitor_el0_fiq_handler
+  .space 124
+
+.set ttc_vector_number, 11
+.rept 5
   mov x16, #ttc_vector_number
   b _ttc_monitor_unexpected_handler
   .space 120
@@ -395,6 +411,8 @@ _ttc_monitor_el1_fault_gate:
 _ttc_monitor_fast_mach_absolute_time:
   isb
   mrs x0, cntvct_el0
+  ldr x16, [x18, #TTC_STATE_VTIMER_OFFSET_OFFSET]
+  add x0, x0, x16
   b _ttc_monitor_fast_time_return
 
 _ttc_monitor_fast_clock_gettime:
@@ -502,8 +520,27 @@ _ttc_monitor_el0_irq_handler:
   stp x16, x17, [sp, #0]
   stp x18, x19, [sp, #16]
   mrs x16, tpidr_el1
+  add x18, x16, #2, lsl #12
+  add x18, x18, #0xa70
+  ldar x19, [x18]
+  stlr xzr, [x18]
+  cbnz x19, 1f
+  mov x19, #TTC_EXIT_RETRY
+1:
+  b _ttc_monitor_el0_interrupt_handler
+
+.globl _ttc_monitor_el0_fiq_handler
+_ttc_monitor_el0_fiq_handler:
+  sub sp, sp, #32
+  stp x16, x17, [sp, #0]
+  stp x18, x19, [sp, #16]
+  mov x19, #TTC_EXIT_INTERRUPTED
+
+_ttc_monitor_el0_interrupt_handler:
+  mrs x16, tpidr_el1
   add x16, x16, #2, lsl #12
   add x16, x16, #0x908
+  str x19, [x16, #TTC_APP_EXIT_KIND_OFFSET]
   stp x0, x1, [x16, #0x00]
   stp x2, x3, [x16, #0x10]
   stp x4, x5, [x16, #0x20]
@@ -533,8 +570,11 @@ _ttc_monitor_el0_irq_handler:
   str x17, [x16, #TTC_APP_TPIDR_OFFSET]
   str xzr, [x16, #TTC_APP_ESR_OFFSET]
   str xzr, [x16, #TTC_APP_FAR_OFFSET]
-  mov x17, #TTC_EXIT_INTERRUPTED
-  str x17, [x16, #TTC_APP_EXIT_KIND_OFFSET]
+  // Hypervisor.framework models virtual IRQ/FIQ inputs as level-triggered.
+  // Exit once after snapshotting EL0 so the host can lower the line before
+  // this handler restores the Sentry continuation. Otherwise the next EL0
+  // entry immediately takes the same interrupt again.
+  hvc #TTC_RING0_HVC_INTERRUPT_ACK
   b _ttc_monitor_finish_application_exit
 
 _ttc_monitor_finish_application_exit:
@@ -551,6 +591,9 @@ _ttc_monitor_finish_application_exit:
   str xzr, [x17, #TTC_STATE_CANCEL_REQUESTED_OFFSET]
   add x18, x17, #3, lsl #12
   SAVE_FP_STATE x18
+  // Publish the complete application exit image before switching TTBR0 and
+  // resuming Sentry, which reads it through a distinct stage-1 alias.
+  dsb ish
   ldr x16, [x17, #TTC_STATE_SENTRY_TTBR0_OFFSET]
   msr ttbr0_el1, x16
   isb

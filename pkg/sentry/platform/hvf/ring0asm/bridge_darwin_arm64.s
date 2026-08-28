@@ -39,75 +39,6 @@ TEXT ·Bluepill(SB),NOSPLIT,$0-16
 	CALL ·bluepillTrap(SB)
 	RET
 
-// nativeResume is the first instruction executed after a signal-free native
-// host entry transfers this call boundary into guest EL1. Enter the monitor
-// immediately from captured registers. In particular, switch away from the
-// movable Go stack before the monitor's first store: stack growth may put the
-// current SP on a page that did not exist when the host mirror was sampled.
-// The monitor preserves R20 across the application entry, allowing us to
-// retain the caller's LR around its call.
-TEXT ·nativeResume(SB),NOSPLIT|NOFRAME,$0
-	MOVD RSP, R2
-	WORD $0xd538d080 // mrs x0, tpidr_el1
-	MOVD R2, 0x3348(R0)
-	ADD $0x4000, R0, R2
-	MOVD R2, RSP
-	MOVD R30, R20
-	MOVD R9, R0
-	MOVD R19, R1
-	CALL (R1)
-	MOVD R20, R30
-	RET
-
-// nativeBluepill captures the only state that the Go and Darwin call ABIs
-// require across a call, switches to bridge-owned C stack space, and invokes
-// hostEntry(bridge, bootstrap). hostEntry does not return: after the vCPU exits
-// it restores the complete resulting continuation through controlled SIGILL.
-//
-// Input: R8=bridge, R9=stateVA, R10=hostStackTop, R12=hostEntry,
-// R13=bootstrap.
-TEXT ·nativeBluepill(SB),NOSPLIT|NOFRAME,$0
-	MOVD RSP, R14
-	MOVD $·nativeResume(SB), R15
-	MOVD R15, 0(R13)
-	MOVD R14, 8(R13)
-	MOVD R29, 16(R13)
-	MOVD R30, 24(R13)
-	MOVD R8, 32(R13)
-	MOVD R9, 40(R13)
-	WORD $0xf90019b2 // str x18, [x13, #48]
-	MOVD g, 56(R13)
-	MOVD R19, 64(R13)
-	MOVD R10, RSP
-	SUB $16, RSP
-	MOVD R14, 0(RSP)
-	MOVD R30, 8(RSP)
-	MOVD R8, R0
-	MOVD R13, R1
-	CALL (R12)
-	// Defensive only: the C entry is noreturn. Avoid a guest-only tail if an
-	// implementation error ever causes it to return normally.
-	MOVD 8(R13), R14
-	MOVD 24(R13), R30
-	MOVD R14, RSP
-	MOVD $1, R11
-	RET
-
-TEXT ·SwitchApplication(SB),NOSPLIT,$0-48
-	MOVD bridge+0(FP), R8
-	MOVD stateVA+8(FP), R9
-	MOVD monitorEntry+16(FP), R19
-	MOVD hostStackTop+24(FP), R10
-	MOVD hostEntry+32(FP), R12
-	MOVD bootstrap+40(FP), R13
-	// The native bridge sets R11 to 1 only when it cannot transfer the
-	// continuation into HVF. Check it before executing the guest-only tail.
-	MOVD $0, R11
-	CALL ·nativeBluepill(SB)
-	CBNZ R11, switch_application_failed
-switch_application_failed:
-	RET
-
 TEXT ·SwitchApplicationGuest(SB),NOSPLIT|NOFRAME,$0
 	MOVD RSP, R2
 	WORD $0xd538d080 // mrs x0, tpidr_el1
@@ -118,17 +49,6 @@ TEXT ·SwitchApplicationGuest(SB),NOSPLIT|NOFRAME,$0
 	MOVD R30, R20
 	CALL (R1)
 	MOVD R20, R30
-	RET
-
-TEXT ·NativeResumeAddress(SB),NOSPLIT,$0-8
-	MOVD $·nativeResume(SB), R0
-	MOVD R0, ret+0(FP)
-	RET
-
-TEXT ·NativeResumeTrapAddress(SB),NOSPLIT,$0-8
-	MOVD $·nativeResume(SB), R0
-	ADD $4, R0
-	MOVD R0, ret+0(FP)
 	RET
 
 TEXT ·SwitchApplicationGuestAddress(SB),NOSPLIT,$0-8
@@ -237,11 +157,6 @@ TEXT ·HostSVCGetpidAddress(SB),NOSPLIT,$0-8
 
 TEXT ·BluepillAddress(SB),NOSPLIT,$0-8
 	MOVD $·Bluepill(SB), R0
-	MOVD R0, ret+0(FP)
-	RET
-
-TEXT ·SwitchApplicationAddress(SB),NOSPLIT,$0-8
-	MOVD $·SwitchApplication(SB), R0
 	MOVD R0, ret+0(FP)
 	RET
 

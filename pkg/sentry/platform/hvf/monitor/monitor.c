@@ -560,7 +560,20 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
         }
         continue;
       }
+      // Operations in one command are ordered. If an earlier operation already
+      // planned a replacement for this leaf, use that pending descriptor as
+      // the input to this operation rather than rereading the unchanged live
+      // page table. This makes unmap+map and map+protect atomic batches behave
+      // sequentially while still publishing one BBM/TLBI transaction.
+      uint32_t mutation_index = mutation_count;
       uint64_t old = *leaf;
+      for (uint32_t i = 0; i < mutation_count; ++i) {
+        if (ctl->mutations[i].pte_va == (uint64_t)(uintptr_t)leaf) {
+          mutation_index = i;
+          old = ctl->mutations[i].new_pte;
+          break;
+        }
+      }
       uint64_t next = 0;
       if (type == TTC_OPERATION_MAP) {
         next = stage1_leaf(space, gpa + page * TTC_MONITOR_PAGE_SIZE,
@@ -573,10 +586,15 @@ static uint32_t MONITOR_CODE apply(struct ttc_monitor_control* ctl,
         next = stage1_leaf(space, old & PTE_ADDR_MASK, access);
       }
       if (old != next) {
-        ctl->mutations[mutation_count].pte_va = (uint64_t)(uintptr_t)leaf;
-        ctl->mutations[mutation_count].new_pte = next;
-        ctl->mutations[mutation_count].va = page_va;
-        ++mutation_count;
+        if (mutation_index == mutation_count) {
+          ctl->mutations[mutation_count].pte_va =
+              (uint64_t)(uintptr_t)leaf;
+          ctl->mutations[mutation_count].new_pte = next;
+          ctl->mutations[mutation_count].va = page_va;
+          ++mutation_count;
+        } else {
+          ctl->mutations[mutation_index].new_pte = next;
+        }
       }
     }
   }

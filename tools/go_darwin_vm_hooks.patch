@@ -68,12 +68,73 @@ index c847aa1..26d9cd1 100644
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
  }
  func madvise_trampoline()
+@@ -302,21 +339,24 @@
+ //go:nosplit
+ //go:cgo_unsafe_args
+-func nanotime1() int64 {
+-	var r struct {
+-		t            int64  // raw timer
+-		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
+-	}
+-	libcCall(unsafe.Pointer(abi.FuncPCABI0(nanotime_trampoline)), unsafe.Pointer(&r))
+-	// Note: Apple seems unconcerned about overflow here. See
+-	// https://developer.apple.com/library/content/qa/qa1398/_index.html
+-	// Note also, numer == denom == 1 is common.
+-	t := r.t
+-	if r.numer != 1 {
+-		t *= int64(r.numer)
+-	}
+-	if r.denom != 1 {
+-		t /= int64(r.denom)
+-	}
+-	return t
+-}
++func nanotime1() int64 {
++	if seconds, nanoseconds, ok := ttcRuntimeTimeCall(ttcRuntimeTimeMonotonic); ok {
++		return seconds*1000000000 + int64(nanoseconds)
++	}
++	var r struct {
++		t            int64  // raw timer
++		numer, denom uint32 // conversion factors. nanoseconds = t * numer / denom.
++	}
++	libcCall(unsafe.Pointer(abi.FuncPCABI0(nanotime_trampoline)), unsafe.Pointer(&r))
++	// Note: Apple seems unconcerned about overflow here. See
++	// https://developer.apple.com/library/content/qa/qa1398/_index.html
++	// Note also, numer == denom == 1 is common.
++	t := r.t
++	if r.numer != 1 {
++		t *= int64(r.numer)
++	}
++	if r.denom != 1 {
++		t /= int64(r.denom)
++	}
++	return t
++}
+ func nanotime_trampoline()
+@@ -332,9 +372,12 @@
+ //go:linkname walltime
+ //go:nosplit
+ //go:cgo_unsafe_args
+-func walltime() (int64, int32) {
+-	var t timespec
+-	libcCall(unsafe.Pointer(abi.FuncPCABI0(walltime_trampoline)), unsafe.Pointer(&t))
+-	return t.tv_sec, int32(t.tv_nsec)
+-}
++func walltime() (int64, int32) {
++	if seconds, nanoseconds, ok := ttcRuntimeTimeCall(ttcRuntimeTimeWall); ok {
++		return seconds, nanoseconds
++	}
++	var t timespec
++	libcCall(unsafe.Pointer(abi.FuncPCABI0(walltime_trampoline)), unsafe.Pointer(&t))
++	return t.tv_sec, int32(t.tv_nsec)
++}
+ func walltime_trampoline()
 diff --git a/src/runtime/ttc_vm_darwin.go b/src/runtime/ttc_vm_darwin.go
 new file mode 100644
 index 0000000..e1d4c90
 --- /dev/null
 +++ b/src/runtime/ttc_vm_darwin.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,149 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -117,8 +178,23 @@ index 0000000..e1d4c90
 +)
 +
 +var (
-+	ttcVMMemoryEnsureHost uintptr
-+	ttcVMMemoryCallback   uintptr
++	ttcVMMemoryEnsureHost  uintptr
++	ttcVMMemoryCallback    uintptr
++	ttcRuntimeTimeCallback uintptr
++)
++
++type ttcRuntimeTimeQuery struct {
++	version     uint32
++	clock       uint32
++	seconds     int64
++	nanoseconds int32
++	reserved    uint32
++}
++
++const (
++	ttcRuntimeTimeVersion   = 1
++	ttcRuntimeTimeWall      = 1
++	ttcRuntimeTimeMonotonic = 2
 +)
 +
 +// ttcSetVMMemoryHooks installs TTC's process-wide Darwin VM notifier. The
@@ -166,4 +242,45 @@ index 0000000..e1d4c90
 +	if asmcgocall(unsafe.Pointer(callback), unsafe.Pointer(mutation)) != 0 {
 +		throw("runtime: TTC VM memory hook failed")
 +	}
++}
++
++// ttcSetRuntimeTimeHook installs TTC's C-ABI clock callback. The callback
++// returns zero at host EL0, one after filling the query at guest EL1, and a
++// negative value for malformed state.
++//
++//go:linkname ttcSetRuntimeTimeHook
++//go:nosplit
++func ttcSetRuntimeTimeHook(version uint32, callback uintptr) int32 {
++	if version != ttcRuntimeTimeVersion {
++		return 1
++	}
++	if callback == 0 {
++		return 2
++	}
++	installed := atomic.Loaduintptr(&ttcRuntimeTimeCallback)
++	if installed != 0 {
++		if installed == callback {
++			return 0
++		}
++		return 3
++	}
++	atomic.Storeuintptr(&ttcRuntimeTimeCallback, callback)
++	return 0
++}
++
++//go:nosplit
++func ttcRuntimeTimeCall(clock uint32) (int64, int32, bool) {
++	callback := atomic.Loaduintptr(&ttcRuntimeTimeCallback)
++	if callback == 0 {
++		return 0, 0, false
++	}
++	query := ttcRuntimeTimeQuery{
++		version: ttcRuntimeTimeVersion,
++		clock:   clock,
++	}
++	status := asmcgocall(unsafe.Pointer(callback), unsafe.Pointer(&query))
++	if status < 0 {
++		throw("runtime: TTC time hook failed")
++	}
++	return query.seconds, query.nanoseconds, status == 1
 +}

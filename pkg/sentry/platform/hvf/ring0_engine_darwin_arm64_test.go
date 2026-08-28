@@ -24,6 +24,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -267,12 +268,6 @@ func TestStage1FaultAccess(t *testing.T) {
 	}
 }
 
-func TestNativeResumeTrapAddress(t *testing.T) {
-	if got, want := ring0asm.NativeResumeTrapAddress(), ring0asm.NativeResumeAddress()+4; got != want {
-		t.Fatalf("native-resume trap address = %#x, want %#x", got, want)
-	}
-}
-
 func TestSwitchApplicationGuestTrapAddress(t *testing.T) {
 	if got, want := ring0asm.SwitchApplicationGuestTrapAddress(), ring0asm.SwitchApplicationGuestAddress()+4; got != want {
 		t.Fatalf("guest-switch trap address = %#x, want %#x", got, want)
@@ -402,7 +397,7 @@ func TestApplicationWaiterInterruptsCPUBoundIncumbent(t *testing.T) {
 	}
 }
 
-func TestTranslationMutationInterruptsCPUBoundApplication(t *testing.T) {
+func TestTranslationMutationQuiescesCPUBoundApplication(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
@@ -489,15 +484,16 @@ func TestTranslationMutationInterruptsCPUBoundApplication(t *testing.T) {
 	}
 	responseBytes, err := engine.RunMonitor(ctx, encoded)
 	if err != nil {
-		t.Fatalf("translation mutation did not interrupt CPU-bound application: %v", err)
+		t.Fatalf("translation mutation did not quiesce CPU-bound application: %v", err)
 	}
 	response, err := monitorabi.UnmarshalResponse(responseBytes)
 	if err != nil || response.Status != monitorabi.StatusOK {
 		t.Fatalf("monitor response=%+v err=%v", response, err)
 	}
 	application := <-applicationDone
-	if application.err != nil || application.exit.Reason != vmm.ExitInterrupted {
-		t.Fatalf("CPU-bound application exit=%+v err=%v", application.exit, application.err)
+	if application.err != nil || application.exit.Reason != vmm.ExitFault ||
+		application.exit.Address != loopVA || application.exit.Access != vmm.Stage2Execute {
+		t.Fatalf("CPU-bound application after execute permission removal exit=%+v err=%v", application.exit, application.err)
 	}
 }
 
@@ -615,7 +611,33 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 	if err := replaceRing0TrackedHostMapping(trackedHost, vmm.HostSlabSize, 0x8877665544332211); err != nil {
 		t.Fatal(err)
 	}
-	loop := <-loopDone
+	select {
+	case loop := <-loopDone:
+		t.Fatalf("runtime mapping rendezvous leaked an application exit: exit=%+v err=%v", loop.exit, loop.err)
+	default:
+	}
+	engine.InterruptApplications()
+	var loop loopResult
+	select {
+	case loop = <-loopDone:
+	case <-time.After(3 * time.Second):
+		cpus := engine.pinApplicationCPUs()
+		detail := "no application vCPU"
+		if len(cpus) != 0 {
+			cpu := cpus[0]
+			state := unsafe.Pointer(cpu.vcpu.stateHost)
+			detail = fmt.Sprintf("vCPU=%d active=%t entry=%t in_guest=%t cancel=%d exit=%d pending_interrupt_exit=%d external=%d cancellations=%d cancel_pc=%#x cancel_pstate=%#x",
+				cpu.vcpu.id, cpu.applicationActive.Load(), cpu.entryActive.Load(),
+				cpu.bridge.inGuest(),
+				atomic.LoadUint64((*uint64)(unsafe.Add(state, stateCancelRequested))),
+				atomic.LoadUint64((*uint64)(unsafe.Add(state, stateExitKind))),
+				atomic.LoadUint64((*uint64)(unsafe.Add(state, statePendingInterruptExitKind))),
+				atomic.LoadUint32((*uint32)(unsafe.Add(unsafe.Pointer(cpu.bridge.pointer), ring0BridgeExternalInterruptOffset))),
+				cpu.bridge.cancelCount(), cpu.bridge.lastCancelPC(), cpu.bridge.lastCancelPState())
+		}
+		engine.unpinApplicationCPUs(cpus)
+		t.Fatalf("spinner did not stop after explicit application interrupt: %s", detail)
+	}
 	if loop.err != nil || loop.exit.Reason != vmm.ExitInterrupted {
 		t.Fatalf("spinner exit=%+v err=%v", loop.exit, loop.err)
 	}
@@ -813,7 +835,7 @@ func TestRing0ConcurrentSyscallMonitorAndRecycle(t *testing.T) {
 					Registers:      registers,
 				})
 				if err != nil || exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
-					errs <- fmt.Errorf("worker %d iteration %d application exit=%+v registers={x8=%d pc=%#x} err=%v", worker, iteration, exit, registers.X[8], registers.PC, err)
+					errs <- fmt.Errorf("worker %d iteration %d application exit=%+v registers={x8=%d pc=%#x} code=%#x err=%v", worker, iteration, exit, registers.X[8], registers.PC, binary.LittleEndian.Uint64(memory[:8]), err)
 					return
 				}
 				responseBytes, err := engine.RunMonitor(context.Background(), replace)
@@ -888,7 +910,7 @@ func TestMonitorRecyclesDestroyedAddressSpaceTables(t *testing.T) {
 	}
 }
 
-func BenchmarkRing0ApplicationFastPath(b *testing.B) {
+func BenchmarkRing0ApplicationSwitch(b *testing.B) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
@@ -1028,11 +1050,11 @@ func BenchmarkRing0ApplicationColdResidency(b *testing.B) {
 	}
 }
 
-// BenchmarkRing0ApplicationFastPathParallel measures the backend-owned world
+// BenchmarkRing0ApplicationSwitchParallel measures the backend-owned world
 // switch without Sentry syscall work while every host application CPU is busy.
 // Keep this separate from the serial benchmark: a regression here identifies
 // Hypervisor.framework/vCPU coordination rather than Linux syscall contention.
-func BenchmarkRing0ApplicationFastPathParallel(b *testing.B) {
+func BenchmarkRing0ApplicationSwitchParallel(b *testing.B) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {

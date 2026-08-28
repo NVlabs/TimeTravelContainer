@@ -28,24 +28,9 @@ func bluepillTrap()
 // or the monitor redirects a host-dependent exception.
 func Bluepill(bridge unsafe.Pointer, stateVA uint64)
 
-// SwitchApplication transfers to EL1 as needed and enters the selected EL0
-// application through monitorEntry. The monitor restores its caller at EL1 on
-// exception; a bounded Sentry root may immediately host-gate the continuation
-// back to Darwin before this function returns to Go.
-func SwitchApplication(bridge unsafe.Pointer, stateVA, monitorEntry uint64, hostStackTop, hostEntry, bootstrap uintptr)
-
 // SwitchApplicationGuest enters the selected application when the calling
 // Sentry continuation is already resident on its owner vCPU at EL1.
 func SwitchApplicationGuest()
-
-// NativeResumeAddress returns the first instruction of the native-entry
-// trampoline. The HVF bridge uses this to keep asynchronous cancellation in
-// the guest until the trampoline has reached the monitor.
-func NativeResumeAddress() uintptr
-
-// NativeResumeTrapAddress returns the exact TPIDR_EL1 instruction in the
-// native-entry trampoline. A host return at this PC is a controlled bluepill.
-func NativeResumeTrapAddress() uintptr
 
 // SwitchApplicationGuestAddress returns the first instruction of the
 // already-resident application-entry trampoline.
@@ -97,9 +82,6 @@ func HostSVCGetpidAddress() uintptr
 
 // BluepillAddress returns an address within Bluepill for identity mapping.
 func BluepillAddress() uintptr
-
-// SwitchApplicationAddress returns an address within SwitchApplication.
-func SwitchApplicationAddress() uintptr
 
 // EnsureHostTrapAddress returns the exact HVC instruction address used by
 // EnsureHost. At host EL0, the SIGILL bridge skips this instruction.

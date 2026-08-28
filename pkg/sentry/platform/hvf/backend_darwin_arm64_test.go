@@ -97,6 +97,10 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
 		t.Skipf("Darwin direct getpid SVC returned %d, want %d", got, hostPID)
 	}
+	// Allocate the Sentry clock object before the engine takes its initial host
+	// VM snapshot. The assertion below is about the EL1 clock service itself,
+	// not the one-time demand import of a Go arena created after bootstrap.
+	calibratedClock := sentrytime.NewCalibratedClock(sentrytime.Monotonic)
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
@@ -153,7 +157,6 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	calibratedClock := sentrytime.NewCalibratedClock(sentrytime.Monotonic)
 	registers := &vmm.ARM64State{PC: codeVA}
 	hostCounterBefore := sentrytime.Rdtsc()
 	hostWallBefore := time.Now()
@@ -445,16 +448,28 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 	runEngineMonitor(t, engine, 1, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: 1})
 	for page := uint64(0); page < 4; page++ {
 		va := uint64(0x400000) + page*vmm.LogicalPageSize
+		operations := []monitorabi.Operation{{
+			Type:   monitorabi.OperationMap,
+			Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA:     va,
+			GPA:    hvf.GuestRAMIPAStart + page*vmm.LogicalPageSize,
+			Length: vmm.LogicalPageSize,
+		}}
+		if page == 0 {
+			// Exercise ordered command semantics and executable-cache resolution:
+			// protect must consume the mapping planned earlier in this same batch.
+			operations[0].Access = monitorabi.AccessRead | monitorabi.AccessWrite
+			operations = append(operations, monitorabi.Operation{
+				Type:   monitorabi.OperationProtect,
+				Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+				VA:     va,
+				Length: vmm.LogicalPageSize,
+			})
+		}
 		runEngineMonitor(t, engine, 2+page, monitorabi.Command{
 			Opcode:         monitorabi.OpcodeApply,
 			AddressSpaceID: 1,
-			Operations: []monitorabi.Operation{{
-				Type:   monitorabi.OperationMap,
-				Access: monitorabi.AccessRead | monitorabi.AccessExecute,
-				VA:     va,
-				GPA:    hvf.GuestRAMIPAStart + page*vmm.LogicalPageSize,
-				Length: vmm.LogicalPageSize,
-			}},
+			Operations:     operations,
 		})
 		registers := &vmm.ARM64State{PC: va}
 		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: 1, Registers: registers})
@@ -500,8 +515,8 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 	}
 
 	// Exercise the asynchronous-exit handoff repeatedly. RequestExit may catch
-	// the untouched nativeResume bootstrap, masked EL1 application entry, or
-	// unmasked EL0 execution. All must return a coherent interrupted state
+	// the shared EL1 entry trampoline, masked monitor entry, or unmasked EL0
+	// execution. All must return a coherent interrupted state
 	// without exporting an EL1-only trampoline to Darwin, and the engine must
 	// remain usable afterward.
 	const loopVA = uint64(0x403000)
@@ -570,7 +585,7 @@ type tlbTortureWorker struct {
 	stopped chan error
 }
 
-func startTLBTortureWorker(engine vmplatform.VMEngine) tlbTortureWorker {
+func startTLBTortureWorker(engine vmplatform.VMEngine, workerID int) tlbTortureWorker {
 	jobs := make(chan tlbTortureJob)
 	stopped := make(chan error, 1)
 	go func() {
@@ -580,7 +595,7 @@ func startTLBTortureWorker(engine vmplatform.VMEngine) tlbTortureWorker {
 			registers := &vmm.ARM64State{PC: job.va}
 			exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: job.addressSpace, Registers: registers})
 			if err == nil && (exit.Reason != vmm.ExitSyscall || registers.X[8] != job.wantSyscall || registers.PC != job.va+8) {
-				err = fmt.Errorf("exit=%+v x8=%d pc=%#x, want syscall=%d pc=%#x", exit, registers.X[8], registers.PC, job.wantSyscall, job.va+8)
+				err = fmt.Errorf("worker=%d exit=%+v x8=%d pc=%#x, want syscall=%d pc=%#x", workerID, exit, registers.X[8], registers.PC, job.wantSyscall, job.va+8)
 			}
 			job.done <- err
 		}
@@ -626,8 +641,8 @@ func TestMonitorMultiVCPUTranslationReplacementTorture(t *testing.T) {
 	runEngineMonitor(t, engine, sequence, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
 	sequence++
 	workers := []tlbTortureWorker{
-		startTLBTortureWorker(engine),
-		startTLBTortureWorker(engine),
+		startTLBTortureWorker(engine, 0),
+		startTLBTortureWorker(engine, 1),
 	}
 	defer func() {
 		for _, worker := range workers {
@@ -910,7 +925,7 @@ func TestRing0PlatformEpochRolloverRebuildsExecutingAddressSpace(t *testing.T) {
 
 // BenchmarkRing0PlatformSwitch measures the complete backend-independent
 // platform.Context boundary around the HVF application world switch. Keep it
-// beside BenchmarkRing0ApplicationFastPath so changes can be attributed to
+// beside BenchmarkRing0ApplicationSwitch so changes can be attributed to
 // vmplatform versus the host-specific execution engine.
 func BenchmarkRing0PlatformSwitch(b *testing.B) {
 	backend := hvf.NewBackend()

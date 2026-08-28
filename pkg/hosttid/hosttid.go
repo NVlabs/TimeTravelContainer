@@ -29,11 +29,12 @@ const _ = runtime.Compiler
 // Current is equivalent to unix.Gettid(), but faster.
 func Current() uint64
 
-// RuntimePointers returns the current runtime g, m, p, and mcache addresses.
+// RuntimePointers returns the current runtime g, m, p, and mcache addresses,
+// followed by the current M's g0 and gsignal pointers and stack bounds.
 // Callers must use the result only for low-level execution-context
 // bookkeeping; the pointed-to runtime layouts remain opaque and
 // version-dependent.
-func RuntimePointers() (g, m, p, mcache uintptr)
+func RuntimePointers() (g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi uintptr)
 
 // RuntimeTLSBase returns the current host thread's architectural TLS base.
 // Callers must keep the calling goroutine locked to its OS thread while using

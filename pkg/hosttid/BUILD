@@ -19,6 +19,8 @@ go_test(
     name = "hosttid_test",
     size = "small",
     srcs = [
+        "hosttid_exact_test.go",
+        "hosttid_inexact_test.go",
         "hosttid_test.go",
     ],
     library = ":hosttid",
@@ -32,6 +34,8 @@ go_test(
     name = "hosttid_net_test",
     size = "small",
     srcs = [
+        "hosttid_exact_test.go",
+        "hosttid_inexact_test.go",
         "hosttid_net_test.go",
         "hosttid_test.go",
     ],

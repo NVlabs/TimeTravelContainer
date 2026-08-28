@@ -20,6 +20,7 @@ package hvf
 #cgo CFLAGS: -mmacosx-version-min=15.0
 #cgo LDFLAGS: -framework Hypervisor -framework CoreFoundation -mmacosx-version-min=15.0
 #include <Hypervisor/Hypervisor.h>
+#include <mach/mach_time.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -135,6 +136,34 @@ static void ttc_monitor_fence(void) {
 	__sync_synchronize();
 }
 
+static uint64_t ttc_monitor_host_cntvct(void) {
+	uint64_t value;
+	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(value));
+	return value;
+}
+
+// Hypervisor.framework defines guest CNTVCT as mach_absolute_time minus this
+// offset. Sentry's clock calibration is created in host EL0 from the host
+// architectural counter, whose epoch is not required to match Mach absolute
+// time. Choose the tightest of several bracketed samples so every vCPU in this
+// VM observes the host CNTVCT domain with only bounded sampling error.
+static uint64_t ttc_monitor_vtimer_offset(void) {
+	uint64_t best_span = UINT64_MAX;
+	uint64_t best_offset = 0;
+	for (unsigned int i = 0; i < 16; ++i) {
+		uint64_t before = ttc_monitor_host_cntvct();
+		uint64_t absolute = mach_absolute_time();
+		uint64_t after = ttc_monitor_host_cntvct();
+		uint64_t span = after - before;
+		if (span < best_span) {
+			uint64_t midpoint = before + span / 2;
+			best_span = span;
+			best_offset = absolute - midpoint;
+		}
+	}
+	return best_offset;
+}
+
 static hv_return_t ttc_monitor_cancel_location(hv_vcpu_t vcpu,
 						uint64_t *cpsr, uint64_t *pc) {
 	hv_return_t ret;
@@ -149,53 +178,55 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
 )
 
 const (
-	monitorCodeGPA       = uint64(0x00010000)
-	monitorCodeCapacity  = uint64(0x00010000)
-	monitorControlGPA    = uint64(0x00020000)
-	monitorStatesGPA     = uint64(0x00024000)
-	monitorMaxVCPUs      = 64
-	monitorStatesLength  = uint64(monitorMaxVCPUs) * vmm.HostSlabSize
-	monitorPoolGPA       = uint64(0x00200000)
-	monitorPoolLength    = uint64(16 << 20)
-	monitorCodeVA        = uint64(0xffff000000000000)
-	monitorControlVA     = monitorCodeVA + monitorCodeCapacity
-	monitorStatesVA      = monitorControlVA + vmm.HostSlabSize
-	monitorPoolVA        = monitorCodeVA + 0x00200000
-	monitorCommandMax    = 64 + 256*40
-	stateCommandLength   = 0x0010
-	stateCommand         = 0x0040
-	stateResponse        = 0x2880
-	stateAddressSpaceID  = 0x2900
-	stateX0              = 0x2908
-	stateSP              = 0x2a00
-	statePC              = 0x2a08
-	statePState          = 0x2a10
-	stateTPIDR           = 0x2a18
-	stateESR             = 0x2a20
-	stateFAR             = 0x2a28
-	stateExitKind        = 0x2a30
-	stateInternalESR     = 0x2a38
-	stateInternalFAR     = 0x2a40
-	stateInternalELR     = 0x2a48
-	stateInternalVector  = 0x2a50
-	stateInternalPState  = 0x2a58
-	stateCancelRequested = 0x2a60
-	stateSentrySP        = 0x2b80
-	stateSentryPC        = 0x2b88
-	stateHostGatePC      = 0x3300
-	stateHostGatePState  = 0x3308
-	stateHostGateESR     = 0x3310
-	stateHostGateFAR     = 0x3318
-	monitorHVCBoot       = 0x70
-	monitorHVCCommand    = 0x71
-	monitorHVCInternal   = 0x7f
-	arm64SPSRAlwaysRES0  = uint64(0xffffffff0cdfe020)
+	monitorCodeGPA                = uint64(0x00010000)
+	monitorCodeCapacity           = uint64(0x00010000)
+	monitorControlGPA             = uint64(0x00020000)
+	monitorStatesGPA              = uint64(0x00024000)
+	monitorMaxVCPUs               = 64
+	monitorStatesLength           = uint64(monitorMaxVCPUs) * vmm.HostSlabSize
+	monitorPoolGPA                = uint64(0x00200000)
+	monitorPoolLength             = uint64(16 << 20)
+	monitorCodeVA                 = uint64(0xffff000000000000)
+	monitorControlVA              = monitorCodeVA + monitorCodeCapacity
+	monitorStatesVA               = monitorControlVA + vmm.HostSlabSize
+	monitorPoolVA                 = monitorCodeVA + 0x00200000
+	monitorCommandMax             = 64 + 256*40
+	stateCommandLength            = 0x0010
+	stateCommand                  = 0x0040
+	stateResponse                 = 0x2880
+	stateAddressSpaceID           = 0x2900
+	stateX0                       = 0x2908
+	stateSP                       = 0x2a00
+	statePC                       = 0x2a08
+	statePState                   = 0x2a10
+	stateTPIDR                    = 0x2a18
+	stateESR                      = 0x2a20
+	stateFAR                      = 0x2a28
+	stateExitKind                 = 0x2a30
+	stateInternalESR              = 0x2a38
+	stateInternalFAR              = 0x2a40
+	stateInternalELR              = 0x2a48
+	stateInternalVector           = 0x2a50
+	stateInternalPState           = 0x2a58
+	stateCancelRequested          = 0x2a60
+	statePendingInterruptExitKind = 0x2a70
+	stateSentrySP                 = 0x2b80
+	stateSentryPC                 = 0x2b88
+	stateHostGatePC               = 0x3300
+	stateHostGatePState           = 0x3308
+	stateHostGateESR              = 0x3310
+	stateHostGateFAR              = 0x3318
+	monitorHVCBoot                = 0x70
+	monitorHVCCommand             = 0x71
+	monitorHVCInternal            = 0x7f
+	arm64SPSRAlwaysRES0           = uint64(0xffffffff0cdfe020)
 )
 
 func validApplicationPState(pstate uint64) bool {
@@ -213,17 +244,19 @@ const SentryMirrorIPAStart = uint64(0x10000000)
 const GuestRAMIPAStart = uint64(1 << 39)
 
 type monitorMemory struct {
-	codeHost    uintptr
-	controlHost uintptr
-	statesHost  uintptr
-	poolHost    uintptr
-	codeLength  uint64
+	bootMu sync.Mutex
 
-	bootstrapOffset            uint64
-	commandOffset              uint64
-	ring0ApplicationOffset     uint64
-	ring0ApplicationFastOffset uint64
-	vectorOffset               uint64
+	codeHost     uintptr
+	controlHost  uintptr
+	statesHost   uintptr
+	poolHost     uintptr
+	codeLength   uint64
+	vtimerOffset uint64
+
+	bootstrapOffset        uint64
+	commandOffset          uint64
+	ring0ApplicationOffset uint64
+	vectorOffset           uint64
 
 	mapped []monitorStage2Mapping
 	pools  []monitorPoolMemory
@@ -246,18 +279,19 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 	if imageLength == 0 || imageLength > monitorCodeCapacity {
 		return nil, fmt.Errorf("invalid embedded EL1 monitor image length %d", imageLength)
 	}
-	m := &monitorMemory{codeLength: roundUp(imageLength, vmm.HostSlabSize)}
+	m := &monitorMemory{
+		codeLength:   roundUp(imageLength, vmm.HostSlabSize),
+		vtimerOffset: uint64(C.ttc_monitor_vtimer_offset()),
+	}
 	m.bootstrapOffset = embeddedMonitorBootstrapOffset
 	m.commandOffset = embeddedMonitorCommandOffset
 	m.ring0ApplicationOffset = embeddedMonitorRing0ApplicationOffset
-	m.ring0ApplicationFastOffset = embeddedMonitorRing0ApplicationFastOffset
 	m.vectorOffset = embeddedMonitorVectorOffset
 	for name, offset := range map[string]uint64{
-		"bootstrap":              m.bootstrapOffset,
-		"command":                m.commandOffset,
-		"ring0-application":      m.ring0ApplicationOffset,
-		"ring0-application-fast": m.ring0ApplicationFastOffset,
-		"vectors":                m.vectorOffset,
+		"bootstrap":         m.bootstrapOffset,
+		"command":           m.commandOffset,
+		"ring0-application": m.ring0ApplicationOffset,
+		"vectors":           m.vectorOffset,
 	} {
 		if offset >= imageLength {
 			return nil, fmt.Errorf("EL1 monitor %s offset %#x exceeds image length %#x", name, offset, imageLength)
@@ -284,6 +318,19 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 	}
 	if m.poolHost, err = alloc.Reserve(monitorPoolLength); err != nil {
 		return nil, err
+	}
+	for _, region := range []struct {
+		address uintptr
+		length  uint64
+	}{
+		{m.codeHost, monitorCodeCapacity},
+		{m.controlHost, vmm.HostSlabSize},
+		{m.statesHost, monitorStatesLength},
+		{m.poolHost, monitorPoolLength},
+	} {
+		if err := alloc.Commit(region.address, region.length); err != nil {
+			return nil, fmt.Errorf("committing EL1 monitor host memory: %w", err)
+		}
 	}
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(m.codeHost)), int(imageLength)), embeddedMonitorImage[:])
 
@@ -374,15 +421,16 @@ func roundUp(value, alignment uint64) uint64 {
 }
 
 func (v *hvfVCPU) ensureBooted() error {
+	v.monitor.bootMu.Lock()
+	defer v.monitor.bootMu.Unlock()
 	if v.booted {
 		return nil
 	}
-	// Keep CNTVCT_EL0 in the same counter domain as mach_absolute_time and
-	// every other vCPU. Sentry's calibrated clocks read CNTVCT directly while
-	// resident at EL1; an implementation-chosen VTimer offset would make host
-	// reference samples and guest cycle reads incomparable and force every
-	// Linux clock read through the host-service gate.
-	if status := C.hv_vcpu_set_vtimer_offset(v.handle, 0); status != C.HV_SUCCESS {
+	// Keep CNTVCT_EL0 in the host architectural-counter domain used by
+	// Sentry's calibrated clocks. Hypervisor.framework otherwise exposes the
+	// mach_absolute_time domain, whose epoch differs on supported Apple
+	// Silicon systems. One VM-wide offset also prevents cross-vCPU skew.
+	if status := C.hv_vcpu_set_vtimer_offset(v.handle, C.uint64_t(v.monitor.vtimerOffset)); status != C.HV_SUCCESS {
 		return fmt.Errorf("setting EL1 monitor VTimer offset: %d", status)
 	}
 	C.ttc_monitor_init_state(unsafe.Pointer(v.stateHost), C.uint64_t(monitorControlVA), C.uint64_t(monitorControlGPA))
@@ -392,7 +440,7 @@ func (v *hvfVCPU) ensureBooted() error {
 		C.uint64_t(v.stateGPA+vmm.HostSlabSize)); status != C.HV_SUCCESS {
 		return fmt.Errorf("setting EL1 monitor bootstrap registers: %d", status)
 	}
-	if err := v.runUntilHVC(context.Background(), monitorHVCBoot); err != nil {
+	if err := v.runUntilHVC(context.Background(), monitorHVCBoot, false); err != nil {
 		return fmt.Errorf("booting EL1 monitor: %w", err)
 	}
 	ttbr1 := v.monitor.ttbr1()
@@ -408,12 +456,17 @@ func (v *hvfVCPU) ensureBooted() error {
 	return nil
 }
 
-func (v *hvfVCPU) runUntilHVC(ctx context.Context, expected uint64) error {
+func (v *hvfVCPU) runUntilHVC(ctx context.Context, expected uint64, pauseGuests bool) error {
 	for {
 		C.ttc_monitor_fence()
-		status := C.hv_vcpu_run(v.handle)
+		status := int32(C.HV_SUCCESS)
+		if pauseGuests {
+			status = runNativeMonitorPaused(uint64(v.handle), unsafe.Pointer(v.exit))
+		} else {
+			status = int32(C.hv_vcpu_run(v.handle))
+		}
 		C.ttc_monitor_fence()
-		if status != C.HV_SUCCESS {
+		if status != int32(C.HV_SUCCESS) {
 			return fmt.Errorf("hv_vcpu_run failed: %d", status)
 		}
 		switch C.ttc_monitor_exit_reason(v.exit) {
@@ -472,7 +525,7 @@ func (v *hvfVCPU) RunMonitor(ctx context.Context, encoded []byte) ([]byte, error
 		C.uint64_t(monitorCodeVA+v.monitor.commandOffset), C.uint64_t(v.stateVA)); status != C.HV_SUCCESS {
 		return nil, fmt.Errorf("setting EL1 monitor command entry: %d", status)
 	}
-	err := v.runUntilHVC(ctx, monitorHVCCommand)
+	err := v.runUntilHVC(ctx, monitorHVCCommand, true)
 	if err != nil {
 		return nil, err
 	}

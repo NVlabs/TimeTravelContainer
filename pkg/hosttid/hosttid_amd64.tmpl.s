@@ -20,6 +20,9 @@
 #define PROCID_OFFSET {{ Offset (Import "runtime") "m.procid" }}
 #define P_OFFSET      {{ Offset (Import "runtime") "m.p" }}
 #define MCACHE_OFFSET {{ Offset (Import "runtime") "p.mcache" }}
+#define G0_OFFSET     {{ Offset (Import "runtime") "m.g0" }}
+#define GSIGNAL_OFFSET {{ Offset (Import "runtime") "m.gsignal" }}
+#define STACK_OFFSET  {{ Offset (Import "runtime") "g.stack" }}
 
 TEXT ·Current(SB),NOSPLIT|NOFRAME,$0-8
 	// procid is in getg().m.procid.
@@ -30,7 +33,7 @@ TEXT ·Current(SB),NOSPLIT|NOFRAME,$0-8
 	MOVQ AX, ret+0(FP)
 	RET
 
-TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-32
+TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-80
 	MOVQ TLS, AX
 	MOVQ 0(AX)(TLS*1), AX
 	MOVQ AX, gp+0(FP)
@@ -40,6 +43,24 @@ TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-32
 	MOVQ DX, pp+16(FP)
 	MOVQ MCACHE_OFFSET(DX), BX
 	MOVQ BX, mcachep+24(FP)
+	MOVQ G0_OFFSET(CX), SI
+	MOVQ SI, g0p+32(FP)
+	MOVQ STACK_OFFSET(SI), DI
+	MOVQ DI, g0StackLo+40(FP)
+	MOVQ (STACK_OFFSET+8)(SI), DI
+	MOVQ DI, g0StackHi+48(FP)
+	MOVQ GSIGNAL_OFFSET(CX), SI
+	MOVQ SI, gsignalp+56(FP)
+	TESTQ SI, SI
+	JZ no_gsignal
+	MOVQ STACK_OFFSET(SI), DI
+	MOVQ DI, gsignalStackLo+64(FP)
+	MOVQ (STACK_OFFSET+8)(SI), DI
+	MOVQ DI, gsignalStackHi+72(FP)
+	RET
+no_gsignal:
+	MOVQ $0, gsignalStackLo+64(FP)
+	MOVQ $0, gsignalStackHi+72(FP)
 	RET
 
 TEXT ·RuntimeTLSBase(SB),NOSPLIT|NOFRAME,$0-8

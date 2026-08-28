@@ -36,6 +36,7 @@
 // resuming that continuation at EL1 and faulting through the host-service gate.
 #define TTC_RING0_HVC_REDPILL 0x73
 #define TTC_RING0_HVC_HOST_GATE 0x74
+#define TTC_RING0_HVC_INTERRUPT_ACK 0x75
 
 #define TTC_ADDRESS_SPACE_SENTRY UINT64_C(1)
 #define TTC_ADDRESS_SPACE_FLAGS_MASK TTC_ADDRESS_SPACE_SENTRY
@@ -66,6 +67,7 @@
 #define TTC_STATE_INTERNAL_INPUT_PSTATE_OFFSET 0x2a58
 #define TTC_STATE_CANCEL_REQUESTED_OFFSET 0x2a60
 #define TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET 0x2a68
+#define TTC_STATE_PENDING_INTERRUPT_EXIT_KIND_OFFSET 0x2a70
 #define TTC_STATE_SENTRY_TTBR0_OFFSET 0x2a80
 #define TTC_STATE_SENTRY_X0_OFFSET 0x2a88
 #define TTC_STATE_SENTRY_SP_OFFSET 0x2b80
@@ -88,10 +90,18 @@
 // monitor must never make its first memory access through a movable Go stack:
 // stack growth can occur after the host mirror was sampled.
 #define TTC_STATE_RING0_SENTRY_SP_OFFSET 0x3348
+// Selected application root retained while entry performs monitor-local cache
+// and register work under the Sentry root. TTBR0 switches only immediately
+// before the final EL0 ERET.
+#define TTC_STATE_APPLICATION_TTBR0_OFFSET 0x3350
 // Nonzero while MDSCR_EL1.SS is enabled for the current EL0 entry. Keeping
 // this bit in monitor-owned state lets ordinary entries avoid serializing the
 // instruction stream merely to write an already-disabled debug register.
 #define TTC_STATE_DEBUG_STEP_ACTIVE_OFFSET 0x3358
+// Hypervisor.framework defines guest CNTVCT as mach_absolute_time minus the
+// VM-wide VTimer offset. Adding it back implements Darwin mach_absolute_time
+// while leaving guest CNTVCT in Sentry's host architectural-counter domain.
+#define TTC_STATE_VTIMER_OFFSET_OFFSET 0x3360
 // Darwin's Go runtime reaches these two functions while Sentry is resident at
 // EL1. The host publishes their process-local PCs plus a counter-to-realtime
 // calibration so the monitor can provide the Linux-VDSO-equivalent fast path
@@ -118,6 +128,7 @@
 #define TTC_EXIT_FAULT 2
 #define TTC_EXIT_INTERRUPTED 3
 #define TTC_EXIT_EXCEPTION 4
+#define TTC_EXIT_RETRY 6
 
 #ifndef __ASSEMBLER__
 

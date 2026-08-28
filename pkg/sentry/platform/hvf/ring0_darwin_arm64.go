@@ -197,11 +197,122 @@ struct ttc_ring0_time_fastpath {
 	int64_t realtime_offset_ns;
 };
 
+#define TTC_RING0_MAX_APPLICATION_VCPUS 63u
+
+struct ttc_ring0_native_domain_slot {
+	_Atomic uint32_t allocated;
+	_Atomic uint32_t active;
+	_Atomic uint64_t tpidrro_el0;
+};
+
+// Darwin's C thread-local ABI calls __tlv_get_addr, which is itself a host
+// library service and therefore cannot be used by a guest-resident callback.
+// Use a fixed process-data table keyed by TPIDRRO_EL0 instead. TPIDRRO_EL0 is
+// readable at both host EL0 and guest EL1, and each slot outlives its bridge's
+// final guest exit, so the callback requires neither a lock nor a live pointer.
+static struct ttc_ring0_native_domain_slot
+		ttc_ring0_native_domains[TTC_RING0_MAX_APPLICATION_VCPUS];
+
+struct ttc_runtime_time_query {
+	uint32_t version;
+	uint32_t clock;
+	int64_t seconds;
+	int32_t nanoseconds;
+	uint32_t reserved;
+};
+
+_Static_assert(sizeof(struct ttc_runtime_time_query) == 24,
+		"Darwin runtime time hook ABI changed");
+
+static uintptr_t ttc_ring0_strip_instruction_pointer(uintptr_t address);
+
+static uint64_t ttc_ring0_host_cntvct(void) {
+	uint64_t value;
+	__asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(value));
+	return value;
+}
+
+static uint64_t ttc_ring0_scale_ticks(uint64_t ticks, uint64_t numer,
+		uint64_t denom) {
+	return (ticks / denom) * numer + ((ticks % denom) * numer) / denom;
+}
+
+// Darwin traps CurrentEL at host EL0. The SIGILL bridge recognizes the first
+// instruction of this naked helper and supplies zero there; at guest EL1 the
+// instruction executes normally and returns one. The native-domain table
+// remains the fast reject so ordinary host clocks do not pay for this probe.
+static uint64_t ttc_ring0_runtime_current_el(void)
+		__attribute__((naked, noinline));
+
+static uint64_t ttc_ring0_runtime_current_el(void) {
+	__asm__ volatile(
+		"mrs x0, CurrentEL\n"
+		"lsr x0, x0, #2\n"
+		"ret\n");
+}
+
+// ttc_ring0_runtime_time_hook runs before Darwin's Go runtime enters
+// libcCall. On native threads outside hv_vcpu_run it declines so the stock
+// runtime path remains authoritative. During guest execution, TPIDR_EL1 names
+// the permanent vCPU state page containing the VM-wide clock calibration.
+static int32_t ttc_ring0_runtime_time_hook(
+		struct ttc_runtime_time_query *query) {
+	uint64_t thread_pointer;
+	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
+	bool in_guest = false;
+	for (size_t i = 0; i < TTC_RING0_MAX_APPLICATION_VCPUS; ++i) {
+		struct ttc_ring0_native_domain_slot *slot =
+				&ttc_ring0_native_domains[i];
+		if (atomic_load_explicit(&slot->active, memory_order_acquire) != 0 &&
+				atomic_load_explicit(&slot->tpidrro_el0,
+				memory_order_relaxed) == thread_pointer) {
+			in_guest = true;
+			break;
+		}
+	}
+	if (!in_guest) return 0;
+	if (ttc_ring0_runtime_current_el() == 0) return 0;
+	if (query == NULL || query->version != 1 ||
+			(query->clock != 1 && query->clock != 2)) return -1;
+	const uint8_t *state;
+	__asm__ volatile("mrs %0, tpidr_el1" : "=r"(state));
+	uint64_t numer;
+	uint64_t denom;
+	uint64_t vtimer_offset;
+	int64_t realtime_offset;
+	__builtin_memcpy(&numer, state + TTC_STATE_TIMEBASE_NUMER_OFFSET,
+			sizeof(numer));
+	__builtin_memcpy(&denom, state + TTC_STATE_TIMEBASE_DENOM_OFFSET,
+			sizeof(denom));
+	__builtin_memcpy(&vtimer_offset,
+			state + TTC_STATE_VTIMER_OFFSET_OFFSET, sizeof(vtimer_offset));
+	__builtin_memcpy(&realtime_offset,
+			state + TTC_STATE_REALTIME_OFFSET_NS_OFFSET,
+			sizeof(realtime_offset));
+	if (numer == 0 || denom == 0) return -1;
+	uint64_t ticks = ttc_ring0_host_cntvct();
+	uint64_t ns;
+	if (query->clock == 1) {
+		ns = ttc_ring0_scale_ticks(ticks, numer, denom) +
+				(uint64_t)realtime_offset;
+	} else {
+		ns = ttc_ring0_scale_ticks(ticks + vtimer_offset, numer, denom);
+	}
+	query->seconds = (int64_t)(ns / UINT64_C(1000000000));
+	query->nanoseconds = (int32_t)(ns % UINT64_C(1000000000));
+	return 1;
+}
+
+static uintptr_t ttc_ring0_runtime_time_hook_address(void) {
+	return ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_time_hook);
+}
+
 // ttc_ring0_calibrate_time_fastpath binds the process-local Darwin helper PCs
-// and relates CNTVCT_EL0/mach_absolute_time to CLOCK_REALTIME. The midpoint of
-// the bracketing counter reads bounds calibration error by the duration of one
-// host clock_gettime call. Apple Silicon exposes CNTVCT in the same domain as
-// mach_absolute_time; backend qualification tests enforce that contract.
+// and relates host CNTVCT_EL0 to CLOCK_REALTIME. The midpoint of the
+// bracketing counter reads bounds calibration error by the duration of one
+// host clock_gettime call. HVF applies the VM-wide VTimer offset separately so
+// guest CNTVCT remains in this same architectural-counter domain.
 static int ttc_ring0_calibrate_time_fastpath(
 		struct ttc_ring0_time_fastpath *result) {
 	mach_timebase_info_data_t timebase;
@@ -209,10 +320,10 @@ static int ttc_ring0_calibrate_time_fastpath(
 			timebase.numer == 0 || timebase.denom == 0) {
 		return EINVAL;
 	}
-	uint64_t before = mach_absolute_time();
+	uint64_t before = ttc_ring0_host_cntvct();
 	struct timespec realtime;
 	if (clock_gettime(CLOCK_REALTIME, &realtime) != 0) return errno;
-	uint64_t after = mach_absolute_time();
+	uint64_t after = ttc_ring0_host_cntvct();
 	uint64_t midpoint = before + (after - before) / 2;
 	__uint128_t counter_ns = (__uint128_t)midpoint * timebase.numer /
 		timebase.denom;
@@ -223,8 +334,10 @@ static int ttc_ring0_calibrate_time_fastpath(
 		return EOVERFLOW;
 	}
 	*result = (struct ttc_ring0_time_fastpath){
-		.clock_gettime_pc = (uintptr_t)&clock_gettime,
-		.mach_absolute_time_pc = (uintptr_t)&mach_absolute_time,
+		.clock_gettime_pc = ttc_ring0_strip_instruction_pointer(
+				(uintptr_t)&clock_gettime),
+		.mach_absolute_time_pc = ttc_ring0_strip_instruction_pointer(
+				(uintptr_t)&mach_absolute_time),
 		.numer = timebase.numer,
 		.denom = timebase.denom,
 		.realtime_offset_ns = (int64_t)offset,
@@ -237,12 +350,15 @@ struct ttc_ring0_bridge {
 	hv_vcpu_t vcpu;
 	const hv_vcpu_exit_t *exit;
 	uint64_t ttbr0;
+	uint64_t ttbr1;
+	uint64_t vector_va;
 	uint64_t state_va;
 	uintptr_t state_host;
-	uintptr_t native_resume_pc;
 	uintptr_t guest_switch_pc;
 	uint32_t destroy_on_host;
+	uint32_t native_domain_slot;
 	_Atomic uint32_t destroy_requested;
+	_Atomic uint32_t external_interrupt_requested;
 	_Atomic uint32_t error;
 	_Atomic uint32_t error_phase;
 	_Atomic uint32_t in_guest;
@@ -257,16 +373,13 @@ struct ttc_ring0_bridge {
 	_Atomic uint64_t entry_tid;
 	_Atomic uint32_t preflight_status;
 	_Atomic uint32_t preflight_stack_status;
-	_Atomic uint32_t native_probe_status;
 	ucontext_t host_context;
 	struct __darwin_mcontext64 host_mcontext;
 	void *host_stack;
 	size_t host_stack_size;
-	uint64_t bootstrap[9];
 	struct ttc_ring0_bridge *registry_next;
 };
 
-#define TTC_RING0_MAX_APPLICATION_VCPUS 63u
 #define TTC_RING0_HOST_SLAB_SIZE UINT64_C(16384)
 #define TTC_RUNTIME_VM_MUTATION_VERSION 1u
 #define TTC_RUNTIME_VM_MMAP 1u
@@ -314,11 +427,15 @@ struct ttc_ring0_mirror_mapping {
 
 static pthread_mutex_t ttc_ring0_mutation_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ttc_ring0_bridge_registry_mu = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic uint32_t ttc_ring0_guest_blocked;
+// Number of overlapping secondary-MMU transactions that require every EL0
+// application and EL1 Sentry continuation to remain stopped. Transactions are
+// serialized while they change the stage-2 registry, but an engine-driven
+// mirror reconciliation releases mutation_mu between individual HVF calls.
+// A count, rather than a boolean, prevents a nested Go-runtime mutation from
+// reopening admission before the outer reconciliation is complete.
+static _Atomic uint32_t ttc_ring0_guest_pause_count;
 static struct ttc_ring0_bridge *ttc_ring0_bridges;
 static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
-
-static uintptr_t ttc_ring0_strip_instruction_pointer(uintptr_t address);
 
 static uint64_t *ttc_ring0_mapping_registered(
 		struct ttc_ring0_mirror_mapping *mapping) {
@@ -369,17 +486,17 @@ static bool ttc_ring0_mapping_slab_overlaps(
 }
 
 // Guest admission is a lock-free read side. The second blocked sample closes
-// the race with a writer that publishes guest_blocked immediately after the
+// the race with a writer that publishes a guest pause immediately after the
 // first sample. The writer cannot finish draining while in_guest remains set.
 static void ttc_ring0_admit_guest(struct ttc_ring0_bridge *bridge) {
 	for (;;) {
-		while (atomic_load_explicit(&ttc_ring0_guest_blocked,
+		while (atomic_load_explicit(&ttc_ring0_guest_pause_count,
 				memory_order_acquire) != 0) {
 			sched_yield();
 		}
 		atomic_store_explicit(&bridge->in_guest, 1,
 				memory_order_seq_cst);
-		if (atomic_load_explicit(&ttc_ring0_guest_blocked,
+		if (atomic_load_explicit(&ttc_ring0_guest_pause_count,
 				memory_order_seq_cst) == 0) {
 			return;
 		}
@@ -391,8 +508,16 @@ static void ttc_ring0_admit_guest(struct ttc_ring0_bridge *bridge) {
 // The caller holds mutation_mu, which also stabilizes the mirror registry.
 static int ttc_ring0_begin_runtime_mutation_locked(void) {
 	int status;
-	atomic_store_explicit(&ttc_ring0_guest_blocked, 1,
-			memory_order_seq_cst);
+	uint32_t previous = atomic_fetch_add_explicit(
+			&ttc_ring0_guest_pause_count, 1, memory_order_seq_cst);
+	if (previous == UINT32_MAX) {
+		atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
+				memory_order_release);
+		return EOVERFLOW;
+	}
+	// mutation_mu serializes pause establishment. A nonzero predecessor has
+	// already drained every registered bridge before releasing that mutex.
+	if (previous != 0) return 0;
 
 	status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
 	if (status != 0) goto fail;
@@ -434,15 +559,84 @@ static int ttc_ring0_begin_runtime_mutation_locked(void) {
 fail_registry:
 	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 fail:
-	atomic_store_explicit(&ttc_ring0_guest_blocked, 0,
+	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
 			memory_order_release);
 	return status;
 }
 
 static void ttc_ring0_end_runtime_mutation(void) {
-	atomic_store_explicit(&ttc_ring0_guest_blocked, 0,
+	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
 			memory_order_release);
 	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+}
+
+// Establish an exact-context guest pause while releasing mutation_mu so the
+// caller can perform one native operation through the ordinary serialized HVF
+// APIs. Nesting with a concurrent runtime VM callback is reference-counted.
+static int32_t ttc_ring0_pause_guest_execution(void) {
+	int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	if (status != 0) return status;
+	status = ttc_ring0_begin_runtime_mutation_locked();
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	return status;
+}
+
+static void ttc_ring0_resume_guest_execution(void) {
+	pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
+			memory_order_release);
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+}
+
+// Publish a local stage-1 flush to every application vCPU before reopening
+// guest admission. The Go-side MMU generation is updated only after this
+// native frame returns. Without this publication, a host-resident reader that
+// passed entry admission immediately before the pause can resume in the small
+// interval between the monitor acknowledgement and that Go update.
+static int ttc_ring0_request_application_tlb_flushes(void) {
+	int status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
+	if (status != 0) return status;
+	for (struct ttc_ring0_bridge *bridge = ttc_ring0_bridges;
+			bridge != NULL; bridge = bridge->registry_next) {
+		if (atomic_load_explicit(&bridge->destroyed,
+				memory_order_acquire) != 0) {
+			continue;
+		}
+		_Atomic uint64_t *requested = (_Atomic uint64_t *)(
+				bridge->state_host + TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET);
+		atomic_store_explicit(requested, 1, memory_order_release);
+	}
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+	return 0;
+}
+
+// Pause only for the native monitor execution interval. Keeping both pause
+// endpoints in this C frame is essential: an EL1 Sentry may be stopped in the
+// shared Go runtime, so executing Go allocation, channel, or safepoint code
+// before reopening admission can deadlock a concurrent GC cycle.
+static int32_t ttc_ring0_run_monitor_paused(uint64_t raw_vcpu,
+		uintptr_t raw_exit) {
+	int status = ttc_ring0_pause_guest_execution();
+	if (status != 0) return (int32_t)HV_ERROR;
+	hv_vcpu_t vcpu = (hv_vcpu_t)raw_vcpu;
+	hv_vcpu_exit_t *exit = (hv_vcpu_exit_t *)raw_exit;
+	hv_return_t hv_status;
+	for (;;) {
+		hv_status = hv_vcpu_run(vcpu);
+		if (hv_status != HV_SUCCESS) break;
+		if (exit->reason == HV_EXIT_REASON_CANCELED) continue;
+		if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+			(void)hv_vcpu_set_vtimer_mask(vcpu, true);
+			continue;
+		}
+		break;
+	}
+	if (hv_status == HV_SUCCESS) {
+		status = ttc_ring0_request_application_tlb_flushes();
+		if (status != 0) hv_status = HV_ERROR;
+	}
+	ttc_ring0_resume_guest_execution();
+	return (int32_t)hv_status;
 }
 
 static hv_memory_flags_t ttc_ring0_memory_flags(uint32_t access) {
@@ -809,45 +1003,28 @@ static int ttc_ring0_replace_tracked_host_mapping(uintptr_t address,
 }
 
 // HVF vCPUs and their bridges are owner-thread affine. Keep the active bridge
-// in native TLS so a host return at nativeResume remains identifiable even if
-// guest execution has already repurposed X8.
+// in native TLS so a continuation redpilled immediately before the guest-entry
+// probe remains identifiable after application registers repurpose X8.
 static _Thread_local struct ttc_ring0_bridge *ttc_ring0_active_bridge;
 
-// These are exact instruction counts from bridge_darwin_arm64.s. A canceled
-// vCPU must not export any PC in either entry trampoline as a Darwin
-// continuation: the registers and stack already have guest-only meanings.
-// Resuming inside the VM is safe because the pending interrupt/cancel word is
-// consumed by the monitor before entering the application.
-#define TTC_RING0_NATIVE_RESUME_BYTES (11u * 4u)
+// This is the exact instruction count of SwitchApplicationGuest. A canceled
+// vCPU must not export a PC in the entry trampoline as a Darwin continuation:
+// its registers and stack already have guest-only meanings. Resuming inside
+// the VM is safe because the monitor consumes the pending cancellation.
 #define TTC_RING0_GUEST_SWITCH_BYTES (10u * 4u)
 
 static bool ttc_ring0_pc_in_entry_trampoline(
 		const struct ttc_ring0_bridge *bridge, uint64_t pc) {
-	return (pc >= bridge->native_resume_pc &&
-			pc < bridge->native_resume_pc + TTC_RING0_NATIVE_RESUME_BYTES) ||
-		(pc >= bridge->guest_switch_pc &&
-			pc < bridge->guest_switch_pc + TTC_RING0_GUEST_SWITCH_BYTES);
+	return pc >= bridge->guest_switch_pc &&
+			pc < bridge->guest_switch_pc + TTC_RING0_GUEST_SWITCH_BYTES;
 }
-
-struct ttc_ring0_bootstrap {
-	uint64_t pc;
-	uint64_t sp;
-	uint64_t fp;
-	uint64_t lr;
-	uint64_t x8;
-	uint64_t x9;
-	uint64_t x18;
-	uint64_t x28;
-	uint64_t x19;
-};
-
-_Static_assert(sizeof(struct ttc_ring0_bootstrap) == 72,
-		"ring0 bootstrap ABI changed");
 
 #define TTC_RING0_BRIDGE_ERROR_OFFSET \
 	offsetof(struct ttc_ring0_bridge, error)
 #define TTC_RING0_BRIDGE_DESTROY_REQUESTED_OFFSET \
 	offsetof(struct ttc_ring0_bridge, destroy_requested)
+#define TTC_RING0_BRIDGE_EXTERNAL_INTERRUPT_REQUESTED_OFFSET \
+	offsetof(struct ttc_ring0_bridge, external_interrupt_requested)
 #define TTC_RING0_BRIDGE_ERROR_PHASE_OFFSET \
 	offsetof(struct ttc_ring0_bridge, error_phase)
 #define TTC_RING0_BRIDGE_IN_GUEST_OFFSET \
@@ -959,8 +1136,6 @@ static void ttc_ring0_fatal_diagnostic(struct ttc_ring0_bridge *bridge,
 			&bridge->preflight_status, memory_order_acquire));
 	TTC_DIAG_FIELD(" preflight_stack_status=", atomic_load_explicit(
 			&bridge->preflight_stack_status, memory_order_acquire));
-	TTC_DIAG_FIELD(" native_probe_status=", atomic_load_explicit(
-			&bridge->native_probe_status, memory_order_acquire));
 	TTC_DIAG_FIELD(" reason=", bridge->exit->reason);
 	TTC_DIAG_FIELD(" syndrome=", bridge->exit->exception.syndrome);
 	TTC_DIAG_FIELD(" exit=", ttc_ring0_state_u64(bridge,
@@ -1012,6 +1187,30 @@ static int ttc_ring0_load_context(struct ttc_ring0_bridge *bridge,
 	arm_neon_state64_t *ns = &ucontext->uc_mcontext->__ns;
 	hv_return_t status;
 	*phase_out = TTC_RING0_PHASE_NONE;
+	// Re-establish the complete EL1 execution regime at every bluepill. HVF may
+	// discard system-register state while a vCPU is resident in host EL0; only
+	// restoring TTBR0 leaves a later application entry running with a zero TCR,
+	// TTBR1, or VBAR. These calls occur once per host residency, never on the
+	// guest-resident Linux syscall path.
+	uint64_t tcr = 16ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) |
+		(16ULL << 16) | (1ULL << 24) | (1ULL << 26) | (3ULL << 28) |
+		(2ULL << 30) | (2ULL << 32) | (1ULL << 36);
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TCR_EL1,
+			tcr)) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_MAIR_EL1,
+			UINT64_C(0xff))) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TTBR1_EL1,
+			bridge->ttbr1)) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_VBAR_EL1,
+			bridge->vector_va)) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TPIDR_EL1,
+			bridge->state_va)) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_CPACR_EL1,
+			UINT64_C(3) << 20)) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_CNTKCTL_EL1,
+			UINT64_C(2))) != HV_SUCCESS) return status;
+	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_SCTLR_EL1,
+			UINT64_C(0x34909185))) != HV_SUCCESS) return status;
 	for (int i = 0; i < 29; ++i) {
 		*phase_out = TTC_RING0_PHASE_LOAD_X0 + (uint32_t)i;
 		status = hv_vcpu_set_reg(bridge->vcpu, (hv_reg_t)(HV_REG_X0 + i),
@@ -1210,12 +1409,62 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 	}
 	ttc_ring0_admit_guest(bridge);
 	for (;;) {
+		struct ttc_ring0_native_domain_slot *domain =
+				&ttc_ring0_native_domains[bridge->native_domain_slot];
+		atomic_store_explicit(&domain->tpidrro_el0,
+				ttc_ring0_read_tpidrro_el0(), memory_order_relaxed);
+		atomic_store_explicit(&domain->active, 1, memory_order_release);
 		status = hv_vcpu_run(bridge->vcpu);
+		atomic_store_explicit(&domain->active, 0, memory_order_release);
 		if (status != HV_SUCCESS) {
 			ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
 					&host_ns, (uint32_t)status, TTC_RING0_PHASE_RUN);
 		}
 		if (bridge->exit->reason == HV_EXIT_REASON_CANCELED) {
+			// A Go runtime mapping mutation is a process-wide secondary-MMU
+			// rendezvous, not an application interrupt. hv_vcpu_run has already
+			// returned on this owner thread, so publish the vCPU quiescent and
+			// leave its complete EL0/EL1 architectural context untouched. The
+			// mutation thread can now suspend/rebind the affected stage-2 lease;
+			// admission resumes this exact context only after the lease is stable.
+			if (atomic_load_explicit(&ttc_ring0_guest_pause_count,
+					memory_order_acquire) != 0) {
+				uint64_t pstate = 0;
+				status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_CPSR,
+						&pstate);
+				if (status != HV_SUCCESS) {
+					ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+							&host_ns, (uint32_t)status,
+							TTC_RING0_PHASE_CANCEL_PSTATE);
+				}
+				if ((pstate & 0xf) == 0) {
+					// A page-table transaction cannot resume a stopped EL0
+					// context directly: that would bypass the per-vCPU local TLB
+					// generation check. Route it through the monitor's IRQ exit;
+					// Sentry transparently retries when cancel_requested is zero.
+					bool external = atomic_exchange_explicit(
+							&bridge->external_interrupt_requested, 0,
+							memory_order_acq_rel) != 0;
+					uint64_t exit_kind = external || atomic_load_explicit(
+							&bridge->destroy_requested, memory_order_acquire) != 0
+							? TTC_EXIT_INTERRUPTED : TTC_EXIT_RETRY;
+					atomic_store_explicit((_Atomic uint64_t *)((uint8_t *)
+							bridge->state_host +
+							TTC_STATE_PENDING_INTERRUPT_EXIT_KIND_OFFSET),
+							exit_kind, memory_order_release);
+					status = hv_vcpu_set_pending_interrupt(bridge->vcpu,
+							HV_INTERRUPT_TYPE_IRQ, true);
+					if (status != HV_SUCCESS) {
+						ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+								&host_ns, (uint32_t)status,
+								TTC_RING0_PHASE_CANCEL_IRQ);
+					}
+				}
+				atomic_store_explicit(&bridge->in_guest, 0,
+						memory_order_release);
+				ttc_ring0_admit_guest(bridge);
+				continue;
+			}
 			uint64_t pstate = 0;
 			status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_CPSR, &pstate);
 			if (status != HV_SUCCESS) {
@@ -1237,9 +1486,21 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 			atomic_fetch_add_explicit(&bridge->cancel_count, 1,
 					memory_order_release);
 			if ((pstate & 0xf) == 0) {
-				// Convert cancellation during EL0 execution to an architected
-				// IRQ. The monitor snapshots the application and restores the
-				// waiting Sentry continuation before execution proceeds.
+				// Convert cancellation during EL0 execution to an architected IRQ.
+				// The native bridge publishes whether the exit is an external Sentry
+				// cancellation or an internal MMU retry before asserting the line;
+				// the monitor snapshots the application and restores the waiting
+				// Sentry continuation.
+				bool external = atomic_exchange_explicit(
+						&bridge->external_interrupt_requested, 0,
+						memory_order_acq_rel) != 0;
+				uint64_t exit_kind = external || atomic_load_explicit(
+						&bridge->destroy_requested, memory_order_acquire) != 0
+						? TTC_EXIT_INTERRUPTED : TTC_EXIT_RETRY;
+				atomic_store_explicit((_Atomic uint64_t *)((uint8_t *)
+						bridge->state_host +
+						TTC_STATE_PENDING_INTERRUPT_EXIT_KIND_OFFSET),
+						exit_kind, memory_order_release);
 				status = hv_vcpu_set_pending_interrupt(bridge->vcpu,
 						HV_INTERRUPT_TYPE_IRQ, true);
 				if (status == HV_SUCCESS) continue;
@@ -1247,13 +1508,11 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 						&host_ns, (uint32_t)status,
 						TTC_RING0_PHASE_CANCEL_IRQ);
 			}
-			// A cancellation can win immediately after the native host entry
-			// publishes in_guest but before HVF executes the first EL1
-			// instruction. nativeResume begins with an EL1-only TPIDR_EL1 read;
-			// exporting that untouched bootstrap PC as a Darwin continuation
-			// would turn the controlled cancellation into an unhandled SIGILL.
-			// Let the vCPU reach the monitor/application boundary, where the
-			// already-pending cancellation is converted to an IRQ or redpill.
+			// A cancellation can win while SwitchApplicationGuest has already
+			// adopted guest-only register/stack meanings. Exporting that PC as a
+			// Darwin continuation would turn the controlled transfer into an
+			// unhandled SIGILL. Let the vCPU reach the monitor/application
+			// boundary, where the pending cancellation becomes an IRQ or redpill.
 			if (ttc_ring0_pc_in_entry_trampoline(bridge, pc)) {
 				continue;
 			}
@@ -1264,6 +1523,8 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 					pc - TTC_MONITOR_CODE_VA < TTC_MONITOR_CODE_CAPACITY) {
 				continue;
 			}
+			atomic_store_explicit(&bridge->external_interrupt_requested, 0,
+					memory_order_release);
 			status = ttc_ring0_save_context(bridge, ucontext, 0);
 			if (status != HV_SUCCESS) {
 				ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
@@ -1278,6 +1539,26 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 			continue;
 		}
 		uint64_t hvc = bridge->exit->exception.syndrome & 0xffff;
+		if (bridge->exit->reason == HV_EXIT_REASON_EXCEPTION &&
+				((bridge->exit->exception.syndrome >> 26) & 0x3f) == 0x16 &&
+				hvc == TTC_RING0_HVC_INTERRUPT_ACK) {
+			// Virtual IRQ/FIQ inputs are level-triggered. The monitor has saved
+			// the interrupted application state and cannot lower an HVF-owned
+			// input itself, so acknowledge it here before allowing the handler
+			// to restore the waiting Sentry continuation.
+			status = hv_vcpu_set_pending_interrupt(bridge->vcpu,
+					HV_INTERRUPT_TYPE_IRQ, false);
+			if (status == HV_SUCCESS) {
+				status = hv_vcpu_set_pending_interrupt(bridge->vcpu,
+						HV_INTERRUPT_TYPE_FIQ, false);
+			}
+			if (status != HV_SUCCESS) {
+				ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+						&host_ns, (uint32_t)status,
+						TTC_RING0_PHASE_CANCEL_IRQ);
+			}
+			continue;
+		}
 		if (bridge->exit->reason != HV_EXIT_REASON_EXCEPTION ||
 				((bridge->exit->exception.syndrome >> 26) & 0x3f) != 0x16 ||
 				(hvc != TTC_RING0_HVC_REDPILL &&
@@ -1334,11 +1615,11 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 }
 
 static uintptr_t ttc_ring0_bluepill_pc;
-static uintptr_t ttc_ring0_native_resume_pc;
 static uintptr_t ttc_ring0_guest_switch_pc;
 static uintptr_t ttc_ring0_host_gate_pc;
 static uintptr_t ttc_ring0_restore_pc;
 static uintptr_t ttc_ring0_current_el_pc;
+static uintptr_t ttc_ring0_runtime_current_el_pc;
 static struct sigaction ttc_ring0_previous_sigill;
 static _Atomic uint32_t ttc_ring0_handler_installed;
 
@@ -1392,7 +1673,8 @@ static void ttc_ring0_sigill(int signo, siginfo_t *info, void *context) {
 		ttc_ring0_set_pc(ss, pc + 4);
 		return;
 	}
-	if (pc == ttc_ring0_current_el_pc) {
+	if (pc == ttc_ring0_current_el_pc ||
+			pc == ttc_ring0_runtime_current_el_pc) {
 		// CurrentEL is deliberately executed before selecting or creating an
 		// owner-affine vCPU. At host EL0, report zero and skip the trapped MRS.
 		ss->__x[0] = 0;
@@ -1410,28 +1692,27 @@ static void ttc_ring0_sigill(int signo, siginfo_t *info, void *context) {
 			ttc_ring0_forward_sigill(signo, info, context);
 			return;
 		}
-		uint64_t interrupted = 3;
+		// This is an internal entry retry, distinct from the monitor's
+		// architected EL0 interrupt exit (3).
+		uint64_t retry = 5;
 		__builtin_memcpy((uint8_t *)bridge->state_host +
-				TTC_STATE_EXIT_KIND_OFFSET, &interrupted,
-				sizeof(interrupted));
+				TTC_STATE_EXIT_KIND_OFFSET, &retry, sizeof(retry));
 		atomic_thread_fence(memory_order_release);
 		ttc_ring0_set_pc(ss, ttc_ring0_get_lr(ss));
 		return;
 	}
-	if (pc != ttc_ring0_bluepill_pc && pc != ttc_ring0_native_resume_pc) {
+	if (pc != ttc_ring0_bluepill_pc) {
 		ttc_ring0_forward_sigill(signo, info, context);
 		return;
 	}
-	struct ttc_ring0_bridge *bridge = pc == ttc_ring0_native_resume_pc ?
-		ttc_ring0_active_bridge :
+	struct ttc_ring0_bridge *bridge =
 		(struct ttc_ring0_bridge *)(uintptr_t)ss->__x[8];
 	if (bridge == NULL || bridge->magic != TTC_RING0_BRIDGE_MAGIC) {
 		ttc_ring0_forward_sigill(signo, info, context);
 		return;
 	}
-	// Both entry mechanisms establish the owner-thread residency. Native entry
-	// publishes this before calling host_entry; the signal entry must do the
-	// same before a cancellation can export the continuation back to Darwin.
+	// Establish the owner-thread residency before a cancellation can export the
+	// continuation back to Darwin.
 	// SwitchApplicationGuest's controlled host-side TPIDR_EL1 trap relies on
 	// this TLS slot to turn that redpill race into ExitInterrupted.
 	ttc_ring0_active_bridge = bridge;
@@ -1459,13 +1740,12 @@ static void ttc_ring0_sigill(int signo, siginfo_t *info, void *context) {
 }
 
 static int ttc_ring0_install_sigill(uintptr_t bluepill_pc,
-		uintptr_t native_resume_pc, uintptr_t guest_switch_pc,
+		uintptr_t guest_switch_pc,
 		uintptr_t host_gate_pc,
 		uintptr_t current_el_pc) {
 	if (atomic_load_explicit(&ttc_ring0_handler_installed,
 			memory_order_acquire) != 0) {
 		return ttc_ring0_bluepill_pc == bluepill_pc &&
-			ttc_ring0_native_resume_pc == native_resume_pc &&
 			ttc_ring0_guest_switch_pc == guest_switch_pc &&
 			ttc_ring0_host_gate_pc == host_gate_pc &&
 			ttc_ring0_current_el_pc == current_el_pc ? 0 : EBUSY;
@@ -1479,10 +1759,11 @@ static int ttc_ring0_install_sigill(uintptr_t bluepill_pc,
 		return errno;
 	}
 	ttc_ring0_bluepill_pc = bluepill_pc;
-	ttc_ring0_native_resume_pc = native_resume_pc;
 	ttc_ring0_guest_switch_pc = guest_switch_pc;
 	ttc_ring0_host_gate_pc = host_gate_pc;
 	ttc_ring0_current_el_pc = current_el_pc;
+	ttc_ring0_runtime_current_el_pc = ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_current_el);
 	ttc_ring0_restore_pc = ttc_ring0_strip_instruction_pointer(
 			(uintptr_t)&ttc_ring0_restore_trap);
 	atomic_store_explicit(&ttc_ring0_handler_installed, 1,
@@ -1491,9 +1772,9 @@ static int ttc_ring0_install_sigill(uintptr_t bluepill_pc,
 }
 
 static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
-		const hv_vcpu_exit_t *exit, uint64_t ttbr0, uint64_t state_va,
-		uintptr_t state_host, uintptr_t native_resume_pc,
-		uintptr_t guest_switch_pc, int destroy_on_host) {
+		const hv_vcpu_exit_t *exit, uint64_t ttbr0, uint64_t ttbr1,
+		uint64_t vector_va, uint64_t state_va,
+		uintptr_t state_host, uintptr_t guest_switch_pc, int destroy_on_host) {
 	struct ttc_ring0_bridge *bridge = calloc(1, sizeof(*bridge));
 	if (bridge == NULL) return NULL;
 	bridge->host_stack_size = TTC_RING0_HOST_STACK_SIZE;
@@ -1507,14 +1788,34 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 	bridge->vcpu = vcpu;
 	bridge->exit = exit;
 	bridge->ttbr0 = ttbr0;
+	bridge->ttbr1 = ttbr1;
+	bridge->vector_va = vector_va;
 	bridge->state_va = state_va;
 	bridge->state_host = state_host;
-	bridge->native_resume_pc = native_resume_pc;
 	bridge->guest_switch_pc = guest_switch_pc;
 	bridge->destroy_on_host = destroy_on_host != 0;
+	bool reserved_domain = false;
+	for (uint32_t i = 0; i < TTC_RING0_MAX_APPLICATION_VCPUS; ++i) {
+		uint32_t expected = 0;
+		if (atomic_compare_exchange_strong_explicit(
+				&ttc_ring0_native_domains[i].allocated, &expected, 1,
+				memory_order_acq_rel, memory_order_relaxed)) {
+			bridge->native_domain_slot = i;
+			reserved_domain = true;
+			break;
+		}
+	}
+	if (!reserved_domain) {
+		(void)munmap(bridge->host_stack, bridge->host_stack_size);
+		free(bridge);
+		return NULL;
+	}
 	(void)pthread_threadid_np(NULL, &bridge->owner_tid);
 	(void)pthread_sigmask(SIG_SETMASK, NULL, &bridge->host_context.uc_sigmask);
 	if (pthread_mutex_lock(&ttc_ring0_bridge_registry_mu) != 0) {
+		atomic_store_explicit(
+				&ttc_ring0_native_domains[bridge->native_domain_slot].allocated,
+				0, memory_order_release);
 		(void)munmap(bridge->host_stack, bridge->host_stack_size);
 		free(bridge);
 		return NULL;
@@ -1595,48 +1896,9 @@ static uintptr_t ttc_ring0_bridge_host_stack_top(
 	return (uintptr_t)bridge->host_stack + bridge->host_stack_size;
 }
 
-static uintptr_t ttc_ring0_bridge_bootstrap(
-		struct ttc_ring0_bridge *bridge) {
-	return (uintptr_t)&bridge->bootstrap[0];
-}
-
 static uintptr_t ttc_ring0_bridge_probe_reg_address(void) {
 	return ttc_ring0_strip_instruction_pointer(
 			(uintptr_t)&ttc_ring0_bridge_probe_reg);
-}
-
-// Enter HVF without first crossing a POSIX signal frame. Production bridges
-// remain reusable for the lifetime of one thread-affine Sentry task residency;
-// an explicit residency boundary requests owner-thread destruction.
-static void ttc_ring0_native_entry(struct ttc_ring0_bridge *bridge,
-		const struct ttc_ring0_bootstrap *bootstrap)
-		__attribute__((noreturn));
-
-static void ttc_ring0_native_entry(struct ttc_ring0_bridge *bridge,
-		const struct ttc_ring0_bootstrap *bootstrap) {
-	ttc_ring0_active_bridge = bridge;
-	hv_return_t native_probe_status = ttc_ring0_bridge_probe_reg(bridge);
-	atomic_store_explicit(&bridge->native_probe_status,
-			(uint32_t)native_probe_status, memory_order_release);
-	__builtin_memset(&bridge->host_mcontext, 0, sizeof(bridge->host_mcontext));
-	bridge->host_context.uc_mcontext = &bridge->host_mcontext;
-	arm_thread_state64_t *ss = &bridge->host_mcontext.__ss;
-	ss->__x[8] = bootstrap->x8;
-	ss->__x[9] = bootstrap->x9;
-	ss->__x[18] = bootstrap->x18;
-	ss->__x[28] = bootstrap->x28;
-	ss->__x[19] = bootstrap->x19;
-	ttc_ring0_set_pc(ss, bootstrap->pc);
-	ttc_ring0_set_sp(ss, bootstrap->sp);
-	ttc_ring0_set_fp(ss, bootstrap->fp);
-	ttc_ring0_set_lr(ss, bootstrap->lr);
-
-	ttc_ring0_host_entry(bridge);
-}
-
-static uintptr_t ttc_ring0_native_entry_address(void) {
-	return ttc_ring0_strip_instruction_pointer(
-			(uintptr_t)&ttc_ring0_native_entry);
 }
 
 // ttc_ring0_bridge_probe_owner verifies that the bridge's vCPU is still
@@ -1660,6 +1922,11 @@ static void ttc_ring0_bridge_destroy(struct ttc_ring0_bridge *bridge) {
 	if (*link == bridge) *link = bridge->registry_next;
 	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 	if (ttc_ring0_active_bridge == bridge) ttc_ring0_active_bridge = NULL;
+	struct ttc_ring0_native_domain_slot *domain =
+			&ttc_ring0_native_domains[bridge->native_domain_slot];
+	atomic_store_explicit(&domain->active, 0, memory_order_release);
+	atomic_store_explicit(&domain->tpidrro_el0, 0, memory_order_relaxed);
+	atomic_store_explicit(&domain->allocated, 0, memory_order_release);
 	bridge->magic = 0;
 	if (bridge->host_stack != NULL && bridge->host_stack != MAP_FAILED) {
 		(void)munmap(bridge->host_stack, bridge->host_stack_size);
@@ -1701,16 +1968,17 @@ type ring0Bridge struct {
 }
 
 const (
-	ring0BridgeDestroyRequestedOffset = uintptr(C.TTC_RING0_BRIDGE_DESTROY_REQUESTED_OFFSET)
-	ring0BridgeErrorOffset            = uintptr(C.TTC_RING0_BRIDGE_ERROR_OFFSET)
-	ring0BridgeErrorPhaseOffset       = uintptr(C.TTC_RING0_BRIDGE_ERROR_PHASE_OFFSET)
-	ring0BridgeInGuestOffset          = uintptr(C.TTC_RING0_BRIDGE_IN_GUEST_OFFSET)
-	ring0BridgeDestroyedOffset        = uintptr(C.TTC_RING0_BRIDGE_DESTROYED_OFFSET)
-	ring0BridgeLastX0Offset           = uintptr(C.TTC_RING0_BRIDGE_LAST_X0_OFFSET)
-	ring0BridgeLastHostX0Offset       = uintptr(C.TTC_RING0_BRIDGE_LAST_HOST_X0_OFFSET)
-	ring0BridgeLastCancelPCOffset     = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PC_OFFSET)
-	ring0BridgeLastCancelPStateOffset = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PSTATE_OFFSET)
-	ring0BridgeCancelCountOffset      = uintptr(C.TTC_RING0_BRIDGE_CANCEL_COUNT_OFFSET)
+	ring0BridgeDestroyRequestedOffset  = uintptr(C.TTC_RING0_BRIDGE_DESTROY_REQUESTED_OFFSET)
+	ring0BridgeExternalInterruptOffset = uintptr(C.TTC_RING0_BRIDGE_EXTERNAL_INTERRUPT_REQUESTED_OFFSET)
+	ring0BridgeErrorOffset             = uintptr(C.TTC_RING0_BRIDGE_ERROR_OFFSET)
+	ring0BridgeErrorPhaseOffset        = uintptr(C.TTC_RING0_BRIDGE_ERROR_PHASE_OFFSET)
+	ring0BridgeInGuestOffset           = uintptr(C.TTC_RING0_BRIDGE_IN_GUEST_OFFSET)
+	ring0BridgeDestroyedOffset         = uintptr(C.TTC_RING0_BRIDGE_DESTROYED_OFFSET)
+	ring0BridgeLastX0Offset            = uintptr(C.TTC_RING0_BRIDGE_LAST_X0_OFFSET)
+	ring0BridgeLastHostX0Offset        = uintptr(C.TTC_RING0_BRIDGE_LAST_HOST_X0_OFFSET)
+	ring0BridgeLastCancelPCOffset      = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PC_OFFSET)
+	ring0BridgeLastCancelPStateOffset  = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PSTATE_OFFSET)
+	ring0BridgeCancelCountOffset       = uintptr(C.TTC_RING0_BRIDGE_CANCEL_COUNT_OFFSET)
 )
 
 type ring0HostRegion struct {
@@ -1719,6 +1987,7 @@ type ring0HostRegion struct {
 	objectOffset uint64
 	objectID     uint64
 	protection   uint32
+	userTag      uint32
 	mainImage    bool
 }
 
@@ -1727,10 +1996,11 @@ type ring0TimeFastpath struct {
 	machAbsolutePC   uint64
 	numer            uint64
 	denom            uint64
+	vtimerOffset     uint64
 	realtimeOffsetNS int64
 }
 
-func calibrateRing0TimeFastpath() (ring0TimeFastpath, error) {
+func calibrateRing0TimeFastpath(vtimerOffset uint64) (ring0TimeFastpath, error) {
 	var calibration C.struct_ttc_ring0_time_fastpath
 	if errno := C.ttc_ring0_calibrate_time_fastpath(&calibration); errno != 0 {
 		return ring0TimeFastpath{}, fmt.Errorf("calibrating EL1 runtime clocks: errno %d", int(errno))
@@ -1740,6 +2010,7 @@ func calibrateRing0TimeFastpath() (ring0TimeFastpath, error) {
 		machAbsolutePC:   uint64(calibration.mach_absolute_time_pc),
 		numer:            uint64(calibration.numer),
 		denom:            uint64(calibration.denom),
+		vtimerOffset:     vtimerOffset,
 		realtimeOffsetNS: int64(calibration.realtime_offset_ns),
 	}
 	if result.clockGettimePC == 0 || result.machAbsolutePC == 0 || result.numer == 0 || result.denom == 0 {
@@ -1780,6 +2051,7 @@ func snapshotRing0HostRegions(limit uint64) ([]ring0HostRegion, error) {
 			objectOffset: uint64(region.object_offset),
 			objectID:     uint64(region.object_id),
 			protection:   uint32(region.protection),
+			userTag:      uint32(region.user_tag),
 			mainImage:    C.ttc_ring0_main_image(region.address, region.length) != 0,
 		})
 	}
@@ -1808,6 +2080,7 @@ func ring0HostRegionAt(target uintptr) (ring0HostRegion, bool, error) {
 		objectOffset: uint64(region.object_offset),
 		objectID:     uint64(region.object_id),
 		protection:   uint32(region.protection),
+		userTag:      uint32(region.user_tag),
 		mainImage:    C.ttc_ring0_main_image(region.address, region.length) != 0,
 	}, true, nil
 }
@@ -1822,7 +2095,6 @@ func copyRing0HostMemory(destination, source uintptr, length uint64) error {
 func installRing0SignalBridge() error {
 	if errno := C.ttc_ring0_install_sigill(
 		C.uintptr_t(ring0asm.BluepillTrapAddress()),
-		C.uintptr_t(ring0asm.NativeResumeTrapAddress()),
 		C.uintptr_t(ring0asm.SwitchApplicationGuestTrapAddress()),
 		C.uintptr_t(ring0asm.EnsureHostTrapAddress()),
 		C.uintptr_t(ring0asm.CurrentELTrapAddress())); errno != 0 {
@@ -1841,6 +2113,10 @@ func installRing0RuntimeVMMemoryHook() error {
 	)
 	if status != 0 {
 		return fmt.Errorf("installing Darwin runtime VM memory hook ABI v%d: status %d", ring0RuntimeVMMemoryHookVersion, status)
+	}
+	timeHook := uintptr(C.ttc_ring0_runtime_time_hook_address())
+	if status := ring0SetRuntimeTimeHook(1, timeHook); status != 0 {
+		return fmt.Errorf("installing Darwin runtime time hook ABI v1: status %d", status)
 	}
 	return nil
 }
@@ -1862,9 +2138,10 @@ func (v *hvfVCPU) newRing0Bridge(ttbr0 uint64, destroyOnHost bool) (*ring0Bridge
 		v.handle,
 		v.exit,
 		C.uint64_t(ttbr0),
+		C.uint64_t(v.monitor.ttbr1()),
+		C.uint64_t(monitorCodeVA+v.monitor.vectorOffset),
 		C.uint64_t(v.stateVA),
 		C.uintptr_t(v.stateHost),
-		C.uintptr_t(ring0asm.NativeResumeAddress()),
 		C.uintptr_t(ring0asm.SwitchApplicationGuestAddress()),
 		C.int(boolToInt(destroyOnHost)),
 	)
@@ -1903,6 +2180,15 @@ func (b *ring0Bridge) markDestroyed() {
 
 func (b *ring0Bridge) requestDestroy() {
 	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeDestroyRequestedOffset)), 1)
+	b.requestExternalInterrupt()
+}
+
+func (b *ring0Bridge) requestExternalInterrupt() {
+	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeExternalInterruptOffset)), 1)
+}
+
+func (b *ring0Bridge) clearExternalInterrupt() {
+	atomic.StoreUint32((*uint32)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeExternalInterruptOffset)), 0)
 }
 
 func (b *ring0Bridge) errorStatus() uint32 {
@@ -1998,18 +2284,6 @@ func (b *ring0Bridge) preflight() error {
 		status,
 		uint64(C.ttc_ring0_bridge_owner_tid(b.pointer)),
 		uint64(C.ttc_ring0_bridge_preflight_tid(b.pointer)))
-}
-
-func (b *ring0Bridge) hostStackTop() uintptr {
-	return uintptr(C.ttc_ring0_bridge_host_stack_top(b.pointer))
-}
-
-func (b *ring0Bridge) bootstrap() uintptr {
-	return uintptr(C.ttc_ring0_bridge_bootstrap(b.pointer))
-}
-
-func ring0NativeEntryAddress() uintptr {
-	return uintptr(C.ttc_ring0_native_entry_address())
 }
 
 func (b *ring0Bridge) lastX0() uint64 {
@@ -2115,6 +2389,10 @@ func unmapNativeStage2(gpa, length uint64, tracked bool) error {
 		return fmt.Errorf("hv_vm_unmap(gpa=%#x, length=%#x, tracked=%t) failed: %d", gpa, length, tracked, status)
 	}
 	return nil
+}
+
+func runNativeMonitorPaused(vcpu uint64, exit unsafe.Pointer) int32 {
+	return int32(C.ttc_ring0_run_monitor_paused(C.uint64_t(vcpu), C.uintptr_t(uintptr(exit))))
 }
 
 func (v *hvfVM) monitorAddressSpaceTTBR(id uint64) uint64 {
@@ -2312,6 +2590,7 @@ func ValidateRing0Continuation(vmInterface vmm.VM) error {
 			binary.LittleEndian.Uint64(state[stateInternalFAR:]),
 			binary.LittleEndian.Uint64(state[stateInternalELR:]),
 			binary.LittleEndian.Uint64(state[stateInternalVector:]))
+		bridge.requestExternalInterrupt()
 		requestErr := vcpu.RequestExit()
 		diagnostic += fmt.Sprintf(" cancellation={err=%v count=%d pc=%#x pstate=%#x}",
 			requestErr, bridge.cancelCount(), bridge.lastCancelPC(), bridge.lastCancelPState())

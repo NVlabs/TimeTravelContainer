@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	ring0SentryAddressSpaceID   = ^uint64(0) // Qualification/legacy mirror only.
+	ring0SentryAddressSpaceID   = ^uint64(0) // Sentry mirror and qualification only.
 	ring0HostVALimit            = uint64(1 << 48)
 	ring0HostMirrorGPAStart     = SentryMirrorIPAStart
 	ring0HostWorkingSetRadius   = uint64(256 << 10)
@@ -47,6 +47,7 @@ const (
 	stateApplicationFP          = 0x3000
 	stateRing0Entry             = 0x3340
 	stateTLBFlushRequested      = 0x2a68
+	stateVTimerOffset           = 0x3360
 	stateClockGettimePC         = 0x3368
 	stateMachAbsoluteTimePC     = 0x3370
 	stateTimebaseNumer          = 0x3378
@@ -109,8 +110,9 @@ type ring0Stage2Lease struct {
 
 type ring0Stage2Slab struct {
 	ring0Stage2Identity
-	lease *ring0Stage2Lease
-	gpa   uint64
+	lease     *ring0Stage2Lease
+	gpa       uint64
+	canonical bool
 }
 
 // ring0QuiescedMonitorExecutor bypasses the public mutation rendezvous after
@@ -148,6 +150,7 @@ type ring0Engine struct {
 	mirrorMu        sync.Mutex
 	stage2Slabs     map[uintptr]ring0Stage2Slab
 	stage1Access    map[uint64]monitorabi.Access
+	applicationGPAs map[uint64]map[uint64]uint64
 	nextMirrorGPA   uint64
 	faultMu         sync.Mutex
 	pendingMirror   map[uintptr]struct{}
@@ -206,7 +209,7 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 	if err := installRing0RuntimeVMMemoryHook(); err != nil {
 		return nil, err
 	}
-	timeFastpath, err := calibrateRing0TimeFastpath()
+	timeFastpath, err := calibrateRing0TimeFastpath(vm.monitor.vtimerOffset)
 	if err != nil {
 		return nil, err
 	}
@@ -215,17 +218,18 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		return nil, fmt.Errorf("creating HVF ring0 monitor vCPU: %w", err)
 	}
 	e := &ring0Engine{
-		vm:            vm,
-		monitorPool:   monitorPool,
-		concurrency:   vcpus,
-		timeFastpath:  timeFastpath,
-		stage2Slabs:   make(map[uintptr]ring0Stage2Slab),
-		stage1Access:  make(map[uint64]monitorabi.Access),
-		nextMirrorGPA: ring0HostMirrorGPAStart,
-		pendingMirror: make(map[uintptr]struct{}),
-		cpuIDs:        make([]bool, vcpus),
-		clockStop:     make(chan struct{}),
-		clockDone:     make(chan struct{}),
+		vm:              vm,
+		monitorPool:     monitorPool,
+		concurrency:     vcpus,
+		timeFastpath:    timeFastpath,
+		stage2Slabs:     make(map[uintptr]ring0Stage2Slab),
+		stage1Access:    make(map[uint64]monitorabi.Access),
+		applicationGPAs: make(map[uint64]map[uint64]uint64),
+		nextMirrorGPA:   ring0HostMirrorGPAStart,
+		pendingMirror:   make(map[uintptr]struct{}),
+		cpuIDs:          make([]bool, vcpus),
+		clockStop:       make(chan struct{}),
+		clockDone:       make(chan struct{}),
 	}
 	e.realtimeOffsetNS.Store(timeFastpath.realtimeOffsetNS)
 	var expander vmm.MonitorPoolExpander
@@ -245,6 +249,15 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		cleanupErr := e.releaseHostMirror()
 		monitorPool.Close()
 		return nil, errors.Join(err, cleanupErr)
+	}
+	for offset := uint64(0); offset < monitorStatesLength; offset += vmm.HostSlabSize {
+		address := vm.monitor.statesHost + uintptr(offset)
+		slab, ok := e.stage2Slabs[address]
+		if !ok || !slab.canonical || slab.gpa != monitorStatesGPA+offset {
+			cleanupErr := e.releaseHostMirror()
+			monitorPool.Close()
+			return nil, errors.Join(fmt.Errorf("Sentry monitor state slab %#x does not reuse canonical GPA %#x: slab=%+v present=%t", address, monitorStatesGPA+offset, slab, ok), cleanupErr)
+		}
 	}
 	e.sentryTTBR0 = vm.monitorAddressSpaceTTBR(ring0SentryAddressSpaceID)
 	if e.sentryTTBR0 == 0 {
@@ -283,11 +296,12 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 	return e.runMonitorCommand(ctx, encoded)
 }
 
-// lockApplicationEntries establishes the writer side of the stage-1
-// rendezvous. Readers publish entryActive in owner-local cache lines and then
-// recheck entryBlocked; a writer publishes entryBlocked first, so it cannot
-// miss an application that passed the initial check. The returned state owns
-// entryMutationMu and must be released with unlockApplicationEntries.
+// lockApplicationEntries serializes translation writers and prevents a
+// host-resident reader from crossing the application admission boundary.
+// The monitor's native run call performs the short exact-context pause for
+// readers already executing at EL0 or EL1; no Go code runs during that pause.
+// The returned state owns entryMutationMu and must be released with
+// unlockApplicationEntries.
 func (e *ring0Engine) lockApplicationEntries(ctx context.Context) error {
 	for !e.entryMutationMu.TryLock() {
 		if err := ctx.Err(); err != nil {
@@ -296,40 +310,7 @@ func (e *ring0Engine) lockApplicationEntries(ctx context.Context) error {
 		time.Sleep(50 * time.Microsecond)
 	}
 	e.entryBlocked.Store(true)
-	cleanup := true
-	defer func() {
-		if cleanup {
-			e.entryBlocked.Store(false)
-			e.entryMutationMu.Unlock()
-		}
-	}()
-	started := time.Now()
-	nextDiagnostic := started.Add(2 * time.Second)
-	for {
-		if err := e.kickApplicationEntries(); err != nil {
-			return err
-		}
-		cpus := e.pinApplicationCPUs()
-		active := 0
-		for _, cpu := range cpus {
-			if cpu.entryActive.Load() {
-				active++
-			}
-		}
-		e.unpinApplicationCPUs(cpus)
-		if active == 0 {
-			cleanup = false
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if !time.Now().Before(nextDiagnostic) {
-			e.writeApplicationWaitDiagnostic(hosttid.Current(), started)
-			nextDiagnostic = time.Now().Add(5 * time.Second)
-		}
-		runtime.Gosched()
-	}
+	return nil
 }
 
 func (e *ring0Engine) unlockApplicationEntries() {
@@ -367,6 +348,12 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 	if len(encoded) == 0 || len(encoded) > monitorCommandMax {
 		return nil, fmt.Errorf("invalid EL1 monitor command length %d", len(encoded))
 	}
+	command, commandErr := monitorabi.UnmarshalCommand(encoded)
+	if commandErr == nil {
+		if err := e.synchronizeExecutableMappings(command); err != nil {
+			return nil, err
+		}
+	}
 	var response []byte
 	if cpu := e.pinCurrentIdleApplicationCPU(); cpu != nil {
 		var err error
@@ -388,10 +375,97 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 			return nil, fmt.Errorf("HVF ring0 monitor returned %T, want []byte", value)
 		}
 	}
+	if commandErr == nil {
+		if decoded, err := monitorabi.UnmarshalResponse(response); err == nil && decoded.Status == monitorabi.StatusOK {
+			e.updateApplicationGPARecords(command)
+		}
+	}
 	if monitorCommandMutatesTranslations(encoded) {
 		e.mmuGeneration.Add(1)
 	}
 	return response, nil
+}
+
+// synchronizeExecutableMappings completes the Darwin writer-side cache
+// protocol before the monitor publishes an executable stage-1 leaf. Map
+// operations carry their GPA directly; protect operations resolve it from
+// acknowledged host records plus earlier operations in the same ordered batch.
+func (e *ring0Engine) synchronizeExecutableMappings(command monitorabi.Command) error {
+	if command.Opcode != monitorabi.OpcodeApply || command.Flags&monitorabi.AddressSpaceFlagSentry != 0 {
+		return nil
+	}
+	space := e.applicationGPAs[command.AddressSpaceID]
+	type pendingGPA struct {
+		gpa    uint64
+		mapped bool
+	}
+	pending := make(map[uint64]pendingGPA)
+	resolve := func(va uint64) (uint64, bool) {
+		if replacement, ok := pending[va]; ok {
+			return replacement.gpa, replacement.mapped
+		}
+		gpa, ok := space[va]
+		return gpa, ok
+	}
+	for _, operation := range command.Operations {
+		switch operation.Type {
+		case monitorabi.OperationMap:
+			if operation.Access&monitorabi.AccessExecute != 0 && operation.GPA >= GuestRAMIPAStart {
+				if err := e.vm.invalidateGuestCode(operation.GPA, operation.Length); err != nil {
+					return fmt.Errorf("synchronizing executable guest mapping at VA %#x: %w", operation.VA, err)
+				}
+			}
+			for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+				pending[operation.VA+offset] = pendingGPA{gpa: operation.GPA + offset, mapped: true}
+			}
+		case monitorabi.OperationUnmap:
+			for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+				pending[operation.VA+offset] = pendingGPA{}
+			}
+		case monitorabi.OperationProtect:
+			if operation.Access&monitorabi.AccessExecute == 0 {
+				continue
+			}
+			for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+				gpa, ok := resolve(operation.VA + offset)
+				if !ok || gpa < GuestRAMIPAStart {
+					continue
+				}
+				if err := e.vm.invalidateGuestCode(gpa, vmm.LogicalPageSize); err != nil {
+					return fmt.Errorf("synchronizing executable guest protection at VA %#x: %w", operation.VA+offset, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (e *ring0Engine) updateApplicationGPARecords(command monitorabi.Command) {
+	switch command.Opcode {
+	case monitorabi.OpcodeCreateAddressSpace:
+		if command.Flags&monitorabi.AddressSpaceFlagSentry == 0 {
+			e.applicationGPAs[command.AddressSpaceID] = make(map[uint64]uint64)
+		}
+	case monitorabi.OpcodeDestroyAddressSpace:
+		delete(e.applicationGPAs, command.AddressSpaceID)
+	case monitorabi.OpcodeApply:
+		space := e.applicationGPAs[command.AddressSpaceID]
+		if space == nil {
+			return
+		}
+		for _, operation := range command.Operations {
+			switch operation.Type {
+			case monitorabi.OperationMap:
+				for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+					space[operation.VA+offset] = operation.GPA + offset
+				}
+			case monitorabi.OperationUnmap:
+				for offset := uint64(0); offset < operation.Length; offset += vmm.LogicalPageSize {
+					delete(space, operation.VA+offset)
+				}
+			}
+		}
+	}
 }
 
 func monitorCommandMutatesTranslations(encoded []byte) bool {
@@ -434,8 +508,9 @@ func (e *ring0Engine) kickApplicationEntries() error {
 		if !cpu.bridge.inGuest() {
 			continue
 		}
+		cpu.bridge.requestExternalInterrupt()
 		if err := cpu.vcpu.RequestExit(); err != nil && !cpu.bridge.destroyed() {
-			return fmt.Errorf("quiescing HVF ring0 vCPU %d for page-table mutation: %w", cpu.vcpu.id, err)
+			return fmt.Errorf("interrupting HVF ring0 vCPU %d for application admission: %w", cpu.vcpu.id, err)
 		}
 	}
 	return nil
@@ -550,15 +625,19 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 	if !validApplicationPState(registers.PState) {
 		return vmm.Exit{}, fmt.Errorf("invalid ARM64 application PSTATE %#x before ring0 EL0 entry", registers.PState)
 	}
-	atGuestEL1 := ring0asm.CurrentEL() != 0
+	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
 	cleanupCPU := func() {
 		cpu.applicationActive.Store(false)
 		atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested)), 0)
+		cpu.bridge.clearExternalInterrupt()
 		if release {
 			e.releaseApplicationCPU(cpu)
 		}
 	}
 	defer cleanupCPU()
+
+retryApplication:
+	atGuestEL1 := ring0asm.CurrentEL() != 0
 	if err := ctx.Err(); err != nil {
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
@@ -582,17 +661,26 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		if stackSlab <= ^uintptr(0)-uintptr(vmm.HostSlabSize) {
 			e.requestHostMirror(stackSlab + uintptr(vmm.HostSlabSize))
 		}
-		g, m, p, mcache := hosttid.RuntimePointers()
+		g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := hosttid.RuntimePointers()
 		e.requestHostMirror(g)
 		e.requestHostMirror(m)
 		e.requestHostMirror(p)
 		e.requestHostMirror(mcache)
+		e.requestHostMirror(g0)
+		e.requestHostMirror(g0StackLo)
+		if g0StackHi != 0 {
+			e.requestHostMirror(g0StackHi - 1)
+		}
+		e.requestHostMirror(gsignal)
+		e.requestHostMirror(gsignalStackLo)
+		if gsignalStackHi != 0 {
+			e.requestHostMirror(gsignalStackHi - 1)
+		}
 		e.requestHostMirror(hosttid.RuntimeTLSBase())
 		if err := e.extendHostMirror(ctx); err != nil {
 			return vmm.Exit{}, errors.Join(err, e.retireUnenteredApplicationCPU(cpu))
 		}
 	}
-	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
 	binary.LittleEndian.PutUint64(state[stateAddressSpaceID:], application.AddressSpaceID)
 	for i, value := range registers.X {
 		binary.LittleEndian.PutUint64(state[stateX0+i*8:], value)
@@ -634,7 +722,7 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		// preparation on the same pinned owner vCPU; the outer invocation retains
 		// the sole reference and performs the eventual release.
 		cpu.entryActive.Store(false)
-		return e.runApplicationCPU(ctx, application, cpu, false)
+		goto retryApplication
 	}
 	// Like KVM, expose guest execution as an external syscall interval to
 	// the Go scheduler. The application exception resumes this continuation
@@ -677,6 +765,26 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		return vmm.Exit{Reason: vmm.ExitFault, Syndrome: syndrome, Address: address, Access: stage1FaultAccess(syndrome)}, nil
 	case 3:
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
+	case 5:
+		// A Darwin VM mutation can redpill the Sentry after CurrentEL was
+		// sampled but before SwitchApplicationGuest reaches the monitor. The
+		// SIGILL bridge records an internal retry in that case, but no Linux
+		// execution occurred and no caller requested cancellation. Retry on the
+		// same pinned owner vCPU so this internal MMU-notifier rendezvous is not
+		// exposed as a spurious application interrupt.
+		if err := ctx.Err(); err != nil {
+			return vmm.Exit{}, err
+		}
+		goto retryApplication
+	case 6:
+		// A native MMU rendezvous interrupted EL0 so this retry performs the
+		// vCPU's local generation flush before re-entry. The monitor encoded it
+		// separately from an architected Sentry cancellation, so it never leaks
+		// to Linux syscall handling.
+		if err := ctx.Err(); err != nil {
+			return vmm.Exit{}, err
+		}
+		goto retryApplication
 	case 4:
 		return vmm.Exit{Reason: vmm.ExitException, Syndrome: syndrome, Address: registers.PC}, nil
 	default:
@@ -763,7 +871,7 @@ func (e *ring0Engine) retireUnenteredApplicationCPU(cpu *ring0ApplicationCPU) er
 func (e *ring0Engine) getApplicationCPU(ctx context.Context) (*ring0ApplicationCPU, bool, error) {
 	tid := hosttid.Current()
 	var waiter *ring0ApplicationWaiter
-	var waitStarted, nextWaitDiagnostic time.Time
+	var waitStarted, nextWaitDiagnostic, lastWaiterKick time.Time
 	defer func() {
 		if waiter != nil {
 			e.removeApplicationWaiter(waiter)
@@ -855,10 +963,15 @@ retry:
 		// retain the final owner-affine vCPU indefinitely while every later exec
 		// waits in the FIFO. kickApplicationEntries also leaves cancellation
 		// pending for resident tasks currently between application entries.
-		if enqueued {
+		// A runtime VM mutation may have temporarily removed an incumbent from
+		// guest admission when the first kick was attempted. Reissue at a bounded
+		// rate until the architected application exit is acknowledged; a single
+		// RequestExit is not persistent across an inactive hv_vcpu_run interval.
+		if enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond {
 			if err := e.kickApplicationEntries(); err != nil {
 				return nil, false, err
 			}
+			lastWaiterKick = time.Now()
 		}
 		if !nextWaitDiagnostic.IsZero() && !time.Now().Before(nextWaitDiagnostic) {
 			e.writeApplicationWaitDiagnostic(tid, waitStarted)
@@ -930,6 +1043,7 @@ func (e *ring0Engine) installRuntimeClockFastpath(vcpu *hvfVCPU) {
 	binary.LittleEndian.PutUint64(state[stateMachAbsoluteTimePC:], e.timeFastpath.machAbsolutePC)
 	binary.LittleEndian.PutUint64(state[stateTimebaseNumer:], e.timeFastpath.numer)
 	binary.LittleEndian.PutUint64(state[stateTimebaseDenom:], e.timeFastpath.denom)
+	binary.LittleEndian.PutUint64(state[stateVTimerOffset:], e.timeFastpath.vtimerOffset)
 	atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(vcpu.stateHost), stateRealtimeOffsetNS)), uint64(e.realtimeOffsetNS.Load()))
 }
 
@@ -945,7 +1059,7 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 		case <-e.clockStop:
 			return
 		case <-refresh.C:
-			calibration, err := calibrateRing0TimeFastpath()
+			calibration, err := calibrateRing0TimeFastpath(e.timeFastpath.vtimerOffset)
 			if err != nil || calibration.clockGettimePC != e.timeFastpath.clockGettimePC ||
 				calibration.machAbsolutePC != e.timeFastpath.machAbsolutePC ||
 				calibration.numer != e.timeFastpath.numer || calibration.denom != e.timeFastpath.denom {
@@ -1160,10 +1274,6 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 		return fmt.Errorf("excluding application entries for Sentry working-set extension: %w", err)
 	}
 	defer e.unlockApplicationEntries()
-	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
-		return fmt.Errorf("quiescing Sentry continuations for working-set extension: %w", err)
-	}
-
 	desiredSlabs := make(map[uintptr]ring0Stage2Identity)
 	desiredAccess := make(map[uint64]monitorabi.Access)
 	seenRegions := make(map[uintptr]ring0HostRegion)
@@ -1321,9 +1431,6 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 		return fmt.Errorf("excluding application entries for host-memory reconciliation: %w", err)
 	}
 	defer e.unlockApplicationEntries()
-	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
-		return fmt.Errorf("quiescing Sentry continuations for host-memory reconciliation: %w", err)
-	}
 	regions, err := snapshotRing0HostRegions(ring0HostVALimit)
 	if err != nil {
 		return err
@@ -1419,9 +1526,15 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			return workingSetAddresses[i] >= region.address
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
-		if region.protection&ring0VMWrite != 0 && workingSetRegion {
-			// Map the complete leased region so arbitrary Go object traversal
-			// remains hot until the next explicit cache eviction.
+		if region.protection&ring0VMWrite != 0 &&
+			(workingSetRegion || bootstrap && region.userTag == 0) {
+			// Darwin's user tag 0 identifies anonymous mappings not owned by a
+			// native malloc zone or pthread stack. At bootstrap these are the Go
+			// runtime's managed heap/stack arenas, whose later VM mutations are
+			// covered by the runtime rendezvous. Map each complete region so a
+			// pre-existing Go object cannot spuriously redpill based on allocator
+			// placement. Demand mapping retains the narrower working-set rule for
+			// mappings created after bootstrap.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}
@@ -1525,48 +1638,6 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 	return nil
 }
 
-func (e *ring0Engine) quiesceGuestContinuations(ctx context.Context, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		cpus := e.pinApplicationCPUs()
-		active := 0
-		var requestErr error
-		for _, cpu := range cpus {
-			if err := cpu.bridge.error(fmt.Sprintf("ring0 vCPU %d bridge failed", cpu.vcpu.id)); err != nil {
-				requestErr = err
-				break
-			}
-			busy := cpu.entryActive.Load()
-			if cpu.bridge.inGuest() && !cpu.bridge.destroyed() {
-				busy = true
-			}
-			if busy {
-				active++
-			}
-			if cpu.bridge.inGuest() && !cpu.bridge.destroyed() {
-				if err := cpu.vcpu.RequestExit(); err != nil {
-					requestErr = fmt.Errorf("requesting ring0 vCPU %d exit: %w", cpu.vcpu.id, err)
-					break
-				}
-			}
-		}
-		e.unpinApplicationCPUs(cpus)
-		if requestErr != nil {
-			return requestErr
-		}
-		if active == 0 {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for %d guest continuations", active)
-		}
-		runtime.Gosched()
-	}
-}
-
 func dropSkippedHostSlabs(addresses []uintptr, desiredSlabs map[uintptr]ring0Stage2Identity, desiredAccess map[uint64]monitorabi.Access) {
 	for _, address := range addresses {
 		delete(desiredSlabs, address)
@@ -1626,6 +1697,15 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 		// the Sentry's own Mach-O image may use a private compatibility shadow;
 		// every other data mapping must remain a coherent direct alias.
 		shadow := ring0HostMirrorNeedsShadow(identity)
+		if gpa, canonicalAccess, ok := e.vm.canonicalGPAForHost(addresses[start]); !shadow && ok && identity.access&^canonicalAccess == 0 {
+			e.stage2Slabs[addresses[start]] = ring0Stage2Slab{
+				ring0Stage2Identity: identity,
+				gpa:                 gpa,
+				canonical:           true,
+			}
+			start++
+			continue
+		}
 		end := start + 1
 		// Private copies avoid Mach's executable-file mapping restrictions for
 		// read-only image pages. Writable source mappings may be coalesced only
@@ -1705,9 +1785,15 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 func (e *ring0Engine) unmapHostStage2Slabs(addresses []uintptr) error {
 	sort.Slice(addresses, func(i, j int) bool { return addresses[i] < addresses[j] })
 	for start := 0; start < len(addresses); {
+		if slab := e.stage2Slabs[addresses[start]]; slab.canonical {
+			delete(e.stage2Slabs, addresses[start])
+			start++
+			continue
+		}
 		end := start + 1
 		for end < len(addresses) &&
 			addresses[end] == addresses[end-1]+uintptr(vmm.HostSlabSize) &&
+			!e.stage2Slabs[addresses[end]].canonical &&
 			e.stage2Slabs[addresses[end]].gpa == e.stage2Slabs[addresses[end-1]].gpa+vmm.HostSlabSize &&
 			e.stage2Slabs[addresses[end]].lease.tracked == e.stage2Slabs[addresses[end-1]].lease.tracked {
 			end++
@@ -1770,10 +1856,6 @@ func (e *ring0Engine) retireHostMirrorRange(ctx context.Context, address uintptr
 		return err
 	}
 	defer e.unlockApplicationEntries()
-	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
-		return err
-	}
-
 	end := address + uintptr(length)
 	var addresses []uintptr
 	pages := make(map[uint64]struct{})
@@ -1821,9 +1903,6 @@ func (e *ring0Engine) FlushHostExecutionCache(ctx context.Context) error {
 		return err
 	}
 	defer e.unlockApplicationEntries()
-	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
-		return err
-	}
 	var addresses []uintptr
 	pages := make(map[uint64]struct{})
 	for address, slab := range e.stage2Slabs {
@@ -1994,15 +2073,37 @@ func (e *ring0Engine) InterruptApplications() {
 	for {
 		pending := false
 		for _, cpu := range cpus {
-			if !cpu.applicationActive.Load() || !cpu.bridge.inGuest() || cpu.bridge.destroyed() {
+			if !cpu.applicationActive.Load() || cpu.bridge.destroyed() {
 				continue
 			}
 			exitKind := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateExitKind))
-			if atomic.LoadUint64(exitKind) != 0 {
+			kind := atomic.LoadUint64(exitKind)
+			if kind == 3 {
 				continue
 			}
 			pending = true
-			if last := lastRequest[cpu]; last.IsZero() || time.Since(last) >= time.Millisecond {
+			// An internal MMU retry also passes through the monitor finish path,
+			// which clears cancelRequested. Republish the external request until
+			// TTC_EXIT_INTERRUPTED is visible or RunApplication returns for another
+			// reason and drops applicationActive.
+			cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))
+			atomic.StoreUint64(cancel, 1)
+			if kind != 0 {
+				continue
+			}
+			// A runtime mapping mutation temporarily withdraws the vCPU from
+			// guest admission. Keep the application pending until it is admitted
+			// again; RequestExit issued while hv_vcpu_run is inactive is not a
+			// persistent virtual interrupt on macOS 15.
+			if !cpu.bridge.inGuest() {
+				continue
+			}
+			// After cancellation, give hv_vcpu_run enough time to deliver the
+			// injected level IRQ. Repeatedly canceling the next run at millisecond
+			// cadence can win before the monitor vector on macOS 15 and starve the
+			// very acknowledgement this loop is waiting for.
+			if last := lastRequest[cpu]; last.IsZero() || time.Since(last) >= 10*time.Millisecond {
+				cpu.bridge.requestExternalInterrupt()
 				if err := cpu.vcpu.RequestExit(); err != nil {
 					return
 				}

@@ -24,6 +24,7 @@ package hvf
 #cgo LDFLAGS: -framework Hypervisor -framework CoreFoundation -mmacosx-version-min=15.0
 #include <Hypervisor/Hypervisor.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <libkern/OSCacheControl.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <string.h>
@@ -37,12 +38,23 @@ static int ttc_madvise_free(void *address, size_t length) {
 	return madvise(address, length, MADV_DONTNEED);
 }
 
-// Accept the host VA as an integer so cgo does not treat a Go heap arena as a
-// Go pointer crossing into C. Hypervisor.framework retains the VM mapping,
-// not a Go object reference; ownership remains with the Sentry host VM map.
-static hv_return_t ttc_hv_vm_map(uintptr_t address, hv_ipa_t gpa,
-		size_t length, hv_memory_flags_t flags) {
-	return hv_vm_map((void *)address, gpa, length, flags);
+// Anonymous Darwin mappings initially reference shared zero backing. A host
+// write after hv_vm_map may COW the HVA without changing HVF's leased physical
+// page. Force every logical subpage through a value-changing write fault
+// before it can become stage-2 backing; restoring the original byte preserves
+// allocator semantics while preventing zero-store elision or subpage laziness.
+static void ttc_commit_host_pages(void *address, size_t length) {
+	volatile uint8_t *bytes = (volatile uint8_t *)address;
+	for (size_t offset = 0; offset < length; offset += 4096) {
+		uint8_t original = bytes[offset];
+		bytes[offset] = (uint8_t)(original ^ UINT8_C(0xff));
+		bytes[offset] = original;
+	}
+}
+
+static void ttc_invalidate_host_instruction_cache(void *address, size_t length) {
+	sys_dcache_flush(address, length);
+	sys_icache_invalidate(address, length);
 }
 */
 import "C"
@@ -142,7 +154,50 @@ type hvfVM struct {
 	mu        sync.Mutex
 	monitor   *monitorMemory
 	hostState *hostMemoryState
+	stage2    map[uint64]hvfStage2Slab
 	closed    bool
+}
+
+type hvfStage2Slab struct {
+	host   uintptr
+	access vmm.Stage2Access
+}
+
+// canonicalGPAForHost returns an existing VM-owned stage-2 lease for one host
+// slab. Sentry identity mappings must reuse this GPA rather than mapping the
+// same HVA a second time: HVF does not guarantee coherent access through two
+// independently installed GPA aliases of mutable memory.
+func (v *hvfVM) canonicalGPAForHost(host uintptr) (uint64, vmm.Stage2Access, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.monitor != nil {
+		m := v.monitor
+		for _, region := range []struct {
+			host   uintptr
+			gpa    uint64
+			length uint64
+			access vmm.Stage2Access
+		}{
+			{m.codeHost, monitorCodeGPA, monitorCodeCapacity, vmm.Stage2Read | vmm.Stage2Execute},
+			{m.controlHost, monitorControlGPA, vmm.HostSlabSize, vmm.Stage2Read | vmm.Stage2Write},
+			{m.statesHost, monitorStatesGPA, monitorStatesLength, vmm.Stage2Read | vmm.Stage2Write},
+		} {
+			if host >= region.host && uint64(host-region.host) < region.length {
+				return region.gpa + uint64(host-region.host), region.access, true
+			}
+		}
+		for _, pool := range m.pools {
+			if host >= pool.host && uint64(host-pool.host) < pool.length {
+				return pool.gpa + uint64(host-pool.host), vmm.Stage2Read | vmm.Stage2Write, true
+			}
+		}
+	}
+	for gpa, slab := range v.stage2 {
+		if slab.host == host {
+			return gpa, slab.access, true
+		}
+	}
+	return 0, 0, false
 }
 
 func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access vmm.Stage2Access) error {
@@ -154,7 +209,16 @@ func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access
 	if gpa < SentryMirrorIPAStart {
 		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, SentryMirrorIPAStart)
 	}
-	return v.mapStage2Locked(gpa, hostAddress, length, access)
+	if err := v.mapStage2Locked(gpa, hostAddress, length, access); err != nil {
+		return err
+	}
+	if v.stage2 == nil {
+		v.stage2 = make(map[uint64]hvfStage2Slab)
+	}
+	for offset := uint64(0); offset < length; offset += vmm.HostSlabSize {
+		v.stage2[gpa+offset] = hvfStage2Slab{host: hostAddress + uintptr(offset), access: access}
+	}
+	return nil
 }
 
 // mapStage2Locked maps monitor-private or GuestRAM memory. The caller owns
@@ -163,6 +227,12 @@ func (v *hvfVM) mapStage2Locked(gpa uint64, hostAddress uintptr, length uint64, 
 	if gpa%vmm.HostSlabSize != 0 || uint64(hostAddress)%vmm.HostSlabSize != 0 || length == 0 || length%vmm.HostSlabSize != 0 {
 		return fmt.Errorf("unaligned HVF stage-2 map gpa=%#x host=%#x length=%#x", gpa, hostAddress, length)
 	}
+	// hv_vm_map must never lease Darwin's shared anonymous zero backing. A
+	// later host write could otherwise COW the HVA while HVF continues to fetch
+	// from the original zero page. Enforce private physical backing at the
+	// backend boundary so direct VMM callers receive the same invariant as
+	// GuestRAM and monitor allocations.
+	C.ttc_commit_host_pages(unsafe.Pointer(hostAddress), C.size_t(length))
 	return mapNativeStage2(gpa, hostAddress, length, access, false)
 }
 
@@ -175,7 +245,40 @@ func (v *hvfVM) UnmapStage2(gpa, length uint64) error {
 	if gpa < SentryMirrorIPAStart {
 		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, SentryMirrorIPAStart)
 	}
-	return v.unmapStage2Locked(gpa, length)
+	if err := v.unmapStage2Locked(gpa, length); err != nil {
+		return err
+	}
+	for offset := uint64(0); offset < length; offset += vmm.HostSlabSize {
+		delete(v.stage2, gpa+offset)
+	}
+	return nil
+}
+
+// invalidateGuestCode performs the writer-side Darwin cache operation for
+// bytes populated through a host alias before EL1 publishes execute access.
+// Guest-side DC/IC maintenance alone cannot clean a dirty host cache line on a
+// different physical CPU.
+func (v *hvfVM) invalidateGuestCode(gpa, length uint64) error {
+	if length == 0 || gpa%vmm.LogicalPageSize != 0 || length%vmm.LogicalPageSize != 0 || gpa+length < gpa {
+		return fmt.Errorf("invalid executable guest range [%#x, %#x)", gpa, gpa+length)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for current, end := gpa, gpa+length; current < end; {
+		slabGPA := current &^ (vmm.HostSlabSize - 1)
+		slab, ok := v.stage2[slabGPA]
+		if !ok {
+			return fmt.Errorf("executable guest GPA %#x has no tracked stage-2 slab", current)
+		}
+		offset := current - slabGPA
+		chunk := vmm.HostSlabSize - offset
+		if remaining := end - current; chunk > remaining {
+			chunk = remaining
+		}
+		C.ttc_invalidate_host_instruction_cache(unsafe.Pointer(slab.host+uintptr(offset)), C.size_t(chunk))
+		current += chunk
+	}
+	return nil
 }
 
 // unmapStage2Locked unmaps monitor-private or GuestRAM memory. The caller owns
@@ -378,7 +481,11 @@ func (hostMemory) Reserve(length uint64) (uintptr, error) {
 }
 
 func (hostMemory) Commit(address uintptr, length uint64) error {
-	return validateHostRange(address, length)
+	if err := validateHostRange(address, length); err != nil {
+		return err
+	}
+	C.ttc_commit_host_pages(unsafe.Pointer(address), C.size_t(length))
+	return nil
 }
 
 func (h hostMemory) Decommit(address uintptr, length uint64) error {

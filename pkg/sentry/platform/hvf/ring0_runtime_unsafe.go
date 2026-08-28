@@ -33,3 +33,9 @@ func ring0ExitSyscall()
 //
 //go:linkname ring0SetVMMemoryHooks runtime.ttcSetVMMemoryHooks
 func ring0SetVMMemoryHooks(version uint32, ensureHost, callback uintptr) int32
+
+// ring0SetRuntimeTimeHook installs the allocation-free Darwin wall/monotonic
+// clock hook supplied by tools/go_darwin_vm_hooks.patch.
+//
+//go:linkname ring0SetRuntimeTimeHook runtime.ttcSetRuntimeTimeHook
+func ring0SetRuntimeTimeHook(version uint32, callback uintptr) int32

@@ -20,6 +20,9 @@
 #define PROCID_OFFSET {{ Offset (Import "runtime") "m.procid" }}
 #define P_OFFSET      {{ Offset (Import "runtime") "m.p" }}
 #define MCACHE_OFFSET {{ Offset (Import "runtime") "p.mcache" }}
+#define G0_OFFSET     {{ Offset (Import "runtime") "m.g0" }}
+#define GSIGNAL_OFFSET {{ Offset (Import "runtime") "m.gsignal" }}
+#define STACK_OFFSET  {{ Offset (Import "runtime") "g.stack" }}
 
 TEXT ·Current(SB),NOSPLIT,$0-8
 	// procid is in getg().m.procid.
@@ -29,7 +32,7 @@ TEXT ·Current(SB),NOSPLIT,$0-8
 	MOVD R0, ret+0(FP)
 	RET
 
-TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-32
+TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-80
 	MOVD g, R0
 	MOVD R0, gp+0(FP)
 	MOVD M_OFFSET(R0), R1
@@ -38,6 +41,23 @@ TEXT ·RuntimePointers(SB),NOSPLIT|NOFRAME,$0-32
 	MOVD R2, pp+16(FP)
 	MOVD MCACHE_OFFSET(R2), R3
 	MOVD R3, mcachep+24(FP)
+	MOVD G0_OFFSET(R1), R4
+	MOVD R4, g0p+32(FP)
+	MOVD STACK_OFFSET(R4), R5
+	MOVD R5, g0StackLo+40(FP)
+	MOVD (STACK_OFFSET+8)(R4), R5
+	MOVD R5, g0StackHi+48(FP)
+	MOVD GSIGNAL_OFFSET(R1), R4
+	MOVD R4, gsignalp+56(FP)
+	CBZ R4, no_gsignal
+	MOVD STACK_OFFSET(R4), R5
+	MOVD R5, gsignalStackLo+64(FP)
+	MOVD (STACK_OFFSET+8)(R4), R5
+	MOVD R5, gsignalStackHi+72(FP)
+	RET
+no_gsignal:
+	MOVD ZR, gsignalStackLo+64(FP)
+	MOVD ZR, gsignalStackHi+72(FP)
 	RET
 
 TEXT ·RuntimeTLSBase(SB),NOSPLIT|NOFRAME,$0-8
