@@ -18,7 +18,34 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
+	"gvisor.dev/gvisor/pkg/context"
 )
+
+func TestHostConnectedEndpointLinuxErrorTranslation(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	if serr != nil {
+		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+	}
+	// Force fdReadVec's pre-syscall truncation path. The resulting buildIovec
+	// error is a Linux EAGAIN, not a host errno. On Darwin, interpreting its
+	// numeric value as a host errno used to panic with EDEADLK.
+	ep.sndbuf.Store(-1)
+	_, _, serr = ep.Recv(context.Background(), nil, RecvArgs{})
+	if serr == nil {
+		t.Fatal("Recv unexpectedly succeeded")
+	}
+	if got := serr.ToLinux(); got != errno.EAGAIN {
+		t.Fatalf("Recv error = %d, want EAGAIN (%d)", got, errno.EAGAIN)
+	}
+}
 
 func TestHostConnectedEndpointShutdownAfterPeerDisconnect(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)

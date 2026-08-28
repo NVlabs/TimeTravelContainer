@@ -123,6 +123,7 @@ go_test(
     library = ":transport",
     deps = [
         "//pkg/abi/linux",
+        "//pkg/abi/linux/errno",
         "//pkg/context",
         "//pkg/syserr",
         "@org_golang_x_sys//unix:go_default_library",
