@@ -151,7 +151,7 @@ func (i *connectionImpl) virtualXattrNames(virtualPath string) []string {
 // Mount implements lisafs.ConnectionImpl.Mount.
 func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*lisafs.ControlFD, lisafs.Statx, int, error) {
 	mountPath := mountNode.FilePath()
-	rootHostFD, err := tryOpen(func(flags int) (int, error) {
+	rootHostFD, rootFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Open(mountPath, flags, 0)
 	})
 	if err != nil {
@@ -183,6 +183,7 @@ func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*l
 
 	rootFD := &controlFDLisa{
 		hostFD:         rootHostFD,
+		openedFlags:    rootFlags,
 		writableHostFD: atomicbitops.FromInt32(-1),
 		isMountPoint:   true,
 		virtualPath:    ".",
@@ -248,6 +249,11 @@ type controlFDLisa struct {
 	// exactly once.
 	writableHostFD atomicbitops.Int32
 
+	// openedFlags is what hostFD was opened with. It is immutable, as hostFD
+	// is: both are set once here and cleared together when the FD is
+	// destroyed.
+	openedFlags int
+
 	// isMountpoint indicates whether this FD represents the mount point for its
 	// owning connection. isMountPoint is immutable.
 	isMountPoint bool
@@ -258,7 +264,7 @@ type controlFDLisa struct {
 
 var _ lisafs.ControlFDImpl = (*controlFDLisa)(nil)
 
-func newControlFDLisa(hostFD int, parent *controlFDLisa, name string, mode linux.FileMode) *controlFDLisa {
+func newControlFDLisa(hostFD int, openedFlags int, parent *controlFDLisa, name string, mode linux.FileMode) *controlFDLisa {
 	var (
 		childFD    *controlFDLisa
 		childNode  *lisafs.Node
@@ -285,6 +291,7 @@ func newControlFDLisa(hostFD int, parent *controlFDLisa, name string, mode linux
 		}
 	})
 	childFD.hostFD = hostFD
+	childFD.openedFlags = openedFlags
 	childFD.virtualPath = path.Join(parent.virtualPath, name)
 	childFD.writableHostFD = atomicbitops.FromInt32(-1)
 	childFD.ControlFD.Init(parent.Conn(), childNode, mode, childFD)
@@ -464,7 +471,7 @@ func (fd *controlFDLisa) SetStat(stat lisafs.SetStatReq) (failureMask uint32, fa
 
 // Walk implements lisafs.ControlFDImpl.Walk.
 func (fd *controlFDLisa) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, error) {
-	childHostFD, err := tryOpen(func(flags int) (int, error) {
+	childHostFD, childFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Openat(fd.hostFD, name, flags, 0)
 	})
 	if err != nil {
@@ -483,7 +490,7 @@ func (fd *controlFDLisa) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, err
 		return nil, lisafs.Statx{}, err
 	}
 
-	return newControlFDLisa(childHostFD, fd, name, linux.FileMode(stat.Mode)).FD(), stat, nil
+	return newControlFDLisa(childHostFD, childFlags, fd, name, linux.FileMode(stat.Mode)).FD(), stat, nil
 }
 
 // WalkStat implements lisafs.ControlFDImpl.WalkStat.
@@ -577,6 +584,22 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 			return nil, -1, unix.EPERM
 		}
 	}
+	// A read-only handle on a regular file does not need a descriptor of its
+	// own. The control FD is already an O_RDONLY descriptor on the same file;
+	// reads and writes here are positional, so nothing depends on the file
+	// description's offset; and an OpenFD holds a reference on its control FD
+	// for its whole lifetime, so the descriptor cannot be closed underneath it.
+	//
+	// This is most of what a gofer holds. A dentry the Sentry is caching keeps
+	// its control FD, and the read handle cached alongside it kept a second
+	// descriptor on the same file until the dentry was destroyed — 3503 of one
+	// failed sandbox's 8146, against a limit of 8191 it could not raise.
+	if fd.lendableFor(flags, ftype) {
+		openFD := fd.newBorrowedOpenFDLisa(fd.hostFD, flags)
+		hostFDToDonate, _ := unix.Dup(fd.hostFD)
+		return openFD.FD(), hostFDToDonate, nil
+	}
+
 	flags |= openFlags
 	openHostFD, err := unix.Openat(int(procSelfFD.FD()), strconv.Itoa(fd.hostFD), int(flags)&^unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -645,7 +668,7 @@ func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lis
 	}
 	cu.Release()
 
-	childFD := newControlFDLisa(childHostFD, fd, name, linux.ModeRegular)
+	childFD := newControlFDLisa(childHostFD, createFlags, fd, name, linux.ModeRegular)
 	newFD := childFD.newOpenFDLisa(newHostFD, uint32(flags))
 
 	// Donate FD because open(O_CREAT|O_EXCL) always creates a regular file.
@@ -674,7 +697,7 @@ func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	defer cu.Clean()
 
 	// Open directory to change ownership.
-	childDirFd, err := tryOpen(func(flags int) (int, error) {
+	childDirFd, childDirFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Openat(fd.hostFD, name, flags|unix.O_DIRECTORY, 0)
 	})
 	if err != nil {
@@ -693,7 +716,7 @@ func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 
 	cu.Release()
-	return newControlFDLisa(childDirFd, fd, name, linux.ModeDirectory).FD(), childDirStat, nil
+	return newControlFDLisa(childDirFd, childDirFlags, fd, name, linux.ModeDirectory).FD(), childDirStat, nil
 }
 
 // Mknod implements lisafs.ControlFDImpl.Mknod.
@@ -727,7 +750,7 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	defer cu.Clean()
 
 	// Open file to change ownership.
-	childFD, err := tryOpen(func(flags int) (int, error) {
+	childFD, childFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Openat(fd.hostFD, name, flags, 0)
 	})
 	if err != nil {
@@ -746,7 +769,7 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 	cu.Release()
 
-	return newControlFDLisa(childFD, fd, name, mode).FD(), childStat, nil
+	return newControlFDLisa(childFD, childFlags, fd, name, mode).FD(), childStat, nil
 }
 
 // Symlink implements lisafs.ControlFDImpl.Symlink.
@@ -778,7 +801,7 @@ func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid
 		return nil, lisafs.Statx{}, err
 	}
 	cu.Release()
-	return newControlFDLisa(symlinkFD, fd, name, linux.ModeSymlink).FD(), symlinkStat, nil
+	return newControlFDLisa(symlinkFD, unix.O_PATH|openFlags, fd, name, linux.ModeSymlink).FD(), symlinkStat, nil
 }
 
 // Link implements lisafs.ControlFDImpl.Link.
@@ -804,7 +827,7 @@ func (fd *controlFDLisa) Link(dir lisafs.ControlFDImpl, name string) (*lisafs.Co
 	})
 	defer cu.Clean()
 
-	linkFD, err := tryOpen(func(flags int) (int, error) {
+	linkFD, linkFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Openat(dirFD.hostFD, name, flags, 0)
 	})
 	if err != nil {
@@ -816,7 +839,7 @@ func (fd *controlFDLisa) Link(dir lisafs.ControlFDImpl, name string) (*lisafs.Co
 		return nil, lisafs.Statx{}, err
 	}
 	cu.Release()
-	return newControlFDLisa(linkFD, dirFD, name, linux.FileMode(linkStat.Mode)).FD(), linkStat, nil
+	return newControlFDLisa(linkFD, linkFlags, dirFD, name, linux.FileMode(linkStat.Mode)).FD(), linkStat, nil
 }
 
 // StatFS implements lisafs.ControlFDImpl.StatFS.
@@ -1011,7 +1034,7 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 		_ = unix.Unlink(socketPath)
 	})
 
-	sockFileFD, err := tryOpen(func(flags int) (int, error) {
+	sockFileFD, sockFileFlags, err := tryOpen(func(flags int) (int, error) {
 		return unix.Openat(fd.hostFD, name, flags, 0)
 	})
 	if err != nil {
@@ -1038,7 +1061,7 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 	}
 	cu.Release()
 
-	socketControlFD := newControlFDLisa(sockFD, fd, name, linux.ModeSocket)
+	socketControlFD := newControlFDLisa(sockFD, sockFileFlags, fd, name, linux.ModeSocket)
 	boundSocketFD := &boundSocketFDLisa{
 		sock: os.NewFile(uintptr(sockFD), socketPath),
 	}
@@ -1195,6 +1218,11 @@ type openFDLisa struct {
 
 	// hostFD is the host file descriptor which can be used to make syscalls.
 	hostFD int
+
+	// borrowed says hostFD belongs to the control FD this was opened on, so
+	// closing this must not close it. The reference an OpenFD holds on its
+	// control FD is what keeps it alive for that long.
+	borrowed bool
 }
 
 var _ lisafs.OpenFDImpl = (*openFDLisa)(nil)
@@ -1207,6 +1235,37 @@ func (fd *controlFDLisa) newOpenFDLisa(hostFD int, flags uint32) *openFDLisa {
 	return newFD
 }
 
+// newBorrowedOpenFDLisa opens on a descriptor this does not own.
+func (fd *controlFDLisa) newBorrowedOpenFDLisa(hostFD int, flags uint32) *openFDLisa {
+	newFD := &openFDLisa{
+		hostFD:   hostFD,
+		borrowed: true,
+	}
+	newFD.OpenFD.Init(fd.FD(), flags, newFD)
+	return newFD
+}
+
+// lendableFor reports whether this control FD's descriptor can serve an Open
+// with these flags instead of a new one being made.
+//
+// Deliberately narrow. Regular files only: a directory's OpenFD seeks its
+// descriptor in Getdent64, so two users of one description would read each
+// other's position, and everything else the Sentry can open — symlinks,
+// sockets — has an O_PATH control FD that cannot be read from at all. Only a
+// bare O_RDONLY, which is exactly what the Sentry sends for a read handle;
+// anything else it may ask for (O_TRUNC alongside, a writable mode) goes the
+// long way round and behaves as it always did, including in what it fails
+// with.
+func (fd *controlFDLisa) lendableFor(flags uint32, ftype linux.FileMode) bool {
+	if ftype != unix.S_IFREG || flags != unix.O_RDONLY {
+		return false
+	}
+	if fd.openedFlags&unix.O_PATH != 0 {
+		return false
+	}
+	return fd.openedFlags&unix.O_ACCMODE == unix.O_RDONLY
+}
+
 // FD implements lisafs.OpenFDImpl.FD.
 func (fd *openFDLisa) FD() *lisafs.OpenFD {
 	if fd == nil {
@@ -1217,6 +1276,11 @@ func (fd *openFDLisa) FD() *lisafs.OpenFD {
 
 // Close implements lisafs.OpenFDImpl.Close.
 func (fd *openFDLisa) Close() {
+	if fd.borrowed {
+		// The control FD owns it and outlives this.
+		fd.hostFD = -1
+		return
+	}
 	if fd.hostFD >= 0 {
 		_ = unix.Close(fd.hostFD)
 		fd.hostFD = -1
@@ -1360,7 +1424,12 @@ func (fd *boundSocketFDLisa) Accept() (int, string, error) {
 }
 
 // tryOpen tries to open() with different modes as documented.
-func tryOpen(open func(int) (int, error)) (hostFD int, err error) {
+// tryOpen returns the descriptor and the flags it was opened with.
+//
+// Which of the two attempts succeeded is worth carrying: an O_PATH descriptor
+// cannot be read from, and a readable one can be lent to an OpenFD instead of
+// opening the file a second time.
+func tryOpen(open func(int) (int, error)) (hostFD int, openedFlags int, err error) {
 	// Attempt to open file in the following in order:
 	//   1. RDONLY | NONBLOCK: for all files, directories, ro mounts, FIFOs.
 	//      Use non-blocking to prevent getting stuck inside open(2) for
@@ -1374,15 +1443,15 @@ func tryOpen(open func(int) (int, error)) (hostFD int, err error) {
 	for _, flag := range flags {
 		hostFD, err = open(flag | openFlags)
 		if err == nil {
-			return
+			return hostFD, flag | openFlags, nil
 		}
 
 		if e := lisafs.ExtractErrno(err); e == unix.ENOENT {
 			// File doesn't exist, no point in retrying.
-			return -1, e
+			return -1, 0, e
 		}
 	}
-	return
+	return hostFD, 0, err
 }
 
 func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {

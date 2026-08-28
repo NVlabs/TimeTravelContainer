@@ -122,6 +122,14 @@ go_library(
 )
 
 go_test(
+    name = "starved_test",
+    size = "small",
+    srcs = ["starved_test.go"],
+    library = ":lisafs",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
+)
+
+go_test(
     name = "sock_test",
     size = "small",
     srcs = ["sock_test.go"],
