@@ -24,8 +24,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -166,7 +168,17 @@ func Pack(root, destination string) error {
 		}
 	}()
 	writer := tar.NewWriter(temp)
-	var paths []string
+	type packReadResult struct {
+		data []byte
+		err  error
+	}
+	type packEntry struct {
+		relative   string
+		info       fs.FileInfo
+		link       string
+		prefetched chan packReadResult
+	}
+	var entries []packEntry
 	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -188,58 +200,119 @@ func Pack(root, destination string) error {
 		if !info.Mode().IsRegular() && !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 			return fmt.Errorf("unsupported checkpoint staging file %q with mode %v", relative, info.Mode())
 		}
-		paths = append(paths, relative)
+		link := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+		entries = append(entries, packEntry{relative: relative, info: info, link: link})
 		return nil
 	}); err != nil {
 		writer.Close()
 		return err
 	}
-	sort.Strings(paths)
-	for _, relative := range paths {
-		path := filepath.Join(root, relative)
-		info, err := os.Lstat(path)
-		if err != nil {
-			writer.Close()
-			return err
-		}
-		linkTarget := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err = os.Readlink(path)
-			if err != nil {
-				writer.Close()
-				return err
+	sort.Slice(entries, func(i, j int) bool { return entries[i].relative < entries[j].relative })
+
+	// APFS clone reads can incur per-file extent-resolution latency. Reading
+	// tens of thousands of package objects serially makes a checkpoint appear
+	// hung even when aggregate data is modest. Prefetch bounded-size files in
+	// parallel while the single tar writer preserves deterministic ordering.
+	const maxPrefetchFileSize = int64(1 << 20)
+	// File opens, rather than CPU, dominate APFS clone reads. Permit more
+	// readers than GOMAXPROCS while keeping the queue and memory window bounded.
+	workers := min(max(runtime.GOMAXPROCS(0), 32), 64)
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+	jobs := make(chan *packEntry, workers*4)
+	var readers sync.WaitGroup
+	readers.Add(workers)
+	for range workers {
+		go func() {
+			defer readers.Done()
+			for entry := range jobs {
+				data, err := os.ReadFile(filepath.Join(root, entry.relative))
+				entry.prefetched <- packReadResult{data: data, err: err}
 			}
+		}()
+	}
+	closeReaders := func() {
+		close(jobs)
+		readers.Wait()
+	}
+	readersClosed := false
+	defer func() {
+		if !readersClosed {
+			closeReaders()
 		}
-		header, err := tar.FileInfoHeader(info, linkTarget)
+	}()
+	nextPrefetch := 0
+	prefetchWindow := workers * 4
+	queuePrefetch := func(limit int) {
+		if limit > len(entries) {
+			limit = len(entries)
+		}
+		for nextPrefetch < limit {
+			entry := &entries[nextPrefetch]
+			nextPrefetch++
+			if !entry.info.Mode().IsRegular() || entry.info.Size() > maxPrefetchFileSize {
+				continue
+			}
+			entry.prefetched = make(chan packReadResult, 1)
+			jobs <- entry
+		}
+	}
+
+	for index := range entries {
+		queuePrefetch(index + prefetchWindow)
+		entry := &entries[index]
+		header, err := tar.FileInfoHeader(entry.info, entry.link)
 		if err != nil {
 			writer.Close()
 			return err
 		}
-		header.Name = filepath.ToSlash(relative)
+		header.Name = filepath.ToSlash(entry.relative)
 		header.Uid = 0
 		header.Gid = 0
 		if err := writer.WriteHeader(header); err != nil {
 			writer.Close()
 			return err
 		}
-		if info.Mode().IsRegular() {
-			file, err := os.Open(path)
-			if err != nil {
+		if !entry.info.Mode().IsRegular() {
+			continue
+		}
+		if entry.prefetched != nil {
+			result := <-entry.prefetched
+			if result.err != nil {
+				writer.Close()
+				return result.err
+			}
+			if _, err := writer.Write(result.data); err != nil {
 				writer.Close()
 				return err
 			}
-			_, copyErr := io.Copy(writer, file)
-			closeErr := file.Close()
-			if copyErr != nil {
-				writer.Close()
-				return copyErr
-			}
-			if closeErr != nil {
-				writer.Close()
-				return closeErr
-			}
+			continue
+		}
+		file, err := os.Open(filepath.Join(root, entry.relative))
+		if err != nil {
+			writer.Close()
+			return err
+		}
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			writer.Close()
+			return copyErr
+		}
+		if closeErr != nil {
+			writer.Close()
+			return closeErr
 		}
 	}
+	closeReaders()
+	readersClosed = true
 	if err := writer.Close(); err != nil {
 		return err
 	}

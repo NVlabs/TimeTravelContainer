@@ -20,7 +20,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -122,20 +125,61 @@ func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo,
 		objectIDs = append(objectIDs, id)
 	}
 	sort.Strings(objectIDs)
-	for _, id := range objectIDs {
-		source := filepath.Join(r.path, r.objectPath(id))
-		if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
-			source = filepath.Join(r.path, "objects", id)
-		}
-		if err := snapshotCopyFile(source, filepath.Join(destination, "objects", id), r.copyMode == CopyModeReflink); err != nil {
-			return SnapshotInfo{}, fmt.Errorf("copying object %q: %w", id, err)
-		}
+	if err := r.exportSnapshotObjects(objectIDs, filepath.Join(destination, "objects")); err != nil {
+		return SnapshotInfo{}, err
 	}
 	if err := writeJSONAtomic(destination, filepath.Join(destination, "snapshot.json"), snapshot); err != nil {
 		return SnapshotInfo{}, err
 	}
 	keep = true
 	return snapshot, nil
+}
+
+// exportSnapshotObjects stages immutable branch objects concurrently. The
+// exported directory is an intermediate representation: checkpoint.Pack()
+// fsyncs the atomically published archive, so flushing every individual APFS
+// clone here adds no durability and makes large package trees prohibitively
+// slow. Importing a snapshot still requests durable object copies below.
+func (r *Repository) exportSnapshotObjects(objectIDs []string, destination string) error {
+	workers := min(runtime.GOMAXPROCS(0), 16)
+	if workers > len(objectIDs) {
+		workers = len(objectIDs)
+	}
+	if workers == 0 {
+		return nil
+	}
+
+	var next atomic.Uint64
+	var failed atomic.Bool
+	var firstErr error
+	var errOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for !failed.Load() {
+				index := int(next.Add(1) - 1)
+				if index >= len(objectIDs) {
+					return
+				}
+				id := objectIDs[index]
+				source := filepath.Join(r.path, r.objectPath(id))
+				if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
+					source = filepath.Join(r.path, "objects", id)
+				}
+				if err := snapshotCopyFile(source, filepath.Join(destination, id), r.copyMode == CopyModeReflink, false); err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("copying object %q: %w", id, err)
+						failed.Store(true)
+					})
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // ImportPrivateSnapshot creates a private repository and installs snapshot as
@@ -235,14 +279,8 @@ func (r *Repository) importSnapshot(source string) (SnapshotInfo, error) {
 	if err := requireSnapshotDirectory(objectsDir); err != nil {
 		return SnapshotInfo{}, err
 	}
-	for object := range objects {
-		destination := filepath.Join(r.path, r.objectPath(object))
-		if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
-			return SnapshotInfo{}, err
-		}
-		if err := snapshotCopyFile(filepath.Join(objectsDir, object), destination, r.copyMode == CopyModeReflink); err != nil {
-			return SnapshotInfo{}, fmt.Errorf("importing object %q: %w", object, err)
-		}
+	if err := r.importSnapshotObjects(objectsDir, objects); err != nil {
+		return SnapshotInfo{}, err
 	}
 	r.info.NextInode = snapshot.NextInode
 	if err := writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "volume.json"), r.info); err != nil {
@@ -297,7 +335,59 @@ func (r *Repository) importSnapshot(source string) (SnapshotInfo, error) {
 	return snapshot, nil
 }
 
-func snapshotCopyFile(source, destination string, reflink bool) error {
+// importSnapshotObjects materializes independent repository objects in
+// parallel. The unpacked archive is already the durable source of truth for
+// this transaction; per-object fsyncs add minutes to package-heavy restores
+// without making the not-yet-published repository observable.
+func (r *Repository) importSnapshotObjects(source string, objects map[string]struct{}) error {
+	objectIDs := make([]string, 0, len(objects))
+	for id := range objects {
+		objectIDs = append(objectIDs, id)
+	}
+	sort.Strings(objectIDs)
+	workers := min(max(runtime.GOMAXPROCS(0), 16), 32)
+	if workers > len(objectIDs) {
+		workers = len(objectIDs)
+	}
+	if workers == 0 {
+		return nil
+	}
+
+	var next atomic.Uint64
+	var failed atomic.Bool
+	var firstErr error
+	var errOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for !failed.Load() {
+				index := int(next.Add(1) - 1)
+				if index >= len(objectIDs) {
+					return
+				}
+				id := objectIDs[index]
+				destination := filepath.Join(r.path, r.objectPath(id))
+				err := os.MkdirAll(filepath.Dir(destination), 0700)
+				if err == nil {
+					err = snapshotCopyFile(filepath.Join(source, id), destination, r.copyMode == CopyModeReflink, false)
+				}
+				if err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("importing object %q: %w", id, err)
+						failed.Store(true)
+					})
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func snapshotCopyFile(source, destination string, reflink, durable bool) error {
 	fd, err := unix.Open(source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -320,8 +410,10 @@ func snapshotCopyFile(source, destination string, reflink bool) error {
 	if reflink {
 		if cloned, err := cloneFile(src, dst, unix.AT_FDCWD, destination); err == nil {
 			dst = cloned
-			if err := dst.Sync(); err != nil {
-				return err
+			if durable {
+				if err := dst.Sync(); err != nil {
+					return err
+				}
 			}
 			keep = true
 			return nil
@@ -335,8 +427,10 @@ func snapshotCopyFile(source, destination string, reflink bool) error {
 	if _, err := io.Copy(dst, src); err != nil {
 		return err
 	}
-	if err := dst.Sync(); err != nil {
-		return err
+	if durable {
+		if err := dst.Sync(); err != nil {
+			return err
+		}
 	}
 	keep = true
 	return nil
