@@ -165,6 +165,9 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	k.ReceiveTaskStates()
 	var capture *DistributedForkCapture
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
+		}
 		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, true)
 		if err != nil {
 			return err

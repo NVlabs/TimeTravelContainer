@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -40,6 +41,16 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+type captureCoherencePlatform struct {
+	sentryplatform.Platform
+	flushes int
+}
+
+func (p *captureCoherencePlatform) FlushForCheckpoint(stdcontext.Context) error {
+	p.flushes++
+	return nil
+}
 
 type ownedKernelTCPReader struct {
 	stateio.AsyncReader
@@ -198,6 +209,31 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	child.Pause()
 	parent.Release()
 	child.Release()
+}
+
+func TestLiveForkFlushesPlatformExecutionCaches(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	coherent := &captureCoherencePlatform{Platform: parent.Platform}
+	parent.Platform = coherent
+	parent.Pause()
+
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LiveFork: %v", err)
+	}
+	if coherent.flushes != 1 {
+		t.Errorf("platform state-capture flushes = %d, want 1", coherent.flushes)
+	}
+	child.Release()
+	parent.Release()
 }
 
 func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {

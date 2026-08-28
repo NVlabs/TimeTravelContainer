@@ -269,13 +269,18 @@ func (p *Platform) NewContext(context.Context) sentryplatform.Context {
 // FlushForCheckpoint implements sentryplatform.CheckpointCoherence. The kernel
 // is quiesced before this call; GuestRAM itself is already coherent.
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
-func (p *Platform) FlushForCheckpoint(context.Context) error {
+func (p *Platform) FlushForCheckpoint(ctx context.Context) error {
 	if err := p.lockEpoch(stdcontext.Background()); err != nil {
 		return err
 	}
 	defer p.epochMu.RUnlock()
 	if err := p.staging.flushAll(); err != nil {
 		return err
+	}
+	if cache, ok := p.engine.(HostExecutionCacheEngine); ok {
+		if err := cache.FlushHostExecutionCache(ctx); err != nil {
+			return fmt.Errorf("flushing VM host execution cache: %w", err)
+		}
 	}
 	p.mu.Lock()
 	spaces := make([]*addressSpace, 0, len(p.spaces))

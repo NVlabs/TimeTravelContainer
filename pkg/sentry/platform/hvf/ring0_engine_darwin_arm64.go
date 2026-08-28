@@ -109,6 +109,7 @@ type ring0Stage2Identity struct {
 	objectID     uint64
 	objectOffset uint64
 	access       vmm.Stage2Access
+	mainImage    bool
 }
 
 type ring0Stage2Lease struct {
@@ -1228,6 +1229,7 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 			objectID:     region.objectID,
 			objectOffset: region.objectOffset + offset,
 			access:       stage2Access,
+			mainImage:    region.mainImage,
 		}
 		for va := uint64(address); va < uint64(address)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
 			desiredAccess[va] = access
@@ -1264,8 +1266,9 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 		}
 		regionEnd := region.address + uintptr(region.length)
 		if region.protection&ring0VMWrite != 0 || region.mainImage {
-			// Go stacks and heap spans grow inside their existing Mach region.
-			// Import the touched region once, but never unrelated writable regions.
+			// Go heap and stack spans grow throughout an existing Mach region.
+			// Importing a touched writable region as one run avoids a demand-fault
+			// storm across Sentry objects.
 			for address := region.address; address < regionEnd; address += uintptr(vmm.HostSlabSize) {
 				addSlab(region, address, access, stage2Access)
 			}
@@ -1455,6 +1458,7 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 				objectID:     region.objectID,
 				objectOffset: region.objectOffset + offset,
 				access:       stage2Access,
+				mainImage:    region.mainImage,
 			}
 			for va := uint64(address); va < uint64(address)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
 				desiredAccess[va] = access
@@ -1472,10 +1476,8 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
 		if region.protection&ring0VMWrite != 0 && workingSetRegion {
-			// Admit a complete writable Mach region only when a continuation
-			// touches it. Importing every writable region at bootstrap includes
-			// transient libc, cgo, and Hypervisor.framework allocations whose host
-			// virtual addresses are later reused for unrelated objects.
+			// Map the complete leased region so arbitrary Go object traversal
+			// remains hot until the next explicit cache eviction.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}
@@ -1784,6 +1786,52 @@ func (e *ring0Engine) releaseHostMirror() error {
 	return e.unmapHostStage2Slabs(addresses)
 }
 
+// FlushHostExecutionCache discards every mutable or allocator-owned Sentry
+// alias while application continuations are quiesced. hv_vm_map leases the
+// pages that currently back a host range, whereas Darwin's allocator can later
+// recycle the same virtual region without preserving that lease's identity.
+// State capture is a natural cache boundary: it allocates and decodes large
+// object graphs and is therefore especially likely to recycle heap spans.
+func (e *ring0Engine) FlushHostExecutionCache(ctx context.Context) error {
+	ring0asm.EnsureHost()
+	e.mirrorMu.Lock()
+	defer e.mirrorMu.Unlock()
+	if err := e.lockApplicationEntries(ctx); err != nil {
+		return err
+	}
+	defer e.unlockApplicationEntries()
+	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
+		return err
+	}
+	var addresses []uintptr
+	pages := make(map[uint64]struct{})
+	for address, slab := range e.stage2Slabs {
+		if slab.mainImage {
+			continue
+		}
+		addresses = append(addresses, address)
+		for va := uint64(address); va < uint64(address)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
+			if _, mapped := e.stage1Access[va]; mapped {
+				pages[va] = struct{}{}
+			}
+		}
+	}
+	if err := e.applyHostStage1(ctx, hostStage1UnmapOperations(pages)); err != nil {
+		return err
+	}
+	if err := e.unmapHostStage2Slabs(addresses); err != nil {
+		return err
+	}
+	e.faultMu.Lock()
+	for address := range e.pendingMirror {
+		if _, mapped := e.stage2Slabs[address]; !mapped {
+			delete(e.pendingMirror, address)
+		}
+	}
+	e.faultMu.Unlock()
+	return nil
+}
+
 func hostStage1UnmapOperations(pages map[uint64]struct{}) []monitorabi.Operation {
 	addresses := make([]uint64, 0, len(pages))
 	for address := range pages {
@@ -2050,3 +2098,4 @@ func (e *ring0Engine) Close() (retErr error) {
 }
 
 var _ vmplatform.VMEngine = (*ring0Engine)(nil)
+var _ vmplatform.HostExecutionCacheEngine = (*ring0Engine)(nil)

@@ -245,6 +245,9 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 	}
 	var child *Kernel
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
+		}
 		validationStarted := time.Now()
 		resumeNetwork, err := k.pauseLiveForkNetworkStacks(opts.AllowNetworkStack, true)
 		if err != nil {
@@ -639,6 +642,9 @@ func (k *Kernel) captureLiveForkMetadata(fsResources vfs.LiveForkFilesystemResou
 	var metadata bytes.Buffer
 	var snapshots mm.LiveForkPMASnapshots
 	err := k.quiescePausedAnd(k.SupervisorContext(), func() error {
+		if err := k.flushPlatformForStateCapture(k.SupervisorContext()); err != nil {
+			return err
+		}
 		// Endpoint beforeSave hooks freeze packet queues and register them for
 		// resumption. Pair the metadata-only save with the same stack lifecycle
 		// used by LiveFork and Kernel.SaveTo; otherwise the primary batch child

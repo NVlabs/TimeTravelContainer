@@ -39,6 +39,16 @@ type VMEngine interface {
 	Close() error
 }
 
+// HostExecutionCacheEngine is optionally implemented by engines that execute
+// Sentry code through a disposable mirror of host virtual memory. A quiesced
+// state capture must discard mutable aliases: host allocators may recycle the
+// backing pages while the capture allocates and decodes a second object graph.
+// Engines that execute Sentry exclusively on the host do not need this hook.
+type HostExecutionCacheEngine interface {
+	VMEngine
+	FlushHostExecutionCache(context.Context) error
+}
+
 // ApplicationResidencyEngine is implemented by VM engines whose application
 // vCPU is owned by the host thread running the Sentry task. vmplatform keeps a
 // residency across consecutive application entries and the intervening Linux

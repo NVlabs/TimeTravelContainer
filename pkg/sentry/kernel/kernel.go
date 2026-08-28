@@ -765,6 +765,15 @@ func (k *Kernel) quiescePausedAnd(ctx context.Context, f func() error) error {
 	return f()
 }
 
+func (k *Kernel) flushPlatformForStateCapture(ctx context.Context) error {
+	if coherent, ok := k.Platform.(platform.CheckpointCoherence); ok {
+		if err := coherent.FlushForCheckpoint(ctx); err != nil {
+			return fmt.Errorf("failed to flush platform memory before state capture: %w", err)
+		}
+	}
+	return nil
+}
+
 // +stateify savable
 type privateMemoryFileMetadata struct {
 	owners []checkpoint.ResourceID
@@ -813,10 +822,8 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
 	defer pagesCleanup.Clean()
 
 	return k.quiescePausedAnd(ctx, func() error {
-		if coherent, ok := k.Platform.(platform.CheckpointCoherence); ok {
-			if err := coherent.FlushForCheckpoint(ctx); err != nil {
-				return fmt.Errorf("failed to flush platform memory before checkpoint: %w", err)
-			}
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
 		}
 
 		// Discard unsavable mappings, such as those for host file descriptors.

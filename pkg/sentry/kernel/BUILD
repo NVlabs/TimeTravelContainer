@@ -504,6 +504,7 @@ go_test(
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/platform",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/syscalls/linux",
         "//pkg/sentry/time",
@@ -524,6 +525,7 @@ go_test(
     deps = [
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/platform",
         "//pkg/sentry/platform/systrap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",

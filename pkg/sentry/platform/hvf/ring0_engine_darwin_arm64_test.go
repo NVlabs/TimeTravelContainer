@@ -112,6 +112,48 @@ func TestRing0HostRegionAt(t *testing.T) {
 	}
 }
 
+func TestFlushHostExecutionCacheReleasesAllocatorMappings(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	allocation := make([]byte, vmm.HostSlabSize)
+	target := uintptr(unsafe.Pointer(&allocation[len(allocation)/2]))
+	engine.requestHostMirror(target)
+	if err := engine.extendHostMirror(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	foundAllocatorMapping := false
+	for _, slab := range engine.stage2Slabs {
+		if !slab.mainImage && slab.access&vmm.Stage2Write != 0 && slab.lease != nil {
+			foundAllocatorMapping = true
+			break
+		}
+	}
+	if !foundAllocatorMapping {
+		t.Fatal("Sentry allocator working set contains no writable stage-2 lease")
+	}
+	if err := engine.FlushHostExecutionCache(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for address, slab := range engine.stage2Slabs {
+		if !slab.mainImage {
+			t.Fatalf("allocator-owned Sentry slab %#x remained after execution-cache flush", address)
+		}
+	}
+	runtime.KeepAlive(allocation)
+}
+
 func TestNativeResumeTrapAddress(t *testing.T) {
 	if got, want := ring0asm.NativeResumeTrapAddress(), ring0asm.NativeResumeAddress()+4; got != want {
 		t.Fatalf("native-resume trap address = %#x, want %#x", got, want)

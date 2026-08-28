@@ -380,6 +380,9 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		metadataFile:        opts.MetadataFile,
 	}
 	err := k.quiescePausedAnd(ctx, func() error {
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
+		}
 		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, false)
 		if err != nil {
 			return err

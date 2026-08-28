@@ -41,6 +41,16 @@ func (*relocationTestVM) Close() error { return nil }
 
 type relocationTestVCPU struct{ vm *relocationTestVM }
 
+type flushCountingEngine struct {
+	*workerPoolTestEngine
+	flushes int
+}
+
+func (e *flushCountingEngine) FlushHostExecutionCache(context.Context) error {
+	e.flushes++
+	return nil
+}
+
 func TestMapUnitFitsOneMonitorTransaction(t *testing.T) {
 	if got, want := (&Platform{}).MapUnit(), uint64(monitorabi.MaxOperations*hostarch.PageSize); got != want {
 		t.Fatalf("MapUnit = %#x, want one monitor transaction (%#x)", got, want)
@@ -79,6 +89,29 @@ func TestPrepareRestoreRequiresReleasedAddressSpaces(t *testing.T) {
 	p.closed = true
 	if err := p.PrepareRestore(); err == nil {
 		t.Fatal("PrepareRestore succeeded on a closed platform")
+	}
+}
+
+func TestFlushForCheckpointFlushesHostExecutionCache(t *testing.T) {
+	vm := &relocationTestVM{}
+	pool, err := NewWorkerPool(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	engine := &flushCountingEngine{workerPoolTestEngine: newWorkerPoolTestEngine(pool)}
+	staging := &stagingCache{pages: make(map[stagingKey]*stagedPage)}
+	staging.cond = sync.NewCond(&staging.mu)
+	p := &Platform{
+		engine:  engine,
+		staging: staging,
+		spaces:  make(map[uint64]*addressSpace),
+	}
+	if err := p.FlushForCheckpoint(nil); err != nil {
+		t.Fatal(err)
+	}
+	if engine.flushes != 1 {
+		t.Fatalf("host execution-cache flushes = %d, want 1", engine.flushes)
 	}
 }
 

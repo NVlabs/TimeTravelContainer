@@ -525,7 +525,13 @@ func networkLoop(ctx context.Context, counts *counters) error {
 		}
 		connection.Close()
 		if !bytes.Equal(got, payload) {
-			return errors.New("TCP echo payload changed")
+			mismatch := 0
+			for mismatch < len(got) && got[mismatch] == payload[mismatch] {
+				mismatch++
+			}
+			start := max(0, mismatch-8)
+			end := min(len(got), mismatch+8)
+			return fmt.Errorf("TCP echo payload changed at byte %d: got[%d:%d]=%x want=%x", mismatch, start, end, got[start:end], payload[start:end])
 		}
 		counts.network.Add(1)
 		select {
