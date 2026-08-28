@@ -36,7 +36,6 @@
 // resuming that continuation at EL1 and faulting through the host-service gate.
 #define TTC_RING0_HVC_REDPILL 0x73
 #define TTC_RING0_HVC_HOST_GATE 0x74
-#define TTC_RING0_HVC_APPLICATION_EXIT 0x75
 
 #define TTC_ADDRESS_SPACE_SENTRY UINT64_C(1)
 #define TTC_ADDRESS_SPACE_FLAGS_MASK TTC_ADDRESS_SPACE_SENTRY
@@ -89,10 +88,6 @@
 // monitor must never make its first memory access through a movable Go stack:
 // stack growth can occur after the host mirror was sampled.
 #define TTC_STATE_RING0_SENTRY_SP_OFFSET 0x3348
-// Nonzero selects the production host-return path. The monitor issues the
-// application-exit HVC without reconstructing a Sentry-at-EL1 continuation;
-// the owner-thread bridge then returns through its ordinary C ABI call.
-#define TTC_STATE_DIRECT_HOST_RETURN_OFFSET 0x3350
 // Nonzero while MDSCR_EL1.SS is enabled for the current EL0 entry. Keeping
 // this bit in monitor-owned state lets ordinary entries avoid serializing the
 // instruction stream merely to write an already-disabled debug register.

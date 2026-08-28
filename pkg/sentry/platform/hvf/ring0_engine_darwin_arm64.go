@@ -46,7 +46,6 @@ const (
 	ring0MonitorVCPUID          = 63
 	stateApplicationFP          = 0x3000
 	stateRing0Entry             = 0x3340
-	stateDirectHostReturn       = 0x3350
 	stateTLBFlushRequested      = 0x2a68
 	stateClockGettimePC         = 0x3368
 	stateMachAbsoluteTimePC     = 0x3370
@@ -54,15 +53,6 @@ const (
 	stateTimebaseDenom          = 0x3380
 	stateRealtimeOffsetNS       = 0x3388
 	applicationResidencyQuantum = time.Millisecond
-	// Keep short-lived processes on the correctness-first host-return path until
-	// the writable Sentry memory plane can provide stable Go-heap identity.
-	applicationEL1PromotionRuns = 4096
-	// A host-service gate returns the continuation to Darwin EL0. One direct
-	// entry is sufficient to complete the host-dependent operation before the
-	// address space retries its already-earned EL1 residency. Do not reuse the
-	// initial promotion threshold here: doing so turns each isolated host gate
-	// into thousands of slow-path syscalls for metadata-heavy workloads.
-	applicationEL1RetryRuns = 1
 )
 
 // MaxApplicationVCPUs is the number of HVF vCPU IDs available to application
@@ -79,15 +69,6 @@ type ring0ApplicationCPU struct {
 	entryActive       atomic.Bool
 	tlbGeneration     uint64
 	residentSince     time.Time
-	el1Promoted       bool
-}
-
-// ring0ApplicationMode learns whether one application address space benefits
-// from keeping Sentry resident at EL1.
-type ring0ApplicationMode struct {
-	directRuns atomic.Uint64
-	cooldown   atomic.Uint64
-	promoted   atomic.Bool
 }
 
 // tryPin prevents bridge reclamation while a caller uses cpu. A negative
@@ -122,6 +103,7 @@ type ring0Stage2Lease struct {
 	hostAddress uintptr
 	length      uint64
 	shadow      bool
+	tracked     bool
 	refs        int
 }
 
@@ -200,8 +182,7 @@ type ring0Engine struct {
 	// that are between application entries in host Sentry. It is diagnostic
 	// state only; applicationWaiters drives admission handoff so a fully leased
 	// but uncontended pool retains its syscall-fast residencies.
-	applicationCPUs  atomic.Int64
-	applicationModes sync.Map // map[uint64]*ring0ApplicationMode
+	applicationCPUs atomic.Int64
 }
 
 // NewVMEngine constructs the Darwin Sentry-at-EL1 dispatcher for the
@@ -220,6 +201,9 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		vcpus = ring0MonitorVCPUID
 	}
 	if err := installRing0SignalBridge(); err != nil {
+		return nil, err
+	}
+	if err := installRing0RuntimeVMMemoryHook(); err != nil {
 		return nil, err
 	}
 	timeFastpath, err := calibrateRing0TimeFastpath()
@@ -267,6 +251,11 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		cleanupErr := e.releaseHostMirror()
 		monitorPool.Close()
 		return nil, errors.Join(fmt.Errorf("monitor did not publish the Sentry TTBR0"), cleanupErr)
+	}
+	if err := vm.hostState.register(e); err != nil {
+		cleanupErr := e.releaseHostMirror()
+		monitorPool.Close()
+		return nil, errors.Join(err, cleanupErr)
 	}
 	go e.runRuntimeClockUpdater()
 	return e, nil
@@ -401,16 +390,6 @@ func (e *ring0Engine) runMonitorCommand(ctx context.Context, encoded []byte) ([]
 	}
 	if monitorCommandMutatesTranslations(encoded) {
 		e.mmuGeneration.Add(1)
-	}
-	if command, commandErr := monitorabi.UnmarshalCommand(encoded); commandErr == nil &&
-		(command.Opcode == monitorabi.OpcodeCreateAddressSpace || command.Opcode == monitorabi.OpcodeDestroyAddressSpace) {
-		if decoded, responseErr := monitorabi.UnmarshalResponse(response); responseErr == nil && decoded.Status == monitorabi.StatusOK {
-			if command.Opcode == monitorabi.OpcodeCreateAddressSpace {
-				e.applicationModes.Store(command.AddressSpaceID, &ring0ApplicationMode{})
-			} else {
-				e.applicationModes.Delete(command.AddressSpaceID)
-			}
-		}
 	}
 	return response, nil
 }
@@ -572,23 +551,6 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		return vmm.Exit{}, fmt.Errorf("invalid ARM64 application PSTATE %#x before ring0 EL0 entry", registers.PState)
 	}
 	atGuestEL1 := ring0asm.CurrentEL() != 0
-	enterEL1 := atGuestEL1
-	var applicationMode *ring0ApplicationMode
-	if !atGuestEL1 {
-		applicationMode = e.applicationMode(application.AddressSpaceID)
-		if cpu.el1Promoted {
-			// Any Darwin service or missing Sentry mapping returns the continuation
-			// to host EL0. Give that continuation one direct entry to finish its
-			// host-dependent work before retrying EL1 residency.
-			cpu.el1Promoted = false
-			applicationMode.cooldown.Store(applicationEL1RetryRuns)
-			e.clearHostGateFault(cpu)
-		} else if applicationMode.promoted.Load() && applicationMode.cooldown.Load() == 0 {
-			// Only long-running syscall bursts cross this threshold. Short-lived
-			// processes stay on the correctness-first host-return path.
-			enterEL1 = true
-		}
-	}
 	cleanupCPU := func() {
 		cpu.applicationActive.Store(false)
 		atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested)), 0)
@@ -600,7 +562,7 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 	if err := ctx.Err(); err != nil {
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
-	if !atGuestEL1 && enterEL1 {
+	if !atGuestEL1 {
 		// A host-service gate publishes its faulting VA in the permanent state
 		// page. Demand-map that slab together with the small continuation working
 		// set needed to return through ordinary Go code at EL1.
@@ -642,15 +604,6 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 	binary.LittleEndian.PutUint64(state[stateExitKind:], 0)
 	binary.LittleEndian.PutUint64(state[stateRing0Entry:],
 		monitorCodeVA+cpu.vcpu.monitor.ring0ApplicationOffset)
-	directHostReturn := uint64(1)
-	if enterEL1 {
-		directHostReturn = 0
-	}
-	binary.LittleEndian.PutUint64(state[stateDirectHostReturn:], directHostReturn)
-	if generation := e.mmuGeneration.Load(); cpu.tlbGeneration != generation {
-		atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateTLBFlushRequested)), 1)
-		cpu.tlbGeneration = generation
-	}
 	copy(state[stateApplicationFP:stateApplicationFP+len(registers.FP)], registers.FP[:])
 	if err := ctx.Err(); err != nil {
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
@@ -665,6 +618,16 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		}
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
+	// Sample the translation generation only after publishing entryActive and
+	// observing entryBlocked clear. A monitor mutation that starts before this
+	// point must finish first; one that starts after it must cancel this entry
+	// before changing page tables. Sampling earlier leaves a window in which a
+	// mutation can complete after the sample but before guest admission, letting
+	// this vCPU enter an application with stale local translations.
+	if generation := e.mmuGeneration.Load(); cpu.tlbGeneration != generation {
+		atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateTLBFlushRequested)), 1)
+		cpu.tlbGeneration = generation
+	}
 	if atGuestEL1 && ring0asm.CurrentEL() == 0 {
 		// A concurrent Sentry-root refresh may redpill this continuation after
 		// the entry sample but before it publishes entryActive. Re-run host-side mirror
@@ -673,42 +636,28 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		cpu.entryActive.Store(false)
 		return e.runApplicationCPU(ctx, application, cpu, false)
 	}
-	if enterEL1 {
-		var bridgePointer unsafe.Pointer
-		var stateVA, monitorEntry uint64
-		var hostStackTop, nativeEntry, bootstrap uintptr
-		if !atGuestEL1 {
-			cpu.el1Promoted = true
-			bridgePointer = unsafe.Pointer(cpu.bridge.pointer)
-			stateVA = cpu.vcpu.stateVA
-			monitorEntry = monitorCodeVA + cpu.vcpu.monitor.ring0ApplicationOffset
-			hostStackTop = cpu.bridge.hostStackTop()
-			nativeEntry = ring0NativeEntryAddress()
-			bootstrap = cpu.bridge.bootstrap()
-		}
-		// Like KVM, expose guest execution as an external syscall interval to
-		// the Go scheduler. The application exception resumes this continuation
-		// at EL1; exitsyscall reacquires a P before Sentry handles the syscall.
-		// All possibly splitting Go work must stay above entersyscall.
-		ring0EnterSyscall()
-		if atGuestEL1 {
-			ring0asm.SwitchApplicationGuest()
-		} else {
-			ring0asm.SwitchApplication(bridgePointer, stateVA, monitorEntry,
-				hostStackTop, nativeEntry, bootstrap)
-		}
-		ring0ExitSyscall()
+	// Like KVM, expose guest execution as an external syscall interval to
+	// the Go scheduler. The application exception resumes this continuation
+	// at EL1; exitsyscall reacquires a P before Sentry handles the syscall.
+	// All possibly splitting Go work must stay above entersyscall.
+	ring0EnterSyscall()
+	if atGuestEL1 {
+		ring0asm.SwitchApplicationGuest()
 	} else {
-		_ = cpu.bridge.runApplicationFast()
+		// The first entry for a retained residency uses a controlled signal so
+		// Darwin supplies a complete architectural context. Synthesizing a
+		// partial context for a signal-free entry is not equivalent to KVM's
+		// bluepill and can lose Go runtime register state. The signal cost is
+		// paid once per residency; subsequent syscall entries stay in EL1.
+		ring0asm.Bluepill(unsafe.Pointer(cpu.bridge.pointer), cpu.vcpu.stateVA)
+		ring0asm.SwitchApplicationGuest()
 	}
+	ring0ExitSyscall()
 	cpu.entryActive.Store(false)
 	if err := cpu.bridge.error("HVF Sentry-at-EL1 application bridge failed"); err != nil {
 		postRunErr := cpu.bridge.probeOwner()
 		retireErr := e.retireUnenteredApplicationCPU(cpu)
 		return vmm.Exit{}, errors.Join(err, postRunErr, retireErr)
-	}
-	if !enterEL1 {
-		recordDirectApplicationRun(applicationMode)
 	}
 	for i := range registers.X {
 		registers.X[i] = binary.LittleEndian.Uint64(state[stateX0+i*8:])
@@ -759,30 +708,6 @@ func stage1FaultAccess(syndrome uint64) vmm.Stage2Access {
 		access |= vmm.Stage2Execute
 	}
 	return access
-}
-
-func (e *ring0Engine) applicationMode(addressSpaceID uint64) *ring0ApplicationMode {
-	if mode, ok := e.applicationModes.Load(addressSpaceID); ok {
-		return mode.(*ring0ApplicationMode)
-	}
-	mode := &ring0ApplicationMode{}
-	actual, _ := e.applicationModes.LoadOrStore(addressSpaceID, mode)
-	return actual.(*ring0ApplicationMode)
-}
-
-func recordDirectApplicationRun(mode *ring0ApplicationMode) {
-	for {
-		remaining := mode.cooldown.Load()
-		if remaining == 0 {
-			break
-		}
-		if mode.cooldown.CompareAndSwap(remaining, remaining-1) {
-			return
-		}
-	}
-	if mode.directRuns.Add(1) >= applicationEL1PromotionRuns {
-		mode.promoted.Store(true)
-	}
 }
 
 func (e *ring0Engine) beginApplicationEntry(ctx context.Context, cpu *ring0ApplicationCPU) error {
@@ -1670,6 +1595,7 @@ func prepareRing0Stage2Lease(source uintptr, length uint64, shadow bool) (*ring0
 		hostAddress: hostAddress,
 		length:      length,
 		shadow:      shadow,
+		tracked:     !shadow,
 	}, nil
 }
 
@@ -1683,12 +1609,23 @@ func releaseRing0Stage2Lease(lease *ring0Stage2Lease) error {
 	return (hostMemory{}).Release(lease.hostAddress, lease.length)
 }
 
+func ring0HostMirrorNeedsShadow(identity ring0Stage2Identity) bool {
+	return identity.mainImage && identity.access&vmm.Stage2Write == 0
+}
+
 func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintptr]ring0Stage2Identity) ([]uintptr, error) {
 	sort.Slice(addresses, func(i, j int) bool { return addresses[i] < addresses[j] })
 	var skipped []uintptr
 	for start := 0; start < len(addresses); {
 		identity := desired[addresses[start]]
-		shadow := identity.access&vmm.Stage2Write == 0
+		// A host mapping's protection describes how Sentry accesses it, not
+		// whether its contents are immutable. In particular, safecopy commonly
+		// exposes GuestRAM through read-only host mappings while the application
+		// continues to modify the underlying frames. Shadowing those mappings
+		// gives EL1 a stale snapshot and corrupts copy-in. Only immutable pages in
+		// the Sentry's own Mach-O image may use a private compatibility shadow;
+		// every other data mapping must remain a coherent direct alias.
+		shadow := ring0HostMirrorNeedsShadow(identity)
 		end := start + 1
 		// Private copies avoid Mach's executable-file mapping restrictions for
 		// read-only image pages. Writable source mappings may be coalesced only
@@ -1713,7 +1650,11 @@ func (e *ring0Engine) mapHostStage2Slabs(addresses []uintptr, desired map[uintpt
 			}
 			lease, mapErr = prepareRing0Stage2Lease(address, length, shadow)
 			if mapErr == nil {
-				mapErr = e.vm.mapRing0Stage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+				if lease.tracked {
+					mapErr = e.vm.mapRing0MirrorStage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+				} else {
+					mapErr = e.vm.mapRing0Stage2Source(uintptr(e.nextMirrorGPA), lease.hostAddress, length, identity.access)
+				}
 			}
 			if mapErr == nil || end-start == 1 {
 				break
@@ -1767,14 +1708,22 @@ func (e *ring0Engine) unmapHostStage2Slabs(addresses []uintptr) error {
 		end := start + 1
 		for end < len(addresses) &&
 			addresses[end] == addresses[end-1]+uintptr(vmm.HostSlabSize) &&
-			e.stage2Slabs[addresses[end]].gpa == e.stage2Slabs[addresses[end-1]].gpa+vmm.HostSlabSize {
+			e.stage2Slabs[addresses[end]].gpa == e.stage2Slabs[addresses[end-1]].gpa+vmm.HostSlabSize &&
+			e.stage2Slabs[addresses[end]].lease.tracked == e.stage2Slabs[addresses[end-1]].lease.tracked {
 			end++
 		}
 		address := addresses[start]
 		length := uint64(end-start) * vmm.HostSlabSize
 		gpa := e.stage2Slabs[address].gpa
-		if err := e.vm.unmapRing0Stage2GPA(gpa, length); err != nil {
-			return fmt.Errorf("unmapping Sentry stage-2 range gpa=[%#x, %#x) host=[%#x, %#x): %w", gpa, gpa+length, address, address+uintptr(length), err)
+		lease := e.stage2Slabs[address].lease
+		var unmapErr error
+		if lease.tracked {
+			unmapErr = e.vm.unmapRing0MirrorStage2GPA(gpa, length)
+		} else {
+			unmapErr = e.vm.unmapRing0Stage2GPA(gpa, length)
+		}
+		if unmapErr != nil {
+			return fmt.Errorf("unmapping Sentry stage-2 range gpa=[%#x, %#x) host=[%#x, %#x): %w", gpa, gpa+length, address, address+uintptr(length), unmapErr)
 		}
 		var released []*ring0Stage2Lease
 		for _, unmapped := range addresses[start:end] {
@@ -1803,6 +1752,59 @@ func (e *ring0Engine) releaseHostMirror() error {
 		addresses = append(addresses, address)
 	}
 	return e.unmapHostStage2Slabs(addresses)
+}
+
+// retireHostMirrorRange removes every Sentry stage-1 and secondary stage-2
+// alias of a VMM-owned host range before its backing is decommitted or its HVA
+// can be reused. The Go runtime VM hook cannot observe GuestRAM's explicit
+// host allocator, so this is the corresponding owner-driven MMU notifier.
+func (e *ring0Engine) retireHostMirrorRange(ctx context.Context, address uintptr, length uint64) error {
+	if length == 0 || address%uintptr(vmm.HostSlabSize) != 0 ||
+		length%vmm.HostSlabSize != 0 || address+uintptr(length) < address {
+		return fmt.Errorf("invalid Sentry mirror retirement [%#x, %#x)", address, address+uintptr(length))
+	}
+	ring0asm.EnsureHost()
+	e.mirrorMu.Lock()
+	defer e.mirrorMu.Unlock()
+	if err := e.lockApplicationEntries(ctx); err != nil {
+		return err
+	}
+	defer e.unlockApplicationEntries()
+	if err := e.quiesceGuestContinuations(ctx, 5*time.Second); err != nil {
+		return err
+	}
+
+	end := address + uintptr(length)
+	var addresses []uintptr
+	pages := make(map[uint64]struct{})
+	for slabAddress := range e.stage2Slabs {
+		if slabAddress < address || slabAddress >= end {
+			continue
+		}
+		addresses = append(addresses, slabAddress)
+		for va := uint64(slabAddress); va < uint64(slabAddress)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
+			if _, mapped := e.stage1Access[va]; mapped {
+				pages[va] = struct{}{}
+			}
+		}
+	}
+	if len(addresses) == 0 {
+		return nil
+	}
+	if err := e.applyHostStage1(ctx, hostStage1UnmapOperations(pages)); err != nil {
+		return fmt.Errorf("retiring Sentry stage-1 aliases for host range [%#x, %#x): %w", address, end, err)
+	}
+	if err := e.unmapHostStage2Slabs(addresses); err != nil {
+		return fmt.Errorf("retiring Sentry stage-2 aliases for host range [%#x, %#x): %w", address, end, err)
+	}
+	e.faultMu.Lock()
+	for pending := range e.pendingMirror {
+		if pending >= address && pending < end {
+			delete(e.pendingMirror, pending)
+		}
+	}
+	e.faultMu.Unlock()
+	return nil
 }
 
 // FlushHostExecutionCache discards every mutable or allocator-owned Sentry
@@ -2028,6 +2030,12 @@ func (e *ring0Engine) Close() (retErr error) {
 		e.cpuMu.Unlock()
 		return retErr
 	}
+	e.cpuMu.Unlock()
+	// Wait for any host allocator notification already using this engine, then
+	// prevent new GuestRAM releases from entering while the monitor is torn
+	// down. Platform epoch transitions exclude allocator users at this point.
+	e.vm.hostState.unregister(e)
+	e.cpuMu.Lock()
 	e.closed.Store(true)
 	e.cpuMu.Unlock()
 	close(e.clockStop)

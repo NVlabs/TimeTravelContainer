@@ -28,6 +28,7 @@ package hvf
 #include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdatomic.h>
@@ -262,7 +263,550 @@ struct ttc_ring0_bridge {
 	void *host_stack;
 	size_t host_stack_size;
 	uint64_t bootstrap[9];
+	struct ttc_ring0_bridge *registry_next;
 };
+
+#define TTC_RING0_MAX_APPLICATION_VCPUS 63u
+#define TTC_RING0_HOST_SLAB_SIZE UINT64_C(16384)
+#define TTC_RUNTIME_VM_MUTATION_VERSION 1u
+#define TTC_RUNTIME_VM_MMAP 1u
+#define TTC_RUNTIME_VM_MUNMAP 2u
+#define TTC_RUNTIME_VM_MADVISE 3u
+#define TTC_RUNTIME_VM_BEFORE 1u
+#define TTC_RUNTIME_VM_AFTER 2u
+#define TTC_RUNTIME_MADV_FREE_REUSABLE 7
+#define TTC_RUNTIME_MADV_FREE_REUSE 8
+
+// Keep this layout synchronized with runtime.ttcVMMemoryMutation in the
+// patched Darwin Go runtime. It deliberately contains no Go pointers.
+struct ttc_runtime_vm_mutation {
+	uint32_t version;
+	uint16_t operation;
+	uint16_t phase;
+	uintptr_t address;
+	uintptr_t length;
+	uintptr_t result;
+	int32_t protection;
+	int32_t flags;
+	int32_t fd;
+	int32_t error;
+	uint32_t offset;
+	uint32_t active;
+};
+
+_Static_assert(sizeof(struct ttc_runtime_vm_mutation) == 56,
+		"Darwin runtime VM mutation ABI changed");
+
+// One record represents one coalesced hv_vm_map lease. registered records the
+// GPAs still owned by the Go mirror metadata; live records which of those
+// GPAs currently have a stage-2 mapping. A runtime munmap may make a slab
+// dormant until a later mmap reuses the same HVA.
+struct ttc_ring0_mirror_mapping {
+	uintptr_t host;
+	uint64_t gpa;
+	uint64_t length;
+	hv_memory_flags_t access;
+	size_t slabs;
+	size_t words;
+	struct ttc_ring0_mirror_mapping *next;
+	uint64_t bits[];
+};
+
+static pthread_mutex_t ttc_ring0_mutation_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t ttc_ring0_bridge_registry_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint32_t ttc_ring0_guest_blocked;
+static struct ttc_ring0_bridge *ttc_ring0_bridges;
+static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
+
+static uintptr_t ttc_ring0_strip_instruction_pointer(uintptr_t address);
+
+static uint64_t *ttc_ring0_mapping_registered(
+		struct ttc_ring0_mirror_mapping *mapping) {
+	return &mapping->bits[0];
+}
+
+static uint64_t *ttc_ring0_mapping_live(
+		struct ttc_ring0_mirror_mapping *mapping) {
+	return &mapping->bits[mapping->words];
+}
+
+static bool ttc_ring0_bit_test(const uint64_t *bits, size_t index) {
+	return (bits[index / 64] & (UINT64_C(1) << (index % 64))) != 0;
+}
+
+static void ttc_ring0_bit_set(uint64_t *bits, size_t index) {
+	bits[index / 64] |= UINT64_C(1) << (index % 64);
+}
+
+static void ttc_ring0_bit_clear(uint64_t *bits, size_t index) {
+	bits[index / 64] &= ~(UINT64_C(1) << (index % 64));
+}
+
+static bool ttc_ring0_mapping_empty(
+		struct ttc_ring0_mirror_mapping *mapping) {
+	uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+	for (size_t word = 0; word < mapping->words; ++word) {
+		if (registered[word] != 0) return false;
+	}
+	return true;
+}
+
+static bool ttc_ring0_ranges_overlap(uintptr_t first, uint64_t first_length,
+		uintptr_t second, uintptr_t second_length) {
+	if (first_length == 0 || second_length == 0) return false;
+	uintptr_t first_end = first + (uintptr_t)first_length;
+	uintptr_t second_end = second + second_length;
+	if (first_end < first || second_end < second) return true;
+	return first < second_end && second < first_end;
+}
+
+static bool ttc_ring0_mapping_slab_overlaps(
+		const struct ttc_ring0_mirror_mapping *mapping, size_t slab,
+		uintptr_t address, uintptr_t length) {
+	return ttc_ring0_ranges_overlap(
+		mapping->host + slab * TTC_RING0_HOST_SLAB_SIZE,
+		TTC_RING0_HOST_SLAB_SIZE, address, length);
+}
+
+// Guest admission is a lock-free read side. The second blocked sample closes
+// the race with a writer that publishes guest_blocked immediately after the
+// first sample. The writer cannot finish draining while in_guest remains set.
+static void ttc_ring0_admit_guest(struct ttc_ring0_bridge *bridge) {
+	for (;;) {
+		while (atomic_load_explicit(&ttc_ring0_guest_blocked,
+				memory_order_acquire) != 0) {
+			sched_yield();
+		}
+		atomic_store_explicit(&bridge->in_guest, 1,
+				memory_order_seq_cst);
+		if (atomic_load_explicit(&ttc_ring0_guest_blocked,
+				memory_order_seq_cst) == 0) {
+			return;
+		}
+		atomic_store_explicit(&bridge->in_guest, 0,
+				memory_order_release);
+	}
+}
+
+// The caller holds mutation_mu, which also stabilizes the mirror registry.
+static int ttc_ring0_begin_runtime_mutation_locked(void) {
+	int status;
+	atomic_store_explicit(&ttc_ring0_guest_blocked, 1,
+			memory_order_seq_cst);
+
+	status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
+	if (status != 0) goto fail;
+	struct timespec start;
+	(void)clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		hv_vcpu_t active[TTC_RING0_MAX_APPLICATION_VCPUS];
+		size_t count = 0;
+		for (struct ttc_ring0_bridge *bridge = ttc_ring0_bridges;
+				bridge != NULL; bridge = bridge->registry_next) {
+			if (atomic_load_explicit(&bridge->in_guest,
+					memory_order_acquire) != 0 &&
+					atomic_load_explicit(&bridge->destroyed,
+					memory_order_acquire) == 0) {
+				if (count == TTC_RING0_MAX_APPLICATION_VCPUS) {
+					status = EOVERFLOW;
+					goto fail_registry;
+				}
+				active[count++] = bridge->vcpu;
+			}
+		}
+		if (count == 0) break;
+		hv_return_t hv_status = hv_vcpus_exit(active, (uint32_t)count);
+		if (hv_status != HV_SUCCESS) {
+			status = EIO;
+			goto fail_registry;
+		}
+		struct timespec now;
+		(void)clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec - start.tv_sec >= 5) {
+			status = ETIMEDOUT;
+			goto fail_registry;
+		}
+		sched_yield();
+	}
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+	return 0;
+
+fail_registry:
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+fail:
+	atomic_store_explicit(&ttc_ring0_guest_blocked, 0,
+			memory_order_release);
+	return status;
+}
+
+static void ttc_ring0_end_runtime_mutation(void) {
+	atomic_store_explicit(&ttc_ring0_guest_blocked, 0,
+			memory_order_release);
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+}
+
+static hv_memory_flags_t ttc_ring0_memory_flags(uint32_t access) {
+	hv_memory_flags_t flags = 0;
+	if ((access & 1u) != 0) flags |= HV_MEMORY_READ;
+	if ((access & 2u) != 0) flags |= HV_MEMORY_WRITE;
+	if ((access & 4u) != 0) flags |= HV_MEMORY_EXEC;
+	return flags;
+}
+
+// ttc_ring0_stage2_map serializes every HVF mapping operation with runtime
+// mutations. Tracked mappings are direct aliases of mutable Sentry memory.
+static hv_return_t ttc_ring0_stage2_map(uintptr_t host, uint64_t gpa,
+		uint64_t length, uint32_t access, int tracked) {
+	struct ttc_ring0_mirror_mapping *mapping = NULL;
+	if (tracked != 0) {
+		size_t slabs = (size_t)(length / TTC_RING0_HOST_SLAB_SIZE);
+		size_t words = (slabs + 63) / 64;
+		if (slabs == 0 || words > (SIZE_MAX - sizeof(*mapping)) /
+				(2 * sizeof(uint64_t))) return HV_NO_RESOURCES;
+		mapping = calloc(1, sizeof(*mapping) +
+				2 * words * sizeof(uint64_t));
+		if (mapping == NULL) return HV_NO_RESOURCES;
+		mapping->host = host;
+		mapping->gpa = gpa;
+		mapping->length = length;
+		mapping->access = ttc_ring0_memory_flags(access);
+		mapping->slabs = slabs;
+		mapping->words = words;
+		for (size_t slab = 0; slab < slabs; ++slab) {
+			ttc_ring0_bit_set(ttc_ring0_mapping_registered(mapping), slab);
+			ttc_ring0_bit_set(ttc_ring0_mapping_live(mapping), slab);
+		}
+	}
+	int lock_status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	if (lock_status != 0) {
+		free(mapping);
+		return HV_ERROR;
+	}
+	hv_return_t status = hv_vm_map((void *)host, gpa, (size_t)length,
+			ttc_ring0_memory_flags(access));
+	if (status == HV_SUCCESS && mapping != NULL) {
+		mapping->next = ttc_ring0_mirror_mappings;
+		ttc_ring0_mirror_mappings = mapping;
+		mapping = NULL;
+	}
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	free(mapping);
+	return status;
+}
+
+static hv_return_t ttc_ring0_unmap_live_run(
+		struct ttc_ring0_mirror_mapping *mapping, size_t first,
+		size_t end) {
+	if (first == end) return HV_SUCCESS;
+	return hv_vm_unmap(mapping->gpa + first * TTC_RING0_HOST_SLAB_SIZE,
+			(end - first) * TTC_RING0_HOST_SLAB_SIZE);
+}
+
+static hv_return_t ttc_ring0_stage2_unmap(uint64_t gpa, uint64_t length,
+		int tracked) {
+	int lock_status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	if (lock_status != 0) return HV_ERROR;
+	if (tracked == 0) {
+		hv_return_t status = hv_vm_unmap(gpa, (size_t)length);
+		pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+		return status;
+	}
+	uint64_t end_gpa = gpa + length;
+	bool found = false;
+	hv_return_t result = HV_SUCCESS;
+	struct ttc_ring0_mirror_mapping **link = &ttc_ring0_mirror_mappings;
+	while (*link != NULL) {
+		struct ttc_ring0_mirror_mapping *mapping = *link;
+		uint64_t mapping_end = mapping->gpa + mapping->length;
+		if (gpa < mapping_end && mapping->gpa < end_gpa) {
+			uint64_t overlap_start = gpa > mapping->gpa ? gpa : mapping->gpa;
+			uint64_t overlap_end = end_gpa < mapping_end ? end_gpa : mapping_end;
+			size_t first = (size_t)((overlap_start - mapping->gpa) /
+					TTC_RING0_HOST_SLAB_SIZE);
+			size_t end = (size_t)((overlap_end - mapping->gpa) /
+					TTC_RING0_HOST_SLAB_SIZE);
+			uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+			uint64_t *live = ttc_ring0_mapping_live(mapping);
+			for (size_t slab = first; slab < end;) {
+				if (!ttc_ring0_bit_test(registered, slab)) {
+					++slab;
+					continue;
+				}
+				found = true;
+				if (ttc_ring0_bit_test(live, slab)) {
+					size_t run = slab + 1;
+					while (run < end &&
+							ttc_ring0_bit_test(registered, run) &&
+							ttc_ring0_bit_test(live, run)) ++run;
+					result = ttc_ring0_unmap_live_run(mapping, slab, run);
+					if (result != HV_SUCCESS) goto done;
+					for (size_t index = slab; index < run; ++index) {
+						ttc_ring0_bit_clear(live, index);
+					}
+				}
+				ttc_ring0_bit_clear(registered, slab);
+				ttc_ring0_bit_clear(live, slab);
+				++slab;
+			}
+		}
+		if (ttc_ring0_mapping_empty(mapping)) {
+			*link = mapping->next;
+			free(mapping);
+			continue;
+		}
+		link = &mapping->next;
+	}
+	if (!found) result = HV_BAD_ARGUMENT;
+
+done:
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	return result;
+}
+
+static bool ttc_ring0_mirror_live_overlap(uintptr_t address,
+		uintptr_t length) {
+	for (struct ttc_ring0_mirror_mapping *mapping =
+			ttc_ring0_mirror_mappings; mapping != NULL;
+			mapping = mapping->next) {
+		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+		uint64_t *live = ttc_ring0_mapping_live(mapping);
+		for (size_t slab = 0; slab < mapping->slabs; ++slab) {
+			if (ttc_ring0_bit_test(registered, slab) &&
+					ttc_ring0_bit_test(live, slab) &&
+					ttc_ring0_mapping_slab_overlaps(mapping, slab,
+						address, length)) return true;
+		}
+	}
+	return false;
+}
+
+static bool ttc_ring0_mirror_dormant_overlap(uintptr_t address,
+		uintptr_t length) {
+	for (struct ttc_ring0_mirror_mapping *mapping =
+			ttc_ring0_mirror_mappings; mapping != NULL;
+			mapping = mapping->next) {
+		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+		uint64_t *live = ttc_ring0_mapping_live(mapping);
+		for (size_t slab = 0; slab < mapping->slabs; ++slab) {
+			if (ttc_ring0_bit_test(registered, slab) &&
+					!ttc_ring0_bit_test(live, slab) &&
+					ttc_ring0_mapping_slab_overlaps(mapping, slab,
+						address, length)) return true;
+		}
+	}
+	return false;
+}
+
+static hv_return_t ttc_ring0_suspend_mirror(uintptr_t address,
+		uintptr_t length) {
+	for (struct ttc_ring0_mirror_mapping *mapping =
+			ttc_ring0_mirror_mappings; mapping != NULL;
+			mapping = mapping->next) {
+		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+		uint64_t *live = ttc_ring0_mapping_live(mapping);
+		for (size_t slab = 0; slab < mapping->slabs;) {
+			if (!ttc_ring0_bit_test(registered, slab) ||
+					!ttc_ring0_bit_test(live, slab) ||
+					!ttc_ring0_mapping_slab_overlaps(mapping, slab,
+						address, length)) {
+				++slab;
+				continue;
+			}
+			size_t run = slab + 1;
+			while (run < mapping->slabs &&
+					ttc_ring0_bit_test(registered, run) &&
+					ttc_ring0_bit_test(live, run) &&
+					ttc_ring0_mapping_slab_overlaps(mapping, run,
+						address, length)) ++run;
+			hv_return_t status = ttc_ring0_unmap_live_run(mapping,
+					slab, run);
+			if (status != HV_SUCCESS) return status;
+			for (size_t index = slab; index < run; ++index) {
+				ttc_ring0_bit_clear(live, index);
+			}
+			slab = run;
+		}
+	}
+	return HV_SUCCESS;
+}
+
+static bool ttc_ring0_host_slab_accessible(uintptr_t address,
+		hv_memory_flags_t access) {
+	struct ttc_ring0_region region;
+	if (ttc_ring0_region_at(address, &region) != KERN_SUCCESS) return false;
+	if (region.address > address || region.length < TTC_RING0_HOST_SLAB_SIZE ||
+			address - region.address >
+			region.length - TTC_RING0_HOST_SLAB_SIZE) return false;
+	if ((access & HV_MEMORY_READ) != 0 &&
+			(region.protection & VM_PROT_READ) == 0) return false;
+	if ((access & HV_MEMORY_WRITE) != 0 &&
+			(region.protection & VM_PROT_WRITE) == 0) return false;
+	if ((access & HV_MEMORY_EXEC) != 0 &&
+			(region.protection & VM_PROT_EXECUTE) == 0) return false;
+	return true;
+}
+
+static hv_return_t ttc_ring0_rebind_mirror(uintptr_t address,
+		uintptr_t length) {
+	for (struct ttc_ring0_mirror_mapping *mapping =
+			ttc_ring0_mirror_mappings; mapping != NULL;
+			mapping = mapping->next) {
+		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
+		uint64_t *live = ttc_ring0_mapping_live(mapping);
+		for (size_t slab = 0; slab < mapping->slabs;) {
+			uintptr_t host = mapping->host +
+					slab * TTC_RING0_HOST_SLAB_SIZE;
+			if (!ttc_ring0_bit_test(registered, slab) ||
+					ttc_ring0_bit_test(live, slab) ||
+					!ttc_ring0_mapping_slab_overlaps(mapping, slab,
+						address, length) ||
+					!ttc_ring0_host_slab_accessible(host,
+						mapping->access)) {
+				++slab;
+				continue;
+			}
+			size_t run = slab + 1;
+			while (run < mapping->slabs) {
+				uintptr_t run_host = mapping->host +
+						run * TTC_RING0_HOST_SLAB_SIZE;
+				if (!ttc_ring0_bit_test(registered, run) ||
+						ttc_ring0_bit_test(live, run) ||
+						!ttc_ring0_mapping_slab_overlaps(mapping, run,
+							address, length) ||
+						!ttc_ring0_host_slab_accessible(run_host,
+							mapping->access)) break;
+				++run;
+			}
+			hv_return_t status = hv_vm_map((void *)host,
+					mapping->gpa + slab * TTC_RING0_HOST_SLAB_SIZE,
+					(run - slab) * TTC_RING0_HOST_SLAB_SIZE,
+					mapping->access);
+			if (status != HV_SUCCESS) return status;
+			for (size_t index = slab; index < run; ++index) {
+				ttc_ring0_bit_set(live, index);
+			}
+			slab = run;
+		}
+	}
+	return HV_SUCCESS;
+}
+
+static int32_t ttc_ring0_runtime_vm_hook(
+		struct ttc_runtime_vm_mutation *mutation) {
+	if (mutation == NULL ||
+			mutation->version != TTC_RUNTIME_VM_MUTATION_VERSION ||
+			mutation->length == 0 ||
+			mutation->address + mutation->length < mutation->address ||
+			mutation->operation < TTC_RUNTIME_VM_MMAP ||
+			mutation->operation > TTC_RUNTIME_VM_MADVISE) return EINVAL;
+	if (mutation->phase == TTC_RUNTIME_VM_BEFORE) {
+		int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+		if (status != 0) return status;
+		bool live = ttc_ring0_mirror_live_overlap(mutation->address,
+				mutation->length);
+		// MADV_FREE_REUSABLE deliberately leaves the host VA backed by pages
+		// that Darwin may reclaim at any later time. Those stage-2 leases stay
+		// dormant until MADV_FREE_REUSE makes the host mapping stable again.
+		// Consequently the reuse callback must rendezvous even when every
+		// overlapping mirror slab is currently dormant.
+		bool reusing = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
+			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE &&
+			ttc_ring0_mirror_dormant_overlap(mutation->address,
+				mutation->length);
+		if (!live && !reusing) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
+		status = ttc_ring0_begin_runtime_mutation_locked();
+		if (status != 0) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return status;
+		}
+		hv_return_t hv_status = live ? ttc_ring0_suspend_mirror(
+				mutation->address, mutation->length) : HV_SUCCESS;
+		if (hv_status != HV_SUCCESS) {
+			ttc_ring0_end_runtime_mutation();
+			return EIO;
+		}
+		mutation->active = 1;
+		return 0;
+	}
+	if (mutation->phase != TTC_RUNTIME_VM_AFTER) return EINVAL;
+	bool releasing = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
+		mutation->flags == TTC_RUNTIME_MADV_FREE_REUSABLE;
+
+	uintptr_t result_address = mutation->operation == TTC_RUNTIME_VM_MMAP &&
+			mutation->error == 0 ? mutation->result : 0;
+	if (mutation->active == 0) {
+		if (result_address == 0) return 0;
+		int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+		if (status != 0) return status;
+		if (!ttc_ring0_mirror_dormant_overlap(result_address,
+				mutation->length)) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
+		status = ttc_ring0_begin_runtime_mutation_locked();
+		if (status != 0) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return status;
+		}
+	}
+	// Do not rebind a FREE_REUSABLE range here. The host call only marks it
+	// reclaimable; its physical backing can still change asynchronously after
+	// the call returns. MADV_FREE_REUSE's after phase performs the rebind.
+	hv_return_t hv_status = releasing ? HV_SUCCESS :
+		ttc_ring0_rebind_mirror(mutation->address, mutation->length);
+	if (hv_status == HV_SUCCESS && result_address != 0 &&
+			result_address != mutation->address) {
+		hv_status = ttc_ring0_rebind_mirror(result_address,
+				mutation->length);
+	}
+	mutation->active = 0;
+	ttc_ring0_end_runtime_mutation();
+	return hv_status == HV_SUCCESS ? 0 : EIO;
+}
+
+static uintptr_t ttc_ring0_runtime_vm_hook_address(void) {
+	return ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_vm_hook);
+}
+
+// Exercise the same replacement protocol as runtime.mmap(MAP_FIXED) without
+// depending on allocator timing. This remains native so the test covers the
+// exact ABI, admission gate, lease suspension, and stage-2 rebind path.
+static int ttc_ring0_replace_tracked_host_mapping(uintptr_t address,
+		size_t length, uint64_t value) {
+	struct ttc_runtime_vm_mutation mutation = {
+		.version = TTC_RUNTIME_VM_MUTATION_VERSION,
+		.operation = TTC_RUNTIME_VM_MMAP,
+		.phase = TTC_RUNTIME_VM_BEFORE,
+		.address = address,
+		.length = length,
+		.protection = PROT_READ | PROT_WRITE,
+		.flags = MAP_PRIVATE | MAP_ANON | MAP_FIXED,
+		.fd = -1,
+	};
+	int status = ttc_ring0_runtime_vm_hook(&mutation);
+	if (status != 0) return status;
+	void *replacement = mmap((void *)address, length,
+			PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+	int map_status = 0;
+	if (replacement == MAP_FAILED) {
+		map_status = errno;
+		mutation.error = map_status;
+		mutation.result = 0;
+	} else {
+		__builtin_memset(replacement, 0, length);
+		__builtin_memcpy(replacement, &value, sizeof(value));
+		mutation.result = (uintptr_t)replacement;
+	}
+	mutation.phase = TTC_RUNTIME_VM_AFTER;
+	int hook_status = ttc_ring0_runtime_vm_hook(&mutation);
+	if (map_status != 0) return map_status;
+	return hook_status;
+}
 
 // HVF vCPUs and their bridges are owner-thread affine. Keep the active bridge
 // in native TLS so a host return at nativeResume remains identifiable even if
@@ -664,7 +1208,7 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 		ttc_ring0_fail_host_return(bridge, ucontext, &host_ss, &host_ns,
 				(uint32_t)status, phase);
 	}
-	atomic_store_explicit(&bridge->in_guest, 1, memory_order_release);
+	ttc_ring0_admit_guest(bridge);
 	for (;;) {
 		status = hv_vcpu_run(bridge->vcpu);
 		if (status != HV_SUCCESS) {
@@ -737,8 +1281,7 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 		if (bridge->exit->reason != HV_EXIT_REASON_EXCEPTION ||
 				((bridge->exit->exception.syndrome >> 26) & 0x3f) != 0x16 ||
 				(hvc != TTC_RING0_HVC_REDPILL &&
-				 hvc != TTC_RING0_HVC_HOST_GATE &&
-				 hvc != TTC_RING0_HVC_APPLICATION_EXIT)) {
+				 hvc != TTC_RING0_HVC_HOST_GATE)) {
 			ttc_ring0_fail_host_return(bridge, ucontext, &host_ss, &host_ns,
 					UINT32_MAX, TTC_RING0_PHASE_UNEXPECTED_EXIT);
 		}
@@ -751,25 +1294,18 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 		}
 		atomic_store_explicit(&bridge->last_host_x0,
 			ucontext->uc_mcontext->__ss.__x[0], memory_order_release);
-		if (status == HV_SUCCESS &&
-				(hvc == TTC_RING0_HVC_HOST_GATE ||
-				 hvc == TTC_RING0_HVC_APPLICATION_EXIT)) {
-			// Host gates publish the pre-exception continuation. Application exits
-			// publish the Sentry call continuation saved before entering EL0. In
-			// both cases GP/FP/TLS/SP came from the vCPU; only PC and NZCV must
-			// reflect the continuation rather than the monitor HVC itself.
+		if (status == HV_SUCCESS && hvc == TTC_RING0_HVC_HOST_GATE) {
+			// Host gates publish the pre-exception continuation. GP/FP/TLS/SP
+			// came from the vCPU; only PC and NZCV must reflect the continuation
+			// rather than the monitor HVC itself.
 			atomic_thread_fence(memory_order_acquire);
 			const uint8_t *state = (const uint8_t *)bridge->state_host;
 			uint64_t host_pc;
 			uint64_t host_pstate;
-			size_t pc_offset = hvc == TTC_RING0_HVC_HOST_GATE ?
-				TTC_STATE_HOST_GATE_PC_OFFSET : TTC_STATE_SENTRY_PC_OFFSET;
-			size_t pstate_offset = hvc == TTC_RING0_HVC_HOST_GATE ?
-				TTC_STATE_HOST_GATE_PSTATE_OFFSET : TTC_STATE_SENTRY_PSTATE_OFFSET;
 			__builtin_memcpy(&host_pc,
-					state + pc_offset, sizeof(host_pc));
+					state + TTC_STATE_HOST_GATE_PC_OFFSET, sizeof(host_pc));
 			__builtin_memcpy(&host_pstate,
-					state + pstate_offset,
+					state + TTC_STATE_HOST_GATE_PSTATE_OFFSET,
 					sizeof(host_pstate));
 			if (host_pc >= TTC_MONITOR_CODE_VA &&
 					host_pc - TTC_MONITOR_CODE_VA < TTC_MONITOR_CODE_CAPACITY) {
@@ -795,123 +1331,6 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 		ttc_ring0_finish_host_return(bridge);
 		ttc_ring0_resume_host(bridge);
 	}
-}
-
-// ttc_ring0_fast_application_run is the production application world switch.
-// Unlike the continuation qualification bridge above, it is an ordinary C ABI
-// call on bridge-owned stack space. The monitor loads/saves Linux application
-// registers from shared memory, so neither host Go registers nor a synthetic
-// signal frame are part of the syscall hot path.
-static uint32_t ttc_ring0_fast_application_run(
-		struct ttc_ring0_bridge *bridge) {
-	hv_return_t status;
-	uint64_t entry_pc = 0;
-	atomic_thread_fence(memory_order_acquire);
-	__builtin_memcpy(&entry_pc,
-			(const uint8_t *)bridge->state_host + TTC_STATE_RING0_ENTRY_OFFSET,
-			sizeof(entry_pc));
-	if (entry_pc < TTC_MONITOR_CODE_VA ||
-			entry_pc - TTC_MONITOR_CODE_VA >= TTC_MONITOR_CODE_CAPACITY) {
-		status = HV_BAD_ARGUMENT;
-		goto fail_entry;
-	}
-	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TPIDR_EL1,
-			bridge->state_va)) != HV_SUCCESS) goto fail_entry;
-	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_SP_EL1,
-			bridge->state_va + TTC_STATE_STACK_TOP)) != HV_SUCCESS) {
-		goto fail_entry;
-	}
-	if ((status = hv_vcpu_set_reg(bridge->vcpu, HV_REG_PC, entry_pc)) !=
-			HV_SUCCESS) goto fail_entry;
-	if ((status = hv_vcpu_set_reg(bridge->vcpu, HV_REG_CPSR,
-			UINT64_C(0x3c5))) != HV_SUCCESS) goto fail_entry;
-
-	atomic_store_explicit(&bridge->in_guest, 1, memory_order_release);
-	for (;;) {
-		status = hv_vcpu_run(bridge->vcpu);
-		if (status != HV_SUCCESS) {
-			atomic_store_explicit(&bridge->error, (uint32_t)status,
-					memory_order_release);
-			atomic_store_explicit(&bridge->error_phase,
-					TTC_RING0_PHASE_RUN, memory_order_release);
-			break;
-		}
-		if (bridge->exit->reason == HV_EXIT_REASON_CANCELED) {
-			uint64_t pstate = 0;
-			uint64_t pc = 0;
-			status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_CPSR, &pstate);
-			if (status != HV_SUCCESS) {
-				atomic_store_explicit(&bridge->error, (uint32_t)status,
-						memory_order_release);
-				atomic_store_explicit(&bridge->error_phase,
-						TTC_RING0_PHASE_CANCEL_PSTATE, memory_order_release);
-				break;
-			}
-			status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_PC, &pc);
-			if (status != HV_SUCCESS) {
-				atomic_store_explicit(&bridge->error, (uint32_t)status,
-						memory_order_release);
-				atomic_store_explicit(&bridge->error_phase,
-						TTC_RING0_PHASE_CANCEL_PC, memory_order_release);
-				break;
-			}
-			atomic_store_explicit(&bridge->last_cancel_pc, pc,
-					memory_order_release);
-			atomic_store_explicit(&bridge->last_cancel_pstate, pstate,
-					memory_order_release);
-			atomic_fetch_add_explicit(&bridge->cancel_count, 1,
-					memory_order_release);
-			if ((pstate & UINT64_C(0xf)) == 0) {
-				status = hv_vcpu_set_pending_interrupt(bridge->vcpu,
-						HV_INTERRUPT_TYPE_IRQ, true);
-				if (status != HV_SUCCESS) {
-					atomic_store_explicit(&bridge->error, (uint32_t)status,
-							memory_order_release);
-					atomic_store_explicit(&bridge->error_phase,
-							TTC_RING0_PHASE_CANCEL_IRQ, memory_order_release);
-					break;
-				}
-			}
-			// At EL0 the pending IRQ snapshots the application. At EL1 the
-			// monitor observes cancel_requested before ERET or completes the
-			// exception path already in progress. In both cases it reaches the
-			// application-exit HVC without exporting an intermediate PC.
-			continue;
-		}
-		if (bridge->exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
-			(void)hv_vcpu_set_vtimer_mask(bridge->vcpu, true);
-			continue;
-		}
-		uint64_t syndrome = bridge->exit->exception.syndrome;
-		if (bridge->exit->reason == HV_EXIT_REASON_EXCEPTION &&
-				((syndrome >> 26) & UINT64_C(0x3f)) == UINT64_C(0x16) &&
-				(syndrome & UINT64_C(0xffff)) ==
-					TTC_RING0_HVC_APPLICATION_EXIT) {
-			status = HV_SUCCESS;
-			break;
-		}
-		status = (hv_return_t)UINT32_MAX;
-		atomic_store_explicit(&bridge->error, UINT32_MAX,
-				memory_order_release);
-		atomic_store_explicit(&bridge->error_phase,
-				TTC_RING0_PHASE_UNEXPECTED_EXIT, memory_order_release);
-		break;
-	}
-	atomic_store_explicit(&bridge->in_guest, 0, memory_order_release);
-	return (uint32_t)status;
-
-fail_entry:
-	atomic_store_explicit(&bridge->error, (uint32_t)status,
-			memory_order_release);
-	atomic_store_explicit(&bridge->error_phase,
-			TTC_RING0_PHASE_LOAD_PC, memory_order_release);
-	atomic_store_explicit(&bridge->in_guest, 0, memory_order_release);
-	return (uint32_t)status;
-}
-
-static uintptr_t ttc_ring0_fast_application_run_address(void) {
-	return ttc_ring0_strip_instruction_pointer(
-			(uintptr_t)&ttc_ring0_fast_application_run);
 }
 
 static uintptr_t ttc_ring0_bluepill_pc;
@@ -1010,6 +1429,12 @@ static void ttc_ring0_sigill(int signo, siginfo_t *info, void *context) {
 		ttc_ring0_forward_sigill(signo, info, context);
 		return;
 	}
+	// Both entry mechanisms establish the owner-thread residency. Native entry
+	// publishes this before calling host_entry; the signal entry must do the
+	// same before a cancellation can export the continuation back to Darwin.
+	// SwitchApplicationGuest's controlled host-side TPIDR_EL1 trap relies on
+	// this TLS slot to turn that redpill race into ExitInterrupted.
+	ttc_ring0_active_bridge = bridge;
 	// Copy the signal-provided context into bridge-owned storage before
 	// sigreturn invalidates the kernel's frame. The handler performs no HVF
 	// operation; normal host execution resumes in ttc_ring0_host_entry.
@@ -1089,6 +1514,14 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 	bridge->destroy_on_host = destroy_on_host != 0;
 	(void)pthread_threadid_np(NULL, &bridge->owner_tid);
 	(void)pthread_sigmask(SIG_SETMASK, NULL, &bridge->host_context.uc_sigmask);
+	if (pthread_mutex_lock(&ttc_ring0_bridge_registry_mu) != 0) {
+		(void)munmap(bridge->host_stack, bridge->host_stack_size);
+		free(bridge);
+		return NULL;
+	}
+	bridge->registry_next = ttc_ring0_bridges;
+	ttc_ring0_bridges = bridge;
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 	return bridge;
 }
 
@@ -1219,6 +1652,13 @@ static hv_return_t ttc_ring0_bridge_probe_owner(
 
 static void ttc_ring0_bridge_destroy(struct ttc_ring0_bridge *bridge) {
 	if (bridge == NULL) return;
+	pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
+	struct ttc_ring0_bridge **link = &ttc_ring0_bridges;
+	while (*link != NULL && *link != bridge) {
+		link = &(*link)->registry_next;
+	}
+	if (*link == bridge) *link = bridge->registry_next;
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 	if (ttc_ring0_active_bridge == bridge) ttc_ring0_active_bridge = NULL;
 	bridge->magic = 0;
 	if (bridge->host_stack != NULL && bridge->host_stack != MAP_FAILED) {
@@ -1391,6 +1831,29 @@ func installRing0SignalBridge() error {
 	return nil
 }
 
+const ring0RuntimeVMMemoryHookVersion = uint32(1)
+
+func installRing0RuntimeVMMemoryHook() error {
+	status := ring0SetVMMemoryHooks(
+		ring0RuntimeVMMemoryHookVersion,
+		ring0asm.EnsureHostTrapAddress(),
+		uintptr(C.ttc_ring0_runtime_vm_hook_address()),
+	)
+	if status != 0 {
+		return fmt.Errorf("installing Darwin runtime VM memory hook ABI v%d: status %d", ring0RuntimeVMMemoryHookVersion, status)
+	}
+	return nil
+}
+
+func replaceRing0TrackedHostMapping(address uintptr, length uint64, value uint64) error {
+	status := C.ttc_ring0_replace_tracked_host_mapping(
+		C.uintptr_t(address), C.size_t(length), C.uint64_t(value))
+	if status != 0 {
+		return fmt.Errorf("replacing tracked Sentry host mapping [%#x, %#x): status %d", address, address+uintptr(length), status)
+	}
+	return nil
+}
+
 func (v *hvfVCPU) newRing0Bridge(ttbr0 uint64, destroyOnHost bool) (*ring0Bridge, error) {
 	if err := v.ensureBooted(); err != nil {
 		return nil, err
@@ -1549,11 +2012,6 @@ func ring0NativeEntryAddress() uintptr {
 	return uintptr(C.ttc_ring0_native_entry_address())
 }
 
-func (b *ring0Bridge) runApplicationFast() uint32 {
-	return ring0asm.RawCall(unsafe.Pointer(b.pointer), b.hostStackTop(),
-		uintptr(C.ttc_ring0_fast_application_run_address()))
-}
-
 func (b *ring0Bridge) lastX0() uint64 {
 	return atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeLastX0Offset)))
 }
@@ -1603,6 +2061,20 @@ func (v *hvfVM) mapRing0Stage2Source(gpa, hostAddress uintptr, length uint64, ac
 	return v.mapStage2Locked(uint64(gpa), hostAddress, length, access)
 }
 
+// mapRing0MirrorStage2Source installs a direct alias of mutable Sentry host
+// memory and registers it with the native runtime-mutation notifier.
+func (v *hvfVM) mapRing0MirrorStage2Source(gpa, hostAddress uintptr, length uint64, access vmm.Stage2Access) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return fmt.Errorf("HVF VM is closed")
+	}
+	if uint64(gpa)%vmm.HostSlabSize != 0 || uint64(hostAddress)%vmm.HostSlabSize != 0 || length == 0 || length%vmm.HostSlabSize != 0 {
+		return fmt.Errorf("unaligned HVF Sentry mirror map gpa=%#x host=%#x length=%#x", gpa, hostAddress, length)
+	}
+	return mapNativeStage2(uint64(gpa), hostAddress, length, access, true)
+}
+
 func (v *hvfVM) unmapRing0Stage2(hostAddress uintptr, length uint64) error {
 	return v.unmapRing0Stage2GPA(uint64(hostAddress), length)
 }
@@ -1614,6 +2086,35 @@ func (v *hvfVM) unmapRing0Stage2GPA(gpa uint64, length uint64) error {
 		return fmt.Errorf("HVF VM is closed")
 	}
 	return v.unmapStage2Locked(gpa, length)
+}
+
+func (v *hvfVM) unmapRing0MirrorStage2GPA(gpa uint64, length uint64) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return fmt.Errorf("HVF VM is closed")
+	}
+	if gpa%vmm.HostSlabSize != 0 || length == 0 || length%vmm.HostSlabSize != 0 {
+		return fmt.Errorf("unaligned HVF Sentry mirror unmap gpa=%#x length=%#x", gpa, length)
+	}
+	return unmapNativeStage2(gpa, length, true)
+}
+
+func mapNativeStage2(gpa uint64, hostAddress uintptr, length uint64, access vmm.Stage2Access, tracked bool) error {
+	status := C.ttc_ring0_stage2_map(C.uintptr_t(hostAddress), C.uint64_t(gpa),
+		C.uint64_t(length), C.uint32_t(access), C.int(boolToInt(tracked)))
+	if status != C.HV_SUCCESS {
+		return fmt.Errorf("hv_vm_map(gpa=%#x, host=%#x, length=%#x, tracked=%t) failed: %d", gpa, hostAddress, length, tracked, status)
+	}
+	return nil
+}
+
+func unmapNativeStage2(gpa, length uint64, tracked bool) error {
+	status := C.ttc_ring0_stage2_unmap(C.uint64_t(gpa), C.uint64_t(length), C.int(boolToInt(tracked)))
+	if status != C.HV_SUCCESS {
+		return fmt.Errorf("hv_vm_unmap(gpa=%#x, length=%#x, tracked=%t) failed: %d", gpa, length, tracked, status)
+	}
+	return nil
 }
 
 func (v *hvfVM) monitorAddressSpaceTTBR(id uint64) uint64 {

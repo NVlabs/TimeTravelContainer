@@ -1,0 +1,169 @@
+diff --git a/src/runtime/sys_darwin.go b/src/runtime/sys_darwin.go
+index c847aa1..26d9cd1 100644
+--- a/src/runtime/sys_darwin.go
++++ b/src/runtime/sys_darwin.go
+@@ -199,5 +199,17 @@ func osinit_hack() {
+ //go:nosplit
+ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
++	mutation := ttcVMMemoryMutation{
++		version:   ttcVMMemoryMutationVersion,
++		operation: ttcVMMemoryMmap,
++		phase:     ttcVMMemoryBefore,
++		address:   uintptr(addr),
++		length:    n,
++		prot:      prot,
++		flags:     flags,
++		fd:        fd,
++		offset:    off,
++	}
++	ttcVMMemoryCall(&mutation)
+ 	args := struct {
+ 		addr            unsafe.Pointer
+ 		n               uintptr
+@@ -207,22 +219,47 @@ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (un
+ 		ret2            int
+ 	}{addr, n, prot, flags, fd, off, nil, 0}
+ 	libcCall(unsafe.Pointer(abi.FuncPCABI0(mmap_trampoline)), unsafe.Pointer(&args))
++	mutation.phase = ttcVMMemoryAfter
++	mutation.result = uintptr(args.ret1)
++	mutation.errno = int32(args.ret2)
++	ttcVMMemoryCall(&mutation)
+ 	return args.ret1, args.ret2
+ }
+ func mmap_trampoline()
+ 
+ //go:nosplit
+ //go:cgo_unsafe_args
+ func munmap(addr unsafe.Pointer, n uintptr) {
++	mutation := ttcVMMemoryMutation{
++		version:   ttcVMMemoryMutationVersion,
++		operation: ttcVMMemoryMunmap,
++		phase:     ttcVMMemoryBefore,
++		address:   uintptr(addr),
++		length:    n,
++	}
++	ttcVMMemoryCall(&mutation)
+ 	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
++	mutation.phase = ttcVMMemoryAfter
++	ttcVMMemoryCall(&mutation)
+ 	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
+ }
+ func munmap_trampoline()
+ 
+ //go:nosplit
+ //go:cgo_unsafe_args
+ func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
++	mutation := ttcVMMemoryMutation{
++		version:   ttcVMMemoryMutationVersion,
++		operation: ttcVMMemoryMadvise,
++		phase:     ttcVMMemoryBefore,
++		address:   uintptr(addr),
++		length:    n,
++		flags:     flags,
++	}
++	ttcVMMemoryCall(&mutation)
+ 	libcCall(unsafe.Pointer(abi.FuncPCABI0(madvise_trampoline)), unsafe.Pointer(&addr))
++	mutation.phase = ttcVMMemoryAfter
++	ttcVMMemoryCall(&mutation)
+ 	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.
+ }
+ func madvise_trampoline()
+diff --git a/src/runtime/ttc_vm_darwin.go b/src/runtime/ttc_vm_darwin.go
+new file mode 100644
+index 0000000..e1d4c90
+--- /dev/null
++++ b/src/runtime/ttc_vm_darwin.go
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build darwin
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++// ttcVMMemoryMutation is the allocation-free ABI between the Darwin runtime
++// VM primitives and an optional userspace secondary-MMU notifier. Keep this
++// layout synchronized with TTC's native hook definition.
++type ttcVMMemoryMutation struct {
++	version   uint32
++	operation uint16
++	phase     uint16
++	address   uintptr
++	length    uintptr
++	result    uintptr
++	prot      int32
++	flags     int32
++	fd        int32
++	errno     int32
++	offset    uint32
++	active    uint32
++}
++
++const (
++	ttcVMMemoryMutationVersion = 1
++
++	ttcVMMemoryMmap    uint16 = 1
++	ttcVMMemoryMunmap  uint16 = 2
++	ttcVMMemoryMadvise uint16 = 3
++
++	ttcVMMemoryBefore uint16 = 1
++	ttcVMMemoryAfter  uint16 = 2
++)
++
++var (
++	ttcVMMemoryEnsureHost uintptr
++	ttcVMMemoryCallback   uintptr
++)
++
++// ttcSetVMMemoryHooks installs TTC's process-wide Darwin VM notifier. The
++// callback uses the C ABI, accepts *ttcVMMemoryMutation, and returns zero on
++// success. Installation is idempotent because one process owns at most one
++// active Hypervisor.framework VM; the native callback owns VM-epoch changes.
++//
++//go:linkname ttcSetVMMemoryHooks
++//go:nosplit
++func ttcSetVMMemoryHooks(version uint32, ensureHost, callback uintptr) int32 {
++	if version != ttcVMMemoryMutationVersion {
++		return 1
++	}
++	if ensureHost == 0 || callback == 0 {
++		return 2
++	}
++	installed := atomic.Loaduintptr(&ttcVMMemoryCallback)
++	if installed != 0 {
++		if installed == callback && atomic.Loaduintptr(&ttcVMMemoryEnsureHost) == ensureHost {
++			return 0
++		}
++		return 3
++	}
++	atomic.Storeuintptr(&ttcVMMemoryEnsureHost, ensureHost)
++	atomic.Storeuintptr(&ttcVMMemoryCallback, callback)
++	return 0
++}
++
++// ttcVMMemoryCall may run without a valid G and while allocator locks are
++// held. It therefore performs only atomic loads and C-ABI calls on the
++// system stack. The first callback returns a resident Sentry continuation to
++// host EL0; the second performs the synchronous native MMU-notifier protocol.
++//
++//go:nosplit
++func ttcVMMemoryCall(mutation *ttcVMMemoryMutation) {
++	callback := atomic.Loaduintptr(&ttcVMMemoryCallback)
++	if callback == 0 {
++		return
++	}
++	ensureHost := atomic.Loaduintptr(&ttcVMMemoryEnsureHost)
++	if ensureHost == 0 {
++		throw("runtime: incomplete TTC VM memory hook")
++	}
++	asmcgocall(unsafe.Pointer(ensureHost), unsafe.Pointer(mutation))
++	if asmcgocall(unsafe.Pointer(callback), unsafe.Pointer(mutation)) != 0 {
++		throw("runtime: TTC VM memory hook failed")
++	}
++}

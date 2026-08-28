@@ -89,6 +89,37 @@ func TestRequestHostMirrorIgnoresAddressesOutsideSentryVA(t *testing.T) {
 	}
 }
 
+func TestHostMirrorShadowsOnlyImmutableMainImageData(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity ring0Stage2Identity
+		want     bool
+	}{
+		{
+			name:     "main image read-only",
+			identity: ring0Stage2Identity{mainImage: true, access: vmm.Stage2Read | vmm.Stage2Execute},
+			want:     true,
+		},
+		{
+			name:     "main image writable",
+			identity: ring0Stage2Identity{mainImage: true, access: vmm.Stage2Read | vmm.Stage2Write},
+		},
+		{
+			name: "read-only data plane",
+			// GuestRAM is commonly mapped read-only into Sentry while EL0 retains
+			// a writable mapping to the same frame. It must remain coherent.
+			identity: ring0Stage2Identity{access: vmm.Stage2Read},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ring0HostMirrorNeedsShadow(test.identity); got != test.want {
+				t.Fatalf("ring0HostMirrorNeedsShadow(%+v) = %t, want %t", test.identity, got, test.want)
+			}
+		})
+	}
+}
+
 func TestRing0HostRegionAt(t *testing.T) {
 	allocation := make([]byte, vmm.HostSlabSize)
 	target := uintptr(unsafe.Pointer(&allocation[len(allocation)/2]))
@@ -154,6 +185,62 @@ func TestFlushHostExecutionCacheReleasesAllocatorMappings(t *testing.T) {
 	runtime.KeepAlive(allocation)
 }
 
+func TestHostMemoryDecommitRetiresSentryMirror(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	allocator := backend.HostMemory()
+	host, err := allocator.Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			_ = allocator.Release(host, vmm.HostSlabSize)
+		}
+	}()
+	engine.requestHostMirror(host)
+	if err := engine.extendHostMirror(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.stage2Slabs[host]; !ok {
+		t.Fatalf("host slab %#x was not imported into the Sentry mirror", host)
+	}
+	for va := uint64(host); va < uint64(host)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
+		if _, ok := engine.stage1Access[va]; !ok {
+			t.Fatalf("host page %#x has no Sentry stage-1 mapping", va)
+		}
+	}
+
+	if err := allocator.Decommit(host, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.stage2Slabs[host]; ok {
+		t.Fatalf("host slab %#x remained mirrored after decommit", host)
+	}
+	for va := uint64(host); va < uint64(host)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
+		if _, ok := engine.stage1Access[va]; ok {
+			t.Fatalf("host page %#x remained in Sentry stage-1 after decommit", va)
+		}
+	}
+	if err := allocator.Release(host, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+	released = true
+}
+
 func TestStage1FaultAccess(t *testing.T) {
 	const (
 		instructionAbort = uint64(0x20) << 26
@@ -189,35 +276,6 @@ func TestNativeResumeTrapAddress(t *testing.T) {
 func TestSwitchApplicationGuestTrapAddress(t *testing.T) {
 	if got, want := ring0asm.SwitchApplicationGuestTrapAddress(), ring0asm.SwitchApplicationGuestAddress()+4; got != want {
 		t.Fatalf("guest-switch trap address = %#x, want %#x", got, want)
-	}
-}
-
-func TestDirectApplicationModePromotionAndRetry(t *testing.T) {
-	mode := &ring0ApplicationMode{}
-	for run := uint64(1); run < applicationEL1PromotionRuns; run++ {
-		recordDirectApplicationRun(mode)
-		if mode.promoted.Load() {
-			t.Fatalf("application mode promoted after %d direct runs, want %d", run, applicationEL1PromotionRuns)
-		}
-	}
-	recordDirectApplicationRun(mode)
-	if !mode.promoted.Load() {
-		t.Fatalf("application mode did not promote after %d direct entries", applicationEL1PromotionRuns)
-	}
-
-	mode.cooldown.Store(applicationEL1RetryRuns)
-	for range applicationEL1RetryRuns {
-		recordDirectApplicationRun(mode)
-	}
-	if got := mode.cooldown.Load(); got != 0 {
-		t.Fatalf("application cooldown after retry entry = %d, want 0", got)
-	}
-	if got := mode.directRuns.Load(); got != applicationEL1PromotionRuns {
-		t.Fatalf("direct-run promotion count after retry entry = %d, want %d", got, applicationEL1PromotionRuns)
-	}
-	recordDirectApplicationRun(mode)
-	if got := mode.directRuns.Load(); got != applicationEL1PromotionRuns+1 {
-		t.Fatalf("direct-run promotion count after resumed accounting = %d, want %d", got, applicationEL1PromotionRuns+1)
 	}
 }
 
@@ -440,6 +498,129 @@ func TestTranslationMutationInterruptsCPUBoundApplication(t *testing.T) {
 	application := <-applicationDone
 	if application.err != nil || application.exit.Reason != vmm.ExitInterrupted {
 		t.Fatalf("CPU-bound application exit=%+v err=%v", application.exit, application.err)
+	}
+}
+
+func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	trackedHost, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(trackedHost, vmm.HostSlabSize)
+	tracked := unsafe.Slice((*byte)(unsafe.Pointer(trackedHost)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint64(tracked, 0x1122334455667788)
+	trackedGPA := GuestRAMIPAStart - vmm.HostSlabSize
+	if err := vm.mapRing0MirrorStage2Source(uintptr(trackedGPA), trackedHost,
+		vmm.HostSlabSize, vmm.Stage2Read|vmm.Stage2Write); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.unmapRing0MirrorStage2GPA(trackedGPA, vmm.HostSlabSize)
+
+	codeHost, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(codeHost, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, codeHost, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	code := unsafe.Slice((*byte)(unsafe.Pointer(codeHost)), int(vmm.HostSlabSize))
+	// reader: ldr x1, literal; ldr x0, [x1]; movz x8, #172; svc #0.
+	binary.LittleEndian.PutUint32(code[0:], 0x58000081)
+	binary.LittleEndian.PutUint32(code[4:], 0xf9400020)
+	binary.LittleEndian.PutUint32(code[8:], 0xd2801588)
+	binary.LittleEndian.PutUint32(code[12:], 0xd4000001)
+	// spinner: b .
+	binary.LittleEndian.PutUint32(code[vmm.LogicalPageSize:], 0x14000000)
+
+	const (
+		spaceID = uint64(43)
+		codeVA  = uint64(0xb00000)
+		dataVA  = uint64(0xc00000)
+		loopVA  = uint64(0xb01000)
+	)
+	binary.LittleEndian.PutUint64(code[16:], dataVA)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{
+			{Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute, VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize},
+			{Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute, VA: loopVA, GPA: GuestRAMIPAStart + vmm.LogicalPageSize, Length: vmm.LogicalPageSize},
+			{Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessWrite, VA: dataVA, GPA: trackedGPA, Length: vmm.LogicalPageSize},
+		},
+	})
+
+	readValue := func() uint64 {
+		engine.BeginApplicationResidency()
+		defer func() {
+			if err := engine.EndApplicationResidency(); err != nil {
+				t.Errorf("ending reader residency: %v", err)
+			}
+		}()
+		registers := &vmm.ARM64State{PC: codeVA}
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: spaceID, Registers: registers})
+		if err != nil || exit.Reason != vmm.ExitSyscall {
+			t.Fatalf("reader exit=%+v err=%v", exit, err)
+		}
+		return registers.X[0]
+	}
+	if got := readValue(); got != 0x1122334455667788 {
+		t.Fatalf("initial guest value=%#x", got)
+	}
+
+	type loopResult struct {
+		exit vmm.Exit
+		err  error
+	}
+	loopDone := make(chan loopResult, 1)
+	go func() {
+		engine.BeginApplicationResidency()
+		registers := &vmm.ARM64State{PC: loopVA}
+		exit, runErr := engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: spaceID, Registers: registers})
+		loopDone <- loopResult{exit: exit, err: errors.Join(runErr, engine.EndApplicationResidency())}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		cpus := engine.pinApplicationCPUs()
+		inGuest := false
+		for _, cpu := range cpus {
+			inGuest = inGuest || cpu.bridge.inGuest()
+		}
+		engine.unpinApplicationCPUs(cpus)
+		if inGuest {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("spinner did not enter guest")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+
+	if err := replaceRing0TrackedHostMapping(trackedHost, vmm.HostSlabSize, 0x8877665544332211); err != nil {
+		t.Fatal(err)
+	}
+	loop := <-loopDone
+	if loop.err != nil || loop.exit.Reason != vmm.ExitInterrupted {
+		t.Fatalf("spinner exit=%+v err=%v", loop.exit, loop.err)
+	}
+	if got := readValue(); got != 0x8877665544332211 {
+		t.Fatalf("guest value after MAP_FIXED=%#x, want %#x", got, uint64(0x8877665544332211))
 	}
 }
 

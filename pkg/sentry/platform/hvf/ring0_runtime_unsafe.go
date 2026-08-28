@@ -27,3 +27,9 @@ func ring0EnterSyscall()
 
 //go:linkname ring0ExitSyscall runtime.exitsyscall
 func ring0ExitSyscall()
+
+// ring0SetVMMemoryHooks installs the allocation-free Darwin runtime notifier
+// supplied by tools/go_darwin_vm_hooks.patch.
+//
+//go:linkname ring0SetVMMemoryHooks runtime.ttcSetVMMemoryHooks
+func ring0SetVMMemoryHooks(version uint32, ensureHost, callback uintptr) int32

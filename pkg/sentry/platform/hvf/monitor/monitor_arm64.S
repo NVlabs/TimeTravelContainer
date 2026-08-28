@@ -128,8 +128,8 @@ _ttc_monitor_write_ttbr0:
 // ttc_monitor_ring0_application_entry saves the running Sentry continuation,
 // switches from its EL1-only TTBR0 to the selected application root, and
 // enters EL0. The lower-EL vectors restore its architectural register image
-// and export the continuation in one HVC after a syscall or fault. Sentry then
-// handles the exit at Darwin EL0, matching KVM's userspace-kernel split.
+// after a syscall or fault so the same Sentry continuation handles the exit at
+// guest EL1. Host-dependent work redpills that continuation explicitly.
 .globl _ttc_monitor_ring0_application_entry
 _ttc_monitor_ring0_application_entry:
   clrex
@@ -178,9 +178,9 @@ _ttc_monitor_ring0_application_entry:
   SAVE_FP_STATE x17
 .globl _ttc_monitor_ring0_application_fast_entry
 _ttc_monitor_ring0_application_fast_entry:
-  // The production entry starts here with TPIDR_EL1 and SP_EL1 already set to
-  // the permanent per-vCPU state. Host Sentry is an ordinary caller of the VMM
-  // and therefore needs no stage-1 mirror or architectural continuation image.
+  // The shared entry has saved the Sentry register image and switched to the
+  // permanent per-vCPU stack. Keep this symbol until the embedded monitor ABI
+  // clean break removes the former direct-entry offset.
   mrs x0, tpidr_el1
   bl _ttc_monitor_ring0_application_ttbr
   mrs x16, tpidr_el1
@@ -551,8 +551,6 @@ _ttc_monitor_finish_application_exit:
   str xzr, [x17, #TTC_STATE_CANCEL_REQUESTED_OFFSET]
   add x18, x17, #3, lsl #12
   SAVE_FP_STATE x18
-  ldr x16, [x17, #TTC_STATE_DIRECT_HOST_RETURN_OFFSET]
-  cbnz x16, _ttc_monitor_direct_host_return
   ldr x16, [x17, #TTC_STATE_SENTRY_TTBR0_OFFSET]
   msr ttbr0_el1, x16
   isb
@@ -587,18 +585,7 @@ _ttc_monitor_finish_application_exit:
   ldp x27, x28, [x18, #0xd8]
   ldp x29, x30, [x18, #0xe8]
   ldr x18, [x18, #0x90]
-  // The high-performance path resumes the exact Sentry syscall continuation
-  // at guest EL1. DIRECT_HOST_RETURN remains available to qualification code
-  // that needs an ordinary host return after an application exit.
   eret
-_ttc_monitor_direct_host_return:
-  // The application register image and FP state are already coherent in the
-  // shared state page. Returning through the owner's normal C ABI call avoids
-  // 60+ register reads and a synthetic SIGILL/sigreturn on every syscall.
-  dsb ishst
-  hvc #TTC_RING0_HVC_APPLICATION_EXIT
-1:
-  b 1b
 .globl _ttc_monitor_el0_irq_handler_end
 _ttc_monitor_el0_irq_handler_end:
 

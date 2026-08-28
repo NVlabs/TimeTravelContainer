@@ -57,18 +57,66 @@ import (
 )
 
 // Backend implements vmplatform.Backend for Apple Silicon macOS 15+.
-type Backend struct{}
+type Backend struct {
+	hostState *hostMemoryState
+}
+
+// hostMemoryState connects VMM-owned host allocations to the Sentry mirror
+// that may alias them. Go runtime VM hooks cover allocator arenas, but they do
+// not observe GuestRAM's explicit mmap/madvise/munmap lifecycle.
+type hostMemoryState struct {
+	mu     sync.RWMutex
+	engine *ring0Engine
+}
+
+func (s *hostMemoryState) register(engine *ring0Engine) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.engine != nil && s.engine != engine {
+		return fmt.Errorf("HVF host memory already has a Sentry mirror owner")
+	}
+	s.engine = engine
+	return nil
+}
+
+func (s *hostMemoryState) unregister(engine *ring0Engine) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.engine == engine {
+		s.engine = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *hostMemoryState) retire(address uintptr, length uint64) error {
+	if s == nil {
+		return nil
+	}
+	// Keep the engine alive and prevent Close from dismantling its monitor
+	// while it removes the secondary alias.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.engine == nil {
+		return nil
+	}
+	return s.engine.retireHostMirrorRange(context.Background(), address, length)
+}
 
 // NewBackend returns the baseline Hypervisor.framework backend. It never asks
 // for the macOS 26 4K IPA extension; stage-2 mappings are always 16 KiB.
-func NewBackend() *Backend { return &Backend{} }
+func NewBackend() *Backend { return &Backend{hostState: &hostMemoryState{}} }
 
 // HostMemory returns the 16 KiB-compatible anonymous host allocator used by
 // GuestRAM.
-func (*Backend) HostMemory() vmm.HostMemory { return hostMemory{} }
+func (b *Backend) HostMemory() vmm.HostMemory { return hostMemory{state: b.hostState} }
 
 // CreateVM implements vmplatform.Backend.CreateVM.
-func (*Backend) CreateVM(context.Context) (vmm.VM, error) {
+func (b *Backend) CreateVM(context.Context) (vmm.VM, error) {
 	config := C.hv_vm_config_create()
 	if config == nil {
 		return nil, fmt.Errorf("hv_vm_config_create failed")
@@ -80,7 +128,7 @@ func (*Backend) CreateVM(context.Context) (vmm.VM, error) {
 	if status := C.hv_vm_create(config); status != C.HV_SUCCESS {
 		return nil, fmt.Errorf("hv_vm_create failed: %d", status)
 	}
-	vm := &hvfVM{}
+	vm := &hvfVM{hostState: b.hostState}
 	monitor, err := newMonitorMemory(vm)
 	if err != nil {
 		_ = C.hv_vm_destroy()
@@ -91,9 +139,10 @@ func (*Backend) CreateVM(context.Context) (vmm.VM, error) {
 }
 
 type hvfVM struct {
-	mu      sync.Mutex
-	monitor *monitorMemory
-	closed  bool
+	mu        sync.Mutex
+	monitor   *monitorMemory
+	hostState *hostMemoryState
+	closed    bool
 }
 
 func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access vmm.Stage2Access) error {
@@ -114,20 +163,7 @@ func (v *hvfVM) mapStage2Locked(gpa uint64, hostAddress uintptr, length uint64, 
 	if gpa%vmm.HostSlabSize != 0 || uint64(hostAddress)%vmm.HostSlabSize != 0 || length == 0 || length%vmm.HostSlabSize != 0 {
 		return fmt.Errorf("unaligned HVF stage-2 map gpa=%#x host=%#x length=%#x", gpa, hostAddress, length)
 	}
-	var flags C.hv_memory_flags_t
-	if access&vmm.Stage2Read != 0 {
-		flags |= C.HV_MEMORY_READ
-	}
-	if access&vmm.Stage2Write != 0 {
-		flags |= C.HV_MEMORY_WRITE
-	}
-	if access&vmm.Stage2Execute != 0 {
-		flags |= C.HV_MEMORY_EXEC
-	}
-	if status := C.ttc_hv_vm_map(C.uintptr_t(hostAddress), C.hv_ipa_t(gpa), C.size_t(length), flags); status != C.HV_SUCCESS {
-		return fmt.Errorf("hv_vm_map(gpa=%#x, length=%#x) failed: %d", gpa, length, status)
-	}
-	return nil
+	return mapNativeStage2(gpa, hostAddress, length, access, false)
 }
 
 func (v *hvfVM) UnmapStage2(gpa, length uint64) error {
@@ -148,10 +184,7 @@ func (v *hvfVM) unmapStage2Locked(gpa, length uint64) error {
 	if gpa%vmm.HostSlabSize != 0 || length == 0 || length%vmm.HostSlabSize != 0 {
 		return fmt.Errorf("unaligned HVF stage-2 unmap gpa=%#x length=%#x", gpa, length)
 	}
-	if status := C.hv_vm_unmap(C.hv_ipa_t(gpa), C.size_t(length)); status != C.HV_SUCCESS {
-		return fmt.Errorf("hv_vm_unmap(gpa=%#x, length=%#x) failed: %d", gpa, length, status)
-	}
-	return nil
+	return unmapNativeStage2(gpa, length, false)
 }
 
 func (v *hvfVM) CreateVCPU(id int) (vmm.VCPU, error) {
@@ -329,7 +362,9 @@ func (v *hvfVCPU) closeStaleOwner() error {
 	return nil
 }
 
-type hostMemory struct{}
+type hostMemory struct {
+	state *hostMemoryState
+}
 
 func (hostMemory) Reserve(length uint64) (uintptr, error) {
 	if length == 0 || length%vmm.HostSlabSize != 0 {
@@ -346,9 +381,12 @@ func (hostMemory) Commit(address uintptr, length uint64) error {
 	return validateHostRange(address, length)
 }
 
-func (hostMemory) Decommit(address uintptr, length uint64) error {
+func (h hostMemory) Decommit(address uintptr, length uint64) error {
 	if err := validateHostRange(address, length); err != nil {
 		return err
+	}
+	if err := h.state.retire(address, length); err != nil {
+		return fmt.Errorf("retiring Sentry alias before host decommit: %w", err)
 	}
 	if result := C.ttc_madvise_free(unsafe.Pointer(address), C.size_t(length)); result != 0 {
 		return fmt.Errorf("madvise(MADV_DONTNEED, %#x, %#x) failed", address, length)
@@ -372,9 +410,12 @@ func (hostMemory) Copy(dst, src uintptr, length uint64) error {
 	return nil
 }
 
-func (hostMemory) Release(address uintptr, length uint64) error {
+func (h hostMemory) Release(address uintptr, length uint64) error {
 	if err := validateHostRange(address, length); err != nil {
 		return err
+	}
+	if err := h.state.retire(address, length); err != nil {
+		return fmt.Errorf("retiring Sentry alias before host release: %w", err)
 	}
 	if result := C.munmap(unsafe.Pointer(address), C.size_t(length)); result != 0 {
 		return fmt.Errorf("munmap(%#x, %#x) failed", address, length)
