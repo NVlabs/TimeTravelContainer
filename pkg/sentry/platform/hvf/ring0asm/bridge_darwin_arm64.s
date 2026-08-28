@@ -66,10 +66,28 @@ TEXT ·RunMonitorGuest(SB),NOSPLIT|NOFRAME,$0-16
 	MOVD R20, R30
 	RET
 
-TEXT ·SyncGuestCode(SB),NOSPLIT|NOFRAME,$0-16
+TEXT ·SyncGuestCode(SB),NOSPLIT|NOFRAME,$0-24
 	MOVD address+0(FP), R0
 	MOVD length+8(FP), R1
 	HVC $0x76
+	MOVD R0, ret+16(FP)
+	RET
+
+TEXT ·SyncGuestCodeRanges(SB),NOSPLIT|NOFRAME,$0-24
+	MOVD ranges+0(FP), R3
+	MOVD count+8(FP), R2
+	MOVD $0, R0
+	CBZ R2, sync_ranges_done
+sync_ranges_next:
+	MOVD 0(R3), R0
+	MOVD 8(R3), R1
+	HVC $0x76
+	CBNZ R0, sync_ranges_done
+	ADD $16, R3
+	SUB $1, R2
+	CBNZ R2, sync_ranges_next
+sync_ranges_done:
+	MOVD R0, ret+16(FP)
 	RET
 
 TEXT ·Yield(SB),NOSPLIT|NOFRAME,$0

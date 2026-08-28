@@ -1757,18 +1757,26 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 				status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_X1, &length);
 			}
 			struct ttc_ring0_region region;
-			if (status != HV_SUCCESS || length == 0 ||
-					address + length < address ||
-					ttc_ring0_region_at(address, &region) != KERN_SUCCESS ||
-					region.address > address ||
-					address - region.address > region.length ||
-					length > region.length - (address - region.address) ||
-					region.external_pager != 0 ||
-					region.user_tag != VM_MEMORY_APPLICATION_SPECIFIC_3 ||
-					(region.protection & VM_PROT_READ) == 0) {
-				ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
-						&host_ns, UINT32_MAX,
-						TTC_RING0_PHASE_UNEXPECTED_EXIT);
+			bool valid = status == HV_SUCCESS && length != 0 &&
+					address + length >= address &&
+					ttc_ring0_region_at(address, &region) == KERN_SUCCESS &&
+					region.address <= address &&
+					address - region.address <= region.length &&
+					length <= region.length - (address - region.address) &&
+					region.external_pager == 0 &&
+					region.user_tag == VM_MEMORY_APPLICATION_SPECIFIC_3 &&
+					(region.protection & VM_PROT_READ) != 0;
+			if (!valid) {
+				// Rejection is an internal protocol result, not a safe point for
+				// exporting the guest-critical Go continuation. Return an error in X0;
+				// the caller redpills only after restoring its ordinary stack and PC.
+				status = hv_vcpu_set_reg(bridge->vcpu, HV_REG_X0, UINT64_MAX);
+				if (status != HV_SUCCESS) {
+					ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+							&host_ns, (uint32_t)status,
+							TTC_RING0_PHASE_UNEXPECTED_EXIT);
+				}
+				continue;
 			}
 			// This runs at Darwin EL0 on the vCPU owner thread, but resumes the
 			// stopped EL1 PC directly. Unlike a host-service gate it needs no
@@ -1777,6 +1785,12 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 			sys_icache_invalidate((void *)(uintptr_t)address, (size_t)length);
 			atomic_fetch_add_explicit(&bridge->cache_sync_count, 1,
 					memory_order_relaxed);
+			status = hv_vcpu_set_reg(bridge->vcpu, HV_REG_X0, 0);
+			if (status != HV_SUCCESS) {
+				ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+						&host_ns, (uint32_t)status,
+						TTC_RING0_PHASE_UNEXPECTED_EXIT);
+			}
 			continue;
 		}
 		if (bridge->exit->reason != HV_EXIT_REASON_EXCEPTION ||

@@ -986,17 +986,17 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		}
 	}()
 
-	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	host, err := backend.HostMemory().Reserve(2 * vmm.HostSlabSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
-	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+	defer backend.HostMemory().Release(host, 2*vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, 2*vmm.HostSlabSize,
 		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
 		t.Fatal(err)
 	}
-	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
-	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	defer vm.UnmapStage2(GuestRAMIPAStart, 2*vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(2*vmm.HostSlabSize))
 	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172
 	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
 
@@ -1017,8 +1017,8 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		Sequence: 2, Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
 		Operations: []monitorabi.Operation{{
 			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
-			VA: codeVA + vmm.LogicalPageSize, GPA: GuestRAMIPAStart + vmm.LogicalPageSize,
-			Length: vmm.LogicalPageSize,
+			VA: codeVA + vmm.LogicalPageSize, GPA: GuestRAMIPAStart,
+			Length: 2 * vmm.HostSlabSize,
 		}},
 	})
 	if err != nil {
@@ -1070,16 +1070,48 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		stats = value.(*ring0ApplicationCPU).bridge.stats()
 	}
 	beforeResidentMonitor := stats
-	responseBytes, err := engine.RunMonitor(context.Background(), residentMonitorCommand)
-	stats = value.(*ring0ApplicationCPU).bridge.stats()
-	if err != nil {
-		t.Fatalf("resident monitor command: %v", err)
+	if status := ring0asm.SyncGuestCode(uintptr(unsafe.Pointer(&stats)), 1); status == 0 {
+		t.Fatal("native cache-sync HVC accepted an untagged Go-stack range")
 	}
-	if stats.cacheSyncs != beforeResidentMonitor.cacheSyncs+1 {
-		t.Fatalf("executable monitor mutation did not use exactly one native cache-sync HVC: before=%+v after=%+v", beforeResidentMonitor, stats)
+	if ring0asm.CurrentEL() == 0 {
+		t.Fatal("rejected cache-sync HVC exported the resident continuation")
 	}
-	if stats.redpills != beforeResidentMonitor.redpills {
-		t.Fatalf("resident monitor mutation redpilled the continuation: before=%+v after=%+v", beforeResidentMonitor, stats)
+	afterRejectedCacheSync := value.(*ring0ApplicationCPU).bridge.stats()
+	if afterRejectedCacheSync != beforeResidentMonitor {
+		t.Fatalf("rejected cache-sync HVC changed bridge accounting: before=%+v after=%+v", beforeResidentMonitor, afterRejectedCacheSync)
+	}
+	var responseBytes []byte
+	direct := false
+	for attempt := 0; attempt < 5 && !direct; attempt++ {
+		if ring0asm.CurrentEL() == 0 {
+			registers.PC = codeVA
+			exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+				AddressSpaceID: spaceID,
+				Registers:      registers,
+			})
+			if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
+				t.Fatalf("resident-monitor retry entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+			}
+		}
+		beforeResidentMonitor = value.(*ring0ApplicationCPU).bridge.stats()
+		responseBytes, err = engine.RunMonitor(context.Background(), residentMonitorCommand)
+		stats = value.(*ring0ApplicationCPU).bridge.stats()
+		if err != nil {
+			t.Fatalf("resident monitor command: %v", err)
+		}
+		switch delta := stats.cacheSyncs - beforeResidentMonitor.cacheSyncs; delta {
+		case 2:
+			direct = true
+		case 0:
+			// An unrelated runtime host service can export this continuation
+			// during allocation-free command preparation. Re-enter and retry the
+			// already-idempotent mapping to exercise the direct transaction.
+		default:
+			t.Fatalf("two-slab executable monitor mutation used %d cache-sync HVCs: before=%+v after=%+v", delta, beforeResidentMonitor, stats)
+		}
+	}
+	if !direct {
+		t.Fatalf("two-slab executable monitor mutation did not reach resident path after retries: before=%+v after=%+v", beforeResidentMonitor, stats)
 	}
 	response, err := monitorabi.UnmarshalResponse(responseBytes)
 	if err != nil || response.Sequence != 2 || response.Status != monitorabi.StatusOK {

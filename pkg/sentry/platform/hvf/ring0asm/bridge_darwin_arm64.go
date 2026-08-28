@@ -39,7 +39,16 @@ func RunMonitorGuest(monitorEntry, stateVA uint64)
 
 // SyncGuestCode asks the native bridge to perform Darwin's writer-side cache
 // maintenance for a GuestRAM HVA, then resumes this EL1 continuation in place.
-func SyncGuestCode(address uintptr, length uint64)
+// It returns zero on success and non-zero if the native bridge rejected the
+// range without exporting the guest-critical continuation.
+func SyncGuestCode(address uintptr, length uint64) uint64
+
+// SyncGuestCodeRanges performs a sequence of cache-maintenance HVCs without
+// returning through Go between ranges. ranges points to count consecutive
+// {uintptr address, uint64 length} records. This must be used after publishing
+// guest-critical state so the language runtime cannot host-gate between the
+// final CurrentEL check and a later HVC.
+func SyncGuestCodeRanges(ranges unsafe.Pointer, count uint64) uint64
 
 // Yield emits the ARM64 processor-yield hint without entering the Go
 // scheduler. It is used only for bounded guest-resident lock acquisition.

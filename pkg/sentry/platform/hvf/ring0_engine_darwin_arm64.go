@@ -374,6 +374,8 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 	clear(state[stateResponse : stateResponse+32])
 
 	needsCacheSync := e.residentCommandNeedsCacheSync(command)
+	var executableRanges [monitorabi.MaxOperations]ring0ExecutableHostRange
+	executableRangeCount := 0
 	vmLocked := false
 	if needsCacheSync {
 		if !e.vm.mu.TryLock() {
@@ -385,7 +387,10 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		e.vm.mu.Unlock()
 		return nil, true, fmt.Errorf("HVF VM is closed")
 	}
-	if err := e.validateResidentExecutableMappings(command); err != nil {
+	if needsCacheSync {
+		executableRangeCount, err = e.prepareResidentExecutableMappings(command, &executableRanges)
+	}
+	if err != nil {
 		if vmLocked {
 			e.vm.mu.Unlock()
 		}
@@ -405,17 +410,22 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		return nil, false, nil
 	}
 
-	if needsCacheSync {
-		e.syncResidentExecutableMappings(command)
+	if executableRangeCount != 0 {
+		if status := ring0asm.SyncGuestCodeRanges(unsafe.Pointer(&executableRanges[0]), uint64(executableRangeCount)); status != 0 {
+			atomic.StoreUint64(critical, 0)
+			ring0asm.EnsureHost()
+			e.vm.mu.Unlock()
+			return nil, true, fmt.Errorf("HVF native bridge rejected a validated executable GuestRAM range")
+		}
 	}
 	ring0asm.RunMonitorGuest(
 		monitorCodeVA+cpu.vcpu.monitor.commandCallOffset,
 		cpu.vcpu.stateVA,
 	)
+	atomic.StoreUint64(critical, 0)
 	if vmLocked {
 		e.vm.mu.Unlock()
 	}
-	atomic.StoreUint64(critical, 0)
 	// A cancellation that arrived inside the critical section remains
 	// published. Complete its requested host transfer now that every PC and
 	// stack address again has a valid Darwin representation.
@@ -695,66 +705,51 @@ func (e *ring0Engine) visitResidentExecutableMappings(command monitorabi.Command
 	}
 }
 
-// validateResidentExecutableMappings verifies every stage-2 lookup before the
-// guest-critical section. The caller holds e.vm.mu, so the subsequent HVC walk
-// observes the same stable host mappings and cannot need an error path.
-func (e *ring0Engine) validateResidentExecutableMappings(command monitorabi.CommandView) error {
-	var missing uint64
-	e.visitResidentExecutableMappings(command, func(gpa, length uint64) bool {
-		for current, end := gpa, gpa+length; current < end; current = (current &^ (vmm.HostSlabSize - 1)) + vmm.HostSlabSize {
-			if _, ok := e.vm.stage2[current&^(vmm.HostSlabSize-1)]; !ok {
-				missing = current
-				return false
-			}
-		}
-		return true
-	})
-	if missing != 0 {
-		return fmt.Errorf("executable guest GPA %#x has no tracked stage-2 slab", missing)
-	}
-	return nil
-}
-
-type ring0ExecutableCacheBatch struct {
+type ring0ExecutableHostRange struct {
 	address uintptr
 	length  uint64
 }
 
-func (b *ring0ExecutableCacheBatch) flush() {
-	if b.length != 0 {
-		ring0asm.SyncGuestCode(b.address, b.length)
-		b.address = 0
-		b.length = 0
-	}
-}
-
-// syncResidentExecutableMappings performs the writer-side Darwin cache
-// protocol through the native bridge. The caller holds e.vm.mu and has already
-// validated every lookup, published guest-critical state, and rechecked EL1.
-func (e *ring0Engine) syncResidentExecutableMappings(command monitorabi.CommandView) {
-	var batch ring0ExecutableCacheBatch
+// prepareResidentExecutableMappings resolves executable GPAs to stable
+// GuestRAM HVAs before entering the guest-critical section. Ranges coalesce
+// only within one 16K stage-2 lease: contiguous host addresses can still be
+// distinct Mach VM regions when they came from separate reservations. The
+// caller holds e.vm.mu through the eventual native cache operation.
+func (e *ring0Engine) prepareResidentExecutableMappings(command monitorabi.CommandView, ranges *[monitorabi.MaxOperations]ring0ExecutableHostRange) (int, error) {
+	count := 0
+	var lastSlabHost uintptr
+	var prepareErr error
 	e.visitResidentExecutableMappings(command, func(gpa, length uint64) bool {
 		for current, end := gpa, gpa+length; current < end; {
 			slabGPA := current &^ (vmm.HostSlabSize - 1)
-			slab := e.vm.stage2[slabGPA]
+			slab, ok := e.vm.stage2[slabGPA]
+			if !ok {
+				prepareErr = fmt.Errorf("executable guest GPA %#x has no tracked stage-2 slab", current)
+				return false
+			}
 			offset := current - slabGPA
 			chunk := vmm.HostSlabSize - offset
 			if remaining := end - current; chunk > remaining {
 				chunk = remaining
 			}
 			hostAddress := slab.host + uintptr(offset)
-			if batch.length != 0 && batch.address+uintptr(batch.length) != hostAddress {
-				batch.flush()
+			if count != 0 && lastSlabHost == slab.host &&
+				ranges[count-1].address+uintptr(ranges[count-1].length) == hostAddress {
+				ranges[count-1].length += chunk
+			} else {
+				if count == len(ranges) {
+					prepareErr = fmt.Errorf("executable command requires more than %d host cache ranges", len(ranges))
+					return false
+				}
+				ranges[count] = ring0ExecutableHostRange{address: hostAddress, length: chunk}
+				count++
+				lastSlabHost = slab.host
 			}
-			if batch.length == 0 {
-				batch.address = hostAddress
-			}
-			batch.length += chunk
 			current += chunk
 		}
 		return true
 	})
-	batch.flush()
+	return count, prepareErr
 }
 
 func (e *ring0Engine) updateApplicationGPARecords(command monitorabi.Command) {
