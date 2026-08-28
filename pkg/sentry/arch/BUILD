@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "proto_library")
+load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -42,6 +42,13 @@ go_library(
         "//pkg/usermem",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "syscalls_test",
+    size = "small",
+    srcs = ["syscalls_test.go"],
+    library = ":arch",
 )
 
 proto_library(

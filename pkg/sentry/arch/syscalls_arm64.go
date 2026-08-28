@@ -30,6 +30,13 @@ func (c *Context64) SyscallSaveOrig() {
 	c.OrigR0 = c.Regs.Regs[0]
 }
 
+// PrepareSyscallEntry implements contextInterface.PrepareSyscallEntry.
+func (c *Context64) PrepareSyscallEntry() {
+	// Linux leaves X0 containing the first syscall argument at syscall-entry
+	// stops. The kernel keeps the saved value in orig_x0, which isn't part of
+	// the userspace general-register regset.
+}
+
 // SyscallNo returns the syscall number according to the 64-bit convention.
 func (c *Context64) SyscallNo() uintptr {
 	return uintptr(c.Regs.Regs[8])
