@@ -205,12 +205,19 @@ func TestDirectApplicationModePromotionAndRetry(t *testing.T) {
 		t.Fatalf("application mode did not promote after %d direct entries", applicationEL1PromotionRuns)
 	}
 
-	mode.cooldown.Store(applicationEL1PromotionRuns)
-	for range applicationEL1PromotionRuns {
+	mode.cooldown.Store(applicationEL1RetryRuns)
+	for range applicationEL1RetryRuns {
 		recordDirectApplicationRun(mode)
 	}
 	if got := mode.cooldown.Load(); got != 0 {
 		t.Fatalf("application cooldown after retry entry = %d, want 0", got)
+	}
+	if got := mode.directRuns.Load(); got != applicationEL1PromotionRuns {
+		t.Fatalf("direct-run promotion count after retry entry = %d, want %d", got, applicationEL1PromotionRuns)
+	}
+	recordDirectApplicationRun(mode)
+	if got := mode.directRuns.Load(); got != applicationEL1PromotionRuns+1 {
+		t.Fatalf("direct-run promotion count after resumed accounting = %d, want %d", got, applicationEL1PromotionRuns+1)
 	}
 }
 

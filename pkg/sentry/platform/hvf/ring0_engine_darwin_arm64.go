@@ -56,8 +56,13 @@ const (
 	applicationResidencyQuantum = time.Millisecond
 	// Keep short-lived processes on the correctness-first host-return path until
 	// the writable Sentry memory plane can provide stable Go-heap identity.
-	// This also bounds the retry backoff after a host-service return.
 	applicationEL1PromotionRuns = 4096
+	// A host-service gate returns the continuation to Darwin EL0. One direct
+	// entry is sufficient to complete the host-dependent operation before the
+	// address space retries its already-earned EL1 residency. Do not reuse the
+	// initial promotion threshold here: doing so turns each isolated host gate
+	// into thousands of slow-path syscalls for metadata-heavy workloads.
+	applicationEL1RetryRuns = 1
 )
 
 // MaxApplicationVCPUs is the number of HVF vCPU IDs available to application
@@ -576,7 +581,7 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 			// to host EL0. Give that continuation one direct entry to finish its
 			// host-dependent work before retrying EL1 residency.
 			cpu.el1Promoted = false
-			applicationMode.cooldown.Store(applicationEL1PromotionRuns)
+			applicationMode.cooldown.Store(applicationEL1RetryRuns)
 			e.clearHostGateFault(cpu)
 		} else if applicationMode.promoted.Load() && applicationMode.cooldown.Load() == 0 {
 			// Only long-running syscall bursts cross this threshold. Short-lived
