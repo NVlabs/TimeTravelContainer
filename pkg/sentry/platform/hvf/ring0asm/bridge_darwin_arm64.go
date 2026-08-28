@@ -61,11 +61,6 @@ func ApplicationProbe(bridge unsafe.Pointer, stateVA, monitorEntry uint64) uint6
 // instruction fault.
 func HostSVCGetpid() uint64
 
-// RawCall executes a one-argument C ABI function on stackTop without a cgo
-// transition. It is used to qualify whether HVF depends on cgo bookkeeping or
-// only on the architectural thread state.
-func RawCall(arg unsafe.Pointer, stackTop, fn uintptr) uint32
-
 // BluepillTrapAddress returns the exact instruction address that raises the
 // controlled host SIGILL.
 func BluepillTrapAddress() uintptr

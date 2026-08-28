@@ -368,11 +368,16 @@ struct ttc_ring0_bridge {
 	_Atomic uint64_t last_cancel_pc;
 	_Atomic uint64_t last_cancel_pstate;
 	_Atomic uint64_t cancel_count;
+	// These counters make the execution-domain boundary observable without
+	// instrumenting the guest-resident Go path. In particular, an application
+	// syscall must not increase any host-return counter: the monitor restores
+	// the waiting Sentry continuation directly at EL1.
+	_Atomic uint64_t guest_entry_count;
+	_Atomic uint64_t host_gate_count;
+	_Atomic uint64_t redpill_count;
+	_Atomic uint64_t host_return_count;
 	uint64_t owner_tid;
-	_Atomic uint64_t preflight_tid;
 	_Atomic uint64_t entry_tid;
-	_Atomic uint32_t preflight_status;
-	_Atomic uint32_t preflight_stack_status;
 	ucontext_t host_context;
 	struct __darwin_mcontext64 host_mcontext;
 	void *host_stack;
@@ -1128,14 +1133,8 @@ static void ttc_ring0_fatal_diagnostic(struct ttc_ring0_bridge *bridge,
 			memory_order_acquire));
 	TTC_DIAG_FIELD(" vcpu=", bridge->vcpu);
 	TTC_DIAG_FIELD(" owner_tid=", bridge->owner_tid);
-	TTC_DIAG_FIELD(" preflight_tid=", atomic_load_explicit(
-			&bridge->preflight_tid, memory_order_acquire));
 	TTC_DIAG_FIELD(" entry_tid=", atomic_load_explicit(
 			&bridge->entry_tid, memory_order_acquire));
-	TTC_DIAG_FIELD(" preflight_status=", atomic_load_explicit(
-			&bridge->preflight_status, memory_order_acquire));
-	TTC_DIAG_FIELD(" preflight_stack_status=", atomic_load_explicit(
-			&bridge->preflight_stack_status, memory_order_acquire));
 	TTC_DIAG_FIELD(" reason=", bridge->exit->reason);
 	TTC_DIAG_FIELD(" syndrome=", bridge->exit->exception.syndrome);
 	TTC_DIAG_FIELD(" exit=", ttc_ring0_state_u64(bridge,
@@ -1314,6 +1313,8 @@ static int ttc_ring0_save_context(struct ttc_ring0_bridge *bridge,
 // copied back into the host signal context. A reusable bridge is destroyed only
 // when its Sentry task reaches an explicit residency boundary.
 static void ttc_ring0_finish_host_return(struct ttc_ring0_bridge *bridge) {
+	atomic_fetch_add_explicit(&bridge->host_return_count, 1,
+			memory_order_relaxed);
 	if (bridge->destroy_on_host != 0 ||
 			atomic_load_explicit(&bridge->destroy_requested,
 				memory_order_acquire) != 0) {
@@ -1398,6 +1399,8 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge)
 		__attribute__((noreturn));
 
 static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
+	atomic_fetch_add_explicit(&bridge->guest_entry_count, 1,
+			memory_order_relaxed);
 	ucontext_t *ucontext = &bridge->host_context;
 	arm_thread_state64_t host_ss = ucontext->uc_mcontext->__ss;
 	arm_neon_state64_t host_ns = ucontext->uc_mcontext->__ns;
@@ -1564,7 +1567,14 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 				(hvc != TTC_RING0_HVC_REDPILL &&
 				 hvc != TTC_RING0_HVC_HOST_GATE)) {
 			ttc_ring0_fail_host_return(bridge, ucontext, &host_ss, &host_ns,
-					UINT32_MAX, TTC_RING0_PHASE_UNEXPECTED_EXIT);
+				UINT32_MAX, TTC_RING0_PHASE_UNEXPECTED_EXIT);
+		}
+		if (hvc == TTC_RING0_HVC_HOST_GATE) {
+			atomic_fetch_add_explicit(&bridge->host_gate_count, 1,
+					memory_order_relaxed);
+		} else {
+			atomic_fetch_add_explicit(&bridge->redpill_count, 1,
+					memory_order_relaxed);
 		}
 		status = ttc_ring0_save_context(bridge, ucontext, 0);
 		uint64_t diagnostic_x0 = 0;
@@ -1826,79 +1836,28 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 	return bridge;
 }
 
-static hv_return_t ttc_ring0_bridge_probe_reg(
-		struct ttc_ring0_bridge *bridge) {
-	uint64_t value = 0;
-	hv_return_t status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_X0, &value);
-	if (status != HV_SUCCESS) return status;
-	return hv_vcpu_set_reg(bridge->vcpu, HV_REG_X0, value);
-}
-
-typedef hv_return_t (*ttc_ring0_stack_call_fn)(
-		struct ttc_ring0_bridge *bridge);
-
-// Run fn on stack_top while preserving the caller's stack and return address.
-// This is diagnostic scaffolding for HVF's undocumented calling-context
-// requirements; all arguments arrive in the standard ARM64 ABI registers.
-static hv_return_t ttc_ring0_call_on_stack(
-		__attribute__((unused)) struct ttc_ring0_bridge *bridge,
-		__attribute__((unused)) uintptr_t stack_top,
-		__attribute__((unused)) ttc_ring0_stack_call_fn fn)
-		__attribute__((naked, noinline));
-
-static hv_return_t ttc_ring0_call_on_stack(
-		__attribute__((unused)) struct ttc_ring0_bridge *bridge,
-		__attribute__((unused)) uintptr_t stack_top,
-		__attribute__((unused)) ttc_ring0_stack_call_fn fn) {
-	__asm__ volatile(
-		"mov x9, sp\n"
-		"mov sp, x1\n"
-		"stp x9, x30, [sp, #-16]!\n"
-		"blr x2\n"
-		"ldp x9, x30, [sp], #16\n"
-		"mov sp, x9\n"
-		"ret\n");
-}
-
-static hv_return_t ttc_ring0_bridge_preflight(
-		struct ttc_ring0_bridge *bridge) {
-	uint64_t tid = 0;
-	(void)pthread_threadid_np(NULL, &tid);
-	atomic_store_explicit(&bridge->preflight_tid, tid,
-			memory_order_release);
-	hv_return_t status = ttc_ring0_bridge_probe_reg(bridge);
-	atomic_store_explicit(&bridge->preflight_status, (uint32_t)status,
-			memory_order_release);
-	// Match host_entry's private stack while retaining an otherwise ordinary
-	// cgo call. This distinguishes a stack-context restriction from the signal
-	// transition itself in diagnostics.
-	hv_return_t stack_status = ttc_ring0_call_on_stack(bridge,
-			(uintptr_t)bridge->host_stack + bridge->host_stack_size,
-			ttc_ring0_bridge_probe_reg);
-	atomic_store_explicit(&bridge->preflight_stack_status,
-			(uint32_t)stack_status, memory_order_release);
-	return status;
-}
-
-static uint64_t ttc_ring0_bridge_owner_tid(
+static uint64_t ttc_ring0_bridge_guest_entry_count(
 		const struct ttc_ring0_bridge *bridge) {
-	return bridge->owner_tid;
+	return atomic_load_explicit(&bridge->guest_entry_count,
+			memory_order_relaxed);
 }
 
-static uint64_t ttc_ring0_bridge_preflight_tid(
+static uint64_t ttc_ring0_bridge_host_gate_count(
 		const struct ttc_ring0_bridge *bridge) {
-	return atomic_load_explicit(&bridge->preflight_tid,
-			memory_order_acquire);
+	return atomic_load_explicit(&bridge->host_gate_count,
+			memory_order_relaxed);
 }
 
-static uintptr_t ttc_ring0_bridge_host_stack_top(
+static uint64_t ttc_ring0_bridge_redpill_count(
 		const struct ttc_ring0_bridge *bridge) {
-	return (uintptr_t)bridge->host_stack + bridge->host_stack_size;
+	return atomic_load_explicit(&bridge->redpill_count,
+			memory_order_relaxed);
 }
 
-static uintptr_t ttc_ring0_bridge_probe_reg_address(void) {
-	return ttc_ring0_strip_instruction_pointer(
-			(uintptr_t)&ttc_ring0_bridge_probe_reg);
+static uint64_t ttc_ring0_bridge_host_return_count(
+		const struct ttc_ring0_bridge *bridge) {
+	return atomic_load_explicit(&bridge->host_return_count,
+			memory_order_relaxed);
 }
 
 // ttc_ring0_bridge_probe_owner verifies that the bridge's vCPU is still
@@ -2269,23 +2228,6 @@ func (b *ring0Bridge) probeOwner() error {
 	return fmt.Errorf("HVF ring0 vCPU owner probe failed: status %#x", status)
 }
 
-func (b *ring0Bridge) preflight() error {
-	status := uint32(C.ttc_ring0_bridge_preflight(b.pointer))
-	if status == 0 {
-		rawStatus := ring0asm.RawCall(unsafe.Pointer(b.pointer),
-			uintptr(C.ttc_ring0_bridge_host_stack_top(b.pointer)),
-			uintptr(C.ttc_ring0_bridge_probe_reg_address()))
-		if rawStatus == 0 {
-			return nil
-		}
-		return fmt.Errorf("HVF ring0 raw-call preflight failed: status %#x", rawStatus)
-	}
-	return fmt.Errorf("HVF ring0 vCPU preflight failed: status %#x owner_tid=%d current_tid=%d",
-		status,
-		uint64(C.ttc_ring0_bridge_owner_tid(b.pointer)),
-		uint64(C.ttc_ring0_bridge_preflight_tid(b.pointer)))
-}
-
 func (b *ring0Bridge) lastX0() uint64 {
 	return atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeLastX0Offset)))
 }
@@ -2304,6 +2246,22 @@ func (b *ring0Bridge) lastCancelPState() uint64 {
 
 func (b *ring0Bridge) cancelCount() uint64 {
 	return atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeCancelCountOffset)))
+}
+
+type ring0BridgeStats struct {
+	guestEntries uint64
+	hostGates    uint64
+	redpills     uint64
+	hostReturns  uint64
+}
+
+func (b *ring0Bridge) stats() ring0BridgeStats {
+	return ring0BridgeStats{
+		guestEntries: uint64(C.ttc_ring0_bridge_guest_entry_count(b.pointer)),
+		hostGates:    uint64(C.ttc_ring0_bridge_host_gate_count(b.pointer)),
+		redpills:     uint64(C.ttc_ring0_bridge_redpill_count(b.pointer)),
+		hostReturns:  uint64(C.ttc_ring0_bridge_host_return_count(b.pointer)),
+	}
 }
 
 func (b *ring0Bridge) probe(stateVA uint64) (uint64, error) {

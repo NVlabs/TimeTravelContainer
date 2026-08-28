@@ -910,6 +910,109 @@ func TestMonitorRecyclesDestroyedAddressSpaceTables(t *testing.T) {
 	}
 }
 
+// TestApplicationSyscallBurstStaysInGuest makes the shared-Sentry contract
+// quantitative. Linux SVC exits return directly to the waiting Go
+// continuation at EL1; only the first entry may cross the Darwin/HVF boundary.
+func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
+	hostPID := os.Getpid()
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172
+	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
+
+	const (
+		spaceID = uint64(94)
+		codeVA  = uint64(0xb00000)
+		calls   = 4096
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+	registers := &vmm.ARM64State{}
+	for i := 0; i < calls; i++ {
+		registers.PC = codeVA
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
+			t.Fatalf("application call %d exit=%+v pc=%#x err=%v", i, exit, registers.PC, err)
+		}
+	}
+	value, ok := engine.cpusByTID.Load(hosttid.Current())
+	if !ok {
+		t.Fatal("resident application vCPU is absent")
+	}
+	stats := value.(*ring0ApplicationCPU).bridge.stats()
+	// Runtime scheduling, stack growth, or allocator maintenance may require a
+	// bounded Darwin service while the benchmark runs. What must never return is
+	// the old one-host-exit-per-application-syscall behavior.
+	if stats.hostReturns > calls/128 || stats.guestEntries != stats.hostReturns+1 {
+		t.Fatalf("host returns scaled with %d guest syscalls: stats=%+v", calls, stats)
+	}
+	beforeHostService := stats
+	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
+		t.Fatalf("host service getpid=%d, want %d", got, hostPID)
+	}
+	stats = value.(*ring0ApplicationCPU).bridge.stats()
+	if stats.guestEntries != beforeHostService.guestEntries ||
+		stats.hostGates != beforeHostService.hostGates+1 ||
+		stats.redpills != beforeHostService.redpills ||
+		stats.hostReturns != beforeHostService.hostReturns+1 {
+		t.Fatalf("explicit host service did not cross exactly one host gate: stats=%+v", stats)
+	}
+	beforeReentry := stats
+	registers.PC = codeVA
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID,
+		Registers:      registers,
+	})
+	if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
+		t.Fatalf("post-host-service application exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+	}
+	stats = value.(*ring0ApplicationCPU).bridge.stats()
+	if stats.guestEntries != beforeReentry.guestEntries+1 ||
+		stats.hostGates != beforeReentry.hostGates ||
+		stats.redpills != beforeReentry.redpills ||
+		stats.hostReturns != beforeReentry.hostReturns {
+		t.Fatalf("post-host-service re-entry did not reuse the residency: stats=%+v", stats)
+	}
+}
+
 func BenchmarkRing0ApplicationSwitch(b *testing.B) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
@@ -983,6 +1086,13 @@ func BenchmarkRing0ApplicationSwitch(b *testing.B) {
 		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
 			b.Fatalf("application exit=%+v pc=%#x err=%v", exit, registers.PC, err)
 		}
+	}
+	if value, ok := engine.cpusByTID.Load(hosttid.Current()); ok {
+		stats := value.(*ring0ApplicationCPU).bridge.stats()
+		b.ReportMetric(float64(stats.guestEntries)/float64(b.N), "guest-entries/op")
+		b.ReportMetric(float64(stats.hostGates)/float64(b.N), "host-gates/op")
+		b.ReportMetric(float64(stats.redpills)/float64(b.N), "redpills/op")
+		b.ReportMetric(float64(stats.hostReturns)/float64(b.N), "host-returns/op")
 	}
 }
 

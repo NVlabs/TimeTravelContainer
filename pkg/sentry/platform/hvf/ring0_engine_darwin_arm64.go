@@ -1009,14 +1009,6 @@ retry:
 		e.cpuMu.Unlock()
 		return nil, false, err
 	}
-	if err := bridge.preflight(); err != nil {
-		bridge.close()
-		_ = vcpu.Close()
-		e.cpuMu.Lock()
-		e.cpuIDs[id] = false
-		e.cpuMu.Unlock()
-		return nil, false, fmt.Errorf("qualifying owner-affine HVF ring0 vCPU %d: %w", id, err)
-	}
 	e.installRuntimeClockFastpath(vcpu)
 	cpu := &ring0ApplicationCPU{vcpu: vcpu, bridge: bridge, tid: tid, residentSince: time.Now()}
 	cpu.uses.Store(1)

@@ -116,25 +116,6 @@ TEXT ·HostSVCGetpid(SB),NOSPLIT|NOFRAME,$0-8
 	MOVD R0, ret+0(FP)
 	RET
 
-// RawCall switches to caller-owned C stack space, invokes fn(arg) using the
-// Darwin ARM64 ABI, then restores the Go SP and LR. The saved values live on
-// the private stack because the C ABI may clobber every temporary register.
-TEXT ·RawCall(SB),NOSPLIT|NOFRAME,$0-32
-	MOVD arg+0(FP), R0
-	MOVD stackTop+8(FP), R1
-	MOVD fn+16(FP), R2
-	MOVD RSP, R9
-	MOVD R1, RSP
-	SUB $16, RSP
-	MOVD R9, 0(RSP)
-	MOVD R30, 8(RSP)
-	CALL (R2)
-	MOVD 0(RSP), R9
-	MOVD 8(RSP), R30
-	MOVD R9, RSP
-	MOVW R0, ret+24(FP)
-	RET
-
 TEXT ·BluepillTrapAddress(SB),NOSPLIT,$0-8
 	MOVD $·bluepillTrap(SB), R0
 	MOVD R0, ret+0(FP)
