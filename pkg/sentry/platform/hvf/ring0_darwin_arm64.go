@@ -24,6 +24,7 @@ package hvf
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/vm_statistics.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach_time.h>
@@ -51,6 +52,7 @@ struct ttc_ring0_region {
 	uint64_t object_id;
 	uint32_t protection;
 	uint32_t user_tag;
+	uint32_t external_pager;
 };
 
 static int ttc_ring0_snapshot_regions(uint64_t limit,
@@ -102,6 +104,7 @@ static int ttc_ring0_snapshot_regions(uint64_t limit,
 					info.object_id_full : info.object_id,
 				.protection = info.protection,
 				.user_tag = info.user_tag,
+				.external_pager = info.external_pager,
 			};
 		}
 		address += length;
@@ -143,6 +146,7 @@ static int ttc_ring0_region_at(uint64_t target,
 				info.object_id_full : info.object_id,
 			.protection = info.protection,
 			.user_tag = info.user_tag,
+			.external_pager = info.external_pager,
 		};
 		return KERN_SUCCESS;
 	}
@@ -202,6 +206,7 @@ struct ttc_ring0_time_fastpath {
 struct ttc_ring0_native_domain_slot {
 	_Atomic uint32_t allocated;
 	_Atomic uint32_t active;
+	_Atomic uint32_t critical;
 	_Atomic uint64_t tpidrro_el0;
 };
 
@@ -259,21 +264,32 @@ static int32_t ttc_ring0_runtime_time_hook(
 		struct ttc_runtime_time_query *query) {
 	uint64_t thread_pointer;
 	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
-	bool in_guest = false;
+	struct ttc_ring0_native_domain_slot *domain = NULL;
 	for (size_t i = 0; i < TTC_RING0_MAX_APPLICATION_VCPUS; ++i) {
 		struct ttc_ring0_native_domain_slot *slot =
 				&ttc_ring0_native_domains[i];
 		if (atomic_load_explicit(&slot->active, memory_order_acquire) != 0 &&
 				atomic_load_explicit(&slot->tpidrro_el0,
 				memory_order_relaxed) == thread_pointer) {
-			in_guest = true;
+			domain = slot;
 			break;
 		}
 	}
-	if (!in_guest) return 0;
-	if (ttc_ring0_runtime_current_el() == 0) return 0;
+	if (domain == NULL) return 0;
+	// Cancellation can export an arbitrary EL1 continuation to Darwin. Keep the
+	// guest-only CurrentEL/TPIDR_EL1 sequence indivisible with respect to that
+	// domain transfer. The owner observes this counter after hv_vcpu_run returns
+	// and resumes the stopped vCPU until the callback leaves the critical range.
+	atomic_fetch_add_explicit(&domain->critical, 1, memory_order_seq_cst);
+	if (ttc_ring0_runtime_current_el() == 0) {
+		atomic_fetch_sub_explicit(&domain->critical, 1, memory_order_release);
+		return 0;
+	}
 	if (query == NULL || query->version != 1 ||
-			(query->clock != 1 && query->clock != 2)) return -1;
+			(query->clock != 1 && query->clock != 2)) {
+		atomic_fetch_sub_explicit(&domain->critical, 1, memory_order_release);
+		return -1;
+	}
 	const uint8_t *state;
 	__asm__ volatile("mrs %0, tpidr_el1" : "=r"(state));
 	uint64_t numer;
@@ -289,7 +305,10 @@ static int32_t ttc_ring0_runtime_time_hook(
 	__builtin_memcpy(&realtime_offset,
 			state + TTC_STATE_REALTIME_OFFSET_NS_OFFSET,
 			sizeof(realtime_offset));
-	if (numer == 0 || denom == 0) return -1;
+	if (numer == 0 || denom == 0) {
+		atomic_fetch_sub_explicit(&domain->critical, 1, memory_order_release);
+		return -1;
+	}
 	uint64_t ticks = ttc_ring0_host_cntvct();
 	uint64_t ns;
 	if (query->clock == 1) {
@@ -300,6 +319,7 @@ static int32_t ttc_ring0_runtime_time_hook(
 	}
 	query->seconds = (int64_t)(ns / UINT64_C(1000000000));
 	query->nanoseconds = (int32_t)(ns % UINT64_C(1000000000));
+	atomic_fetch_sub_explicit(&domain->critical, 1, memory_order_release);
 	return 1;
 }
 
@@ -390,6 +410,8 @@ struct ttc_ring0_bridge {
 #define TTC_RUNTIME_VM_MMAP 1u
 #define TTC_RUNTIME_VM_MUNMAP 2u
 #define TTC_RUNTIME_VM_MADVISE 3u
+#define TTC_RUNTIME_VM_STACK_SUSPEND 4u
+#define TTC_RUNTIME_VM_STACK_RESUME 5u
 #define TTC_RUNTIME_VM_BEFORE 1u
 #define TTC_RUNTIME_VM_AFTER 2u
 #define TTC_RUNTIME_MADV_FREE_REUSABLE 7
@@ -440,7 +462,116 @@ static pthread_mutex_t ttc_ring0_bridge_registry_mu = PTHREAD_MUTEX_INITIALIZER;
 // reopening admission before the outer reconciliation is complete.
 static _Atomic uint32_t ttc_ring0_guest_pause_count;
 static struct ttc_ring0_bridge *ttc_ring0_bridges;
+// Bridge records are visible to the shared EL1 Sentry and therefore may gain
+// a long-lived stage-2 lease. Recycle their anonymous 16K mappings in place
+// instead of unmapping them: Darwin may otherwise reuse the same HVA with a
+// different backing object while the engine's mirror registry still owns the
+// old HVF lease. The pool is bounded by peak simultaneous vCPU ownership.
+static struct ttc_ring0_bridge *ttc_ring0_free_bridges;
 static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
+static pthread_once_t ttc_ring0_preemption_once = PTHREAD_ONCE_INIT;
+static _Atomic int32_t ttc_ring0_preemption_status;
+
+// A resident application keeps its Go G and P active because its exception
+// resumes ordinary Sentry Go code directly at EL1. A native tick is required
+// to bound the interval in which CPU-bound EL0 execution cannot reach a Go
+// safepoint. It intentionally runs without a Go P, just like the host kernel's
+// preemption facility used by KVM.
+#define TTC_RING0_PREEMPTION_QUANTUM_NS UINT64_C(10000000)
+
+static void *ttc_ring0_preemption_thread(
+		__attribute__((unused)) void *argument) {
+	const struct timespec quantum = {
+		.tv_sec = 0,
+		.tv_nsec = TTC_RING0_PREEMPTION_QUANTUM_NS,
+	};
+	for (;;) {
+		struct timespec remaining = quantum;
+		while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
+		int status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
+		if (status != 0) {
+			atomic_store_explicit(&ttc_ring0_preemption_status, status,
+					memory_order_release);
+			return NULL;
+		}
+		hv_vcpu_t active[TTC_RING0_MAX_APPLICATION_VCPUS];
+		size_t count = 0;
+		for (struct ttc_ring0_bridge *bridge = ttc_ring0_bridges;
+				bridge != NULL; bridge = bridge->registry_next) {
+			if (atomic_load_explicit(&bridge->in_guest,
+					memory_order_acquire) == 0 ||
+					atomic_load_explicit(&bridge->destroyed,
+					memory_order_acquire) != 0) {
+				continue;
+			}
+			_Atomic uint64_t *exit_kind = (_Atomic uint64_t *)(
+					bridge->state_host + TTC_STATE_EXIT_KIND_OFFSET);
+			if (atomic_load_explicit(exit_kind, memory_order_acquire) != 0) {
+				// The application has already returned to Sentry Go code, which
+				// reaches ordinary runtime safepoints without a native kick.
+				continue;
+			}
+			if (count == TTC_RING0_MAX_APPLICATION_VCPUS) break;
+			active[count++] = bridge->vcpu;
+		}
+		if (count != 0) {
+			// Do not set external_interrupt_requested. The owner bridge turns an
+			// EL0 cancellation into TTC_EXIT_RETRY, while an EL1 cancellation
+			// exports the exact Sentry continuation so Darwin's Go scheduler can
+			// honor pending preemption and GC work.
+			(void)hv_vcpus_exit(active, (uint32_t)count);
+		}
+		pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+	}
+}
+
+static void ttc_ring0_start_preemption_thread_once(void) {
+	pthread_t thread;
+	int status = pthread_create(&thread, NULL,
+			ttc_ring0_preemption_thread, NULL);
+	if (status == 0) status = pthread_detach(thread);
+	atomic_store_explicit(&ttc_ring0_preemption_status, status,
+			memory_order_release);
+}
+
+static int ttc_ring0_start_preemption_thread(void) {
+	int status = pthread_once(&ttc_ring0_preemption_once,
+			ttc_ring0_start_preemption_thread_once);
+	if (status != 0) return status;
+	return atomic_load_explicit(&ttc_ring0_preemption_status,
+			memory_order_acquire);
+}
+
+static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
+	struct ttc_ring0_bridge *bridge = NULL;
+	if (pthread_mutex_lock(&ttc_ring0_bridge_registry_mu) != 0) return NULL;
+	if (ttc_ring0_free_bridges != NULL) {
+		bridge = ttc_ring0_free_bridges;
+		ttc_ring0_free_bridges = bridge->registry_next;
+	}
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+	if (bridge == NULL) {
+		bridge = mmap(NULL, TTC_RING0_HOST_SLAB_SIZE,
+				PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANON,
+				VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2), 0);
+		if (bridge == MAP_FAILED) return NULL;
+	}
+	__builtin_memset(bridge, 0, TTC_RING0_HOST_SLAB_SIZE);
+	return bridge;
+}
+
+static void ttc_ring0_bridge_storage_release(
+		struct ttc_ring0_bridge *bridge) {
+	if (bridge == NULL) return;
+	bridge->magic = 0;
+	// If the mutex itself is unusable, deliberately retain the mapping rather
+	// than munmapping memory that may still have a registered HVF lease.
+	if (pthread_mutex_lock(&ttc_ring0_bridge_registry_mu) != 0) return;
+	bridge->registry_next = ttc_ring0_free_bridges;
+	ttc_ring0_free_bridges = bridge;
+	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+}
 
 static uint64_t *ttc_ring0_mapping_registered(
 		struct ttc_ring0_mirror_mapping *mapping) {
@@ -897,7 +1028,33 @@ static int32_t ttc_ring0_runtime_vm_hook(
 			mutation->length == 0 ||
 			mutation->address + mutation->length < mutation->address ||
 			mutation->operation < TTC_RUNTIME_VM_MMAP ||
-			mutation->operation > TTC_RUNTIME_VM_MADVISE) return EINVAL;
+			mutation->operation > TTC_RUNTIME_VM_STACK_RESUME) return EINVAL;
+	if (mutation->operation == TTC_RUNTIME_VM_STACK_SUSPEND ||
+			mutation->operation == TTC_RUNTIME_VM_STACK_RESUME) {
+		if (mutation->phase != TTC_RUNTIME_VM_BEFORE) return EINVAL;
+		int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
+		if (status != 0) return status;
+		bool suspend = mutation->operation == TTC_RUNTIME_VM_STACK_SUSPEND;
+		bool affected = suspend ?
+			ttc_ring0_mirror_live_overlap(mutation->address,
+					mutation->length) :
+			ttc_ring0_mirror_dormant_overlap(mutation->address,
+					mutation->length);
+		if (!affected) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
+		status = ttc_ring0_begin_runtime_mutation_locked();
+		if (status != 0) {
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return status;
+		}
+		hv_return_t hv_status = suspend ?
+			ttc_ring0_suspend_mirror(mutation->address, mutation->length) :
+			ttc_ring0_rebind_mirror(mutation->address, mutation->length);
+		ttc_ring0_end_runtime_mutation();
+		return hv_status == HV_SUCCESS ? 0 : EIO;
+	}
 	if (mutation->phase == TTC_RUNTIME_VM_BEFORE) {
 		int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
 		if (status != 0) return status;
@@ -1046,6 +1203,14 @@ static bool ttc_ring0_pc_in_entry_trampoline(
 	offsetof(struct ttc_ring0_bridge, last_cancel_pstate)
 #define TTC_RING0_BRIDGE_CANCEL_COUNT_OFFSET \
 	offsetof(struct ttc_ring0_bridge, cancel_count)
+#define TTC_RING0_BRIDGE_GUEST_ENTRY_COUNT_OFFSET \
+	offsetof(struct ttc_ring0_bridge, guest_entry_count)
+#define TTC_RING0_BRIDGE_HOST_GATE_COUNT_OFFSET \
+	offsetof(struct ttc_ring0_bridge, host_gate_count)
+#define TTC_RING0_BRIDGE_REDPILL_COUNT_OFFSET \
+	offsetof(struct ttc_ring0_bridge, redpill_count)
+#define TTC_RING0_BRIDGE_HOST_RETURN_COUNT_OFFSET \
+	offsetof(struct ttc_ring0_bridge, host_return_count)
 
 static uintptr_t ttc_ring0_get_pc(const arm_thread_state64_t *ss) {
 	return __darwin_arm_thread_state64_get_pc(*ss);
@@ -1137,6 +1302,10 @@ static void ttc_ring0_fatal_diagnostic(struct ttc_ring0_bridge *bridge,
 			&bridge->entry_tid, memory_order_acquire));
 	TTC_DIAG_FIELD(" reason=", bridge->exit->reason);
 	TTC_DIAG_FIELD(" syndrome=", bridge->exit->exception.syndrome);
+	TTC_DIAG_FIELD(" virtual_address=",
+			bridge->exit->exception.virtual_address);
+	TTC_DIAG_FIELD(" physical_address=",
+			bridge->exit->exception.physical_address);
 	TTC_DIAG_FIELD(" exit=", ttc_ring0_state_u64(bridge,
 			TTC_STATE_EXIT_KIND_OFFSET));
 	TTC_DIAG_FIELD(" app_esr=", ttc_ring0_state_u64(bridge,
@@ -1424,6 +1593,13 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 					&host_ns, (uint32_t)status, TTC_RING0_PHASE_RUN);
 		}
 		if (bridge->exit->reason == HV_EXIT_REASON_CANCELED) {
+			if (atomic_load_explicit(&domain->critical,
+					memory_order_acquire) != 0) {
+				// The stopped PC is inside a guest-only native callback. Any
+				// external interrupt, destroy request, or MMU pause remains
+				// published; resume until the callback reaches a host-safe PC.
+				continue;
+			}
 			// A Go runtime mapping mutation is a process-wide secondary-MMU
 			// rendezvous, not an application interrupt. hv_vcpu_run has already
 			// returned on this owner thread, so publish the vCPU quiescent and
@@ -1785,13 +1961,14 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 		const hv_vcpu_exit_t *exit, uint64_t ttbr0, uint64_t ttbr1,
 		uint64_t vector_va, uint64_t state_va,
 		uintptr_t state_host, uintptr_t guest_switch_pc, int destroy_on_host) {
-	struct ttc_ring0_bridge *bridge = calloc(1, sizeof(*bridge));
+	if (ttc_ring0_start_preemption_thread() != 0) return NULL;
+	struct ttc_ring0_bridge *bridge = ttc_ring0_bridge_storage_acquire();
 	if (bridge == NULL) return NULL;
 	bridge->host_stack_size = TTC_RING0_HOST_STACK_SIZE;
 	bridge->host_stack = mmap(NULL, bridge->host_stack_size,
 			PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (bridge->host_stack == MAP_FAILED) {
-		free(bridge);
+		ttc_ring0_bridge_storage_release(bridge);
 		return NULL;
 	}
 	bridge->magic = TTC_RING0_BRIDGE_MAGIC;
@@ -1817,7 +1994,7 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 	}
 	if (!reserved_domain) {
 		(void)munmap(bridge->host_stack, bridge->host_stack_size);
-		free(bridge);
+		ttc_ring0_bridge_storage_release(bridge);
 		return NULL;
 	}
 	(void)pthread_threadid_np(NULL, &bridge->owner_tid);
@@ -1827,7 +2004,7 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 				&ttc_ring0_native_domains[bridge->native_domain_slot].allocated,
 				0, memory_order_release);
 		(void)munmap(bridge->host_stack, bridge->host_stack_size);
-		free(bridge);
+		ttc_ring0_bridge_storage_release(bridge);
 		return NULL;
 	}
 	bridge->registry_next = ttc_ring0_bridges;
@@ -1836,28 +2013,14 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 	return bridge;
 }
 
-static uint64_t ttc_ring0_bridge_guest_entry_count(
+static uint64_t ttc_ring0_bridge_exit_virtual_address(
 		const struct ttc_ring0_bridge *bridge) {
-	return atomic_load_explicit(&bridge->guest_entry_count,
-			memory_order_relaxed);
+	return bridge->exit->exception.virtual_address;
 }
 
-static uint64_t ttc_ring0_bridge_host_gate_count(
+static uint64_t ttc_ring0_bridge_exit_physical_address(
 		const struct ttc_ring0_bridge *bridge) {
-	return atomic_load_explicit(&bridge->host_gate_count,
-			memory_order_relaxed);
-}
-
-static uint64_t ttc_ring0_bridge_redpill_count(
-		const struct ttc_ring0_bridge *bridge) {
-	return atomic_load_explicit(&bridge->redpill_count,
-			memory_order_relaxed);
-}
-
-static uint64_t ttc_ring0_bridge_host_return_count(
-		const struct ttc_ring0_bridge *bridge) {
-	return atomic_load_explicit(&bridge->host_return_count,
-			memory_order_relaxed);
+	return bridge->exit->exception.physical_address;
 }
 
 // ttc_ring0_bridge_probe_owner verifies that the bridge's vCPU is still
@@ -1884,13 +2047,14 @@ static void ttc_ring0_bridge_destroy(struct ttc_ring0_bridge *bridge) {
 	struct ttc_ring0_native_domain_slot *domain =
 			&ttc_ring0_native_domains[bridge->native_domain_slot];
 	atomic_store_explicit(&domain->active, 0, memory_order_release);
+	atomic_store_explicit(&domain->critical, 0, memory_order_release);
 	atomic_store_explicit(&domain->tpidrro_el0, 0, memory_order_relaxed);
 	atomic_store_explicit(&domain->allocated, 0, memory_order_release);
 	bridge->magic = 0;
 	if (bridge->host_stack != NULL && bridge->host_stack != MAP_FAILED) {
 		(void)munmap(bridge->host_stack, bridge->host_stack_size);
 	}
-	free(bridge);
+	ttc_ring0_bridge_storage_release(bridge);
 }
 
 static uint64_t ttc_monitor_address_space_ttbr(const void *memory,
@@ -1938,16 +2102,21 @@ const (
 	ring0BridgeLastCancelPCOffset      = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PC_OFFSET)
 	ring0BridgeLastCancelPStateOffset  = uintptr(C.TTC_RING0_BRIDGE_LAST_CANCEL_PSTATE_OFFSET)
 	ring0BridgeCancelCountOffset       = uintptr(C.TTC_RING0_BRIDGE_CANCEL_COUNT_OFFSET)
+	ring0BridgeGuestEntryCountOffset   = uintptr(C.TTC_RING0_BRIDGE_GUEST_ENTRY_COUNT_OFFSET)
+	ring0BridgeHostGateCountOffset     = uintptr(C.TTC_RING0_BRIDGE_HOST_GATE_COUNT_OFFSET)
+	ring0BridgeRedpillCountOffset      = uintptr(C.TTC_RING0_BRIDGE_REDPILL_COUNT_OFFSET)
+	ring0BridgeHostReturnCountOffset   = uintptr(C.TTC_RING0_BRIDGE_HOST_RETURN_COUNT_OFFSET)
 )
 
 type ring0HostRegion struct {
-	address      uintptr
-	length       uint64
-	objectOffset uint64
-	objectID     uint64
-	protection   uint32
-	userTag      uint32
-	mainImage    bool
+	address       uintptr
+	length        uint64
+	objectOffset  uint64
+	objectID      uint64
+	protection    uint32
+	userTag       uint32
+	externalPager bool
+	mainImage     bool
 }
 
 type ring0TimeFastpath struct {
@@ -2005,13 +2174,14 @@ func snapshotRing0HostRegions(limit uint64) ([]ring0HostRegion, error) {
 			return nil, fmt.Errorf("invalid Darwin VM region [%#x, %#x)", address, address+length)
 		}
 		result = append(result, ring0HostRegion{
-			address:      uintptr(address),
-			length:       length,
-			objectOffset: uint64(region.object_offset),
-			objectID:     uint64(region.object_id),
-			protection:   uint32(region.protection),
-			userTag:      uint32(region.user_tag),
-			mainImage:    C.ttc_ring0_main_image(region.address, region.length) != 0,
+			address:       uintptr(address),
+			length:        length,
+			objectOffset:  uint64(region.object_offset),
+			objectID:      uint64(region.object_id),
+			protection:    uint32(region.protection),
+			userTag:       uint32(region.user_tag),
+			externalPager: region.external_pager != 0,
+			mainImage:     C.ttc_ring0_main_image(region.address, region.length) != 0,
 		})
 	}
 	return result, nil
@@ -2034,13 +2204,14 @@ func ring0HostRegionAt(target uintptr) (ring0HostRegion, bool, error) {
 		return ring0HostRegion{}, false, fmt.Errorf("invalid Darwin VM region [%#x, %#x) for %#x", address, address+length, target)
 	}
 	return ring0HostRegion{
-		address:      uintptr(address),
-		length:       length,
-		objectOffset: uint64(region.object_offset),
-		objectID:     uint64(region.object_id),
-		protection:   uint32(region.protection),
-		userTag:      uint32(region.user_tag),
-		mainImage:    C.ttc_ring0_main_image(region.address, region.length) != 0,
+		address:       uintptr(address),
+		length:        length,
+		objectOffset:  uint64(region.object_offset),
+		objectID:      uint64(region.object_id),
+		protection:    uint32(region.protection),
+		userTag:       uint32(region.user_tag),
+		externalPager: region.external_pager != 0,
+		mainImage:     C.ttc_ring0_main_image(region.address, region.length) != 0,
 	}, true, nil
 }
 
@@ -2208,8 +2379,10 @@ func (b *ring0Bridge) error(prefix string) error {
 	}
 	phase := b.errorPhase()
 	if phase == C.TTC_RING0_PHASE_UNEXPECTED_EXIT {
-		return fmt.Errorf("%s: status %#x while %s: host_gate_esr=%#x host_gate_far=%#x host_gate_pc=%#x internal_esr=%#x internal_elr=%#x internal_vector=%#x",
+		return fmt.Errorf("%s: status %#x while %s: exit_va=%#x exit_ipa=%#x host_gate_esr=%#x host_gate_far=%#x host_gate_pc=%#x internal_esr=%#x internal_elr=%#x internal_vector=%#x",
 			prefix, status, ring0ErrorPhaseName(phase),
+			uint64(C.ttc_ring0_bridge_exit_virtual_address(b.pointer)),
+			uint64(C.ttc_ring0_bridge_exit_physical_address(b.pointer)),
 			uint64(C.ttc_ring0_state_u64(b.pointer, C.TTC_STATE_HOST_GATE_ESR_OFFSET)),
 			uint64(C.ttc_ring0_state_u64(b.pointer, C.TTC_STATE_HOST_GATE_FAR_OFFSET)),
 			uint64(C.ttc_ring0_state_u64(b.pointer, C.TTC_STATE_HOST_GATE_PC_OFFSET)),
@@ -2257,10 +2430,10 @@ type ring0BridgeStats struct {
 
 func (b *ring0Bridge) stats() ring0BridgeStats {
 	return ring0BridgeStats{
-		guestEntries: uint64(C.ttc_ring0_bridge_guest_entry_count(b.pointer)),
-		hostGates:    uint64(C.ttc_ring0_bridge_host_gate_count(b.pointer)),
-		redpills:     uint64(C.ttc_ring0_bridge_redpill_count(b.pointer)),
-		hostReturns:  uint64(C.ttc_ring0_bridge_host_return_count(b.pointer)),
+		guestEntries: atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeGuestEntryCountOffset))),
+		hostGates:    atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeHostGateCountOffset))),
+		redpills:     atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeRedpillCountOffset))),
+		hostReturns:  atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(b.pointer), ring0BridgeHostReturnCountOffset))),
 	}
 }
 

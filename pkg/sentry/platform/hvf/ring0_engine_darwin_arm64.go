@@ -724,11 +724,13 @@ retryApplication:
 		cpu.entryActive.Store(false)
 		goto retryApplication
 	}
-	// Like KVM, expose guest execution as an external syscall interval to
-	// the Go scheduler. The application exception resumes this continuation
-	// at EL1; exitsyscall reacquires a P before Sentry handles the syscall.
-	// All possibly splitting Go work must stay above entersyscall.
-	ring0EnterSyscall()
+	// Keep this G and its P active while the application runs. Unlike KVM's
+	// SwitchToUser, an application exception restores this continuation directly
+	// at EL1, so ordinary Sentry Go code executes before this function returns to
+	// Darwin. Marking the G as _Gsyscall here would release its P and mcache for
+	// use by another M while the EL1 continuation still allocates from them.
+	// Long-running EL0 execution is made preemptible by the bridge's vCPU
+	// cancellation path; it must not be modeled as a host syscall interval.
 	if atGuestEL1 {
 		ring0asm.SwitchApplicationGuest()
 	} else {
@@ -740,7 +742,6 @@ retryApplication:
 		ring0asm.Bluepill(unsafe.Pointer(cpu.bridge.pointer), cpu.vcpu.stateVA)
 		ring0asm.SwitchApplicationGuest()
 	}
-	ring0ExitSyscall()
 	cpu.entryActive.Store(false)
 	if err := cpu.bridge.error("HVF Sentry-at-EL1 application bridge failed"); err != nil {
 		postRunErr := cpu.bridge.probeOwner()
@@ -851,6 +852,33 @@ func (e *ring0Engine) requestHostMirror(address uintptr) {
 	e.faultMu.Lock()
 	e.pendingMirror[address&^uintptr(vmm.HostSlabSize-1)] = struct{}{}
 	e.faultMu.Unlock()
+}
+
+// hostSlabCanMirror returns true only when the HVA has a lifetime protocol
+// strong enough for a persistent HVF stage-2 lease. File-backed mappings used
+// by safecopy are external-pager VM objects whose VA may be unmapped and reused
+// independently of the patched Go allocator; those accesses must redpill and
+// complete at host EL0. The patched runtime and the native bridge allocator use
+// distinct application-specific Darwin VM tags, while VM-owned slabs have a
+// canonical GPA and an explicit retirement notifier. Go pthread stacks are
+// suspended and rebound by minit/unminit runtime callbacks. Other untagged
+// anonymous mappings remain host-only.
+func (e *ring0Engine) hostSlabCanMirror(region ring0HostRegion, address uintptr) bool {
+	if region.mainImage {
+		return true
+	}
+	if _, _, ok := e.vm.canonicalGPAForHost(address); ok {
+		return true
+	}
+	const (
+		vmMemoryTTCRuntime = uint32(240)
+		vmMemoryTTCBridge  = uint32(241)
+		vmMemoryTTCVM      = uint32(242)
+		vmMemoryStack      = uint32(30)
+	)
+	return !region.externalPager &&
+		(region.userTag == vmMemoryTTCRuntime || region.userTag == vmMemoryTTCBridge ||
+			region.userTag == vmMemoryTTCVM || region.userTag == vmMemoryStack)
 }
 
 // retireUnenteredApplicationCPU destroys a vCPU that was created by the
@@ -1270,6 +1298,9 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 	desiredAccess := make(map[uint64]monitorabi.Access)
 	seenRegions := make(map[uintptr]ring0HostRegion)
 	addSlab := func(region ring0HostRegion, address uintptr, access monitorabi.Access, stage2Access vmm.Stage2Access) {
+		if !e.hostSlabCanMirror(region, address) {
+			return
+		}
 		offset := uint64(address - region.address)
 		desiredSlabs[address] = ring0Stage2Identity{
 			objectID:     region.objectID,
@@ -1496,6 +1527,9 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			continue
 		}
 		addSlab := func(address uintptr) {
+			if !e.hostSlabCanMirror(region, address) {
+				return
+			}
 			offset := uint64(address - region.address)
 			desiredSlabs[address] = ring0Stage2Identity{
 				objectID:     region.objectID,
@@ -1518,15 +1552,13 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 			return workingSetAddresses[i] >= region.address
 		})
 		workingSetRegion := workingSetIndex < len(workingSetAddresses) && workingSetAddresses[workingSetIndex] < regionEnd
+		bootstrapOwned := region.userTag == 240 || region.userTag == 242
 		if region.protection&ring0VMWrite != 0 &&
-			(workingSetRegion || bootstrap && region.userTag == 0) {
-			// Darwin's user tag 0 identifies anonymous mappings not owned by a
-			// native malloc zone or pthread stack. At bootstrap these are the Go
-			// runtime's managed heap/stack arenas, whose later VM mutations are
-			// covered by the runtime rendezvous. Map each complete region so a
-			// pre-existing Go object cannot spuriously redpill based on allocator
+			(workingSetRegion || bootstrap && bootstrapOwned) {
+			// At bootstrap, import each complete explicitly owned region so a
+			// pre-existing Go or VMM object cannot spuriously redpill based on its
 			// placement. Demand mapping retains the narrower working-set rule for
-			// mappings created after bootstrap.
+			// tagged mappings created after bootstrap.
 			for offset := uint64(0); offset < region.length; offset += vmm.HostSlabSize {
 				addSlab(region.address + uintptr(offset))
 			}

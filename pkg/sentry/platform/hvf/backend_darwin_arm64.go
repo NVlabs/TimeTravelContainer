@@ -25,12 +25,14 @@ package hvf
 #include <Hypervisor/Hypervisor.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/vm_statistics.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <string.h>
 
 static void *ttc_mmap_anon(size_t length) {
-	void *p = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	void *p = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+			VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_3), 0);
 	return p == MAP_FAILED ? NULL : p;
 }
 

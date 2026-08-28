@@ -18,16 +18,6 @@ package hvf
 
 import _ "unsafe" // Required for go:linkname.
 
-// A resident Sentry continuation is invisible to the host Go scheduler while
-// HVF executes EL0 and EL1. Match KVM's runtime contract so GC and asynchronous
-// preemption never treat that continuation as ordinary host Go execution.
-
-//go:linkname ring0EnterSyscall runtime.entersyscall
-func ring0EnterSyscall()
-
-//go:linkname ring0ExitSyscall runtime.exitsyscall
-func ring0ExitSyscall()
-
 // ring0SetVMMemoryHooks installs the allocation-free Darwin runtime notifier
 // supplied by tools/go_darwin_vm_hooks.patch.
 //

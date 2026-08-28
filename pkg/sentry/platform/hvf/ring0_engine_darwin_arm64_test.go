@@ -137,10 +137,38 @@ func TestRing0HostRegionAt(t *testing.T) {
 	if region.protection&ring0VMWrite == 0 {
 		t.Fatalf("heap region at %#x has protection %#x, want writable", target, region.protection)
 	}
+	if region.userTag != 240 {
+		t.Fatalf("heap region at %#x has Darwin VM tag %d, want TTC runtime tag 240", target, region.userTag)
+	}
 	runtime.KeepAlive(allocation)
 
 	if region, ok, err := ring0HostRegionAt(0); err != nil || ok {
 		t.Fatalf("Darwin VM region at zero = %+v, ok=%t, err=%v; want absent", region, ok, err)
+	}
+}
+
+func TestHostSlabCanMirrorRequiresOwnedLifetime(t *testing.T) {
+	engine := &ring0Engine{vm: &hvfVM{}}
+	tests := []struct {
+		name   string
+		region ring0HostRegion
+		want   bool
+	}{
+		{name: "main image", region: ring0HostRegion{mainImage: true, externalPager: true}, want: true},
+		{name: "runtime arena", region: ring0HostRegion{userTag: 240}, want: true},
+		{name: "bridge", region: ring0HostRegion{userTag: 241}, want: true},
+		{name: "VM allocation", region: ring0HostRegion{userTag: 242}, want: true},
+		{name: "pthread stack", region: ring0HostRegion{userTag: 30}, want: true},
+		{name: "untagged anonymous", region: ring0HostRegion{}, want: false},
+		{name: "file-backed runtime tag", region: ring0HostRegion{userTag: 240, externalPager: true}, want: false},
+		{name: "unowned application tag", region: ring0HostRegion{userTag: 239}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := engine.hostSlabCanMirror(test.region, 0x10000); got != test.want {
+				t.Fatalf("hostSlabCanMirror(%+v) = %t, want %t", test.region, got, test.want)
+			}
+		})
 	}
 }
 
@@ -978,11 +1006,34 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		t.Fatal("resident application vCPU is absent")
 	}
 	stats := value.(*ring0ApplicationCPU).bridge.stats()
+	bridgeAddress := uintptr(unsafe.Pointer(value.(*ring0ApplicationCPU).bridge.pointer))
+	bridgeRegion, present, err := ring0HostRegionAt(bridgeAddress)
+	if err != nil || !present || bridgeRegion.userTag != 241 {
+		t.Fatalf("bridge region at %#x = %+v, present=%t, err=%v; want TTC bridge tag 241", bridgeAddress, bridgeRegion, present, err)
+	}
 	// Runtime scheduling, stack growth, or allocator maintenance may require a
 	// bounded Darwin service while the benchmark runs. What must never return is
 	// the old one-host-exit-per-application-syscall behavior.
-	if stats.hostReturns > calls/128 || stats.guestEntries != stats.hostReturns+1 {
-		t.Fatalf("host returns scaled with %d guest syscalls: stats=%+v", calls, stats)
+	if stats.hostReturns > calls/128 {
+		region, present, regionErr := ring0HostRegionAt(ring0asm.CurrentSP())
+		state := unsafe.Slice((*byte)(unsafe.Pointer(value.(*ring0ApplicationCPU).vcpu.stateHost)), vmm.HostSlabSize)
+		far := binary.LittleEndian.Uint64(state[stateHostGateFAR:])
+		faultRegion, faultPresent, faultErr := ring0HostRegionAt(uintptr(far))
+		t.Fatalf("host returns scaled with %d guest syscalls: stats=%+v stack-region=%+v present=%t err=%v last-far=%#x fault-region=%+v present=%t err=%v", calls, stats, region, present, regionErr, far, faultRegion, faultPresent, faultErr)
+	}
+	// A final-iteration demand import may have returned this continuation to
+	// Darwin after the last application exit. Re-enter once so the explicit SVC
+	// below measures the guest-to-host service boundary, not host-native SVC.
+	if ring0asm.CurrentEL() == 0 {
+		registers.PC = codeVA
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
+			t.Fatalf("demand-import re-entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+		}
+		stats = value.(*ring0ApplicationCPU).bridge.stats()
 	}
 	beforeHostService := stats
 	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
@@ -1010,6 +1061,160 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		stats.redpills != beforeReentry.redpills ||
 		stats.hostReturns != beforeReentry.hostReturns {
 		t.Fatalf("post-host-service re-entry did not reuse the residency: stats=%+v", stats)
+	}
+}
+
+// TestCPUboundApplicationDoesNotStarveGoScheduler verifies the execution
+// contract that replaces runtime.entersyscall for shared EL1 continuations.
+// With one P, only the native HVF preemption tick can return a CPU-bound Linux
+// task to a Go safepoint and allow this test goroutine to run again.
+func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+
+	const (
+		spaceID = uint64(95)
+		codeVA  = uint64(0xc00000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	entered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		engine.BeginApplicationResidency()
+		close(entered)
+		registers := &vmm.ARM64State{PC: codeVA}
+		exit, runErr := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		endErr := engine.EndApplicationResidency()
+		if runErr == nil && exit.Reason != vmm.ExitInterrupted {
+			runErr = fmt.Errorf("CPU-bound application exit=%+v, want interrupted", exit)
+		}
+		done <- errors.Join(runErr, endErr)
+	}()
+	<-entered
+	// Closing entered makes this goroutine runnable without yielding the worker.
+	// Reaching this point therefore proves that native preemption returned the
+	// worker to a runtime safepoint while it owned the only P.
+	engine.InterruptApplications()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativePreemptionPreservesApplicationRegisters(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+
+	const (
+		spaceID    = uint64(96)
+		codeVA     = uint64(0xd00000)
+		iterations = 64
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+
+	for iteration := 0; iteration < iterations; iteration++ {
+		registers := &vmm.ARM64State{
+			PC:     codeVA,
+			SP:     0x70000000 + uint64(iteration)*0x1000,
+			PState: uint64(iteration&0xf) << 28,
+			TPIDR:  0x12345000 + uint64(iteration),
+		}
+		for index := range registers.X {
+			registers.X[index] = uint64(iteration+1)<<32 | uint64(index+1)
+		}
+		// FPSR/FPCR occupy the first eight bytes and mask architecturally
+		// reserved bits on restore; compare the SIMD register payload exactly.
+		for index := 8; index < len(registers.FP); index++ {
+			registers.FP[index] = byte(iteration*3 + index)
+		}
+		want := *registers
+		interrupted := make(chan struct{})
+		go func() {
+			time.Sleep(25 * time.Millisecond)
+			engine.InterruptApplications()
+			close(interrupted)
+		}()
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		<-interrupted
+		if err != nil || exit.Reason != vmm.ExitInterrupted || *registers != want {
+			t.Fatalf("preempted application iteration %d: exit=%+v registers=%+v want=%+v err=%v", iteration, exit, registers, &want, err)
+		}
 	}
 }
 

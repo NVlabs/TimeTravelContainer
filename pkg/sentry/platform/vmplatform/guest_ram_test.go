@@ -542,6 +542,60 @@ func TestGuestRAMCompactionWaitsForHostMappingLease(t *testing.T) {
 	}
 }
 
+func TestGuestRAMDecommitWaitsForHostMappingLease(t *testing.T) {
+	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	_, lease, err := backing.AcquireMapping(memmap.FileRange{Start: 0, End: GuestFrameSize}, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- backing.Decommit(memmap.FileRange{Start: 0, End: GuestFrameSize})
+	}()
+	select {
+	case err := <-done:
+		lease.Release()
+		t.Fatalf("Decommit completed while mapping lease was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	lease.Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Decommit did not continue after mapping lease release")
+	}
+}
+
+func TestGuestRAMDestroyWaitsForHostMappingLease(t *testing.T) {
+	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	_, lease, err := backing.AcquireMapping(memmap.FileRange{Start: 0, End: GuestFrameSize}, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- backing.Destroy()
+	}()
+	select {
+	case err := <-done:
+		lease.Release()
+		t.Fatalf("Destroy completed while mapping lease was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	lease.Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Destroy did not continue after mapping lease release")
+	}
+}
+
 func TestGuestRAMMemoryFileAsyncSaveRestoreUsesLeasedMappings(t *testing.T) {
 	host := newStagingTestHost()
 	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: host, IPAStart: 0x100000, IPASize: 1 << 24})

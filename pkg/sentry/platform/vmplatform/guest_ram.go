@@ -114,8 +114,9 @@ type guestBacking struct {
 // GuestRAM implements pgalloc.BackingProvider over 16 KiB host slabs.
 type GuestRAM struct {
 	mu sync.Mutex
-	// accessMu excludes physical frame relocation from leased Sentry host
-	// mappings. Stage-1 mappings are synchronized independently by the monitor.
+	// accessMu excludes physical frame relocation, zeroing, and retirement from
+	// leased Sentry host mappings. Stage-1 mappings are synchronized
+	// independently by the monitor.
 	accessMu sync.RWMutex
 	// cond wakes backing operations after a frame decommit or slab release.
 	// It prevents a logical 4K frame from being reactivated while its old
@@ -532,6 +533,11 @@ func (b *guestBacking) Decommit(fr memmap.FileRange) error {
 	if err := validateFrameRange(fr); err != nil {
 		return err
 	}
+	// Decommit may zero a frame and release its containing host mapping. Drain
+	// every operation-scoped Sentry mapping before changing either the bytes or
+	// the lifetime of those host addresses.
+	b.ram.accessMu.Lock()
+	defer b.ram.accessMu.Unlock()
 	b.ram.mu.Lock()
 	for {
 		if b.destroyed || fr.End > b.size {
@@ -1171,6 +1177,10 @@ func (*guestBacking) DataFD(memmap.FileRange) (int, error) {
 }
 
 func (b *guestBacking) Destroy() error {
+	// Destroy has the same host-address invalidation semantics as Decommit, but
+	// for every frame in the backing.
+	b.ram.accessMu.Lock()
+	defer b.ram.accessMu.Unlock()
 	b.ram.mu.Lock()
 	if b.destroyed {
 		b.ram.mu.Unlock()

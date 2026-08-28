@@ -98,9 +98,11 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 		t.Skipf("Darwin direct getpid SVC returned %d, want %d", got, hostPID)
 	}
 	// Allocate the Sentry clock object before the engine takes its initial host
-	// VM snapshot. The assertion below is about the EL1 clock service itself,
-	// not the one-time demand import of a Go arena created after bootstrap.
+	// VM snapshot, and run the Darwin runtime clock path once from this stack
+	// frame. The assertion below is about the EL1 clock service itself, not the
+	// one-time demand import of a Go arena created after bootstrap.
 	calibratedClock := sentrytime.NewCalibratedClock(sentrytime.Monotonic)
+	_ = time.Now()
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
