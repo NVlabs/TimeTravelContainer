@@ -31,6 +31,7 @@ go_library(
         "monitor_darwin_arm64.go",
         "ring0_darwin_arm64.go",
         "ring0_engine_darwin_arm64.go",
+        "ring0_runtime_unsafe.go",
     ],
     bazel_cgo = True,
     bazel_cdeps = select_system(
@@ -78,6 +79,7 @@ go_test(
         "//pkg/sentry/platform/vmplatform/arm64",
         "//pkg/sentry/platform/vmplatform/monitorabi",
         "//pkg/sentry/platform/vmplatform/vmm",
+        "//pkg/sentry/time",
         "//pkg/sentry/usage",
     ],
 )

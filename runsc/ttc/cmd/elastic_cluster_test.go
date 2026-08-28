@@ -49,6 +49,25 @@ func TestClusterAdvertiseResolution(t *testing.T) {
 	}
 }
 
+func TestDistributedSourceTerminalCommandPreservesActivatedMigrationFilesystem(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		tx   *cluster.Transaction
+		want string
+	}{
+		{name: "missing", want: "distributed-cancel"},
+		{name: "ordinary-fork", tx: &cluster.Transaction{}, want: "distributed-cancel"},
+		{name: "migration-before-cutover", tx: &cluster.Transaction{Identity: cluster.ForkIdentity{Migration: true}}, want: "distributed-cancel"},
+		{name: "activated-migration", tx: &cluster.Transaction{Identity: cluster.ForkIdentity{Migration: true}, Activated: true}, want: "distributed-complete"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := distributedSourceTerminalCommand(test.tx); got != test.want {
+				t.Fatalf("distributedSourceTerminalCommand(%+v)=%q, want %q", test.tx, got, test.want)
+			}
+		})
+	}
+}
+
 func TestDaemonCommandOwner(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")

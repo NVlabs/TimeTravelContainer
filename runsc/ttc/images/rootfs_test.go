@@ -108,6 +108,21 @@ func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 	}
 }
 
+func TestApplyLayerPreservesEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	layer := makeLayer(t, true, []tarEntry{
+		{name: "run/", mode: 0755},
+		{name: "var/", mode: 0755},
+		{name: "var/run", mode: 0777, typeflag: tar.TypeSymlink, linkname: "../run"},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(layer)); err != nil {
+		t.Fatalf("applying layer with empty directory: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "run")); err != nil || !info.IsDir() {
+		t.Fatalf("empty directory was not preserved: info=%v err=%v", info, err)
+	}
+}
+
 func TestApplyLayerVirtualizesXattrs(t *testing.T) {
 	root := t.TempDir()
 	owners := newOwnershipState()

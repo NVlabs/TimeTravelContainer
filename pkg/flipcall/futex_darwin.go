@@ -19,7 +19,14 @@ package flipcall
 import (
 	"fmt"
 	"runtime"
-	"time"
+	"syscall"
+)
+
+const (
+	ulCompareAndWaitShared = 3
+	ulWakeAll              = 0x00000100
+	sysUlockWait           = 515
+	sysUlockWake           = 516
 )
 
 func (ep *Endpoint) futexSetPeerActive() error {
@@ -34,12 +41,8 @@ func (ep *Endpoint) futexSetPeerActive() error {
 	}
 }
 
-// Darwin has no supported process-shared futex API. The state word is already
-// in coherent MAP_SHARED memory, so v1 uses bounded polling. This preserves
-// protocol correctness and process topology while leaving an efficient Mach
-// semaphore/ulock transport as a later performance optimization.
 func (ep *Endpoint) futexWakePeer() error {
-	return nil
+	return ep.futexWakeConnState(1)
 }
 
 func (ep *Endpoint) futexWaitUntilActive() error {
@@ -62,19 +65,36 @@ func (ep *Endpoint) futexWaitUntilActive() error {
 	}
 }
 
-func (ep *Endpoint) futexWakeConnState(_ int32) error {
-	return nil
+func (ep *Endpoint) futexWakeConnState(numThreads int32) error {
+	operation := uintptr(ulCompareAndWaitShared)
+	if numThreads != 1 {
+		operation |= ulWakeAll
+	}
+	_, _, errno := syscall.Syscall6(sysUlockWake, operation, ep.packet, 0, 0, 0, 0)
+	// It is valid for the peer to observe the changed state before it enters
+	// the kernel, in which case there is no waiter to wake.
+	if errno == 0 || errno == syscall.ENOENT {
+		return nil
+	}
+	return fmt.Errorf("__ulock_wake: %w", errno)
 }
 
 func (ep *Endpoint) futexWaitConnState(curState uint32) error {
-	for i := 0; i < 64; i++ {
-		if ep.connState().Load() != curState || ep.isShutdownLocally() {
-			return nil
-		}
-		runtime.Gosched()
+	_, _, errno := syscall.Syscall6(
+		sysUlockWait,
+		ulCompareAndWaitShared,
+		ep.packet,
+		uintptr(curState),
+		0, // No timeout.
+		0,
+		0,
+	)
+	// EAGAIN means the peer changed the state before the kernel committed the
+	// wait. EINTR is retried by futexWaitUntilActive after it rechecks state.
+	if errno == 0 || errno == syscall.EAGAIN || errno == syscall.EINTR {
+		return nil
 	}
-	time.Sleep(50 * time.Microsecond)
-	return nil
+	return fmt.Errorf("__ulock_wait: %w", errno)
 }
 
 func yieldThread() {

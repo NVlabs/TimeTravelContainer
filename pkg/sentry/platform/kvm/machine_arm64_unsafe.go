@@ -138,6 +138,14 @@ func (c *vCPU) initArchState() error {
 		return err
 	}
 
+	// Application entry mirrors PSTATE.SS into MDSCR_EL1.SS from guest EL1.
+	// Start disabled so bootstrap cannot enter the software-step state machine.
+	data = 0
+	reg.id = _KVM_ARM64_REGS_MDSCR_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
 	// sctlr_el1
 	data = _SCTLR_EL1_DEFAULT
 	reg.id = _KVM_ARM64_REGS_SCTLR_EL1
@@ -406,9 +414,18 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 		ring0.El0SyncInv:
 		return c.fault(int32(unix.SIGILL), info)
 	case ring0.El0SyncDbg:
+		code := int32(linux.TRAP_BRKPT)
+		if syndrome, user := c.CPU.ErrorCode(); user {
+			switch syndrome >> 26 & 0x3f {
+			case 0x30, 0x34: // Hardware breakpoint or watchpoint from EL0.
+				code = linux.TRAP_HWBKPT
+			case 0x32: // Software step from EL0.
+				code = linux.TRAP_TRACE
+			}
+		}
 		*info = linux.SignalInfo{
 			Signo: int32(unix.SIGTRAP),
-			Code:  1, // TRAP_BRKPT (breakpoint).
+			Code:  code,
 		}
 		info.SetAddr(switchOpts.Registers.Pc) // Include address.
 		return hostarch.AccessType{}, platform.ErrContextSignal

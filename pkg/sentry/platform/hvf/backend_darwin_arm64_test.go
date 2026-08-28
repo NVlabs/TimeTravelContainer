@@ -19,6 +19,7 @@ package hvf_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -40,6 +41,7 @@ import (
 	vmarm64 "gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/arm64"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
+	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
@@ -75,6 +77,21 @@ func runEngineMonitor(t *testing.T, engine vmplatform.VMEngine, sequence uint64,
 	}
 }
 
+func beginEngineResidency(t *testing.T, engine vmplatform.VMEngine) func() {
+	t.Helper()
+	resident, ok := engine.(vmplatform.ApplicationResidencyEngine)
+	if !ok {
+		t.Fatalf("engine %T does not implement application residency", engine)
+	}
+	resident.BeginApplicationResidency()
+	return func() {
+		t.Helper()
+		if err := resident.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}
+}
+
 func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	hostPID := os.Getpid()
 	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
@@ -91,6 +108,7 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
+	defer beginEngineResidency(t, engine)()
 
 	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
 	if err != nil {
@@ -135,7 +153,10 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	calibratedClock := sentrytime.NewCalibratedClock(sentrytime.Monotonic)
 	registers := &vmm.ARM64State{PC: codeVA}
+	hostCounterBefore := sentrytime.Rdtsc()
+	hostWallBefore := time.Now()
 	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
 		AddressSpaceID: spaceID,
 		Registers:      registers,
@@ -144,11 +165,28 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
-		t.Fatalf("first ring0 SVC-gate exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
+		t.Fatalf("first ring0 SVC exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
 	}
-	// Exercise the resident continuation directly. This second application
-	// entry must call the monitor at EL1; attempting the native host trampoline
-	// here would create an invalid nested Hypervisor.framework entry.
+	if got := ring0asm.CurrentEL(); got != 1 {
+		t.Fatalf("Sentry syscall continuation resumed at EL%d, want EL1", got)
+	}
+	guestCounter := sentrytime.Rdtsc()
+	if _, err := calibratedClock.GetTime(); err != nil {
+		t.Fatalf("reading calibrated clock at EL1: %v", err)
+	}
+	if got := ring0asm.CurrentEL(); got != 1 {
+		t.Fatalf("calibrated EL1 clock read host-gated the Sentry continuation to EL%d", got)
+	}
+	guestWall := time.Now()
+	if got := ring0asm.CurrentEL(); got != 1 {
+		t.Fatalf("Darwin runtime wall clock host-gated the Sentry continuation to EL%d", got)
+	}
+	if delta := guestWall.Sub(hostWallBefore); delta < 0 || delta > 5*time.Second {
+		t.Fatalf("EL1 Darwin runtime wall clock advanced by %s, want [0, 5s]", delta)
+	}
+	// Exercise the resident owner-affine vCPU again. The first application exit
+	// resumed this exact Go continuation at EL1, so the second entry does not
+	// cross Hypervisor.framework.
 	registers.PC = codeVA
 	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{
 		AddressSpaceID: spaceID,
@@ -158,28 +196,32 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
-		t.Fatalf("resident ring0 SVC-gate exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
+		t.Fatalf("resident ring0 EL1 SVC exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
 	}
-	// RunApplication returned directly to the Sentry continuation at EL1. A
-	// direct Darwin SVC must be replayed at host EL0, with its result and return
-	// address preserved.
+	// A Darwin service redpills only the current Sentry continuation while the
+	// owner-affine vCPU remains reusable by the next application entry.
 	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
 		t.Fatalf("host-service SVC getpid=%d, want %d", got, hostPID)
+	}
+	hostCounterAfter := sentrytime.Rdtsc()
+	if guestCounter < hostCounterBefore || guestCounter > hostCounterAfter {
+		t.Fatalf("guest CNTVCT=%d outside host counter interval [%d, %d]", guestCounter, hostCounterBefore, hostCounterAfter)
+	}
+	if got := ring0asm.CurrentEL(); got != 0 {
+		t.Fatalf("host-service continuation resumed at EL%d, want Darwin EL0", got)
 	}
 	registers.PC = codeVA
 	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{
 		AddressSpaceID: spaceID,
 		Registers:      registers,
 	})
-	// RunApplication returned directly to the Sentry continuation at EL1. The
-	// Darwin libc call below enters an executable that is intentionally NX in
-	// the Sentry identity mirror. Its current-EL instruction abort must redpill,
-	// execute the service at host EL0, and preserve the calling continuation.
+	// The regular libc path likewise executes at host EL0 without ending the
+	// application residency.
 	if got := os.Getpid(); got != hostPID {
 		t.Fatalf("host-service gate getpid=%d, want %d", got, hostPID)
 	}
-	// The host-service gate already redpilled this continuation. RunMonitor's
-	// EnsureHost is consequently a no-op before its dedicated service vCPU runs.
+	// RunMonitor's EnsureHost is a no-op here before its dedicated service vCPU
+	// runs.
 	responseBytes, hostErr := engine.RunMonitor(context.Background(), hostCommand)
 	if hostErr != nil {
 		t.Fatalf("returning ring0 continuation to host: %v", hostErr)
@@ -192,6 +234,87 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	}
 	if exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
 		t.Fatalf("ring0 instruction-gate exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
+	}
+}
+
+func TestRing0EngineForwardsBreakpointAndSoftwareStep(t *testing.T) {
+	backend := hvf.NewBackend()
+	vm, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	defer vm.Close()
+	engine, err := hvf.NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	defer beginEngineResidency(t, engine)()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(hvf.GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(hvf.GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory[0:], 0xd4200000)  // brk #0
+	binary.LittleEndian.PutUint32(memory[4:], 0xd2802460)  // movz x0, #0x123
+	binary.LittleEndian.PutUint32(memory[8:], 0xd2801588)  // movz x8, #172 (getpid)
+	binary.LittleEndian.PutUint32(memory[12:], 0xd4000001) // svc #0
+
+	const (
+		spaceID = uint64(11)
+		codeVA  = uint64(0x610000)
+	)
+	runEngineMonitor(t, engine, 1, monitorabi.Command{
+		Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID,
+	})
+	runEngineMonitor(t, engine, 2, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: hvf.GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+
+	registers := &vmm.ARM64State{PC: codeVA}
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID, Registers: registers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ec := exit.Syndrome >> 26 & 0x3f; exit.Reason != vmm.ExitException || ec != 0x3c || registers.PC != codeVA {
+		t.Fatalf("BRK exit=%+v pc=%#x, want exception EC=0x3c pc=%#x", exit, registers.PC, codeVA)
+	}
+
+	// This is the transition GDB uses after restoring the instruction hidden
+	// by its software breakpoint. Exactly one instruction must execute before
+	// an EC 0x32 software-step exception returns control to the tracer.
+	registers.PC = codeVA + 4
+	registers.PState |= arch.ARMTrapFlag
+	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID, Registers: registers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ec := exit.Syndrome >> 26 & 0x3f; exit.Reason != vmm.ExitException || ec != 0x32 || registers.PC != codeVA+8 || registers.X[0] != 0x123 {
+		t.Fatalf("single-step exit=%+v pc=%#x x0=%#x, want exception EC=0x32 pc=%#x x0=0x123", exit, registers.PC, registers.X[0], codeVA+8)
+	}
+
+	registers.PState &^= arch.ARMTrapFlag
+	registers.PC = codeVA + 8
+	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID, Registers: registers,
+	})
+	if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+16 || registers.X[8] != 172 {
+		t.Fatalf("post-step syscall exit=%+v pc=%#x x8=%d err=%v", exit, registers.PC, registers.X[8], err)
 	}
 }
 
@@ -247,6 +370,8 @@ func TestRing0EngineCloseRetiresOwnerVCPU(t *testing.T) {
 	}
 	result := make(chan applicationResult, 1)
 	go func() {
+		resident := engine.(vmplatform.ApplicationResidencyEngine)
+		resident.BeginApplicationResidency()
 		registers := &vmm.ARM64State{PC: codeVA}
 		registers.X[0] = 1
 		registers.X[1] = codeVA + 0x100
@@ -254,7 +379,8 @@ func TestRing0EngineCloseRetiresOwnerVCPU(t *testing.T) {
 			AddressSpaceID: spaceID,
 			Registers:      registers,
 		})
-		result <- applicationResult{exit: exit, err: err}
+		endErr := resident.EndApplicationResidency()
+		result <- applicationResult{exit: exit, err: errors.Join(err, endErr)}
 	}()
 	// Wait until the application has entered its non-terminating EL0 loop.
 	// Close must
@@ -315,6 +441,7 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
+	defer beginEngineResidency(t, engine)()
 	runEngineMonitor(t, engine, 1, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: 1})
 	for page := uint64(0); page < 4; page++ {
 		va := uint64(0x400000) + page*vmm.LogicalPageSize
@@ -373,9 +500,10 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 	}
 
 	// Exercise the asynchronous-exit handoff repeatedly. RequestExit may catch
-	// either masked EL1 application entry or unmasked EL0 execution; both must
-	// return a coherent interrupted state without reading canceled CPSR through
-	// HVF, and the vCPU must remain usable afterward.
+	// the untouched nativeResume bootstrap, masked EL1 application entry, or
+	// unmasked EL0 execution. All must return a coherent interrupted state
+	// without exporting an EL1-only trampoline to Darwin, and the engine must
+	// remain usable afterward.
 	const loopVA = uint64(0x403000)
 	runEngineMonitor(t, engine, 12, monitorabi.Command{
 		Opcode:         monitorabi.OpcodeApply,
@@ -398,19 +526,35 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 			Length: vmm.LogicalPageSize,
 		}},
 	})
-	interruptErr := make(chan error, 1)
-	go func() {
-		time.Sleep(time.Millisecond)
-		engine.InterruptApplications()
-		interruptErr <- nil
-	}()
-	registers = &vmm.ARM64State{PC: loopVA}
-	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: 1, Registers: registers})
-	if interruptRequestErr := <-interruptErr; interruptRequestErr != nil {
-		t.Fatalf("RequestExit: %v", interruptRequestErr)
-	}
-	if err != nil || exit.Reason != vmm.ExitInterrupted || registers.PC != loopVA || registers.PState != 0 {
-		t.Fatalf("interrupted loop exit=%+v registers=%+v err=%v", exit, registers, err)
+	for iteration := 0; iteration < 256; iteration++ {
+		stopInterrupts := make(chan struct{})
+		interruptDone := make(chan struct{})
+		go func() {
+			defer close(interruptDone)
+			for {
+				engine.InterruptApplications()
+				select {
+				case <-stopInterrupts:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+		registers = &vmm.ARM64State{PC: loopVA, SP: loopVA + 0x800, TPIDR: 0x12345000 + uint64(iteration)}
+		for index := range registers.X {
+			registers.X[index] = uint64(iteration+1)<<32 | uint64(index+1)
+		}
+		for index := 8; index < len(registers.FP); index++ {
+			registers.FP[index] = byte(iteration + index)
+		}
+		wantRegisters := *registers
+		exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: 1, Registers: registers})
+		close(stopInterrupts)
+		<-interruptDone
+		if err != nil || exit.Reason != vmm.ExitInterrupted || *registers != wantRegisters {
+			t.Fatalf("interrupted loop iteration %d: exit=%+v registers=%+v err=%v", iteration, exit, registers, err)
+		}
 	}
 }
 
@@ -421,9 +565,17 @@ type tlbTortureJob struct {
 	done         chan<- error
 }
 
-func startTLBTortureWorker(engine vmplatform.VMEngine) chan<- tlbTortureJob {
+type tlbTortureWorker struct {
+	jobs    chan tlbTortureJob
+	stopped chan error
+}
+
+func startTLBTortureWorker(engine vmplatform.VMEngine) tlbTortureWorker {
 	jobs := make(chan tlbTortureJob)
+	stopped := make(chan error, 1)
 	go func() {
+		resident := engine.(vmplatform.ApplicationResidencyEngine)
+		resident.BeginApplicationResidency()
 		for job := range jobs {
 			registers := &vmm.ARM64State{PC: job.va}
 			exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{AddressSpaceID: job.addressSpace, Registers: registers})
@@ -432,8 +584,9 @@ func startTLBTortureWorker(engine vmplatform.VMEngine) chan<- tlbTortureJob {
 			}
 			job.done <- err
 		}
+		stopped <- resident.EndApplicationResidency()
 	}()
-	return jobs
+	return tlbTortureWorker{jobs: jobs, stopped: stopped}
 }
 
 func TestMonitorMultiVCPUTranslationReplacementTorture(t *testing.T) {
@@ -472,13 +625,18 @@ func TestMonitorMultiVCPUTranslationReplacementTorture(t *testing.T) {
 	sequence := uint64(1)
 	runEngineMonitor(t, engine, sequence, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
 	sequence++
-	workers := []chan<- tlbTortureJob{
+	workers := []tlbTortureWorker{
 		startTLBTortureWorker(engine),
 		startTLBTortureWorker(engine),
 	}
 	defer func() {
 		for _, worker := range workers {
-			close(worker)
+			close(worker.jobs)
+		}
+		for _, worker := range workers {
+			if err := <-worker.stopped; err != nil {
+				t.Errorf("stopping TLB torture worker: %v", err)
+			}
 		}
 	}()
 	done := make(chan error, len(workers))
@@ -511,7 +669,7 @@ func TestMonitorMultiVCPUTranslationReplacementTorture(t *testing.T) {
 			sequence++
 		}
 		for _, worker := range workers {
-			worker <- tlbTortureJob{addressSpace: spaceID, va: va, wantSyscall: want, done: done}
+			worker.jobs <- tlbTortureJob{addressSpace: spaceID, va: va, wantSyscall: want, done: done}
 		}
 		for range workers {
 			if err := <-done; err != nil {
@@ -748,4 +906,83 @@ func TestRing0PlatformEpochRolloverRebuildsExecutingAddressSpace(t *testing.T) {
 		t.Fatalf("VM epoch after threshold allocation = %d, want 2", got)
 	}
 	run("after rollover")
+}
+
+// BenchmarkRing0PlatformSwitch measures the complete backend-independent
+// platform.Context boundary around the HVF application world switch. Keep it
+// beside BenchmarkRing0ApplicationFastPath so changes can be attributed to
+// vmplatform versus the host-specific execution engine.
+func BenchmarkRing0PlatformSwitch(b *testing.B) {
+	backend := hvf.NewBackend()
+	vm, err := backend.CreateVM(context.Background())
+	if err != nil {
+		b.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	p, err := vmplatform.New(vmplatform.Config{
+		VM: vm, HostMemory: backend.HostMemory(), Architecture: vmarm64.Architecture{},
+		VCPUs: 1, IPAStart: hvf.GuestRAMIPAStart, IPASize: 1 << 30,
+		PlatformName: "hvf-benchmark", VMEngineFactory: hvf.NewVMEngine,
+	})
+	if err != nil {
+		_ = vm.Close()
+		b.Fatal(err)
+	}
+	defer p.Close()
+
+	mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+		BackingProvider:         p.MemoryFileBackingProvider(),
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer mf.Destroy()
+	fr, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer mf.DecRef(fr)
+	blocks, lease, err := memmap.MapInternalWithLease(mf, fr, hostarch.Write)
+	if err != nil {
+		b.Fatal(err)
+	}
+	code := []byte{0x88, 0x15, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4} // movz x8,#172; svc #0
+	if n, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(code))); err != nil || n != uint64(len(code)) {
+		lease.Release()
+		b.Fatalf("writing code: n=%d err=%v", n, err)
+	}
+	lease.Release()
+
+	as, err := p.NewAddressSpace()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer as.Release()
+	const codeVA = hostarch.Addr(0xb00000)
+	if err := as.MapFile(codeVA, mf, fr, hostarch.ReadExecute, false); err != nil {
+		b.Fatal(err)
+	}
+	platformCtx := p.NewContext(gcontext.Background())
+	defer platformCtx.Release()
+	mm := &compactionTestMemoryManager{as: as}
+	ac := arch.New(arch.ARM64)
+	run := func() {
+		ac.SetIP(uintptr(codeVA))
+		if _, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1); err != nil {
+			b.Fatal(err)
+		}
+	}
+	run() // Establish owner-thread residency before timing.
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		run()
+	}
+	b.StopTimer()
+	if got := ac.Regs.Regs[8]; got != 172 {
+		b.Fatalf("syscall sentinel = %d, want 172", got)
+	}
 }

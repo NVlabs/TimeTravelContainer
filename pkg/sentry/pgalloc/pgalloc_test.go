@@ -248,6 +248,70 @@ func TestMemoryRangeCaptureSnapshotPinsOnlyCapturedPages(t *testing.T) {
 	f.DecRef(fr)
 }
 
+func TestCapturedMemoryLayoutPacksLogicalChunksContiguously(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 4 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.DecRef(fr)
+	capture := NewMemoryRangeCapture()
+	if err := capture.Record(f, fr); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := capture.SnapshotLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately make physical offset order disagree with logical chunk
+	// order. This is representative of CoW versions and sparse imports after a
+	// few live migrations.
+	var low, high, version LogicalAllocatorID
+	low[0], high[0], version[0] = 1, 2, 3
+	type logical struct {
+		allocator LogicalAllocatorID
+		slot      uint64
+	}
+	identities := []logical{{high, 0}, {low, 1}, {high, 1}, {low, 0}}
+	for i := range layout.Bindings {
+		identity := identities[i]
+		layout.Bindings[i].Page = LogicalPageID{Allocator: identity.allocator, Sequence: identity.slot}
+		layout.Bindings[i].Version = PageVersionID{Allocator: version, Sequence: uint64(i + 1)}
+		layout.Bindings[i].Chunk, layout.Bindings[i].Slot = layout.Bindings[i].Page.Chunk()
+	}
+	packed, err := layout.PackByLogicalChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPhysicalPages := []uint64{3, 1, 0, 2}
+	for i, binding := range packed.Bindings {
+		if got, want := binding.OldOffset, fr.Start+wantPhysicalPages[i]*page; got != want {
+			t.Fatalf("packed binding %d offset=%#x, want %#x", i, got, want)
+		}
+		if got, want := binding.StreamOffset, uint64(i)*page; got != want {
+			t.Fatalf("packed binding %d stream offset=%#x, want %#x", i, got, want)
+		}
+		if i != 0 && packed.Bindings[i-1].Chunk == binding.Chunk &&
+			packed.Bindings[i-1].StreamOffset+page != binding.StreamOffset {
+			t.Fatalf("logical chunk is not contiguous at binding %d", i)
+		}
+	}
+	var packedBytes uint64
+	for i, region := range packed.Regions {
+		if !region.LogicalChunked || region.ID != RemoteRegionID(i+1) {
+			t.Fatalf("packed region %d = %+v", i, region)
+		}
+		packedBytes += region.Range.Length()
+	}
+	if packedBytes != fr.Length() {
+		t.Fatalf("packed regions contain %#x bytes, want %#x", packedBytes, fr.Length())
+	}
+}
+
 func TestMemoryRangeCaptureRejectsRetiredPage(t *testing.T) {
 	f := newLogicalPageTestMemoryFile()
 	fr, err := f.findAllocatableAndMarkUsed(&allocState{

@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	sessionMetadataVersion = 2
-	sessionMetadataHeader  = 32
+	sessionMetadataVersion = 3
+	sessionMetadataHeader  = 36
 	sessionMetadataDigest  = sha256.Size
 	sessionBindingBytes    = 72
 )
@@ -44,10 +44,14 @@ type SessionMetadata struct {
 	TargetBranchID    string
 	KernelMetadata    []byte
 	AllocatorMetadata []byte
-	LoadRanges        []pgalloc.RemoteLoadRange
-	// MemoryBindings describe allocator-wide page identities in the same packed
-	// stream as LoadRanges. They let an existing family relocate and reuse
-	// identical resident chunks without importing a second allocator.
+	// ExecSessions is opaque branch-control metadata. The boot package owns its
+	// schema; keeping it opaque here avoids coupling the transport to runsc's
+	// loader while ensuring remote forks preserve managed exec identities.
+	ExecSessions []byte
+	LoadRanges   []pgalloc.RemoteLoadRange
+	// MemoryBindings describe the exact branch-reachable page identities in the
+	// same packed stream as LoadRanges. They let a target relocate and reuse
+	// identical resident chunks without importing family-wide allocator state.
 	MemoryBindings []pgalloc.CapturedPageBinding
 }
 
@@ -57,6 +61,7 @@ type SessionMetadataLimits struct {
 	MaxTotalBytes     uint64
 	MaxKernelBytes    uint64
 	MaxAllocatorBytes uint64
+	MaxExecBytes      uint64
 	MaxLoadRanges     uint32
 }
 
@@ -68,7 +73,7 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 			return nil, errors.New("distributed branch identity exceeds 65535 bytes")
 		}
 	}
-	if uint64(len(m.KernelMetadata)) > uint64(^uint32(0)) || uint64(len(m.AllocatorMetadata)) > uint64(^uint32(0)) || uint64(len(m.LoadRanges)) > uint64(^uint32(0)) || uint64(len(m.MemoryBindings)) > uint64(^uint32(0)) {
+	if uint64(len(m.KernelMetadata)) > uint64(^uint32(0)) || uint64(len(m.AllocatorMetadata)) > uint64(^uint32(0)) || uint64(len(m.ExecSessions)) > uint64(^uint32(0)) || uint64(len(m.LoadRanges)) > uint64(^uint32(0)) || uint64(len(m.MemoryBindings)) > uint64(^uint32(0)) {
 		return nil, errors.New("distributed metadata field exceeds protocol limit")
 	}
 	var body bytes.Buffer
@@ -80,6 +85,7 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 	}
 	body.Write(m.KernelMetadata)
 	body.Write(m.AllocatorMetadata)
+	body.Write(m.ExecSessions)
 	for _, load := range m.LoadRanges {
 		if !load.Target.WellFormed() || load.Target.Length() == 0 {
 			return nil, fmt.Errorf("invalid remote load range %+v", load)
@@ -116,6 +122,7 @@ func (m *SessionMetadata) MarshalBinary() ([]byte, error) {
 	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(m.LoadRanges)))
 	binary.BigEndian.PutUint64(encoded[20:28], uint64(body.Len()))
 	binary.BigEndian.PutUint32(encoded[28:32], uint32(len(m.MemoryBindings)))
+	binary.BigEndian.PutUint32(encoded[32:36], uint32(len(m.ExecSessions)))
 	copy(encoded[sessionMetadataHeader:], body.Bytes())
 	digest := sha256.Sum256(encoded[:len(encoded)-sessionMetadataDigest])
 	copy(encoded[len(encoded)-sessionMetadataDigest:], digest[:])
@@ -137,8 +144,9 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 	allocatorLen := uint64(binary.BigEndian.Uint32(encoded[12:16]))
 	rangeCount := binary.BigEndian.Uint32(encoded[16:20])
 	bindingCount := binary.BigEndian.Uint32(encoded[28:32])
+	execLen := uint64(binary.BigEndian.Uint32(encoded[32:36]))
 	bodyLen := binary.BigEndian.Uint64(encoded[20:28])
-	if kernelLen > limits.MaxKernelBytes || allocatorLen > limits.MaxAllocatorBytes || rangeCount > limits.MaxLoadRanges || bindingCount > limits.MaxLoadRanges ||
+	if kernelLen > limits.MaxKernelBytes || allocatorLen > limits.MaxAllocatorBytes || execLen > limits.MaxExecBytes || rangeCount > limits.MaxLoadRanges || bindingCount > limits.MaxLoadRanges ||
 		bodyLen != uint64(len(encoded)-sessionMetadataHeader-sessionMetadataDigest) {
 		return nil, errors.New("distributed metadata fields exceed configured limits or size is inconsistent")
 	}
@@ -167,7 +175,7 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 	if m.TargetBranchID, err = readString(); err != nil {
 		return nil, err
 	}
-	if kernelLen+allocatorLen+uint64(rangeCount)*24+uint64(bindingCount)*sessionBindingBytes != uint64(r.Len()) {
+	if kernelLen+allocatorLen+execLen+uint64(rangeCount)*24+uint64(bindingCount)*sessionBindingBytes != uint64(r.Len()) {
 		return nil, errors.New("distributed metadata payload layout is inconsistent")
 	}
 	m.KernelMetadata = make([]byte, kernelLen)
@@ -176,6 +184,10 @@ func UnmarshalSessionMetadata(encoded []byte, limits SessionMetadataLimits) (*Se
 		return nil, err
 	}
 	if _, err := io.ReadFull(r, m.AllocatorMetadata); err != nil {
+		return nil, err
+	}
+	m.ExecSessions = make([]byte, execLen)
+	if _, err := io.ReadFull(r, m.ExecSessions); err != nil {
 		return nil, err
 	}
 	m.LoadRanges = make([]pgalloc.RemoteLoadRange, rangeCount)

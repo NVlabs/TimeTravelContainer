@@ -120,6 +120,28 @@ TEXT ·SwitchApplicationGuest(SB),NOSPLIT|NOFRAME,$0
 	MOVD R20, R30
 	RET
 
+TEXT ·NativeResumeAddress(SB),NOSPLIT,$0-8
+	MOVD $·nativeResume(SB), R0
+	MOVD R0, ret+0(FP)
+	RET
+
+TEXT ·NativeResumeTrapAddress(SB),NOSPLIT,$0-8
+	MOVD $·nativeResume(SB), R0
+	ADD $4, R0
+	MOVD R0, ret+0(FP)
+	RET
+
+TEXT ·SwitchApplicationGuestAddress(SB),NOSPLIT,$0-8
+	MOVD $·SwitchApplicationGuest(SB), R0
+	MOVD R0, ret+0(FP)
+	RET
+
+TEXT ·SwitchApplicationGuestTrapAddress(SB),NOSPLIT,$0-8
+	MOVD $·SwitchApplicationGuest(SB), R0
+	ADD $4, R0
+	MOVD R0, ret+0(FP)
+	RET
+
 TEXT ·EnsureHost(SB),NOSPLIT|NOFRAME,$0
 	HVC $0x73
 	RET

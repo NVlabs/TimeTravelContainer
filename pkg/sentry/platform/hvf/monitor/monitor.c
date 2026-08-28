@@ -187,6 +187,16 @@ static MONITOR_INLINE uint64_t gpa_to_va(struct ttc_monitor_control* ctl,
 }
 
 static uint64_t MONITOR_CODE alloc_page(struct ttc_monitor_control* ctl) {
+  if (ctl->free_page_gpa != 0) {
+    uint64_t gpa = ctl->free_page_gpa;
+    uint64_t va = gpa_to_va(ctl, gpa);
+    if (va == 0) {
+      return 0;
+    }
+    ctl->free_page_gpa = *(uint64_t*)(uintptr_t)va;
+    zero_page((uint64_t*)(uintptr_t)va);
+    return gpa;
+  }
   for (uint64_t i = 0; i < ctl->pool_region_count; ++i) {
     struct ttc_monitor_pool_region* region = &ctl->pool[i];
     uint64_t used = (region->used + TTC_MONITOR_PAGE_SIZE - 1) &
@@ -200,6 +210,44 @@ static uint64_t MONITOR_CODE alloc_page(struct ttc_monitor_control* ctl) {
     }
   }
   return 0;
+}
+
+static int MONITOR_CODE recycle_page(struct ttc_monitor_control* ctl,
+                                     uint64_t gpa) {
+  uint64_t va = gpa_to_va(ctl, gpa);
+  if (va == 0) {
+    return 0;
+  }
+  uint64_t* page = (uint64_t*)(uintptr_t)va;
+  zero_page(page);
+  page[0] = ctl->free_page_gpa;
+  ctl->free_page_gpa = gpa;
+  return 1;
+}
+
+static int MONITOR_CODE recycle_table(struct ttc_monitor_control* ctl,
+                                      uint64_t table_gpa, uint64_t level) {
+  uint64_t table_va = gpa_to_va(ctl, table_gpa);
+  if (table_va == 0 || level > 3) {
+    return 0;
+  }
+  uint64_t* table = (uint64_t*)(uintptr_t)table_va;
+  if (level < 3) {
+    for (uint64_t i = 0; i < 512; ++i) {
+      uint64_t entry = table[i];
+      if ((entry & PTE_VALID) == 0) {
+        continue;
+      }
+      if ((entry & (PTE_VALID | PTE_TABLE)) !=
+          (PTE_VALID | PTE_TABLE)) {
+        return 0;
+      }
+      if (!recycle_table(ctl, entry & PTE_ADDR_MASK, level + 1)) {
+        return 0;
+      }
+    }
+  }
+  return recycle_page(ctl, table_gpa);
 }
 
 static struct ttc_monitor_address_space* MONITOR_CODE find_space(
@@ -433,15 +481,21 @@ static uint32_t MONITOR_CODE destroy_space(struct ttc_monitor_control* ctl,
   ttc_monitor_tlbi_aside1is((uint64_t)space->asid << 48);
   ttc_monitor_dsb_ish();
   ttc_monitor_isb();
-  // v1 uses a monotonic page-table pool. Roots are discarded with the VM
-  // epoch; recycling table pages is intentionally deferred until recursive
-  // teardown can be added without introducing an ASID reuse hazard.
+  uint64_t root_gpa = space->root_gpa;
   *(volatile uint8_t*)&space->active = 0;
   ttc_monitor_dsb_ish();
   space->id = 0;
   space->root_gpa = 0;
   space->asid = 0;
   space->flags = 0;
+  // The host mutation rendezvous has stopped application vCPUs, and the ASID
+  // invalidation above is acknowledged. No page walker can retain a reference
+  // to this tree, so recursively return every table page to the intrusive free
+  // list. GPAs remain permanently leased stage-2 memory; only monitor-owned
+  // stage-1 metadata is recycled.
+  if (!recycle_table(ctl, root_gpa, 0)) {
+    return TTC_STATUS_INTERNAL;
+  }
   return TTC_STATUS_OK;
 }
 

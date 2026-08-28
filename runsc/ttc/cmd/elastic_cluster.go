@@ -285,6 +285,11 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.ttc.daemon-stream")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		// Commit the authenticated full-duplex stream before a slow command
+		// starts so the caller can exchange daemon frames immediately.
+		flusher.Flush()
+	}
 	buffer := make([]byte, 32<<10)
 	for {
 		n, readErr := conn.Read(buffer)
@@ -1198,24 +1203,32 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 		}
 		physicalLocalOwned := false
 		protectedMigration := false
+		protectedBranches := make(map[string]bool)
 		for _, branch := range runtimeFamily.Branches {
 			if info.BranchNodeID(branch.ID) == b.nodeID {
 				physicalLocalOwned = true
-				break
+				continue
 			}
 			if b.activeSparseMigrationSource(info.ID, branch.ID) {
 				protectedMigration = true
+				protectedBranches[branch.ID] = true
 			}
 		}
-		if !physicalLocalOwned && !protectedMigration {
-			result = errors.Join(result, b.purgeRuntime(info.ID))
+		if !physicalLocalOwned {
+			if !protectedMigration {
+				result = errors.Join(result, b.purgeRuntime(info.ID))
+			}
+			// A family containing only a still-active migration source must be
+			// retained whole. Rechecking the transaction per branch creates a
+			// TOCTOU window in which independence arrives between the two checks
+			// and cleanup attempts to destroy runsc's last branch.
 			continue
 		}
 		for _, runtimeBranch := range runtimeFamily.Branches {
 			if info.BranchNodeID(runtimeBranch.ID) == b.nodeID {
 				continue
 			}
-			if b.activeSparseMigrationSource(info.ID, runtimeBranch.ID) {
+			if protectedBranches[runtimeBranch.ID] {
 				continue
 			}
 			if _, err := b.command("timetravel", info.ID, "destroy", runtimeBranch.ID); err != nil {

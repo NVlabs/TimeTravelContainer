@@ -937,28 +937,23 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			AdvertiseAddress: children[i].advertise,
 		}
 	}
-	configReader, configWriter, err := os.Pipe()
+	encodedConfig, err := json.Marshal(&captureArgs)
+	if err != nil {
+		return nil, fmt.Errorf("encoding distributed batch config: %w", err)
+	}
+	configReader, finishConfig, err := pipeReaderForBytes(encodedConfig)
 	if err != nil {
 		return nil, fmt.Errorf("creating distributed batch config pipe: %w", err)
 	}
-	encodedConfig, err := json.Marshal(&captureArgs)
-	if err == nil {
-		_, err = configWriter.Write(encodedConfig)
-	}
-	closeErr := configWriter.Close()
-	if err != nil {
-		configReader.Close()
-		return nil, fmt.Errorf("writing distributed batch config: %w", err)
-	}
-	if closeErr != nil {
-		configReader.Close()
-		return nil, fmt.Errorf("closing distributed batch config: %w", closeErr)
-	}
+	defer finishConfig()
 	output, err := b.commandWithFiles([]*os.File{configReader}, "timetravel", "--distributed-config-fd=3",
 		source.container, "distributed-capture-many", children[0].transaction)
-	configReader.Close()
+	configErr := finishConfig()
 	if err != nil {
 		return nil, fmt.Errorf("capturing %d distributed siblings: %w", len(children), err)
+	}
+	if configErr != nil {
+		return nil, fmt.Errorf("supplying distributed batch configuration: %w", configErr)
 	}
 	var sessions []boot.DistributedForkSessionInfo
 	if err := json.Unmarshal(output, &sessions); err != nil {
@@ -988,14 +983,24 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 	}
 	prepareErrors := make([]error, len(children))
-	var prepareWG sync.WaitGroup
+	targetGroups := make(map[string][]int)
 	for i := range children {
-		i := i
+		targetGroups[children[i].target.container] = append(targetGroups[children[i].target.container], i)
+	}
+	var prepareWG sync.WaitGroup
+	for _, indices := range targetGroups {
+		indices := indices
 		prepareWG.Add(1)
 		go func() {
 			defer prepareWG.Done()
-			child := &children[i]
-			child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+			// The first child of a new destination family creates its physical
+			// Sentry; later siblings import into it. Preserve reservation order
+			// within that family so an imported sibling cannot race ahead and
+			// report that its target runtime is unavailable.
+			for _, i := range indices {
+				child := &children[i]
+				child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+			}
 		}()
 	}
 	prepareWG.Wait()
@@ -1005,19 +1010,28 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 	}
 	publishErrors := make([]error, len(children))
+	// Target-side publication mutates family metadata and starts console
+	// followers. daemonTargetRuntime serializes those mutations for one family,
+	// but racing independent HTTP requests still leaves their acquisition order
+	// nondeterministic. In particular, an imported sibling can be published
+	// before the physical @main loader that owns the target Sentry. Preserve the
+	// caller's order within one destination family while retaining parallelism
+	// between unrelated destination families.
 	var publishWG sync.WaitGroup
-	for i := range children {
-		i := i
+	for _, indices := range targetGroups {
+		indices := indices
 		publishWG.Add(1)
 		go func() {
 			defer publishWG.Done()
-			child := &children[i]
-			child.tx, publishErrors[i] = peer.Publish(ctx, child.transaction, child.tx.Revision, paused)
-			if publishErrors[i] != nil {
-				status, statusErr := peer.Status(ctx, child.transaction)
-				if statusErr == nil && (status.State == cluster.TransactionPublished || status.State == cluster.TransactionIndependent) {
-					child.tx = status
-					publishErrors[i] = nil
+			for _, i := range indices {
+				child := &children[i]
+				child.tx, publishErrors[i] = peer.Publish(ctx, child.transaction, child.tx.Revision, paused)
+				if publishErrors[i] != nil {
+					status, statusErr := peer.Status(ctx, child.transaction)
+					if statusErr == nil && (status.State == cluster.TransactionPublished || status.State == cluster.TransactionIndependent) {
+						child.tx = status
+						publishErrors[i] = nil
+					}
 				}
 			}
 		}()
@@ -1084,7 +1098,7 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 				case cluster.TransactionCanceled, cluster.TransactionFailed:
 					cancel()
 					b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
-					_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+					_, _ = b.command("timetravel", sourceContainer, distributedSourceTerminalCommand(current), transactionID)
 					relay.Close()
 					return
 				}
@@ -1121,6 +1135,19 @@ func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, bra
 		_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
 		_ = repository.Close()
 	}
+}
+
+// distributedSourceTerminalCommand chooses how a source releases a terminal
+// remote session. Once an activated migration has crossed the placement CAS,
+// its target owns the forked filesystem branch even if the target process dies
+// before draining memory. Completing releases page reservations while retaining
+// that filesystem; canceling would delete the branch referenced by the now-
+// exited target and make an ordinary later `ttc start` impossible.
+func distributedSourceTerminalCommand(tx *cluster.Transaction) string {
+	if tx != nil && tx.Identity.Migration && tx.Activated {
+		return "distributed-complete"
+	}
+	return "distributed-cancel"
 }
 
 // reconcileClusterSparseMemoryRoots removes branch pointers left behind when
@@ -1209,7 +1236,7 @@ func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceCo
 				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 				return
 			case cluster.TransactionCanceled, cluster.TransactionFailed:
-				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				_, _ = b.command("timetravel", sourceContainer, distributedSourceTerminalCommand(status), transactionID)
 				return
 			}
 		}
@@ -1267,7 +1294,7 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 				return
 			case cluster.TransactionCanceled, cluster.TransactionFailed:
-				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				_, _ = b.command("timetravel", sourceContainer, distributedSourceTerminalCommand(peerStatus), transactionID)
 				return
 			}
 		}

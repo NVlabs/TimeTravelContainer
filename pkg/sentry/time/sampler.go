@@ -233,7 +233,9 @@ func (syscallTSCReferenceClocks) Sample(c ClockID) (sample, error) {
 	// Don't call clockGettime to avoid a call which may call morestack.
 	var ts unix.Timespec
 
-	vdsoClockGettime(c, &ts)
+	if ret := vdsoClockGettime(c, &ts); ret != 0 {
+		return sample{}, unix.Errno(-ret)
+	}
 
 	s.after = Rdtsc()
 	s.ref = ReferenceNS(ts.Nano())

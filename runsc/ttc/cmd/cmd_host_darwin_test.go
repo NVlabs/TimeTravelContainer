@@ -27,3 +27,40 @@ func TestDarwinHostCompatibilityDoesNotApplyLinuxGSOFallback(t *testing.T) {
 		t.Fatal("Darwin compatibility unexpectedly enabled the Linux host-GSO fallback")
 	}
 }
+
+func TestDarwinHypervisorEntitlement(t *testing.T) {
+	const entitlement = "com.apple.security.hypervisor"
+	for _, test := range []struct {
+		name  string
+		plist string
+		want  bool
+	}{
+		{
+			name:  "present",
+			plist: `<?xml version="1.0"?><plist><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>`,
+			want:  true,
+		},
+		{
+			name:  "false",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key><false/></dict></plist>`,
+		},
+		{
+			name:  "unrelated true",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key><false/><key>other</key><true/></dict></plist>`,
+		},
+		{
+			name:  "missing",
+			plist: `<plist><dict><key>other</key><true/></dict></plist>`,
+		},
+		{
+			name:  "malformed",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key>`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasDarwinBooleanEntitlement([]byte(test.plist), entitlement); got != test.want {
+				t.Fatalf("hasDarwinBooleanEntitlement(%q) = %t, want %t", test.plist, got, test.want)
+			}
+		})
+	}
+}

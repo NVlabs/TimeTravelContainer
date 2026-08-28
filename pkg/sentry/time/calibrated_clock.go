@@ -52,9 +52,18 @@ type CalibratedClock struct {
 
 // NewCalibratedClock creates a CalibratedClock that tracks the given ClockID.
 func NewCalibratedClock(c ClockID) *CalibratedClock {
-	return &CalibratedClock{
+	clock := &CalibratedClock{
 		ref: newSampler(c),
 	}
+	// Hosts with an architecturally specified userspace counter can provide a
+	// valid initial slope from one bracketed reference sample. Starting ready
+	// avoids making every early guest clock read fall back to a host service
+	// while the periodic calibrator gathers its first two samples.
+	if params, ok := platformInitialClockParameters(c); ok {
+		clock.ready = true
+		clock.params = params
+	}
+	return clock
 }
 
 // Debugf logs at debug level.
@@ -95,8 +104,17 @@ func (c *CalibratedClock) reset(str string, v ...any) {
 // resetLocked is equivalent to reset with c.mu already held for writing.
 func (c *CalibratedClock) resetLocked(str string, v ...any) {
 	c.Warningf(str+" Resetting clock; time may jump.", v...)
-	c.ready = false
 	c.ref.Reset()
+	// A platform with an exact architected counter frequency can immediately
+	// re-anchor after a bad calibration sample. Leaving such a clock unready
+	// would force every reader through the expensive host reference path until
+	// two later updater samples happen to succeed.
+	if params, ok := platformInitialClockParameters(c.ref.clockID); ok {
+		c.params = params
+		c.ready = true
+	} else {
+		c.ready = false
+	}
 	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeTimeFallback)
 }
 

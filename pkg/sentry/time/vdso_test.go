@@ -17,7 +17,6 @@ package time
 import (
 	"syscall"
 	"testing"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -29,10 +28,8 @@ func TestClockGetTime(t *testing.T) {
 		t.Fatalf("Unexpected error code: %v", ret)
 	}
 	sts := unix.Timespec{}
-	if _, _, errno := unix.RawSyscall(unix.SYS_CLOCK_GETTIME,
-		uintptr(linux.CLOCK_MONOTONIC),
-		uintptr(unsafe.Pointer(&sts)), 0); errno != 0 {
-		t.Fatalf("Unexpected error code: %v", errno)
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &sts); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
 	}
 	// Check that ts.Sec is in [sts.Sec, sts.Sec + 5].
 	if sts.Sec < ts.Sec || sts.Sec > ts.Sec+5 {

@@ -33,6 +33,10 @@ import (
 // address space maps them. Writable entries are conservatively dirty.
 type stagingCache struct {
 	mu sync.Mutex
+	// cond is signaled when a page finishes decommitting. Decommit must not
+	// hold mu because GuestRAM's last-line frame revocation may acquire address
+	// space locks, whose mapping paths acquire mu in the opposite order.
+	cond *sync.Cond
 
 	backing pgalloc.Backing
 	size    uint64
@@ -52,8 +56,13 @@ type stagedPage struct {
 	file          memmap.File
 	backingOffset uint64
 	frame         pgalloc.FrameID
-	mappings      uint64
-	dirty         bool
+	// reservations counts resolve results that MapFile has not yet either
+	// installed or abandoned. It closes the lifetime gap between resolving a
+	// shared page and recording its reverse mapping.
+	reservations uint64
+	mappings     uint64
+	dirty        bool
+	releasing    bool
 }
 
 func newStagingCache(ram *GuestRAM) (*stagingCache, error) {
@@ -61,10 +70,12 @@ func newStagingCache(ram *GuestRAM) (*stagingCache, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating VM staging backing: %w", err)
 	}
-	return &stagingCache{
+	cache := &stagingCache{
 		backing: backing,
 		pages:   make(map[stagingKey]*stagedPage),
-	}, nil
+	}
+	cache.cond = sync.NewCond(&cache.mu)
+	return cache, nil
 }
 
 func stagingFileKey(file memmap.File, offset uint64) (stagingKey, error) {
@@ -90,6 +101,10 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 			return nil, nil, err
 		}
 		page := s.pages[key]
+		for page != nil && page.releasing {
+			s.cond.Wait()
+			page = s.pages[key]
+		}
 		if page == nil {
 			backingOffset, err := s.allocateOffsetLocked()
 			if err != nil {
@@ -129,6 +144,7 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		if at.Write {
 			page.dirty = true
 		}
+		page.reservations++
 		frames = append(frames, resolved[0])
 		pages = append(pages, page)
 	}
@@ -154,13 +170,35 @@ func (s *stagingCache) allocateOffsetLocked() (uint64, error) {
 	return offset, nil
 }
 
-func (s *stagingCache) addMapping(page *stagedPage) {
+// commitMapping converts a reservation returned by resolve into an installed
+// address-space mapping.
+func (s *stagingCache) commitMapping(page *stagedPage) error {
 	if page == nil {
-		return
+		return nil
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if page.releasing || s.pages[page.key] != page {
+		return fmt.Errorf("VM staging page disappeared before mapping %T offset %#x", page.file, page.key.offset)
+	}
+	if page.reservations == 0 {
+		return fmt.Errorf("VM staging reservation underflow for %T offset %#x", page.file, page.key.offset)
+	}
+	page.reservations--
 	page.mappings++
-	s.mu.Unlock()
+	return nil
+}
+
+// cancelReservations abandons unresolved MapFile results. Pages with neither
+// mappings nor other reservations are reclaimed just like a last unmap.
+func (s *stagingCache) cancelReservations(pages []*stagedPage) error {
+	var retErr error
+	for _, page := range pages {
+		if page != nil {
+			retErr = errors.Join(retErr, s.dropReference(page, true))
+		}
+	}
+	return retErr
 }
 
 // removeMapping writes a dirty page back before releasing its last mapping.
@@ -170,25 +208,60 @@ func (s *stagingCache) removeMapping(page *stagedPage) error {
 	if page == nil {
 		return nil
 	}
+	return s.dropReference(page, false)
+}
+
+// dropReference drops either a provisional reservation or an installed
+// mapping. The page remains discoverable but marked releasing while decommit
+// runs, so a concurrent resolve cannot reuse its frame or backing offset.
+func (s *stagingCache) dropReference(page *stagedPage, reservation bool) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if page.mappings == 0 {
-		return fmt.Errorf("VM staging mapping underflow for %T offset %#x", page.file, page.key.offset)
+	for page.releasing {
+		s.cond.Wait()
 	}
-	page.mappings--
-	if page.mappings != 0 {
+	if s.pages[page.key] != page {
+		s.mu.Unlock()
+		return fmt.Errorf("VM staging page missing while dropping %T offset %#x", page.file, page.key.offset)
+	}
+	if reservation {
+		if page.reservations == 0 {
+			s.mu.Unlock()
+			return fmt.Errorf("VM staging reservation underflow for %T offset %#x", page.file, page.key.offset)
+		}
+		page.reservations--
+	} else {
+		if page.mappings == 0 {
+			s.mu.Unlock()
+			return fmt.Errorf("VM staging mapping underflow for %T offset %#x", page.file, page.key.offset)
+		}
+		page.mappings--
+	}
+	if page.mappings != 0 || page.reservations != 0 {
+		s.mu.Unlock()
 		return nil
 	}
 	if err := s.flushPageLocked(page); err != nil {
 		// Keep the page cached and dirty. A later synchronous coherence point
 		// reports the error and retries the writeback.
+		s.mu.Unlock()
 		return err
 	}
-	delete(s.pages, page.key)
-	if err := s.backing.Decommit(memmap.FileRange{Start: page.backingOffset, End: page.backingOffset + hostarch.PageSize}); err != nil {
+	page.releasing = true
+	s.mu.Unlock()
+
+	err := s.backing.Decommit(memmap.FileRange{Start: page.backingOffset, End: page.backingOffset + hostarch.PageSize})
+
+	s.mu.Lock()
+	page.releasing = false
+	if err == nil {
+		delete(s.pages, page.key)
+		s.free = append(s.free, page.backingOffset)
+	}
+	s.cond.Broadcast()
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	s.free = append(s.free, page.backingOffset)
 	return nil
 }
 
@@ -199,6 +272,12 @@ func (s *stagingCache) flushPages(pages []*stagedPage) error {
 	var retErr error
 	for _, page := range pages {
 		if page == nil {
+			continue
+		}
+		for page.releasing {
+			s.cond.Wait()
+		}
+		if s.pages[page.key] != page {
 			continue
 		}
 		if _, ok := seen[page]; ok {
@@ -213,6 +292,19 @@ func (s *stagingCache) flushPages(pages []*stagedPage) error {
 func (s *stagingCache) flushAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for {
+		waited := false
+		for _, page := range s.pages {
+			if page.releasing {
+				s.cond.Wait()
+				waited = true
+				break
+			}
+		}
+		if !waited {
+			break
+		}
+	}
 	var retErr error
 	for _, page := range s.pages {
 		retErr = errors.Join(retErr, s.flushPageLocked(page))

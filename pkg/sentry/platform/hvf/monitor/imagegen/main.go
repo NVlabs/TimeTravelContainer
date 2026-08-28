@@ -27,10 +27,11 @@ import (
 )
 
 var requiredSymbols = map[string]string{
-	"_ttc_monitor_bootstrap":               "embeddedMonitorBootstrapOffset",
-	"_ttc_monitor_command_entry":           "embeddedMonitorCommandOffset",
-	"_ttc_monitor_ring0_application_entry": "embeddedMonitorRing0ApplicationOffset",
-	"_ttc_monitor_vectors":                 "embeddedMonitorVectorOffset",
+	"_ttc_monitor_bootstrap":                    "embeddedMonitorBootstrapOffset",
+	"_ttc_monitor_command_entry":                "embeddedMonitorCommandOffset",
+	"_ttc_monitor_ring0_application_entry":      "embeddedMonitorRing0ApplicationOffset",
+	"_ttc_monitor_ring0_application_fast_entry": "embeddedMonitorRing0ApplicationFastOffset",
+	"_ttc_monitor_vectors":                      "embeddedMonitorVectorOffset",
 }
 
 func main() {

@@ -16,7 +16,7 @@
 #include "textflag.h"
 
 #define CPU_SELF             0   // +checkoffset . CPU.self
-#define CPU_REGISTERS        224 // +checkoffset . CPU.registers
+#define CPU_REGISTERS        232 // +checkoffset . CPU.registers
 #define CPU_ARCH_STATE       16  // +checkoffset . CPU.CPUArchState
 #define CPU_STACK_BOTTOM     CPU_ARCH_STATE+0     // +checkoffset . CPUArchState.stack
 #define CPU_STACK_TOP        CPU_STACK_BOTTOM+128 // +checksize . CPUArchState.stack
@@ -30,6 +30,7 @@
 #define CPU_APP_ADDR         CPU_ARCH_STATE+184   // +checkoffset . CPUArchState.appAddr
 #define CPU_LAZY_VFP         CPU_ARCH_STATE+192   // +checkoffset . CPUArchState.lazyVFP
 #define CPU_APP_ASID         CPU_ARCH_STATE+200   // +checkoffset . CPUArchState.appASID
+#define CPU_DEBUG_STEP       CPU_ARCH_STATE+208   // +checkoffset . CPUArchState.debugStepActive
 
 // Bits.
 #define _KERNEL_FLAGS 965 // +checkconst . KernelFlagsSet
@@ -532,6 +533,14 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	// set pstate.
 	MOVD PTRACE_PSTATE(RSV_REG_APP), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
+	// Keep debug-register writes and their serialization off ordinary entries.
+	// kernelExitToEl1 clears MDSCR_EL1.SS before this CPU can be reused.
+	TBZ $21, R1, no_software_step
+	MOVD $1, R2
+	MOVD R2, CPU_DEBUG_STEP(RSV_REG)
+	WORD $0xd5100242  // MSR MDSCR_EL1, R2
+	ISB $15
+no_software_step:
 
 	// need use kernel space address to execute below code, since
 	// after SWITCH_TO_APP_PAGETABLE the ASID is changed to app's
@@ -567,6 +576,14 @@ do_exit_to_el0:
 // Prepare the vcpu environment for sentry.
 TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
+	// MDSCR_EL1.SS is level-sensitive. Clear it only after a stepped entry so
+	// the normal syscall path pays no debug-register write or ISB.
+	MOVD CPU_DEBUG_STEP(RSV_REG), R2
+	CBZ R2, no_software_step_active
+	MOVD ZR, CPU_DEBUG_STEP(RSV_REG)
+	WORD $0xd510025f  // MSR MDSCR_EL1, ZR
+	ISB $15
+no_software_step_active:
 	MOVD CPU_REGISTERS+PTRACE_PSTATE(RSV_REG), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
 
@@ -709,6 +726,12 @@ TEXT ·El0_sync(SB),NOSPLIT,$0
 	BEQ el0_undef                     // unknown exception in EL0
 	CMP $ESR_ELx_EC_BREAKPT_LOW, R24
 	BEQ el0_dbg                       // debug exception in EL0
+	CMP $ESR_ELx_EC_SOFTSTP_LOW, R24
+	BEQ el0_dbg                       // software step in EL0
+	CMP $ESR_ELx_EC_WATCHPT_LOW, R24
+	BEQ el0_dbg                       // watchpoint in EL0
+	CMP $ESR_ELx_EC_BRK64, R24
+	BEQ el0_dbg                       // BRK instruction in EL0
 	CMP $ESR_ELx_EC_SYS64, R24
 	BEQ el0_sys                       // configurable trap
 	CMP $ESR_ELx_EC_WFx, R24

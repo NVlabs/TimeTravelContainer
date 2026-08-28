@@ -607,6 +607,13 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		fsName = gofer.Name
 
 		data := goferMountData(ioFD, conf.FileAccess, conf, suppressDirectFS)
+		if _, ok := c.l.k.Platform.(memoryFileBackingPlatform); ok {
+			// A VM platform cannot map a gofer's host FD directly into guest
+			// stage 2. Keep executable and file pages in the kernel MemoryFile,
+			// whose platform backing is GuestRAM, so clean pages survive the last
+			// process unmap and can be reused by fork/exec-heavy workloads.
+			data = append(data, "force_page_cache")
+		}
 
 		// We can't check for overlayfs here because sandbox is chroot'ed and gofer
 		// can only send mount options for specs.Mounts (specs.Root is missing
@@ -1026,7 +1033,8 @@ func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credenti
 }
 
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
-	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+	_, forcePageCache := c.l.k.Platform.(memoryFileBackingPlatform)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs, forcePageCache)
 	if err != nil {
 		return nil, fmt.Errorf("mountOptions failed: %w", err)
 	}
@@ -1093,7 +1101,7 @@ func goferSubmountReadOnly(m *mountInfo) bool {
 
 // getMountNameAndOptions retrieves the fsName, opts, and useOverlay values
 // used for mounts.
-func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName, containerID string, fsr *fsRestore, rdmaSysfs *rdma.Snapshot) (string, *vfs.MountOptions, error) {
+func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName, containerID string, fsr *fsRestore, rdmaSysfs *rdma.Snapshot, forcePageCache bool) (string, *vfs.MountOptions, error) {
 	fsName := m.mount.Type
 	var (
 		mopts        = m.mount.Options
@@ -1176,6 +1184,9 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			return "", nil, err
 		}
 		data = append(data, goferMountData(m.goferFD.Release(), getMountAccessType(conf, m.hint), conf, m.hint != nil && m.hint.SuppressDirectFS)...)
+		if forcePageCache {
+			data = append(data, "force_page_cache")
+		}
 		internalData = gofer.InternalFilesystemOptions{
 			ReadOnly: goferSubmountReadOnly(m),
 			UniqueID: checkpoint.ResourceID{
@@ -1719,7 +1730,8 @@ func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Sp
 	// Mount the master using the options from the hint (mount annotations).
 	origOpts := mntInfo.mount.Options
 	mntInfo.mount.Options = mntInfo.hint.Mount.Options
-	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+	_, forcePageCache := c.l.k.Platform.(memoryFileBackingPlatform)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs, forcePageCache)
 	mntInfo.mount.Options = origOpts
 	if err != nil {
 		return nil, err

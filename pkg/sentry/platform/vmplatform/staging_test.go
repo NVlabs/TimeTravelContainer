@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 type stagingTestReservation struct {
@@ -120,12 +121,16 @@ func TestStagingSharesFrameAndWritesBackOnLastUnmap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache.addMapping(firstPages[0])
+	if err := cache.commitMapping(firstPages[0]); err != nil {
+		t.Fatal(err)
+	}
 	secondFrames, secondPages, err := cache.resolve(file, fr, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache.addMapping(secondPages[0])
+	if err := cache.commitMapping(secondPages[0]); err != nil {
+		t.Fatal(err)
+	}
 	if firstFrames[0].ID != secondFrames[0].ID || firstPages[0] != secondPages[0] {
 		t.Fatalf("shared file page received different staging identities: first=%+v second=%+v", firstFrames[0], secondFrames[0])
 	}
@@ -162,7 +167,9 @@ func TestStagingPreservesAndRetriesWritebackError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache.addMapping(pages[0])
+	if err := cache.commitMapping(pages[0]); err != nil {
+		t.Fatal(err)
+	}
 	unsafe.Slice((*byte)(unsafe.Pointer(frames[0].HostAddress)), int(hostarch.PageSize))[0] = 0x55
 	if err := cache.removeMapping(pages[0]); !errors.Is(err, wantErr) {
 		t.Fatalf("removeMapping error = %v, want %v", err, wantErr)
@@ -173,5 +180,70 @@ func TestStagingPreservesAndRetriesWritebackError(t *testing.T) {
 	}
 	if file.data[0] != 0x55 {
 		t.Fatalf("retried writeback = %#x, want %#x", file.data[0], 0x55)
+	}
+}
+
+func TestStagingReservationPreventsResolveUnmapRace(t *testing.T) {
+	ram, cache := newStagingTestCache(t)
+	file := &stagingTestFile{data: make([]byte, hostarch.PageSize)}
+	fr := memmap.FileRange{Start: 0, End: hostarch.PageSize}
+	_, firstPages, err := cache.resolve(file, fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.commitMapping(firstPages[0]); err != nil {
+		t.Fatal(err)
+	}
+	_, secondPages, err := cache.resolve(file, fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.removeMapping(firstPages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if got := ram.Metrics().LogicalBytes; got != hostarch.PageSize {
+		t.Fatalf("reserved staging page was reclaimed: logical bytes = %d, want %d", got, hostarch.PageSize)
+	}
+	if err := cache.commitMapping(secondPages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.removeMapping(secondPages[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type stagingUnlockedDecommitBacking struct {
+	pgalloc.Backing
+	cache    *stagingCache
+	observed bool
+}
+
+func (b *stagingUnlockedDecommitBacking) Decommit(fr memmap.FileRange) error {
+	if !b.cache.mu.TryLock() {
+		return errors.New("staging cache mutex held during GuestRAM decommit")
+	}
+	b.observed = true
+	b.cache.mu.Unlock()
+	return b.Backing.Decommit(fr)
+}
+
+func TestStagingDecommitDoesNotHoldCacheMutex(t *testing.T) {
+	_, cache := newStagingTestCache(t)
+	probe := &stagingUnlockedDecommitBacking{Backing: cache.backing, cache: cache}
+	cache.backing = probe
+	file := &stagingTestFile{data: make([]byte, hostarch.PageSize)}
+	fr := memmap.FileRange{Start: 0, End: hostarch.PageSize}
+	_, pages, err := cache.resolve(file, fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.commitMapping(pages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.removeMapping(pages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if !probe.observed {
+		t.Fatal("staging page was not decommitted")
 	}
 }

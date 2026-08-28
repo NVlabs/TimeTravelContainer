@@ -23,6 +23,36 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Darwin rejects a nonblocking AF_UNIX stream sendmsg whose payload exceeds
+// the socket's current send high-water mark with EMSGSIZE instead of accepting
+// a partial write. Keep each send below the minimum high-water mark used by
+// supported macOS releases. SocketWriter callers already retry partial writes.
+const maxDarwinSendmsgPayload = 4096
+
+func limitDarwinSendmsgBuffers(bufs [][]byte) [][]byte {
+	remaining := maxDarwinSendmsgPayload
+	limited := make([][]byte, 0, len(bufs))
+	for _, buf := range bufs {
+		if len(buf) == 0 {
+			continue
+		}
+		if len(buf) > remaining {
+			limited = append(limited, buf[:remaining])
+			return limited
+		}
+		limited = append(limited, buf)
+		remaining -= len(buf)
+		if remaining == 0 {
+			return limited
+		}
+	}
+	// Preserve an empty iovec list for control-message-only sends.
+	if len(limited) == 0 {
+		return bufs
+	}
+	return limited
+}
+
 func (s *Socket) wait(write bool) error {
 	for {
 		fd := s.fd.Load()
@@ -153,6 +183,7 @@ func (w *SocketWriter) WriteVec(bufs [][]byte) (int, error) {
 		return 0, unix.EBADF
 	}
 	defer w.socket.gate.Leave()
+	bufs = limitDarwinSendmsgBuffers(bufs)
 	for {
 		n, err := unix.SendmsgBuffers(fd, bufs, w.ControlMessage, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
 		if err == nil {
@@ -161,7 +192,9 @@ func (w *SocketWriter) WriteVec(bufs [][]byte) (int, error) {
 		if err == unix.EINTR {
 			continue
 		}
-		if !w.blocking || (err != unix.EAGAIN && err != unix.EWOULDBLOCK) {
+		// Darwin may report EMSGSIZE, rather than EAGAIN, when a stream
+		// socket's remaining send space cannot hold this bounded chunk.
+		if !w.blocking || (err != unix.EAGAIN && err != unix.EWOULDBLOCK && err != unix.EMSGSIZE) {
 			return 0, err
 		}
 		if err := w.socket.wait(true); err != nil {

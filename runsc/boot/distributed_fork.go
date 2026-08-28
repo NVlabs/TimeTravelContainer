@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -189,6 +190,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}()
 	}
 	var metadata *ttcremote.SessionMetadata
+	var execSessions []ExecSessionInfo
 	var durableMetadata kernel.DurableDehydrationMetadata
 	var encoded []byte
 	var err error
@@ -218,13 +220,17 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		metadata, err = ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 			MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-			MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+			MaxAllocatorBytes: args.MetadataBytes, MaxExecBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
 		})
 		if err != nil {
 			return nil, err
 		}
 		if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
 			return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
+		}
+		execSessions, err = decodeDistributedExecSessions(metadata.ExecSessions, l.sandboxID)
+		if err != nil {
+			return nil, err
 		}
 	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
@@ -451,6 +457,12 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		return nil, err
 	}
+	if err := l.family.RestoreLoaderExecSessions(execSessions); err != nil {
+		if !bootstrapReleased {
+			old.Release()
+		}
+		return nil, fmt.Errorf("restoring distributed exec sessions: %w", err)
+	}
 	if filesystemBranch != "" {
 		if err := l.family.SetDefaultFilesystemBranch(filesystemBranch); err != nil {
 			if !bootstrapReleased {
@@ -584,13 +596,17 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}
 	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 		MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-		MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+		MaxAllocatorBytes: args.MetadataBytes, MaxExecBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
 	})
 	if err != nil {
 		return nil, err
 	}
 	if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
 		return nil, fmt.Errorf("distributed peer metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
+	}
+	execSessions, err := decodeDistributedExecSessions(metadata.ExecSessions, l.sandboxID)
+	if err != nil {
+		return nil, err
 	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
 		MaxReadBytes: args.MaxTransferBytes, MaxRanges: pgalloc.PagesPerSparseChunk(), MaxParallel: args.MaxParallel,
@@ -629,7 +645,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 	}()
 	var child *kernel.Kernel
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, execSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		loadOpts := kernel.DistributedForkLoadOptions{
 			// ChildBranchID selects the prepared persistent filesystem branch
 			// during an in-Sentry restore. TargetBranchID is the immutable remote
@@ -737,7 +753,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			_ = sparseRepository.Close()
 		}
 	}()
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, nil, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
 		// LoadSparseDurableDehydration consumes one ownership reference for
 		// every MemoryFile. Application memory is shared with the active family,
@@ -766,4 +782,23 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 		return nil, err
 	}
 	return &DistributedForkRestoreInfo{SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID}, nil
+}
+
+func decodeDistributedExecSessions(encoded []byte, targetContainerID string) ([]ExecSessionInfo, error) {
+	if len(encoded) == 0 {
+		return nil, nil
+	}
+	var sessions []ExecSessionInfo
+	if err := json.Unmarshal(encoded, &sessions); err != nil {
+		return nil, fmt.Errorf("decoding distributed exec sessions: %w", err)
+	}
+	for i := range sessions {
+		// The Kernel tasks are rebound to the target sandbox ID above. Managed
+		// session metadata is loader state rather than Kernel state, so remap it
+		// explicitly as checkpoint restore does. ExecSessions filters by this ID;
+		// retaining the source's physical container ID makes a restored session
+		// run but disappear from list/log/reattach and skips its console follower.
+		sessions[i].ContainerID = targetContainerID
+	}
+	return sessions, nil
 }

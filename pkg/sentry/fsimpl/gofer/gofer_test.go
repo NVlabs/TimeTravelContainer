@@ -24,9 +24,44 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+func TestBoundedFillRange(t *testing.T) {
+	const limit = uint64(1 << 20)
+	for _, test := range []struct {
+		name               string
+		required, optional memmap.MappableRange
+		want               memmap.MappableRange
+	}{
+		{
+			name:     "bounded forward readahead",
+			required: memmap.MappableRange{Start: 0x2000, End: 0x3000},
+			optional: memmap.MappableRange{Start: 0, End: 4 << 20},
+			want:     memmap.MappableRange{Start: 0x2000, End: 0x2000 + limit},
+		},
+		{
+			name:     "small optional range",
+			required: memmap.MappableRange{Start: 0x2000, End: 0x3000},
+			optional: memmap.MappableRange{Start: 0x1000, End: 0x9000},
+			want:     memmap.MappableRange{Start: 0x1000, End: 0x9000},
+		},
+		{
+			name:     "large required range",
+			required: memmap.MappableRange{Start: 0x2000, End: 0x2000 + 2*limit},
+			optional: memmap.MappableRange{Start: 0, End: 4 << 20},
+			want:     memmap.MappableRange{Start: 0x2000, End: 0x2000 + 2*limit},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := boundedFillRange(test.required, test.optional, limit); got != test.want {
+				t.Fatalf("boundedFillRange(%v, %v, %#x) = %v, want %v", test.required, test.optional, limit, got, test.want)
+			}
+		})
+	}
+}
 
 func TestLiveForkFilesystemEligibility(t *testing.T) {
 	id := checkpoint.ResourceID{ContainerName: "container", Path: "/data"}

@@ -116,6 +116,7 @@ go_test(
     name = "transport_test",
     size = "small",
     srcs = [
+        "host_test.go",
         "live_fork_test.go",
         "queue_test.go",
     ],
@@ -124,5 +125,6 @@ go_test(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/syserr",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

@@ -87,6 +87,65 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 	}
 }
 
+func TestPortLockHolderUsesRecordedPID(t *testing.T) {
+	const (
+		container = "port-owner-test"
+		branch    = "child"
+		endpoint  = "127.0.0.1:32123:8080"
+	)
+	lockPath := filepath.Join(t.TempDir(), "port.lock")
+	command := exec.Command(os.Args[0], "-test.run=^TestPortLockHolderHelper$", "--", "port-forward", "--branch="+branch, container, endpoint)
+	command.Env = append(os.Environ(), "TTC_PORT_LOCK_HELPER="+lockPath)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(stdout, ready); err != nil {
+		t.Fatalf("waiting for helper: %v", err)
+	}
+	if string(ready) != "ready\n" {
+		t.Fatalf("helper readiness = %q", ready)
+	}
+
+	pid, err := portLockHolder(lockPath, container, branch, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != command.Process.Pid {
+		t.Fatalf("portLockHolder returned PID %d, want %d", pid, command.Process.Pid)
+	}
+}
+
+func TestPortLockHolderHelper(t *testing.T) {
+	lockPath := os.Getenv("TTC_PORT_LOCK_HELPER")
+	if lockPath == "" {
+		return
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPortSidecarPID(lockFile, os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Minute)
+}
+
 func TestMigrateCommand(t *testing.T) {
 	backend := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -180,6 +239,31 @@ func TestParseSelector(t *testing.T) {
 			}
 			if got != test.want {
 				t.Errorf("parseSelector(%q) = %+v, want %+v", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseSelectorOrMain(t *testing.T) {
+	tests := []struct {
+		input string
+		want  selector
+		err   bool
+	}{
+		{input: "web", want: selector{container: "web", branch: defaultBranchID}},
+		{input: strings.Repeat("a", 64), want: selector{container: strings.Repeat("a", 64), branch: defaultBranchID}},
+		{input: "web@child", want: selector{container: "web", branch: "child"}},
+		{input: "", err: true},
+		{input: "web@", err: true},
+	}
+	for _, test := range tests {
+		t.Run(test.input, func(t *testing.T) {
+			got, err := parseSelectorOrMain(test.input)
+			if (err != nil) != test.err {
+				t.Fatalf("parseSelectorOrMain(%q) error: %v, want error=%t", test.input, err, test.err)
+			}
+			if got != test.want {
+				t.Errorf("parseSelectorOrMain(%q) = %+v, want %+v", test.input, got, test.want)
 			}
 		})
 	}
@@ -1853,6 +1937,16 @@ func TestCreateAndStart(t *testing.T) {
 	if stdout.String() != "demo@main\n" {
 		t.Errorf("start output=%q", stdout.String())
 	}
+	stdout.Reset()
+	if status := runCommand([]string{"start", containerID}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("start by container ID status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.started != (selector{container: containerID, branch: defaultBranchID}) {
+		t.Errorf("start by container ID target=%v", b.started)
+	}
+	if got, want := stdout.String(), containerID+"\n"; got != want {
+		t.Errorf("start by container ID output=%q, want %q", got, want)
+	}
 }
 
 func TestStartMultipleAndContainerAliases(t *testing.T) {
@@ -3023,11 +3117,19 @@ func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 		t.Errorf("restart starts=%+v, want %+v", got, want)
 	}
 
-	b = &fakeBackend{}
+	b = &fakeBackend{inspectInfo: InspectInfo{
+		TTC: TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: defaultBranchID, State: "exited"}}}},
+	}}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
-		t.Fatal("restart accepted a family name")
+	if status := runCommand([]string{"restart", "--force", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("restart main container status=%d stderr=%q", status, stderr.String())
+	}
+	if got, want := b.startCalls, []startCall{{target: selector{container: "web", branch: defaultBranchID}, detach: true}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("main-container restart starts=%+v, want %+v", got, want)
+	}
+	if got, want := stdout.String(), "web\n"; got != want {
+		t.Errorf("main-container restart output=%q, want %q", got, want)
 	}
 }
 
@@ -3358,7 +3460,8 @@ func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {
 	script := `#!/bin/sh
 echo discarded-output
 echo launch-diagnostic >&2
-sleep 3 &
+sleep 30 &
+echo $! >"$0.pid"
 exit 0
 `
 	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
@@ -3368,7 +3471,14 @@ exit 0
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
 	started := time.Now()
 	status, err := b.runConfiguredCommand("start", "demo")
-	if elapsed := time.Since(started); elapsed >= time.Second {
+	if pidBytes, readErr := os.ReadFile(runsc + ".pid"); readErr == nil {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(pidBytes))); parseErr == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	// The descendant sleeps for 30 seconds, so five seconds is a generous
+	// loaded-CI allowance while still proving that launch did not wait for it.
+	if elapsed := time.Since(started); elapsed >= 5*time.Second {
 		t.Fatalf("launch waited %v for a descendant holding stdio", elapsed)
 	}
 	if err != nil || status != 0 {
@@ -5280,5 +5390,24 @@ func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	}
 	if err := runRename([]string{"demo@try-a"}, &out, backend); err == nil {
 		t.Fatal("a rename with no new name was accepted")
+	}
+}
+
+func TestPipeReaderForBytesExceedsKernelBuffer(t *testing.T) {
+	want := bytes.Repeat([]byte("large-ttc-control-payload\n"), 16<<10)
+	reader, finish, err := pipeReaderForBytes(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(reader)
+	writeErr := finish()
+	if readErr != nil {
+		t.Fatalf("reading payload: %v", readErr)
+	}
+	if writeErr != nil {
+		t.Fatalf("writing payload: %v", writeErr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(want))
 	}
 }

@@ -452,11 +452,11 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 // Sentry and application MemoryFile. BranchID is the user-visible identity;
 // filesystemBranch is the globally unique repository branch prepared by the
 // source transaction.
-func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	if branchID == "" || filesystemBranch == "" || load == nil {
 		return errors.New("distributed peer restore is missing branch, filesystem, or loader")
 	}
-	return f.restorePeer(branchID, "", filesystemBranch, false, nil, load)
+	return f.restorePeer(branchID, "", filesystemBranch, false, sessions, load)
 }
 
 func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
@@ -510,14 +510,13 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resum
 		child.Release()
 		return err
 	}
-	newSessions := make(map[string]*execSession)
-	for _, info := range sessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
-		if tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID); tg != nil {
-			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
-		}
+	newSessions, err := restoredExecSessions(child, sessions)
+	if err != nil {
+		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		child.Unpause()
+		child.WaitExited()
+		child.Release()
+		return err
 	}
 	var dog *watchdog.Watchdog
 	if f.watchdogOpts != nil {

@@ -163,21 +163,38 @@ func ReadSnapshot(snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedP
 	}
 	source := make([]SourcePage, len(bindings))
 	zeroPage := make([]byte, hostarch.PageSize)
-	for i, binding := range bindings {
-		data := make([]byte, hostarch.PageSize)
-		n, err := snapshot.CopyStreamAt(data, int64(binding.StreamOffset))
+	// CopyStreamAt acquires snapshot leases and maps the underlying MemoryFile
+	// ranges. Doing that once per 4 KiB page makes large dehydrations spend most
+	// of their time entering the mapping machinery. Bindings are normally in
+	// packed-stream order, so read adjacent pages in one logical-chunk-sized
+	// batch. Non-adjacent bindings remain valid and simply start a new batch.
+	for first := 0; first < len(bindings); {
+		last := first + 1
+		for last < len(bindings) &&
+			last-first < PagesPerChunk &&
+			bindings[last].StreamOffset == bindings[last-1].StreamOffset+hostarch.PageSize {
+			last++
+		}
+		data := make([]byte, (last-first)*hostarch.PageSize)
+		n, err := snapshot.CopyStreamAt(data, int64(bindings[first].StreamOffset))
 		if err != nil || n != len(data) {
 			if err == nil {
 				err = io.ErrUnexpectedEOF
 			}
-			return nil, nil, fmt.Errorf("reading captured page at stream offset %#x: %w", binding.StreamOffset, err)
+			return nil, nil, fmt.Errorf("reading captured pages at stream offset %#x: %w", bindings[first].StreamOffset, err)
 		}
-		source[i] = SourcePage{Binding: binding}
-		if bytes.Equal(data, zeroPage) {
-			source[i].Zero = true
-		} else {
-			source[i].Data = data
+		for i := first; i < last; i++ {
+			page := data[(i-first)*hostarch.PageSize : (i-first+1)*hostarch.PageSize]
+			source[i] = SourcePage{Binding: bindings[i]}
+			if bytes.Equal(page, zeroPage) {
+				source[i].Zero = true
+			} else {
+				// Retain the batch through Assemble. Encode copies page into the
+				// immutable object before ReadSnapshot returns.
+				source[i].Data = page
+			}
 		}
+		first = last
 	}
 	return Assemble(source)
 }

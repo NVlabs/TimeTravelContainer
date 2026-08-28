@@ -80,6 +80,27 @@ func (Architecture) DecodeExit(exit vmplatform.Exit) (*linux.SignalInfo, hostarc
 			Execute: exit.Access&vmm.Stage2Execute != 0,
 		}
 		return info, access, sentryplatform.ErrContextSignal
+	case vmplatform.ExitException:
+		info := &linux.SignalInfo{}
+		info.SetAddr(exit.Address)
+		switch ec := exit.Syndrome >> 26 & 0x3f; ec {
+		case 0x30, 0x34: // Hardware breakpoint or watchpoint from EL0.
+			info.Signo = int32(linux.SIGTRAP)
+			info.Code = linux.TRAP_HWBKPT
+		case 0x32: // Software step from EL0.
+			info.Signo = int32(linux.SIGTRAP)
+			info.Code = linux.TRAP_TRACE
+		case 0x3c: // BRK instruction in AArch64 state.
+			info.Signo = int32(linux.SIGTRAP)
+			info.Code = linux.TRAP_BRKPT
+		case 0x22, 0x26: // PC or SP alignment fault.
+			info.Signo = int32(linux.SIGBUS)
+			info.Code = 1 // BUS_ADRALN.
+		default:
+			info.Signo = int32(linux.SIGILL)
+			info.Code = 1 // ILL_ILLOPC.
+		}
+		return info, hostarch.NoAccess, sentryplatform.ErrContextSignal
 	case vmplatform.ExitShutdown:
 		return nil, hostarch.NoAccess, fmt.Errorf("ARM64 VM shut down")
 	default:

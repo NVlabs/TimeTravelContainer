@@ -109,6 +109,12 @@ const (
 
 	// NT_ARM_TLS is for ARM TLS register.
 	NT_ARM_TLS = 0x401
+
+	// NT_ARM_HW_BREAK and NT_ARM_HW_WATCH expose the AArch64 hardware debug
+	// register sets. A kernel may report zero slots in the leading dbg_info
+	// field when the execution platform does not virtualize them.
+	NT_ARM_HW_BREAK = 0x402
+	NT_ARM_HW_WATCH = 0x403
 )
 
 // ElfHeader64 is the ELF64 file header.

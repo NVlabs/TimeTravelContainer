@@ -330,40 +330,79 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}
 			continue
 		}
-		scanOffset := fr.Start
-		if err := f.withMappingSlices(fr, hostarch.Read, func(bs []byte) error {
-			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
-				pg := bs[pgoff : pgoff+hostarch.PageSize]
-				off := scanOffset + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
-				if isZeroed {
-					if !wasCommitted {
-						alreadyUncommittedBytes += hostarch.PageSize
+		scanPage := func(pg []byte, off uint64) {
+			isZeroed := bytes.Equal(pg, zeroPage)
+			if isZeroed {
+				if !wasCommitted {
+					alreadyUncommittedBytes += hostarch.PageSize
+					// A platform backing is the coherent data plane for every live
+					// TTC sibling. Accounting-uncommitted does not imply that its
+					// resident frame is transient or unused by another branch, so a
+					// single-branch checkpoint must not decommit it.
+					if f.backing == nil {
 						decommitAddPage(off)
-					} else {
-						newUncommittedBytes += hostarch.PageSize
 					}
 				} else {
-					if !wasCommitted {
-						newCommittedBytes += hostarch.PageSize
-					} else {
-						alreadyCommittedBytes += hostarch.PageSize
-					}
+					newUncommittedBytes += hostarch.PageSize
 				}
-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
+			} else {
+				if !wasCommitted {
+					newCommittedBytes += hostarch.PageSize
+				} else {
+					alreadyCommittedBytes += hostarch.PageSize
+				}
 			}
-			// f.UpdateUsage() may be called concurrently with f.SaveTo();
-			// occasionally unlock f.mu to ensure that the former can promptly
-			// observe f.isSaving and return. Assume that maseg is not
-			// invalidated while f.mu is unlocked, since it should still be the
-			// case that nothing is concurrently trying to mutate f.
-			f.mu.Unlock()
-			f.mu.Lock()
-			scanOffset += uint64(len(bs))
-			return nil
-		}); err != nil {
+			maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
+		}
+		scanRange := func(scanRange memmap.FileRange) error {
+			scanOffset := scanRange.Start
+			return f.withMappingSlices(scanRange, hostarch.Read, func(bs []byte) error {
+				for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
+					off := scanOffset + uint64(pgoff)
+					scanPage(bs[pgoff:pgoff+hostarch.PageSize], off)
+				}
+				scanOffset += uint64(len(bs))
+				return nil
+			})
+		}
+		if f.backing != nil && !wasCommitted {
+			// Query physical commitment before mapping. ResolveFrames allocates
+			// missing GuestRAM frames, so mapping the whole range would turn a
+			// sparse zero allocation into resident memory just to omit it again.
+			committed := make([]byte, fr.Length()/hostarch.PageSize)
+			if err := f.backing.QueryCommitment(fr, committed); err != nil {
+				return fmt.Errorf("querying platform commitment while saving %v: %w", fr, err)
+			}
+			for page := 0; page < len(committed); {
+				off := fr.Start + uint64(page)*hostarch.PageSize
+				if committed[page] == 0 {
+					scanPage(zeroPage, off)
+					page++
+					continue
+				}
+				end := page + 1
+				for end < len(committed) && committed[end] != 0 {
+					end++
+				}
+				committedRange := memmap.FileRange{
+					Start: off,
+					End:   fr.Start + uint64(end)*hostarch.PageSize,
+				}
+				if err := scanRange(committedRange); err != nil {
+					return fmt.Errorf("mapping committed platform pages for save: %w", err)
+				}
+				page = end
+			}
+		} else if err := scanRange(fr); err != nil {
 			return fmt.Errorf("mapping MemoryFile pages for save: %w", err)
 		}
+		// Keep f.mu held across the scan. TTC live-fork kernels share one
+		// MemoryFile, so quiescing the kernel being checkpointed does not stop
+		// sibling branches from allocating or releasing ranges. Temporarily
+		// dropping f.mu here allowed a sibling to invalidate maseg and corrupt
+		// memAcct during SaveTo. UpdateUsage and allocator mutations may wait
+		// for the checkpoint scan; this is a cold-path family-wide memory
+		// rendezvous, while page contents remain copy-on-write coherent.
 		// We need to flush batched updates to f.memAcct whenever potentially
 		// reaching the end of a segment, in order to maintain the invariant
 		// that updatePendingFR corresponds to a single segment.

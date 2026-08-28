@@ -208,7 +208,14 @@ func (*Platform) HaveGlobalMemoryBarrier() bool { return false }
 func (*Platform) GlobalMemoryBarrier() error {
 	panic("vmplatform does not implement a global memory barrier")
 }
-func (*Platform) MapUnit() uint64                 { return 16 << 20 }
+func (*Platform) MapUnit() uint64 {
+	// Unlike KVM, the v1 VM platform builds 4K leaves and can mutate at most
+	// monitorabi.MaxOperations pages per EL1 transaction. KVM's 16 MiB unit
+	// turns a minor fault into thousands of PTE writes and many monitor entries.
+	// Use exactly one monitor transaction so VM gofer readahead can amortize
+	// executable faults without constructing an unbounded number of leaves.
+	return monitorabi.MaxOperations * hostarch.PageSize
+}
 func (*Platform) MinUserAddress() hostarch.Addr   { return hostarch.PageSize }
 func (p *Platform) MaxUserAddress() hostarch.Addr { return p.maxUser }
 
@@ -509,6 +516,46 @@ type addressMapping struct {
 	staged *stagedPage
 }
 
+type stage1MapRun struct {
+	operation  monitorabi.Operation
+	firstFrame int
+	endFrame   int
+}
+
+// stage1MapRuns combines physically contiguous GuestRAM frames into one
+// monitor operation. Page-cache fill allocates in slab order, so executable
+// readahead normally becomes a single operation instead of one ABI entry per
+// 4K page. The monitor still constructs 4K stage-1 leaves and performs the
+// architected invalidation sequence for the complete range.
+func stage1MapRuns(addr hostarch.Addr, frames []pgalloc.BackingFrame, access monitorabi.Access) []stage1MapRun {
+	runs := make([]stage1MapRun, 0, len(frames))
+	for i, frame := range frames {
+		va := uint64(addr) + uint64(i)*hostarch.PageSize
+		if len(runs) != 0 {
+			last := &runs[len(runs)-1]
+			if last.operation.VA+last.operation.Length == va &&
+				last.operation.GPA+last.operation.Length == frame.GPA &&
+				last.operation.Length < monitorabi.MaxOperations*hostarch.PageSize {
+				last.operation.Length += hostarch.PageSize
+				last.endFrame = i + 1
+				continue
+			}
+		}
+		runs = append(runs, stage1MapRun{
+			operation: monitorabi.Operation{
+				Type:   monitorabi.OperationMap,
+				Access: access,
+				VA:     va,
+				GPA:    frame.GPA,
+				Length: hostarch.PageSize,
+			},
+			firstFrame: i,
+			endFrame:   i + 1,
+		})
+	}
+	return runs
+}
+
 type addressSpace struct {
 	sentryplatform.NoAddressSpaceIO
 
@@ -522,7 +569,7 @@ type addressSpace struct {
 }
 
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
-func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.FileRange, at hostarch.AccessType, _ bool) error {
+func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.FileRange, at hostarch.AccessType, _ bool) (retErr error) {
 	if addr%hostarch.PageSize != 0 || fr.Start%hostarch.PageSize != 0 || fr.Length() == 0 || fr.End%hostarch.PageSize != 0 {
 		return fmt.Errorf("invalid vmplatform mapping addr=%#x range=%v", addr, fr)
 	}
@@ -543,47 +590,62 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 		}
 		epoch := as.platform.ram.Metrics().Epoch
 		if epoch != before {
+			if err := as.platform.staging.cancelReservations(stagedPages); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := as.platform.lockEpoch(stdcontext.Background()); err != nil {
-			return err
+			return errors.Join(err, as.platform.staging.cancelReservations(stagedPages))
 		}
 		if as.platform.ram.Metrics().Epoch == epoch && as.platform.ram.layoutGeneration() == layoutBefore {
 			break
 		}
 		as.platform.epochMu.RUnlock()
+		if err := as.platform.staging.cancelReservations(stagedPages); err != nil {
+			return err
+		}
 	}
+	// Register reservation cleanup before epoch unlock so return processing
+	// first releases as.mu and epochMu, then performs any potentially blocking
+	// GuestRAM decommit.
+	defer func() {
+		retErr = errors.Join(retErr, as.platform.staging.cancelReservations(stagedPages))
+	}()
 	defer as.platform.epochMu.RUnlock()
 	if uint64(len(frames))*hostarch.PageSize != fr.Length() {
 		return fmt.Errorf("GuestRAM returned %d frames for %d-byte mapping", len(frames), fr.Length())
 	}
-	access := monitorAccess(at)
-	operations := make([]monitorabi.Operation, len(frames))
-	for i, frame := range frames {
-		operations[i] = monitorabi.Operation{
-			Type:   monitorabi.OperationMap,
-			Access: access,
-			VA:     uint64(addr) + uint64(i)*hostarch.PageSize,
-			GPA:    frame.GPA,
-			Length: hostarch.PageSize,
-		}
-	}
+	runs := stage1MapRuns(addr, frames, monitorAccess(at))
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released {
 		return fmt.Errorf("mapping released vmplatform address space")
 	}
-	for start := 0; start < len(operations); start += monitorabi.MaxOperations {
-		end := min(start+monitorabi.MaxOperations, len(operations))
+	for start := 0; start < len(runs); {
+		end := start
+		pages := uint64(0)
+		for end < len(runs) {
+			runPages := runs[end].operation.Length / hostarch.PageSize
+			if pages != 0 && pages+runPages > monitorabi.MaxOperations {
+				break
+			}
+			pages += runPages
+			end++
+		}
+		operations := make([]monitorabi.Operation, end-start)
+		for i := start; i < end; i++ {
+			operations[i-start] = runs[i].operation
+		}
 		if err := as.platform.monitor.Execute(stdcontext.Background(), monitorabi.Command{
 			Opcode:         monitorabi.OpcodeApply,
 			AddressSpaceID: as.id,
-			Operations:     operations[start:end],
+			Operations:     operations,
 		}); err != nil {
 			return err
 		}
-		for i := start; i < end; i++ {
+		for i := runs[start].firstFrame; i < runs[end-1].endFrame; i++ {
 			va := addr + hostarch.Addr(uint64(i)*hostarch.PageSize)
 			if old, ok := as.mappings[va]; ok {
 				if old.frame == frames[i].ID {
@@ -601,9 +663,17 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 				return err
 			}
 			staged := stagedPageAt(stagedPages, i)
-			as.platform.staging.addMapping(staged)
+			if err := as.platform.staging.commitMapping(staged); err != nil {
+				as.platform.ram.RemoveMapping(frames[i].ID, ref)
+				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+				return err
+			}
+			if staged != nil {
+				stagedPages[i] = nil
+			}
 			as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: staged}
 		}
+		start = end
 	}
 	return nil
 }
@@ -931,9 +1001,105 @@ type platformContext struct {
 	registers any
 
 	mu          sync.Mutex
-	cancel      stdcontext.CancelFunc
+	runContext  applicationRunContext
+	runActive   bool
 	interrupted bool
 	released    bool
+	resident    ApplicationResidencyEngine
+	residentErr error
+}
+
+// beginApplicationResidency pins owner-affine VM state to the task's current
+// host thread. The task goroutine remains resident while it handles a burst of
+// Linux syscalls, avoiding a host hypervisor exit and vCPU reconstruction at
+// every application entry.
+func (c *platformContext) beginApplicationResidency(engine VMEngine) error {
+	want, supported := engine.(ApplicationResidencyEngine)
+	c.mu.Lock()
+	current := c.resident
+	residentErr := c.residentErr
+	released := c.released
+	c.mu.Unlock()
+	if released {
+		return fmt.Errorf("released vmplatform Context")
+	}
+	if current == want {
+		return residentErr
+	}
+	if current != nil {
+		if err := c.endApplicationResidency(); err != nil {
+			return err
+		}
+	}
+	if !supported {
+		return residentErr
+	}
+	want.BeginApplicationResidency()
+	c.mu.Lock()
+	if c.released {
+		c.mu.Unlock()
+		if err := want.EndApplicationResidency(); err != nil {
+			return errors.Join(fmt.Errorf("released vmplatform Context"), err)
+		}
+		return fmt.Errorf("released vmplatform Context")
+	}
+	c.resident = want
+	residentErr = c.residentErr
+	c.mu.Unlock()
+	return residentErr
+}
+
+// endApplicationResidency must be called by the task goroutine that began the
+// residency. platform.Context's preparation hooks satisfy that requirement.
+func (c *platformContext) endApplicationResidency() error {
+	c.mu.Lock()
+	engine := c.resident
+	c.resident = nil
+	c.mu.Unlock()
+	if engine == nil {
+		return nil
+	}
+	err := engine.EndApplicationResidency()
+	if err != nil {
+		c.mu.Lock()
+		c.residentErr = errors.Join(c.residentErr, err)
+		c.mu.Unlock()
+	}
+	return err
+}
+
+// yieldApplicationResidency ends an owner-affine residency only when the
+// selected backend reports actual contention. It must run on the task
+// goroutine, immediately after application state has returned to host Sentry.
+func (c *platformContext) yieldApplicationResidency() error {
+	c.mu.Lock()
+	engine := c.resident
+	c.mu.Unlock()
+	yielder, ok := engine.(ApplicationResidencyYieldEngine)
+	if !ok || !yielder.ShouldYieldApplicationResidency() {
+		return nil
+	}
+	return c.endApplicationResidency()
+}
+
+// completeApplicationExitResidency retains an owner-affine vCPU across Linux
+// syscall handling and, for engines with bounded admission, local fault
+// handling. Engines that cannot reserve progress capacity still end fault
+// residency here because remote page acquisition does not necessarily block
+// through Task.Block.
+func (c *platformContext) completeApplicationExitResidency(reason ExitReason) error {
+	if reason == ExitSyscall {
+		return c.yieldApplicationResidency()
+	}
+	if reason == ExitFault {
+		c.mu.Lock()
+		engine := c.resident
+		c.mu.Unlock()
+		if retainer, ok := engine.(ApplicationFaultResidencyEngine); ok && retainer.ShouldRetainApplicationFaultResidency() {
+			return c.yieldApplicationResidency()
+		}
+	}
+	return c.endApplicationResidency()
 }
 
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.
@@ -949,6 +1115,10 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 		return nil, hostarch.NoAccess, err
 	}
 	defer c.platform.epochMu.RUnlock()
+	engine := c.platform.engine
+	if err := c.beginApplicationResidency(engine); err != nil {
+		return nil, hostarch.NoAccess, err
+	}
 	c.mu.Lock()
 	if c.released {
 		c.mu.Unlock()
@@ -957,30 +1127,37 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 	if c.interrupted {
 		c.interrupted = false
 		c.mu.Unlock()
+		// There is no application burst to amortize after consuming an interrupt.
+		// In particular, restored tasks are commonly interrupted before their
+		// first entry; retaining one vCPU per such task can exhaust the owner-
+		// affine pool before any task becomes runnable.
+		if err := c.endApplicationResidency(); err != nil {
+			return nil, hostarch.NoAccess, err
+		}
+		// kernel.runApp compares this sentinel by identity, so it must not be
+		// wrapped even when residency teardown succeeded.
 		return nil, hostarch.NoAccess, sentryplatform.ErrContextInterrupt
 	}
-	runCtx, cancel := stdcontext.WithCancel(ctx)
-	c.cancel = cancel
+	c.runContext.reset(ctx)
+	c.runActive = true
 	c.mu.Unlock()
 
 	if err := c.platform.arch.LoadApplicationState(c.registers, ac); err != nil {
-		cancel()
-		return nil, hostarch.NoAccess, err
+		c.finishApplicationRun()
+		return nil, hostarch.NoAccess, errors.Join(err, c.endApplicationResidency())
 	}
-	exit, err := c.platform.engine.RunApplication(runCtx, ApplicationState{AddressSpaceID: as.id, Registers: c.registers})
-	c.mu.Lock()
-	wasInterrupted := c.interrupted
-	c.interrupted = false
-	c.cancel = nil
-	c.mu.Unlock()
-	cancel()
+	exit, err := engine.RunApplication(&c.runContext, ApplicationState{AddressSpaceID: as.id, Registers: c.registers})
+	wasInterrupted := c.finishApplicationRun()
 	if err := c.platform.arch.SaveApplicationState(ac, c.registers, true); err != nil {
-		return nil, hostarch.NoAccess, err
+		return nil, hostarch.NoAccess, errors.Join(err, c.endApplicationResidency())
 	}
 	if err != nil {
 		if wasInterrupted || errors.Is(err, stdcontext.Canceled) {
 			return nil, hostarch.NoAccess, sentryplatform.ErrContextInterrupt
 		}
+		return nil, hostarch.NoAccess, errors.Join(err, c.endApplicationResidency())
+	}
+	if err := c.completeApplicationExitResidency(exit.Reason); err != nil {
 		return nil, hostarch.NoAccess, err
 	}
 	// Synchronous exceptions win races with Context.Interrupt. The monitor has
@@ -995,17 +1172,26 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 	return c.platform.arch.DecodeExit(exit)
 }
 
+func (c *platformContext) finishApplicationRun() bool {
+	c.mu.Lock()
+	wasInterrupted := c.interrupted
+	c.interrupted = false
+	c.runActive = false
+	c.mu.Unlock()
+	c.runContext.finish()
+	return wasInterrupted
+}
+
 func (*platformContext) PullFullState(sentryplatform.AddressSpace, *arch.Context64) error { return nil }
 func (*platformContext) FullStateChanged()                                                {}
 func (c *platformContext) Interrupt() {
 	c.mu.Lock()
 	c.interrupted = true
-	if c.cancel != nil {
-		c.cancel()
+	if c.runActive {
+		c.runContext.cancel()
 	}
 	c.mu.Unlock()
-	// VM engines run the Sentry continuation at EL1 on the application vCPU;
-	// canceling the Go context alone cannot wake an EL0 task. Request an
+	// Canceling the Go context alone cannot wake a running EL0 task. Request an
 	// architected guest exit after publishing interrupted so Switch observes a
 	// coherent register snapshot.
 	c.platform.engine.InterruptApplications()
@@ -1016,9 +1202,10 @@ func (c *platformContext) Release() {
 	c.mu.Lock()
 	c.released = true
 	c.mu.Unlock()
+	_ = c.endApplicationResidency()
 }
-func (*platformContext) PrepareSleep()                {}
-func (*platformContext) PrepareUninterruptibleSleep() {}
-func (*platformContext) PrepareStop()                 {}
-func (*platformContext) PrepareExecve()               {}
-func (*platformContext) PrepareExit()                 {}
+func (c *platformContext) PrepareSleep()                { _ = c.endApplicationResidency() }
+func (c *platformContext) PrepareUninterruptibleSleep() { _ = c.endApplicationResidency() }
+func (c *platformContext) PrepareStop()                 { _ = c.endApplicationResidency() }
+func (c *platformContext) PrepareExecve()               { _ = c.endApplicationResidency() }
+func (c *platformContext) PrepareExit()                 { _ = c.endApplicationResidency() }

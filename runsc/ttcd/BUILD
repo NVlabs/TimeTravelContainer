@@ -17,6 +17,7 @@ go_binary(
     deps = [
         "//runsc/cli/maincli",
         "//runsc/ttc/cmd",
+        "//runsc/ttc/copyguest",
         "//runsc/version",
     ],
 )
@@ -31,6 +32,7 @@ go_test(
     deps = [
         "//runsc/cli/maincli",
         "//runsc/ttc/cmd",
+        "//runsc/ttc/copyguest",
         "//runsc/version",
     ],
 )

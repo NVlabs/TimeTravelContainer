@@ -575,7 +575,7 @@ func marshal(s *unet.Socket, v any, fs []*os.File) error {
 		}
 		n += cur
 		if err != nil {
-			log.Warningf("urpc: error writing %v: %s", data[n:], err.Error())
+			log.Warningf("urpc: error writing %d remaining bytes: %s", len(data)-n, err.Error())
 			return err
 		}
 	}

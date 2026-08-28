@@ -220,6 +220,15 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	}()
 
 	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family.mu.Lock()
+	family.branches[DefaultBranchID].execSessions["remote-exec"] = &execSession{
+		info: ExecSessionInfo{
+			ID: "remote-exec", ContainerID: "source-container", PID: parent.GlobalInit().ID(),
+			ConsoleID: "remote-console", State: ExecSessionRunning, CreatedAt: time.Unix(1, 0).UTC(),
+		},
+		tg: parent.GlobalInit(),
+	}
+	family.mu.Unlock()
 	info, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
 		SessionID: "tx-1", FamilyID: "family-1", TargetBranchID: "remote-1",
 		ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10,
@@ -239,13 +248,20 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	}
 	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 		MaxTotalBytes: 64 << 20, MaxKernelBytes: 60 << 20,
-		MaxAllocatorBytes: 4 << 20, MaxLoadRanges: 1 << 20,
+		MaxAllocatorBytes: 4 << 20, MaxExecBytes: 1 << 20, MaxLoadRanges: 1 << 20,
 	})
 	if err != nil {
 		t.Fatalf("UnmarshalSessionMetadata: %v", err)
 	}
 	if metadata.FamilyID != "family-1" || metadata.SourceBranchID != DefaultBranchID || metadata.TargetBranchID != "remote-1" {
 		t.Fatalf("metadata identity: %+v", metadata)
+	}
+	execSessions, err := decodeDistributedExecSessions(metadata.ExecSessions, "target-container")
+	if err != nil {
+		t.Fatalf("decodeDistributedExecSessions: %v", err)
+	}
+	if len(execSessions) != 1 || execSessions[0].ID != "remote-exec" || execSessions[0].ContainerID != "target-container" || execSessions[0].PID != parent.GlobalInit().ID() {
+		t.Fatalf("distributed exec sessions: %+v", execSessions)
 	}
 	status, err := family.DistributedForkSessionStatus("tx-1")
 	if err != nil {

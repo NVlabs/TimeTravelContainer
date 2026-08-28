@@ -91,6 +91,11 @@ const (
 	ExitUnknown ExitReason = iota
 	ExitSyscall
 	ExitFault
+	// ExitException is a synchronous architectural exception that is not a
+	// stage-1 memory abort, such as an AArch64 breakpoint, software step, or
+	// undefined instruction. Architecture.DecodeExit converts its syndrome to
+	// the Linux signal ABI.
+	ExitException
 	ExitInterrupted
 	ExitShutdown
 )

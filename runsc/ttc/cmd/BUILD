@@ -48,6 +48,7 @@ go_library(
         "//runsc/ttc/checkpoint",
         "//runsc/ttc/cluster",
         "//runsc/ttc/console",
+        "//runsc/ttc/copyhelper",
         "//runsc/ttc/images",
         "//runsc/version",
         "@com_github_opencontainers_runtime_spec//specs-go",

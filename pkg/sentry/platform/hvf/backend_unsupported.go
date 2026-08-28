@@ -33,6 +33,10 @@ const SentryMirrorIPAStart = uint64(0x10000000)
 
 const GuestRAMIPAStart = uint64(1 << 39)
 
+// MaxApplicationVCPUs retains the owner-affine vCPU aperture contract in
+// pure-Go analysis builds.
+const MaxApplicationVCPUs = 63
+
 func NewBackend() *Backend { return &Backend{} }
 
 // NewVMEngine retains the engine-factory surface for analysis and pure-Go

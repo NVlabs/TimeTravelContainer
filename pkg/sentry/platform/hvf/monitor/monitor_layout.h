@@ -31,6 +31,13 @@
 #define TTC_MONITOR_MAX_ADDRESS_SPACES 128
 #define TTC_MONITOR_MAX_POOL_REGIONS 64
 
+// Ring0 bridge calls. Application exits use a distinct call so the host can
+// replace the monitor HVC PC with the saved Sentry continuation without first
+// resuming that continuation at EL1 and faulting through the host-service gate.
+#define TTC_RING0_HVC_REDPILL 0x73
+#define TTC_RING0_HVC_HOST_GATE 0x74
+#define TTC_RING0_HVC_APPLICATION_EXIT 0x75
+
 #define TTC_ADDRESS_SPACE_SENTRY UINT64_C(1)
 #define TTC_ADDRESS_SPACE_FLAGS_MASK TTC_ADDRESS_SPACE_SENTRY
 
@@ -59,6 +66,7 @@
 #define TTC_STATE_INTERNAL_VECTOR_OFFSET 0x2a50
 #define TTC_STATE_INTERNAL_INPUT_PSTATE_OFFSET 0x2a58
 #define TTC_STATE_CANCEL_REQUESTED_OFFSET 0x2a60
+#define TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET 0x2a68
 #define TTC_STATE_SENTRY_TTBR0_OFFSET 0x2a80
 #define TTC_STATE_SENTRY_X0_OFFSET 0x2a88
 #define TTC_STATE_SENTRY_SP_OFFSET 0x2b80
@@ -81,6 +89,23 @@
 // monitor must never make its first memory access through a movable Go stack:
 // stack growth can occur after the host mirror was sampled.
 #define TTC_STATE_RING0_SENTRY_SP_OFFSET 0x3348
+// Nonzero selects the production host-return path. The monitor issues the
+// application-exit HVC without reconstructing a Sentry-at-EL1 continuation;
+// the owner-thread bridge then returns through its ordinary C ABI call.
+#define TTC_STATE_DIRECT_HOST_RETURN_OFFSET 0x3350
+// Nonzero while MDSCR_EL1.SS is enabled for the current EL0 entry. Keeping
+// this bit in monitor-owned state lets ordinary entries avoid serializing the
+// instruction stream merely to write an already-disabled debug register.
+#define TTC_STATE_DEBUG_STEP_ACTIVE_OFFSET 0x3358
+// Darwin's Go runtime reaches these two functions while Sentry is resident at
+// EL1. The host publishes their process-local PCs plus a counter-to-realtime
+// calibration so the monitor can provide the Linux-VDSO-equivalent fast path
+// without returning to Darwin for ordinary runtime clock reads.
+#define TTC_STATE_CLOCK_GETTIME_PC_OFFSET 0x3368
+#define TTC_STATE_MACH_ABSOLUTE_TIME_PC_OFFSET 0x3370
+#define TTC_STATE_TIMEBASE_NUMER_OFFSET 0x3378
+#define TTC_STATE_TIMEBASE_DENOM_OFFSET 0x3380
+#define TTC_STATE_REALTIME_OFFSET_NS_OFFSET 0x3388
 #define TTC_STATE_FP_Q0_OFFSET 0x0008
 
 #define TTC_STATE_STACK_TOP 0x4000
@@ -173,7 +198,10 @@ struct ttc_monitor_control {
   uint64_t pool_aperture_length;
   uint64_t next_asid;
   uint64_t pool_region_count;
-  uint64_t reserved[5];
+  // Head of an intrusive GPA free list. Freed page-table pages store the next
+  // GPA in their first word and are zeroed before reuse.
+  uint64_t free_page_gpa;
+  uint64_t reserved[4];
   struct ttc_monitor_pool_region pool[TTC_MONITOR_MAX_POOL_REGIONS];
   struct ttc_monitor_address_space spaces[TTC_MONITOR_MAX_ADDRESS_SPACES];
   struct ttc_monitor_mutation mutations[TTC_MONITOR_MAX_OPERATIONS];

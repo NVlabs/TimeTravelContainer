@@ -87,9 +87,18 @@ allocation slabs, and does not boot a Linux VM. This first backend is a trusted
 workload mode: it deliberately omits Linux host namespaces, seccomp, and
 cgroups, and therefore makes no macOS host-security-boundary claim.
 
-Build the runtime, copy it to its final location, and then ad-hoc sign the
-installed `ttcd`. Signing before a copy is insufficient on macOS versions that
-validate the installed inode independently:
+Use the installer to build, copy, and ad-hoc sign `ttcd` at its final path. It
+defaults to `../bin`; pass a destination directory as its first argument and
+set `BAZEL` when Bazel is not in `PATH`:
+
+```sh
+BAZEL=/path/to/bazel tools/ttc/install_macos.sh ~/projects/ttc-macos/bin
+```
+
+For a manual installation, copy the runtime first and then sign the installed
+`ttcd`. A plain Bazel output has only a linker signature and cannot use
+Hypervisor.framework. Signing before a copy is insufficient on macOS versions
+that validate the installed inode independently:
 
 ```sh
 bazel build //runsc/ttc:ttc //runsc/ttcd:ttcd

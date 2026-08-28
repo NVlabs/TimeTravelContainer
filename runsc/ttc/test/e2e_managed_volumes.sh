@@ -379,7 +379,9 @@ ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
 ttc fork "$SECOND@main" f1 >/dev/null
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
-ttc daemon stop >/dev/null
+# The daemon deliberately refuses to strand active families unless shutdown
+# policy is explicit. Stop them durably before exercising daemon restart.
+ttc daemon stop --stop-all >/dev/null
 ttc "$@"
 ttc start "$MAIN" >/dev/null
 ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'

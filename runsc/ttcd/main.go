@@ -22,10 +22,12 @@ import (
 
 	"gvisor.dev/gvisor/runsc/cli/maincli"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
+	"gvisor.dev/gvisor/runsc/ttc/copyguest"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 func main() {
+	cmd.SetGuestCopyHelper(copyguest.Binary())
 	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true

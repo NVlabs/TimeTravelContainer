@@ -2237,7 +2237,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc start [--attach] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
+		return errors.New("usage: ttc start [--attach] (CONTAINER|CONTAINER@BRANCH) [(CONTAINER|CONTAINER@BRANCH)...]")
 	}
 	if *interactive && !*attach {
 		return errors.New("--interactive requires --attach")
@@ -2246,7 +2246,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 		return errors.New("--attach supports exactly one container")
 	}
 	for _, value := range fs.Args() {
-		target, err := parseSelector(value)
+		target, err := parseSelectorOrMain(value)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
@@ -2258,7 +2258,9 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 			return exitStatus{code: status}
 		}
 		if !*attach {
-			fmt.Fprintln(stdout, target)
+			// Match Docker's output shape for an unqualified main-container
+			// operand while retaining the explicit branch for TTC callers.
+			fmt.Fprintln(stdout, value)
 		}
 	}
 	return nil
@@ -4612,18 +4614,26 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	fs.IntVar(&timeout, "time", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "timeout", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "t", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	// Restart already escalates to SIGKILL after the configured timeout. Accept
+	// Docker/TTC's historical --force spelling as an explicit acknowledgement
+	// of that behavior.
+	fs.Bool("force", false, "force termination after the graceful timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc restart [--time SECONDS] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
+		return errors.New("usage: ttc restart [--force] [--time SECONDS] (CONTAINER|CONTAINER@BRANCH) [(CONTAINER|CONTAINER@BRANCH)...]")
 	}
 	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
 	if timeoutSet && timeout < -1 {
 		return errors.New("restart timeout must be -1 or greater")
 	}
 	for _, value := range fs.Args() {
-		targets, err := branchOperationTargets(value, backend, false)
+		selected, err := parseSelectorOrMain(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
+		}
+		targets, err := branchOperationTargets(selected.String(), backend, false)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
@@ -4655,7 +4665,7 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if status != 0 {
 			return exitStatus{code: status}
 		}
-		fmt.Fprintln(stdout, target.selector)
+		fmt.Fprintln(stdout, value)
 	}
 	return nil
 }
@@ -4886,6 +4896,19 @@ func parseSelector(value string) (selector, error) {
 		return selector{}, errors.New("branch name must not be empty")
 	}
 	return selector{container: parts[0], branch: parts[1]}, nil
+}
+
+// parseSelectorOrMain preserves Docker's main-container lifecycle surface for
+// commands such as `ttc start ID`, while parseSelector remains strict for TTC
+// operations that must identify one branch explicitly.
+func parseSelectorOrMain(value string) (selector, error) {
+	if strings.Contains(value, "@") {
+		return parseSelector(value)
+	}
+	if value == "" {
+		return selector{}, errors.New("container name or ID must not be empty")
+	}
+	return selector{container: value, branch: defaultBranchID}, nil
 }
 
 type execSelector struct {
@@ -8523,6 +8546,12 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 		readyWriter.Close()
 		return fmt.Errorf("starting published port %s: %w", endpoint, err)
 	}
+	if err := recordPortSidecarPID(lockFile, command.Process.Pid); err != nil {
+		readyWriter.Close()
+		command.Process.Kill()
+		command.Wait()
+		return fmt.Errorf("recording published-port process: %w", err)
+	}
 	if err := readyWriter.Close(); err != nil {
 		command.Process.Kill()
 		command.Wait()
@@ -8608,57 +8637,26 @@ func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, e
 	return append([]ttcbundle.PortBinding(nil), info.PublishedPorts...), nil
 }
 
-func portForwardProcessMatches(pid int, container, branch, endpoint string) bool {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-	if err != nil {
-		return false
+func recordPortSidecarPID(lockFile *os.File, pid int) error {
+	if err := lockFile.Truncate(0); err != nil {
+		return err
 	}
-	fields := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
-	want := map[string]bool{
-		"port-forward":       false,
-		"--branch=" + branch: false,
-		container:            false,
-		endpoint:             false,
+	if _, err := lockFile.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
-	for _, field := range fields {
-		if _, ok := want[field]; ok {
-			want[field] = true
-		}
+	if _, err := fmt.Fprintf(lockFile, "%d\n", pid); err != nil {
+		return err
 	}
-	for _, found := range want {
-		if !found {
-			return false
-		}
-	}
-	return true
+	return lockFile.Sync()
 }
 
 func portLockHolder(lockPath, container, branch, endpoint string) (int, error) {
-	want, err := os.Stat(lockPath)
-	if err != nil {
-		return 0, err
-	}
-	processes, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	for _, process := range processes {
-		pid, err := strconv.Atoi(process.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		fds, err := os.ReadDir(filepath.Join("/proc", process.Name(), "fd"))
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			info, err := os.Stat(filepath.Join("/proc", process.Name(), "fd", fd.Name()))
-			if err == nil && os.SameFile(want, info) && portForwardProcessMatches(pid, container, branch, endpoint) {
-				return pid, nil
-			}
+	if data, err := os.ReadFile(lockPath); err == nil {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && pid > 0 && pid != os.Getpid() && portForwardProcessMatches(pid, container, branch, endpoint) {
+			return pid, nil
 		}
 	}
-	return 0, fmt.Errorf("published-port lock is held by an unknown process")
+	return legacyPortLockHolder(lockPath, container, branch, endpoint)
 }
 
 func waitForPortLock(file *os.File, timeout time.Duration) error {
@@ -8860,6 +8858,38 @@ func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]b
 		return nil, err
 	}
 	return output, nil
+}
+
+// pipeReaderForBytes returns a file descriptor that yields data and a
+// completion function that closes the reader and reports the asynchronous
+// writer's result. Writing must be concurrent with the command that consumes
+// the descriptor: configuration payloads can exceed the kernel pipe buffer.
+// The completion function is idempotent and must always be called.
+func pipeReaderForBytes(data []byte) (*os.File, func() error, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, writeErr := writer.Write(data)
+		if closeErr := writer.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		done <- writeErr
+	}()
+	var (
+		once      sync.Once
+		finishErr error
+	)
+	finish := func() error {
+		once.Do(func() {
+			_ = reader.Close()
+			finishErr = <-done
+		})
+		return finishErr
+	}
+	return reader, finish, nil
 }
 
 func familyNodeID(info ttcbundle.ContainerInfo) string {
@@ -10598,19 +10628,11 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err != nil {
 		return err
 	}
-	configReader, configWriter, err := os.Pipe()
+	configReader, finishConfig, err := pipeReaderForBytes(encoded)
 	if err != nil {
 		return err
 	}
-	if _, err := configWriter.Write(encoded); err != nil {
-		configReader.Close()
-		configWriter.Close()
-		return err
-	}
-	if err := configWriter.Close(); err != nil {
-		configReader.Close()
-		return err
-	}
+	defer finishConfig()
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	if sparse {
@@ -10629,9 +10651,12 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
-	configReader.Close()
+	configErr := finishConfig()
 	if err != nil {
 		return fmt.Errorf("installing dehydration image: %w", err)
+	}
+	if configErr != nil {
+		return fmt.Errorf("supplying dehydration configuration: %w", configErr)
 	}
 	// commandWithFiles has transferred the metadata to the Sentry. Close our
 	// source descriptor before sparse cleanup; otherwise NFS must silly-rename
@@ -10719,19 +10744,11 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if err != nil {
 		return err
 	}
-	configReader, configWriter, err := os.Pipe()
+	configReader, finishConfig, err := pipeReaderForBytes(encoded)
 	if err != nil {
 		return err
 	}
-	if _, err := configWriter.Write(encoded); err != nil {
-		configReader.Close()
-		configWriter.Close()
-		return err
-	}
-	if err := configWriter.Close(); err != nil {
-		configReader.Close()
-		return err
-	}
+	defer finishConfig()
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	targetStartFD := 5 + len(snapshots)
@@ -10755,9 +10772,12 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
 		info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
-	configReader.Close()
+	configErr := finishConfig()
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
+	}
+	if configErr != nil {
+		return fmt.Errorf("supplying dehydrated-peer configuration: %w", configErr)
 	}
 	_ = metadata.Close()
 	state := "paused"

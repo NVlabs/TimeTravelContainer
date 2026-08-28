@@ -98,8 +98,8 @@ covers:
   `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, JSON
   creation timestamps, and branch-local writable/virtual `ps --size` accounting;
-- attached exec fork rejection while imported host stdio is live, successful
-  fork after the imported resource exits, and detached exec-session ID/PID cloning
+- attached exec live-fork continuity through Sentry-owned branch-local consoles,
+  independent parent/child completion and output, and detached exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
 - user tmpfs copy-on-write isolation between a parent and child branch;
 - tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
@@ -213,7 +213,10 @@ client `TERM` propagation, terminal ioctls, and `exec -it`. It repeats
 quick-exit terminal runs to cover the pre-start console
 follower handshake, verifies that their output is never lost, and requires
 `exec -it` to close promptly after the guest process exits. The 60-second
-`timeout` is a test-wide deadlock guard, not an accepted teardown delay.
+per-operation timeout is a deadlock guard, not an accepted teardown delay. The
+image matrix uses the Linux release requirements on every host: 15 seconds for
+lifecycle and service readiness, and 2 seconds for individual HTTP probes.
+macOS has no correctness-only timeout exception.
 
 The `runsc/boot:boot_test` live-fork coverage also installs the same explicitly
 transient channel waiter used by active TTC port forwarding. It verifies that
@@ -232,8 +235,9 @@ RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 ```
 
 Omit `TTC_UNSAFE_NO_HOST_ISOLATION=1` on a host where `unshare -Ur /bin/true`
-succeeds. The test also requires util-linux `script` and `timeout`. Set
-`TTC_E2E_ROOT` to retain terminal transcripts, console logs, and runtime state.
+succeeds. The test uses util-linux `script` and `timeout` on Linux; on macOS it
+uses BSD `script` and Perl as the timeout fallback. Set `TTC_E2E_ROOT` to retain
+terminal transcripts, console logs, and runtime state.
 
 ## Docker main-container compatibility
 

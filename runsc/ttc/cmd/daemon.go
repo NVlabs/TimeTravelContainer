@@ -82,6 +82,18 @@ var (
 	daemonExecutablePreflight = preflightDaemonExecutable
 )
 
+// newClusterHTTPServer configures the authenticated cluster control plane.
+// ReadHeaderTimeout bounds unauthenticated header reads, while command streams
+// deliberately have no total read or write deadline: an HVF operation can take
+// longer than a fixed request timeout without the connection being idle.
+func newClusterHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+}
+
 type daemonWireOptions struct {
 	Root             string `json:"root"`
 	Runsc            string `json:"runsc"`
@@ -227,6 +239,17 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		}
 	}
 	defer r.lockTarget(tx.Identity.TargetContainer)()
+	if tx.Identity.Migration {
+		// A fast reverse migration can target a node whose previous source
+		// snapshot is still being drained in the background. Shared placement
+		// metadata already says that branch is remote, but its old physical
+		// Sentry must disappear before distributed-restore can reuse the same
+		// container and visible branch IDs. Wait for the prior handoff to become
+		// independent and let normal non-owner cleanup reclaim it.
+		if err := r.awaitMigrationTargetRuntimeRelease(ctx, tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch()); err != nil {
+			return fmt.Errorf("preparing migration target runtime: %w", err)
+		}
+	}
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
@@ -234,6 +257,49 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		SourceNode: tx.Identity.SourceNodeID, Migration: tx.Identity.Migration,
 	})
 	return err
+}
+
+func (r *daemonTargetRuntime) awaitMigrationTargetRuntimeRelease(ctx context.Context, containerID, branchID string) error {
+	const pollInterval = 100 * time.Millisecond
+	var lastCleanupErr error
+	for {
+		cleanupErr := r.backend.cleanupNonOwnedRuntimeBranches()
+		if cleanupErr != nil {
+			lastCleanupErr = cleanupErr
+		}
+		families, err := r.backend.listRuntimeFamilies()
+		if err != nil {
+			return err
+		}
+		present := false
+		for _, family := range families {
+			if family.ID != containerID {
+				continue
+			}
+			for _, branch := range family.Branches {
+				if branch.ID == branchID {
+					present = true
+					break
+				}
+			}
+			break
+		}
+		if !present {
+			return nil
+		}
+		info, err := r.backend.containerStore().LoadContainer(containerID)
+		if err != nil {
+			return err
+		}
+		if info.BranchNodeID(branchID) == r.nodeID {
+			return fmt.Errorf("branch %q is already owned by target node %q", branchID, r.nodeID)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for stale runtime branch %s@%s to be reclaimed: %w", containerID, branchID, errors.Join(ctx.Err(), lastCleanupErr))
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
@@ -332,19 +398,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err != nil {
 			return err
 		}
-		reader, writer, err := os.Pipe()
+		reader, finishConfig, err := pipeReaderForBytes(encoded)
 		if err != nil {
 			return err
 		}
-		if _, err := writer.Write(encoded); err != nil {
-			reader.Close()
-			writer.Close()
-			return err
-		}
-		if err := writer.Close(); err != nil {
-			reader.Close()
-			return err
-		}
+		defer finishConfig()
 		connectionCount := 1
 		if restoreArgs.SharedMetadata {
 			connectionCount = 0
@@ -521,7 +579,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			"--distributed-connections-start-fd="+strconv.Itoa(connectionsStartFD), "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
 			info.ID, "distributed-restore", tx.Identity.TransactionID)
 		_, err = r.backend.commandWithFiles(files, commandArgs...)
-		reader.Close()
+		configErr := finishConfig()
 		if sharedMetadata != nil {
 			sharedMetadata.Close()
 		}
@@ -536,6 +594,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		if err != nil {
 			return err
+		}
+		if configErr != nil {
+			return fmt.Errorf("supplying distributed restore configuration: %w", configErr)
 		}
 		keepDurableTargets = true
 		if runtimeCreated {
@@ -713,7 +774,11 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 				}
 			}
 			if present {
-				if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
+				if len(branches) == 1 {
+					if purgeErr := r.backend.purgeRuntime(info.ID); purgeErr != nil {
+						return fmt.Errorf("purging canceled distributed target family %q: %w", info.ID, purgeErr)
+					}
+				} else if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
 					return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
 				}
 			}
@@ -982,11 +1047,27 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				if failedPolls < 3 {
 					continue
 				}
-				if _, stateErr := r.backend.command("state", containerID); stateErr == nil {
-					continue
+				runtimeState := "unavailable"
+				if stateOutput, stateErr := r.backend.command("state", containerID); stateErr == nil {
+					state, decodeErr := decodeRuntimeStateStatus(stateOutput)
+					if decodeErr != nil {
+						// A transiently unreadable state record is not evidence that a
+						// published target died. Keep polling until runsc reports a
+						// coherent lifecycle state or the control RPC recovers.
+						continue
+					}
+					runtimeState = state
+					if state == "running" {
+						continue
+					}
 				}
-				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
-					"dependent target exited before remote memory drain completed", time.Now())
+				failure := fmt.Sprintf("dependent target exited before remote memory drain completed (runtime state %q)", runtimeState)
+				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed, failure, time.Now())
+				// runsc state succeeds for a dead sandbox and reports "stopped".
+				// Treating any successful state command as liveness previously left
+				// the transaction published forever and the logical branch marked
+				// running, which fenced every later operation behind a dead target.
+				_ = r.backend.containerStore().UpdateDistributedForkTargetState(transactionID, "exited")
 				return
 			}
 			failedPolls = 0
@@ -1028,6 +1109,20 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			return
 		}
 	}()
+}
+
+func decodeRuntimeStateStatus(encoded []byte) (string, error) {
+	var state struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return "", fmt.Errorf("decoding runtime state: %w", err)
+	}
+	state.Status = strings.TrimSpace(strings.ToLower(state.Status))
+	if state.Status == "" {
+		return "", errors.New("runtime state omitted status")
+	}
+	return state.Status, nil
 }
 
 type daemonFrameWriter struct {
@@ -2208,10 +2303,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		server.clusterDirectory = clusterRuntime.directory
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
-		clusterServer = &http.Server{
-			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
-		}
+		clusterServer = newClusterHTTPServer(clusterRuntime.controlPlane)
 		tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
 		go func() {
 			err := clusterServer.Serve(tlsListener)
@@ -3014,6 +3106,7 @@ func daemonCommandUsesStdin(args []string) bool {
 
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	var err error
+	args = normalizeDaemonEnvironmentImports(args)
 	args, err = normalizeDaemonImageArchivePaths(args)
 	if err != nil {
 		return 1, err
@@ -3066,6 +3159,64 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		return 1, fmt.Errorf("daemon mutation request %s: %w", request.RequestID, lastErr)
 	}
 	return 1, lastErr
+}
+
+// normalizeDaemonEnvironmentImports resolves --env NAME in the invoking ttc
+// process. The daemon may have been started before NAME was exported and must
+// not substitute its own environment for the client's.
+func normalizeDaemonEnvironmentImports(args []string) []string {
+	command := 0
+	if len(args) != 0 && args[0] == "container" {
+		command = 1
+	}
+	if command >= len(args) || (args[command] != "run" && args[command] != "create") {
+		return args
+	}
+	result := append([]string(nil), args...)
+	valueFlags := map[string]bool{
+		"--name": true, "--pull": true, "--workdir": true, "-w": true,
+		"--user": true, "-u": true, "--hostname": true, "-h": true,
+		"--network": true, "--net": true, "--ip": true, "--mac-address": true,
+		"--publish": true, "-p": true, "--add-host": true, "--dns": true,
+		"--dns-search": true, "--dns-option": true, "--dns-opt": true,
+		"--entrypoint": true, "--stop-signal": true, "--stop-timeout": true,
+		"--pids-limit": true, "--memory": true, "-m": true, "--cpus": true,
+		"--cpu-shares": true, "--cpu-period": true, "--cpu-quota": true,
+		"--shm-size": true, "--group-add": true, "--cap-add": true,
+		"--cap-drop": true, "--ulimit": true, "--env": true, "-e": true,
+		"--env-file": true, "--label": true, "-l": true, "--label-file": true,
+		"--volume": true, "-v": true, "--mount": true, "--tmpfs": true,
+		"--log-driver": true, "--log-opt": true,
+	}
+	resolve := func(value string) string {
+		if strings.Contains(value, "=") {
+			return value
+		}
+		if hostValue, ok := os.LookupEnv(value); ok {
+			return value + "=" + hostValue
+		}
+		return value
+	}
+	for i := command + 1; i < len(result); i++ {
+		arg := result[i]
+		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
+			break
+		}
+		switch {
+		case arg == "--env" || arg == "-e":
+			if i+1 < len(result) {
+				i++
+				result[i] = resolve(result[i])
+			}
+		case strings.HasPrefix(arg, "--env="):
+			result[i] = "--env=" + resolve(strings.TrimPrefix(arg, "--env="))
+		case strings.HasPrefix(arg, "-e="):
+			result[i] = "-e=" + resolve(strings.TrimPrefix(arg, "-e="))
+		case valueFlags[arg]:
+			i++
+		}
+	}
+	return result
 }
 
 // normalizeDaemonImageArchivePaths gives load/save the same client-relative

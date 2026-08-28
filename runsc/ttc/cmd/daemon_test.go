@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,22 @@ func shortDaemonTestSocket(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "ttcd.sock")
+}
+
+func TestClusterHTTPServerAllowsLongStreamingCommands(t *testing.T) {
+	server := newClusterHTTPServer(http.NotFoundHandler())
+	if got, want := server.ReadHeaderTimeout, 5*time.Second; got != want {
+		t.Errorf("ReadHeaderTimeout=%s, want %s", got, want)
+	}
+	if server.ReadTimeout != 0 {
+		t.Errorf("ReadTimeout=%s, want no total request deadline", server.ReadTimeout)
+	}
+	if server.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout=%s, want no total response deadline", server.WriteTimeout)
+	}
+	if got, want := server.IdleTimeout, time.Minute; got != want {
+		t.Errorf("IdleTimeout=%s, want %s", got, want)
+	}
 }
 
 func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
@@ -630,6 +647,26 @@ func TestNormalizeDaemonImageArchivePaths(t *testing.T) {
 	}
 }
 
+func TestNormalizeDaemonEnvironmentImports(t *testing.T) {
+	t.Setenv("TTC_TEST_CLIENT_ENV", "from-client")
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"run", "-e", "TTC_TEST_CLIENT_ENV", "alpine"}, []string{"run", "-e", "TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"create", "--name", "demo", "--env=TTC_TEST_CLIENT_ENV", "alpine"}, []string{"create", "--name", "demo", "--env=TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"container", "run", "-e=TTC_TEST_CLIENT_ENV", "alpine"}, []string{"container", "run", "-e=TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"run", "--env", "TTC_TEST_CLIENT_ENV=explicit", "alpine"}, []string{"run", "--env", "TTC_TEST_CLIENT_ENV=explicit", "alpine"}},
+		{[]string{"run", "--env", "TTC_TEST_MISSING_ENV", "alpine"}, []string{"run", "--env", "TTC_TEST_MISSING_ENV", "alpine"}},
+		{[]string{"run", "alpine", "sh", "-c", "echo", "--env", "TTC_TEST_CLIENT_ENV"}, []string{"run", "alpine", "sh", "-c", "echo", "--env", "TTC_TEST_CLIENT_ENV"}},
+		{[]string{"exec", "-e", "TTC_TEST_CLIENT_ENV", "demo@main", "true"}, []string{"exec", "-e", "TTC_TEST_CLIENT_ENV", "demo@main", "true"}},
+	} {
+		if got := normalizeDaemonEnvironmentImports(test.args); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("normalizeDaemonEnvironmentImports(%q)=%q, want %q", test.args, got, test.want)
+		}
+	}
+}
+
 func TestDaemonCommandNeedsMutationLock(t *testing.T) {
 	for _, test := range []struct {
 		args []string
@@ -1018,5 +1055,30 @@ func TestAdaptivePrefetchControllerAccumulatesLocalitySamples(t *testing.T) {
 	behind, ahead, changed := controller.observe(status, now.Add(120*time.Millisecond))
 	if !changed || behind != 0 || ahead != controller.maxAhead {
 		t.Fatalf("accumulated sequential update=(%d,%d,%t)", behind, ahead, changed)
+	}
+}
+
+func TestDecodeRuntimeStateStatusDistinguishesStoppedSandbox(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		encoded string
+		want    string
+		wantErr bool
+	}{
+		{name: "running", encoded: `{"status":"running","pid":123}`, want: "running"},
+		{name: "stopped", encoded: `{"status":"stopped","pid":-1}`, want: "stopped"},
+		{name: "normalized", encoded: `{"status":" Paused "}`, want: "paused"},
+		{name: "missing", encoded: `{"pid":123}`, wantErr: true},
+		{name: "malformed", encoded: `{`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := decodeRuntimeStateStatus([]byte(test.encoded))
+			if (err != nil) != test.wantErr {
+				t.Fatalf("decodeRuntimeStateStatus(%q)=(%q,%v), want error=%t", test.encoded, got, err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("decodeRuntimeStateStatus(%q)=%q, want %q", test.encoded, got, test.want)
+			}
+		})
 	}
 }

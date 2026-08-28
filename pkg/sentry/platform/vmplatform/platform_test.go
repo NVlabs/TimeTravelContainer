@@ -41,6 +41,12 @@ func (*relocationTestVM) Close() error { return nil }
 
 type relocationTestVCPU struct{ vm *relocationTestVM }
 
+func TestMapUnitFitsOneMonitorTransaction(t *testing.T) {
+	if got, want := (&Platform{}).MapUnit(), uint64(monitorabi.MaxOperations*hostarch.PageSize); got != want {
+		t.Fatalf("MapUnit = %#x, want one monitor transaction (%#x)", got, want)
+	}
+}
+
 func (v relocationTestVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
 	command, err := monitorabi.UnmarshalCommand(encoded)
 	if err != nil {

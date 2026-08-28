@@ -592,7 +592,11 @@ func (fs *filesystem) Release(ctx context.Context) {
 	}
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.mu.Lock()
-	if fs.root.inode.isDir() {
+	// GetFilesystem installs root only after a managed-volume root has loaded.
+	// An error during that load drops the partially initialized Filesystem and
+	// reaches Release with root == nil; cleanup must preserve the original mount
+	// error instead of replacing it with a nil-pointer panic.
+	if fs.root != nil && fs.root.inode.isDir() {
 		fs.root.releaseChildrenLocked(ctx)
 	}
 	if fs.ovlWhiteout != nil {

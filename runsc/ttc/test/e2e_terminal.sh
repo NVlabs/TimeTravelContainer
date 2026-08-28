@@ -33,8 +33,7 @@ fail() {
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
 [ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
-command -v script >/dev/null 2>&1 || fail "util-linux script is required"
-command -v timeout >/dev/null 2>&1 || fail "timeout is required"
+command -v script >/dev/null 2>&1 || fail "script is required"
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required"
   unshare -Ur /bin/true >/dev/null 2>&1 || fail "rootless user namespaces are unavailable; set TTC_UNSAFE_NO_HOST_ISOLATION=1 only for trusted workloads"
@@ -69,10 +68,52 @@ ttc() {
     "$@"
 }
 
+run_with_timeout() {
+  seconds=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    return
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+    return
+  fi
+  command -v perl >/dev/null 2>&1 || fail "timeout, gtimeout, or perl is required"
+  perl -e '
+    use POSIX qw(:sys_wait_h);
+    my $seconds = shift @ARGV;
+    my $pid = fork();
+    die "fork: $!\n" unless defined $pid;
+    if ($pid == 0) {
+      exec @ARGV;
+      die "exec $ARGV[0]: $!\n";
+    }
+    $SIG{ALRM} = sub {
+      kill "TERM", $pid;
+      select undef, undef, undef, 1;
+      kill "KILL", $pid;
+      exit 124;
+    };
+    alarm $seconds;
+    waitpid($pid, 0);
+    my $status = $?;
+    alarm 0;
+    exit(WIFEXITED($status) ? WEXITSTATUS($status) : 128 + WTERMSIG($status));
+  ' "$seconds" "$@"
+}
+
 run_pty() {
   transcript=$1
   command=$2
-  timeout 60 script -qec "$TTC_COMMAND $command" "$transcript"
+  case "$(uname -s)" in
+    Darwin)
+      run_with_timeout 60 script -q "$transcript" /bin/sh -c "$TTC_COMMAND $command"
+      ;;
+    *)
+      run_with_timeout 60 script -qec "$TTC_COMMAND $command" "$transcript"
+      ;;
+  esac
 }
 
 cleanup() {

@@ -30,19 +30,32 @@ import (
 	vmarm64 "gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/arm64"
 )
 
-const hvfIPASize = uint64(1 << 40)
+const (
+	hvfIPASize        = uint64(1 << 40)
+	hvfVCPUOvercommit = 3
+)
 
 type constructor struct{}
 
+func hvfApplicationVCPUs(applicationCores int) int {
+	vcpus := hvfbackend.MaxApplicationVCPUs
+	if applicationCores <= hvfbackend.MaxApplicationVCPUs/hvfVCPUOvercommit {
+		vcpus = applicationCores * hvfVCPUOvercommit
+	}
+	return vcpus
+}
+
 func (*constructor) New(opts sentryplatform.Options) (sentryplatform.Platform, error) {
 	backend := hvfbackend.NewBackend()
-	vcpus := opts.ApplicationCores
-	if vcpus <= 0 {
-		vcpus = runtime.NumCPU()
+	applicationCores := opts.ApplicationCores
+	if applicationCores <= 0 {
+		applicationCores = runtime.NumCPU()
 	}
-	if vcpus > 64 {
-		vcpus = 64
-	}
+	// Match KVM's application-vCPU admission headroom. HVF vCPUs are
+	// owner-thread affine and therefore cannot be stolen by a waiting Sentry
+	// task; extra lazily-created IDs keep syscall-heavy tasks from monopolizing
+	// every execution slot and delaying exec or fork control work.
+	vcpus := hvfApplicationVCPUs(applicationCores)
 	config := vmplatform.Config{
 		NewVM:           backend.CreateVM,
 		HostMemory:      backend.HostMemory(),

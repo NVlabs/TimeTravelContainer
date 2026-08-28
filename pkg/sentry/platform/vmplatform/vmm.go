@@ -47,6 +47,7 @@ const (
 	ExitUnknown     = vmm.ExitUnknown
 	ExitSyscall     = vmm.ExitSyscall
 	ExitFault       = vmm.ExitFault
+	ExitException   = vmm.ExitException
 	ExitInterrupted = vmm.ExitInterrupted
 	ExitShutdown    = vmm.ExitShutdown
 )

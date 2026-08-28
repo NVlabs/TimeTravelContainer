@@ -140,8 +140,17 @@ type GuestRAM struct {
 	backings      map[uint64]*guestBacking
 	frames        map[pgalloc.FrameID]*guestFrame
 	slabs         map[slabKey]*guestSlab
-	logicalBytes  uint64
-	logicalLimit  uint64
+	// partialSlabs contains exactly the non-releasing slabs with at least one
+	// free 4K frame. Full page-cache slabs are deliberately absent so that
+	// choosing an allocation target does not become O(total resident memory).
+	partialSlabs map[slabKey]*guestSlab
+	// allocationSlab caches the densest non-full slab. Allocation increases
+	// its occupancy, so it remains optimal until full. Decommit updates or
+	// invalidates it while holding mu. This avoids scanning every live slab for
+	// every 4K allocation in exec-heavy workloads with a large page cache.
+	allocationSlab *guestSlab
+	logicalBytes   uint64
+	logicalLimit   uint64
 }
 
 type guestMappingLease struct {
@@ -168,18 +177,19 @@ func NewGuestRAM(config GuestRAMConfig) (*GuestRAM, error) {
 		return nil, fmt.Errorf("IPA range overflows")
 	}
 	r := &GuestRAM{
-		vm:        config.VM,
-		host:      config.Host,
-		revoker:   config.Revoker,
-		relocator: config.Relocator,
-		rollover:  config.Rollover,
-		ipaStart:  config.IPAStart,
-		ipaSize:   config.IPASize,
-		nextGPA:   config.IPAStart,
-		epoch:     1,
-		backings:  make(map[uint64]*guestBacking),
-		frames:    make(map[pgalloc.FrameID]*guestFrame),
-		slabs:     make(map[slabKey]*guestSlab),
+		vm:           config.VM,
+		host:         config.Host,
+		revoker:      config.Revoker,
+		relocator:    config.Relocator,
+		rollover:     config.Rollover,
+		ipaStart:     config.IPAStart,
+		ipaSize:      config.IPASize,
+		nextGPA:      config.IPAStart,
+		epoch:        1,
+		backings:     make(map[uint64]*guestBacking),
+		frames:       make(map[pgalloc.FrameID]*guestFrame),
+		slabs:        make(map[slabKey]*guestSlab),
+		partialSlabs: make(map[slabKey]*guestSlab),
 	}
 	r.cond = sync.NewCond(&r.mu)
 	return r, nil
@@ -392,12 +402,56 @@ func slabOccupancy(slab *guestSlab) uint64 {
 	return occupied
 }
 
+func betterAllocationSlab(candidate, current *guestSlab) bool {
+	if candidate == nil || candidate.releasing {
+		return false
+	}
+	candidateOccupancy := slabOccupancy(candidate)
+	if candidateOccupancy >= FramesPerSlab {
+		return false
+	}
+	if current == nil || current.releasing {
+		return true
+	}
+	currentOccupancy := slabOccupancy(current)
+	return candidateOccupancy > currentOccupancy ||
+		candidateOccupancy == currentOccupancy && candidate.key < current.key
+}
+
+func (r *GuestRAM) considerAllocationSlabLocked(candidate *guestSlab) {
+	if candidate == nil {
+		return
+	}
+	if candidate.releasing || slabOccupancy(candidate) >= FramesPerSlab {
+		delete(r.partialSlabs, candidate.key)
+		if r.allocationSlab == candidate {
+			r.allocationSlab = nil
+		}
+		return
+	}
+	if r.partialSlabs == nil {
+		r.partialSlabs = make(map[slabKey]*guestSlab)
+	}
+	r.partialSlabs[candidate.key] = candidate
+	if betterAllocationSlab(candidate, r.allocationSlab) {
+		r.allocationSlab = candidate
+	}
+}
+
+func (r *GuestRAM) selectAllocationSlabLocked() *guestSlab {
+	if r.allocationSlab != nil && !r.allocationSlab.releasing && slabOccupancy(r.allocationSlab) < FramesPerSlab {
+		return r.allocationSlab
+	}
+	r.allocationSlab = nil
+	for _, candidate := range r.partialSlabs {
+		r.considerAllocationSlabLocked(candidate)
+	}
+	return r.allocationSlab
+}
+
 func (r *GuestRAM) freeSlotsLocked(_ *guestBacking) uint64 {
 	var free uint64
-	for _, slab := range r.slabs {
-		if slab.releasing {
-			continue
-		}
+	for _, slab := range r.partialSlabs {
 		for _, frame := range slab.frames {
 			if frame == nil {
 				free++
@@ -408,16 +462,7 @@ func (r *GuestRAM) freeSlotsLocked(_ *guestBacking) uint64 {
 }
 
 func (r *GuestRAM) allocateFrameLocked(backing *guestBacking, offset uint64) (*guestFrame, error) {
-	var slab *guestSlab
-	var occupancy uint64
-	for _, candidate := range r.slabs {
-		candidateOccupancy := slabOccupancy(candidate)
-		if !candidate.releasing && candidateOccupancy < FramesPerSlab &&
-			(slab == nil || candidateOccupancy > occupancy || candidateOccupancy == occupancy && candidate.key < slab.key) {
-			slab = candidate
-			occupancy = candidateOccupancy
-		}
-	}
+	slab := r.selectAllocationSlabLocked()
 	if slab == nil {
 		var err error
 		slab, err = r.allocateSlabLocked()
@@ -445,6 +490,7 @@ func (r *GuestRAM) allocateFrameLocked(backing *guestBacking, offset uint64) (*g
 		slab:     slab,
 	}
 	slab.frames[slot] = frame
+	r.considerAllocationSlabLocked(slab)
 	backing.frames[offset] = frame
 	r.frames[frame.id] = frame
 	r.logicalBytes += GuestFrameSize
@@ -478,6 +524,7 @@ func (r *GuestRAM) allocateSlabLocked() (*guestSlab, error) {
 		gpa:         gpa,
 	}
 	r.slabs[slab.key] = slab
+	r.considerAllocationSlabLocked(slab)
 	return slab, nil
 }
 
@@ -568,18 +615,29 @@ func (b *guestBacking) Decommit(fr memmap.FileRange) error {
 			return err
 		}
 	}
+	selectedTouched := false
 	for _, frame := range deactivated {
 		for _, ref := range refs[frame.id] {
 			delete(frame.mappings, ref)
+		}
+		if frame.slab == b.ram.allocationSlab {
+			selectedTouched = true
 		}
 		frame.slab.frames[frame.slot] = nil
 		delete(frame.backing.frames, frame.offset)
 		delete(b.ram.frames, frame.id)
 	}
 	var releases []slabRelease
+	if selectedTouched {
+		b.ram.allocationSlab = nil
+	}
+	for slab := range touched {
+		b.ram.considerAllocationSlabLocked(slab)
+	}
 	for slab := range touched {
 		if slabEmpty(slab) && !slab.releasing {
 			slab.releasing = true
+			b.ram.considerAllocationSlabLocked(slab)
 			releases = append(releases, slabRelease{slab: slab, refs: slabRefs(slab)})
 		}
 	}
@@ -637,6 +695,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 			r.mu.Lock()
 			for _, release := range releases {
 				release.slab.releasing = false
+				r.considerAllocationSlabLocked(release.slab)
 			}
 			r.cond.Broadcast()
 			r.mu.Unlock()
@@ -646,6 +705,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 			r.mu.Lock()
 			for _, release := range releases {
 				release.slab.releasing = false
+				r.considerAllocationSlabLocked(release.slab)
 			}
 			r.cond.Broadcast()
 			r.mu.Unlock()
@@ -660,6 +720,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 		if r.slabs[slab.key] != slab || !slab.releasing || !slabEmpty(slab) {
 			for _, rollback := range releases {
 				rollback.slab.releasing = false
+				r.considerAllocationSlabLocked(rollback.slab)
 			}
 			r.cond.Broadcast()
 			return fmt.Errorf("GuestRAM slab changed during release")
@@ -672,6 +733,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 	clearReleasing := func(releases []slabRelease) {
 		for _, release := range releases {
 			release.slab.releasing = false
+			r.considerAllocationSlabLocked(release.slab)
 		}
 	}
 	remap := func(releases []slabRelease) error {
@@ -685,6 +747,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 				continue
 			}
 			slab.releasing = false
+			r.considerAllocationSlabLocked(slab)
 		}
 		return firstErr
 	}
@@ -733,6 +796,10 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 				return fmt.Errorf("releasing GuestRAM slab host reservation: %w", err)
 			}
 			delete(r.slabs, slab.key)
+			delete(r.partialSlabs, slab.key)
+			if r.allocationSlab == slab {
+				r.allocationSlab = nil
+			}
 		}
 		groupStart = groupEnd
 	}
@@ -922,6 +989,11 @@ func (r *GuestRAM) Compact(ctx context.Context) (GuestRAMCompaction, error) {
 			source.releasing = true
 			releases = append(releases, slabRelease{slab: source})
 		}
+	}
+	r.allocationSlab = nil
+	r.partialSlabs = make(map[slabKey]*guestSlab)
+	for _, slab := range r.slabs {
+		r.considerAllocationSlabLocked(slab)
 	}
 	r.cond.Broadcast()
 	r.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -132,6 +133,59 @@ func checkDaemonPeer(conn net.Conn) error {
 
 func setTTCCommandParentDeathSignal(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+}
+
+func portForwardProcessMatches(pid int, container, branch, endpoint string) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	if err != nil {
+		return false
+	}
+	fields := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+	want := map[string]bool{
+		"port-forward":       false,
+		"--branch=" + branch: false,
+		container:            false,
+		endpoint:             false,
+	}
+	for _, field := range fields {
+		if _, ok := want[field]; ok {
+			want[field] = true
+		}
+	}
+	for _, found := range want {
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func legacyPortLockHolder(lockPath, container, branch, endpoint string) (int, error) {
+	want, err := os.Stat(lockPath)
+	if err != nil {
+		return 0, err
+	}
+	processes, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	for _, process := range processes {
+		pid, err := strconv.Atoi(process.Name())
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		fds, err := os.ReadDir(filepath.Join("/proc", process.Name(), "fd"))
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			info, err := os.Stat(filepath.Join("/proc", process.Name(), "fd", fd.Name()))
+			if err == nil && os.SameFile(want, info) && portForwardProcessMatches(pid, container, branch, endpoint) {
+				return pid, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("published-port lock is held by an unknown process")
 }
 
 // currentNodeMemoryBytes prefers the containing cgroup because Sentries are

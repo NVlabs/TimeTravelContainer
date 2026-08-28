@@ -39,6 +39,40 @@ type VMEngine interface {
 	Close() error
 }
 
+// ApplicationResidencyEngine is implemented by VM engines whose application
+// vCPU is owned by the host thread running the Sentry task. vmplatform keeps a
+// residency across consecutive application entries and the intervening Linux
+// syscall handling. Residency preserves the owner/vCPU association; it does not
+// require the syscall handler itself to remain inside the VM. It ends immediately
+// before the task blocks or changes execution identity.
+//
+// This is intentionally optional. Engines without owner-affine vCPUs retain
+// the ordinary per-Switch lifecycle.
+type ApplicationResidencyEngine interface {
+	VMEngine
+	BeginApplicationResidency()
+	EndApplicationResidency() error
+}
+
+// ApplicationResidencyYieldEngine optionally asks vmplatform to end the
+// current owner-thread residency after an application exit. Engines use this
+// to provide fair vCPU handoff under contention without adding work to their
+// uncontended syscall path. The decision and quantum remain backend policy;
+// vmplatform only performs the owner-thread lifecycle operation.
+type ApplicationResidencyYieldEngine interface {
+	ApplicationResidencyEngine
+	ShouldYieldApplicationResidency() bool
+}
+
+// ApplicationFaultResidencyEngine is optionally implemented by owner-affine
+// engines that can retain a vCPU while Sentry resolves an application fault.
+// Implementations must bound retained fault residencies so slow or remote
+// fault handling cannot exhaust the execution pool.
+type ApplicationFaultResidencyEngine interface {
+	ApplicationResidencyEngine
+	ShouldRetainApplicationFaultResidency() bool
+}
+
 // VMEngineFactory constructs the execution policy for a VM epoch. A fresh
 // engine is constructed whenever the disposable VM epoch is rebuilt.
 type VMEngineFactory func(VM, int) (VMEngine, error)

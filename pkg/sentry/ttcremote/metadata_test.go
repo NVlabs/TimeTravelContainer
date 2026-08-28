@@ -36,6 +36,7 @@ func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
 		TargetBranchID:    "worker-b",
 		KernelMetadata:    bytes.Repeat([]byte{0x31}, 70<<10),
 		AllocatorMetadata: bytes.Repeat([]byte{0xa7}, 19<<10),
+		ExecSessions:      []byte(`[{"id":"build","pid":7}]`),
 		LoadRanges: []pgalloc.RemoteLoadRange{
 			{Target: memmap.FileRange{Start: 0x1000, End: 0x9000}, StreamOffset: 0},
 			{Target: memmap.FileRange{Start: 0x20000, End: 0x24000}, StreamOffset: 0x8000},
@@ -49,7 +50,7 @@ func TestSessionMetadataRoundTripAndIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	limits := SessionMetadataLimits{MaxTotalBytes: 1 << 20, MaxKernelBytes: 128 << 10, MaxAllocatorBytes: 64 << 10, MaxLoadRanges: 10}
+	limits := SessionMetadataLimits{MaxTotalBytes: 1 << 20, MaxKernelBytes: 128 << 10, MaxAllocatorBytes: 64 << 10, MaxExecBytes: 64 << 10, MaxLoadRanges: 10}
 	got, err := UnmarshalSessionMetadata(encoded, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +72,7 @@ func TestSessionMetadataDecodeLimits(t *testing.T) {
 	}
 	if _, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimits{
 		MaxTotalBytes: uint64(len(encoded)), MaxKernelBytes: 1024,
-		MaxAllocatorBytes: 4096, MaxLoadRanges: 1,
+		MaxAllocatorBytes: 4096, MaxExecBytes: 4096, MaxLoadRanges: 1,
 	}); err == nil {
 		t.Fatal("oversized Kernel metadata passed decode limits")
 	}

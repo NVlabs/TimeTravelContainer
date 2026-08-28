@@ -337,6 +337,51 @@ func TestGuestRAMPacksFramesAcrossBackingLifetimes(t *testing.T) {
 	}
 }
 
+func TestGuestRAMIndexesOnlyPartialSlabs(t *testing.T) {
+	ram, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	frames, err := backing.ResolveFrames(memmap.FileRange{Start: 0, End: 2 * HostSlabSize}, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ram.mu.Lock()
+	if got := len(ram.partialSlabs); got != 0 {
+		ram.mu.Unlock()
+		t.Fatalf("partial slab count after filling two slabs = %d, want 0", got)
+	}
+	ram.mu.Unlock()
+
+	if err := backing.Decommit(memmap.FileRange{Start: 0, End: GuestFrameSize}); err != nil {
+		t.Fatal(err)
+	}
+	ram.mu.Lock()
+	if got := len(ram.partialSlabs); got != 1 {
+		ram.mu.Unlock()
+		t.Fatalf("partial slab count after creating one hole = %d, want 1", got)
+	}
+	ram.mu.Unlock()
+
+	second, err := ram.NewBacking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		t.Fatal(err)
+	}
+	reused, err := second.ResolveFrames(memmap.FileRange{Start: 0, End: GuestFrameSize}, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused[0].GPA != frames[0].GPA {
+		t.Fatalf("replacement frame GPA = %#x, want dense reuse of %#x", reused[0].GPA, frames[0].GPA)
+	}
+	ram.mu.Lock()
+	if got := len(ram.partialSlabs); got != 0 {
+		ram.mu.Unlock()
+		t.Fatalf("partial slab count after refilling hole = %d, want 0", got)
+	}
+	ram.mu.Unlock()
+}
+
 func TestGuestRAMCompactionRelocatesStableFramesAndReleasesSlab(t *testing.T) {
 	ram, backing, vm, host, _ := newRAMTestBacking(t, 1<<20)
 	relocator := &ramTestRelocator{}
@@ -579,6 +624,50 @@ func TestGuestRAMMemoryFileAsyncSaveRestoreUsesLeasedMappings(t *testing.T) {
 	target.Destroy()
 	source.DecRef(fr)
 	source.Destroy()
+}
+
+func TestGuestRAMMemoryFileSavePreservesSparseAndResidentUnknownPages(t *testing.T) {
+	host := newStagingTestHost()
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: host, IPAStart: 0x100000, IPASize: 1 << 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+		BackingProvider:         ram,
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := mf.Allocate(2*GuestFrameSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateUncommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Materialize only the first zero page without updating MemoryFile's
+	// commitment accounting. A live sibling may be using exactly this kind of
+	// frame while another branch is checkpointed.
+	resident := memmap.FileRange{Start: fr.Start, End: fr.Start + GuestFrameSize}
+	_, lease, err := memmap.MapInternalWithLease(mf, resident, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	before := ram.Metrics()
+	if before.LogicalBytes != GuestFrameSize || before.HostResidentBytes != HostSlabSize {
+		t.Fatalf("GuestRAM before save = %+v, want one logical frame and one slab", before)
+	}
+
+	var checkpoint bytes.Buffer
+	if err := mf.SaveTo(gcontext.Background(), &checkpoint, &pgalloc.SaveOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	after := ram.Metrics()
+	if after.LogicalBytes != before.LogicalBytes || after.HostResidentBytes != before.HostResidentBytes {
+		t.Fatalf("GuestRAM after sparse save = %+v, want unchanged %+v", after, before)
+	}
+	mf.DecRef(fr)
+	mf.Destroy()
 }
 
 func TestGuestRAMResolveBackingFramesWaitsForRemotePage(t *testing.T) {

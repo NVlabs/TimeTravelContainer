@@ -19,8 +19,10 @@ import (
 	"os"
 
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
+	"gvisor.dev/gvisor/runsc/ttc/copyguest"
 )
 
 func main() {
+	cmd.SetGuestCopyHelper(copyguest.Binary())
 	os.Exit(cmd.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }

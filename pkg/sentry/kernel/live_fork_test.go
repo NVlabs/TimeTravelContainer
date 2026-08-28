@@ -506,7 +506,7 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	ownedReader := &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}
 	targetMF := newRemoteKernelMemoryFile(t)
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, ownedReader,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, ownedReader,
 		kernel.DistributedForkLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "remote",
 			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
@@ -554,7 +554,7 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		reader := pgalloc.NewLoopbackRemoteReader(capture.Snapshots[i], pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4)
 		capture.Snapshots[i] = nil
 		child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, reader,
+			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, reader,
 			kernel.DistributedForkLoadOptions{
 				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: id,
 				FilesystemResources: capture.FilesystemResources, DemandOnly: true,
@@ -608,10 +608,17 @@ func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 		t.Fatalf("CaptureDistributedFork: %v", err)
 	}
 	parent.MemoryFile().DecRef(orphan)
-	if len(capture.HandoffBindings) <= len(capture.MemoryBindings) {
+	if len(capture.HandoffBindings) != len(capture.MemoryBindings) {
 		capture.Close()
 		parent.Release()
-		t.Fatalf("test setup did not create allocator-only pages: handoff=%d exact=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
+		t.Fatalf("handoff bindings=%d, exact bindings=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
+	}
+	for _, binding := range capture.HandoffBindings {
+		if orphan.Start <= binding.OldOffset && binding.OldOffset < orphan.End {
+			capture.Close()
+			parent.Release()
+			t.Fatal("branch-scoped handoff included an unreachable allocator page")
+		}
 	}
 	repositoryDir := t.TempDir()
 	publisher, err := ttcchunk.OpenMemoryRepository(repositoryDir)
@@ -664,7 +671,7 @@ func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 	}
 	targetMF := newRemoteKernelMemoryFile(t)
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings,
 		&ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone},
 		kernel.DistributedForkLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "handoff",
@@ -709,8 +716,7 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	parent.PipeMount().IncRef()
 	parent.SetHostMount(parent.PipeMount())
 	// Keep an allocator page that is deliberately unreachable from this branch.
-	// The legacy transport snapshot includes it, while the sparse snapshot must
-	// use the exact branch binding layout.
+	// All portable transports must exclude it from the exact branch layout.
 	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		parent.Release()
@@ -727,12 +733,19 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	if capture.SparseSnapshot == nil || capture.Snapshot == nil {
 		capture.Close()
 		parent.Release()
-		t.Fatal("distributed capture omitted its sparse or legacy snapshot")
+		t.Fatal("distributed capture omitted a snapshot reservation")
 	}
-	if sparseBytes, legacyBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes >= legacyBytes {
+	if sparseBytes, transportBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes != transportBytes {
 		capture.Close()
 		parent.Release()
-		t.Fatalf("sparse snapshot bytes=%d, legacy bytes=%d; unreachable allocator page was not excluded", sparseBytes, legacyBytes)
+		t.Fatalf("sparse snapshot bytes=%d, transport bytes=%d", sparseBytes, transportBytes)
+	}
+	for _, load := range capture.LoadRanges {
+		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
+			capture.Close()
+			parent.Release()
+			t.Fatal("branch-scoped transport included an unreachable allocator page")
+		}
 	}
 	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
 	if err != nil {
@@ -783,8 +796,7 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	parent.Pause()
 	defer parent.Release()
 	// Simulate a page owned by another branch in the family-wide MemoryFile.
-	// The legacy allocator export includes it, but the branch-scoped binding
-	// graph must not.
+	// Neither the binding graph nor the transport ranges may include it.
 	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		t.Fatal(err)
@@ -806,15 +818,10 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 			t.Fatalf("branch-scoped capture included unrelated allocator page %+v", orphanPage)
 		}
 	}
-	legacyIncludedOrphan := false
 	for _, load := range capture.LoadRanges {
 		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
-			legacyIncludedOrphan = true
-			break
+			t.Fatal("branch-scoped transport included unrelated allocator page")
 		}
-	}
-	if !legacyIncludedOrphan {
-		t.Fatal("test setup failed: allocator-wide export did not include unrelated page")
 	}
 	if capture.Snapshot != nil || len(capture.Snapshots) != 2 {
 		t.Fatalf("capture snapshots: singular=%p siblings=%d", capture.Snapshot, len(capture.Snapshots))
@@ -822,8 +829,8 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	if capture.SparseSnapshot != nil || len(capture.SparseSnapshots) != 2 {
 		t.Fatalf("sparse capture snapshots: singular=%p siblings=%d", capture.SparseSnapshot, len(capture.SparseSnapshots))
 	}
-	// This portion tests legacy sibling acknowledgement in isolation. Sparse
-	// consumers have independent reservations over the exact branch graph.
+	// Test sibling acknowledgement in isolation. Sparse consumers have
+	// independent reservations over the same exact branch graph.
 	for i, snapshot := range capture.SparseSnapshots {
 		if err := snapshot.Close(); err != nil {
 			t.Fatal(err)
@@ -866,7 +873,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 			t.Fatal(err)
 		}
 		session, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
-			MaxTotalBytes: 32 << 20, MaxKernelBytes: 24 << 20, MaxAllocatorBytes: 8 << 20, MaxLoadRanges: 1 << 16,
+			MaxTotalBytes: 32 << 20, MaxKernelBytes: 24 << 20, MaxAllocatorBytes: 8 << 20, MaxExecBytes: 1 << 20, MaxLoadRanges: 1 << 16,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -917,7 +924,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 	}
 	envelope, err := (&ttcremote.SessionMetadata{
 		FamilyID: "kernel-subprocess", SourceBranchID: "main", TargetBranchID: "subprocess",
-		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges, MemoryBindings: capture.HandoffBindings,
+		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
 	}).MarshalBinary()
 	if err != nil {
 		t.Fatal(err)

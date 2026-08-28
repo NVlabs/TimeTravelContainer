@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -858,12 +859,30 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		_ = resume()
 		return nil, fmt.Errorf("distributed capture returned %d handoff snapshots for %d children", len(handoffSnapshots), len(children))
 	}
+	// Kernel state contains the exec processes and internal consoles, while the
+	// branch-local session registry is loader control state. Carry the registry
+	// beside the Kernel image so remote forks and migrations retain wait, logs,
+	// signal, and reattachment identities for those processes.
+	f.mu.Lock()
+	execSessions := make([]ExecSessionInfo, 0, len(source.execSessions))
+	for _, session := range source.execSessions {
+		if session.info.State == ExecSessionRunning && source.k.RootPIDNamespace().ThreadGroupWithID(session.info.PID) != nil {
+			execSessions = append(execSessions, cloneExecSessionInfo(session.info))
+		}
+	}
+	f.mu.Unlock()
+	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
+	encodedExecSessions, err := json.Marshal(execSessions)
+	if err != nil {
+		_ = resume()
+		return nil, fmt.Errorf("encoding distributed exec sessions: %w", err)
+	}
 	infos := make([]DistributedForkSessionInfo, len(children))
 	for i, child := range children {
 		metadata, err := (&ttcremote.SessionMetadata{
 			FamilyID: familyID, SourceBranchID: sourceID, TargetBranchID: child.TargetBranchID,
 			KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
-			LoadRanges: capture.LoadRanges, MemoryBindings: capture.HandoffBindings,
+			ExecSessions: encodedExecSessions, LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
 		}).MarshalBinary()
 		if err != nil {
 			_ = resume()
@@ -912,7 +931,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		sessions[i] = &distributedForkSession{
 			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
 			resources: capture.FilesystemResources, server: server,
-			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.HandoffBindings,
+			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.MemoryBindings,
 		}
 		if capture.HandoffSnapshot != nil {
 			capture.HandoffSnapshot = nil
@@ -924,8 +943,8 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
 		}
 	}
-	// The legacy TCP and allocator-wide handoff snapshots have transferred to
-	// their servers/sessions. Close the now-unused exact branch snapshots.
+	// The live and durable branch-scoped reservations have transferred to their
+	// servers/sessions. Close the extra direct-publication reservations.
 	if err := capture.Close(); err != nil {
 		_ = resume()
 		return nil, fmt.Errorf("closing unused distributed capture reservations: %w", err)

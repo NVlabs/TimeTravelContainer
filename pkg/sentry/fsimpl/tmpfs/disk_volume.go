@@ -258,6 +258,12 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	root, ok := fs.root.inode.impl.(*directory)
+	if !ok {
+		// A TTC :copy mount may have a regular file as its filesystem root.
+		// Such a filesystem has no directory namespace cache to prune.
+		return
+	}
 	fs.diskSaveChildren = make(map[*directory]map[string]*dentry)
 	var collect func(*directory)
 	collect = func(dir *directory) {
@@ -269,7 +275,7 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 			}
 		}
 	}
-	collect(fs.root.inode.impl.(*directory))
+	collect(root)
 	filtered := make(map[*directory]map[string]*dentry, len(fs.diskSaveChildren))
 	for dir, original := range fs.diskSaveChildren {
 		kept := make(map[string]*dentry)

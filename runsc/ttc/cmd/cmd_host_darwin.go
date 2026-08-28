@@ -3,6 +3,8 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"net"
 	"os"
@@ -70,7 +72,63 @@ func preflightDaemonExecutable(path string) error {
 	if err := command.Run(); err != nil {
 		return fmt.Errorf("cannot execute: %w; ad-hoc macOS builds must be signed at their final installed path with the com.apple.security.hypervisor entitlement", err)
 	}
+	entitlements, err := darwinExecutableEntitlements(path)
+	if err != nil {
+		return err
+	}
+	if !hasDarwinBooleanEntitlement(entitlements, "com.apple.security.hypervisor") {
+		return fmt.Errorf("missing required com.apple.security.hypervisor entitlement in %q; after copying ttcd to its final path, run: codesign --force --sign - --entitlements /path/to/runsc/hvf.entitlements %q", path, path)
+	}
 	return nil
+}
+
+func darwinExecutableEntitlements(path string) ([]byte, error) {
+	command := exec.Command("/usr/bin/codesign", "-d", "--entitlements", ":-", path)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	entitlements, err := command.Output()
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return nil, fmt.Errorf("reading macOS entitlements from %q: %w: %s", path, err, detail)
+		}
+		return nil, fmt.Errorf("reading macOS entitlements from %q: %w", path, err)
+	}
+	return entitlements, nil
+}
+
+func hasDarwinBooleanEntitlement(plist []byte, name string) bool {
+	decoder := xml.NewDecoder(bytes.NewReader(plist))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "key" {
+			continue
+		}
+		var key string
+		if err := decoder.DecodeElement(&key, &start); err != nil || key != name {
+			continue
+		}
+		for {
+			token, err := decoder.Token()
+			if err != nil {
+				return false
+			}
+			switch token := token.(type) {
+			case xml.CharData:
+				if len(bytes.TrimSpace(token)) != 0 {
+					return false
+				}
+			case xml.StartElement:
+				return token.Name.Local == "true"
+			default:
+				return false
+			}
+		}
+	}
 }
 
 func createRootlessProbe() error {
@@ -119,6 +177,14 @@ func checkDaemonPeer(conn net.Conn) error {
 // The child re-arms an EVFILT_PROC parent watcher during its own startup.
 func setTTCCommandParentDeathSignal(command *exec.Cmd) {
 	command.SysProcAttr = &unix.SysProcAttr{}
+}
+
+func portForwardProcessMatches(pid int, _, _, _ string) bool {
+	return unix.Kill(pid, 0) == nil
+}
+
+func legacyPortLockHolder(_, _, _, _ string) (int, error) {
+	return 0, fmt.Errorf("published-port lock is held by a legacy listener without a recorded process ID")
 }
 
 // currentNodeMemoryBytes reports the daemon's resident high-water mark as a

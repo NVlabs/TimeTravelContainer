@@ -100,6 +100,12 @@ static hv_return_t ttc_monitor_enable_mmu(hv_vcpu_t vcpu, uint64_t ttbr1,
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, state_va + TTC_STATE_STACK_TOP)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, 3ULL << 20)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1, 2)) != HV_SUCCESS) return ret;
+	// Keep debug exceptions in the guest so the EL1 monitor can preserve the
+	// architectural ESR/ELR. Application entry mirrors PSTATE.SS into
+	// MDSCR_EL1.SS; initialize it disabled so ordinary bootstrap execution
+	// cannot enter the software-step state machine.
+	if ((ret = hv_vcpu_set_trap_debug_exceptions(vcpu, false)) != HV_SUCCESS) return ret;
+	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MDSCR_EL1, 0)) != HV_SUCCESS) return ret;
 	return hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x34909185);
 }
 
@@ -213,10 +219,11 @@ type monitorMemory struct {
 	poolHost    uintptr
 	codeLength  uint64
 
-	bootstrapOffset        uint64
-	commandOffset          uint64
-	ring0ApplicationOffset uint64
-	vectorOffset           uint64
+	bootstrapOffset            uint64
+	commandOffset              uint64
+	ring0ApplicationOffset     uint64
+	ring0ApplicationFastOffset uint64
+	vectorOffset               uint64
 
 	mapped []monitorStage2Mapping
 	pools  []monitorPoolMemory
@@ -243,12 +250,14 @@ func newMonitorMemory(vm *hvfVM) (*monitorMemory, error) {
 	m.bootstrapOffset = embeddedMonitorBootstrapOffset
 	m.commandOffset = embeddedMonitorCommandOffset
 	m.ring0ApplicationOffset = embeddedMonitorRing0ApplicationOffset
+	m.ring0ApplicationFastOffset = embeddedMonitorRing0ApplicationFastOffset
 	m.vectorOffset = embeddedMonitorVectorOffset
 	for name, offset := range map[string]uint64{
-		"bootstrap":         m.bootstrapOffset,
-		"command":           m.commandOffset,
-		"ring0-application": m.ring0ApplicationOffset,
-		"vectors":           m.vectorOffset,
+		"bootstrap":              m.bootstrapOffset,
+		"command":                m.commandOffset,
+		"ring0-application":      m.ring0ApplicationOffset,
+		"ring0-application-fast": m.ring0ApplicationFastOffset,
+		"vectors":                m.vectorOffset,
 	} {
 		if offset >= imageLength {
 			return nil, fmt.Errorf("EL1 monitor %s offset %#x exceeds image length %#x", name, offset, imageLength)
@@ -367,6 +376,14 @@ func roundUp(value, alignment uint64) uint64 {
 func (v *hvfVCPU) ensureBooted() error {
 	if v.booted {
 		return nil
+	}
+	// Keep CNTVCT_EL0 in the same counter domain as mach_absolute_time and
+	// every other vCPU. Sentry's calibrated clocks read CNTVCT directly while
+	// resident at EL1; an implementation-chosen VTimer offset would make host
+	// reference samples and guest cycle reads incomparable and force every
+	// Linux clock read through the host-service gate.
+	if status := C.hv_vcpu_set_vtimer_offset(v.handle, 0); status != C.HV_SUCCESS {
+		return fmt.Errorf("setting EL1 monitor VTimer offset: %d", status)
 	}
 	C.ttc_monitor_init_state(unsafe.Pointer(v.stateHost), C.uint64_t(monitorControlVA), C.uint64_t(monitorControlGPA))
 	if status := C.ttc_monitor_set_boot_registers(v.handle,
