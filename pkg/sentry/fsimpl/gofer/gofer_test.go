@@ -15,6 +15,7 @@
 package gofer
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -127,6 +128,87 @@ func TestDestroyIdempotent(t *testing.T) {
 	}
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+}
+
+// A gofer with no descriptors left gets some back.
+//
+// The cache is where they are: the gofer holds one host descriptor for every
+// dentry cached here, and it cannot close what this side still refers to.
+// Evicting only when the cache passed its own count left a gofer at EMFILE
+// sitting on thousands of dentries nobody was using, and the sandbox failed
+// every path it touched from then until it was restarted.
+func TestAGoferOutOfDescriptorsHasTheCacheGivenBack(t *testing.T) {
+	ctx := contexttest.Context(t)
+	fs := filesystem{
+		mf:          pgalloc.MemoryFileFromContext(ctx),
+		inoByKey:    make(map[inoKey]uint64),
+		inodeByKey:  make(map[inoKey]*inode),
+		clock:       ktime.RealtimeClockFromContext(ctx),
+		dentryCache: &dentryCache{maxCachedDentries: 8},
+		client:      &lisafs.Client{},
+	}
+	parent, err := fs.newLisafsDentry(ctx, &lisafs.Inode{
+		ControlFD: 1,
+		Stat: lisafs.Statx{
+			Mask: linux.STATX_TYPE | linux.STATX_MODE,
+			Mode: linux.S_IFDIR | 0666,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Enough idle children to fill the cache.
+	for i := 0; i < 8; i++ {
+		child, err := fs.newLisafsDentry(ctx, &lisafs.Inode{
+			ControlFD: lisafs.FDID(i + 2),
+			Stat: lisafs.Statx{
+				Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_SIZE,
+				Mode: linux.S_IFREG | 0666,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent.opMu.Lock()
+		parent.childrenMu.Lock()
+		parent.cacheNewChildLocked(child, fmt.Sprintf("child%d", i))
+		parent.childrenMu.Unlock()
+		parent.opMu.Unlock()
+		fs.renameMu.Lock()
+		child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+		fs.renameMu.Unlock()
+	}
+	fs.dentryCache.mu.Lock()
+	filled := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	if filled == 0 {
+		t.Fatal("nothing was cached, so there is nothing this test can be about")
+	}
+
+	// Nothing has said anything is wrong, so the cache stays.
+	fs.renameMu.Lock()
+	parent.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+	fs.renameMu.Unlock()
+	fs.dentryCache.mu.Lock()
+	quiet := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	if quiet < filled {
+		t.Fatalf("the cache dropped from %d to %d with no shortage reported", filled, quiet)
+	}
+
+	// A gofer says it is out. The next dentry that goes idle gives half back —
+	// and it need not be one on the connection that was refused, which is the
+	// point of keeping this beside the cache.
+	fs.dentryCache.starved.Store(true)
+	fs.renameMu.Lock()
+	parent.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+	fs.renameMu.Unlock()
+	fs.dentryCache.mu.Lock()
+	after := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	if after > fs.dentryCache.maxCachedDentries/2 {
+		t.Fatalf("a gofer out of descriptors was left holding %d of %d cached dentries", after, quiet)
+	}
 }
 
 func TestStringFixedCache(t *testing.T) {
