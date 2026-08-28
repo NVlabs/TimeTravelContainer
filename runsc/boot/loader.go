@@ -2482,20 +2482,22 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 	}
 
 	// Setup loopback.
-	n := &Network{Stack: s.Stack}
 	nicID := s.Stack.NextNICID()
 	if nicID != linux.LOOPBACK_IFINDEX {
 		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
 	}
-	link := DefaultLoopbackLink
 	linkEP := ethernet.New(loopback.New())
 	opts := stack.NICOptions{
-		Name:               link.Name,
+		Name:               DefaultLoopbackLink.Name,
 		DeliverLinkPackets: true,
 	}
-
-	if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
-		return nil, err
+	// A newly created Linux network namespace contains an unconfigured
+	// loopback device. In particular, 127.0.0.1 and ::1 are not assigned
+	// until userspace configures them. Bubblewrap relies on this and adds the
+	// IPv4 address with NLM_F_EXCL; preconfiguring it here makes that request
+	// fail with EEXIST and prevents nested sandboxes from starting.
+	if err := s.Stack.CreateNICWithOptions(nicID, linkEP, opts); err != nil {
+		return nil, fmt.Errorf("creating nested network namespace loopback: %v", err)
 	}
 
 	return s, nil

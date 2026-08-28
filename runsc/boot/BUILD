@@ -268,6 +268,17 @@ go_test(
 )
 
 go_test(
+    name = "nested_network_test",
+    size = "small",
+    srcs = ["nested_network_test.go"],
+    library = ":boot",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/tcpip",
+    ],
+)
+
+go_test(
     name = "portable_resources_test",
     size = "small",
     srcs = ["portable_resources_test.go"],
