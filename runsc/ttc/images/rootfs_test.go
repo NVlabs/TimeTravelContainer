@@ -68,6 +68,25 @@ func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
 	}
 }
 
+func TestApplyLayerAllowsLaterWhiteoutOfDeclaredDirectory(t *testing.T) {
+	root := t.TempDir()
+	layer := makeLayer(t, true, []tarEntry{
+		{name: "transient/", mode: 0755},
+		{name: "transient/value", body: "temporary", mode: 0644},
+		{name: ".wh.transient", mode: 0600},
+		{name: "retained", body: "complete", mode: 0644},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(layer)); err != nil {
+		t.Fatalf("applying layer with later directory whiteout: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "transient")); !os.IsNotExist(err) {
+		t.Fatalf("whiteouted transient directory stat error = %v, want not-exist", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "retained")); err != nil || string(got) != "complete" {
+		t.Fatalf("retained entry = %q, err %v", got, err)
+	}
+}
+
 func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 	root := t.TempDir()
 	t.Cleanup(func() {

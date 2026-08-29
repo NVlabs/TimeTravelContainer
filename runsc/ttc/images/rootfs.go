@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -239,6 +240,18 @@ func applyLayerWithOwnership(ctx context.Context, root string, compressed io.Rea
 		return directoryModes.record(header)
 	}
 	_, applyErr := archive.Apply(ctx, root, stream, archive.WithNoSameOwner(), archive.WithFilter(filter))
+	// containerd defers directory timestamps until the complete tar stream has
+	// been applied. A valid diff may declare a directory and then remove it with
+	// a later whiteout (dpkg-generated TTC layers do this for transient
+	// *.dpkg-new trees). In that case extraction is complete and the only
+	// failure is the deferred timestamp syscall observing the intended final
+	// absence. Do not reject the otherwise fully applied layer. Keep the string
+	// qualification narrow: an unrelated ENOENT during entry extraction still
+	// indicates a malformed layer.
+	if applyErr != nil && errors.Is(applyErr, os.ErrNotExist) &&
+		strings.Contains(applyErr.Error(), "failed call to UtimesNanoAt for ") {
+		applyErr = nil
+	}
 	restoreErr := directoryModes.restore(root)
 	if applyErr != nil {
 		if restoreErr != nil {
