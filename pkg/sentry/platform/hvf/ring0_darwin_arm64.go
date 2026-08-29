@@ -483,6 +483,15 @@ static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_count;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_bytes;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_count;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_bytes;
+// Crash-only breadcrumbs for the most recent Go runtime VM hook. These are
+// deliberately atomic and pointer-free: an unexpected stage-2 abort may be
+// reported while another host thread is entering or leaving the hook.
+static _Atomic uint64_t ttc_ring0_runtime_vm_hook_sequence;
+static _Atomic uint32_t ttc_ring0_runtime_vm_hook_operation;
+static _Atomic uint32_t ttc_ring0_runtime_vm_hook_phase;
+static _Atomic uintptr_t ttc_ring0_runtime_vm_hook_address_value;
+static _Atomic uintptr_t ttc_ring0_runtime_vm_hook_length;
+static _Atomic uint32_t ttc_ring0_runtime_vm_hook_active;
 static struct ttc_ring0_bridge *ttc_ring0_bridges;
 // Bridge records are visible to the shared EL1 Sentry and therefore may gain
 // a long-lived stage-2 lease. Recycle their anonymous 16K mappings in place
@@ -1072,6 +1081,20 @@ static int32_t ttc_ring0_runtime_vm_hook(
 		struct ttc_runtime_vm_mutation *mutation) {
 	atomic_fetch_add_explicit(&ttc_ring0_runtime_vm_hook_calls, 1,
 			memory_order_relaxed);
+	atomic_fetch_add_explicit(&ttc_ring0_runtime_vm_hook_sequence, 1,
+			memory_order_relaxed);
+	if (mutation != NULL) {
+		atomic_store_explicit(&ttc_ring0_runtime_vm_hook_operation,
+				mutation->operation, memory_order_relaxed);
+		atomic_store_explicit(&ttc_ring0_runtime_vm_hook_phase,
+				mutation->phase, memory_order_relaxed);
+		atomic_store_explicit(&ttc_ring0_runtime_vm_hook_address_value,
+				mutation->address, memory_order_relaxed);
+		atomic_store_explicit(&ttc_ring0_runtime_vm_hook_length,
+				mutation->length, memory_order_relaxed);
+		atomic_store_explicit(&ttc_ring0_runtime_vm_hook_active,
+				mutation->active, memory_order_relaxed);
+	}
 	if (mutation == NULL ||
 			mutation->version != TTC_RUNTIME_VM_MUTATION_VERSION ||
 			mutation->length == 0 ||
@@ -1393,10 +1416,62 @@ static uint64_t ttc_ring0_state_u64(const struct ttc_ring0_bridge *bridge,
 	return value;
 }
 
+struct ttc_ring0_mirror_fault_diagnostic {
+	uint64_t found;
+	uint64_t host;
+	uint64_t mapping_gpa;
+	uint64_t slab;
+	uint64_t registered;
+	uint64_t live;
+};
+
+// This is diagnostic-only and must not wait for mutation_mu: a runtime VM
+// hook may itself be waiting for this vCPU to publish in_guest=0. The caller
+// has already done so, but trylock also keeps fatal reporting robust if the
+// mutator cannot make forward progress for some unrelated reason.
+static struct ttc_ring0_mirror_fault_diagnostic
+ttc_ring0_mirror_fault_state(uint64_t gpa) {
+	struct ttc_ring0_mirror_fault_diagnostic result = {0};
+	if (pthread_mutex_trylock(&ttc_ring0_mutation_mu) != 0) return result;
+	for (struct ttc_ring0_mirror_mapping *mapping =
+			ttc_ring0_mirror_mappings; mapping != NULL;
+			mapping = mapping->next) {
+		if (gpa < mapping->gpa || gpa - mapping->gpa >= mapping->length) {
+			continue;
+		}
+		size_t slab = (size_t)((gpa - mapping->gpa) /
+				TTC_RING0_HOST_SLAB_SIZE);
+		result.found = 1;
+		result.host = mapping->host + slab * TTC_RING0_HOST_SLAB_SIZE;
+		result.mapping_gpa = mapping->gpa;
+		result.slab = slab;
+		result.registered = ttc_ring0_bit_test(
+				ttc_ring0_mapping_registered(mapping), slab);
+		result.live = ttc_ring0_bit_test(
+				ttc_ring0_mapping_live(mapping), slab);
+		break;
+	}
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	return result;
+}
+
 static void ttc_ring0_fatal_diagnostic(struct ttc_ring0_bridge *bridge,
 		uint32_t status) {
-	char out[768];
+	char out[2048];
 	size_t n = 0;
+	uint64_t pc = 0;
+	uint64_t cpsr = 0;
+	uint64_t sp_el0 = 0;
+	uint64_t sp_el1 = 0;
+	uint64_t lr = 0;
+	(void)hv_vcpu_get_reg(bridge->vcpu, HV_REG_PC, &pc);
+	(void)hv_vcpu_get_reg(bridge->vcpu, HV_REG_CPSR, &cpsr);
+	(void)hv_vcpu_get_sys_reg(bridge->vcpu, HV_SYS_REG_SP_EL0, &sp_el0);
+	(void)hv_vcpu_get_sys_reg(bridge->vcpu, HV_SYS_REG_SP_EL1, &sp_el1);
+	(void)hv_vcpu_get_reg(bridge->vcpu, HV_REG_X30, &lr);
+	struct ttc_ring0_mirror_fault_diagnostic mirror =
+			ttc_ring0_mirror_fault_state(
+					bridge->exit->exception.physical_address);
 #define TTC_DIAG_FIELD(label, value) do { \
 	n = ttc_ring0_append_literal(out, n, label); \
 	n = ttc_ring0_append_hex(out, n, (uint64_t)(value)); \
@@ -1431,6 +1506,31 @@ static void ttc_ring0_fatal_diagnostic(struct ttc_ring0_bridge *bridge,
 			TTC_STATE_HOST_GATE_FAR_OFFSET));
 	TTC_DIAG_FIELD(" host_gate_pc=", ttc_ring0_state_u64(bridge,
 			TTC_STATE_HOST_GATE_PC_OFFSET));
+	TTC_DIAG_FIELD(" guest_pc=", pc);
+	TTC_DIAG_FIELD(" guest_cpsr=", cpsr);
+	TTC_DIAG_FIELD(" guest_sp_el0=", sp_el0);
+	TTC_DIAG_FIELD(" guest_sp_el1=", sp_el1);
+	TTC_DIAG_FIELD(" guest_lr=", lr);
+	TTC_DIAG_FIELD(" pause=", atomic_load_explicit(
+			&ttc_ring0_guest_pause_count, memory_order_acquire));
+	TTC_DIAG_FIELD(" mirror_found=", mirror.found);
+	TTC_DIAG_FIELD(" mirror_host=", mirror.host);
+	TTC_DIAG_FIELD(" mirror_base_gpa=", mirror.mapping_gpa);
+	TTC_DIAG_FIELD(" mirror_slab=", mirror.slab);
+	TTC_DIAG_FIELD(" mirror_registered=", mirror.registered);
+	TTC_DIAG_FIELD(" mirror_live=", mirror.live);
+	TTC_DIAG_FIELD(" vm_seq=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_sequence, memory_order_relaxed));
+	TTC_DIAG_FIELD(" vm_op=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_operation, memory_order_relaxed));
+	TTC_DIAG_FIELD(" vm_phase=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_phase, memory_order_relaxed));
+	TTC_DIAG_FIELD(" vm_address=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_address_value, memory_order_relaxed));
+	TTC_DIAG_FIELD(" vm_length=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_length, memory_order_relaxed));
+	TTC_DIAG_FIELD(" vm_active=", atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_active, memory_order_relaxed));
 #undef TTC_DIAG_FIELD
 	out[n++] = '\n';
 	(void)write(STDERR_FILENO, out, n);
