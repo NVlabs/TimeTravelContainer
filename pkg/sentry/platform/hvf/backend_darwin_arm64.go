@@ -26,6 +26,7 @@ package hvf
 #include <CoreFoundation/CoreFoundation.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/vm_statistics.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <string.h>
@@ -42,15 +43,18 @@ static int ttc_madvise_free(void *address, size_t length) {
 
 // Anonymous Darwin mappings initially reference shared zero backing. A host
 // write after hv_vm_map may COW the HVA without changing HVF's leased physical
-// page. Force every logical subpage through a value-changing write fault
-// before it can become stage-2 backing; restoring the original byte preserves
-// allocator semantics while preventing zero-store elision or subpage laziness.
-static void ttc_commit_host_pages(void *address, size_t length) {
-	volatile uint8_t *bytes = (volatile uint8_t *)address;
+// page. Force every logical subpage through an atomic write fault before it can
+// become stage-2 backing. A compare-exchange of a byte with itself is a
+// compiler-visible write, but it never exposes a transient value or overwrites
+// a concurrent update in live Sentry memory.
+static void ttc_commit_host_pages(uintptr_t address, size_t length) {
+	_Atomic uint8_t *bytes = (_Atomic uint8_t *)address;
 	for (size_t offset = 0; offset < length; offset += 4096) {
-		uint8_t original = bytes[offset];
-		bytes[offset] = (uint8_t)(original ^ UINT8_C(0xff));
-		bytes[offset] = original;
+		uint8_t observed = atomic_load_explicit(&bytes[offset],
+				memory_order_relaxed);
+		while (!atomic_compare_exchange_weak_explicit(&bytes[offset],
+				&observed, observed, memory_order_relaxed,
+				memory_order_relaxed)) {}
 	}
 }
 
@@ -170,6 +174,10 @@ type hvfStage2Slab struct {
 	access vmm.Stage2Access
 }
 
+func commitHostPages(address uintptr, length uint64) {
+	C.ttc_commit_host_pages(C.uintptr_t(address), C.size_t(length))
+}
+
 // canonicalGPAForHost returns an existing VM-owned stage-2 lease for one host
 // slab. Sentry identity mappings must reuse this GPA rather than mapping the
 // same HVA a second time: HVF does not guarantee coherent access through two
@@ -253,7 +261,7 @@ func (v *hvfVM) mapStage2Locked(gpa uint64, hostAddress uintptr, length uint64, 
 	// from the original zero page. Enforce private physical backing at the
 	// backend boundary so direct VMM callers receive the same invariant as
 	// GuestRAM and monitor allocations.
-	C.ttc_commit_host_pages(unsafe.Pointer(hostAddress), C.size_t(length))
+	commitHostPages(hostAddress, length)
 	return mapNativeStage2(gpa, hostAddress, length, access, false)
 }
 
@@ -509,7 +517,7 @@ func (hostMemory) Commit(address uintptr, length uint64) error {
 	if err := validateHostRange(address, length); err != nil {
 		return err
 	}
-	C.ttc_commit_host_pages(unsafe.Pointer(address), C.size_t(length))
+	commitHostPages(address, length)
 	return nil
 }
 

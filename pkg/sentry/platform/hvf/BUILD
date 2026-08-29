@@ -84,5 +84,6 @@ go_test(
         "//pkg/sentry/platform/vmplatform/vmm",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

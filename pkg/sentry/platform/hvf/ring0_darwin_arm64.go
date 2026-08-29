@@ -218,6 +218,7 @@ struct ttc_ring0_native_domain_slot {
 // final guest exit, so the callback requires neither a lock nor a live pointer.
 static struct ttc_ring0_native_domain_slot
 		ttc_ring0_native_domains[TTC_RING0_MAX_APPLICATION_VCPUS];
+static _Atomic uint32_t ttc_ring0_native_domain_active_count;
 
 struct ttc_runtime_time_query {
 	uint32_t version;
@@ -327,6 +328,45 @@ static int32_t ttc_ring0_runtime_time_hook(
 static uintptr_t ttc_ring0_runtime_time_hook_address(void) {
 	return ttc_ring0_strip_instruction_pointer(
 			(uintptr_t)&ttc_ring0_runtime_time_hook);
+}
+
+// ttc_ring0_runtime_ensure_host is the common Darwin libc boundary for the
+// shared Sentry. Ordinary host execution takes the active-count fast reject
+// and never raises SIGILL. A resident EL1 continuation finds its owner-affine
+// domain, prevents cancellation from exporting it inside this native helper,
+// and redpills before libcCall changes stacks or invokes external text.
+static int32_t ttc_ring0_runtime_ensure_host(void *unused) {
+	(void)unused;
+	if (atomic_load_explicit(&ttc_ring0_native_domain_active_count,
+			memory_order_acquire) == 0) return 0;
+	uint64_t thread_pointer;
+	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(thread_pointer));
+	struct ttc_ring0_native_domain_slot *domain = NULL;
+	for (size_t i = 0; i < TTC_RING0_MAX_APPLICATION_VCPUS; ++i) {
+		struct ttc_ring0_native_domain_slot *slot =
+				&ttc_ring0_native_domains[i];
+		if (atomic_load_explicit(&slot->active, memory_order_acquire) != 0 &&
+				atomic_load_explicit(&slot->tpidrro_el0,
+				memory_order_relaxed) == thread_pointer) {
+			domain = slot;
+			break;
+		}
+	}
+	if (domain == NULL) return 0;
+	atomic_fetch_add_explicit(&domain->critical, 1, memory_order_seq_cst);
+	if (ttc_ring0_runtime_current_el() == 0) {
+		atomic_fetch_sub_explicit(&domain->critical, 1,
+				memory_order_release);
+		return 0;
+	}
+	__asm__ volatile("hvc #0x73" ::: "memory");
+	atomic_fetch_sub_explicit(&domain->critical, 1, memory_order_release);
+	return 1;
+}
+
+static uintptr_t ttc_ring0_runtime_ensure_host_address(void) {
+	return ttc_ring0_strip_instruction_pointer(
+			(uintptr_t)&ttc_ring0_runtime_ensure_host);
 }
 
 // ttc_ring0_calibrate_time_fastpath binds the process-local Darwin helper PCs
@@ -847,6 +887,24 @@ static hv_memory_flags_t ttc_ring0_memory_flags(uint32_t access) {
 	return flags;
 }
 
+// Anonymous Darwin mappings may still reference shared zero backing even
+// though their VM region is writable. Force each 16K host page through an
+// atomic write fault while mutation_mu excludes runtime mmap/madvise changes.
+// A same-value compare-exchange never exposes a transient byte or overwrites a
+// concurrent Sentry store, but it makes the physical backing leased by HVF
+// private before hv_vm_map observes it.
+static void ttc_ring0_commit_host_pages(uintptr_t address, uint64_t length) {
+	_Atomic uint8_t *bytes = (_Atomic uint8_t *)address;
+	for (uint64_t offset = 0; offset < length;
+			offset += TTC_RING0_HOST_SLAB_SIZE) {
+		uint8_t observed = atomic_load_explicit(&bytes[offset],
+				memory_order_relaxed);
+		while (!atomic_compare_exchange_weak_explicit(&bytes[offset],
+				&observed, observed, memory_order_relaxed,
+				memory_order_relaxed)) {}
+	}
+}
+
 // ttc_ring0_stage2_map serializes every HVF mapping operation with runtime
 // mutations. Tracked mappings are direct aliases of mutable Sentry memory.
 static hv_return_t ttc_ring0_stage2_map(uintptr_t host, uint64_t gpa,
@@ -875,6 +933,9 @@ static hv_return_t ttc_ring0_stage2_map(uintptr_t host, uint64_t gpa,
 	if (lock_status != 0) {
 		free(mapping);
 		return HV_ERROR;
+	}
+	if (tracked != 0 && (mapping->access & HV_MEMORY_WRITE) != 0) {
+		ttc_ring0_commit_host_pages(host, length);
 	}
 	hv_return_t status = hv_vm_map((void *)host, gpa, (size_t)length,
 			ttc_ring0_memory_flags(access));
@@ -1070,6 +1131,10 @@ static hv_return_t ttc_ring0_rebind_mirror(uintptr_t address,
 						!ttc_ring0_host_slab_accessible(run_host,
 							mapping->access)) break;
 				++run;
+			}
+			if ((mapping->access & HV_MEMORY_WRITE) != 0) {
+				ttc_ring0_commit_host_pages(host,
+						(run - slab) * TTC_RING0_HOST_SLAB_SIZE);
 			}
 			hv_return_t status = hv_vm_map((void *)host,
 					mapping->gpa + slab * TTC_RING0_HOST_SLAB_SIZE,
@@ -1840,8 +1905,12 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 		atomic_store_explicit(&domain->tpidrro_el0,
 				ttc_ring0_read_tpidrro_el0(), memory_order_relaxed);
 		atomic_store_explicit(&domain->active, 1, memory_order_release);
+		atomic_fetch_add_explicit(&ttc_ring0_native_domain_active_count, 1,
+				memory_order_release);
 		status = hv_vcpu_run(bridge->vcpu);
 		atomic_store_explicit(&domain->active, 0, memory_order_release);
+		atomic_fetch_sub_explicit(&ttc_ring0_native_domain_active_count, 1,
+				memory_order_release);
 		if (status != HV_SUCCESS) {
 			ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
 					&host_ns, (uint32_t)status, TTC_RING0_PHASE_RUN);
@@ -2543,7 +2612,7 @@ const ring0RuntimeVMMemoryHookVersion = uint32(2)
 func installRing0RuntimeVMMemoryHook() error {
 	status := ring0SetVMMemoryHooks(
 		ring0RuntimeVMMemoryHookVersion,
-		ring0asm.EnsureHostTrapAddress(),
+		uintptr(C.ttc_ring0_runtime_ensure_host_address()),
 		uintptr(C.ttc_ring0_runtime_vm_hook_address()),
 	)
 	if status != 0 {

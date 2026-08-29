@@ -151,7 +151,7 @@ new file mode 100644
 index 0000000..e1d4c90
 --- /dev/null
 +++ b/src/runtime/ttc_vm_darwin.go
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,196 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -270,6 +270,21 @@ index 0000000..e1d4c90
 +	}
 +}
 +
++// ttcRuntimeEnsureHost establishes the execution-domain boundary before a
++// Darwin libc call. Entering an external text mapping from resident EL1 and
++// relying on the instruction-abort bridge would suspend asmcgocall halfway
++// through its stack transition; returning to the same Go continuation first
++// keeps the entire libcCall at host EL0.
++//
++//go:linkname ttcRuntimeEnsureHost
++//go:nosplit
++func ttcRuntimeEnsureHost() {
++	ensureHost := atomic.Loaduintptr(&ttcVMMemoryEnsureHost)
++	if ensureHost != 0 {
++		asmcgocall(unsafe.Pointer(ensureHost), nil)
++	}
++}
++
 +// ttcVMMemoryStack publishes pthread stack lifetime transitions to TTC's
 +// secondary MMU. It may run without a P and must remain allocation-free.
 +//
@@ -333,3 +348,28 @@ index 0000000..e1d4c90
 +	}
 +	return query.seconds, query.nanoseconds, status == 1
 +}
+diff --git a/src/runtime/sys_libc.go b/src/runtime/sys_libc.go
+index 6913903..a2968bc 100644
+--- a/src/runtime/sys_libc.go
++++ b/src/runtime/sys_libc.go
+@@ -20 +20,2 @@
+ func libcCall(fn, arg unsafe.Pointer) int32 {
++	ttcRuntimeEnsureHost()
+diff --git a/src/runtime/ttc_vm_openbsd.go b/src/runtime/ttc_vm_openbsd.go
+new file mode 100644
+index 0000000..c6f37b5
+--- /dev/null
++++ b/src/runtime/ttc_vm_openbsd.go
+@@ -0,0 +1,12 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build openbsd
++
++package runtime
++
++// ttcRuntimeEnsureHost is a no-op outside Darwin; sys_libc.go is shared by
++// both operating systems.
++//go:nosplit
++func ttcRuntimeEnsureHost() {}

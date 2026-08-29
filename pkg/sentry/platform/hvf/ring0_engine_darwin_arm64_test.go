@@ -29,6 +29,7 @@ import (
 	"time"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
@@ -1298,6 +1299,205 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		stats.hostReturns != beforeReentry.hostReturns {
 		t.Fatalf("post-host-service re-entry did not reuse the residency: stats=%+v", stats)
 	}
+}
+
+// TestSentryHeapRemainsCoherentAcrossHostService verifies the defining
+// property of the shared-Sentry execution model: stores issued by Sentry Go
+// code at EL1 must be visible when the same continuation redpills to Darwin
+// EL0. Port forwarding exercises this transition for every host socket write,
+// so stale heap backing here becomes repeated or corrupted TCP payloads.
+func TestSentryHeapRemainsCoherentAcrossHostService(t *testing.T) {
+	const payloadSize = 4 * vmm.HostSlabSize
+	payload := make([]byte, payloadSize)
+
+	hostPID := os.Getpid()
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172
+	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
+
+	const (
+		spaceID = uint64(98)
+		codeVA  = uint64(0xe00000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+	registers := &vmm.ARM64State{PC: codeVA}
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID,
+		Registers:      registers,
+	})
+	if err != nil || exit.Reason != vmm.ExitSyscall {
+		t.Fatalf("application exit=%+v err=%v", exit, err)
+	}
+	if ring0asm.CurrentEL() == 0 {
+		t.Fatal("application syscall returned Sentry to host instead of EL1")
+	}
+	for i := range payload {
+		payload[i] = byte(i*131 + 17)
+	}
+	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
+		t.Fatalf("host service getpid=%d, want %d", got, hostPID)
+	}
+	if ring0asm.CurrentEL() != 0 {
+		t.Fatal("host service did not return the Sentry continuation to Darwin")
+	}
+	for i, got := range payload {
+		if want := byte(i*131 + 17); got != want {
+			t.Fatalf("payload[%d]=%#x after EL1-to-host transition, want %#x", i, got, want)
+		}
+	}
+	runtime.KeepAlive(payload)
+}
+
+// TestDarwinLibcCallRedpillsBeforeASMCGOCall guards the boundary used by
+// imported host sockets. A host service entered by faulting on external libc
+// text must not replay the Darwin system call while unwinding asmcgocall.
+func TestDarwinLibcCallRedpillsBeforeASMCGOCall(t *testing.T) {
+	sockets, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(sockets[0])
+	defer unix.Close(sockets[1])
+	if err := unix.SetNonblock(sockets[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.SetNonblock(sockets[1], true); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172
+	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
+
+	const (
+		spaceID = uint64(99)
+		codeVA  = uint64(0xe10000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+	registers := &vmm.ARM64State{PC: codeVA}
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID,
+		Registers:      registers,
+	})
+	if err != nil || exit.Reason != vmm.ExitSyscall {
+		t.Fatalf("application exit=%+v err=%v", exit, err)
+	}
+	if ring0asm.CurrentEL() == 0 {
+		t.Fatal("application syscall returned Sentry to host instead of EL1")
+	}
+
+	payload := make([]byte, vmm.HostSlabSize)
+	for i := range payload {
+		payload[i] = byte(i*29 + 7)
+	}
+	n, err := unix.SendmsgBuffers(sockets[0], [][]byte{payload}, nil, nil, unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL)
+	if err != nil || n != len(payload) {
+		t.Fatalf("sendmsg wrote %d of %d bytes: %v", n, len(payload), err)
+	}
+	if ring0asm.CurrentEL() != 0 {
+		t.Fatal("Darwin libc call did not return the Sentry continuation to host")
+	}
+
+	var received []byte
+	buffer := make([]byte, 2*vmm.HostSlabSize)
+	for {
+		n, err := unix.Read(sockets[1], buffer)
+		if n > 0 {
+			received = append(received, buffer[:n]...)
+		}
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if len(received) != len(payload) {
+		t.Fatalf("peer received %d bytes from one %d-byte sendmsg", len(received), len(payload))
+	}
+	for i := range payload {
+		if received[i] != payload[i] {
+			t.Fatalf("peer byte %d = %#x, want %#x", i, received[i], payload[i])
+		}
+	}
+
 }
 
 // TestCPUboundApplicationDoesNotStarveGoScheduler verifies the KVM-equivalent
