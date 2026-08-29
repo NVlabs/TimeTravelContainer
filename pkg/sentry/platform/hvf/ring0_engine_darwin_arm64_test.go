@@ -448,6 +448,118 @@ func TestApplicationWaiterInterruptsCPUBoundIncumbent(t *testing.T) {
 	}
 }
 
+func TestAdmissionKickTargetsOneCPUBoundIncumbent(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+
+	const (
+		spaceID = uint64(97)
+		loopVA  = uint64(0xe00000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: loopVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+
+	type applicationResult struct {
+		exit vmm.Exit
+		err  error
+	}
+	done := make(chan applicationResult, 2)
+	for range 2 {
+		go func() {
+			engine.BeginApplicationResidency()
+			registers := &vmm.ARM64State{PC: loopVA}
+			exit, runErr := engine.RunApplication(context.Background(), vmm.ApplicationState{
+				AddressSpaceID: spaceID,
+				Registers:      registers,
+			})
+			done <- applicationResult{exit: exit, err: errors.Join(runErr, engine.EndApplicationResidency())}
+		}()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		engine.cpuMu.Lock()
+		active := engine.applicationCPUCountLocked() == 2
+		for _, cpu := range engine.cpusByID {
+			if cpu != nil && !cpu.applicationActive.Load() {
+				active = false
+			}
+		}
+		engine.cpuMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CPU-bound incumbents did not both enter EL0")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var first applicationResult
+	for {
+		if err := engine.kickOneApplicationEntry(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case first = <-done:
+			if first.err != nil || first.exit.Reason != vmm.ExitInterrupted {
+				t.Fatalf("targeted incumbent exit=%+v err=%v", first.exit, first.err)
+			}
+			goto handedOff
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("targeted admission kick did not interrupt an incumbent")
+		}
+	}
+
+handedOff:
+	select {
+	case second := <-done:
+		t.Fatalf("one admission kick interrupted both incumbents: second=%+v", second)
+	case <-time.After(25 * time.Millisecond):
+	}
+	engine.InterruptApplications()
+	select {
+	case second := <-done:
+		if second.err != nil || second.exit.Reason != vmm.ExitInterrupted {
+			t.Fatalf("remaining incumbent exit=%+v err=%v", second.exit, second.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remaining incumbent did not stop during cleanup")
+	}
+}
+
 func TestTranslationMutationQuiescesCPUBoundApplication(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
@@ -1226,15 +1338,15 @@ func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 	}()
 	<-entered
 	// Closing entered makes this goroutine runnable without yielding the worker.
-	// Reaching this point therefore proves that native preemption returned the
-	// worker to a runtime safepoint while it owned the only P.
+	// Reaching this point proves that the KVM-style entersyscall boundary released
+	// the only P while the application continued to execute at EL0.
 	engine.InterruptApplications()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestNativePreemptionPreservesApplicationRegisters(t *testing.T) {
+func TestArchitectedInterruptionPreservesApplicationRegisters(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {

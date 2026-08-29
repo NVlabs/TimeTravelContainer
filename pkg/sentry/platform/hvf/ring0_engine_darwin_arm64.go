@@ -69,6 +69,7 @@ type ring0ApplicationCPU struct {
 	retiring          atomic.Bool
 	applicationActive atomic.Bool
 	entryActive       atomic.Bool
+	admissionHandoff  atomic.Bool
 	tlbGeneration     uint64
 	residentSince     time.Time
 }
@@ -834,18 +835,37 @@ func monitorCommandMutatesTranslations(encoded []byte) bool {
 // to remain pending across that interval on all HVF versions.
 func (e *ring0Engine) kickOneApplicationEntry() error {
 	e.cpuMu.Lock()
+	pending := 0
+	for _, cpu := range e.cpusByID {
+		if cpu != nil && cpu.admissionHandoff.Load() && !cpu.retiring.Load() && !cpu.bridge.destroyed() {
+			pending++
+		}
+	}
+	wanted := int(e.applicationWaiters.Load())
+	if wanted < 1 {
+		// Tests and backend maintenance may request an explicit handoff without
+		// entering the application FIFO.
+		wanted = 1
+	}
+	retryPending := pending >= wanted
 	var selected *ring0ApplicationCPU
 	for offset := range len(e.cpusByID) {
 		id := (e.admissionKickCursor + offset) % len(e.cpusByID)
 		cpu := e.cpusByID[id]
 		if cpu == nil || cpu.retiring.Load() || cpu.bridge.destroyed() ||
-			!cpu.bridge.inGuest() || cpu.bridge.externalInterruptRequested() {
+			!cpu.bridge.inGuest() || cpu.admissionHandoff.Load() != retryPending {
+			continue
+		}
+		if !retryPending && cpu.bridge.externalInterruptRequested() {
+			// A translation rendezvous or lifecycle interrupt already owns this
+			// exit. Let it complete before admission assigns the residency.
 			continue
 		}
 		cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))
-		if atomic.LoadUint64(cancel) != 0 || !cpu.tryPin() {
+		if !retryPending && atomic.LoadUint64(cancel) != 0 || !cpu.tryPin() {
 			continue
 		}
+		cpu.admissionHandoff.Store(true)
 		if cpu.entryActive.Load() {
 			atomic.StoreUint64(cancel, 1)
 		}
@@ -856,8 +876,8 @@ func (e *ring0Engine) kickOneApplicationEntry() error {
 	}
 	e.cpuMu.Unlock()
 	if selected == nil {
-		// Every guest-resident incumbent already has a handoff pending. Their
-		// owner paths will release IDs; the waiter's bounded poll observes it.
+		// Either enough handoffs are already pending outside hv_vcpu_run, or no
+		// otherwise-unclaimed guest residency is currently interruptible.
 		return nil
 	}
 	defer e.releaseApplicationCPU(selected)
@@ -1466,7 +1486,7 @@ func (e *ring0Engine) writeApplicationWaitDiagnostic(tid uint64, started time.Ti
 			continue
 		}
 		cancel := atomic.LoadUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested)))
-		fmt.Fprintf(&state, " cpu%d={tid:%d uses:%d active:%t guest:%t cancel:%d destroyed:%t age:%s}", id, cpu.tid, cpu.uses.Load(), cpu.applicationActive.Load(), cpu.bridge.inGuest(), cancel, cpu.bridge.destroyed(), time.Since(cpu.residentSince).Round(time.Millisecond))
+		fmt.Fprintf(&state, " cpu%d={tid:%d uses:%d active:%t guest:%t cancel:%d handoff:%t destroyed:%t age:%s}", id, cpu.tid, cpu.uses.Load(), cpu.applicationActive.Load(), cpu.bridge.inGuest(), cancel, cpu.admissionHandoff.Load(), cpu.bridge.destroyed(), time.Since(cpu.residentSince).Round(time.Millisecond))
 	}
 	state.WriteByte('\n')
 	e.cpuMu.Unlock()
