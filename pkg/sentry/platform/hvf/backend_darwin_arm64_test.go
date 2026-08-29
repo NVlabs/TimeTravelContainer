@@ -323,6 +323,37 @@ func TestRing0EngineForwardsBreakpointAndSoftwareStep(t *testing.T) {
 	}
 }
 
+func TestStage2HostReverseIndexTracksMapLifecycle(t *testing.T) {
+	backend := hvf.NewBackend()
+	vm, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	defer vm.Close()
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	const secondGPA = hvf.GuestRAMIPAStart + vmm.HostSlabSize
+	access := vmm.Stage2Read | vmm.Stage2Write
+	if err := vm.MapStage2(hvf.GuestRAMIPAStart, host, vmm.HostSlabSize, access); err != nil {
+		t.Fatal(err)
+	}
+	if err := vm.MapStage2(secondGPA, host, vmm.HostSlabSize, access); err == nil {
+		t.Fatal("mapping one host slab at a second GPA unexpectedly succeeded")
+	}
+	if err := vm.UnmapStage2(hvf.GuestRAMIPAStart, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := vm.MapStage2(secondGPA, host, vmm.HostSlabSize, access); err != nil {
+		t.Fatalf("mapping host slab after reverse-index removal: %v", err)
+	}
+	if err := vm.UnmapStage2(secondGPA, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRing0EngineCloseRetiresOwnerVCPU(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())

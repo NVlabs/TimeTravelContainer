@@ -70,6 +70,12 @@ var (
 	hvfMonitorResidentCommands = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/monitor/resident_commands",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of translation commands completed directly by a resident Sentry EL1 continuation."})
+	hvfMonitorResidentTotalNS = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/resident_ns",
+		metric.Uint64Metadata{Cumulative: true, Description: "Total resident-Sentry EL1 monitor execution time, in nanoseconds."})
+	hvfMonitorResidentMaxNS = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/resident_max_ns",
+		metric.Uint64Metadata{Cumulative: true, Description: "Maximum resident-Sentry EL1 monitor execution time, in nanoseconds."})
 	hvfMonitorHostCommands = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/monitor/host_commands",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of EL1 monitor commands completed through the Darwin host path."})
@@ -130,6 +136,8 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfMonitorCommands.Set(engine.monitorCommands.Load())
 	hvfMonitorTranslationCommands.Set(engine.monitorTranslationCommands.Load())
 	hvfMonitorResidentCommands.Set(engine.monitorResidentCommands.Load())
+	hvfMonitorResidentTotalNS.Set(engine.monitorResidentTotalNS.Load())
+	hvfMonitorResidentMaxNS.Set(engine.monitorResidentMaxNS.Load())
 	hvfMonitorHostCommands.Set(engine.monitorHostCommands.Load())
 	hvfMonitorHostTotalNS.Set(engine.monitorHostTotalNS.Load())
 	hvfMonitorHostMaxNS.Set(engine.monitorHostMaxNS.Load())

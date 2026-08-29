@@ -201,6 +201,8 @@ type ring0Engine struct {
 	monitorCommands                    atomic.Uint64
 	monitorTranslationCommands         atomic.Uint64
 	monitorResidentCommands            atomic.Uint64
+	monitorResidentTotalNS             atomic.Uint64
+	monitorResidentMaxNS               atomic.Uint64
 	monitorHostCommands                atomic.Uint64
 	monitorResidentFallbackHostEL      atomic.Uint64
 	monitorResidentFallbackUnsupported atomic.Uint64
@@ -359,6 +361,12 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		e.monitorResidentFallbackUnsupported.Add(1)
 		return nil, false, nil
 	}
+	// Besides timestamping this command, time.Now crosses the TTC-patched Darwin
+	// runtime clock boundary. That gives a persistent EL1 continuation a bounded
+	// opportunity to synchronize with native runtime work without the much more
+	// expensive unconditional Yield path. Keep this before decoding: even a
+	// command that falls back after inspection needs the boundary.
+	residentStarted := time.Now()
 	command, err := monitorabi.UnmarshalCommandView(encoded)
 	if err != nil || (command.Opcode != monitorabi.OpcodeApply &&
 		command.Opcode != monitorabi.OpcodeDestroyAddressSpace) {
@@ -489,6 +497,9 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 	copy(response, state[stateResponse:stateResponse+32])
 	e.recordMonitorCommandView(command, response, true)
 	e.monitorResidentCommands.Add(1)
+	residentElapsed := uint64(time.Since(residentStarted))
+	e.monitorResidentTotalNS.Add(residentElapsed)
+	atomicMaxUint64(&e.monitorResidentMaxNS, residentElapsed)
 	return response, true, nil
 }
 

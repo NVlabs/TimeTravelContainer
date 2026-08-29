@@ -157,7 +157,12 @@ type hvfVM struct {
 	monitor   *monitorMemory
 	hostState *hostMemoryState
 	stage2    map[uint64]hvfStage2Slab
-	closed    bool
+	// stage2ByHost is the reverse index for GuestRAM slabs that the Sentry may
+	// mirror into its EL1 address space. GuestRAM churn can leave thousands of
+	// live stage-2 entries; scanning stage2 for every host fault makes process
+	// startup quadratic and produces multi-second latency outliers.
+	stage2ByHost map[uintptr]uint64
+	closed       bool
 }
 
 type hvfStage2Slab struct {
@@ -194,10 +199,12 @@ func (v *hvfVM) canonicalGPAForHost(host uintptr) (uint64, vmm.Stage2Access, boo
 			}
 		}
 	}
-	for gpa, slab := range v.stage2 {
-		if slab.host == host {
-			return gpa, slab.access, true
+	if gpa, ok := v.stage2ByHost[host]; ok {
+		slab, present := v.stage2[gpa]
+		if !present || slab.host != host {
+			panic(fmt.Sprintf("HVF stage-2 reverse index host=%#x gpa=%#x is inconsistent", host, gpa))
 		}
+		return gpa, slab.access, true
 	}
 	return 0, 0, false
 }
@@ -211,14 +218,26 @@ func (v *hvfVM) MapStage2(gpa uint64, hostAddress uintptr, length uint64, access
 	if gpa < SentryMirrorIPAStart {
 		return fmt.Errorf("HVF GPA %#x overlaps the private EL1 monitor range [0, %#x)", gpa, SentryMirrorIPAStart)
 	}
+	for offset := uint64(0); offset < length; offset += vmm.HostSlabSize {
+		host := hostAddress + uintptr(offset)
+		if existing, ok := v.stage2ByHost[host]; ok {
+			return fmt.Errorf("HVF host slab %#x is already mapped at GPA %#x", host, existing)
+		}
+	}
 	if err := v.mapStage2Locked(gpa, hostAddress, length, access); err != nil {
 		return err
 	}
 	if v.stage2 == nil {
 		v.stage2 = make(map[uint64]hvfStage2Slab)
 	}
+	if v.stage2ByHost == nil {
+		v.stage2ByHost = make(map[uintptr]uint64)
+	}
 	for offset := uint64(0); offset < length; offset += vmm.HostSlabSize {
-		v.stage2[gpa+offset] = hvfStage2Slab{host: hostAddress + uintptr(offset), access: access}
+		slabGPA := gpa + offset
+		host := hostAddress + uintptr(offset)
+		v.stage2[slabGPA] = hvfStage2Slab{host: host, access: access}
+		v.stage2ByHost[host] = slabGPA
 	}
 	return nil
 }
@@ -251,7 +270,11 @@ func (v *hvfVM) UnmapStage2(gpa, length uint64) error {
 		return err
 	}
 	for offset := uint64(0); offset < length; offset += vmm.HostSlabSize {
-		delete(v.stage2, gpa+offset)
+		slabGPA := gpa + offset
+		if slab, ok := v.stage2[slabGPA]; ok {
+			delete(v.stage2ByHost, slab.host)
+		}
+		delete(v.stage2, slabGPA)
 	}
 	return nil
 }
