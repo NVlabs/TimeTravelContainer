@@ -192,6 +192,28 @@ type ring0Engine struct {
 	// state only; applicationWaiters drives admission handoff so a fully leased
 	// but uncontended pool retains its syscall-fast residencies.
 	applicationCPUs atomic.Int64
+
+	// Monitor-path counters distinguish the inexpensive resident EL1 path from
+	// the host path whose surrounding redpill, worker handoff, and re-entry are
+	// intentionally outside the native rendezvous pause timer. Keep these as
+	// owner-local atomics so production workloads can attribute that otherwise
+	// invisible cost without enabling syscall tracing.
+	monitorCommands                    atomic.Uint64
+	monitorTranslationCommands         atomic.Uint64
+	monitorResidentCommands            atomic.Uint64
+	monitorHostCommands                atomic.Uint64
+	monitorResidentFallbackHostEL      atomic.Uint64
+	monitorResidentFallbackUnsupported atomic.Uint64
+	monitorResidentFallbackEntryLock   atomic.Uint64
+	monitorResidentFallbackMonitorLock atomic.Uint64
+	monitorResidentFallbackOwner       atomic.Uint64
+	monitorResidentFallbackConflict    atomic.Uint64
+	monitorResidentFallbackResources   atomic.Uint64
+	monitorHostTotalNS                 atomic.Uint64
+	monitorHostMaxNS                   atomic.Uint64
+	monitorApplicationMapPages         atomic.Uint64
+	monitorApplicationUnmapPages       atomic.Uint64
+	monitorApplicationProtectPages     atomic.Uint64
 }
 
 // NewVMEngine constructs the Darwin Sentry-at-EL1 dispatcher for the
@@ -281,8 +303,10 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 }
 
 func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, error) {
+	e.monitorCommands.Add(1)
 	mutatesTranslations := monitorCommandMutatesTranslations(encoded)
 	if mutatesTranslations {
+		e.monitorTranslationCommands.Add(1)
 		if response, ran, err := e.tryRunResidentMonitor(ctx, encoded); ran {
 			return response, err
 		}
@@ -293,6 +317,13 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 	// Linux syscall at EL1, so return that continuation to Darwin before either
 	// path runs. At host EL0 EnsureHost is a signal-bridge no-op.
 	ring0asm.EnsureHost()
+	e.monitorHostCommands.Add(1)
+	hostStarted := time.Now()
+	defer func() {
+		elapsed := uint64(time.Since(hostStarted))
+		e.monitorHostTotalNS.Add(elapsed)
+		atomicMaxUint64(&e.monitorHostMaxNS, elapsed)
+	}()
 	// Mapping mutation and application execution share page tables but execute
 	// on distinct HVF vCPUs. Hypervisor.framework does not provide a reliable
 	// cross-vCPU TLB rendezvous on every supported macOS 15 machine. Kick every
@@ -320,12 +351,18 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 // resident continuation never parks while holding a guest-only critical
 // section.
 func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte) ([]byte, bool, error) {
-	if len(encoded) == 0 || len(encoded) > monitorCommandMax || ring0asm.CurrentEL() == 0 {
+	if ring0asm.CurrentEL() == 0 {
+		e.monitorResidentFallbackHostEL.Add(1)
+		return nil, false, nil
+	}
+	if len(encoded) == 0 || len(encoded) > monitorCommandMax {
+		e.monitorResidentFallbackUnsupported.Add(1)
 		return nil, false, nil
 	}
 	command, err := monitorabi.UnmarshalCommandView(encoded)
 	if err != nil || (command.Opcode != monitorabi.OpcodeApply &&
 		command.Opcode != monitorabi.OpcodeDestroyAddressSpace) {
+		e.monitorResidentFallbackUnsupported.Add(1)
 		return nil, false, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -345,6 +382,7 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		ring0asm.Yield()
 	}
 	if !lockedEntries {
+		e.monitorResidentFallbackEntryLock.Add(1)
 		return nil, false, nil
 	}
 	e.entryBlocked.Store(true)
@@ -353,24 +391,29 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		e.entryMutationMu.Unlock()
 	}()
 	if !e.monitorMu.TryLock() {
+		e.monitorResidentFallbackMonitorLock.Add(1)
 		return nil, false, nil
 	}
 	defer e.monitorMu.Unlock()
 
 	value, ok := e.cpusByTID.Load(hosttid.Current())
 	if !ok {
+		e.monitorResidentFallbackOwner.Add(1)
 		return nil, false, nil
 	}
 	cpu := value.(*ring0ApplicationCPU)
 	if !cpu.tryPin() {
+		e.monitorResidentFallbackOwner.Add(1)
 		return nil, false, nil
 	}
 	defer e.releaseApplicationCPU(cpu)
 	if e.closed.Load() || cpu.retiring.Load() || cpu.entryActive.Load() ||
 		!cpu.bridge.inGuest() || cpu.bridge.destroyed() {
+		e.monitorResidentFallbackOwner.Add(1)
 		return nil, false, nil
 	}
 	if conflicting, inspected := e.residentMonitorConflicts(command.AddressSpaceID, cpu); !inspected || conflicting {
+		e.monitorResidentFallbackConflict.Add(1)
 		return nil, false, nil
 	}
 	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
@@ -384,12 +427,14 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 	vmLocked := false
 	if needsCacheSync {
 		if !e.vm.mu.TryLock() {
+			e.monitorResidentFallbackResources.Add(1)
 			return nil, false, nil
 		}
 		vmLocked = true
 	}
 	if vmLocked && e.vm.closed {
 		e.vm.mu.Unlock()
+		e.monitorResidentFallbackResources.Add(1)
 		return nil, true, fmt.Errorf("HVF VM is closed")
 	}
 	if needsCacheSync {
@@ -443,7 +488,16 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 	response := make([]byte, 32)
 	copy(response, state[stateResponse:stateResponse+32])
 	e.recordMonitorCommandView(command, response, true)
+	e.monitorResidentCommands.Add(1)
 	return response, true, nil
+}
+
+func atomicMaxUint64(target *atomic.Uint64, value uint64) {
+	for current := target.Load(); value > current; current = target.Load() {
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
 }
 
 // residentMonitorConflicts reports whether another application vCPU is
@@ -556,6 +610,7 @@ func (e *ring0Engine) recordMonitorCommand(command monitorabi.Command, response 
 	if validCommand {
 		if decoded, err := monitorabi.UnmarshalResponse(response); err == nil && decoded.Status == monitorabi.StatusOK {
 			e.updateApplicationGPARecords(command)
+			e.recordApplicationMonitorOperations(command.AddressSpaceID, command.Operations)
 		}
 	}
 	if mutatesTranslations {
@@ -566,9 +621,35 @@ func (e *ring0Engine) recordMonitorCommand(command monitorabi.Command, response 
 func (e *ring0Engine) recordMonitorCommandView(command monitorabi.CommandView, response []byte, mutatesTranslations bool) {
 	if decoded, err := monitorabi.UnmarshalResponse(response); err == nil && decoded.Status == monitorabi.StatusOK {
 		e.updateApplicationGPARecordsView(command)
+		if command.AddressSpaceID != ring0SentryAddressSpaceID {
+			for index := 0; index < command.OperationCount; index++ {
+				e.recordApplicationMonitorOperation(command.Operation(index))
+			}
+		}
 	}
 	if mutatesTranslations {
 		e.mmuGeneration.Add(1)
+	}
+}
+
+func (e *ring0Engine) recordApplicationMonitorOperations(addressSpaceID uint64, operations []monitorabi.Operation) {
+	if addressSpaceID == ring0SentryAddressSpaceID {
+		return
+	}
+	for _, operation := range operations {
+		e.recordApplicationMonitorOperation(operation)
+	}
+}
+
+func (e *ring0Engine) recordApplicationMonitorOperation(operation monitorabi.Operation) {
+	pages := operation.Length / vmm.LogicalPageSize
+	switch operation.Type {
+	case monitorabi.OperationMap:
+		e.monitorApplicationMapPages.Add(pages)
+	case monitorabi.OperationUnmap:
+		e.monitorApplicationUnmapPages.Add(pages)
+	case monitorabi.OperationProtect:
+		e.monitorApplicationProtectPages.Add(pages)
 	}
 }
 
@@ -1441,7 +1522,7 @@ func (e *ring0Engine) installRuntimeClockFastpath(vcpu *hvfVCPU) {
 
 func (e *ring0Engine) runRuntimeClockUpdater() {
 	defer close(e.clockDone)
-	defer publishRing0RuntimeMetrics()
+	defer publishRing0RuntimeMetrics(e)
 	// Linux updates its VDSO time data continuously. Refreshing the single
 	// realtime offset here gives the EL1 Darwin-runtime service the same clock
 	// step behavior without putting a host exit back in the syscall hot path.
@@ -1452,7 +1533,7 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 		case <-e.clockStop:
 			return
 		case <-refresh.C:
-			publishRing0RuntimeMetrics()
+			publishRing0RuntimeMetrics(e)
 			calibration, err := calibrateRing0TimeFastpath(e.timeFastpath.vtimerOffset)
 			if err != nil || calibration.clockGettimePC != e.timeFastpath.clockGettimePC ||
 				calibration.machAbsolutePC != e.timeFastpath.machAbsolutePC ||

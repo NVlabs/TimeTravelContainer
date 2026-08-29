@@ -61,9 +61,57 @@ var (
 	hvfRuntimeSuppressedReuseBytes = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/suppressed_reuse_bytes",
 		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in unnecessary Go runtime FREE_REUSE operations suppressed for live HVF backing."})
+	hvfMonitorCommands = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/commands",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of EL1 monitor commands requested."})
+	hvfMonitorTranslationCommands = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/translation_commands",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of translation-mutating EL1 monitor commands requested."})
+	hvfMonitorResidentCommands = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/resident_commands",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of translation commands completed directly by a resident Sentry EL1 continuation."})
+	hvfMonitorHostCommands = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/host_commands",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of EL1 monitor commands completed through the Darwin host path."})
+	hvfMonitorHostTotalNS = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/host_ns",
+		metric.Uint64Metadata{Cumulative: true, Description: "Total Darwin-host monitor execution time after redpill, in nanoseconds."})
+	hvfMonitorHostMaxNS = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/host_max_ns",
+		metric.Uint64Metadata{Cumulative: true, Description: "Maximum Darwin-host monitor execution time after redpill, in nanoseconds."})
+	hvfMonitorFallbackHostEL = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_host_el",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected because the Sentry continuation was already at host EL0."})
+	hvfMonitorFallbackUnsupported = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_unsupported",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected because the command cannot run on the resident path."})
+	hvfMonitorFallbackEntryLock = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_entry_lock",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected by application-entry mutation lock contention."})
+	hvfMonitorFallbackMonitorLock = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_monitor_lock",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected by monitor serialization lock contention."})
+	hvfMonitorFallbackOwner = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_owner",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected because the current owner-affine vCPU was unavailable."})
+	hvfMonitorFallbackConflict = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_conflict",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected by another active reader of the affected address space."})
+	hvfMonitorFallbackResources = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/fallback_resources",
+		metric.Uint64Metadata{Cumulative: true, Description: "Resident monitor attempts rejected by cache-maintenance or VM resource contention."})
+	hvfMonitorApplicationMapPages = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/application_map_pages",
+		metric.Uint64Metadata{Cumulative: true, Description: "Application 4K pages successfully mapped by EL1 monitor commands."})
+	hvfMonitorApplicationUnmapPages = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/application_unmap_pages",
+		metric.Uint64Metadata{Cumulative: true, Description: "Application 4K pages successfully unmapped by EL1 monitor commands."})
+	hvfMonitorApplicationProtectPages = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/monitor/application_protect_pages",
+		metric.Uint64Metadata{Cumulative: true, Description: "Application 4K pages successfully protected by EL1 monitor commands."})
 )
 
-func publishRing0RuntimeMetrics() {
+func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	stats := readRing0RuntimeStats()
 	hvfRendezvousCount.Set(stats.rendezvousCount)
 	hvfRuntimeRendezvousRequests.Set(stats.runtimeRendezvousRequests)
@@ -79,4 +127,20 @@ func publishRing0RuntimeMetrics() {
 	hvfRuntimeSuppressedFreeBytes.Set(stats.suppressedFreeBytes)
 	hvfRuntimeSuppressedReuseCount.Set(stats.suppressedReuseCount)
 	hvfRuntimeSuppressedReuseBytes.Set(stats.suppressedReuseBytes)
+	hvfMonitorCommands.Set(engine.monitorCommands.Load())
+	hvfMonitorTranslationCommands.Set(engine.monitorTranslationCommands.Load())
+	hvfMonitorResidentCommands.Set(engine.monitorResidentCommands.Load())
+	hvfMonitorHostCommands.Set(engine.monitorHostCommands.Load())
+	hvfMonitorHostTotalNS.Set(engine.monitorHostTotalNS.Load())
+	hvfMonitorHostMaxNS.Set(engine.monitorHostMaxNS.Load())
+	hvfMonitorFallbackHostEL.Set(engine.monitorResidentFallbackHostEL.Load())
+	hvfMonitorFallbackUnsupported.Set(engine.monitorResidentFallbackUnsupported.Load())
+	hvfMonitorFallbackEntryLock.Set(engine.monitorResidentFallbackEntryLock.Load())
+	hvfMonitorFallbackMonitorLock.Set(engine.monitorResidentFallbackMonitorLock.Load())
+	hvfMonitorFallbackOwner.Set(engine.monitorResidentFallbackOwner.Load())
+	hvfMonitorFallbackConflict.Set(engine.monitorResidentFallbackConflict.Load())
+	hvfMonitorFallbackResources.Set(engine.monitorResidentFallbackResources.Load())
+	hvfMonitorApplicationMapPages.Set(engine.monitorApplicationMapPages.Load())
+	hvfMonitorApplicationUnmapPages.Set(engine.monitorApplicationUnmapPages.Load())
+	hvfMonitorApplicationProtectPages.Set(engine.monitorApplicationProtectPages.Load())
 }
