@@ -48,6 +48,11 @@ type PortForward struct {
 	allowStoppedSandbox bool
 }
 
+// portForwardSocketBufferSize keeps the donated UDS above the relay's 16 KiB
+// copy size. Darwin otherwise defaults AF_UNIX streams to an 8 KiB send queue,
+// forcing every guest-to-host chunk through a readiness round trip.
+const portForwardSocketBufferSize = 1 << 20
+
 // Name implements subcommands.Command.Name.
 func (*PortForward) Name() string {
 	return "port-forward"
@@ -378,6 +383,10 @@ func openStream(name string) (*os.File, error) {
 	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, err
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, portForwardSocketBufferSize); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("setting UDS send buffer: %w", err)
 	}
 
 	// We are acting as a client so we will connect to the socket.

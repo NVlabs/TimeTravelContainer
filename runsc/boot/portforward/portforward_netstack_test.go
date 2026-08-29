@@ -338,9 +338,10 @@ func (c *chunkedPacketReadImpl) Shutdown(tcpip.ShutdownFlags) tcpip.Error {
 }
 
 type bufferConn struct {
-	name string
-	mu   sync.Mutex
-	buf  bytes.Buffer
+	name     string
+	maxWrite int
+	mu       sync.Mutex
+	buf      bytes.Buffer
 }
 
 func (b *bufferConn) Name() string {
@@ -350,6 +351,9 @@ func (b *bufferConn) Name() string {
 func (b *bufferConn) Write(_ context.Context, p []byte, _ <-chan struct{}) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.maxWrite > 0 && len(p) > b.maxWrite {
+		p = p[:b.maxWrite]
+	}
 	return b.buf.Write(p)
 }
 
@@ -388,5 +392,31 @@ func TestDoCopyDrainsLargeRead(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("copied data mismatch")
+	}
+}
+
+func TestDoCopyRetriesShortWrite(t *testing.T) {
+	const maxWrite = 257
+	payload := bytes.Repeat([]byte("short writes must not drop bytes"), 1000)
+
+	ctx := contexttest.Context(t)
+	wq := &waiter.Queue{}
+	ep := newMockTCPEndpoint(&chunkedPacketReadImpl{data: payload}, wq)
+	src := &netstackConn{ep: ep, wq: wq}
+	dst := &bufferConn{name: "short-writer", maxWrite: maxWrite}
+	cancel := make(chan struct{})
+	defer close(cancel)
+	defer src.Close(ctx)
+
+	buf := make([]byte, len(payload))
+	if err := doCopy(ctx, dst, src, buf, cancel); err != nil {
+		t.Fatalf("doCopy failed: %v", err)
+	}
+
+	dst.mu.Lock()
+	got := append([]byte(nil), dst.buf.Bytes()...)
+	dst.mu.Unlock()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("copied %d bytes, want intact %d-byte payload", len(got), len(payload))
 	}
 }
