@@ -18,6 +18,19 @@ package hvf
 
 import _ "unsafe" // Required for go:linkname.
 
+// ring0EnterSyscall and ring0ExitSyscall give the host Go scheduler the same
+// application-execution boundary used by KVM. No Go code or allocation may
+// occur between these calls: the application owns the thread-affine HVF vCPU,
+// while the Sentry G has released its P. The application exception returns
+// directly to EL1 and ring0ExitSyscall reacquires a P before ordinary Sentry
+// Go execution resumes.
+//
+//go:linkname ring0EnterSyscall runtime.entersyscall
+func ring0EnterSyscall()
+
+//go:linkname ring0ExitSyscall runtime.exitsyscall
+func ring0ExitSyscall()
+
 // ring0SetVMMemoryHooks installs the allocation-free Darwin runtime notifier
 // supplied by tools/go_darwin_vm_hooks.patch.
 //

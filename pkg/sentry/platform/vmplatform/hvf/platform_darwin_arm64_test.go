@@ -27,10 +27,10 @@ func TestHVFApplicationVCPUs(t *testing.T) {
 		cores int
 		want  int
 	}{
-		{cores: 1, want: 3},
-		{cores: 2, want: 6},
-		{cores: 20, want: 60},
-		{cores: 21, want: 63},
+		{cores: 1, want: 1},
+		{cores: 2, want: 2},
+		{cores: 20, want: 20},
+		{cores: 21, want: 21},
 		{cores: 64, want: 63},
 	} {
 		if got := hvfApplicationVCPUs(test.cores); got != test.want {
@@ -51,8 +51,8 @@ func TestPlatformRegistrationConstructsSentryAtEL1Engine(t *testing.T) {
 	if got := p.SeccompInfo().ConfigKey(); got != "hvf" {
 		t.Errorf("platform config key = %q, want hvf", got)
 	}
-	if got := p.ConcurrencyCount(); got != 6 {
-		t.Errorf("platform concurrency = %d, want 6", got)
+	if got := p.ConcurrencyCount(); got != 2 {
+		t.Errorf("platform concurrency = %d, want 2", got)
 	}
 	closer, ok := p.(interface{ Close() error })
 	if !ok {

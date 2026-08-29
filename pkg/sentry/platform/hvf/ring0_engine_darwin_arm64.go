@@ -1061,13 +1061,13 @@ retryApplication:
 		cpu.entryActive.Store(false)
 		goto retryApplication
 	}
-	// Keep this G and its P active while the application runs. Unlike KVM's
-	// SwitchToUser, an application exception restores this continuation directly
-	// at EL1, so ordinary Sentry Go code executes before this function returns to
-	// Darwin. Marking the G as _Gsyscall here would release its P and mcache for
-	// use by another M while the EL1 continuation still allocates from them.
-	// Long-running EL0 execution is made preemptible by the bridge's vCPU
-	// cancellation path; it must not be modeled as a host syscall interval.
+	// Match KVM's scheduler boundary: EL0 application execution neither runs Go
+	// code nor owns the Sentry G's P. The exception returns directly to this
+	// continuation at EL1, where exitsyscall reacquires a P before any ordinary
+	// Sentry Go code can allocate or reach a safepoint. Keeping the P across
+	// hv_vcpu_run lets CPU-bound guests occupy every P and prevents a newly
+	// runnable task from reaching vCPU admission at all.
+	ring0EnterSyscall()
 	if atGuestEL1 {
 		ring0asm.SwitchApplicationGuest()
 	} else {
@@ -1079,6 +1079,7 @@ retryApplication:
 		ring0asm.Bluepill(unsafe.Pointer(cpu.bridge.pointer), cpu.vcpu.stateVA)
 		ring0asm.SwitchApplicationGuest()
 	}
+	ring0ExitSyscall()
 	cpu.entryActive.Store(false)
 	if err := cpu.bridge.error("HVF Sentry-at-EL1 application bridge failed"); err != nil {
 		postRunErr := cpu.bridge.probeOwner()

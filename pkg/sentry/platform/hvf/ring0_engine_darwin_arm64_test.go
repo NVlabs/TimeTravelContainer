@@ -1161,10 +1161,10 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 	}
 }
 
-// TestCPUboundApplicationDoesNotStarveGoScheduler verifies the execution
-// contract that replaces runtime.entersyscall for shared EL1 continuations.
-// With one P, only the native HVF preemption tick can return a CPU-bound Linux
-// task to a Go safepoint and allow this test goroutine to run again.
+// TestCPUboundApplicationDoesNotStarveGoScheduler verifies the KVM-equivalent
+// entersyscall/exitsyscall boundary for shared EL1 continuations. With one P,
+// a CPU-bound Linux task must release the P while it remains in EL0 so this
+// test goroutine can run and request its architected vCPU interruption.
 func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
