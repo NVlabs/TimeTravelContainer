@@ -142,7 +142,13 @@ go_test(
         "linux64_amd64_test.go",
         "linux64_arm64_test.go",
         "linux64_test.go",
+        "sys_file_openat2_test.go",
     ],
     library = ":linux",
-    deps = ["//pkg/sentry/seccheck"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
+        "//pkg/sentry/seccheck",
+    ],
 )
