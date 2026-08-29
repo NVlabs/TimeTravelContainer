@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 type relocationTestVM struct {
@@ -30,6 +32,9 @@ type relocationTestVM struct {
 	commands    []monitorabi.Command
 	applyCount  int
 	failApplyAt int
+	applyOnce   sync.Once
+	applyStart  chan struct{}
+	applyFinish chan struct{}
 }
 
 func (*relocationTestVM) MapStage2(uint64, uintptr, uint64, Stage2Access) error { return nil }
@@ -62,6 +67,12 @@ func (v relocationTestVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	if command.Opcode == monitorabi.OpcodeApply && v.vm.applyStart != nil {
+		v.vm.applyOnce.Do(func() { close(v.vm.applyStart) })
+		if v.vm.applyFinish != nil {
+			<-v.vm.applyFinish
+		}
+	}
 	v.vm.mu.Lock()
 	v.vm.commands = append(v.vm.commands, command)
 	status := monitorabi.StatusOK
@@ -73,6 +84,85 @@ func (v relocationTestVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byt
 	}
 	v.vm.mu.Unlock()
 	return monitorabi.MarshalResponse(monitorabi.Response{Sequence: command.Sequence, Status: status}), nil
+}
+
+func TestAddressSpaceMapPinsFramesUntilReverseMapIsVisible(t *testing.T) {
+	vm := &relocationTestVM{applyStart: make(chan struct{}), applyFinish: make(chan struct{})}
+	host := newRAMTestHost()
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: vm, Host: host, IPAStart: 0x100000, IPASize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+		BackingProvider:         ram,
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateUncommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := NewWorkerPool(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	defer func() {
+		select {
+		case <-vm.applyFinish:
+		default:
+			close(vm.applyFinish)
+		}
+	}()
+	p := &Platform{
+		engine:  newWorkerPoolTestEngine(pool),
+		ram:     ram,
+		spaces:  make(map[uint64]*addressSpace),
+		staging: &stagingCache{},
+	}
+	p.monitor = NewMonitor(p.engine, monitorPoolExpander(vm))
+	as := &addressSpace{id: 1, platform: p, mappings: make(map[hostarch.Addr]addressMapping)}
+	p.spaces[as.id] = as
+	ram.SetRevoker(p)
+
+	mapDone := make(chan error, 1)
+	go func() {
+		mapDone <- as.MapFile(0x4000, mf, fr, hostarch.Read, false)
+	}()
+	select {
+	case <-vm.applyStart:
+	case <-time.After(time.Second):
+		t.Fatal("stage-1 map did not reach the monitor")
+	}
+	decommitDone := make(chan struct{})
+	go func() {
+		mf.Decommit(memmap.FileRange{Start: fr.Start, End: fr.End})
+		close(decommitDone)
+	}()
+	select {
+	case <-decommitDone:
+		t.Fatal("Decommit retired a frame while its stage-1 map transaction was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(vm.applyFinish)
+	if err := <-mapDone; err != nil {
+		t.Fatalf("MapFile: %v", err)
+	}
+	select {
+	case <-decommitDone:
+	case <-time.After(time.Second):
+		t.Fatal("Decommit did not continue after the stage-1 mapping lease was released")
+	}
+	if len(as.mappings) != 0 {
+		t.Fatalf("decommit left stale address-space mappings: %+v", as.mappings)
+	}
+	mf.DecRef(fr)
+	mf.Destroy()
 }
 func (relocationTestVCPU) RequestExit() error { return nil }
 func (relocationTestVCPU) Close() error       { return nil }

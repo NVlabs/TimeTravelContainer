@@ -32,6 +32,13 @@ type BackingFrame struct {
 	HostAddress uintptr
 }
 
+// BackingMappingRequest describes one logical MemoryFile range in an atomic
+// host-mapping lease acquisition.
+type BackingMappingRequest struct {
+	Range  memmap.FileRange
+	Access hostarch.AccessType
+}
+
 // BackingProvider creates storage for one MemoryFile. A VM platform normally
 // implements this with a view onto its shared GuestRAM allocator.
 type BackingProvider interface {
@@ -41,7 +48,8 @@ type BackingProvider interface {
 // Backing is platform-owned MemoryFile storage. Grow returns one mapping slot
 // per newly added pgalloc chunk; relocatable implementations return zero slots
 // and expose host addresses only through AcquireMapping. ResolveFrames is for
-// platform page-table construction, not Sentry host access.
+// backing management and inspection; stage-1 page-table construction must use
+// MemoryFile.AcquireBackingFrames so physical lifetime is pinned.
 type Backing interface {
 	Grow(oldSize, newSize uint64, huge bool) ([]uintptr, error)
 	Commit(fr memmap.FileRange) error
@@ -63,9 +71,13 @@ type Backing interface {
 	Destroy() error
 }
 
-// ResolveBackingFrames returns the stable logical frames backing fr. It is
-// used by VM AddressSpaces instead of translating host file descriptors or
-// host physical addresses.
+type backingBatchMapper interface {
+	AcquireMappings([]BackingMappingRequest) ([][]BackingFrame, memmap.InternalMappingLease, error)
+}
+
+// ResolveBackingFrames returns the stable logical frames backing fr without a
+// lifetime lease. It is intended for backing management and inspection. VM
+// AddressSpaces must use AcquireBackingFrames.
 func (f *MemoryFile) ResolveBackingFrames(fr memmap.FileRange, at hostarch.AccessType) ([]BackingFrame, error) {
 	if f.backing == nil {
 		return nil, &NoPlatformBackingError{}
@@ -78,6 +90,22 @@ func (f *MemoryFile) ResolveBackingFrames(fr memmap.FileRange, at hostarch.Acces
 		return nil, err
 	}
 	return f.backing.ResolveFrames(fr, at)
+}
+
+// AcquireBackingFrames returns the stable logical frames backing fr and pins
+// their physical storage until the returned lease is released. VM address
+// spaces must retain this lease until the monitor has acknowledged the
+// stage-1 transaction and every new reverse mapping has been recorded. This
+// closes the lifetime window in which Decommit could otherwise retire a frame
+// after resolution but before its new PTE became visible to the reverse map.
+func (f *MemoryFile) AcquireBackingFrames(fr memmap.FileRange, at hostarch.AccessType) ([]BackingFrame, memmap.InternalMappingLease, error) {
+	if f.backing == nil {
+		return nil, nil, &NoPlatformBackingError{}
+	}
+	if err := f.awaitBackingLoads(fr); err != nil {
+		return nil, nil, err
+	}
+	return f.backing.AcquireMapping(fr, at)
 }
 
 // NoPlatformBackingError indicates that a MemoryFile uses the ordinary host

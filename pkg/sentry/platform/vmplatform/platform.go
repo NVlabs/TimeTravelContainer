@@ -512,7 +512,7 @@ func (p *Platform) rebuildEpoch(ram *GuestRAM) (retErr error) {
 }
 
 type frameResolver interface {
-	ResolveBackingFrames(memmap.FileRange, hostarch.AccessType) ([]pgalloc.BackingFrame, error)
+	AcquireBackingFrames(memmap.FileRange, hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, error)
 }
 
 type addressMapping struct {
@@ -579,34 +579,48 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 		return fmt.Errorf("invalid vmplatform mapping addr=%#x range=%v", addr, fr)
 	}
 	var frames []pgalloc.BackingFrame
+	var frameLease memmap.InternalMappingLease
 	var stagedPages []*stagedPage
 	for {
 		before := as.platform.ram.Metrics().Epoch
 		layoutBefore := as.platform.ram.layoutGeneration()
 		var err error
 		if resolver, ok := file.(frameResolver); ok {
-			frames, err = resolver.ResolveBackingFrames(fr, at)
+			frames, frameLease, err = resolver.AcquireBackingFrames(fr, at)
 			stagedPages = nil
 		} else {
 			frames, stagedPages, err = as.platform.staging.resolve(file, fr, at)
+			frameLease = nil
 		}
 		if err != nil {
 			return err
 		}
 		epoch := as.platform.ram.Metrics().Epoch
 		if epoch != before {
+			if frameLease != nil {
+				frameLease.Release()
+				frameLease = nil
+			}
 			if err := as.platform.staging.cancelReservations(stagedPages); err != nil {
 				return err
 			}
 			continue
 		}
 		if err := as.platform.lockEpoch(stdcontext.Background()); err != nil {
+			if frameLease != nil {
+				frameLease.Release()
+				frameLease = nil
+			}
 			return errors.Join(err, as.platform.staging.cancelReservations(stagedPages))
 		}
 		if as.platform.ram.Metrics().Epoch == epoch && as.platform.ram.layoutGeneration() == layoutBefore {
 			break
 		}
 		as.platform.epochMu.RUnlock()
+		if frameLease != nil {
+			frameLease.Release()
+			frameLease = nil
+		}
 		if err := as.platform.staging.cancelReservations(stagedPages); err != nil {
 			return err
 		}
@@ -616,6 +630,21 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 	// GuestRAM decommit.
 	defer func() {
 		retErr = errors.Join(retErr, as.platform.staging.cancelReservations(stagedPages))
+	}()
+	var retiredStagedPages []*stagedPage
+	defer func() {
+		for _, staged := range retiredStagedPages {
+			if err := as.platform.staging.removeMapping(staged); err != nil {
+				as.mu.Lock()
+				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+				as.mu.Unlock()
+			}
+		}
+	}()
+	defer func() {
+		if frameLease != nil {
+			frameLease.Release()
+		}
 	}()
 	defer as.platform.epochMu.RUnlock()
 	if uint64(len(frames))*hostarch.PageSize != fr.Length() {
@@ -643,44 +672,79 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, file memmap.File, fr memmap.
 		for i := start; i < end; i++ {
 			operations[i-start] = runs[i].operation
 		}
-		if err := as.platform.monitor.Execute(stdcontext.Background(), monitorabi.Command{
-			Opcode:         monitorabi.OpcodeApply,
-			AddressSpaceID: as.id,
-			Operations:     operations,
-		}); err != nil {
-			return err
-		}
-		for i := runs[start].firstFrame; i < runs[end-1].endFrame; i++ {
+		firstFrame := runs[start].firstFrame
+		endFrame := runs[end-1].endFrame
+		prepared := make([]int, 0, endFrame-firstFrame)
+		for i := firstFrame; i < endFrame; i++ {
 			va := addr + hostarch.Addr(uint64(i)*hostarch.PageSize)
-			if old, ok := as.mappings[va]; ok {
-				if old.frame == frames[i].ID {
-					as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: stagedPageAt(stagedPages, i)}
-					continue
-				}
-				as.platform.ram.RemoveMapping(old.frame, MappingRef{AddressSpaceID: as.id, VirtualAddress: uint64(va)})
-				if err := as.platform.staging.removeMapping(old.staged); err != nil {
-					as.stickyWriteback = errors.Join(as.stickyWriteback, err)
-				}
+			if old, ok := as.mappings[va]; ok && old.frame == frames[i].ID {
+				continue
 			}
 			ref := MappingRef{AddressSpaceID: as.id, VirtualAddress: uint64(va)}
 			if err := as.platform.ram.AddMapping(frames[i].ID, ref); err != nil {
-				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+				as.rollbackPreparedMappings(addr, frames, stagedPages, prepared)
 				return err
 			}
 			staged := stagedPageAt(stagedPages, i)
 			if err := as.platform.staging.commitMapping(staged); err != nil {
 				as.platform.ram.RemoveMapping(frames[i].ID, ref)
-				as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+				as.rollbackPreparedMappings(addr, frames, stagedPages, prepared)
 				return err
 			}
+			prepared = append(prepared, i)
+		}
+		if err := as.platform.monitor.Execute(stdcontext.Background(), monitorabi.Command{
+			Opcode:         monitorabi.OpcodeApply,
+			AddressSpaceID: as.id,
+			Operations:     operations,
+		}); err != nil {
+			as.rollbackPreparedMappings(addr, frames, stagedPages, prepared)
+			return err
+		}
+		for i := firstFrame; i < endFrame; i++ {
+			va := addr + hostarch.Addr(uint64(i)*hostarch.PageSize)
+			if old, ok := as.mappings[va]; ok {
+				if old.frame == frames[i].ID {
+					// The existing reverse/staging references already own this
+					// frame. Leave the duplicate staging reservation for deferred
+					// cancellation and only update the PTE permissions.
+					old.access = at
+					as.mappings[va] = old
+					continue
+				}
+				as.platform.ram.RemoveMapping(old.frame, MappingRef{AddressSpaceID: as.id, VirtualAddress: uint64(va)})
+				if old.staged != nil {
+					retiredStagedPages = append(retiredStagedPages, old.staged)
+				}
+			}
+			staged := stagedPageAt(stagedPages, i)
+			as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: staged}
 			if staged != nil {
 				stagedPages[i] = nil
 			}
-			as.mappings[va] = addressMapping{frame: frames[i].ID, access: at, staged: staged}
 		}
 		start = end
 	}
 	return nil
+}
+
+// rollbackPreparedMappings removes ownership acquired before a monitor
+// transaction that failed without publishing any of its PTE changes.
+func (as *addressSpace) rollbackPreparedMappings(addr hostarch.Addr, frames []pgalloc.BackingFrame, stagedPages []*stagedPage, prepared []int) {
+	for i := len(prepared) - 1; i >= 0; i-- {
+		frameIndex := prepared[i]
+		va := addr + hostarch.Addr(uint64(frameIndex)*hostarch.PageSize)
+		as.platform.ram.RemoveMapping(frames[frameIndex].ID, MappingRef{AddressSpaceID: as.id, VirtualAddress: uint64(va)})
+		staged := stagedPageAt(stagedPages, frameIndex)
+		if err := as.platform.staging.removeMapping(staged); err != nil {
+			as.stickyWriteback = errors.Join(as.stickyWriteback, err)
+		}
+		if staged != nil {
+			// commitMapping consumed this reservation; prevent the deferred
+			// cancellation path from dropping it a second time.
+			stagedPages[frameIndex] = nil
+		}
+	}
 }
 
 // +checklocksignore: lockEpoch conditionally returns with epochMu read-locked.

@@ -374,11 +374,30 @@ func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType
 }
 
 func (b *guestBacking) AcquireMapping(fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, error) {
-	b.ram.accessMu.RLock()
-	frames, err := b.ResolveFrames(fr, at)
+	frames, lease, err := b.AcquireMappings([]pgalloc.BackingMappingRequest{{Range: fr, Access: at}})
 	if err != nil {
-		b.ram.accessMu.RUnlock()
 		return nil, nil, err
+	}
+	return frames[0], lease, nil
+}
+
+// AcquireMappings resolves all requests under one accessMu read acquisition.
+// Callers that copy between GuestRAM ranges must not recursively acquire this
+// RWMutex: a pending Decommit writer would otherwise wait for the first lease
+// while the second acquisition waits behind that writer.
+func (b *guestBacking) AcquireMappings(requests []pgalloc.BackingMappingRequest) ([][]pgalloc.BackingFrame, memmap.InternalMappingLease, error) {
+	if len(requests) == 0 {
+		return nil, nil, nil
+	}
+	b.ram.accessMu.RLock()
+	frames := make([][]pgalloc.BackingFrame, len(requests))
+	for i, request := range requests {
+		resolved, err := b.ResolveFrames(request.Range, request.Access)
+		if err != nil {
+			b.ram.accessMu.RUnlock()
+			return nil, nil, err
+		}
+		frames[i] = resolved
 	}
 	return frames, &guestMappingLease{ram: b.ram}, nil
 }

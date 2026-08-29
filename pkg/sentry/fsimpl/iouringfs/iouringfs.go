@@ -232,19 +232,23 @@ func (fd *FileDescription) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeC
 // mapSharedBuffers caches internal mappings for the ring's shared memory
 // regions.
 func (fd *FileDescription) mapSharedBuffers() error {
-	// Mapping for the IORings header struct.
-	rb, rbLease, err := memmap.MapInternalWithLease(fd.mf, fd.rbmf.fr, hostarch.ReadWrite)
+	mappings, mappingLease, err := memmap.MapInternalBatchWithLease(fd.mf, []memmap.InternalMappingRequest{
+		{Range: fd.rbmf.fr, Access: hostarch.ReadWrite},
+		{Range: fd.sqemf.fr, Access: hostarch.ReadWrite},
+	})
 	if err != nil {
 		return err
 	}
+	// Mapping for the IORings header struct.
+	rb := mappings[0]
 	fd.ioRingsBuf.init(rb)
 
 	// Mapping for the CQEs array. This is contiguous to the header struct.
 	cqesOffset := uint64(fd.ioRings.SizeBytes())
 	cqesOffset, ok := hostarch.CacheLineRoundUp(cqesOffset)
 	if !ok {
-		if rbLease != nil {
-			rbLease.Release()
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 		return linuxerr.EOVERFLOW
 	}
@@ -252,20 +256,11 @@ func (fd *FileDescription) mapSharedBuffers() error {
 	fd.cqesBuf.init(cqes)
 
 	// Mapping for the SQEs array.
-	sqes, sqeLease, err := memmap.MapInternalWithLease(fd.mf, fd.sqemf.fr, hostarch.ReadWrite)
-	if err != nil {
-		if rbLease != nil {
-			rbLease.Release()
-		}
-		return err
-	}
+	sqes := mappings[1]
 	fd.sqesBuf.init(sqes)
 	fd.mappingLeases = fd.mappingLeases[:0]
-	if rbLease != nil {
-		fd.mappingLeases = append(fd.mappingLeases, rbLease)
-	}
-	if sqeLease != nil {
-		fd.mappingLeases = append(fd.mappingLeases, sqeLease)
+	if mappingLease != nil {
+		fd.mappingLeases = append(fd.mappingLeases, mappingLease)
 	}
 
 	return nil

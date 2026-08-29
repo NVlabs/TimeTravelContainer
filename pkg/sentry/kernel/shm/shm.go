@@ -540,25 +540,18 @@ func (s *Shm) copyOnWriteLocked(ctx context.Context, mr memmap.MappableRange) er
 		if err != nil {
 			return err
 		}
-		oldIMS, oldLease, err := memmap.MapInternalWithLease(s.mf, oldRange, hostarch.Read)
+		mappings, mappingLease, err := memmap.MapInternalBatchWithLease(s.mf, []memmap.InternalMappingRequest{
+			{Range: oldRange, Access: hostarch.Read},
+			{Range: newRange, Access: hostarch.Write},
+		})
 		if err != nil {
 			s.mf.DecRef(newRange)
 			return err
 		}
-		newIMS, newLease, err := memmap.MapInternalWithLease(s.mf, newRange, hostarch.Write)
-		if err != nil {
-			if oldLease != nil {
-				oldLease.Release()
-			}
-			s.mf.DecRef(newRange)
-			return err
-		}
+		oldIMS, newIMS := mappings[0], mappings[1]
 		n, copyErr := safemem.CopySeq(newIMS, oldIMS)
-		if newLease != nil {
-			newLease.Release()
-		}
-		if oldLease != nil {
-			oldLease.Release()
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 		if copyErr != nil || n != cowRange.Length() {
 			s.mf.DecRef(newRange)

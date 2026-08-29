@@ -569,6 +569,50 @@ func TestGuestRAMDecommitWaitsForHostMappingLease(t *testing.T) {
 	}
 }
 
+func TestGuestRAMBatchMappingUsesSingleLease(t *testing.T) {
+	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	batchBacking, ok := backing.(interface {
+		AcquireMappings([]pgalloc.BackingMappingRequest) ([][]pgalloc.BackingFrame, memmap.InternalMappingLease, error)
+	})
+	if !ok {
+		t.Fatal("GuestRAM backing does not implement batch mapping")
+	}
+	mappings, lease, err := batchBacking.AcquireMappings([]pgalloc.BackingMappingRequest{
+		{Range: memmap.FileRange{Start: 0, End: GuestFrameSize}, Access: hostarch.Read},
+		{Range: memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}, Access: hostarch.Write},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappings) != 2 {
+		lease.Release()
+		t.Fatalf("batch mapping count = %d, want 2", len(mappings))
+	}
+	if len(mappings[0]) != 1 || len(mappings[1]) != 1 {
+		lease.Release()
+		t.Fatalf("batch mapping lengths = [%d, %d], want [1, 1]", len(mappings[0]), len(mappings[1]))
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- backing.Decommit(memmap.FileRange{Start: 0, End: GuestFrameSize})
+	}()
+	select {
+	case err := <-done:
+		lease.Release()
+		t.Fatalf("Decommit completed while batch lease was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	lease.Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Decommit did not continue after batch lease release")
+	}
+}
+
 func TestGuestRAMDestroyWaitsForHostMappingLease(t *testing.T) {
 	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
 	_, lease, err := backing.AcquireMapping(memmap.FileRange{Start: 0, End: GuestFrameSize}, hostarch.Write)

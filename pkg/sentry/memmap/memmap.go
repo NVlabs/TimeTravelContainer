@@ -555,6 +555,29 @@ type internalMappingLeaser interface {
 	MapInternalWithLease(FileRange, hostarch.AccessType) (safemem.BlockSeq, InternalMappingLease, error)
 }
 
+// InternalMappingRequest describes one range in a batch of operation-scoped
+// host mappings. Batching is important for relocatable VM memory: acquiring a
+// second read lease while retaining the first can deadlock with a queued
+// relocation writer on implementations backed by sync.RWMutex.
+type InternalMappingRequest struct {
+	Range  FileRange
+	Access hostarch.AccessType
+}
+
+type internalMappingBatchLeaser interface {
+	MapInternalBatchWithLease([]InternalMappingRequest) ([]safemem.BlockSeq, InternalMappingLease, error)
+}
+
+type internalMappingLeaseGroup []InternalMappingLease
+
+func (g internalMappingLeaseGroup) Release() {
+	for i := len(g) - 1; i >= 0; i-- {
+		if g[i] != nil {
+			g[i].Release()
+		}
+	}
+}
+
 type pmaInternalMapper interface {
 	MapInternalForPMA(FileRange, hostarch.AccessType) (safemem.BlockSeq, error)
 }
@@ -568,6 +591,28 @@ func MapInternalWithLease(file File, fr FileRange, at hostarch.AccessType) (safe
 	}
 	blocks, err := file.MapInternal(fr, at)
 	return blocks, nil, err
+}
+
+// MapInternalBatchWithLease maps all requests under one operation-scoped
+// lease when file supports it. The fallback retains the ordinary File
+// contract while releasing already-acquired mappings if a later request
+// fails.
+func MapInternalBatchWithLease(file File, requests []InternalMappingRequest) ([]safemem.BlockSeq, InternalMappingLease, error) {
+	if file, ok := file.(internalMappingBatchLeaser); ok {
+		return file.MapInternalBatchWithLease(requests)
+	}
+	blocks := make([]safemem.BlockSeq, 0, len(requests))
+	leases := make(internalMappingLeaseGroup, 0, len(requests))
+	for _, request := range requests {
+		mapping, lease, err := MapInternalWithLease(file, request.Range, request.Access)
+		if err != nil {
+			leases.Release()
+			return nil, nil, err
+		}
+		blocks = append(blocks, mapping)
+		leases = append(leases, lease)
+	}
+	return blocks, leases, nil
 }
 
 // MapInternalForPMA obtains a mapping that may be cached only inside a

@@ -1866,6 +1866,67 @@ func (f *MemoryFile) MapInternalWithLease(fr memmap.FileRange, at hostarch.Acces
 	return f.mapInternalWithLeaseNoWait(fr, at)
 }
 
+// MapInternalBatchWithLease implements memmap's batch mapping interface. VM
+// backings acquire one relocation exclusion for the complete batch, avoiding
+// recursive read locking when a caller needs source and destination mappings
+// simultaneously.
+func (f *MemoryFile) MapInternalBatchWithLease(requests []memmap.InternalMappingRequest) ([]safemem.BlockSeq, memmap.InternalMappingLease, error) {
+	if len(requests) == 0 {
+		return nil, nil, nil
+	}
+	for _, request := range requests {
+		if err := f.awaitInternalMappingLoads(request.Range, request.Access); err != nil {
+			return nil, nil, err
+		}
+	}
+	if f.backing == nil {
+		blocks := make([]safemem.BlockSeq, 0, len(requests))
+		for _, request := range requests {
+			mapping, err := f.mapInternalNoWait(request.Range)
+			if err != nil {
+				return nil, nil, err
+			}
+			blocks = append(blocks, mapping)
+		}
+		return blocks, nil, nil
+	}
+	batchBacking, ok := f.backing.(backingBatchMapper)
+	if !ok {
+		return nil, nil, fmt.Errorf("platform MemoryFile backing does not support atomic mapping batches")
+	}
+	backingRequests := make([]BackingMappingRequest, len(requests))
+	aligned := make([]memmap.FileRange, len(requests))
+	for i, request := range requests {
+		var err error
+		aligned[i], err = pageAlignFileRange(request.Range)
+		if err != nil {
+			return nil, nil, err
+		}
+		backingRequests[i] = BackingMappingRequest{Range: aligned[i], Access: request.Access}
+	}
+	frames, lease, err := batchBacking.AcquireMappings(backingRequests)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(frames) != len(requests) {
+		if lease != nil {
+			lease.Release()
+		}
+		return nil, nil, fmt.Errorf("platform MemoryFile backing returned %d mapping batches, want %d", len(frames), len(requests))
+	}
+	blocks := make([]safemem.BlockSeq, len(requests))
+	for i, request := range requests {
+		blocks[i], err = blockSeqFromBackingFrames(request.Range, aligned[i].Start, frames[i])
+		if err != nil {
+			if lease != nil {
+				lease.Release()
+			}
+			return nil, nil, err
+		}
+	}
+	return blocks, lease, nil
+}
+
 // mapInternalWithLeaseNoWait is used by asynchronous page loaders after they
 // have committed and exclusively claimed the destination range. Unlike the
 // public mapping methods, it must not wait for that same load to complete.
