@@ -28,6 +28,7 @@ go_library(
         "backend_darwin_arm64.go",
         "backend_unsupported.go",
         ":monitor_image_go",
+        "metrics_darwin_arm64.go",
         "monitor_darwin_arm64.go",
         "ring0_darwin_arm64.go",
         "ring0_engine_darwin_arm64.go",
@@ -48,6 +49,7 @@ go_library(
     deps = [
         "//pkg/hostarch",
         "//pkg/hosttid",
+        "//pkg/metric",
         "//pkg/sentry/platform/hvf/ring0asm",
         "//pkg/sentry/platform/vmplatform",
         "//pkg/sentry/platform/vmplatform/monitorabi",

@@ -688,6 +688,15 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vm.unmapRing0MirrorStage2GPA(trackedGPA, vmm.HostSlabSize)
+	statsBeforeSuppression := readRing0RuntimeStats()
+	if err := suppressRing0TrackedHostReclaim(trackedHost, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+	statsAfterSuppression := readRing0RuntimeStats()
+	if statsAfterSuppression.suppressedFreeCount <= statsBeforeSuppression.suppressedFreeCount ||
+		statsAfterSuppression.suppressedFreeBytes-statsBeforeSuppression.suppressedFreeBytes < vmm.HostSlabSize {
+		t.Fatalf("runtime reclaim suppression stats before=%+v after=%+v", statsBeforeSuppression, statsAfterSuppression)
+	}
 
 	codeHost, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
 	if err != nil {
@@ -771,8 +780,17 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 		time.Sleep(100 * time.Microsecond)
 	}
 
+	statsBeforeReplacement := readRing0RuntimeStats()
 	if err := replaceRing0TrackedHostMapping(trackedHost, vmm.HostSlabSize, 0x8877665544332211); err != nil {
 		t.Fatal(err)
+	}
+	statsAfterReplacement := readRing0RuntimeStats()
+	if statsAfterReplacement.rendezvousCount <= statsBeforeReplacement.rendezvousCount ||
+		statsAfterReplacement.runtimeRendezvousRequests <= statsBeforeReplacement.runtimeRendezvousRequests ||
+		statsAfterReplacement.rendezvousDrainMaxNS == 0 ||
+		statsAfterReplacement.rendezvousPauseMaxNS == 0 ||
+		statsAfterReplacement.rendezvousVCPUExitCalls <= statsBeforeReplacement.rendezvousVCPUExitCalls {
+		t.Fatalf("runtime replacement rendezvous stats before=%+v after=%+v", statsBeforeReplacement, statsAfterReplacement)
 	}
 	select {
 	case loop := <-loopDone:

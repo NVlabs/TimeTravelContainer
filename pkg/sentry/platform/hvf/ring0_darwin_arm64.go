@@ -408,7 +408,7 @@ struct ttc_ring0_bridge {
 };
 
 #define TTC_RING0_HOST_SLAB_SIZE UINT64_C(16384)
-#define TTC_RUNTIME_VM_MUTATION_VERSION 1u
+#define TTC_RUNTIME_VM_MUTATION_VERSION 2u
 #define TTC_RUNTIME_VM_MMAP 1u
 #define TTC_RUNTIME_VM_MUNMAP 2u
 #define TTC_RUNTIME_VM_MADVISE 3u
@@ -418,6 +418,10 @@ struct ttc_ring0_bridge {
 #define TTC_RUNTIME_VM_AFTER 2u
 #define TTC_RUNTIME_MADV_FREE_REUSABLE 7
 #define TTC_RUNTIME_MADV_FREE_REUSE 8
+#define TTC_RUNTIME_VM_PROCEED 0u
+#define TTC_RUNTIME_VM_SUPPRESS 1u
+#define TTC_RING0_RENDEZVOUS_MONITOR 1u
+#define TTC_RING0_RENDEZVOUS_RUNTIME 2u
 
 // Keep this layout synchronized with runtime.ttcVMMemoryMutation in the
 // patched Darwin Go runtime. It deliberately contains no Go pointers.
@@ -434,9 +438,10 @@ struct ttc_runtime_vm_mutation {
 	int32_t error;
 	uint32_t offset;
 	uint32_t active;
+	uint32_t disposition;
 };
 
-_Static_assert(sizeof(struct ttc_runtime_vm_mutation) == 56,
+_Static_assert(sizeof(struct ttc_runtime_vm_mutation) == 64,
 		"Darwin runtime VM mutation ABI changed");
 
 // One record represents one coalesced hv_vm_map lease. registered records the
@@ -463,6 +468,21 @@ static pthread_mutex_t ttc_ring0_bridge_registry_mu = PTHREAD_MUTEX_INITIALIZER;
 // A count, rather than a boolean, prevents a nested Go-runtime mutation from
 // reopening admission before the outer reconciliation is complete.
 static _Atomic uint32_t ttc_ring0_guest_pause_count;
+static uint64_t ttc_ring0_guest_pause_started_ns;
+static _Atomic uint64_t ttc_ring0_rendezvous_count;
+static _Atomic uint64_t ttc_ring0_runtime_rendezvous_requests;
+static _Atomic uint64_t ttc_ring0_rendezvous_drain_total_ns;
+static _Atomic uint64_t ttc_ring0_rendezvous_drain_max_ns;
+static _Atomic uint64_t ttc_ring0_rendezvous_pause_total_ns;
+static _Atomic uint64_t ttc_ring0_rendezvous_pause_max_ns;
+static _Atomic uint64_t ttc_ring0_rendezvous_vcpu_exit_calls;
+static _Atomic uint64_t ttc_ring0_rendezvous_vcpu_exit_targets;
+static _Atomic uint64_t ttc_ring0_rendezvous_failures;
+static _Atomic uint64_t ttc_ring0_runtime_vm_hook_calls;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_count;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_bytes;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_count;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_bytes;
 static struct ttc_ring0_bridge *ttc_ring0_bridges;
 // Bridge records are visible to the shared EL1 Sentry and therefore may gain
 // a long-lived stage-2 lease. Recycle their anonymous 16K mappings in place
@@ -471,6 +491,72 @@ static struct ttc_ring0_bridge *ttc_ring0_bridges;
 // old HVF lease. The pool is bounded by peak simultaneous vCPU ownership.
 static struct ttc_ring0_bridge *ttc_ring0_free_bridges;
 static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
+
+static uint64_t ttc_ring0_monotonic_ns(void) {
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+	return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+			(uint64_t)now.tv_nsec;
+}
+
+static void ttc_ring0_atomic_max(_Atomic uint64_t *maximum, uint64_t value) {
+	uint64_t current = atomic_load_explicit(maximum, memory_order_relaxed);
+	while (current < value && !atomic_compare_exchange_weak_explicit(
+			maximum, &current, value, memory_order_relaxed,
+			memory_order_relaxed)) {
+	}
+}
+
+enum ttc_ring0_runtime_stat_index {
+	TTC_RING0_STAT_RENDEZVOUS_COUNT,
+	TTC_RING0_STAT_RUNTIME_RENDEZVOUS_REQUESTS,
+	TTC_RING0_STAT_RENDEZVOUS_DRAIN_TOTAL_NS,
+	TTC_RING0_STAT_RENDEZVOUS_DRAIN_MAX_NS,
+	TTC_RING0_STAT_RENDEZVOUS_PAUSE_TOTAL_NS,
+	TTC_RING0_STAT_RENDEZVOUS_PAUSE_MAX_NS,
+	TTC_RING0_STAT_RENDEZVOUS_VCPU_EXIT_CALLS,
+	TTC_RING0_STAT_RENDEZVOUS_VCPU_EXIT_TARGETS,
+	TTC_RING0_STAT_RENDEZVOUS_FAILURES,
+	TTC_RING0_STAT_RUNTIME_VM_HOOK_CALLS,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_COUNT,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_BYTES,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_COUNT,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES,
+	TTC_RING0_STAT_COUNT,
+};
+
+static void ttc_ring0_runtime_stats(uint64_t *stats, size_t count) {
+	if (stats == NULL || count < TTC_RING0_STAT_COUNT) return;
+	stats[TTC_RING0_STAT_RENDEZVOUS_COUNT] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_count, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_RENDEZVOUS_REQUESTS] =
+			atomic_load_explicit(&ttc_ring0_runtime_rendezvous_requests,
+					memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_DRAIN_TOTAL_NS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_drain_total_ns, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_DRAIN_MAX_NS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_drain_max_ns, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_PAUSE_TOTAL_NS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_pause_total_ns, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_PAUSE_MAX_NS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_pause_max_ns, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_VCPU_EXIT_CALLS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_vcpu_exit_calls, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_VCPU_EXIT_TARGETS] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_vcpu_exit_targets, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RENDEZVOUS_FAILURES] = atomic_load_explicit(
+			&ttc_ring0_rendezvous_failures, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_VM_HOOK_CALLS] = atomic_load_explicit(
+			&ttc_ring0_runtime_vm_hook_calls, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_COUNT] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_free_count, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_BYTES] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_free_bytes, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_COUNT] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_reuse_count, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_reuse_bytes, memory_order_relaxed);
+}
 
 static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
 	struct ttc_ring0_bridge *bridge = NULL;
@@ -571,9 +657,27 @@ static void ttc_ring0_admit_guest(struct ttc_ring0_bridge *bridge) {
 	}
 }
 
+static void ttc_ring0_end_rendezvous_reference_locked(void) {
+	uint32_t previous = atomic_fetch_sub_explicit(
+			&ttc_ring0_guest_pause_count, 1, memory_order_release);
+	if (previous != 1) return;
+	uint64_t now = ttc_ring0_monotonic_ns();
+	uint64_t elapsed = now >= ttc_ring0_guest_pause_started_ns ?
+			now - ttc_ring0_guest_pause_started_ns : 0;
+	atomic_fetch_add_explicit(&ttc_ring0_rendezvous_pause_total_ns, elapsed,
+			memory_order_relaxed);
+	ttc_ring0_atomic_max(&ttc_ring0_rendezvous_pause_max_ns, elapsed);
+	ttc_ring0_guest_pause_started_ns = 0;
+}
+
 // The caller holds mutation_mu, which also stabilizes the mirror registry.
-static int ttc_ring0_begin_runtime_mutation_locked(void) {
+static int ttc_ring0_begin_runtime_mutation_locked(uint32_t reason) {
 	int status;
+	uint64_t started = ttc_ring0_monotonic_ns();
+	if (reason == TTC_RING0_RENDEZVOUS_RUNTIME) {
+		atomic_fetch_add_explicit(&ttc_ring0_runtime_rendezvous_requests, 1,
+				memory_order_relaxed);
+	}
 	uint32_t previous = atomic_fetch_add_explicit(
 			&ttc_ring0_guest_pause_count, 1, memory_order_seq_cst);
 	if (previous == UINT32_MAX) {
@@ -584,11 +688,12 @@ static int ttc_ring0_begin_runtime_mutation_locked(void) {
 	// mutation_mu serializes pause establishment. A nonzero predecessor has
 	// already drained every registered bridge before releasing that mutex.
 	if (previous != 0) return 0;
+	ttc_ring0_guest_pause_started_ns = started;
+	atomic_fetch_add_explicit(&ttc_ring0_rendezvous_count, 1,
+			memory_order_relaxed);
 
 	status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
 	if (status != 0) goto fail;
-	struct timespec start;
-	(void)clock_gettime(CLOCK_MONOTONIC, &start);
 	for (;;) {
 		hv_vcpu_t active[TTC_RING0_MAX_APPLICATION_VCPUS];
 		size_t count = 0;
@@ -606,33 +711,45 @@ static int ttc_ring0_begin_runtime_mutation_locked(void) {
 			}
 		}
 		if (count == 0) break;
+		atomic_fetch_add_explicit(&ttc_ring0_rendezvous_vcpu_exit_calls, 1,
+				memory_order_relaxed);
+		atomic_fetch_add_explicit(&ttc_ring0_rendezvous_vcpu_exit_targets,
+				count, memory_order_relaxed);
 		hv_return_t hv_status = hv_vcpus_exit(active, (uint32_t)count);
 		if (hv_status != HV_SUCCESS) {
 			status = EIO;
 			goto fail_registry;
 		}
-		struct timespec now;
-		(void)clock_gettime(CLOCK_MONOTONIC, &now);
-		if (now.tv_sec - start.tv_sec >= 5) {
+		uint64_t now = ttc_ring0_monotonic_ns();
+		if (now - started >= UINT64_C(5000000000)) {
 			status = ETIMEDOUT;
 			goto fail_registry;
 		}
 		sched_yield();
 	}
 	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
+	uint64_t drain_ns = ttc_ring0_monotonic_ns() - started;
+	atomic_fetch_add_explicit(&ttc_ring0_rendezvous_drain_total_ns, drain_ns,
+			memory_order_relaxed);
+	ttc_ring0_atomic_max(&ttc_ring0_rendezvous_drain_max_ns, drain_ns);
 	return 0;
 
 fail_registry:
 	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 fail:
-	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
-			memory_order_release);
+	atomic_fetch_add_explicit(&ttc_ring0_rendezvous_failures, 1,
+			memory_order_relaxed);
+	uint64_t failed_drain_ns = ttc_ring0_monotonic_ns() - started;
+	atomic_fetch_add_explicit(&ttc_ring0_rendezvous_drain_total_ns,
+			failed_drain_ns, memory_order_relaxed);
+	ttc_ring0_atomic_max(&ttc_ring0_rendezvous_drain_max_ns,
+			failed_drain_ns);
+	ttc_ring0_end_rendezvous_reference_locked();
 	return status;
 }
 
 static void ttc_ring0_end_runtime_mutation(void) {
-	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
-			memory_order_release);
+	ttc_ring0_end_rendezvous_reference_locked();
 	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 }
 
@@ -642,15 +759,15 @@ static void ttc_ring0_end_runtime_mutation(void) {
 static int32_t ttc_ring0_pause_guest_execution(void) {
 	int status = pthread_mutex_lock(&ttc_ring0_mutation_mu);
 	if (status != 0) return status;
-	status = ttc_ring0_begin_runtime_mutation_locked();
+	status = ttc_ring0_begin_runtime_mutation_locked(
+			TTC_RING0_RENDEZVOUS_MONITOR);
 	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 	return status;
 }
 
 static void ttc_ring0_resume_guest_execution(void) {
 	pthread_mutex_lock(&ttc_ring0_mutation_mu);
-	atomic_fetch_sub_explicit(&ttc_ring0_guest_pause_count, 1,
-			memory_order_release);
+	ttc_ring0_end_rendezvous_reference_locked();
 	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 }
 
@@ -953,6 +1070,8 @@ static hv_return_t ttc_ring0_rebind_mirror(uintptr_t address,
 
 static int32_t ttc_ring0_runtime_vm_hook(
 		struct ttc_runtime_vm_mutation *mutation) {
+	atomic_fetch_add_explicit(&ttc_ring0_runtime_vm_hook_calls, 1,
+			memory_order_relaxed);
 	if (mutation == NULL ||
 			mutation->version != TTC_RUNTIME_VM_MUTATION_VERSION ||
 			mutation->length == 0 ||
@@ -974,7 +1093,8 @@ static int32_t ttc_ring0_runtime_vm_hook(
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return 0;
 		}
-		status = ttc_ring0_begin_runtime_mutation_locked();
+		status = ttc_ring0_begin_runtime_mutation_locked(
+				TTC_RING0_RENDEZVOUS_RUNTIME);
 		if (status != 0) {
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return status;
@@ -990,6 +1110,41 @@ static int32_t ttc_ring0_runtime_vm_hook(
 		if (status != 0) return status;
 		bool live = ttc_ring0_mirror_live_overlap(mutation->address,
 				mutation->length);
+		bool releasing = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
+			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSABLE;
+		bool dormant = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
+			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE &&
+			ttc_ring0_mirror_dormant_overlap(mutation->address,
+					mutation->length);
+		// Go's Darwin scavenger uses FREE_REUSABLE only as an RSS hint. Keep
+		// live secondary-MMU leases stable instead of turning routine heap
+		// scavenging into a VM-wide stage-2 replacement. FREE_REUSE is also a
+		// no-op when the entire mirrored range remained live. A range with any
+		// dormant slab must still execute the host operation and rebind it.
+		if (releasing && live) {
+			mutation->disposition = TTC_RUNTIME_VM_SUPPRESS;
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_free_count, 1,
+					memory_order_relaxed);
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_free_bytes,
+					mutation->length, memory_order_relaxed);
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
+		if (mutation->operation == TTC_RUNTIME_VM_MADVISE &&
+				mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE && live &&
+				!dormant) {
+			mutation->disposition = TTC_RUNTIME_VM_SUPPRESS;
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_reuse_count, 1,
+					memory_order_relaxed);
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_reuse_bytes,
+					mutation->length, memory_order_relaxed);
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
 		// MADV_FREE_REUSABLE deliberately leaves the host VA backed by pages
 		// that Darwin may reclaim at any later time. Those stage-2 leases stay
 		// dormant until MADV_FREE_REUSE makes the host mapping stable again.
@@ -997,13 +1152,13 @@ static int32_t ttc_ring0_runtime_vm_hook(
 		// overlapping mirror slab is currently dormant.
 		bool reusing = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
 			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE &&
-			ttc_ring0_mirror_dormant_overlap(mutation->address,
-				mutation->length);
+			dormant;
 		if (!live && !reusing) {
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return 0;
 		}
-		status = ttc_ring0_begin_runtime_mutation_locked();
+		status = ttc_ring0_begin_runtime_mutation_locked(
+				TTC_RING0_RENDEZVOUS_RUNTIME);
 		if (status != 0) {
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return status;
@@ -1032,7 +1187,8 @@ static int32_t ttc_ring0_runtime_vm_hook(
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return 0;
 		}
-		status = ttc_ring0_begin_runtime_mutation_locked();
+		status = ttc_ring0_begin_runtime_mutation_locked(
+				TTC_RING0_RENDEZVOUS_RUNTIME);
 		if (status != 0) {
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return status;
@@ -1056,6 +1212,27 @@ static int32_t ttc_ring0_runtime_vm_hook(
 static uintptr_t ttc_ring0_runtime_vm_hook_address(void) {
 	return ttc_ring0_strip_instruction_pointer(
 			(uintptr_t)&ttc_ring0_runtime_vm_hook);
+}
+
+// Exercise the runtime disposition handshake without changing host VM state.
+// Tests use a live mirror range, for which FREE_REUSABLE must be suppressed
+// before a rendezvous or host madvise occurs.
+static int ttc_ring0_test_suppress_runtime_reclaim(uintptr_t address,
+		size_t length) {
+	struct ttc_runtime_vm_mutation mutation = {
+		.version = TTC_RUNTIME_VM_MUTATION_VERSION,
+		.operation = TTC_RUNTIME_VM_MADVISE,
+		.phase = TTC_RUNTIME_VM_BEFORE,
+		.address = address,
+		.length = length,
+		.flags = TTC_RUNTIME_MADV_FREE_REUSABLE,
+	};
+	int status = ttc_ring0_runtime_vm_hook(&mutation);
+	if (status != 0) return status;
+	if (mutation.disposition != TTC_RUNTIME_VM_SUPPRESS ||
+			mutation.active != 0) return EPROTO;
+	mutation.phase = TTC_RUNTIME_VM_AFTER;
+	return ttc_ring0_runtime_vm_hook(&mutation);
 }
 
 // Exercise the same replacement protocol as runtime.mmap(MAP_FIXED) without
@@ -2216,7 +2393,7 @@ func installRing0SignalBridge() error {
 	return nil
 }
 
-const ring0RuntimeVMMemoryHookVersion = uint32(1)
+const ring0RuntimeVMMemoryHookVersion = uint32(2)
 
 func installRing0RuntimeVMMemoryHook() error {
 	status := ring0SetVMMemoryHooks(
@@ -2230,6 +2407,55 @@ func installRing0RuntimeVMMemoryHook() error {
 	timeHook := uintptr(C.ttc_ring0_runtime_time_hook_address())
 	if status := ring0SetRuntimeTimeHook(1, timeHook); status != 0 {
 		return fmt.Errorf("installing Darwin runtime time hook ABI v1: status %d", status)
+	}
+	return nil
+}
+
+const ring0RuntimeStatCount = 14
+
+type ring0RuntimeStats struct {
+	rendezvousCount           uint64
+	runtimeRendezvousRequests uint64
+	rendezvousDrainTotalNS    uint64
+	rendezvousDrainMaxNS      uint64
+	rendezvousPauseTotalNS    uint64
+	rendezvousPauseMaxNS      uint64
+	rendezvousVCPUExitCalls   uint64
+	rendezvousVCPUExitTargets uint64
+	rendezvousFailures        uint64
+	runtimeVMHookCalls        uint64
+	suppressedFreeCount       uint64
+	suppressedFreeBytes       uint64
+	suppressedReuseCount      uint64
+	suppressedReuseBytes      uint64
+}
+
+func readRing0RuntimeStats() ring0RuntimeStats {
+	var values [ring0RuntimeStatCount]uint64
+	C.ttc_ring0_runtime_stats(
+		(*C.uint64_t)(unsafe.Pointer(&values[0])), C.size_t(len(values)))
+	return ring0RuntimeStats{
+		rendezvousCount:           values[0],
+		runtimeRendezvousRequests: values[1],
+		rendezvousDrainTotalNS:    values[2],
+		rendezvousDrainMaxNS:      values[3],
+		rendezvousPauseTotalNS:    values[4],
+		rendezvousPauseMaxNS:      values[5],
+		rendezvousVCPUExitCalls:   values[6],
+		rendezvousVCPUExitTargets: values[7],
+		rendezvousFailures:        values[8],
+		runtimeVMHookCalls:        values[9],
+		suppressedFreeCount:       values[10],
+		suppressedFreeBytes:       values[11],
+		suppressedReuseCount:      values[12],
+		suppressedReuseBytes:      values[13],
+	}
+}
+
+func suppressRing0TrackedHostReclaim(address uintptr, length uint64) error {
+	if status := C.ttc_ring0_test_suppress_runtime_reclaim(
+		C.uintptr_t(address), C.size_t(length)); status != 0 {
+		return fmt.Errorf("suppressing tracked Sentry host reclaim [%#x, %#x): status %d", address, address+uintptr(length), status)
 	}
 	return nil
 }

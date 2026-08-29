@@ -1441,6 +1441,7 @@ func (e *ring0Engine) installRuntimeClockFastpath(vcpu *hvfVCPU) {
 
 func (e *ring0Engine) runRuntimeClockUpdater() {
 	defer close(e.clockDone)
+	defer publishRing0RuntimeMetrics()
 	// Linux updates its VDSO time data continuously. Refreshing the single
 	// realtime offset here gives the EL1 Darwin-runtime service the same clock
 	// step behavior without putting a host exit back in the syscall hot path.
@@ -1451,6 +1452,7 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 		case <-e.clockStop:
 			return
 		case <-refresh.C:
+			publishRing0RuntimeMetrics()
 			calibration, err := calibrateRing0TimeFastpath(e.timeFastpath.vtimerOffset)
 			if err != nil || calibration.clockGettimePC != e.timeFastpath.clockGettimePC ||
 				calibration.machAbsolutePC != e.timeFastpath.machAbsolutePC ||
