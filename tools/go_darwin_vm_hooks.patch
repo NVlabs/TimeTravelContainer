@@ -23,7 +23,7 @@ index c847aa1..26d9cd1 100644
  	args := struct {
  		addr            unsafe.Pointer
  		n               uintptr
-@@ -207,22 +222,49 @@ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (un
+@@ -207,22 +222,51 @@ func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (un
  		ret2            int
  	}{addr, n, prot, flags, fd, off, nil, 0}
  	libcCall(unsafe.Pointer(abi.FuncPCABI0(mmap_trampoline)), unsafe.Pointer(&args))
@@ -46,7 +46,10 @@ index c847aa1..26d9cd1 100644
 +		length:    n,
 +	}
 +	ttcVMMemoryCall(&mutation)
- 	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
+-	libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
++	if mutation.disposition == ttcVMMemoryProceed {
++		libcCall(unsafe.Pointer(abi.FuncPCABI0(munmap_trampoline)), unsafe.Pointer(&addr))
++	}
 +	mutation.phase = ttcVMMemoryAfter
 +	ttcVMMemoryCall(&mutation)
  	KeepAlive(addr) // Just for consistency. Hopefully addr is not a Go address.

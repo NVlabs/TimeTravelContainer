@@ -61,6 +61,12 @@ var (
 	hvfRuntimeSuppressedReuseBytes = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/suppressed_reuse_bytes",
 		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in unnecessary Go runtime FREE_REUSE operations suppressed for live HVF backing."})
+	hvfRuntimeSuppressedUnmapCount = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/suppressed_unmap_count",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of Go runtime unmaps suppressed to retain live HVF backing for the VM epoch."})
+	hvfRuntimeSuppressedUnmapBytes = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/suppressed_unmap_bytes",
+		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in Go runtime unmaps suppressed to retain live HVF backing for the VM epoch."})
 	hvfMonitorCommands = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/monitor/commands",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of EL1 monitor commands requested."})
@@ -133,6 +139,8 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfRuntimeSuppressedFreeBytes.Set(stats.suppressedFreeBytes)
 	hvfRuntimeSuppressedReuseCount.Set(stats.suppressedReuseCount)
 	hvfRuntimeSuppressedReuseBytes.Set(stats.suppressedReuseBytes)
+	hvfRuntimeSuppressedUnmapCount.Set(stats.suppressedUnmapCount)
+	hvfRuntimeSuppressedUnmapBytes.Set(stats.suppressedUnmapBytes)
 	hvfMonitorCommands.Set(engine.monitorCommands.Load())
 	hvfMonitorTranslationCommands.Set(engine.monitorTranslationCommands.Load())
 	hvfMonitorResidentCommands.Set(engine.monitorResidentCommands.Load())

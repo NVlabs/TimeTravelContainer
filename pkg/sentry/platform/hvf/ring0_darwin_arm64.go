@@ -483,6 +483,8 @@ static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_count;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_bytes;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_count;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_bytes;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_unmap_count;
+static _Atomic uint64_t ttc_ring0_runtime_suppressed_unmap_bytes;
 // Crash-only breadcrumbs for the most recent Go runtime VM hook. These are
 // deliberately atomic and pointer-free: an unexpected stage-2 abort may be
 // reported while another host thread is entering or leaving the hook.
@@ -531,6 +533,8 @@ enum ttc_ring0_runtime_stat_index {
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_BYTES,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_COUNT,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_COUNT,
+	TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_BYTES,
 	TTC_RING0_STAT_COUNT,
 };
 
@@ -565,6 +569,10 @@ static void ttc_ring0_runtime_stats(uint64_t *stats, size_t count) {
 			&ttc_ring0_runtime_suppressed_reuse_count, memory_order_relaxed);
 	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES] = atomic_load_explicit(
 			&ttc_ring0_runtime_suppressed_reuse_bytes, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_COUNT] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_unmap_count, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_BYTES] = atomic_load_explicit(
+			&ttc_ring0_runtime_suppressed_unmap_bytes, memory_order_relaxed);
 }
 
 static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
@@ -1135,10 +1143,30 @@ static int32_t ttc_ring0_runtime_vm_hook(
 				mutation->length);
 		bool releasing = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
 			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSABLE;
+		bool unmapping = mutation->operation == TTC_RUNTIME_VM_MUNMAP;
 		bool dormant = mutation->operation == TTC_RUNTIME_VM_MADVISE &&
 			mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE &&
 			ttc_ring0_mirror_dormant_overlap(mutation->address,
 					mutation->length);
+		// A Go sysFree can retire allocator metadata while an EL1 continuation
+		// still has its old address in architectural state. KVM's secondary MMU
+		// invalidation tolerates that transition; HVF exposes an immediate raw
+		// stage-2 abort once the lease is removed. Retain already mirrored
+		// runtime allocations for the VM epoch. Go never logically reuses a
+		// sysFree range, and a later MAP_FIXED replacement still takes the full
+		// suspend/rebind path below. This both preserves backing identity and
+		// avoids a VM-wide rendezvous for metadata growth.
+		if (unmapping && live) {
+			mutation->disposition = TTC_RUNTIME_VM_SUPPRESS;
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_unmap_count, 1,
+					memory_order_relaxed);
+			atomic_fetch_add_explicit(
+					&ttc_ring0_runtime_suppressed_unmap_bytes,
+					mutation->length, memory_order_relaxed);
+			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+			return 0;
+		}
 		// Go's Darwin scavenger uses FREE_REUSABLE only as an RSS hint. Keep
 		// live secondary-MMU leases stable instead of turning routine heap
 		// scavenging into a VM-wide stage-2 replacement. FREE_REUSE is also a
@@ -1249,6 +1277,23 @@ static int ttc_ring0_test_suppress_runtime_reclaim(uintptr_t address,
 		.address = address,
 		.length = length,
 		.flags = TTC_RUNTIME_MADV_FREE_REUSABLE,
+	};
+	int status = ttc_ring0_runtime_vm_hook(&mutation);
+	if (status != 0) return status;
+	if (mutation.disposition != TTC_RUNTIME_VM_SUPPRESS ||
+			mutation.active != 0) return EPROTO;
+	mutation.phase = TTC_RUNTIME_VM_AFTER;
+	return ttc_ring0_runtime_vm_hook(&mutation);
+}
+
+static int ttc_ring0_test_suppress_runtime_unmap(uintptr_t address,
+		size_t length) {
+	struct ttc_runtime_vm_mutation mutation = {
+		.version = TTC_RUNTIME_VM_MUTATION_VERSION,
+		.operation = TTC_RUNTIME_VM_MUNMAP,
+		.phase = TTC_RUNTIME_VM_BEFORE,
+		.address = address,
+		.length = length,
 	};
 	int status = ttc_ring0_runtime_vm_hook(&mutation);
 	if (status != 0) return status;
@@ -2511,7 +2556,7 @@ func installRing0RuntimeVMMemoryHook() error {
 	return nil
 }
 
-const ring0RuntimeStatCount = 14
+const ring0RuntimeStatCount = 16
 
 type ring0RuntimeStats struct {
 	rendezvousCount           uint64
@@ -2528,6 +2573,8 @@ type ring0RuntimeStats struct {
 	suppressedFreeBytes       uint64
 	suppressedReuseCount      uint64
 	suppressedReuseBytes      uint64
+	suppressedUnmapCount      uint64
+	suppressedUnmapBytes      uint64
 }
 
 func readRing0RuntimeStats() ring0RuntimeStats {
@@ -2549,6 +2596,8 @@ func readRing0RuntimeStats() ring0RuntimeStats {
 		suppressedFreeBytes:       values[11],
 		suppressedReuseCount:      values[12],
 		suppressedReuseBytes:      values[13],
+		suppressedUnmapCount:      values[14],
+		suppressedUnmapBytes:      values[15],
 	}
 }
 
@@ -2556,6 +2605,14 @@ func suppressRing0TrackedHostReclaim(address uintptr, length uint64) error {
 	if status := C.ttc_ring0_test_suppress_runtime_reclaim(
 		C.uintptr_t(address), C.size_t(length)); status != 0 {
 		return fmt.Errorf("suppressing tracked Sentry host reclaim [%#x, %#x): status %d", address, address+uintptr(length), status)
+	}
+	return nil
+}
+
+func suppressRing0TrackedHostUnmap(address uintptr, length uint64) error {
+	if status := C.ttc_ring0_test_suppress_runtime_unmap(
+		C.uintptr_t(address), C.size_t(length)); status != 0 {
+		return fmt.Errorf("suppressing tracked Sentry host unmap [%#x, %#x): status %d", address, address+uintptr(length), status)
 	}
 	return nil
 }

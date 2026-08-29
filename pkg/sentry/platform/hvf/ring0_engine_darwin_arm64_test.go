@@ -697,6 +697,15 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 		statsAfterSuppression.suppressedFreeBytes-statsBeforeSuppression.suppressedFreeBytes < vmm.HostSlabSize {
 		t.Fatalf("runtime reclaim suppression stats before=%+v after=%+v", statsBeforeSuppression, statsAfterSuppression)
 	}
+	statsBeforeUnmap := readRing0RuntimeStats()
+	if err := suppressRing0TrackedHostUnmap(trackedHost, vmm.HostSlabSize); err != nil {
+		t.Fatal(err)
+	}
+	statsAfterUnmap := readRing0RuntimeStats()
+	if statsAfterUnmap.suppressedUnmapCount <= statsBeforeUnmap.suppressedUnmapCount ||
+		statsAfterUnmap.suppressedUnmapBytes-statsBeforeUnmap.suppressedUnmapBytes < vmm.HostSlabSize {
+		t.Fatalf("runtime unmap suppression stats before=%+v after=%+v", statsBeforeUnmap, statsAfterUnmap)
+	}
 
 	codeHost, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
 	if err != nil {
