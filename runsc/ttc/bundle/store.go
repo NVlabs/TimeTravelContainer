@@ -163,6 +163,30 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if err != nil {
 		return "", nil, err
 	}
+	if distributedTarget && len(repositories) != 0 {
+		// Checkpoint import needs RestoreID to name the repository identity in
+		// the imported state. Once that state has been restored,
+		// CompleteRestore canonicalizes every filesystem to the new local
+		// repository identity. A later dehydration or migration captures that
+		// local identity, so a cold target bundle must donate its repositories
+		// under the current IDs rather than preserving the one-shot import IDs
+		// from the canonical OCI spec.
+		manager, err := ttcvolume.OpenManager(s.Root, true)
+		if err != nil {
+			return "", nil, err
+		}
+		for i := range repositories {
+			repository, err := manager.OpenPrivate(repositories[i].Path)
+			if err != nil {
+				return "", nil, fmt.Errorf("opening cold-restore repository %q: %w", repositories[i].Source, err)
+			}
+			info := repository.Info()
+			if err := repository.Close(); err != nil {
+				return "", nil, fmt.Errorf("closing cold-restore repository %q: %w", repositories[i].Source, err)
+			}
+			repositories[i].RestoreID = info.ID
+		}
+	}
 	for i := range repositories {
 		repositories[i].Branch = filesystemBranch
 	}

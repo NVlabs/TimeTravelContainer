@@ -1469,6 +1469,87 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}
 }
 
+func TestPrepareDehydrationRestoreBundleUsesCurrentRepositoryIdentity(t *testing.T) {
+	root := t.TempDir()
+	transientRoot := t.TempDir()
+	store := Store{Root: root, TransientRoot: transientRoot}
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	repositoryPath := filepath.Join(containerDir, "repository")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := ttcvolume.OpenManager(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(repositoryPath, "rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentID := repository.Info().ID
+	if err := repository.Fork(ttcvolume.MainBranch, "fs-child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source:    specutils.TTCRootfsUpperSource,
+		Path:      repositoryPath,
+		Branch:    ttcvolume.MainBranch,
+		CopyMode:  string(ttcvolume.CopyModeFull),
+		RestoreID: strings.Repeat("a", 32),
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := specs.Spec{
+		Root:    &specs.Root{Path: "rootfs"},
+		Process: &specs.Process{Args: []string{"true"}},
+		Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories: string(encoded),
+		},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "dehydrated", CreatedAt: time.Now(),
+		Branches: []BranchInfo{{ID: "child", ParentID: "main", State: "dehydrated", FilesystemBranch: "fs-child"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	temp, cleanup, err := store.PrepareDehydrationRestoreBundle("demo", "fs-child")
+	if err != nil {
+		t.Fatalf("PrepareDehydrationRestoreBundle: %v", err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(filepath.Join(temp, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got specs.Spec
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	gotRepositories, err := specutils.TTCVolumeRepositories(&got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotRepositories) != 1 {
+		t.Fatalf("repositories=%+v", gotRepositories)
+	}
+	if gotRepositories[0].RestoreID != currentID {
+		t.Fatalf("restore identity=%q, want current repository %q", gotRepositories[0].RestoreID, currentID)
+	}
+	if gotRepositories[0].Branch != "fs-child" {
+		t.Fatalf("restore branch=%q, want fs-child", gotRepositories[0].Branch)
+	}
+}
+
 func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
