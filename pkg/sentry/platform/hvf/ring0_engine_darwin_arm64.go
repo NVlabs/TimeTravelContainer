@@ -168,9 +168,13 @@ type ring0Engine struct {
 	cpusByTID  sync.Map // map[uint64]*ring0ApplicationCPU; owner hot path.
 	cpuIDs     []bool
 	cpuWaiters []*ring0ApplicationWaiter
-	closed     atomic.Bool
-	closeMu    sync.Mutex
-	closeErr   error
+	// admissionKickCursor is protected by cpuMu. Admission pressure walks the
+	// pool from this cursor so simultaneous waiters interrupt distinct
+	// incumbents instead of broadcasting an exit to the entire VM.
+	admissionKickCursor int
+	closed              atomic.Bool
+	closeMu             sync.Mutex
+	closeErr            error
 
 	// mmuGeneration changes after every acknowledged monitor transaction.
 	// Application vCPUs locally invalidate stage-1 translations on their first
@@ -822,33 +826,43 @@ func monitorCommandMutatesTranslations(encoded []byte) bool {
 	}
 }
 
-// kickApplicationEntries requests an architected exit from every application
-// reader that published entryActive. cancelRequested also covers the narrow
-// interval after a task published entryActive but before its first
-// hv_vcpu_run; RequestExit alone is not guaranteed to remain pending across
-// that interval on all HVF versions.
-func (e *ring0Engine) kickApplicationEntries() error {
-	cpus := e.pinApplicationCPUs()
-	defer e.unpinApplicationCPUs(cpus)
-	for _, cpu := range cpus {
-		if cpu.bridge.destroyed() {
+// kickOneApplicationEntry requests one architected residency handoff. Each
+// waiter marks a different incumbent before issuing hv_vcpus_exit, avoiding an
+// O(waiters*vCPUs) broadcast storm when the fixed HVF ID set is saturated.
+// cancelRequested also covers the narrow interval after a task published
+// entryActive but before its hv_vcpu_run; RequestExit alone is not guaranteed
+// to remain pending across that interval on all HVF versions.
+func (e *ring0Engine) kickOneApplicationEntry() error {
+	e.cpuMu.Lock()
+	var selected *ring0ApplicationCPU
+	for offset := range len(e.cpusByID) {
+		id := (e.admissionKickCursor + offset) % len(e.cpusByID)
+		cpu := e.cpusByID[id]
+		if cpu == nil || cpu.retiring.Load() || cpu.bridge.destroyed() ||
+			!cpu.bridge.inGuest() || cpu.bridge.externalInterruptRequested() {
+			continue
+		}
+		cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))
+		if atomic.LoadUint64(cancel) != 0 || !cpu.tryPin() {
 			continue
 		}
 		if cpu.entryActive.Load() {
-			cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))
 			atomic.StoreUint64(cancel, 1)
 		}
-		// An inactive application residency may still be executing its Sentry
-		// syscall continuation at EL1. Kick every guest-resident bridge; the owner
-		// loop exports an EL1 continuation directly and converts EL0 cancellation
-		// into the monitor's architected application interrupt.
-		if !cpu.bridge.inGuest() {
-			continue
-		}
 		cpu.bridge.requestExternalInterrupt()
-		if err := cpu.vcpu.RequestExit(); err != nil && !cpu.bridge.destroyed() {
-			return fmt.Errorf("interrupting HVF ring0 vCPU %d for application admission: %w", cpu.vcpu.id, err)
-		}
+		e.admissionKickCursor = (id + 1) % len(e.cpusByID)
+		selected = cpu
+		break
+	}
+	e.cpuMu.Unlock()
+	if selected == nil {
+		// Every guest-resident incumbent already has a handoff pending. Their
+		// owner paths will release IDs; the waiter's bounded poll observes it.
+		return nil
+	}
+	defer e.releaseApplicationCPU(selected)
+	if err := selected.vcpu.RequestExit(); err != nil && !selected.bridge.destroyed() {
+		return fmt.Errorf("interrupting HVF ring0 vCPU %d for application admission: %w", selected.vcpu.id, err)
 	}
 	return nil
 }
@@ -1327,14 +1341,14 @@ retry:
 		// Admission pressure must preempt a CPU-bound incumbent as well as a
 		// syscall-heavy one. Without this kick, a task that never exits EL0 can
 		// retain the final owner-affine vCPU indefinitely while every later exec
-		// waits in the FIFO. kickApplicationEntries also leaves cancellation
-		// pending for resident tasks currently between application entries.
+		// waits in the FIFO. Each waiter targets one unmarked incumbent; a
+		// pending request remains visible until that owner performs the handoff.
 		// A runtime VM mutation may have temporarily removed an incumbent from
 		// guest admission when the first kick was attempted. Reissue at a bounded
 		// rate until the architected application exit is acknowledged; a single
 		// RequestExit is not persistent across an inactive hv_vcpu_run interval.
 		if enqueued || lastWaiterKick.IsZero() || time.Since(lastWaiterKick) >= time.Millisecond {
-			if err := e.kickApplicationEntries(); err != nil {
+			if err := e.kickOneApplicationEntry(); err != nil {
 				return nil, false, err
 			}
 			lastWaiterKick = time.Now()

@@ -471,78 +471,6 @@ static struct ttc_ring0_bridge *ttc_ring0_bridges;
 // old HVF lease. The pool is bounded by peak simultaneous vCPU ownership.
 static struct ttc_ring0_bridge *ttc_ring0_free_bridges;
 static struct ttc_ring0_mirror_mapping *ttc_ring0_mirror_mappings;
-static pthread_once_t ttc_ring0_preemption_once = PTHREAD_ONCE_INIT;
-static _Atomic int32_t ttc_ring0_preemption_status;
-
-// A resident application keeps its Go G and P active because its exception
-// resumes ordinary Sentry Go code directly at EL1. A native tick is required
-// to bound the interval in which CPU-bound EL0 execution cannot reach a Go
-// safepoint. It intentionally runs without a Go P, just like the host kernel's
-// preemption facility used by KVM.
-#define TTC_RING0_PREEMPTION_QUANTUM_NS UINT64_C(10000000)
-
-static void *ttc_ring0_preemption_thread(
-		__attribute__((unused)) void *argument) {
-	const struct timespec quantum = {
-		.tv_sec = 0,
-		.tv_nsec = TTC_RING0_PREEMPTION_QUANTUM_NS,
-	};
-	for (;;) {
-		struct timespec remaining = quantum;
-		while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
-		int status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
-		if (status != 0) {
-			atomic_store_explicit(&ttc_ring0_preemption_status, status,
-					memory_order_release);
-			return NULL;
-		}
-		hv_vcpu_t active[TTC_RING0_MAX_APPLICATION_VCPUS];
-		size_t count = 0;
-		for (struct ttc_ring0_bridge *bridge = ttc_ring0_bridges;
-				bridge != NULL; bridge = bridge->registry_next) {
-			if (atomic_load_explicit(&bridge->in_guest,
-					memory_order_acquire) == 0 ||
-					atomic_load_explicit(&bridge->destroyed,
-					memory_order_acquire) != 0) {
-				continue;
-			}
-			_Atomic uint64_t *exit_kind = (_Atomic uint64_t *)(
-					bridge->state_host + TTC_STATE_EXIT_KIND_OFFSET);
-			if (atomic_load_explicit(exit_kind, memory_order_acquire) != 0) {
-				// The application has already returned to Sentry Go code, which
-				// reaches ordinary runtime safepoints without a native kick.
-				continue;
-			}
-			if (count == TTC_RING0_MAX_APPLICATION_VCPUS) break;
-			active[count++] = bridge->vcpu;
-		}
-		if (count != 0) {
-			// Do not set external_interrupt_requested. The owner bridge turns an
-			// EL0 cancellation into TTC_EXIT_RETRY, while an EL1 cancellation
-			// exports the exact Sentry continuation so Darwin's Go scheduler can
-			// honor pending preemption and GC work.
-			(void)hv_vcpus_exit(active, (uint32_t)count);
-		}
-		pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
-	}
-}
-
-static void ttc_ring0_start_preemption_thread_once(void) {
-	pthread_t thread;
-	int status = pthread_create(&thread, NULL,
-			ttc_ring0_preemption_thread, NULL);
-	if (status == 0) status = pthread_detach(thread);
-	atomic_store_explicit(&ttc_ring0_preemption_status, status,
-			memory_order_release);
-}
-
-static int ttc_ring0_start_preemption_thread(void) {
-	int status = pthread_once(&ttc_ring0_preemption_once,
-			ttc_ring0_start_preemption_thread_once);
-	if (status != 0) return status;
-	return atomic_load_explicit(&ttc_ring0_preemption_status,
-			memory_order_acquire);
-}
 
 static struct ttc_ring0_bridge *ttc_ring0_bridge_storage_acquire(void) {
 	struct ttc_ring0_bridge *bridge = NULL;
@@ -2016,7 +1944,6 @@ static struct ttc_ring0_bridge *ttc_ring0_bridge_create(hv_vcpu_t vcpu,
 		const hv_vcpu_exit_t *exit, uint64_t ttbr0, uint64_t ttbr1,
 		uint64_t vector_va, uint64_t state_va,
 		uintptr_t state_host, uintptr_t guest_switch_pc, int destroy_on_host) {
-	if (ttc_ring0_start_preemption_thread() != 0) return NULL;
 	struct ttc_ring0_bridge *bridge = ttc_ring0_bridge_storage_acquire();
 	if (bridge == NULL) return NULL;
 	bridge->host_stack_size = TTC_RING0_HOST_STACK_SIZE;

@@ -31,16 +31,18 @@ import (
 )
 
 const (
-	hvfIPASize = uint64(1 << 40)
+	hvfIPASize        = uint64(1 << 40)
+	hvfVCPUOvercommit = 3
 )
 
 type constructor struct{}
 
 func hvfApplicationVCPUs(applicationCores int) int {
-	if applicationCores > hvfbackend.MaxApplicationVCPUs {
-		return hvfbackend.MaxApplicationVCPUs
+	vcpus := hvfbackend.MaxApplicationVCPUs
+	if applicationCores <= hvfbackend.MaxApplicationVCPUs/hvfVCPUOvercommit {
+		vcpus = applicationCores * hvfVCPUOvercommit
 	}
-	return applicationCores
+	return vcpus
 }
 
 func (*constructor) New(opts sentryplatform.Options) (sentryplatform.Platform, error) {
@@ -49,11 +51,11 @@ func (*constructor) New(opts sentryplatform.Options) (sentryplatform.Platform, e
 	if applicationCores <= 0 {
 		applicationCores = runtime.NumCPU()
 	}
-	// Match KVM's one application vCPU per configured core. Application EL0
-	// execution releases its Go P, while the FIFO admission handoff interrupts
-	// an incumbent when more Linux tasks are runnable. Overcommitting owner-
-	// affine HVF vCPUs instead creates many locked host threads that contend to
-	// reacquire the smaller Go P set after every application exception.
+	// Keep bounded owner-affine residency headroom above the configured core
+	// count. Application EL0 execution now releases its Go P just as KVM does,
+	// so dormant HVF residencies do not starve the Sentry scheduler. The extra
+	// IDs avoid destroy/create churn across syscall-heavy live branches; the FIFO
+	// admission handoff remains the fallback at the architected 63-vCPU limit.
 	vcpus := hvfApplicationVCPUs(applicationCores)
 	config := vmplatform.Config{
 		NewVM:           backend.CreateVM,
