@@ -122,6 +122,7 @@ type daemonPlacementClaim struct {
 
 type daemonServer struct {
 	listener              net.Listener
+	socket                string
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
@@ -154,6 +155,17 @@ type daemonServer struct {
 
 	sidecarMu sync.Mutex
 	sidecars  map[string]*exec.Cmd
+
+	consoleClientMu      sync.Mutex
+	consoleClients       map[string]map[*daemonConsoleClient]struct{}
+	closingConsoleClient map[string]int
+}
+
+type daemonConsoleClient struct {
+	cancel      func()
+	done        chan struct{}
+	cancelOnce  sync.Once
+	releaseOnce sync.Once
 }
 
 type daemonClusterOptions struct {
@@ -1078,6 +1090,114 @@ func (s *daemonServer) StopPortSidecar(key string) (bool, error) {
 	return s.stopOwnedSidecar(key)
 }
 
+func consoleClientKey(target selector) string {
+	return target.container + "@" + target.branch
+}
+
+func consoleClientFamilyKey(container string) string {
+	return container + "@*"
+}
+
+// RegisterConsoleClient tracks a daemon request that has persistent console
+// artifacts open. Registration precedes opening those files, so a concurrent
+// branch/family removal either waits for this client or rejects the new reader
+// after quiescing has begun.
+func (s *daemonServer) RegisterConsoleClient(target selector, cancel func()) (func(), error) {
+	if target.container == "" || target.branch == "" || cancel == nil {
+		return nil, errors.New("console client requires a branch and cancellation function")
+	}
+	key := consoleClientKey(target)
+	familyKey := consoleClientFamilyKey(target.container)
+	client := &daemonConsoleClient{cancel: cancel, done: make(chan struct{})}
+	s.consoleClientMu.Lock()
+	if s.closingConsoleClient[key] != 0 || s.closingConsoleClient[familyKey] != 0 {
+		s.consoleClientMu.Unlock()
+		return nil, fmt.Errorf("console clients for %s are being detached", target)
+	}
+	if s.consoleClients == nil {
+		s.consoleClients = make(map[string]map[*daemonConsoleClient]struct{})
+	}
+	clients := s.consoleClients[key]
+	if clients == nil {
+		clients = make(map[*daemonConsoleClient]struct{})
+		s.consoleClients[key] = clients
+	}
+	clients[client] = struct{}{}
+	s.consoleClientMu.Unlock()
+	release := func() {
+		client.releaseOnce.Do(func() {
+			s.consoleClientMu.Lock()
+			if clients := s.consoleClients[key]; clients != nil {
+				delete(clients, client)
+				if len(clients) == 0 {
+					delete(s.consoleClients, key)
+				}
+			}
+			s.consoleClientMu.Unlock()
+			close(client.done)
+		})
+	}
+	return release, nil
+}
+
+// QuiesceConsoleClients disconnects and waits for console artifact readers.
+// An empty branch means the whole family. The returned release function lifts
+// the registration fence after the caller has finished deleting artifacts.
+func (s *daemonServer) QuiesceConsoleClients(target selector) (func(), error) {
+	if target.container == "" {
+		return nil, errors.New("console-client quiescing requires a container")
+	}
+	closingKey := consoleClientKey(target)
+	if target.branch == "" {
+		closingKey = consoleClientFamilyKey(target.container)
+	}
+	s.consoleClientMu.Lock()
+	if s.closingConsoleClient == nil {
+		s.closingConsoleClient = make(map[string]int)
+	}
+	s.closingConsoleClient[closingKey]++
+	var clients []*daemonConsoleClient
+	if target.branch == "" {
+		prefix := target.container + "@"
+		for key, registered := range s.consoleClients {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			for client := range registered {
+				clients = append(clients, client)
+			}
+		}
+	} else {
+		for client := range s.consoleClients[consoleClientKey(target)] {
+			clients = append(clients, client)
+		}
+	}
+	s.consoleClientMu.Unlock()
+	release := func() {
+		s.consoleClientMu.Lock()
+		if count := s.closingConsoleClient[closingKey]; count <= 1 {
+			delete(s.closingConsoleClient, closingKey)
+		} else {
+			s.closingConsoleClient[closingKey] = count - 1
+		}
+		s.consoleClientMu.Unlock()
+	}
+	for _, client := range clients {
+		client.cancelOnce.Do(client.cancel)
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for _, client := range clients {
+		select {
+		case <-client.done:
+		case <-deadline.C:
+			release()
+			return nil, fmt.Errorf("timed out waiting for %d console client(s) of %s to detach", len(clients), target)
+		}
+	}
+	return release, nil
+}
+
 func (s *daemonServer) stopOwnedSidecar(key string) (bool, error) {
 	s.sidecarMu.Lock()
 	command := s.sidecars[key]
@@ -1182,6 +1302,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		root:                  opts.root,
 		runsc:                 opts.runsc,
 		dataRoot:              opts.dataRoot,
+		daemonSocket:          opts.daemonSocket,
 		runtimePlatform:       opts.runtimePlatform,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		disableHostGSO:        opts.disableHostGSO,
@@ -1412,6 +1533,7 @@ func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
 	opts.dataRoot = s.dataRoot
+	opts.daemonSocket = s.socket
 	return opts
 }
 
@@ -2174,6 +2296,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	server := &daemonServer{
 		listener:              listener,
+		socket:                socket,
 		runtimePlatform:       runtimePlatform,
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
@@ -2684,6 +2807,15 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend.progressTerminal = request.StderrTerminal
 	backend.progressWidth = request.StderrWidth
 	backend.consoleSidecars = s
+	clientCanceled := make(chan struct{})
+	var cancelClientOnce sync.Once
+	backend.clientCanceled = clientCanceled
+	backend.cancelClient = func() {
+		cancelClientOnce.Do(func() {
+			close(clientCanceled)
+			_ = conn.Close()
+		})
+	}
 	backend.distributedSource = s.distributedSource
 	if s.clusterCapabilities != nil {
 		backend.nodeID = s.clusterCapabilities.NodeID

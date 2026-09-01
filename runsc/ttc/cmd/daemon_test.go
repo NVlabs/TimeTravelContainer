@@ -46,6 +46,7 @@ func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
 
 func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	server := &daemonServer{
+		socket:                "/run/ttc/ttcd.sock",
 		root:                  "/run/ttc/runsc",
 		runsc:                 "/opt/ttc/bin/ttcd",
 		dataRoot:              "/var/lib/ttc",
@@ -63,6 +64,9 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 	if got, want := opts.dataRoot, server.dataRoot; got != want {
 		t.Errorf("data root=%q, want %q", got, want)
+	}
+	if got, want := opts.daemonSocket, server.socket; got != want {
+		t.Errorf("daemon socket=%q, want %q", got, want)
 	}
 	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
 		t.Errorf("client executable=%q, want %q", got, want)
@@ -439,6 +443,58 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	if command.ProcessState == nil {
 		t.Fatalf("sidecar was not reaped: state=%v", command.ProcessState)
 	}
+}
+
+func TestDaemonQuiescesConsoleClientsBeforeArtifactRemoval(t *testing.T) {
+	server := &daemonServer{}
+	target := selector{container: "demo", branch: "main"}
+	canceled := make(chan struct{})
+	releaseClient, err := server.RegisterConsoleClient(target, func() { close(canceled) })
+	if err != nil {
+		t.Fatalf("RegisterConsoleClient: %v", err)
+	}
+	type quiesceResult struct {
+		release func()
+		err     error
+	}
+	result := make(chan quiesceResult, 1)
+	go func() {
+		release, err := server.QuiesceConsoleClients(selector{container: target.container})
+		result <- quiesceResult{release: release, err: err}
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("family quiescing did not cancel the active console client")
+	}
+	select {
+	case got := <-result:
+		if got.release != nil {
+			got.release()
+		}
+		t.Fatalf("quiescing returned before the console reader closed: %v", got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseClient()
+	var got quiesceResult
+	select {
+	case got = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("quiescing did not finish after the console reader closed")
+	}
+	if got.err != nil {
+		t.Fatalf("QuiesceConsoleClients: %v", got.err)
+	}
+	if release, err := server.RegisterConsoleClient(target, func() {}); err == nil {
+		release()
+		t.Fatal("console reader registered while artifact removal was fenced")
+	}
+	got.release()
+	release, err := server.RegisterConsoleClient(target, func() {})
+	if err != nil {
+		t.Fatalf("console reader remained fenced after removal: %v", err)
+	}
+	release()
 }
 
 func TestDaemonStopsOwnedPortSidecar(t *testing.T) {

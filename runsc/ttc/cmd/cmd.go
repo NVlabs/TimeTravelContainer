@@ -3056,6 +3056,34 @@ func runAutoRemove(args []string, backend backend) error {
 	if _, err := backend.wait(target); err != nil {
 		return fmt.Errorf("waiting to auto-remove %s: %w", target, err)
 	}
+	// A detached helper waits independently so daemon restarts do not lose the
+	// --rm policy. Once deletion is due, route it back through a live daemon: it
+	// owns attach/log client connections and can close them before unlinking
+	// console artifacts. If no daemon is running, no daemon-owned readers can
+	// remain, so direct removal is safe.
+	if runtime, ok := backend.(*runtimeBackend); ok && runtime.daemonSocket != "" {
+		if conn, err := connectRunningDaemon(runtime.daemonSocket); err == nil {
+			_ = conn.Close()
+			inspect, err := backend.inspect(target.container)
+			if err != nil {
+				return err
+			}
+			removeArgs := []string{"rm", "-f"}
+			if len(inspect.TTC.Branches) <= 1 {
+				removeArgs = append(removeArgs, "--volumes", target.container)
+			} else {
+				removeArgs = append(removeArgs, target.String())
+			}
+			status, err := runViaDaemon(options{daemonSocket: runtime.daemonSocket, dataRoot: runtime.dataRoot}, removeArgs, strings.NewReader(""), io.Discard, io.Discard)
+			if err != nil {
+				return fmt.Errorf("requesting daemon auto-removal of %s: %w", target, err)
+			}
+			if status != 0 {
+				return fmt.Errorf("daemon auto-removal of %s exited with status %d", target, status)
+			}
+			return nil
+		}
+	}
 	if err := autoRemoveTarget(target, backend); err != nil {
 		return fmt.Errorf("auto-removing %s: %w", target, err)
 	}
@@ -5287,6 +5315,8 @@ type consoleSidecarOwner interface {
 	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
+	RegisterConsoleClient(target selector, cancel func()) (func(), error)
+	QuiesceConsoleClients(target selector) (func(), error)
 }
 
 func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
@@ -5370,6 +5400,7 @@ type runtimeBackend struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	daemonSocket          string
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
@@ -5385,6 +5416,8 @@ type runtimeBackend struct {
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
 	nodeID                string
+	cancelClient          func()
+	clientCanceled        <-chan struct{}
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
@@ -5395,6 +5428,32 @@ func (b *runtimeBackend) signalLifecycleReady() {
 	if b.lifecycleReady != nil {
 		b.lifecycleReady()
 		b.lifecycleReady = nil
+	}
+}
+
+func (b *runtimeBackend) registerConsoleClient(target selector) (func(), error) {
+	if b.consoleSidecars == nil || b.cancelClient == nil {
+		return func() {}, nil
+	}
+	return b.consoleSidecars.RegisterConsoleClient(target, b.cancelClient)
+}
+
+func (b *runtimeBackend) quiesceConsoleClients(target selector) (func(), error) {
+	if b.consoleSidecars == nil {
+		return func() {}, nil
+	}
+	return b.consoleSidecars.QuiesceConsoleClients(target)
+}
+
+func (b *runtimeBackend) consoleClientCanceled() bool {
+	if b.clientCanceled == nil {
+		return false
+	}
+	select {
+	case <-b.clientCanceled:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -6331,6 +6390,9 @@ func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 		"--runsc", b.runsc,
 		"--data-root", b.dataRoot,
 	}
+	if b.daemonSocket != "" {
+		args = append(args, "--daemon-socket", b.daemonSocket)
+	}
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--unsafe-no-host-isolation")
 	}
@@ -6340,12 +6402,6 @@ func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 		return fmt.Errorf("opening auto-remove stdio: %w", err)
 	}
 	defer devNull.Close()
-	errorPath := filepath.Join(b.dataRoot, "containers", target.container, "auto-remove.error.log")
-	errorLog, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("opening auto-remove error log: %w", err)
-	}
-	defer errorLog.Close()
 	command := exec.Command(executable, args...)
 	for _, value := range os.Environ() {
 		if !strings.HasPrefix(value, "TTC_RUNTIME_PLATFORM=") {
@@ -6355,7 +6411,12 @@ func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 	command.Env = append(command.Env, "TTC_RUNTIME_PLATFORM="+b.runtimePlatform)
 	command.Stdin = devNull
 	command.Stdout = devNull
-	command.Stderr = errorLog
+	// The helper is the process that ultimately unlinks the container tree. Its
+	// own stderr must therefore not be a file inside that tree: on NFS this
+	// deterministically silly-renames the open log to .nfs* and makes every
+	// successful --rm require deferred cleanup. Helper failures leave the
+	// container record intact and are visible through normal lifecycle state.
+	command.Stderr = devNull
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("starting auto-remove helper: %w", err)
@@ -6799,6 +6860,11 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 	if err != nil {
 		return 0, err
 	}
+	releaseClient, err := b.registerConsoleClient(target)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseClient()
 	execID := request.execID
 	var paths ttcbundle.ConsolePaths
 	consoleID := "init"
@@ -6901,6 +6967,9 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 	}
 	var waitErr error
 	for {
+		if b.consoleClientCanceled() {
+			return 0, errDetached
+		}
 		progress, err := follower.drain(stdout, stderr)
 		if err != nil {
 			return 0, err
@@ -7175,6 +7244,11 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	target = resolved
+	releaseClient, err := b.registerConsoleClient(target)
+	if err != nil {
+		return err
+	}
+	defer releaseClient()
 	container, err := (ttcbundle.Store{Root: b.dataRoot}).LoadContainer(target.container)
 	if err != nil {
 		return err
@@ -7207,6 +7281,9 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 	output := newConsoleLogOutput(options, container.LogAttributes)
 	initial := true
 	for {
+		if b.consoleClientCanceled() {
+			return nil
+		}
 		var progress bool
 		if initial && options.Tail >= 0 {
 			collector := &consoleLogTail{limit: options.Tail}
@@ -8007,8 +8084,16 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			}
 		}
 	}
+	releaseClients, err := b.quiesceConsoleClients(selector{container: info.ID})
+	if err != nil {
+		return fmt.Errorf("detaching console clients for %q: %w", name, err)
+	}
+	defer releaseClients()
 	if err := b.stopContainerConsoleDrains(info.ID); err != nil {
 		return fmt.Errorf("stopping console followers for %q: %w", name, err)
+	}
+	if err := b.stopPublishedPorts(info); err != nil {
+		return fmt.Errorf("stopping published ports for %q: %w", name, err)
 	}
 	runtimeID := info.ID
 	families, err := b.listRuntimeFamilies()
@@ -8683,6 +8768,16 @@ func (b *runtimeBackend) stopPublishedPortsForBranch(info ttcbundle.ContainerInf
 		if binding.Branch() != branch {
 			continue
 		}
+		if err := b.stopPublishedPort(info, binding); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", portBindingSpec(binding), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *runtimeBackend) stopPublishedPorts(info ttcbundle.ContainerInfo) error {
+	var errs []error
+	for _, binding := range info.PublishedPorts {
 		if err := b.stopPublishedPort(info, binding); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", portBindingSpec(binding), err))
 		}
@@ -10818,6 +10913,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// without --volumes.
 		return b.remove(target.container, true, false)
 	}
+	releaseClients, err := b.quiesceConsoleClients(target)
+	if err != nil {
+		return fmt.Errorf("detaching console clients for %s: %w", target, err)
+	}
+	defer releaseClients()
 	store := b.containerStore()
 	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
 		if err := b.stopConsoleDrain(paths); err != nil {
