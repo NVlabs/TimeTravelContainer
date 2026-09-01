@@ -5203,6 +5203,27 @@ func TestElasticCommandsTakeMutationLock(t *testing.T) {
 	}
 }
 
+func TestPersistentFamilyRequiredRuntime(t *testing.T) {
+	container := ttcbundle.ContainerInfo{
+		NodeID: "node-a",
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", NodeID: "node-a", State: "created"},
+			{ID: "cold", NodeID: "node-a", State: "dehydrated"},
+			{ID: "remote", NodeID: "node-b", State: "running"},
+		},
+	}
+	if persistentFamilyRequiredRuntime(container, "node-a") {
+		t.Fatal("process-free local branches unexpectedly require a runtime")
+	}
+	if !persistentFamilyRequiredRuntime(container, "node-b") {
+		t.Fatal("running remote branch did not require its node runtime")
+	}
+	container.Branches[0].State = "paused"
+	if !persistentFamilyRequiredRuntime(container, "node-a") {
+		t.Fatal("paused local branch did not require its runtime")
+	}
+}
+
 func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 	for _, args := range [][]string{
 		{"node", "drain", "--target", "node-b", "node-a"},

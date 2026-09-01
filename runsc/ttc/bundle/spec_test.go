@@ -1377,6 +1377,143 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 }
 
+func TestListContainersSkipsUnreadableDirectory(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	goodDir := filepath.Join(root, "containers", "good")
+	if err := os.MkdirAll(filepath.Join(goodDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goodDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(goodDir, "container.json"), &ContainerInfo{
+		ID: "good", Name: "good", BundleDir: filepath.Join(goodDir, "bundle"),
+		State: "created", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "containers", "incomplete"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err := store.ListContainers()
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(containers) != 1 || containers[0].ID != "good" {
+		t.Fatalf("containers=%+v, want only good", containers)
+	}
+	if _, err := store.listContainers(true); err == nil {
+		t.Fatal("strict container scan ignored incomplete metadata")
+	}
+
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatalf("RecoverContainerRemovals: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "containers", "incomplete")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("incomplete active directory remains: %v", err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 1 {
+		t.Fatalf("strict containers after recovery=%+v, err=%v", containers, err)
+	}
+	creatingDir := filepath.Join(root, "containers", "being-created")
+	if err := os.Mkdir(creatingDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creatingDir, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 1 {
+		t.Fatalf("strict containers during marked creation=%+v, err=%v", containers, err)
+	}
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatalf("recovery during marked creation: %v", err)
+	}
+	if _, err := os.Stat(creatingDir); err != nil {
+		t.Fatalf("recovery moved an in-progress cluster-node creation: %v", err)
+	}
+}
+
+func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := false
+	store := Store{Root: root}
+	store.removeAllPath = func(path string) error {
+		if filepath.Dir(path) == store.removedContainersRoot() && !failed {
+			failed = true
+			// Model RemoveAll having already unlinked metadata before NFS rejects
+			// the final rmdir because another descriptor is still open.
+			if err := os.Remove(filepath.Join(path, "container.json")); err != nil {
+				t.Fatal(err)
+			}
+			return unix.ENOTEMPTY
+		}
+		return os.RemoveAll(path)
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if _, err := os.Stat(containerDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("container remained visible after committed delete: %v", err)
+	}
+	tombstone := filepath.Join(store.removedContainersRoot(), "demo")
+	if _, err := os.Stat(tombstone); err != nil {
+		t.Fatalf("failed cleanup did not retain tombstone: %v", err)
+	}
+	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
+		t.Fatalf("listing after deferred delete=%+v, err=%v", containers, err)
+	}
+	removed, err := store.SweepRemovedContainers()
+	if err != nil || removed != 1 {
+		t.Fatalf("SweepRemovedContainers=(%d, %v), want (1, nil)", removed, err)
+	}
+	if _, err := os.Stat(tombstone); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("retried tombstone remains: %v", err)
+	}
+}
+
+func TestSweepRemovedContainersIsolatesFailures(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	for _, name := range []string{"busy", "free"} {
+		path := filepath.Join(store.removedContainersRoot(), name)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.removeAllPath = func(path string) error {
+		if filepath.Base(path) == "busy" {
+			return unix.ENOTEMPTY
+		}
+		return os.RemoveAll(path)
+	}
+	removed, err := store.SweepRemovedContainers()
+	if err == nil || removed != 1 {
+		t.Fatalf("SweepRemovedContainers=(%d, %v), want one removal and one isolated error", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "busy")); err != nil {
+		t.Fatalf("busy tombstone disappeared: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "free")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("free tombstone was blocked by peer failure: %v", err)
+	}
+}
+
 func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	root := t.TempDir()
 	transientRoot := t.TempDir()

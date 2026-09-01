@@ -5385,6 +5385,17 @@ type runtimeBackend struct {
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
 	nodeID                string
+	// lifecycleReady releases the daemon lifecycle lock after an attached
+	// run/start has finished creating its runtime but before it waits for the
+	// guest. Detached commands release the lock when the command returns.
+	lifecycleReady func()
+}
+
+func (b *runtimeBackend) signalLifecycleReady() {
+	if b.lifecycleReady != nil {
+		b.lifecycleReady()
+		b.lifecycleReady = nil
+	}
 }
 
 func terminalType(value string) string {
@@ -6259,6 +6270,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 }
 
 func (b *runtimeBackend) finishPreservedPeerStart(info ttcbundle.ContainerInfo, target selector, detach, interactive bool) (int, error) {
+	b.signalLifecycleReady()
 	if detach {
 		if info.AutoRemove {
 			return b.applyAutoRemove(target, true, 0, nil)
@@ -8383,6 +8395,7 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 		}
 		return 1, fmt.Errorf("publishing ports: %w", err)
 	}
+	b.signalLifecycleReady()
 	if detach {
 		return 0, nil
 	}
@@ -8971,6 +8984,14 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if _, ok := runtimeIDs[container.ID]; ok {
 				continue
 			}
+			// Process-free states intentionally have no live Sentry. This also
+			// covers the publication window for `runsc create` and the short
+			// interval after a foreground init exits but before its waiter records
+			// the result: persistent state is still "created" in both cases.
+			// Inventory must not force-delete runtime metadata in either window.
+			if !persistentFamilyRequiredRuntime(container, b.nodeID) {
+				continue
+			}
 			var exitStatus *int
 			// A wait-status file belongs to one incarnation of main. Do not
 			// attribute an old main exit to a different live branch that was
@@ -9064,6 +9085,20 @@ func persistentBranchRequiredRuntime(container ttcbundle.ContainerInfo, branchID
 	default:
 		return false
 	}
+}
+
+func persistentFamilyRequiredRuntime(container ttcbundle.ContainerInfo, nodeID string) bool {
+	for _, branch := range container.Branches {
+		owner := container.BranchNodeID(branch.ID)
+		if nodeID != "" && owner != "" && owner != nodeID {
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "creating", "running", "paused", "dehydrating", "rehydrating", "restarting":
+			return true
+		}
+	}
+	return false
 }
 
 func enrichPersistentBranchDiagnostics(family *Family) {

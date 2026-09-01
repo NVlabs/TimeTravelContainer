@@ -601,17 +601,50 @@ func TestDaemonMutationLocksAreScopedByDataRoot(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	unlockRead := server.lockMutation(root, []string{"inspect", "demo"})
-	unlockRead()
+	readAcquired := make(chan func(), 1)
+	go func() {
+		readAcquired <- server.lockMutation(root, []string{"inspect", "demo"})
+	}()
+	select {
+	case unlock := <-readAcquired:
+		unlock()
+		t.Fatal("lifecycle read acquired the lock during a conflicting mutation")
+	case <-time.After(50 * time.Millisecond):
+	}
 	unlockOther := server.lockMutation(root+"-other", []string{"stop", "demo"})
 	unlockOther()
 
 	unlockFirst()
-	select {
-	case unlock := <-secondAcquired:
-		unlock()
-	case <-time.After(5 * time.Second):
-		t.Fatal("conflicting mutation remained blocked after unlock")
+	remaining := 2
+	for remaining != 0 {
+		select {
+		case unlock := <-secondAcquired:
+			secondAcquired = nil
+			unlock()
+			remaining--
+		case unlock := <-readAcquired:
+			readAcquired = nil
+			unlock()
+			remaining--
+		case <-time.After(5 * time.Second):
+			t.Fatal("lifecycle operation remained blocked after unlock")
+		}
+	}
+}
+
+func TestDaemonLifecycleReadsDoNotEnterMutationJournal(t *testing.T) {
+	for _, args := range [][]string{{"ps", "-a"}, {"ls", "--json"}, {"inspect", "demo@main"}, {"container", "stats", "demo@main"}, {"run", "alpine"}, {"start", "-a", "demo@main"}} {
+		if !daemonCommandReadsLifecycle(args) {
+			t.Errorf("%v does not take the lifecycle lock", args)
+		}
+		if daemonCommandNeedsMutationJournal(args) {
+			t.Errorf("%v unnecessarily enters the mutation journal", args)
+		}
+	}
+	for _, args := range [][]string{{"run", "-d", "alpine"}, {"start", "demo@main"}, {"ps", "-a"}} {
+		if got := daemonCommandReleasesLifecycleAfterStart(args); got {
+			t.Errorf("%v unexpectedly releases an attached lifecycle lock", args)
+		}
 	}
 }
 

@@ -1686,6 +1686,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	store := ttcbundle.Store{Root: daemonDataRoot}
+	// Namespace recovery must precede every startup inventory. In particular,
+	// image-root pruning uses a conservative container scan and should never be
+	// reached with a half-deleted legacy directory still in containers/.
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers before startup inventory: %v\n", err)
+	}
 	if _, err := store.RemoveObsoleteApplicationMemoryFiles(); err != nil {
 		fmt.Fprintf(stderr, "ttcd: removing obsolete application memory files: %v\n", err)
 		return 1
@@ -2180,9 +2186,20 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	// Recover namespace-atomic deletions before announcing readiness. Failure
+	// to physically remove one tombstone is non-fatal: it is outside the active
+	// container namespace and periodic maintenance will retry it.
+	unlockRecovery := server.lockDataRoot(dataRoot)
+	_, recoveryErr := (ttcbundle.Store{Root: dataRoot}).RecoverContainerRemovals()
+	unlockRecovery()
+	if recoveryErr != nil && stderr != nil {
+		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", recoveryErr)
+	}
 	maintenanceDone := make(chan struct{})
 	defer close(maintenanceDone)
-	go maintainRepositories(dataRoot, stderr, maintenanceDone)
+	go maintainRepositories(dataRoot, stderr, maintenanceDone, func() func() {
+		return server.lockDataRoot(dataRoot)
+	})
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
 	var elasticRecord *cluster.NodeRecord
@@ -2353,7 +2370,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 }
 
-func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{}) {
+func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	for {
@@ -2362,12 +2379,21 @@ func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{
 			return
 		case <-timer.C:
 		}
-		if _, err := (ttcbundle.Store{Root: dataRoot}).GarbageCollectRepositories(); err != nil && stderr != nil {
+		unlock := func() {}
+		if lock != nil {
+			unlock = lock()
+		}
+		store := ttcbundle.Store{Root: dataRoot}
+		if _, err := store.RecoverContainerRemovals(); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", err)
+		}
+		if _, err := store.GarbageCollectRepositories(); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
 		}
 		if err := collectSparseMemoryRepositories(dataRoot); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)
 		}
+		unlock()
 		timer.Reset(repositoryMaintenanceInterval)
 	}
 }
@@ -2679,8 +2705,18 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, status)
 		return
 	}
+	rawUnlock := s.lockMutation(opts.dataRoot, request.Args)
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(rawUnlock) }
+	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
+		backend.lifecycleReady = unlock
+	}
+	// Reconciliation lists runsc state and may reap runtimes that have lost
+	// their Sentry. Keep it in the same lifecycle critical section as the
+	// command: otherwise a read-only `ttc ps` can observe `runsc create` after
+	// its state file is published but before its control server is ready and
+	// mistake the in-progress runtime for stale state.
 	s.reconcile(backend)
-	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
 		unlock()
 		stdinReader.Close()
@@ -2783,6 +2819,52 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 	}
 }
 
+// daemonCommandReadsLifecycle reports commands whose runtime inventory must be
+// a coherent snapshot. They do not enter the mutation journal, but must not
+// probe or reconcile runsc state while create/delete or another lifecycle
+// mutation is only partially complete.
+func daemonCommandReadsLifecycle(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "container" {
+		args = args[1:]
+		if len(args) == 0 {
+			return false
+		}
+	}
+	switch args[0] {
+	case "ps", "ls", "inspect", "top", "stats", "diff":
+		return true
+	default:
+		return daemonCommandReleasesLifecycleAfterStart(args)
+	}
+}
+
+// daemonCommandReleasesLifecycleAfterStart identifies attached lifecycle
+// commands. They need exclusion only through runtime publication; holding the
+// lock while the client remains attached would block the daemon for the whole
+// lifetime of the guest process.
+func daemonCommandReleasesLifecycleAfterStart(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "container" {
+		args = args[1:]
+		if len(args) == 0 {
+			return false
+		}
+	}
+	switch args[0] {
+	case "run":
+		return !daemonCommandBoolFlag(args[1:], 'd', "--detach")
+	case "start":
+		return daemonCommandBoolFlag(args[1:], 'a', "--attach")
+	default:
+		return false
+	}
+}
+
 // daemonCommandNeedsMutationJournal identifies state-changing commands whose
 // small output can be durably buffered for retry. Container-to-host cp still
 // takes the lifecycle lock, but its arbitrarily large archive is streamed.
@@ -2859,7 +2941,7 @@ func daemonCommandBoolFlag(args []string, short byte, long string) bool {
 }
 
 func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
-	if !daemonCommandNeedsMutationLock(args) {
+	if !daemonCommandNeedsMutationLock(args) && !daemonCommandReadsLifecycle(args) {
 		return func() {}
 	}
 	return s.lockDataRoot(dataRoot)

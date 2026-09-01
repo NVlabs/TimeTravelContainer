@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -38,6 +39,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -56,6 +58,14 @@ const (
 
 const promotedRepositoryDir = "repositories"
 
+// removedContainerDir is outside the active container namespace so that a
+// failed physical deletion cannot make container discovery fail. It remains
+// under Store.Root to keep the rename that commits a deletion on one
+// filesystem, including when Store.Root is an NFS mount.
+const removedContainerDir = "removed-containers"
+
+const containerCreationMarker = ".creating"
+
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
 	Root string
@@ -64,7 +74,14 @@ type Store struct {
 	// bundle config descriptor for its lifetime, so unlinking an NFS-backed
 	// bundle would leave a .nfs placeholder until the container exits.
 	TransientRoot string
+
+	// These hooks are used only by tests that emulate failures such as NFS
+	// silly-renamed files. Production stores leave them nil.
+	renamePath    func(string, string) error
+	removeAllPath func(string) error
 }
+
+var warnedUnreadableContainers sync.Map
 
 // RemoveObsoleteApplicationMemoryFiles removes pathname-backed live memory
 // allocators created by TTC versions predating sparse dehydration. Current
@@ -867,7 +884,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 				_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 				cancel()
 			}
-			os.RemoveAll(containerDir)
+			s.discardIncompleteContainer(id)
 		}
 	}()
 	rootfsUpperID := ""
@@ -1036,7 +1053,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 			cancel()
 		}
-		_ = os.RemoveAll(containerDir)
+		s.discardIncompleteContainer(id)
 	}()
 
 	specData, err := json.Marshal(opts.Spec)
@@ -1383,7 +1400,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		return Prepared{}, err
 	}
 	if err := rehomeInternalMounts(spec, containerDir); err != nil {
-		_ = os.RemoveAll(containerDir)
+		s.discardIncompleteContainer(id)
 		return Prepared{}, err
 	}
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
@@ -1399,7 +1416,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 			cancel()
 		}
-		_ = os.RemoveAll(containerDir)
+		s.discardIncompleteContainer(id)
 	}()
 	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.CgroupsPath != "" {
 		spec.Linux.CgroupsPath = filepath.Join("ttc", id)
@@ -2081,6 +2098,15 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		}
 		dir := filepath.Join(containersDir, id)
 		if err := os.Mkdir(dir, 0700); err == nil {
+			// Retain the marker through metadata publication. On NFS, another
+			// client may observe its unlink before preceding config.json and
+			// container.json renames. Startup/maintenance removes it only after
+			// loading the complete record through the normal path.
+			marker := filepath.Join(dir, containerCreationMarker)
+			if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0600); err != nil {
+				_ = os.Remove(dir)
+				return "", "", fmt.Errorf("marking container %s creation: %w", id, err)
+			}
 			return id, dir, nil
 		} else if !os.IsExist(err) {
 			return "", "", fmt.Errorf("creating state for container %s: %w", id, err)
@@ -2088,7 +2114,6 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 	}
 	return "", "", errors.New("could not allocate a unique container ID")
 }
-
 func normalizePortBinding(binding PortBinding) (PortBinding, error) {
 	address, err := netip.ParseAddr(binding.HostIP)
 	if err != nil || !address.Is4() {
@@ -2389,10 +2414,19 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
-	return s.listContainers(false)
+	return s.listContainersWithPolicy(false, true)
 }
 
 func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
+	return s.listContainersWithPolicy(includeHidden, false)
+}
+
+// listContainersWithPolicy separates availability-oriented discovery from
+// conservative internal scans. User-facing listing skips and warns about one
+// unreadable record so that an isolated damaged directory cannot hide every
+// healthy container. Mutations and garbage collection remain strict: they
+// must not infer that unreadable state is unreferenced.
+func (s Store) listContainersWithPolicy(includeHidden, tolerateUnreadable bool) ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
@@ -2406,10 +2440,34 @@ func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 		if !entry.IsDir() {
 			continue
 		}
+		containerDir := filepath.Join(containersDir, entry.Name())
+		_, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker))
+		creationMarked := markerErr == nil
+		if _, metadataErr := os.Stat(filepath.Join(containerDir, "container.json")); errors.Is(metadataErr, fs.ErrNotExist) {
+			if creationMarked {
+				// Another cluster node may still be preparing this directory in the
+				// shared data root. It becomes visible only when container.json is
+				// atomically published.
+				continue
+			}
+		}
 		info, err := s.loadContainerKey(entry.Name())
 		if err != nil {
+			if creationMarked {
+				// Publication can become visible to NFS clients one pathname at a
+				// time. The marker makes this an unpublished record, not corruption.
+				continue
+			}
+			if tolerateUnreadable {
+				key := filepath.Join(containersDir, entry.Name())
+				if _, loaded := warnedUnreadableContainers.LoadOrStore(key, struct{}{}); !loaded {
+					log.Warningf("Skipping unreadable TTC container directory %q during listing: %v", key, err)
+				}
+				continue
+			}
 			return nil, err
 		}
+		warnedUnreadableContainers.Delete(filepath.Join(containersDir, entry.Name()))
 		if includeHidden || !info.DistributedForkHidden {
 			containers = append(containers, info)
 		}
@@ -2645,18 +2703,7 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 		}
 		return s.RemoveBranchRecord(info.ID, branch.ID)
 	}
-	if info.LeaseID != "" {
-		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
-			return err
-		}
-	}
-	if err := s.removeDistributedMemorySnapshot(info); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
-		return err
-	}
-	return s.gcPromotedRepositories()
+	return s.removeContainerInfo(info)
 }
 
 func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
@@ -3472,18 +3519,204 @@ func (s Store) RemoveContainer(name string) error {
 	if err != nil {
 		return err
 	}
-	if info.LeaseID != "" {
-		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
-			return fmt.Errorf("releasing image content for container %q: %w", name, err)
+	return s.removeContainerInfo(info)
+}
+
+func (s Store) rename(oldPath, newPath string) error {
+	if s.renamePath != nil {
+		return s.renamePath(oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+func (s Store) removeAll(path string) error {
+	if s.removeAllPath != nil {
+		return s.removeAllPath(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (s Store) removedContainersRoot() string {
+	return filepath.Join(s.Root, removedContainerDir)
+}
+
+func (s Store) discardIncompleteContainer(id string) {
+	tombstone, err := s.stageContainerRemoval(id)
+	if err != nil {
+		log.Warningf("Deferring cleanup of incomplete container %q in the active namespace: %v", id, err)
+		return
+	}
+	if err := s.cleanupRemovedContainer(tombstone, nil); err != nil {
+		log.Warningf("Deferring physical cleanup of incomplete container %q: %v", id, err)
+	}
+}
+
+// stageContainerRemoval atomically removes one container from the active
+// namespace. Physical cleanup happens only after this rename, so a partially
+// successful recursive deletion can damage only a tombstone.
+func (s Store) stageContainerRemoval(id string) (string, error) {
+	active := filepath.Join(s.Root, "containers", id)
+	root := s.removedContainersRoot()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating removed-container staging directory: %w", err)
+	}
+	tombstone := filepath.Join(root, id)
+	if _, err := os.Lstat(tombstone); err == nil {
+		return "", fmt.Errorf("removed-container tombstone already exists for %q", id)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("checking removed-container tombstone for %q: %w", id, err)
+	}
+	if err := s.rename(active, tombstone); err != nil {
+		return "", fmt.Errorf("committing removal of container %q: %w", id, err)
+	}
+	// The rename is already the logical commit point. Directory sync failures
+	// affect crash durability, not whether callers may continue using the
+	// active namespace, so retain the tombstone and report them in the daemon
+	// log instead of turning a committed removal into an ambiguous failure.
+	for _, dir := range []string{filepath.Dir(active), root} {
+		directory, err := os.Open(dir)
+		if err == nil {
+			err = directory.Sync()
+			err = errors.Join(err, directory.Close())
+		}
+		if err != nil {
+			log.Warningf("Container %q was removed but syncing directory %q failed: %v", id, dir, err)
 		}
 	}
-	if err := s.removeDistributedMemorySnapshot(info); err != nil {
+	return tombstone, nil
+}
+
+func loadRemovedContainerInfo(path string) (*ContainerInfo, error) {
+	data, err := os.ReadFile(filepath.Join(path, "container.json"))
+	if err != nil {
+		return nil, err
+	}
+	var info ContainerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// cleanupRemovedContainer performs idempotent post-commit cleanup. Metadata is
+// deliberately retained until external resources have been released. Once
+// recursive removal begins, losing container.json is harmless: all cleanup
+// that needed it has already completed.
+func (s Store) cleanupRemovedContainer(path string, known *ContainerInfo) error {
+	info := known
+	if info == nil {
+		loaded, err := loadRemovedContainerInfo(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Older TTC versions could leave an empty active directory after first
+			// releasing the image lease. Also make the conventional lease cleanup
+			// idempotently in case creation was interrupted before publication.
+			id := filepath.Base(path)
+			if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: images.ContainerLeaseID(id)}); err != nil {
+				return fmt.Errorf("releasing inferred image content for removed container %q: %w", id, err)
+			}
+			return s.removeAll(path)
+		}
+		if err != nil {
+			return fmt.Errorf("reading removed container metadata from %q: %w", path, err)
+		}
+		info = loaded
+	}
+	if info.LeaseID != "" {
+		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
+			return fmt.Errorf("releasing image content for removed container %q: %w", info.ID, err)
+		}
+	}
+	if err := s.removeDistributedMemorySnapshot(*info); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
-		return fmt.Errorf("removing container %q: %w", name, err)
+	return s.removeAll(path)
+}
+
+func (s Store) removeContainerInfo(info ContainerInfo) error {
+	tombstone, err := s.stageContainerRemoval(info.ID)
+	if err != nil {
+		return err
 	}
-	return s.gcPromotedRepositories()
+	if err := s.cleanupRemovedContainer(tombstone, &info); err != nil {
+		log.Warningf("Container %q was removed; deferred physical cleanup of %q: %v", info.Name, tombstone, err)
+	}
+	// Promoted repositories are global derived garbage. A failure here must not
+	// reverse or obscure the already-committed container removal; maintenance
+	// retries it independently.
+	if err := s.gcPromotedRepositories(); err != nil {
+		log.Warningf("Container %q was removed; deferred promoted-repository cleanup: %v", info.Name, err)
+	}
+	return nil
+}
+
+// RecoverContainerRemovals moves incomplete legacy container directories out
+// of the active namespace, then retries every tombstone independently. It is
+// intended to run at daemon startup and during periodic maintenance while the
+// data-root mutation lock is held.
+func (s Store) RecoverContainerRemovals() (int, error) {
+	containersRoot := filepath.Join(s.Root, "containers")
+	entries, err := os.ReadDir(containersRoot)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return 0, fmt.Errorf("scanning incomplete container removals: %w", err)
+	}
+	var result error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		containerDir := filepath.Join(containersRoot, entry.Name())
+		metadata := filepath.Join(containerDir, "container.json")
+		if _, err := os.Stat(metadata); err == nil {
+			marker := filepath.Join(containerDir, containerCreationMarker)
+			if _, markerErr := os.Stat(marker); markerErr == nil {
+				if _, loadErr := s.loadContainerKey(entry.Name()); loadErr == nil {
+					if removeErr := os.Remove(marker); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+						result = errors.Join(result, fmt.Errorf("finalizing container creation %q: %w", entry.Name(), removeErr))
+					}
+				}
+			}
+			continue
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("checking container metadata %q: %w", metadata, err))
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(containerDir, containerCreationMarker)); err == nil {
+			continue
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("checking container creation marker for %q: %w", entry.Name(), err))
+			continue
+		}
+		if _, err := s.stageContainerRemoval(entry.Name()); err != nil {
+			result = errors.Join(result, fmt.Errorf("isolating incomplete container directory %q: %w", entry.Name(), err))
+		}
+	}
+	removed, sweepErr := s.SweepRemovedContainers()
+	return removed, errors.Join(result, sweepErr)
+}
+
+// SweepRemovedContainers retries tombstones independently. One path that an
+// NFS server still considers busy is retained without preventing cleanup of
+// any other removed container.
+func (s Store) SweepRemovedContainers() (int, error) {
+	root := s.removedContainersRoot()
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("listing removed containers: %w", err)
+	}
+	removed := 0
+	var result error
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if err := s.cleanupRemovedContainer(path, nil); err != nil {
+			result = errors.Join(result, fmt.Errorf("cleaning removed container %q: %w", entry.Name(), err))
+			continue
+		}
+		removed++
+	}
+	return removed, result
 }
 
 // PromoteContainerRepositories moves container-private repositories into the

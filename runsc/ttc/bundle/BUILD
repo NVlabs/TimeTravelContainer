@@ -14,6 +14,7 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/log",
         "//pkg/ttcvolume",
         "//runsc/specutils",
         "//runsc/ttc/console",
