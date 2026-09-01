@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // ArchPrctl implements linux syscall arch_prctl(2).
@@ -45,9 +46,23 @@ func ArchPrctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		if !t.Arch().SetTLS(uintptr(fsbase)) {
 			return 0, nil, linuxerr.EPERM
 		}
-	case linux.ARCH_GET_GS, linux.ARCH_SET_GS:
-		t.Kernel().EmitUnimplementedEvent(t, sysno)
-		fallthrough
+	case linux.ARCH_GET_GS:
+		if !platform.SupportsGuestGSBase(t.Kernel().Platform) {
+			return 0, nil, linuxerr.EINVAL
+		}
+		addr := args[1].Pointer()
+		gsbase := t.Arch().GSBase()
+		if _, err := primitive.CopyUint64Out(t, addr, uint64(gsbase)); err != nil {
+			return 0, nil, err
+		}
+	case linux.ARCH_SET_GS:
+		if !platform.SupportsGuestGSBase(t.Kernel().Platform) {
+			return 0, nil, linuxerr.EINVAL
+		}
+		gsbase := args[1].Uint64()
+		if !t.Arch().SetGSBase(uintptr(gsbase)) {
+			return 0, nil, linuxerr.EPERM
+		}
 	default:
 		return 0, nil, linuxerr.EINVAL
 	}

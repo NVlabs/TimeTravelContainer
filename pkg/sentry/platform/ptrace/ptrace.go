@@ -260,6 +260,11 @@ func (*PTrace) SupportsAddressSpaceIO() bool {
 	return false
 }
 
+// SupportsGuestGSBase implements platform.GuestGSBaseSupport.
+func (*PTrace) SupportsGuestGSBase() bool {
+	return true
+}
+
 // MapUnit implements platform.Platform.MapUnit.
 func (*PTrace) MapUnit() uint64 {
 	// The host kernel manages page tables and arbitrary-sized mappings

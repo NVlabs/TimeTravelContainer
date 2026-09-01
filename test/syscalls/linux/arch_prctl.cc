@@ -42,6 +42,32 @@ TEST(ArchPrctlTest, GetSetFS) {
               SyscallFailsWithErrno(EPERM));
 }
 
+TEST(ArchPrctlTest, GetSetGS) {
+  uintptr_t orig;
+  const int get_result =
+      arch_prctl(ARCH_GET_GS, reinterpret_cast<uintptr_t>(&orig));
+  if (get_result == -1 && errno == EINVAL) {
+    GTEST_SKIP() << "execution platform reserves GS";
+  }
+  ASSERT_THAT(get_result, SyscallSucceeds());
+
+  uint64_t value = 0x0123456789abcdef;
+  ASSERT_THAT(arch_prctl(ARCH_SET_GS, reinterpret_cast<uintptr_t>(&value)),
+              SyscallSucceeds());
+
+  uint64_t loaded;
+  asm volatile("movq %%gs:0, %0" : "=r"(loaded));
+  EXPECT_EQ(loaded, value);
+
+  uintptr_t current;
+  EXPECT_THAT(arch_prctl(ARCH_GET_GS,
+                         reinterpret_cast<uintptr_t>(&current)),
+              SyscallSucceeds());
+  EXPECT_EQ(current, reinterpret_cast<uintptr_t>(&value));
+
+  ASSERT_THAT(arch_prctl(ARCH_SET_GS, orig), SyscallSucceeds());
+}
+
 }  // namespace
 
 }  // namespace testing

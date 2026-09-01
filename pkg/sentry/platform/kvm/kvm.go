@@ -140,6 +140,11 @@ func (*KVM) SupportsAddressSpaceIO() bool {
 	return false
 }
 
+// SupportsGuestGSBase implements platform.GuestGSBaseSupport.
+func (*KVM) SupportsGuestGSBase() bool {
+	return true
+}
+
 // MapUnit implements platform.Platform.MapUnit.
 func (*KVM) MapUnit() uint64 {
 	// We greedily creates PTEs in MapFile, so extremely large mappings can

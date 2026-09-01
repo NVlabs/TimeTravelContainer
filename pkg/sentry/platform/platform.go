@@ -118,6 +118,21 @@ type Platform interface {
 	NumCPUs() int
 }
 
+// GuestGSBaseSupport is implemented by platforms that can preserve an
+// application-selected x86 GS base across context switches. It is optional so
+// architecture-independent platform implementations and test fakes do not
+// need to claim support for an x86-specific facility.
+type GuestGSBaseSupport interface {
+	SupportsGuestGSBase() bool
+}
+
+// SupportsGuestGSBase reports whether p can safely preserve an
+// application-selected x86 GS base.
+func SupportsGuestGSBase(p Platform) bool {
+	s, ok := p.(GuestGSBaseSupport)
+	return ok && s.SupportsGuestGSBase()
+}
+
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and
 // dependent methods for Platforms that do not support this feature.
 type NoCPUPreemptionDetection struct{}

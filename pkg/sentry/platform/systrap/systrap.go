@@ -352,6 +352,13 @@ func (*Systrap) SupportsAddressSpaceIO() bool {
 	return false
 }
 
+// SupportsGuestGSBase implements platform.GuestGSBaseSupport. The systrap
+// syscall-patching fast path reserves GS for its own thread state, so guest GS
+// is available only when syscall patching is disabled.
+func (*Systrap) SupportsGuestGSBase() bool {
+	return disableSyscallPatching
+}
+
 // MapUnit implements platform.Platform.MapUnit.
 func (*Systrap) MapUnit() uint64 {
 	// The host kernel manages page tables and arbitrary-sized mappings

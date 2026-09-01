@@ -161,6 +161,34 @@ static void set_fsbase(uint64_t fsbase) {
   }
 }
 
+// get_gsbase returns the current thread's GS base. Unlike FS, which Linux uses
+// for TLS, applications are free to use GS on x86-64. In particular, Firefox's
+// RLBox/wasm2c runtime uses it as the base of a sandboxed Wasm linear memory.
+static uint64_t get_gsbase(void) {
+  uint64_t gsbase;
+  if (__export_arch_state.fsgsbase) {
+    asm volatile("rdgsbase %0" : "=r"(gsbase));
+  } else {
+    int ret =
+        __syscall(__NR_arch_prctl, ARCH_GET_GS, (long)&gsbase, 0, 0, 0, 0);
+    if (ret) {
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
+    }
+  }
+  return gsbase;
+}
+
+static void set_gsbase(uint64_t gsbase) {
+  if (__export_arch_state.fsgsbase) {
+    asm volatile("wrgsbase %0" : : "r"(gsbase) : "memory");
+  } else {
+    int ret = __syscall(__NR_arch_prctl, ARCH_SET_GS, gsbase, 0, 0, 0, 0);
+    if (ret) {
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
+    }
+  }
+}
+
 // switch_context_amd64 is a wrapper of switch_context() which does checks
 // specific to amd64.
 struct thread_context *switch_context_amd64(
@@ -209,9 +237,14 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   struct thread_context *ctx = NULL;
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
   long fs_base = 0;
+  uint64_t gs_base = 0;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
     // Find a new context and exit to restore it.
+    // The stub initialized GS to sysmsg. Capture it so that the comparison at
+    // init installs the first application's GS base, including the usual zero
+    // value.
+    gs_base = get_gsbase();
     init_new_thread();
     goto init;
   }
@@ -232,6 +265,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   }
 
   fs_base = get_fsbase();
+  gs_base = get_gsbase();
 
   ctx->signo = signo;
   ctx->siginfo = *siginfo;
@@ -241,6 +275,7 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   if (signo != SIGCHLD ||
       ucontext->uc_mcontext.gregs[REG_RIP] < __export_stub_start) {
     ctx->ptregs.fs_base = fs_base;
+    ctx->ptregs.gs_base = gs_base;
     ctx->err = 0;
     gregs_to_ptregs(ucontext, &ctx->ptregs);
     memcpy(ctx->fpstate, (uint8_t *)ucontext->uc_mcontext.fpregs,
@@ -339,6 +374,10 @@ init:
   ctx = switch_context_amd64(sysmsg, ctx, ctx_state);
   if (fs_base != ctx->ptregs.fs_base) {
     set_fsbase(ctx->ptregs.fs_base);
+  }
+
+  if (gs_base != ctx->ptregs.gs_base) {
+    set_gsbase(ctx->ptregs.gs_base);
   }
 
   if (atomic_load(&ctx->fpstate_changed)) {
