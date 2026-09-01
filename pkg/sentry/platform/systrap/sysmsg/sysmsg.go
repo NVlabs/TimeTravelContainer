@@ -269,6 +269,9 @@ type ThreadContext struct {
 	// goroutine used for this thread context is busy-polling for a response
 	// instead of using FUTEX_WAIT.
 	SentryFastPath uint32
+	// GuestGS is non-zero when Regs.Gs_base, rather than systrap's sysmsg
+	// pointer, must be installed while this context executes application code.
+	GuestGS uint32
 	// AckedTime is used by sysmsg threads to signal to the sentry that this context
 	// has been picked up from the context queue and is actively being worked on.
 	// The stub thread puts down the timestamp at which it has started processing
@@ -334,6 +337,7 @@ func (c *ThreadContext) Init(initialThreadID uint32) {
 	c.Signo = 0
 	c.SignalInfo = linux.SignalInfo{}
 	c.State = ContextStateNone
+	c.GuestGS = 0
 	c.ThreadID = initialThreadID
 	c.ThreadName = [linux.TASK_COMM_LEN]byte{}
 }

@@ -61,6 +61,11 @@ func (*State) HandleFault(ctx context.Context, ac *arch.Context64, mm memoryMana
 	return nil
 }
 
+// GuestGSMode is always false on arm64, which has no GS register.
+func (*State) GuestGSMode(ctx context.Context, mm memoryManager) (bool, error) {
+	return false, nil
+}
+
 // PreFork does nothing on arm64 as syscall trapping is not supported.
 func (*State) PreFork() {
 }

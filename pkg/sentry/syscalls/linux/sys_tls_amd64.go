@@ -59,6 +59,9 @@ func ArchPrctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 		if !platform.SupportsGuestGSBase(t.Kernel().Platform) {
 			return 0, nil, linuxerr.EINVAL
 		}
+		if err := platform.PrepareGuestGSBase(t, t.Kernel().Platform, t.MemoryManager()); err != nil {
+			return 0, nil, err
+		}
 		gsbase := args[1].Uint64()
 		if !t.Arch().SetGSBase(uintptr(gsbase)) {
 			return 0, nil, linuxerr.EPERM

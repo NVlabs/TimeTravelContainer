@@ -53,6 +53,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -181,6 +182,19 @@ func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManag
 	}
 	c.sharedContext.shared.ThreadName = [linux.TASK_COMM_LEN]byte{}
 	copy(c.sharedContext.shared.ThreadName[:linux.TASK_COMM_LEN-1], name)
+	guestGS := disableSyscallPatching
+	if !guestGS {
+		var err error
+		guestGS, err = s.usertrap.GuestGSMode(ctx, mm)
+		if err != nil {
+			return nil, hostarch.NoAccess, &platform.ContextError{Err: fmt.Errorf("loading systrap GS mode: %w", err), Errno: unix.EFAULT}
+		}
+	}
+	if guestGS {
+		atomic.StoreUint32(&c.sharedContext.shared.GuestGS, 1)
+	} else {
+		atomic.StoreUint32(&c.sharedContext.shared.GuestGS, 0)
+	}
 
 restart:
 	isSyscall, needPatch, at, err := s.switchToApp(c, ac)
@@ -350,13 +364,6 @@ func New(opts platform.Options) (*Systrap, error) {
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
 func (*Systrap) SupportsAddressSpaceIO() bool {
 	return false
-}
-
-// SupportsGuestGSBase implements platform.GuestGSBaseSupport. The systrap
-// syscall-patching fast path reserves GS for its own thread state, so guest GS
-// is available only when syscall patching is disabled.
-func (*Systrap) SupportsGuestGSBase() bool {
-	return disableSyscallPatching
 }
 
 // MapUnit implements platform.Platform.MapUnit.

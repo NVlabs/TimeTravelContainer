@@ -96,6 +96,9 @@ struct thread_context {
   uint32_t thread_id;
   uint32_t last_thread_id;
   uint32_t sentry_fast_path;
+  // guest_gs is non-zero when ptregs.gs_base, rather than the systrap sysmsg
+  // pointer, must be installed while this context executes application code.
+  uint32_t guest_gs;
   uint64_t acked_time;
   uint64_t state_changed_time;
   uint64_t tls;

@@ -15,8 +15,43 @@
 package systrap
 
 import (
+	"fmt"
+
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
+
+// SupportsGuestGSBase implements platform.GuestGSBaseSupport. Systrap starts
+// with its GS-dependent syscall fast path enabled and transitions each address
+// space on its first ARCH_SET_GS.
+func (*Systrap) SupportsGuestGSBase() bool {
+	return true
+}
+
+// PrepareGuestGSBase implements platform.GuestGSBasePreparer.
+func (*Systrap) PrepareGuestGSBase(ctx context.Context, mm platform.MemoryManager) error {
+	if disableSyscallPatching {
+		return nil
+	}
+	s, ok := mm.AddressSpace().(*subprocess)
+	if !ok || s == nil {
+		return fmt.Errorf("systrap GS transition requires an active address space")
+	}
+	return s.usertrap.Disable(ctx, mm)
+}
+
+// SanitizeFeatureSet implements platform.FeatureSetSanitizer. While any
+// address space may still use GS-dependent syscall trampolines, applications
+// must request GS changes through arch_prctl so systrap can observe and retire
+// those trampolines first.
+func (*Systrap) SanitizeFeatureSet(fs cpuid.FeatureSet) cpuid.FeatureSet {
+	if disableSyscallPatching {
+		return fs
+	}
+	return fs.WithoutFSGSBASE()
+}
 
 func stackPointer(r *arch.Registers) uintptr {
 	return uintptr(r.Rsp)

@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -126,11 +127,43 @@ type GuestGSBaseSupport interface {
 	SupportsGuestGSBase() bool
 }
 
+// GuestGSBasePreparer is implemented by platforms that must perform a
+// one-time transition before an application thread may select its GS base.
+// For example, systrap must retire syscall trampolines that use GS as private
+// thread-local storage.
+type GuestGSBasePreparer interface {
+	PrepareGuestGSBase(ctx context.Context, mm MemoryManager) error
+}
+
+// FeatureSetSanitizer is implemented by platforms that must conceal CPU
+// features which cannot be used safely with their execution fast path.
+type FeatureSetSanitizer interface {
+	SanitizeFeatureSet(cpuid.FeatureSet) cpuid.FeatureSet
+}
+
 // SupportsGuestGSBase reports whether p can safely preserve an
 // application-selected x86 GS base.
 func SupportsGuestGSBase(p Platform) bool {
 	s, ok := p.(GuestGSBaseSupport)
 	return ok && s.SupportsGuestGSBase()
+}
+
+// PrepareGuestGSBase prepares p and mm for an application-selected x86 GS
+// base. Platforms that advertise GS support and require no transition need
+// not implement GuestGSBasePreparer.
+func PrepareGuestGSBase(ctx context.Context, p Platform, mm MemoryManager) error {
+	if prep, ok := p.(GuestGSBasePreparer); ok {
+		return prep.PrepareGuestGSBase(ctx, mm)
+	}
+	return nil
+}
+
+// SanitizeFeatureSet applies p's platform-specific feature restrictions.
+func SanitizeFeatureSet(p Platform, fs cpuid.FeatureSet) cpuid.FeatureSet {
+	if sanitizer, ok := p.(FeatureSetSanitizer); ok {
+		return sanitizer.SanitizeFeatureSet(fs)
+	}
+	return fs
 }
 
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and

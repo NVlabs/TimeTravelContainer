@@ -533,6 +533,19 @@ func (fs FeatureSet) UseFSGSBASE() bool {
 	return fs.HasFeature(X86FeatureFSGSBase) && ((fs.hwCap.hwCap2 & HWCAP2_FSGSBASE) != 0)
 }
 
+// WithoutFSGSBASE returns fs without advertising userspace FSGSBASE
+// instructions through CPUID or AT_HWCAP2. This is used by systrap while its
+// syscall-patching fast path temporarily owns GS; conforming applications then
+// request GS changes through arch_prctl, where systrap can transition safely.
+func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
+	static := fs.ToStatic()
+	static.Remove(X86FeatureFSGSBase)
+	masked := static.ToFeatureSet()
+	masked.hwCap = fs.hwCap
+	masked.hwCap.hwCap2 &^= HWCAP2_FSGSBASE
+	return masked
+}
+
 // archCheckHostCompatible checks for compatibility.
 func (fs FeatureSet) archCheckHostCompatible(hfs FeatureSet) error {
 	// The size of a cache line must match, as it is critical to correctly

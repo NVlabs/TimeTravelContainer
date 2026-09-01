@@ -8229,12 +8229,6 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		"--root", b.root,
 		"--platform=" + runtimePlatform,
 	}
-	if runtimePlatform == "systrap" {
-		// Systrap's patched-syscall trampoline reserves GS for its per-thread
-		// control block. Disable that optimization so applications may use GS as
-		// Linux permits; current Firefox uses it for RLBox/wasm2c Segue.
-		args = append(args, "--systrap-disable-syscall-patching=true")
-	}
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
 	} else {

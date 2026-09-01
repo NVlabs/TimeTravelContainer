@@ -36,6 +36,7 @@
 package kernel
 
 import (
+	gocontext "context"
 	"errors"
 	"fmt"
 	"io"
@@ -509,6 +510,13 @@ type Kernel struct {
 	// DomainNamePoller is notified when the system domainname changes in *any*
 	// UTS namespace.
 	DomainNamePoller vfs.DynamicBytesPoller
+}
+
+// afterLoad reapplies execution-platform CPU feature restrictions to saved
+// kernels. This matters for TTC live fork and dehydration images created by an
+// older runtime that advertised a feature the current platform must hide.
+func (k *Kernel) afterLoad(gocontext.Context) {
+	k.featureSet = platform.SanitizeFeatureSet(k.Platform, k.featureSet)
 }
 
 // InitKernelArgs holds arguments to Init.

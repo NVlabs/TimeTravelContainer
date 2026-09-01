@@ -237,14 +237,12 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   struct thread_context *ctx = NULL;
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
   long fs_base = 0;
-  uint64_t gs_base = 0;
+  // Syscall-patched contexts use GS for sysmsg. Guest-GS contexts instead
+  // carry the application's GS base in ptregs.
+  uint64_t gs_base = (uint64_t)sysmsg;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
     // Find a new context and exit to restore it.
-    // The stub initialized GS to sysmsg. Capture it so that the comparison at
-    // init installs the first application's GS base, including the usual zero
-    // value.
-    gs_base = get_gsbase();
     init_new_thread();
     goto init;
   }
@@ -265,7 +263,9 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   }
 
   fs_base = get_fsbase();
-  gs_base = get_gsbase();
+  if (ctx->guest_gs) {
+    gs_base = get_gsbase();
+  }
 
   ctx->signo = signo;
   ctx->siginfo = *siginfo;
@@ -275,7 +275,9 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   if (signo != SIGCHLD ||
       ucontext->uc_mcontext.gregs[REG_RIP] < __export_stub_start) {
     ctx->ptregs.fs_base = fs_base;
-    ctx->ptregs.gs_base = gs_base;
+    if (ctx->guest_gs) {
+      ctx->ptregs.gs_base = gs_base;
+    }
     ctx->err = 0;
     gregs_to_ptregs(ucontext, &ctx->ptregs);
     memcpy(ctx->fpstate, (uint8_t *)ucontext->uc_mcontext.fpregs,
@@ -376,8 +378,9 @@ init:
     set_fsbase(ctx->ptregs.fs_base);
   }
 
-  if (gs_base != ctx->ptregs.gs_base) {
-    set_gsbase(ctx->ptregs.gs_base);
+  uint64_t next_gs_base = ctx->guest_gs ? ctx->ptregs.gs_base : (uint64_t)sysmsg;
+  if (gs_base != next_gs_base) {
+    set_gsbase(next_gs_base);
   }
 
   if (atomic_load(&ctx->fpstate_changed)) {
@@ -421,6 +424,19 @@ void __syshandler() {
 
 // asm_restore_state is implemented in syshandler_amd64.S
 void asm_restore_state();
+__attribute__((noreturn)) void asm_restore_state_guest_gs(
+    struct thread_context *ctx);
+
+// restore_state_guest_gs transfers from a GS-dependent fast syscall handler
+// to a context that owns GS. Nothing after set_gsbase may depend on systrap's
+// GS-relative sysmsg pointer.
+__attribute__((noreturn)) void restore_state_guest_gs(
+    struct thread_context *ctx) {
+  set_fsbase(ctx->ptregs.fs_base);
+  set_gsbase(ctx->ptregs.gs_base);
+  asm_restore_state_guest_gs(ctx);
+  __builtin_unreachable();
+}
 
 // On x86 restore_state jumps straight to user code and does not return.
 void restore_state(struct sysmsg *sysmsg, struct thread_context *ctx,
@@ -486,6 +502,8 @@ void verify_offsets_amd64() {
                (offsetof(struct user_regs_struct, fs) + PTREGS_OFFSET));
   BUILD_BUG_ON(offsetof_thread_context_ptregs_gs !=
                (offsetof(struct user_regs_struct, gs) + PTREGS_OFFSET));
+  BUILD_BUG_ON(offsetof_thread_context_guest_gs !=
+               offsetof(struct thread_context, guest_gs));
 #undef PTREGS_OFFSET
 }
 

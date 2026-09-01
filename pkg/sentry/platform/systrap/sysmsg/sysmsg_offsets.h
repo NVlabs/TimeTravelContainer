@@ -50,6 +50,9 @@
 #define offsetof_thread_context_fpstate 0x0
 #define offsetof_thread_context_fpstate_changed MAX_FPSTATE_LEN
 #define offsetof_thread_context_ptregs 0x8 + MAX_FPSTATE_LEN
+// guest_gs occupies padding that preceded the first uint64 field after the
+// context state words.
+#define offsetof_thread_context_guest_gs 0xf7c
 
 #define kTHREAD_STATE_NONE 0
 #define kTHREAD_STATE_INTERRUPT 3

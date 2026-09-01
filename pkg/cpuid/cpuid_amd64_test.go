@@ -189,3 +189,18 @@ func TestRemove(t *testing.T) {
 		t.Errorf("Remove failed, got %q want %q", testFeatures.FlagString(), justFPU.FlagString())
 	}
 }
+
+func TestWithoutFSGSBASE(t *testing.T) {
+	fs := makeFeatureSet(X86FeatureFSGSBase, X86FeatureFPU)
+	fs.hwCap.hwCap2 = HWCAP2_FSGSBASE
+	masked := fs.WithoutFSGSBASE()
+	if masked.HasFeature(X86FeatureFSGSBase) {
+		t.Fatalf("WithoutFSGSBASE left CPUID feature enabled: %q", masked.FlagString())
+	}
+	if masked.hwCap.hwCap2&HWCAP2_FSGSBASE != 0 {
+		t.Fatalf("WithoutFSGSBASE left AT_HWCAP2 bit enabled: %#x", masked.hwCap.hwCap2)
+	}
+	if !masked.HasFeature(X86FeatureFPU) {
+		t.Fatalf("WithoutFSGSBASE removed unrelated features: %q", masked.FlagString())
+	}
+}

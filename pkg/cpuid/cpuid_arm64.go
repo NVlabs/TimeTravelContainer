@@ -109,6 +109,11 @@ func (FeatureSet) archCheckHostCompatible(FeatureSet) error {
 	return nil
 }
 
+// WithoutFSGSBASE is a no-op on arm64, which has no x86 FSGSBASE feature.
+func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
+	return fs
+}
+
 // AllowedHWCap1 returns the HWCAP1 bits that the guest is allowed to depend
 // on.
 func (fs FeatureSet) AllowedHWCap1() uint64 {

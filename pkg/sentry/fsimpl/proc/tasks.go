@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"sort"
 	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -79,7 +80,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 
 	contents := map[string]kernfs.Inode{
 		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, &cpuInfoData{}),
 		"devices":        fs.newInode(ctx, root, 0444, &devicesData{}),
 		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
 		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
@@ -282,13 +283,39 @@ func newStaticFileSetStat(data string) *staticFileSetStat {
 	return &staticFileSetStat{StaticData: vfs.StaticData{Data: data}}
 }
 
-func cpuInfoData(k *kernel.Kernel) string {
-	features := k.FeatureSet()
-	var buf bytes.Buffer
-	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
-		features.WriteCPUInfoTo(i, max, &buf)
+// Generate implements vfs.DynamicBytesSource.Generate. Older checkpoints
+// stored /proc/cpuinfo in staticFileSetStat, before cpuInfoData became dynamic.
+// Recognize that serialized form and regenerate it from the restored kernel's
+// effective feature set; all other legacy static files retain their data.
+func (s *staticFileSetStat) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if strings.HasPrefix(s.Data, "processor\t: 0\n") &&
+		(strings.Contains(s.Data, "\nflags\t\t:") || strings.Contains(s.Data, "\nFeatures\t\t:")) {
+		return (&cpuInfoData{}).Generate(ctx, buf)
 	}
-	return buf.String()
+	buf.WriteString(s.Data)
+	return nil
+}
+
+// cpuInfoData implements vfs.DynamicBytesSource for /proc/cpuinfo. It must be
+// generated at read time rather than snapshotted when procfs is mounted: a
+// restored sandbox may run on a platform that must conceal additional CPU
+// features from applications.
+//
+// +stateify savable
+type cpuInfoData struct {
+	dynamicBytesFileSetAttr
+}
+
+var _ dynamicInode = (*cpuInfoData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*cpuInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	k := kernel.KernelFromContext(ctx)
+	features := k.FeatureSet()
+	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
+		features.WriteCPUInfoTo(i, max, buf)
+	}
+	return nil
 }
 
 func ipcData(v uint64) dynamicInode {

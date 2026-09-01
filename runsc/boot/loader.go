@@ -850,6 +850,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	cpufs := cpuid.HostFeatureSet()
+	if args.Conf.Platform == "systrap" && !args.Conf.SystrapDisableSyscallPatching {
+		cpufs = cpufs.WithoutFSGSBASE()
+	}
 	if value, ok := args.Spec.Annotations[specutils.AnnotationCPUFeatures]; ok {
 		allowedFeatures := make(map[cpuid.Feature]struct{})
 		for str := range strings.SplitSeq(value, ",") {
