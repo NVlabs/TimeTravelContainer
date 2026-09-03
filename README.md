@@ -45,15 +45,6 @@ TTC is designed for efficiency. Memory and writable storage are
   without first transferring all of its memory. Missing memory is fetched on
   demand over the network or from shared storage.
 
-Live-fork eligibility is a lifetime property of a container family. Families
-are eligible by default, and TTC rejects incompatible features when they are
-requested rather than allowing a running workload to become unexpectedly
-unforkable. A feature whose state is deliberately outside the Sentry, such as
-host networking, can be selected only together with `--waive-live-fork`; every
-fork of that family then fails predictably. Guest-created, Sentry-managed
-resources—including network namespaces, virtual interfaces, routes, iptables,
-and internal sockets—remain forkable.
-
 ## Get Started
 
 TTC is delivered as two static Linux binaries with no runtime dependencies.
@@ -179,21 +170,27 @@ on a source node. When one branch is dehydrated, TTC initially writes only the
 memory that must become durable for that branch; CoW-shared pages can remain
 resident and are saved lazily if an active peer later writes them.
 
+Live-fork eligibility is a lifetime property of a container family. Families
+are eligible by default, and TTC rejects incompatible features when they are
+requested rather than allowing a running workload to become unexpectedly
+unforkable. A feature whose state is deliberately outside the Sentry, such as
+host networking, can be selected only together with `--waive-live-fork`; every
+fork of that family then fails predictably. Guest-created, Sentry-managed
+resources—including network namespaces, virtual interfaces, routes, iptables,
+and internal sockets—remain forkable.
+
 Host requirements are deliberately small:
 
 - Linux 3.17 or newer on x86-64 or ARM64. Linux 4.14.77+ is recommended for
   full network performance.
-- An unprivileged user namespace for normal rootless isolation. No subordinate
+- (Optional) An unprivileged user namespace for normal rootless isolation. No subordinate
   UID/GID ranges or `newuidmap` helpers are required. Trusted environments that
   prohibit user namespaces can explicitly use `--unsafe-no-host-isolation`.
-- A data root on a filesystem with reflink support for efficient persistent
+- A data root on a filesystem with (optional) reflink support for efficient persistent
   file CoW. `--allow-slow-volume-copy` enables a compatible whole-file-copy
   fallback.
-- A delegated cgroup v2 subtree only when hard host CPU or memory limits are
+- (optional) A delegated cgroup v2 subtree only when hard host CPU or memory limits are
   requested.
-
-KVM is optional, not required. Docker, containerd, CRIU, and a privileged
-system-wide installation are not runtime dependencies.
 
 ## Current Limitations
 
