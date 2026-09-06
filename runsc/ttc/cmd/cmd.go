@@ -10296,6 +10296,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
 		return fmt.Errorf("settling remote branches before dehydrating %s: %w", target, err)
 	}
+	if err := b.ensureDistributedTargetMemoryIndependent(info, persistentBranch); err != nil {
+		return fmt.Errorf("materializing remote memory before dehydrating %s: %w", target, err)
+	}
 	store := b.containerStore()
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
@@ -10510,6 +10513,61 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	return nil
+}
+
+// ensureDistributedTargetMemoryIndependent drains a live target's original
+// peer-backed page loader before capturing a process-free image. A sparse
+// dehydration export can read outstanding pages through that loader, but the
+// target's distributed transaction and loader lifecycle would otherwise
+// overlap the replacement cold loader after rehydration. Besides retaining a
+// stale volatile dependency, that overlap can make guest faults fail when the
+// old source transaction is released. Dehydration is allowed to take time, so
+// resolve the dependency first and capture one self-contained memory graph.
+func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	if transactionIDForBranch(info, branch) == "" || branch.DependentMemoryBytes == 0 {
+		return nil
+	}
+	readStatus := func() (pgalloc.AsyncPagesFileLoadStats, error) {
+		output, err := b.command("timetravel", info.ID, "distributed-dependency", branch.ID)
+		if err != nil {
+			return pgalloc.AsyncPagesFileLoadStats{}, err
+		}
+		var status pgalloc.AsyncPagesFileLoadStats
+		if err := json.Unmarshal(output, &status); err != nil {
+			return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("decoding remote-memory dependency: %w", err)
+		}
+		return status, nil
+	}
+	status, err := readStatus()
+	if err != nil {
+		return err
+	}
+	if status.Done {
+		if status.Error != "" {
+			return errors.New(status.Error)
+		}
+		return nil
+	}
+	if _, err := b.command("timetravel", info.ID, "distributed-drain", branch.ID); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		status, err = readStatus()
+		if err != nil {
+			return err
+		}
+		if status.Done {
+			if status.Error != "" {
+				return errors.New(status.Error)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {

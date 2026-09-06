@@ -767,6 +767,19 @@ func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 	if err != nil {
 		return GCResult{}, err
 	}
+	// A lazy branch may name objects that are authoritative in a cold pack or
+	// remote peer but have never been cached in this repository. Post-GC
+	// validation must prove that GC retained every *local* object that was
+	// rooted; requiring all logical objects to exist locally turns a healthy
+	// sparse cache into an error after the first consumption update.
+	initialLocalChunks := make(map[ID]struct{}, len(chunkFiles))
+	for _, file := range chunkFiles {
+		id, parseErr := ParseID(file.id)
+		if parseErr != nil {
+			return GCResult{}, parseErr
+		}
+		initialLocalChunks[id] = struct{}{}
+	}
 	expired = append(expired, manifestTemps...)
 	expired = append(expired, chunkTemps...)
 	all := append(manifestFiles, chunkFiles...)
@@ -897,14 +910,22 @@ func (r *MemoryRepository) CollectGarbage(opts GCOptions) (GCResult, error) {
 			return GCResult{}, fmt.Errorf("validating rooted memory manifest %s after collection: %w", id, err)
 		}
 		if _, full := latest.fullManifests[id]; full {
-			if err := r.validateManifestObjects(id); err != nil {
-				return GCResult{}, fmt.Errorf("validating rooted memory manifest %s after collection: %w", id, err)
+			for _, run := range manifest.Runs {
+				if _, wasLocal := initialLocalChunks[run.Object]; !wasLocal {
+					continue
+				}
+				if err := r.chunks.Contains(run.Object); err != nil {
+					return GCResult{}, fmt.Errorf("validating locally retained memory object %s for manifest %s after collection: %w", run.Object, id, err)
+				}
 			}
 			continue
 		}
 		for _, consumed := range latest.branchConsumption[id] {
 			for _, run := range manifest.Runs {
 				if _, done := consumed[run.Object]; done {
+					continue
+				}
+				if _, wasLocal := initialLocalChunks[run.Object]; !wasLocal {
 					continue
 				}
 				if err := r.chunks.Contains(run.Object); err != nil {

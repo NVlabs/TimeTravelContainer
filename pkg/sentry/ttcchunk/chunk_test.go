@@ -1410,6 +1410,63 @@ func TestRepositoryCorruptRootFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRepositoryGarbageCollectionAcceptsLazyMissingObjects(t *testing.T) {
+	source, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := publishLifecycleManifest(t, source, 0x48)
+	loaded, err := source.LoadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := loaded.Runs[0].Object
+
+	root := t.TempDir()
+	target, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.ImportRemoteManifest(source, manifest, "lazy"); err != nil {
+		t.Fatal(err)
+	}
+	// Model one demand-fetched object. Other objects named by a general
+	// manifest are deliberately absent from the local sparse cache.
+	file, err := source.chunks.Open(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(readErr, closeErr))
+	}
+	if err := target.chunks.PutObject(Object{ID: object, Logical: loaded.Runs[0].Logical, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+
+	collector, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := target.AcquireLease(manifest, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := collector.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 {
+		t.Fatalf("lazy GC with reader lease = %+v, %v", got, err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.MarkConsumed("lazy", manifest, []ID{object}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := collector.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 {
+		t.Fatalf("lazy GC after consumption = %+v, %v", got, err)
+	}
+}
+
 func TestRepositoryOpenRecoversInterruptedCollection(t *testing.T) {
 	root := t.TempDir()
 	repository, err := OpenMemoryRepository(root)

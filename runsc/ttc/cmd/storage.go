@@ -61,6 +61,15 @@ type coldFilesystemRelays struct {
 	memoryClient *os.File
 }
 
+func (b *runtimeBackend) reportColdRelayError(kind string, err error) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return
+	}
+	if b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: warning: %s cold-storage relay failed: %v\n", kind, err)
+	}
+}
+
 func (r *coldFilesystemRelays) close() {
 	if r == nil {
 		return
@@ -898,9 +907,11 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		done := make(chan error, 1)
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
 		go func() {
-			done <- ttcvolume.ServeRemoteObjects(server, relays.token, []ttcvolume.RemoteObjectSource{{
+			err := ttcvolume.ServeRemoteObjects(server, relays.token, []ttcvolume.RemoteObjectSource{{
 				Key: key, Reader: coldPackObjectReader{directory: directory}, Objects: objects,
 			}})
+			b.reportColdRelayError("filesystem", err)
+			done <- err
 			_ = directory.Close()
 			close(done)
 		}()
@@ -941,7 +952,9 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		relays.memoryClient = os.NewFile(uintptr(fds[1]), "ttc-cold-memory-client")
 		done := make(chan error, 1)
 		go func() {
-			done <- ttcchunk.ServeRemoteChunks(server, relays.memoryToken, coldPackMemoryReader{directory: directory}, allowed)
+			err := ttcchunk.ServeRemoteChunks(server, relays.memoryToken, coldPackMemoryReader{directory: directory}, allowed)
+			b.reportColdRelayError("memory", err)
+			done <- err
 			_ = directory.Close()
 			close(done)
 		}()
