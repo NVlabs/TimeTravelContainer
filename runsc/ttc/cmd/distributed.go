@@ -93,6 +93,9 @@ func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*clus
 	if record.Capabilities.RepositoryID != r.capabilities.RepositoryID {
 		return nil, fmt.Errorf("cluster target node %q uses repository %q, want %q", nodeID, record.Capabilities.RepositoryID, r.capabilities.RepositoryID)
 	}
+	if record.Capabilities.BuildID != r.capabilities.BuildID {
+		return nil, fmt.Errorf("cluster target node %q uses TTC build %q, want exact build %q", nodeID, record.Capabilities.BuildID, r.capabilities.BuildID)
+	}
 	r.peerMu.Lock()
 	defer r.peerMu.Unlock()
 	if cached, ok := r.dynamicPeers[nodeID]; ok && cached.incarnation == record.Incarnation &&

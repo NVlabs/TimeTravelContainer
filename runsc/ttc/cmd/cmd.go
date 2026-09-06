@@ -81,6 +81,7 @@ type options struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	localRoot             string
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
@@ -92,15 +93,6 @@ type options struct {
 
 // Run executes ttc with args and returns a process exit status.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) != 0 && args[0] == "_cp-helper" {
-		return runCopyHelper(args[1:], stdin, stdout, stderr)
-	}
-	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
-		return 0
-	}
-	if len(args) != 0 && args[0] == "_daemon-serve" {
-		return RunDaemon(args[1:], stdout, stderr)
-	}
 	opts, args, done, err := parseGlobalOptions(args, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
@@ -113,6 +105,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+	if opts.unsafeNoHostIsolation && args[0] != "daemon" {
+		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' only; ordinary commands inherit the running daemon's mode")
+		return 2
+	}
 	if printCustomCommandHelp(args, stdout) {
 		return 0
 	}
@@ -121,6 +117,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if len(args) == 3 && args[2] == "--help" && (args[0] == "container" || args[0] == "image" || args[0] == "volume" || args[0] == "exec") {
 		return runCommand(args, stdout, stdout, nil)
+	}
+	if args[0] == "help" {
+		printUsage(stdout)
+		return 0
+	}
+	if args[0] == "completion" {
+		return runCommand(args, stdout, stderr, nil)
 	}
 	if args[0] == "daemon" {
 		return runDaemonControl(opts, args[1:], stdout, stderr)
@@ -139,20 +142,6 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if opts.unsafeNoHostIsolation && !opts.direct {
-		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' or '--direct' only; ordinary commands inherit the running daemon's mode")
-		return 2
-	}
-	if opts.direct {
-		if opts.unsafeNoHostIsolation {
-			fmt.Fprintln(stderr, "ttc: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
-		}
-		if args[0] == "events" {
-			fmt.Fprintln(stderr, "ttc: events require ttcd; remove --direct")
-			return 1
-		}
-		return runCommand(args, stdout, stderr, directBackend(opts, stdin, stdout, stderr))
-	}
 	status, err := runViaDaemon(opts, args, stdin, stdout, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
@@ -163,12 +152,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
 	opts := options{
-		root:             runtimeRoot(),
-		runsc:            runscPath(),
-		dataRoot:         dataRoot(),
-		runtimePlatform:  runtimePlatformFromEnvironment(),
-		daemonSocket:     defaultDaemonSocket(),
-		clientExecutable: currentExecutable(),
+		runtimePlatform: runtimePlatformFromEnvironment(),
+		daemonSocket:    defaultDaemonSocket(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -179,42 +164,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 		case arg == "--version":
 			fmt.Fprintf(stdout, "ttc version %s\n", version.Version())
 			return opts, nil, true, nil
-		case arg == "--root":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--root requires a path")
-			}
-			opts.root = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--root="):
-			opts.root = strings.TrimPrefix(arg, "--root=")
-			if opts.root == "" {
-				return opts, nil, false, errors.New("--root requires a path")
-			}
-			args = args[1:]
-		case arg == "--runsc":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--runsc requires a path")
-			}
-			opts.runsc = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--runsc="):
-			opts.runsc = strings.TrimPrefix(arg, "--runsc=")
-			if opts.runsc == "" {
-				return opts, nil, false, errors.New("--runsc requires a path")
-			}
-			args = args[1:]
-		case arg == "--data-root":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--data-root requires a path")
-			}
-			opts.dataRoot = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--data-root="):
-			opts.dataRoot = strings.TrimPrefix(arg, "--data-root=")
-			if opts.dataRoot == "" {
-				return opts, nil, false, errors.New("--data-root requires a path")
-			}
-			args = args[1:]
 		case arg == "--daemon-socket":
 			if len(args) < 2 || args[1] == "" {
 				return opts, nil, false, errors.New("--daemon-socket requires a path")
@@ -226,9 +175,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 			if opts.daemonSocket == "" {
 				return opts, nil, false, errors.New("--daemon-socket requires a path")
 			}
-			args = args[1:]
-		case arg == "--direct":
-			opts.direct = true
 			args = args[1:]
 		case arg == "--unsafe-no-host-isolation":
 			opts.unsafeNoHostIsolation = true
@@ -242,45 +188,9 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 	return opts, args, false, nil
 }
 
-func runtimeRoot() string {
-	if dir := os.Getenv("TTC_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "runsc")
-	}
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "runsc")
-	}
-	return filepath.Join(os.TempDir(), "ttc-"+strconv.Itoa(os.Geteuid()), "runsc")
-}
-
-func runscPath() string {
-	if path := os.Getenv("TTC_RUNSC"); path != "" {
-		return path
-	}
-	if executable, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(executable), "ttcd")
-		if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
-			return sibling
-		}
-	}
-	return "ttcd"
-}
-
 func currentExecutable() string {
 	executable, _ := os.Executable()
 	return executable
-}
-
-func dataRoot() string {
-	if root := os.Getenv("TTC_DATA_ROOT"); root != "" {
-		return root
-	}
-	if root := os.Getenv("XDG_DATA_HOME"); root != "" {
-		return filepath.Join(root, "ttc")
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".local", "share", "ttc")
-	}
-	return filepath.Join(os.TempDir(), "ttc")
 }
 
 func printUsage(w io.Writer) {
@@ -289,12 +199,8 @@ func printUsage(w io.Writer) {
 Manage TimeTravelContainer container families and live branches.
 
 Global options:
-  --root PATH                    runsc state root
-  --runsc PATH                   TimeTravel-enabled runsc executable
-  --data-root PATH               native images, bundles, and metadata
   --daemon-socket PATH           per-user ttcd Unix socket
-  --direct                       bypass ttcd for recovery/debugging
-  --unsafe-no-host-isolation     disable host isolation for daemon start/--direct
+  --unsafe-no-host-isolation     disable host isolation for daemon start
 
 Commands:
   images [OPTIONS]               List local images
@@ -6384,17 +6290,9 @@ func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
 	if executable == "" {
 		return errors.New("locating ttc executable")
 	}
-	args := []string{
-		"--direct",
-		"--root", b.root,
-		"--runsc", b.runsc,
-		"--data-root", b.dataRoot,
-	}
+	args := []string{}
 	if b.daemonSocket != "" {
 		args = append(args, "--daemon-socket", b.daemonSocket)
-	}
-	if b.unsafeNoHostIsolation {
-		args = append(args, "--unsafe-no-host-isolation")
 	}
 	args = append(args, "_auto-remove", target.String())
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)

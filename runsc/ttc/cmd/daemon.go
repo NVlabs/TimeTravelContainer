@@ -55,7 +55,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 4
+	daemonAPIVersion       = 5
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -75,6 +75,8 @@ const (
 
 const repositoryMaintenanceInterval = 5 * time.Minute
 
+const daemonRootFormatVersion = 1
+
 var (
 	createDaemonRootlessProbe = createRootlessProbe
 	daemonEffectiveUID        = os.Geteuid
@@ -84,14 +86,11 @@ var (
 )
 
 type daemonWireOptions struct {
-	Root             string `json:"root"`
-	Runsc            string `json:"runsc"`
-	DataRoot         string `json:"data_root"`
-	ClientExecutable string `json:"client_executable"`
 }
 
 type daemonRequest struct {
 	Version         int                    `json:"version"`
+	ClientBuildID   string                 `json:"client_build_id,omitempty"`
 	Action          string                 `json:"action"`
 	RequestID       string                 `json:"request_id,omitempty"`
 	ClientTERM      string                 `json:"client_term,omitempty"`
@@ -100,6 +99,7 @@ type daemonRequest struct {
 	Options         daemonWireOptions      `json:"options,omitempty"`
 	Args            []string               `json:"args,omitempty"`
 	Stdin           bool                   `json:"stdin,omitempty"`
+	ManageStop      bool                   `json:"manage_stop,omitempty"`
 	Route           []string               `json:"route,omitempty"`
 	PlacementNode   string                 `json:"placement_node,omitempty"`
 	PlacementClaims []daemonPlacementClaim `json:"placement_claims,omitempty"`
@@ -128,6 +128,7 @@ type daemonServer struct {
 	disableHostGSO        bool
 	hostKernelRelease     string
 	dataRoot              string
+	localRoot             string
 	root                  string
 	runsc                 string
 	clientExecutable      string
@@ -1280,8 +1281,8 @@ func (w daemonFrameWriter) Write(data []byte) (int, error) {
 }
 
 func defaultDaemonSocket() string {
-	if dir := os.Getenv("TTC_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "ttcd.sock")
+	if socket := os.Getenv("TTC_SOCKET"); socket != "" {
+		return socket
 	}
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "ttc", "ttcd.sock")
@@ -1504,16 +1505,11 @@ func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchI
 }
 
 func wireOptions(opts options) daemonWireOptions {
-	return daemonWireOptions{
-		ClientExecutable: opts.clientExecutable,
-	}
+	return daemonWireOptions{}
 }
 
 func optionsFromWire(w daemonWireOptions) options {
-	return options{
-		root: w.Root, runsc: w.Runsc, dataRoot: w.DataRoot,
-		clientExecutable: w.ClientExecutable,
-	}
+	return options{}
 }
 
 // optionsFromRequest applies daemon-owned configuration. Runtime state, the
@@ -1526,9 +1522,7 @@ func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 	opts := optionsFromWire(w)
 	opts.root = s.root
 	opts.runsc = s.runsc
-	if opts.clientExecutable == "" {
-		opts.clientExecutable = s.clientExecutable
-	}
+	opts.clientExecutable = s.clientExecutable
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
@@ -1689,8 +1683,7 @@ func preflightDaemonPlatform(runtimePlatform string) error {
 	return nil
 }
 
-// RunDaemon serves the versioned TTC local API. It is used by the standalone
-// ttcd binary and by ttc's private daemon entry point.
+// RunDaemon serves the versioned TTC local API from the ttcd binary.
 func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
 		return 0
@@ -1699,9 +1692,6 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	runtimePlatform := defaultRuntimePlatform
 	unsafeNoHostIsolation := false
 	allowSlowVolumeCopy := false
-	daemonDataRoot := dataRoot()
-	daemonRoot := runtimeRoot()
-	daemonRunsc := runscPath()
 	clusterOpts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		switch {
@@ -1727,24 +1717,6 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		case strings.HasPrefix(args[0], "--platform="):
 			runtimePlatform = strings.TrimPrefix(args[0], "--platform=")
 			args = args[1:]
-		case args[0] == "--data-root" && len(args) >= 2:
-			daemonDataRoot = args[1]
-			args = args[2:]
-		case strings.HasPrefix(args[0], "--data-root="):
-			daemonDataRoot = strings.TrimPrefix(args[0], "--data-root=")
-			args = args[1:]
-		case args[0] == "--root" && len(args) >= 2:
-			daemonRoot = args[1]
-			args = args[2:]
-		case strings.HasPrefix(args[0], "--root="):
-			daemonRoot = strings.TrimPrefix(args[0], "--root=")
-			args = args[1:]
-		case args[0] == "--runsc" && len(args) >= 2:
-			daemonRunsc = args[1]
-			args = args[2:]
-		case strings.HasPrefix(args[0], "--runsc="):
-			daemonRunsc = strings.TrimPrefix(args[0], "--runsc=")
-			args = args[1:]
 		default:
 			consumed, err := consumeDaemonClusterOption(args, &clusterOpts)
 			if err != nil {
@@ -1762,15 +1734,19 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd: socket path must not be empty")
 		return 2
 	}
-	if daemonDataRoot == "" {
-		fmt.Fprintln(stderr, "ttcd: data root must not be empty")
+	roots, err := daemonRootsFromEnvironment(clusterOpts.Configured)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
 	}
-	if daemonRoot == "" || daemonRunsc == "" {
-		fmt.Fprintln(stderr, "ttcd: runsc state root and executable must not be empty")
-		return 2
+	daemonDataRoot := roots.shared
+	daemonRoot := roots.runtime
+	daemonRunsc, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: finding embedded runtime executable: %v\n", err)
+		return 1
 	}
-	runtimePlatform, err := normalizeRuntimePlatform(runtimePlatform)
+	runtimePlatform, err = normalizeRuntimePlatform(runtimePlatform)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
@@ -1798,6 +1774,22 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
+	if err := prepareDaemonStorageRoot(roots.shared, "shared", clusterOpts.RepositoryID, ""); err != nil {
+		fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
+		return 1
+	}
+	if clusterOpts.Configured {
+		if err := prepareDaemonStorageRoot(roots.local, "local", clusterOpts.RepositoryID, clusterOpts.NodeID); err != nil {
+			fmt.Fprintf(stderr, "ttcd: preparing TTC_LOCAL_ROOT: %v\n", err)
+			return 1
+		}
+	}
+	localLock, err := lockDaemonLocalRoot(roots.local)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: locking TTC local root: %v\n", err)
+		return 1
+	}
+	defer localLock.Close()
 	if err := prepareDaemonRuntimeStorage(socket, daemonRoot); err != nil {
 		fmt.Fprintf(stderr, "ttcd: preparing node-local runtime storage: %v\n", err)
 		return 1
@@ -1827,11 +1819,162 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
 		return 1
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
+	if err := serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+type daemonRoots struct {
+	shared  string
+	local   string
+	runtime string
+}
+
+// daemonRootsFromEnvironment is the only source of daemon storage paths.
+// Keeping this out of the client prevents client/daemon disagreement and makes
+// it possible for a client to operate without access to either root.
+func daemonRootsFromEnvironment(clustered bool) (daemonRoots, error) {
+	if legacy := strings.TrimSpace(os.Getenv("TTC_DATA_ROOT")); legacy != "" {
+		return daemonRoots{}, errors.New("TTC_DATA_ROOT is no longer supported; configure a fresh TTC_ROOT (existing data roots are not migrated)")
+	}
+	shared := strings.TrimSpace(os.Getenv("TTC_ROOT"))
+	if shared == "" {
+		return daemonRoots{}, errors.New("TTC_ROOT must be explicitly set to a fresh absolute path")
+	}
+	if !filepath.IsAbs(shared) {
+		return daemonRoots{}, fmt.Errorf("TTC_ROOT %q is not an absolute path", shared)
+	}
+	shared = filepath.Clean(shared)
+	local := shared
+	if clustered {
+		local = strings.TrimSpace(os.Getenv("TTC_LOCAL_ROOT"))
+		if local == "" {
+			return daemonRoots{}, errors.New("TTC_LOCAL_ROOT must be explicitly set for cluster mode")
+		}
+		if !filepath.IsAbs(local) {
+			return daemonRoots{}, fmt.Errorf("TTC_LOCAL_ROOT %q is not an absolute path", local)
+		}
+		local = filepath.Clean(local)
+		same, err := pathsReferToSameLocation(shared, local)
+		if err != nil {
+			return daemonRoots{}, err
+		}
+		if same {
+			return daemonRoots{}, errors.New("TTC_LOCAL_ROOT must be distinct from shared TTC_ROOT in cluster mode")
+		}
+	}
+	return daemonRoots{shared: shared, local: local, runtime: filepath.Join(local, "runtime", "runsc")}, nil
+}
+
+func pathsReferToSameLocation(first, second string) (bool, error) {
+	resolve := func(path string) (string, error) {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("resolving storage root %q: %w", path, err)
+		}
+		parent, base := filepath.Dir(path), filepath.Base(path)
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			return filepath.Join(resolved, base), nil
+		}
+		return filepath.Clean(path), nil
+	}
+	a, err := resolve(first)
+	if err != nil {
+		return false, err
+	}
+	b, err := resolve(second)
+	if err != nil {
+		return false, err
+	}
+	return a == b, nil
+}
+
+type daemonRootMarker struct {
+	Version      int    `json:"version"`
+	Kind         string `json:"kind"`
+	RepositoryID string `json:"repository_id,omitempty"`
+	NodeID       string `json:"node_id,omitempty"`
+}
+
+func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	want := daemonRootMarker{Version: daemonRootFormatVersion, Kind: kind, RepositoryID: repositoryID, NodeID: nodeID}
+	data, err := os.ReadFile(markerPath)
+	if err == nil {
+		var got daemonRootMarker
+		if err := json.Unmarshal(data, &got); err != nil {
+			return fmt.Errorf("invalid root marker: %w", err)
+		}
+		if got != want {
+			return fmt.Errorf("root marker %+v does not match requested %+v", got, want)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() != "lost+found" {
+			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
+		}
+	}
+	data, err = json.Marshal(want)
+	if err != nil {
+		return err
+	}
+	marker, err := os.OpenFile(markerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if errors.Is(err, os.ErrExist) {
+		// Another node may have initialized a shared root concurrently. Validate
+		// what it published instead of replacing its marker.
+		published, readErr := os.ReadFile(markerPath)
+		if readErr != nil {
+			return readErr
+		}
+		var got daemonRootMarker
+		if err := json.Unmarshal(published, &got); err != nil {
+			return fmt.Errorf("invalid concurrently-created root marker: %w", err)
+		}
+		if got != want {
+			return fmt.Errorf("root marker %+v does not match requested %+v", got, want)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := marker.Write(append(data, '\n')); err != nil {
+		marker.Close()
+		_ = os.Remove(markerPath)
+		return err
+	}
+	if err := marker.Sync(); err != nil {
+		marker.Close()
+		_ = os.Remove(markerPath)
+		return err
+	}
+	return marker.Close()
+}
+
+func lockDaemonLocalRoot(root string) (*os.File, error) {
+	lock, err := os.OpenFile(filepath.Join(root, ".ttcd.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("another ttcd is already using %q: %w", root, err)
+	}
+	return lock, nil
 }
 
 func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int, error) {
@@ -2226,9 +2369,8 @@ func secureDaemonDirectory(dir string) error {
 }
 
 // prepareDaemonRuntimeStorage ensures that control sockets and runsc's live
-// state remain on node-local storage. TTC_DATA_ROOT may intentionally be
-// shared through NFS, but runsc state contains Unix sockets, locks, and other
-// host-local objects whose semantics are not safe on NFS.
+// state remain on node-local storage. In cluster mode TTC_ROOT may be shared,
+// but TTC_LOCAL_ROOT contains all paths checked here.
 func prepareDaemonRuntimeStorage(socket, root string) error {
 	paths := []struct {
 		name string
@@ -2252,17 +2394,17 @@ func prepareDaemonRuntimeStorage(socket, root string) error {
 			return fmt.Errorf("checking %s filesystem %q: %w", candidate.name, clean, err)
 		}
 		if int64(statfs.Type) == int64(unix.NFS_SUPER_MAGIC) {
-			return fmt.Errorf("%s %q is on NFS; use node-local storage for TTC_RUNTIME_DIR and runsc state, and keep only TTC_DATA_ROOT on shared storage", candidate.name, clean)
+			return fmt.Errorf("%s %q is on NFS; TTC_SOCKET and TTC_LOCAL_ROOT runtime state must be node-local (only TTC_ROOT may be shared)", candidate.name, clean)
 		}
 	}
 	return nil
 }
 
 func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
-	return serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
+	return serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -2302,6 +2444,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
 		hostKernelRelease:     kernelCompatibility.release,
 		dataRoot:              dataRoot,
+		localRoot:             localRoot,
 		root:                  root,
 		runsc:                 runsc,
 		clientExecutable:      siblingTTCExecutable(),
@@ -2603,14 +2746,22 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
 		_ = writeDaemonStatus(conn, &writeMu, 1)
 	}
-	if request.Version != daemonAPIVersion {
+	// Stop is deliberately a minimal, stable escape hatch. In particular, a
+	// newly installed client must be able to stop an older daemon before
+	// starting its matching sibling. Peer-UID validation above still applies.
+	if request.Action != "stop" && request.Version != daemonAPIVersion {
 		writeError(fmt.Errorf("unsupported API version %d (server uses %d)", request.Version, daemonAPIVersion))
+		return
+	}
+	if request.Action != "stop" && request.ClientBuildID != "" && request.ClientBuildID != version.Version() {
+		writeError(fmt.Errorf("client build %q does not match daemon build %q; only 'ttc daemon stop' is allowed across versions", request.ClientBuildID, version.Version()))
 		return
 	}
 	switch request.Action {
 	case "ping":
 		status := map[string]any{
 			"version":                  daemonAPIVersion,
+			"build_id":                 version.Version(),
 			"pid":                      os.Getpid(),
 			"runtime_platform":         s.runtimePlatform,
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
@@ -2618,6 +2769,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"host_kernel_release":      s.hostKernelRelease,
 			"host_gso_enabled":         !s.disableHostGSO,
 			"data_root":                s.dataRoot,
+			"shared_root":              s.dataRoot,
+			"local_root":               s.localRoot,
 			"volume_copy_mode":         s.volumeCapability.Mode,
 			"volume_filesystem_type":   s.volumeCapability.FilesystemType,
 			"volume_device":            s.volumeCapability.Device,
@@ -2640,7 +2793,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		return
 	case "stop":
-		if request.Options != (daemonWireOptions{}) {
+		if request.ManageStop {
 			opts := s.optionsFromRequest(request.Options)
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
@@ -2675,7 +2828,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		s.stopOnce.Do(func() { s.listener.Close() })
 		return
 	case "mutation-control":
-		status := s.handleMutationControl(request.Options.DataRoot, request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+		status := s.handleMutationControl(s.dataRoot, request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 		_ = writeDaemonStatus(conn, &writeMu, status)
 		return
 	case "command":
@@ -3322,11 +3475,11 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 	}
 	stderrTerminal, stderrWidth := terminalWriterInfo(stderr)
 	request := daemonRequest{
-		Version: daemonAPIVersion, Action: "command", Options: wireOptions(opts),
+		Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Options: wireOptions(opts),
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
 		StderrTerminal: stderrTerminal, StderrWidth: stderrWidth,
 	}
-	if daemonCommandNeedsMutationJournal(args) && opts.dataRoot != "" {
+	if daemonCommandNeedsMutationJournal(args) {
 		requestID, err := newDaemonRequestID()
 		if err != nil {
 			return 1, err
@@ -3528,7 +3681,7 @@ func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
 }
 
-func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
+func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -3536,14 +3689,20 @@ func startDaemonProcess(socket, dataRoot, root, runsc, runtimePlatform string, u
 	if err != nil {
 		return "", nil, fmt.Errorf("finding ttc executable: %w", err)
 	}
-	commandName := executable
-	commandArgs := []string{"_daemon-serve", "--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
-	if sibling := filepath.Join(filepath.Dir(executable), "ttcd"); sibling != executable {
-		if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-			commandName = sibling
-			commandArgs = []string{"--socket", socket, "--data-root", dataRoot, "--root", root, "--runsc", runsc, "--platform", runtimePlatform}
-		}
+	commandName := filepath.Join(filepath.Dir(executable), "ttcd")
+	info, err := os.Stat(commandName)
+	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
+		return "", nil, fmt.Errorf("matching executable ttcd was not found beside %s", executable)
 	}
+	output, err := exec.Command(commandName, "--version").Output()
+	if err != nil {
+		return "", nil, fmt.Errorf("checking ttcd version: %w", err)
+	}
+	wantVersion := "ttcd version " + version.Version()
+	if strings.TrimSpace(string(output)) != wantVersion {
+		return "", nil, fmt.Errorf("ttc build %q does not match %s", version.Version(), strings.TrimSpace(string(output)))
+	}
+	commandArgs := []string{"--socket", socket, "--platform", runtimePlatform}
 	if unsafeNoHostIsolation {
 		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 	}
@@ -3699,7 +3858,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 1
 		}
 		defer conn.Close()
-		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, Action: "mutation-control", Options: wireOptions(opts), Args: append([]string(nil), args...)}, strings.NewReader(""), stdout, stderr)
+		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "mutation-control", Options: wireOptions(opts), Args: append([]string(nil), args...)}, strings.NewReader(""), stdout, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
@@ -3719,17 +3878,21 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 	switch action {
 	case "start":
 		if conn, err := connectDaemon(opts.daemonSocket); err == nil {
+			status, checkErr := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, stderr)
 			conn.Close()
+			if checkErr != nil || status != 0 {
+				if checkErr != nil {
+					fmt.Fprintf(stderr, "ttc: checking running daemon: %v\n", checkErr)
+				}
+				return 1
+			}
 			fmt.Fprintln(stdout, "ttcd already running; use 'ttc daemon status' to inspect its mode")
 			return 0
 		}
 		if opts.unsafeNoHostIsolation {
 			fmt.Fprintln(stderr, "ttc: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
-		} else if err := preflightDaemonIsolation(false); err != nil {
-			fmt.Fprintf(stderr, "ttc: %v\n", err)
-			return 1
 		}
-		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.dataRoot, opts.root, opts.runsc, opts.runtimePlatform, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
@@ -3758,9 +3921,11 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 1
 		}
 		defer conn.Close()
-		request := daemonRequest{Version: daemonAPIVersion, Action: map[string]string{"status": "ping", "stop": "stop"}[action]}
+		request := daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: map[string]string{"status": "ping", "stop": "stop"}[action]}
 		if action == "stop" {
-			request.Options = wireOptions(opts)
+			// Stop intentionally omits the build ID so it works across releases.
+			request.ClientBuildID = ""
+			request.ManageStop = true
 			if stopMode != "" {
 				request.Args = []string{stopMode}
 			}

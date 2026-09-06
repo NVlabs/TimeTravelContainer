@@ -141,6 +141,9 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 	if source.RepositoryID != target.RepositoryID {
 		return NegotiatedCapabilities{}, fmt.Errorf("shared repository mismatch: source=%q target=%q", source.RepositoryID, target.RepositoryID)
 	}
+	if source.BuildID != target.BuildID {
+		return NegotiatedCapabilities{}, fmt.Errorf("TTC build mismatch: source=%q target=%q", source.BuildID, target.BuildID)
+	}
 	protocolMin := max(source.ProtocolMin, target.ProtocolMin)
 	protocolMax := min(source.ProtocolMax, target.ProtocolMax)
 	if protocolMax < protocolMin {

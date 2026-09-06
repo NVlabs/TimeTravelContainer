@@ -18,9 +18,9 @@ package main
 import (
 	"os"
 
-	"gvisor.dev/gvisor/runsc/ttc/cmd"
+	"gvisor.dev/gvisor/runsc/ttc/client"
 )
 
 func main() {
-	os.Exit(cmd.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(client.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }

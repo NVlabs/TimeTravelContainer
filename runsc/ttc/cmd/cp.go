@@ -333,10 +333,9 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 }
 
 func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
-	executable := b.clientExecutable
-	if executable == "" {
-		executable = currentExecutable()
-	}
+	// The copy helper is built into ttcd. Donating the daemon executable keeps
+	// the client binary out of the Sentry and out of the wire protocol.
+	executable := currentExecutable()
 	helper, err := os.Open(executable)
 	if err != nil {
 		return nil, fmt.Errorf("opening TTC copy helper %q: %w", executable, err)
@@ -612,6 +611,11 @@ func runCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 		return 1
 	}
 	return 0
+}
+
+// RunCopyHelper runs the private container-side copy helper embedded in ttcd.
+func RunCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runCopyHelper(args, stdin, stdout, stderr)
 }
 
 type copyFileIdentity struct {

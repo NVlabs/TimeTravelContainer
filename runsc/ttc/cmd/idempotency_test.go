@@ -32,7 +32,7 @@ func TestDaemonMutationRecordReplay(t *testing.T) {
 	}
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: id,
-		Options: daemonWireOptions{DataRoot: root}, Args: []string{"pause", "demo"},
+		Args: []string{"pause", "demo"},
 	}
 	record, replay, err := beginDaemonMutation(root, request)
 	if err != nil || replay {
@@ -123,7 +123,7 @@ func TestResolveDaemonMutationIsExplicitAndNeverReexecutes(t *testing.T) {
 	id := fmt.Sprintf("%032x", 42)
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: id,
-		Options: daemonWireOptions{DataRoot: root}, Args: []string{"image", "rm", "important"},
+		Args: []string{"image", "rm", "important"},
 	}
 	record, replay, err := beginDaemonMutation(root, request)
 	if err != nil || replay {
@@ -152,7 +152,7 @@ func TestDaemonMutationControlListInspectAndResolve(t *testing.T) {
 	id := fmt.Sprintf("%032x", 77)
 	request := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: id,
-		Options: daemonWireOptions{DataRoot: root}, Args: []string{"pause", "demo"},
+		Args: []string{"pause", "demo"},
 	}
 	if _, _, err := beginDaemonMutation(root, request); err != nil {
 		t.Fatal(err)

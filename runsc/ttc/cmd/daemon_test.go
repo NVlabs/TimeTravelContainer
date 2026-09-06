@@ -30,17 +30,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
-func TestDaemonWireOptionsPreserveClientExecutable(t *testing.T) {
-	wire := wireOptions(options{clientExecutable: "/opt/ttc/bin/ttc"})
-	if got := wire.ClientExecutable; got != "/opt/ttc/bin/ttc" {
-		t.Fatalf("wire client executable=%q, want /opt/ttc/bin/ttc", got)
-	}
-	opts := optionsFromWire(wire)
-	backend := directBackend(opts, strings.NewReader(""), io.Discard, io.Discard)
-	if got := backend.clientExecutable; got != "/opt/ttc/bin/ttc" {
-		t.Fatalf("backend client executable=%q, want /opt/ttc/bin/ttc", got)
+func TestDaemonWireOptionsContainNoClientPaths(t *testing.T) {
+	if got := wireOptions(options{root: "/runtime", dataRoot: "/data", clientExecutable: "/ttc"}); got != (daemonWireOptions{}) {
+		t.Fatalf("wire options leak daemon-owned paths: %+v", got)
 	}
 }
 
@@ -82,19 +77,14 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	}
 }
 
-func TestDaemonRequestOptionsIgnoreClientRuntimeOverrides(t *testing.T) {
+func TestDaemonRequestOptionsCannotOverrideServerRuntime(t *testing.T) {
 	server := &daemonServer{
 		root:             "/default/root",
 		runsc:            "/default/ttcd",
 		dataRoot:         "/daemon/data",
 		clientExecutable: "/default/ttc",
 	}
-	opts := server.optionsFromRequest(daemonWireOptions{
-		Root:             "/custom/root",
-		Runsc:            "/custom/ttcd",
-		DataRoot:         "/ignored/client/data",
-		ClientExecutable: "/custom/ttc",
-	})
+	opts := server.optionsFromRequest(daemonWireOptions{})
 	if got, want := opts.root, server.root; got != want {
 		t.Errorf("root=%q, want %q", got, want)
 	}
@@ -104,7 +94,7 @@ func TestDaemonRequestOptionsIgnoreClientRuntimeOverrides(t *testing.T) {
 	if got, want := opts.dataRoot, server.dataRoot; got != want {
 		t.Errorf("data root=%q, want daemon-owned %q", got, want)
 	}
-	if got, want := opts.clientExecutable, "/custom/ttc"; got != want {
+	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
 		t.Errorf("client executable=%q, want %q", got, want)
 	}
 }
@@ -170,6 +160,7 @@ func TestRuntimePlatformValidation(t *testing.T) {
 }
 
 func TestDaemonKVMPreflightFailure(t *testing.T) {
+	t.Setenv("TTC_ROOT", t.TempDir())
 	original := daemonPlatformPreflight
 	defer func() { daemonPlatformPreflight = original }()
 	var gotPlatform string
@@ -185,6 +176,7 @@ func TestDaemonKVMPreflightFailure(t *testing.T) {
 }
 
 func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
+	t.Setenv("TTC_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
 	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "supported platforms are systrap and kvm") {
@@ -201,7 +193,7 @@ func TestPrepareDaemonRuntimeStorageRejectsNFS(t *testing.T) {
 	}
 	dir := t.TempDir()
 	err := prepareDaemonRuntimeStorage(filepath.Join(dir, "runtime", "ttcd.sock"), filepath.Join(dir, "runsc"))
-	if err == nil || !strings.Contains(err.Error(), "node-local storage") || !strings.Contains(err.Error(), "TTC_DATA_ROOT") {
+	if err == nil || !strings.Contains(err.Error(), "node-local") || !strings.Contains(err.Error(), "TTC_ROOT") {
 		t.Fatalf("prepareDaemonRuntimeStorage on NFS: %v", err)
 	}
 }
@@ -227,6 +219,7 @@ func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
 }
 
 func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
+	t.Setenv("TTC_ROOT", t.TempDir())
 	original := daemonKernelRelease
 	defer func() {
 		daemonKernelRelease = original
@@ -239,7 +232,6 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{
 		"--socket", socket,
-		"--data-root", t.TempDir(),
 		"--unsafe-no-host-isolation",
 		"--allow-slow-volume-copy",
 	}, &stdout, &stderr)
@@ -264,10 +256,10 @@ func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
 	if err := os.WriteFile(dataRoot, []byte("fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("TTC_ROOT", dataRoot)
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{
 		"--socket", filepath.Join(t.TempDir(), "runtime", "ttcd.sock"),
-		"--data-root", dataRoot,
 		"--unsafe-no-host-isolation",
 		"--allow-slow-volume-copy",
 	}, &stdout, &stderr)
@@ -282,9 +274,15 @@ func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
 func TestClientRequiresExplicitDaemonStart(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
 	var stdout, stderr bytes.Buffer
-	status := Run([]string{"--daemon-socket", socket, "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
+	status := Run([]string{"--daemon-socket", socket, "ps"}, strings.NewReader(""), &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "start it explicitly with 'ttc daemon start'") {
-		t.Fatalf("missing daemon: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+		t.Fatalf("missing daemon command: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	status = Run([]string{"--daemon-socket", socket, "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)
+	if status != 0 || !strings.Contains(stdout.String(), "_ttc_completion") || stderr.Len() != 0 {
+		t.Fatalf("offline completion: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 }
 
@@ -369,6 +367,7 @@ func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 }
 
 func TestRootlessDaemonStartupPreflight(t *testing.T) {
+	t.Setenv("TTC_ROOT", t.TempDir())
 	original := createDaemonRootlessProbe
 	originalEUID := daemonEffectiveUID
 	defer func() {
@@ -391,25 +390,79 @@ func TestRootlessDaemonStartupPreflight(t *testing.T) {
 
 	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
 	var stdout, stderr bytes.Buffer
-	status := Run([]string{"--daemon-socket", socket, "daemon", "start"}, strings.NewReader(""), &stdout, &stderr)
-	if status != 1 || stdout.Len() != 0 {
-		t.Fatalf("rootless start: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "rootless mode is unavailable") || !strings.Contains(stderr.String(), "--unsafe-no-host-isolation") {
-		t.Fatalf("rootless start diagnostic=%q", stderr.String())
+	status := RunDaemon([]string{"--socket", socket}, &stdout, &stderr)
+	if status != 1 || !strings.Contains(stderr.String(), "rootless mode is unavailable") {
+		t.Fatalf("ttcd preflight: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 	if calls != 1 {
-		t.Fatalf("rootless start ran %d probes, want one", calls)
+		t.Fatalf("ttcd startup ran %d rootless probes, want one", calls)
 	}
 	if _, err := os.Stat(socket); !os.IsNotExist(err) {
 		t.Fatalf("failed preflight created daemon socket: %v", err)
 	}
+}
 
-	stdout.Reset()
-	stderr.Reset()
-	status = RunDaemon([]string{"--socket", socket}, &stdout, &stderr)
-	if status != 1 || !strings.Contains(stderr.String(), "rootless mode is unavailable") {
-		t.Fatalf("direct ttcd preflight: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+func TestDaemonRootsRequireExplicitFreshEnvironment(t *testing.T) {
+	t.Setenv("TTC_ROOT", "")
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	t.Setenv("TTC_DATA_ROOT", "")
+	if _, err := daemonRootsFromEnvironment(false); err == nil || !strings.Contains(err.Error(), "TTC_ROOT") {
+		t.Fatalf("missing TTC_ROOT error=%v", err)
+	}
+	t.Setenv("TTC_DATA_ROOT", "/legacy")
+	if _, err := daemonRootsFromEnvironment(false); err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("legacy root error=%v", err)
+	}
+	t.Setenv("TTC_DATA_ROOT", "")
+	t.Setenv("TTC_ROOT", "relative")
+	if _, err := daemonRootsFromEnvironment(false); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("relative root error=%v", err)
+	}
+	shared := filepath.Join(t.TempDir(), "shared")
+	t.Setenv("TTC_ROOT", shared)
+	if roots, err := daemonRootsFromEnvironment(false); err != nil || roots.shared != shared || roots.local != shared || roots.runtime != filepath.Join(shared, "runtime", "runsc") {
+		t.Fatalf("standalone roots=%+v err=%v", roots, err)
+	}
+	if _, err := daemonRootsFromEnvironment(true); err == nil || !strings.Contains(err.Error(), "TTC_LOCAL_ROOT") {
+		t.Fatalf("missing cluster local root error=%v", err)
+	}
+	t.Setenv("TTC_LOCAL_ROOT", shared)
+	if _, err := daemonRootsFromEnvironment(true); err == nil || !strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("aliased cluster roots error=%v", err)
+	}
+	local := filepath.Join(t.TempDir(), "local")
+	t.Setenv("TTC_LOCAL_ROOT", local)
+	if roots, err := daemonRootsFromEnvironment(true); err != nil || roots.shared != shared || roots.local != local || roots.runtime != filepath.Join(local, "runtime", "runsc") {
+		t.Fatalf("cluster roots=%+v err=%v", roots, err)
+	}
+}
+
+func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
+	old := t.TempDir()
+	if err := os.WriteFile(filepath.Join(old, "containers"), []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDaemonStorageRoot(old, "shared", "", ""); err == nil || !strings.Contains(err.Error(), "not a fresh TTC root") {
+		t.Fatalf("old root error=%v", err)
+	}
+	fresh := filepath.Join(t.TempDir(), "fresh")
+	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-a"); err != nil {
+		t.Fatalf("reopening matching root: %v", err)
+	}
+	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-b"); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched node marker error=%v", err)
+	}
+	first, err := lockDaemonLocalRoot(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if second, err := lockDaemonLocalRoot(fresh); err == nil {
+		second.Close()
+		t.Fatal("local root was locked by two daemons")
 	}
 }
 
@@ -794,6 +847,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 
 	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
 	if status != 0 ||
+		!strings.Contains(stdout, `"build_id":"`+version.Version()+`"`) ||
 		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
@@ -804,13 +858,17 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		stderr != "" {
 		t.Fatalf("daemon mode status: status=%d stdout=%q stderr=%q", status, stdout, stderr)
 	}
+	status, _, stderr = exchange(daemonRequest{Version: daemonAPIVersion, ClientBuildID: "different-build", Action: "ping"})
+	if status == 0 || !strings.Contains(stderr, "does not match daemon build") {
+		t.Fatalf("build mismatch response: status=%d stderr=%q", status, stderr)
+	}
 	requestID, err := newDaemonRequestID()
 	if err != nil {
 		t.Fatal(err)
 	}
 	mutation := daemonRequest{
 		Version: daemonAPIVersion, Action: "command", RequestID: requestID,
-		Options: daemonWireOptions{DataRoot: dataRoot}, Args: []string{"image", "rm", "missing"},
+		Args: []string{"image", "rm", "missing"},
 	}
 	status, firstStdout, stderr := exchange(mutation)
 	if status == 0 || firstStdout != "" || stderr == "" {
@@ -834,7 +892,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		t.Fatalf("version rejection: status=%d stderr=%q", status, stderr)
 	}
 
-	status, _, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "stop"})
+	status, _, stderr = exchange(daemonRequest{Version: daemonAPIVersion + 100, ClientBuildID: "different-build", Action: "stop"})
 	if status != 0 || stderr != "" {
 		t.Fatalf("stop response: status=%d stderr=%q", status, stderr)
 	}
@@ -848,9 +906,9 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	}
 }
 
-func TestDefaultDaemonSocketHonorsTTCRuntimeDir(t *testing.T) {
-	t.Setenv("TTC_RUNTIME_DIR", "/var/run/ttc-test")
-	if got, want := defaultDaemonSocket(), "/var/run/ttc-test/ttcd.sock"; got != want {
+func TestDefaultDaemonSocketHonorsTTCSocket(t *testing.T) {
+	t.Setenv("TTC_SOCKET", "/var/run/ttc-test/daemon.sock")
+	if got, want := defaultDaemonSocket(), "/var/run/ttc-test/daemon.sock"; got != want {
 		t.Fatalf("defaultDaemonSocket() = %q, want %q", got, want)
 	}
 }

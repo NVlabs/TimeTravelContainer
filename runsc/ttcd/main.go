@@ -26,6 +26,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "_cp-helper" {
+		os.Exit(cmd.RunCopyHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true

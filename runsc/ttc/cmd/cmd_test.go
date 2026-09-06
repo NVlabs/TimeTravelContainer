@@ -3197,20 +3197,11 @@ func TestVerifyCgroupV2Resources(t *testing.T) {
 	}
 }
 
-func TestRuntimeRootIsWritableByDefault(t *testing.T) {
-	t.Setenv("TTC_RUNTIME_DIR", "/var/run/ttc-test")
-	if got, want := runtimeRoot(), "/var/run/ttc-test/runsc"; got != want {
-		t.Fatalf("runtimeRoot with TTC_RUNTIME_DIR=%q, want %q", got, want)
-	}
-	t.Setenv("TTC_RUNTIME_DIR", "")
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/test")
-	if got, want := runtimeRoot(), "/run/user/test/runsc"; got != want {
-		t.Fatalf("runtimeRoot with XDG_RUNTIME_DIR=%q, want %q", got, want)
-	}
-	t.Setenv("XDG_RUNTIME_DIR", "")
-	want := filepath.Join(os.TempDir(), "ttc-"+strconv.Itoa(os.Geteuid()), "runsc")
-	if got := runtimeRoot(); got != want {
-		t.Fatalf("runtimeRoot without XDG_RUNTIME_DIR=%q, want %q", got, want)
+func TestClientDoesNotAcceptStorageOrDirectOptions(t *testing.T) {
+	for _, option := range []string{"--root=/runtime", "--runsc=/ttcd", "--data-root=/data", "--direct"} {
+		if _, _, _, err := parseGlobalOptions([]string{option, "ps"}, io.Discard); err == nil {
+			t.Fatalf("legacy client option %q was accepted", option)
+		}
 	}
 }
 

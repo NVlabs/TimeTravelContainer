@@ -17,7 +17,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createConnection, type Socket } from "node:net";
 
-export const API_VERSION = 4;
+export const API_VERSION = 5;
 const MAX_FRAME = 1 << 20;
 const STDIN_WINDOW = 1 << 20;
 

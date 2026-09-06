@@ -23,10 +23,11 @@ import (
 )
 
 var topLevelCompletionCommands = []string{
-	"attach", "completion", "container", "cp", "create", "daemon", "events", "exec", "fork",
-	"dehydrate", "help", "image", "images", "inspect", "kill", "load", "logs", "ls", "pause",
-	"port", "ps", "pull", "rehydrate", "restart", "resume", "rm", "rmi", "run", "start", "stop",
-	"save", "top", "unpause", "wait",
+	"attach", "checkpoint", "commit", "completion", "container", "cp", "create", "daemon", "dehydrate",
+	"diff", "events", "exec", "fork", "help", "image", "images", "inspect", "kill", "load", "logs",
+	"ls", "migrate", "node", "pause", "port", "ps", "pull", "rehydrate", "rename", "restart",
+	"restore", "resume", "rm", "rmi", "run", "save", "start", "stats", "stop", "top", "tty",
+	"unpause", "volume", "wait",
 }
 
 const bashCompletion = `# bash completion for ttc
@@ -41,7 +42,7 @@ _ttc_completion() {
   done
   for ((i=0; i<${#before[@]}; i++)); do
     case "${before[i]}" in
-      --root|--runsc|--data-root|--daemon-socket)
+      --daemon-socket)
         globals+=("${before[i]}")
         if ((i+1 < ${#before[@]})); then
           globals+=("${before[i+1]}")
@@ -50,7 +51,7 @@ _ttc_completion() {
           break
         fi
         ;;
-      --root=*|--runsc=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
+      --daemon-socket=*|--unsafe-no-host-isolation)
         globals+=("${before[i]}")
         ;;
       *) break ;;
@@ -72,7 +73,7 @@ _ttc_completion() {
   done
   for ((i=1; i<=${#before[@]}; i++)); do
     case "${before[i]}" in
-      --root|--runsc|--data-root|--daemon-socket)
+      --daemon-socket)
         globals+=("${before[i]}")
         if ((i < ${#before[@]})); then
           ((i++))
@@ -81,7 +82,7 @@ _ttc_completion() {
           break
         fi
         ;;
-      --root=*|--runsc=*|--data-root=*|--daemon-socket=*|--direct|--unsafe-no-host-isolation)
+      --daemon-socket=*|--unsafe-no-host-isolation)
         globals+=("${before[i]}")
         ;;
       *) break ;;
@@ -102,13 +103,13 @@ const fishCompletion = `function __ttc_completion
     set -l scan $before
     while test (count $scan) -gt 0
         switch $scan[1]
-            case --root --runsc --data-root --daemon-socket
+            case --daemon-socket
                 if test (count $scan) -lt 2
                     break
                 end
                 set -a globals $scan[1] $scan[2]
                 set -e scan[1..2]
-            case "--root=*" "--runsc=*" "--data-root=*" "--daemon-socket=*" --direct --unsafe-no-host-isolation
+            case "--daemon-socket=*" --unsafe-no-host-isolation
                 set -a globals $scan[1]
                 set -e scan[1]
             case "*"
@@ -169,15 +170,14 @@ func stripGlobalCompletionOptions(words []string) []string {
 	for len(words) != 0 {
 		word := words[0]
 		switch {
-		case word == "--unsafe-no-host-isolation" || word == "--direct":
+		case word == "--unsafe-no-host-isolation":
 			words = words[1:]
-		case word == "--root" || word == "--runsc" || word == "--data-root" || word == "--daemon-socket":
+		case word == "--daemon-socket":
 			if len(words) == 1 {
 				return nil
 			}
 			words = words[2:]
-		case strings.HasPrefix(word, "--root=") || strings.HasPrefix(word, "--runsc=") ||
-			strings.HasPrefix(word, "--data-root=") || strings.HasPrefix(word, "--daemon-socket="):
+		case strings.HasPrefix(word, "--daemon-socket="):
 			words = words[1:]
 		default:
 			return words
