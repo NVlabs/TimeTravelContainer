@@ -232,9 +232,37 @@ follow-up loopback-NFS run was not used as evidence because the local kernel
 NFS server itself stalled during remount. Earlier Rocky Linux and repeated
 crash/rejoin NFS results above continue to cover the full NFS workload path.
 
-The remote `/dev/kvm` qualification node was unreachable during this run
-(`No route to host`). KVM remains part of Phase 5 rather than being marked
-qualified by loopback evidence.
+Later qualification replaced the host-kernel server with NFS-Ganesha and
+covered both NFSv3 and NFSv4.2. An unshaped NFSv4.2 matrix forked four 128 MiB
+siblings in 1.991 seconds and completed in 24.287 seconds; a random sparse
+two-sibling variant forked in 1.702 seconds and completed in 14.672 seconds.
+A 15±3 ms, 100 Mbit/s run completed in 101.280 seconds, including 20.850
+seconds for remote fork, 15.973 seconds for dehydration, 13.555 seconds for
+rehydration, and 62.562 seconds to make every remote dependency independent.
+
+The final shaped regression used hard NFSv3 with 1 MiB reads/writes and
+20±5 ms, 50 Mbit/s loopback shaping. The source kept 128 MiB resident in
+`/dev/shm`, created a 64 MiB rootfs object and 2,000 small files, forked two
+branches, and drained to a dynamically joined node. Each target then verified
+the inherited files and independently wrote 32 MiB to rootfs and 32 MiB to
+`/dev/shm`. It passed in 236.705 seconds; preparation took 17.336 seconds and
+target verification took 2.370 and 2.948 seconds. The traffic shaper, family,
+daemons, NFS test tree, and local roots were all removed afterward.
+
+A controlled shared-storage outage then suspended NFS-Ganesha for eight
+seconds during migration while node leases remained valid. Both branches
+completed migration and verification in 20.805 seconds. This distinguished a
+recoverable repository stall from source loss; a separate trial that exceeded
+the deliberately short lease correctly fenced the expired source instead of
+allowing two owners.
+
+An earlier shaped run also caught a target-cleanup race: the background
+reconciler could observe a prepared target before placement cutover, conclude
+that its local runtime was unowned, and terminate it. Provisional distributed
+targets are now protected by their fenced import transaction until cutover or
+explicit cancellation. The full 128 MiB/4,000-file, 20±5 ms, 50 Mbit/s rerun
+then passed in 596.508 seconds, including independent 64 MiB writes in both
+target branches.
 
 A follow-up cutover-hardening run completed locally in 7.306 seconds. It
 verified that a prepared migration remains physically paused and hidden while
@@ -321,6 +349,33 @@ found a monitor race where intentional process-free dehydration was mistaken
 for a crashed target; `dehydrating` is now published before teardown and a
 durable dehydration image completes the remote dependency.
 
+### Branch churn and deletion
+
+A separate NFSv3 lifecycle test repeatedly reused one visible branch name for
+50 local forks. Every branch created 128 files plus hardlinks and symlinks and
+a 2 MiB regular file; every third iteration held an open file descriptor in a
+named detached exec session; every fifth iteration dehydrated, waited for
+shared durability, and copied the 2 MiB file directly from the process-free
+branch. Every iteration then force-removed the branch and immediately reused
+its name.
+
+The first run exposed a stable-key cleanup bug: memory control images are keyed
+by the internal filesystem-branch identity so renames do not move them, but
+branch removal deleted only the legacy visible-name path. Name reuse therefore
+collided with the retained dehydration image. Removal now deletes both the
+stable key and legacy key after fencing publications and releasing the sparse
+memory root. The same failure also showed that a sparse publication transaction
+could remain rooted if a later control-image step failed; manifest reachability
+is now committed before those steps and restored by the existing rollback.
+
+The complete rerun passed. It left zero dehydration directories, zero memory
+branch pointers, zero pending publications, zero exec followers, zero NFS
+`.nfs*` files, and one rootfs branch. Rootfs metadata compacted to eight layers
+after the run. A non-owning cluster node also attempted to collect another
+node's intentionally unmaterialized private repository; maintenance now skips
+only an absent repository path while continuing to report a present but
+malformed repository.
+
 Run the same matrix with:
 
 ```shell
@@ -333,9 +388,13 @@ python3 tools/ttc/distributed_benchmark/benchmark.py \
 
 ## Remaining qualification
 
-The configured `kvm-node` was unreachable (`No route to host`) during this
-iteration, and the development host has no `/dev/kvm`; therefore the latest
-elastic changes have not yet been rerun on the KVM platform. Physical
-multi-host network-delay/loss, exhaustive node-loss injection at every
-instruction-level migration boundary, and long-running automatic
-rebalance/anti-oscillation tests also remain required before production use.
+Lustre was not available on this qualification host: its
+`6.17.0-1017-aws` kernel exposes neither Lustre nor LNet in `/proc/filesystems`,
+has no corresponding kernel modules, and provides neither `mount.lustre` nor
+`lctl`. NFS latency/bandwidth shaping exercises TTC's slow-shared-storage
+behavior but is not presented as Lustre qualification. A real Lustre client
+and server must be provisioned before that result can be recorded.
+
+Physical multi-host loss/reordering, exhaustive node-loss injection at every
+migration boundary, a real Lustre deployment, and long-running automatic
+rebalance/anti-oscillation tests remain required before production use.
