@@ -1369,50 +1369,59 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		}
 	}
 	if existingTarget != nil {
-		existing := *existingTarget
-		if !opts.Migration && existing.NodeID != "" && existing.NodeID != opts.NodeID {
-			return Prepared{}, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, existing.NodeID)
-		}
-		existingFamilyID := existing.DistributedFamilyID
-		if existingFamilyID == "" {
-			existingFamilyID = existing.ID
-		}
-		if existingFamilyID != globalFamilyID {
-			return Prepared{}, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
-		}
-		branchExists := false
-		for _, branch := range existing.Branches {
-			if branch.ID != opts.VisibleBranch {
-				continue
+		// A target family can simultaneously finish an earlier branch import
+		// while this one is being reserved. Keep the complete read/validate/write
+		// transaction under the same per-container lock as dependency and
+		// publication updates; otherwise either writer can silently erase the
+		// other's DistributedForkImports entry on a delayed shared filesystem.
+		var existing ContainerInfo
+		err := s.mutateContainer(existingTarget.ID, func(current *ContainerInfo) (bool, error) {
+			if !opts.Migration && current.NodeID != "" && current.NodeID != opts.NodeID {
+				return false, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, current.NodeID)
 			}
-			branchExists = true
-			if !opts.Migration {
-				return Prepared{}, fmt.Errorf("branch %s@%s already exists", existing.Name, opts.VisibleBranch)
+			existingFamilyID := current.DistributedFamilyID
+			if existingFamilyID == "" {
+				existingFamilyID = current.ID
 			}
-			if existing.BranchNodeID(branch.ID) != opts.SourceNode {
-				return Prepared{}, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", existing.Name, branch.ID, existing.BranchNodeID(branch.ID), opts.SourceNode)
+			if existingFamilyID != globalFamilyID {
+				return false, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
 			}
-		}
-		if opts.Migration && !branchExists {
-			return Prepared{}, fmt.Errorf("migration source branch %s@%s does not exist", existing.Name, opts.VisibleBranch)
-		}
-		if existing.DistributedForkImports == nil {
-			existing.DistributedForkImports = make(map[string]DistributedForkImport)
-		}
-		if _, ok := existing.DistributedForkImports[opts.TransactionID]; ok {
-			return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
-		}
-		for _, pending := range existing.DistributedForkImports {
-			if pending.BranchID == opts.VisibleBranch {
-				return Prepared{}, fmt.Errorf("branch %s@%s is already being imported", existing.Name, opts.VisibleBranch)
+			branchExists := false
+			for _, branch := range current.Branches {
+				if branch.ID != opts.VisibleBranch {
+					continue
+				}
+				branchExists = true
+				if !opts.Migration {
+					return false, fmt.Errorf("branch %s@%s already exists", current.Name, opts.VisibleBranch)
+				}
+				if current.BranchNodeID(branch.ID) != opts.SourceNode {
+					return false, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", current.Name, branch.ID, current.BranchNodeID(branch.ID), opts.SourceNode)
+				}
 			}
-		}
-		now := time.Now().UTC()
-		existing.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-			BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
-			State: "created", CreatedAt: now, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
-		}
-		if err := writeJSON(filepath.Join(s.Root, "containers", existing.ID, "container.json"), &existing); err != nil {
+			if opts.Migration && !branchExists {
+				return false, fmt.Errorf("migration source branch %s@%s does not exist", current.Name, opts.VisibleBranch)
+			}
+			if current.DistributedForkImports == nil {
+				current.DistributedForkImports = make(map[string]DistributedForkImport)
+			}
+			if _, ok := current.DistributedForkImports[opts.TransactionID]; ok {
+				existing = *current
+				return false, nil
+			}
+			for _, pending := range current.DistributedForkImports {
+				if pending.BranchID == opts.VisibleBranch {
+					return false, fmt.Errorf("branch %s@%s is already being imported", current.Name, opts.VisibleBranch)
+				}
+			}
+			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
+				BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
+				State: "created", CreatedAt: time.Now().UTC(), SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
+			}
+			existing = *current
+			return true, nil
+		})
+		if err != nil {
 			return Prepared{}, err
 		}
 		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
@@ -2589,8 +2598,11 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
 		return ContainerInfo{}, fmt.Errorf("updating OCI config for container %q image root: %w", info.Name, err)
 	}
-	info.RootFS = rootfs
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+	if err := s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		current.RootFS = rootfs
+		info = *current
+		return true, nil
+	}); err != nil {
 		return ContainerInfo{}, fmt.Errorf("updating container %q image root: %w", info.Name, err)
 	}
 	return info, nil
@@ -2829,27 +2841,29 @@ func (s Store) UpdateDistributedForkSparseRoot(transactionID, repository, branch
 	if err != nil {
 		return err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		info.DistributedSparseRepository = repository
-		info.DistributedSparseBranch = branch
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		pending.SparseRepository = repository
-		pending.SparseBranch = branch
-		info.DistributedForkImports[transactionID] = pending
-	} else {
-		found := false
-		for i := range info.Branches {
-			if info.Branches[i].DistributedForkTransactionID == transactionID {
-				info.Branches[i].DistributedSparseRepository = repository
-				info.Branches[i].DistributedSparseBranch = branch
-				found = true
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID == transactionID {
+			current.DistributedSparseRepository = repository
+			current.DistributedSparseBranch = branch
+		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.SparseRepository = repository
+			pending.SparseBranch = branch
+			current.DistributedForkImports[transactionID] = pending
+		} else {
+			found := false
+			for i := range current.Branches {
+				if current.Branches[i].DistributedForkTransactionID == transactionID {
+					current.Branches[i].DistributedSparseRepository = repository
+					current.Branches[i].DistributedSparseBranch = branch
+					found = true
+				}
+			}
+			if !found {
+				return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 			}
 		}
-		if !found {
-			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-		}
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		return true, nil
+	})
 }
 
 // DistributedForkTargetBranch resolves the branch associated with a target
@@ -2926,9 +2940,14 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 					return err
 				}
 			}
-			delete(info.DistributedForkImports, transactionID)
-			recomputeContainerState(&info)
-			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+			return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+				if _, ok := current.DistributedForkImports[transactionID]; !ok {
+					return false, nil
+				}
+				delete(current.DistributedForkImports, transactionID)
+				recomputeContainerState(current)
+				return true, nil
+			})
 		}
 		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
 			return err
@@ -2961,39 +2980,32 @@ func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
 // contains only main. It never rewrites peer branches; callers managing an
 // existing family must use the branch-specific state methods instead.
 func (s Store) UpdateState(name, state string, exitStatus *int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
 	now := time.Now().UTC()
-	found := false
-	for i := range info.Branches {
-		if info.Branches[i].ID == "main" {
-			info.Branches[i].State = state
-			found = true
-			break
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		found := false
+		for i := range info.Branches {
+			if info.Branches[i].ID == "main" {
+				info.Branches[i].State = state
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", "main")
-	}
-	switch state {
-	case "running":
-		info.StartedAt = &now
-	}
-	recomputeContainerState(&info)
-	if info.State == "exited" {
-		info.ExitStatus = exitStatus
-		info.ExitedAt = &now
-	} else {
-		info.ExitStatus = nil
-		info.ExitedAt = nil
-	}
-	path := filepath.Join(s.Root, "containers", info.ID, "container.json")
-	if err := writeJSON(path, &info); err != nil {
-		return fmt.Errorf("updating container %q: %w", name, err)
-	}
-	return nil
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", "main")
+		}
+		if state == "running" {
+			info.StartedAt = &now
+		}
+		recomputeContainerState(info)
+		if info.State == "exited" {
+			info.ExitStatus = exitStatus
+			info.ExitedAt = &now
+		} else {
+			info.ExitStatus = nil
+			info.ExitedAt = nil
+		}
+		return true, nil
+	})
 }
 
 // AddPortBinding atomically records a branch-local published TCP listener.
@@ -3002,51 +3014,49 @@ func (s Store) AddPortBinding(name string, binding PortBinding) error {
 	if err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	if info.NetworkMode != "ttc" {
-		return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
-	}
-	branchFound := false
-	for _, branch := range info.Branches {
-		if branch.ID != binding.BranchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		if info.NetworkMode != "ttc" {
+			return false, fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
 		}
-		if branch.State != "running" && branch.State != "paused" {
-			return fmt.Errorf("branch %q is %s", binding.BranchID, branch.State)
+		branchFound := false
+		for _, branch := range info.Branches {
+			if branch.ID != binding.BranchID {
+				continue
+			}
+			if branch.State != "running" && branch.State != "paused" {
+				return false, fmt.Errorf("branch %q is %s", binding.BranchID, branch.State)
+			}
+			branchFound = true
+			break
 		}
-		branchFound = true
-		break
-	}
-	if !branchFound {
-		return fmt.Errorf("branch %q is not recorded", binding.BranchID)
-	}
-	endpoint := portHostEndpoint(binding)
-	for _, existing := range info.PublishedPorts {
-		if samePortBinding(existing, binding) {
-			return fmt.Errorf("published port for %s already exists on branch %q", endpoint, binding.BranchID)
+		if !branchFound {
+			return false, fmt.Errorf("branch %q is not recorded", binding.BranchID)
 		}
-		if portHostEndpoint(existing) == endpoint {
-			return fmt.Errorf("published host endpoint %s is already assigned to branch %q", endpoint, existing.Branch())
+		endpoint := portHostEndpoint(binding)
+		for _, existing := range info.PublishedPorts {
+			if samePortBinding(existing, binding) {
+				return false, fmt.Errorf("published port for %s already exists on branch %q", endpoint, binding.BranchID)
+			}
+			if portHostEndpoint(existing) == endpoint {
+				return false, fmt.Errorf("published host endpoint %s is already assigned to branch %q", endpoint, existing.Branch())
+			}
 		}
-	}
-	info.PublishedPorts = append(info.PublishedPorts, binding)
-	sort.Slice(info.PublishedPorts, func(i, j int) bool {
-		a, b := info.PublishedPorts[i], info.PublishedPorts[j]
-		if a.Branch() != b.Branch() {
-			return a.Branch() < b.Branch()
-		}
-		if a.HostIP != b.HostIP {
-			return a.HostIP < b.HostIP
-		}
-		if a.HostPort != b.HostPort {
-			return a.HostPort < b.HostPort
-		}
-		return a.ContainerPort < b.ContainerPort
+		info.PublishedPorts = append(info.PublishedPorts, binding)
+		sort.Slice(info.PublishedPorts, func(i, j int) bool {
+			a, b := info.PublishedPorts[i], info.PublishedPorts[j]
+			if a.Branch() != b.Branch() {
+				return a.Branch() < b.Branch()
+			}
+			if a.HostIP != b.HostIP {
+				return a.HostIP < b.HostIP
+			}
+			if a.HostPort != b.HostPort {
+				return a.HostPort < b.HostPort
+			}
+			return a.ContainerPort < b.ContainerPort
+		})
+		return true, nil
 	})
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // RemovePortBinding atomically removes one exact branch-local listener.
@@ -3055,18 +3065,16 @@ func (s Store) RemovePortBinding(name string, binding PortBinding) error {
 	if err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	for i, existing := range info.PublishedPorts {
-		if !samePortBinding(existing, binding) {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i, existing := range info.PublishedPorts {
+			if !samePortBinding(existing, binding) {
+				continue
+			}
+			info.PublishedPorts = append(info.PublishedPorts[:i], info.PublishedPorts[i+1:]...)
+			return true, nil
 		}
-		info.PublishedPorts = append(info.PublishedPorts[:i], info.PublishedPorts[i+1:]...)
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("published port is not configured on branch %q", binding.BranchID)
+		return false, fmt.Errorf("published port is not configured on branch %q", binding.BranchID)
+	})
 }
 
 // RemovePortBindingsForBranch atomically forgets every listener for branchID.
@@ -3074,21 +3082,19 @@ func (s Store) RemovePortBindingsForBranch(name, branchID string) error {
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	bindings := info.PublishedPorts[:0]
-	for _, binding := range info.PublishedPorts {
-		if binding.Branch() != branchID {
-			bindings = append(bindings, binding)
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		bindings := info.PublishedPorts[:0]
+		for _, binding := range info.PublishedPorts {
+			if binding.Branch() != branchID {
+				bindings = append(bindings, binding)
+			}
 		}
-	}
-	if len(bindings) == len(info.PublishedPorts) {
-		return nil
-	}
-	info.PublishedPorts = bindings
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		if len(bindings) == len(info.PublishedPorts) {
+			return false, nil
+		}
+		info.PublishedPorts = bindings
+		return true, nil
+	})
 }
 
 // RecordBranch appends one branch identity or refreshes its lifecycle data.
@@ -3318,66 +3324,36 @@ func (s Store) AbandonBranchPublication(name, branchID string, generation uint64
 // daemons sharing an NFS data root; higher-level placement generations fence
 // stale callers.
 func (s Store) CompareAndSwapNodeID(name, expected, replacement string) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	info, err = s.loadContainerKey(info.ID)
-	if err != nil {
-		return err
-	}
-	if info.NodeID != expected {
-		return fmt.Errorf("container %q cluster owner changed from %q to %q", info.Name, expected, info.NodeID)
-	}
-	info.NodeID = replacement
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		if info.NodeID != expected {
+			return false, fmt.Errorf("container %q cluster owner changed from %q to %q", info.Name, expected, info.NodeID)
+		}
+		info.NodeID = replacement
+		return true, nil
+	})
 }
 
 // CompareAndSwapBranchNodeID transfers one process-free branch without
 // changing sibling placement. Empty legacy branch owners inherit NodeID.
 func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement string) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	info, err = s.loadContainerKey(info.ID)
-	if err != nil {
-		return err
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ID != branchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			if info.Branches[i].ID != branchID {
+				continue
+			}
+			owner := info.Branches[i].NodeID
+			if owner == "" {
+				owner = info.NodeID
+			}
+			if owner != expected {
+				return false, fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
+			}
+			info.Branches[i].NodeID = replacement
+			info.Branches[i].Unplaced = replacement == ""
+			return true, nil
 		}
-		owner := info.Branches[i].NodeID
-		if owner == "" {
-			owner = info.NodeID
-		}
-		if owner != expected {
-			return fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
-		}
-		info.Branches[i].NodeID = replacement
-		info.Branches[i].Unplaced = replacement == ""
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("branch %q is not recorded", branchID)
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
 }
 
 // RenameBranch changes a branch's visible name in the durable record.
@@ -3393,49 +3369,49 @@ func (s Store) RenameBranch(name, oldID, newID string) error {
 	if err := validateObjectName("branch", newID); err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	found := false
-	var renamedBranch BranchInfo
-	for i := range info.Branches {
-		switch info.Branches[i].ID {
-		case newID:
-			return fmt.Errorf("branch %q already exists", newID)
-		case oldID:
-			found = true
-			renamedBranch = info.Branches[i]
+	var rollback func() error
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		found := false
+		var renamedBranch BranchInfo
+		for i := range info.Branches {
+			switch info.Branches[i].ID {
+			case newID:
+				return false, fmt.Errorf("branch %q already exists", newID)
+			case oldID:
+				found = true
+				renamedBranch = info.Branches[i]
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", oldID)
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ID == oldID {
-			info.Branches[i].ID = newID
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", oldID)
 		}
-		if info.Branches[i].ParentID == oldID {
-			info.Branches[i].ParentID = newID
+		for i := range info.Branches {
+			if info.Branches[i].ID == oldID {
+				info.Branches[i].ID = newID
+			}
+			if info.Branches[i].ParentID == oldID {
+				info.Branches[i].ParentID = newID
+			}
 		}
-	}
-	for i := range info.PublishedPorts {
-		if info.PublishedPorts[i].Branch() == oldID {
-			info.PublishedPorts[i].BranchID = newID
+		for i := range info.PublishedPorts {
+			if info.PublishedPorts[i].Branch() == oldID {
+				info.PublishedPorts[i].BranchID = newID
+			}
 		}
-	}
-	rollback, err := s.renameBranchArtifacts(info.ID, renamedBranch, oldID, newID)
-	if err != nil {
-		return err
-	}
-	recomputeContainerState(&info)
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		var err error
+		rollback, err = s.renameBranchArtifacts(info.ID, renamedBranch, oldID, newID)
+		if err != nil {
+			return false, err
+		}
+		recomputeContainerState(info)
+		return true, nil
+	})
+	if err != nil && rollback != nil {
 		if rollbackErr := rollback(); rollbackErr != nil {
 			return fmt.Errorf("recording renamed branch: %w; rolling back branch artifacts: %v", err, rollbackErr)
 		}
-		return err
 	}
-	return nil
+	return err
 }
 
 type renamePath struct {
@@ -3612,37 +3588,32 @@ func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
 // Elastic families may have live siblings on other nodes, which this operation
 // must never rewrite merely because they are absent from the local runsc root.
 func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	changed := false
-	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		changed := false
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
+				continue
+			}
+			switch branch.State {
+			case "creating", "running", "paused", "dehydrating", "rehydrating":
+				branch.State = "exited"
+				changed = true
+			}
 		}
-		switch branch.State {
-		case "creating", "running", "paused", "dehydrating", "rehydrating":
-			branch.State = "exited"
+		oldState := info.State
+		recomputeContainerState(info)
+		if oldState != info.State {
 			changed = true
 		}
-	}
-	oldState := info.State
-	recomputeContainerState(&info)
-	if oldState != info.State {
-		changed = true
-	}
-	if info.State == "exited" && exitStatus != nil {
-		now := time.Now().UTC()
-		info.ExitStatus = exitStatus
-		info.ExitedAt = &now
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		if info.State == "exited" && exitStatus != nil {
+			now := time.Now().UTC()
+			info.ExitStatus = exitStatus
+			info.ExitedAt = &now
+			changed = true
+		}
+		return changed, nil
+	})
 }
 
 // RemoveBranchRecord removes a branch from persistent metadata and splices its

@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,6 +230,65 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 		}
 	}
 	t.Fatal("published migration lost child branch")
+}
+
+func TestConcurrentDistributedMigrationReservationsPreserveImports(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	bundleDir := filepath.Join(root, "containers", "family-id", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const imports = 32
+	branches := make([]BranchInfo, 0, imports)
+	for i := 0; i < imports; i++ {
+		branches = append(branches, BranchInfo{
+			ID: fmt.Sprintf("branch-%02d", i), NodeID: "node-a",
+			FilesystemBranch: fmt.Sprintf("fs-%02d", i), State: "running",
+		})
+	}
+	info := ContainerInfo{
+		ID: "family-id", Name: "family", DistributedFamilyID: "family-id",
+		NodeID: "node-a", BundleDir: bundleDir, State: "running", Branches: branches,
+	}
+	if err := writeJSON(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errorsByImport := make([]error, imports)
+	var wg sync.WaitGroup
+	for i := 0; i < imports; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			_, errorsByImport[index] = store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+				SourceContainer: "family", TargetName: "family",
+				TargetBranch:  fmt.Sprintf("transaction-branch-%02d", index),
+				VisibleBranch: fmt.Sprintf("branch-%02d", index),
+				TransactionID: fmt.Sprintf("transaction-%02d", index),
+				NodeID:        "node-b", SourceNode: "node-a", Migration: true,
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errorsByImport {
+		if err != nil {
+			t.Fatalf("reservation %d: %v", i, err)
+		}
+	}
+	got, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DistributedForkImports) != imports {
+		t.Fatalf("retained %d/%d concurrent imports: %+v", len(got.DistributedForkImports), imports, got.DistributedForkImports)
+	}
 }
 
 func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
