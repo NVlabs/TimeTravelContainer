@@ -258,11 +258,19 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return err
 	}
-	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, session.StreamBytes, 0); err != nil {
+	filesystemConnections, err := r.backend.materializeDistributedFilesystemMetadata(info, targetBranch.FilesystemBranch, tx.Identity.TransactionID, session.FilesystemMetadataPack, peer)
+	if err != nil {
+		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
+	}
+	memoryDependencyBytes := session.StreamBytes
+	if session.SparseManifest != "" || session.SharedSnapshot != "" {
+		memoryDependencyBytes = 0
+	}
+	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, memoryDependencyBytes, session.FilesystemBytes); err != nil {
 		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
-	if session.SharedMetadata == "" {
+	if session.SharedMetadata == "" || session.FilesystemMetadataPack != "" {
 		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
 		if err != nil || len(tokenBytes) != 16 {
 			return errors.New("invalid distributed snapshot token")
@@ -276,10 +284,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
-		PushPolicy:         ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
-		SharedSnapshot:     session.SharedSnapshot != "",
-		SharedMetadata:     session.SharedMetadata != "",
-		DurableDehydration: session.DurableDehydration,
+		FilesystemConnections: filesystemConnections,
+		PushPolicy:            ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
+		SharedSnapshot:        session.SharedSnapshot != "",
+		SharedMetadata:        session.SharedMetadata != "",
+		DurableDehydration:    session.DurableDehydration,
 	}
 	if session.SparseManifest != "" {
 		manifest, err := ttcchunk.ParseManifestID(session.SparseManifest)
@@ -357,9 +366,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			reader.Close()
 			return err
 		}
-		connectionCount := 1
-		if restoreArgs.SharedMetadata {
-			connectionCount = 0
+		connectionCount := restoreArgs.FilesystemConnections
+		if !restoreArgs.SharedMetadata {
+			connectionCount++
 		}
 		if !restoreArgs.SharedSnapshot && restoreArgs.SparseManifest == (ttcchunk.ManifestID{}) {
 			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
@@ -671,7 +680,11 @@ func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) 
 	if err != nil {
 		return err
 	}
-	_, err = r.backend.command("timetravel", info.ID, "distributed-drain", branch.ID)
+	action := "distributed-drain"
+	if branch.DependentMemoryBytes == 0 {
+		action = "distributed-filesystem-drain"
+	}
+	_, err = r.backend.command("timetravel", info.ID, action, branch.ID)
 	return err
 }
 
@@ -807,7 +820,12 @@ func (b *runtimeBackend) releaseSparseRoot(repositoryPath, branch string) error 
 	return nil
 }
 
-func (*daemonTargetRuntime) MarkIndependent(context.Context, *cluster.Transaction) error { return nil }
+func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Transaction) error {
+	if r == nil || r.backend == nil || tx == nil {
+		return nil
+	}
+	return r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, 0)
+}
 
 type adaptivePrefetchController struct {
 	policy               ttcpolicy.Policy
@@ -946,6 +964,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		failedPolls := 0
+		sourceFailedPolls := 0
 		var adaptive *adaptivePrefetchController
 		for {
 			select {
@@ -959,6 +978,24 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			}
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
 				continue
+			}
+			if tx.SourceNeeded && r.directory != nil {
+				if source, sourceErr := r.directory.Lookup(tx.Identity.SourceNodeID); sourceErr != nil || !source.LeaseActive(time.Now()) || source.State == cluster.NodeOffline {
+					sourceFailedPolls++
+					if sourceFailedPolls < 3 {
+						continue
+					}
+					if info, loadErr := r.backend.containerStore().LoadDistributedForkTarget(transactionID); loadErr == nil {
+						if branch, branchErr := persistentBranchInfo(info, tx.Identity.VisibleTargetBranch()); branchErr == nil &&
+							(branch.DependentMemoryBytes != 0 || branch.DependentFilesystemBytes != 0) {
+							_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
+								"unrecoverable volatile-state loss: source node disappeared before memory and filesystem dependencies became durable", time.Now())
+							return
+						}
+					}
+				} else {
+					sourceFailedPolls = 0
+				}
 			}
 			// Migration publication precedes the placement compare-and-swap. Do
 			// not let dependency completion race that cutover and advance the
@@ -1017,14 +1054,25 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					)
 				}
 			}
+			info, infoErr := r.backend.containerStore().LoadDistributedForkTarget(transactionID)
+			var filesystemBytes uint64
+			if infoErr == nil {
+				if branch, branchErr := persistentBranchInfo(info, targetBranch); branchErr == nil {
+					filesystemBytes = branch.DependentFilesystemBytes
+				}
+			}
 			if !status.Done {
-				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, status.BytesOutstanding, 0)
+				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, status.BytesOutstanding, filesystemBytes)
 				continue
 			}
 			if status.Error != "" {
 				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
 					"remote memory loader failed: "+status.Error, time.Now())
 				return
+			}
+			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, filesystemBytes)
+			if filesystemBytes != 0 && tx.State != cluster.TransactionIndependent {
+				continue
 			}
 			if tx.State != cluster.TransactionIndependent {
 				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())

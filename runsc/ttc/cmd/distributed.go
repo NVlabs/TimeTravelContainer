@@ -35,6 +35,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -123,14 +124,17 @@ type distributedForkBackend interface {
 }
 
 type distributedPageRelay struct {
-	listener net.Listener
-	backend  *runtimeBackend
-	source   string
-	session  string
-	close    sync.Once
-	mu       sync.Mutex
-	closed   bool
-	commands map[*exec.Cmd]struct{}
+	listener       net.Listener
+	backend        *runtimeBackend
+	source         string
+	session        string
+	close          sync.Once
+	mu             sync.Mutex
+	closed         bool
+	commands       map[*exec.Cmd]struct{}
+	fsToken        ttcvolume.RemoteToken
+	fsSources      []ttcvolume.RemoteObjectSource
+	fsRepositories []*ttcvolume.Repository
 }
 
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
@@ -153,6 +157,24 @@ func (r *distributedPageRelay) serve() {
 			conn.Close()
 			continue
 		}
+		magic, err := peekDistributedMagic(tcp)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		if magic == [4]byte{'T', 'T', 'C', 'F'} {
+			r.mu.Lock()
+			token := r.fsToken
+			sources := append([]ttcvolume.RemoteObjectSource(nil), r.fsSources...)
+			closed := r.closed
+			r.mu.Unlock()
+			if closed || len(sources) == 0 {
+				conn.Close()
+				continue
+			}
+			go func() { _ = ttcvolume.ServeRemoteObjects(tcp, token, sources) }()
+			continue
+		}
 		file, err := tcp.File()
 		conn.Close()
 		if err != nil {
@@ -160,6 +182,42 @@ func (r *distributedPageRelay) serve() {
 		}
 		go r.serveFile(file)
 	}
+}
+
+func peekDistributedMagic(tcp *net.TCPConn) ([4]byte, error) {
+	var magic [4]byte
+	raw, err := tcp.SyscallConn()
+	if err != nil {
+		return magic, err
+	}
+	var socketErr error
+	err = raw.Read(func(fd uintptr) bool {
+		n, _, recvErr := unix.Recvfrom(int(fd), magic[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+		if errors.Is(recvErr, unix.EAGAIN) || errors.Is(recvErr, unix.EWOULDBLOCK) {
+			return false
+		}
+		if recvErr != nil {
+			socketErr = recvErr
+			return true
+		}
+		if n != len(magic) {
+			socketErr = io.ErrUnexpectedEOF
+		}
+		return true
+	})
+	return magic, errors.Join(err, socketErr)
+}
+
+func (r *distributedPageRelay) ConfigureFilesystem(token ttcvolume.RemoteToken, sources []ttcvolume.RemoteObjectSource, repositories []*ttcvolume.Repository) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || len(r.fsSources) != 0 {
+		return errors.New("distributed filesystem relay is closed or already configured")
+	}
+	r.fsToken = token
+	r.fsSources = append([]ttcvolume.RemoteObjectSource(nil), sources...)
+	r.fsRepositories = append([]*ttcvolume.Repository(nil), repositories...)
+	return nil
 }
 
 func (r *distributedPageRelay) serveFile(file *os.File) {
@@ -206,11 +264,17 @@ func (r *distributedPageRelay) Close() {
 			for command := range r.commands {
 				commands = append(commands, command)
 			}
+			repositories := r.fsRepositories
+			r.fsRepositories = nil
+			r.fsSources = nil
 			r.mu.Unlock()
 			for _, command := range commands {
 				if command.Process != nil {
 					_ = command.Process.Kill()
 				}
+			}
+			for _, repository := range repositories {
+				_ = repository.Close()
 			}
 		})
 	}
@@ -236,6 +300,159 @@ func newDistributedTransactionID() (string, error) {
 		return "", err
 	}
 	return "fork-" + hex.EncodeToString(random[:]), nil
+}
+
+// prepareDistributedFilesystem seals metadata for the already-forked volume
+// generation into one immutable shared pack and configures the source relay to
+// serve only its allowlisted objects. Active object data remains node-local.
+func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch, transactionID string, token ttcvolume.RemoteToken, relay *distributedPageRelay) (string, uint64, error) {
+	if filesystemBranch == "" {
+		return "", 0, errors.New("distributed capture omitted its filesystem generation")
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return "", 0, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(configs) == 0 {
+		return "", 0, nil
+	}
+	staging := filepath.Join(b.activeDataRoot(), "distributed-filesystem-staging", transactionID)
+	if err := os.RemoveAll(staging); err != nil {
+		return "", 0, err
+	}
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return "", 0, err
+	}
+	defer os.RemoveAll(staging)
+	var sources []ttcvolume.RemoteObjectSource
+	var repositories []*ttcvolume.Repository
+	var dependentBytes uint64
+	countedObjects := make(map[string]struct{})
+	closeRepositories := func() {
+		for _, repository := range repositories {
+			_ = repository.Close()
+		}
+	}
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			closeRepositories()
+			return "", 0, err
+		}
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
+		destination := filepath.Join(staging, hex.EncodeToString(key[:]))
+		_, objects, err := repository.ExportRemoteSnapshot(filesystemBranch, destination)
+		if err != nil {
+			repository.Close()
+			closeRepositories()
+			return "", 0, err
+		}
+		for object, size := range objects {
+			identity := repository.Info().ID + ":" + object
+			if _, ok := countedObjects[identity]; !ok {
+				dependentBytes += uint64(size)
+				countedObjects[identity] = struct{}{}
+			}
+		}
+		repositories = append(repositories, repository)
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository, Objects: objects})
+	}
+	pack, err := ttcpack.WriteDirectory(staging, filepath.Join(b.dataRoot, "cold"))
+	if err != nil {
+		closeRepositories()
+		return "", 0, err
+	}
+	if err := relay.ConfigureFilesystem(token, sources, repositories); err != nil {
+		closeRepositories()
+		return "", 0, err
+	}
+	return pack.String(), dependentBytes, nil
+}
+
+func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle.ContainerInfo, filesystemBranch, transactionID, packText string, peer bool) (int, error) {
+	if packText == "" {
+		return 0, nil
+	}
+	pack, err := ttcpack.ParseID(packText)
+	if err != nil {
+		return 0, err
+	}
+	staging := filepath.Join(b.activeDataRoot(), "distributed-filesystem-metadata", transactionID)
+	if err := os.RemoveAll(staging); err != nil {
+		return 0, err
+	}
+	if err := ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), pack, staging); err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(staging)
+	store := b.containerStore()
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return 0, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return 0, err
+	}
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	if err != nil {
+		return 0, err
+	}
+	for index := range configs {
+		config := &configs[index]
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
+		snapshot := filepath.Join(staging, hex.EncodeToString(key[:]))
+		var snapshotInfo ttcvolume.SnapshotInfo
+		encodedSnapshot, err := os.ReadFile(filepath.Join(snapshot, "snapshot.json"))
+		if err != nil {
+			return 0, fmt.Errorf("reading remote repository %q identity: %w", config.Source, err)
+		}
+		if err := json.Unmarshal(encodedSnapshot, &snapshotInfo); err != nil {
+			return 0, fmt.Errorf("decoding remote repository %q identity: %w", config.Source, err)
+		}
+		if peer {
+			repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+			if err != nil {
+				return 0, err
+			}
+			_, importErr := repository.ImportRemoteBranchSnapshot(snapshot, filesystemBranch)
+			closeErr := repository.Close()
+			if importErr != nil || closeErr != nil {
+				return 0, errors.Join(importErr, closeErr)
+			}
+			continue
+		}
+		pathKey := sha256.Sum256([]byte(filepath.Clean(config.Path)))
+		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
+		var repository *ttcvolume.Repository
+		if _, err := os.Stat(destination); err == nil {
+			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
+		} else if errors.Is(err, os.ErrNotExist) {
+			repository, _, err = manager.ImportPrivateRemoteSnapshot(destination, "remote-"+fmt.Sprint(index), snapshot, filesystemBranch)
+		} else {
+			return 0, err
+		}
+		if err != nil {
+			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
+		}
+		config.Path = destination
+		config.Branch = filesystemBranch
+		config.CopyMode = string(manager.Capability().Mode)
+		config.RestoreID = snapshotInfo.RepositoryID
+		config.Private = true
+		if err := repository.Close(); err != nil {
+			return 0, err
+		}
+	}
+	if err := store.WriteActiveRepositoryMap(info.ID, configs); err != nil {
+		return 0, err
+	}
+	return len(configs), nil
 }
 
 func distributedSnapshotRelativePath(transactionID string) string {
@@ -365,13 +582,6 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
-	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
-		return selector{}, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
-	}
-	sourceInfo, err = b.containerStore().LoadContainer(source.container)
-	if err != nil {
-		return selector{}, fmt.Errorf("reloading promoted source metadata: %w", err)
-	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
 	}
@@ -465,10 +675,17 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], session.Token[:])
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, transactionID, filesystemToken, relay)
+	if err != nil {
+		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes: dataPlaneMax,
+		MaxTransferBytes:       dataPlaneMax,
+		FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -600,13 +817,57 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, err
 	}
+	filesystemCommitted := false
+	committedFilesystemForks := 0
 	defer func() {
-		if !committed {
-			for i := len(filesystemForks) - 1; i >= 0; i-- {
-				_ = filesystemForks[i].abort()
+		if filesystemCommitted {
+			if !committed {
+				_ = b.removeDistributedFilesystemBranch(sourceInfo.ID, childFilesystemBranch)
 			}
+			return
+		}
+		for i := len(filesystemForks) - 1; i >= committedFilesystemForks; i-- {
+			_ = filesystemForks[i].abort()
+		}
+		if committedFilesystemForks != 0 {
+			_ = b.removeDistributedFilesystemBranch(sourceInfo.ID, childFilesystemBranch)
 		}
 	}()
+	for _, fork := range filesystemForks {
+		if err := fork.commit(); err != nil {
+			return selector{}, fmt.Errorf("committing distributed filesystem fork: %w", err)
+		}
+		committedFilesystemForks++
+	}
+	filesystemCommitted = true
+	listener, err := net.Listen("tcp", b.distributedSource.pageListen)
+	if err != nil {
+		return selector{}, fmt.Errorf("opening dehydrated filesystem range listener: %w", err)
+	}
+	advertise, err := resolveDistributedAdvertiseAddress(b.distributedSource.pageAdvertise, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		return selector{}, err
+	}
+	relayBackend := *b
+	relayBackend.stdin = strings.NewReader("")
+	relayBackend.stdout = io.Discard
+	relayBackend.stderr = io.Discard
+	relay := newDistributedPageRelay(listener, &relayBackend, sourceInfo.ID, transactionID)
+	relayOwned := true
+	defer func() {
+		if relayOwned {
+			relay.Close()
+		}
+	}()
+	var filesystemToken ttcvolume.RemoteToken
+	if _, err := rand.Read(filesystemToken[:]); err != nil {
+		return selector{}, err
+	}
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, transactionID, filesystemToken, relay)
+	if err != nil {
+		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
+	}
 	manifest, err := clusterRepository.LoadManifest(capture.SparseManifest)
 	if err != nil {
 		return selector{}, err
@@ -616,11 +877,12 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		streamBytes += uint64(run.Pages) * 4096
 	}
 	descriptor := cluster.RemoteSessionDescriptor{
+		Address: advertise, SnapshotToken: hex.EncodeToString(filesystemToken[:]),
 		MetadataBytes: uint64(len(encodedMetadata)), StreamBytes: streamBytes,
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
 		SharedMetadata:   metadataRelative, SparseRepository: clusterRepositoryRelative,
 		SparseManifest: capture.SparseManifest.String(), SparseBranch: childFilesystemBranch,
-		DurableDehydration: true,
+		DurableDehydration: true, FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -634,24 +896,75 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		}
 		tx = status
 	}
-	for _, fork := range filesystemForks {
-		if err := fork.commit(); err != nil {
-			return selector{}, fmt.Errorf("committing distributed filesystem fork: %w", err)
-		}
-	}
 	sparseRootCommitted = true
 	committed = true
-	if tx.State != cluster.TransactionIndependent {
-		if _, err := peer.MarkIndependentWithMetrics(ctx, transactionID, tx.Revision, cluster.TransferMetrics{}); err != nil {
-			if status, statusErr := peer.Status(ctx, transactionID); statusErr != nil || status.State != cluster.TransactionIndependent {
-				return selector{}, fmt.Errorf("marking dehydrated target independent: %w", err)
-			}
-		}
-	}
+	relayOwned = false
+	go b.completeDehydratedFilesystemTransfer(peer, transactionID, tx.Revision, sourceInfo.ID, childFilesystemBranch, relay)
 	if committedTransaction != nil {
 		*committedTransaction = transactionID
 	}
 	return target, nil
+}
+
+func (b *runtimeBackend) completeDehydratedFilesystemTransfer(peer *cluster.Client, transactionID string, revision uint64, containerID, filesystemBranch string, relay *distributedPageRelay) {
+	defer relay.Close()
+	defer b.removeDistributedFilesystemBranch(containerID, filesystemBranch)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		tx, err := peer.Drain(ctx, transactionID, revision)
+		cancel()
+		if err == nil && tx != nil {
+			revision = tx.Revision
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			_, err = peer.MarkIndependentWithMetrics(ctx, transactionID, revision, cluster.TransferMetrics{})
+			cancel()
+			if err == nil {
+				return
+			}
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		status, statusErr := peer.Status(ctx, transactionID)
+		cancel()
+		if statusErr == nil {
+			revision = status.Revision
+			switch status.State {
+			case cluster.TransactionIndependent, cluster.TransactionCanceled, cluster.TransactionFailed:
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (b *runtimeBackend) removeDistributedFilesystemBranch(containerID, branch string) error {
+	spec, err := b.containerStore().LoadSpec(containerID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(configs))
+	var result error
+	for _, config := range configs {
+		if _, ok := seen[config.Path]; ok {
+			continue
+		}
+		seen[config.Path] = struct{}{}
+		repository, openErr := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if openErr != nil {
+			result = errors.Join(result, openErr)
+			continue
+		}
+		removeErr := repository.RemoveBranch(branch)
+		closeErr := repository.Close()
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			result = errors.Join(result, removeErr)
+		}
+		result = errors.Join(result, closeErr)
+	}
+	return result
 }
 
 func writeDurableDistributedFile(path string, data []byte) error {
@@ -795,13 +1108,6 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	source = resolved
 	if !sourceInfo.LiveForkEligible {
 		return nil, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
-	}
-	if err := b.containerStore().PromoteContainerRepositories(source.container); err != nil {
-		return nil, fmt.Errorf("stabilizing source filesystem repositories: %w", err)
-	}
-	sourceInfo, err = b.containerStore().LoadContainer(source.container)
-	if err != nil {
-		return nil, fmt.Errorf("reloading promoted source metadata: %w", err)
 	}
 	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
 	if err != nil {
@@ -987,10 +1293,17 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
+		var filesystemToken ttcvolume.RemoteToken
+		copy(filesystemToken[:], session.Token[:])
+		filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.transaction, filesystemToken, child.relay)
+		if err != nil {
+			return nil, fmt.Errorf("sealing filesystem generation for target %s: %w", child.target, err)
+		}
 		descriptors[i] = cluster.RemoteSessionDescriptor{
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-			MaxTransferBytes: child.dataPlaneMax,
+			MaxTransferBytes:       child.dataPlaneMax,
+			FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
 		}
 	}
 	prepareErrors := make([]error, len(children))
@@ -1288,6 +1601,13 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 		if status.Snapshot.PagesOutstanding != 0 {
 			continue
 		}
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		draining, drainErr := peer.Drain(ctx, transactionID, revision)
+		cancel()
+		if drainErr != nil || draining == nil {
+			continue
+		}
+		revision = draining.Revision
 		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 		metrics := cluster.TransferMetrics{
 			PullRequests:     status.Transport.PullRequests,

@@ -117,8 +117,8 @@ class ClientTest(unittest.TestCase):
 
     def test_default_socket_path_precedence(self):
         self.assertEqual(
-            default_socket_path({"TTC_RUNTIME_DIR": "/run/a", "XDG_RUNTIME_DIR": "/run/b"}),
-            "/run/a/ttcd.sock",
+            default_socket_path({"TTC_SOCKET": "/run/a/custom.sock", "XDG_RUNTIME_DIR": "/run/b"}),
+            "/run/a/custom.sock",
         )
         self.assertEqual(
             default_socket_path({"XDG_RUNTIME_DIR": "/run/b"}),

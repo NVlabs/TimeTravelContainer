@@ -103,8 +103,8 @@ export interface ImageSaveOptions {
 export function defaultSocketPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  if (env.TTC_RUNTIME_DIR) {
-    return join(env.TTC_RUNTIME_DIR, "ttcd.sock");
+  if (env.TTC_SOCKET) {
+    return env.TTC_SOCKET;
   }
   if (env.XDG_RUNTIME_DIR) {
     return join(env.XDG_RUNTIME_DIR, "ttc", "ttcd.sock");

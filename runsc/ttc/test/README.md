@@ -131,7 +131,7 @@ rebinding, and cloning of Sentry-owned netlink sockets.
 
 The test requires network access for image pulls. TTC resolves OCI registries
 directly and stores verified manifests, configs, and layers in its native
-rootless content store under `--data-root`; no Docker or containerd daemon is
+rootless content store under the explicitly configured `TTC_ROOT`; no Docker or containerd daemon is
 required. By default, the runtime user must be able to create a user namespace
 with a one-entry UID/GID map:
 

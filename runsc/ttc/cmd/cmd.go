@@ -2297,7 +2297,7 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 		return errors.New("--interactive and --no-stdin cannot be used together")
 	}
 	if *takeover {
-		return errors.New("--takeover requires ttcd; remove --direct")
+		return errors.New("--takeover is unavailable for this attachment")
 	}
 	request := attachRequest{
 		execID: *execID,
@@ -6033,7 +6033,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6108,7 +6108,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -7002,7 +7002,7 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 		if err != nil {
 			return 0, err
 		}
-		store := ttcbundle.Store{Root: b.dataRoot}
+		store := b.containerStore()
 		containerInfo, err := store.LoadContainer(target.container)
 		if err != nil {
 			return 0, err
@@ -7377,7 +7377,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	defer releaseClient()
-	container, err := (ttcbundle.Store{Root: b.dataRoot}).LoadContainer(target.container)
+	container, err := b.containerStore().LoadContainer(target.container)
 	if err != nil {
 		return err
 	}
@@ -7450,7 +7450,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 }
 
 func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	info, err := store.LoadContainer(container)
 	if err != nil {
 		return 0, 0, fmt.Errorf("loading console retention for %s: %w", container, err)
@@ -7467,7 +7467,7 @@ func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) 
 }
 
 func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbundle.ConsolePaths, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.BranchConsolePaths(target.container, target.branch)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
@@ -7476,7 +7476,7 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbun
 }
 
 func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, consoleID string, reset bool) (ttcbundle.ConsolePaths, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.ExecConsolePaths(target.container, target.branch, execID)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err

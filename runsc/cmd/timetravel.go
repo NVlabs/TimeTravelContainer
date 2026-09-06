@@ -122,6 +122,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-filesystem-drain <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-handoff <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
@@ -396,6 +397,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.SetDistributedForkPrefetchWindow(f.Arg(2), t.distributedPrefetchBehind, t.distributedPrefetchBytes)
 	case "distributed-drain":
 		err = cont.Sandbox.DrainDistributedForkMemory(f.Arg(2))
+	case "distributed-filesystem-drain":
+		err = cont.Sandbox.DrainDistributedForkFilesystems(f.Arg(2))
 	case "distributed-handoff":
 		if t.dehydrationMemoryRepositoryFD < 0 || t.distributedSessionID == "" {
 			util.Fatalf("--dehydration-memory-repository-fd and --distributed-session=<manifest> are required")

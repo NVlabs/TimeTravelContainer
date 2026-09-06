@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -81,6 +83,9 @@ type DistributedForkRestoreArgs struct {
 	VisibleBranchID string
 	// FilesystemBranch is the prepared target branch in each TTC repository.
 	FilesystemBranch string
+	// FilesystemConnections is the prefix of donated TCP streams used for
+	// authenticated TTC-volume range requests.
+	FilesystemConnections int
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -174,6 +179,21 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			}
 		}
 	}()
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || (args.FilesystemConnections != 0 && args.FilesystemConnections != len(l.ttcVolumeRepositories)) {
+		return nil, fmt.Errorf("distributed target has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], args.SnapshotToken[:])
+	connectionIndex := 0
+	for _, volume := range l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
+		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, volume.config.Branch); err != nil {
+			return nil, fmt.Errorf("attaching distributed filesystem source %q: %w", volume.config.Source, err)
+		}
+		connectionIndex++
+	}
+	donated = donated[args.FilesystemConnections:]
+	donatedMode = len(donated) != 0
 	var pushConn net.Conn
 	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {

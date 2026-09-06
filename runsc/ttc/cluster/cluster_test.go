@@ -163,6 +163,28 @@ func TestRemoteSessionDescriptorSharedMetadata(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
+		SharedMetadata: "cluster/memory-metadata/tx.state", SparseRepository: "cluster/memory-chunks",
+		SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+		FilesystemMetadataPack: strings.Repeat("cd", 32), FilesystemBytes: 1 << 20,
+	}
+	if err := descriptor.validate(negotiated); err != nil {
+		t.Fatalf("valid shared-memory/volatile-filesystem descriptor: %v", err)
+	}
+	invalid := descriptor
+	invalid.SnapshotToken = "bad"
+	if err := invalid.validate(negotiated); err == nil {
+		t.Fatal("accepted invalid filesystem range token")
+	}
+}
+
 func testForkIdentity() ForkIdentity {
 	digest := "sha256:" + strings.Repeat("1", 64)
 	return ForkIdentity{

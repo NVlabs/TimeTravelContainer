@@ -97,8 +97,9 @@ non-forkable.
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.
 
-Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or use
-`Client::new("/path/to/ttcd.sock")`.
+Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or use
+`Client::new("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
+`TTC_LOCAL_ROOT`.
 
 ## Test
 

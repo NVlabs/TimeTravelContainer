@@ -255,6 +255,9 @@ type Repository struct {
 	branchCache map[string]cachedBranch
 	journalMu   sync.Mutex
 	journals    map[string]*os.File
+
+	remoteMu sync.Mutex
+	remote   *remoteObjectClient
 }
 
 type cachedBranch struct {
@@ -525,6 +528,13 @@ func (r *Repository) Close() error {
 	if r == nil || r.dir == nil {
 		return nil
 	}
+	r.remoteMu.Lock()
+	var remoteErr error
+	if r.remote != nil {
+		remoteErr = r.remote.conn.Close()
+		r.remote = nil
+	}
+	r.remoteMu.Unlock()
 	r.journalMu.Lock()
 	var journalErr error
 	for layer, journal := range r.journals {
@@ -546,6 +556,9 @@ func (r *Repository) Close() error {
 	}
 	if journalErr != nil {
 		return journalErr
+	}
+	if remoteErr != nil {
+		return remoteErr
 	}
 	return err
 }
@@ -1423,6 +1436,12 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if inode.DataGeneration == branch.Generation {
 		return false, nil
 	}
+	// A remotely inherited object is sparse in the target repository. A file-
+	// level CoW clone must not preserve unfetched holes as zeroes, so fetch this
+	// one object completely before creating its private writable generation.
+	if err := r.ensureObjectRange(inode.Object, inode.Size, 0, inode.Size); err != nil {
+		return false, err
+	}
 	object, err := r.createObject(inode.Object)
 	if err != nil {
 		return false, err
@@ -1504,6 +1523,16 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	}
 	if !validID(inode.Object) {
 		return 0, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
+	}
+	if length := int64(len(data)); length != 0 {
+		if offset < inode.Size && length > inode.Size-offset {
+			length = inode.Size - offset
+		}
+		if length > 0 {
+			if err := r.ensureObjectRange(inode.Object, inode.Size, offset, length); err != nil {
+				return 0, err
+			}
+		}
 	}
 	file, err := r.openObject(inode.Object, os.O_RDONLY)
 	if err != nil {

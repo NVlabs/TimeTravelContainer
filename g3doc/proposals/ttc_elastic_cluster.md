@@ -21,15 +21,13 @@ cross-node cut.
 ## Scope and assumptions
 
 Elastic cluster mode assumes mutually trusted mTLS-authenticated `ttcd` nodes,
-one shared TTC data root, a common architecture and base-page size, compatible
-TTC protocol features, and reliable host networking. Images may be cached
-locally by digest. Branch filesystems, managed volumes, dehydration metadata,
-and immutable memory chunks live in the shared repository.
-
-Each node must keep `TTC_RUNTIME_DIR`, the daemon socket, and runsc's live state
-on node-local storage. These paths contain Unix sockets, advisory locks, and
-host-process state and are not portable repository data. `ttcd` rejects an NFS
-runtime path at startup; an NFS `TTC_DATA_ROOT` remains supported.
+one shared `TTC_ROOT`, a common architecture and base-page size, exact daemon
+build compatibility, and reliable host networking. Every node also configures
+a distinct, node-local `TTC_LOCAL_ROOT`. Active filesystems, runtime state,
+mutable metadata, staging data, and caches stay local; immutable image content,
+committed cold manifests and packs, and the cluster catalog live in the shared
+repository. The daemon socket is selected independently with `TTC_SOCKET` (or
+the normal per-user runtime default).
 
 Unexpected node loss is distinct from graceful elasticity. A clean drain is
 lossless. A branch that still depends exclusively on volatile pages from a
@@ -189,7 +187,7 @@ means a proposed move touches only incident edges. One solve can select
 several destinations and TTC reserves all of them before the first migration.
 
 An optional shared policy at
-`$TTC_DATA_ROOT/cluster/placement-policy.json` adds exact-selector allowed-node
+`$TTC_ROOT/cluster/placement-policy.json` adds exact-selector allowed-node
 sets, hard co-location groups, and weighted soft affinities. Policy branches
 outside the movable window become fixed node terminals. The current schema is:
 
@@ -222,7 +220,7 @@ latency-sensitive branches as non-dehydratable.
 ## Capacity events
 
 Provisioning remains outside TTC. TTC publishes a durable JSON request in
-`$TTC_DATA_ROOT/cluster/capacity-requests/<source-node>.json` when pressure or
+`$TTC_ROOT/cluster/capacity-requests/<source-node>.json` when pressure or
 a drain has no feasible destination. An external provisioner watches this
 shared outbox and removes the file only after durably accepting it. Manual and
 automatic retries coalesce while the file exists, and removal permits a new

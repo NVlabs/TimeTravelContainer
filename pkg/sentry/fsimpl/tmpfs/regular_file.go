@@ -1012,6 +1012,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		var done int64
 		for dst.NumBytes() != 0 {
 			want := min(dst.NumBytes(), int64(len(buf)))
+			if err := f.inode.fs.diskVolume.Repository.EnsureDataRange(f.inode.fs.diskVolume.Branch, f.inode.ino, offset+done, want); err != nil {
+				return done, err
+			}
 			n, readErr := file.ReadAt(buf[:want], offset+done)
 			if n != 0 {
 				copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])

@@ -2229,6 +2229,15 @@ func (s *Sandbox) DrainDistributedForkMemory(branchID string) error {
 	return nil
 }
 
+// DrainDistributedForkFilesystems eagerly loads remote filesystem objects
+// without changing sparse-memory residency.
+func (s *Sandbox) DrainDistributedForkFilesystems(branchID string) error {
+	if err := s.call(boot.ContMgrDrainDistributedForkFilesystems, &boot.DistributedForkDependencyArgs{BranchID: branchID}, nil); err != nil {
+		return fmt.Errorf("draining distributed fork filesystems for branch %q: %w", branchID, err)
+	}
+	return nil
+}
+
 // HandoffDistributedForkMemory replaces a live source with a sparse manifest.
 func (s *Sandbox) HandoffDistributedForkMemory(args *boot.DistributedForkHandoffArgs) error {
 	if err := s.call(boot.ContMgrHandoffDistributedForkMemory, args, nil); err != nil {

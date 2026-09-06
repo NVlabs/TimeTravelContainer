@@ -466,7 +466,7 @@ func writeDaemonEvent(writer io.Writer, event DaemonEvent, jsonOutput bool) erro
 
 func (s *daemonServer) streamEvents(dataRoot string, args []string, writer io.Writer) error {
 	if dataRoot == "" {
-		return errors.New("events require a persistent --data-root")
+		return errors.New("events require ttcd to have an explicit TTC_ROOT")
 	}
 	options, err := parseDaemonEventsOptions(args)
 	if err != nil {

@@ -127,8 +127,9 @@ sending them to `ttcd`. Other raw commands that name host files should likewise
 use absolute paths because the daemon does not share the SDK process's current
 working directory.
 
-Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR` as for the CLI, or pass
-`Client("/path/to/ttcd.sock")`.
+Set `TTC_SOCKET` or `XDG_RUNTIME_DIR` as for the CLI, or pass
+`Client("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
+`TTC_LOCAL_ROOT`.
 
 ## Test
 

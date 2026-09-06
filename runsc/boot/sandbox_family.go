@@ -169,12 +169,13 @@ type DistributedForkCaptureManyArgs struct {
 // socket. Token is a bearer capability and must never appear in status or log
 // output after initial creation.
 type DistributedForkSessionInfo struct {
-	SessionID     string
-	Source        string
-	Address       string
-	Token         ttcremote.SnapshotToken
-	MetadataBytes uint64
-	StreamBytes   uint64
+	SessionID        string
+	Source           string
+	FilesystemBranch string
+	Address          string
+	Token            ttcremote.SnapshotToken
+	MetadataBytes    uint64
+	StreamBytes      uint64
 }
 
 // DistributedForkSessionArgs identifies an existing source snapshot.
@@ -917,7 +918,8 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		}
 		infos[i] = DistributedForkSessionInfo{
 			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
-			MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
+			FilesystemBranch: volumeBranches[i],
+			MetadataBytes:    uint64(len(metadata)), StreamBytes: server.StreamBytes(),
 		}
 	}
 	// The legacy TCP and allocator-wide handoff snapshots have transferred to
@@ -1080,8 +1082,8 @@ func removeDistributedFilesystemBranch(resources vfs.LiveForkFilesystemResources
 	return result
 }
 
-// CompleteDistributedForkSession releases memory ownership after a target has
-// drained while preserving the filesystem branches now owned by that target.
+// CompleteDistributedForkSession releases memory ownership and the sealed
+// source-only filesystem generation after the target has materialized it.
 func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 	f.mu.Lock()
 	session := f.distributedSessions[id]
@@ -1099,7 +1101,7 @@ func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 		session.sparseSnapshot = nil
 	}
 	session.mu.Unlock()
-	return errors.Join(session.server.Close(), sparseErr)
+	return errors.Join(session.server.Close(), sparseErr, removeDistributedFilesystemBranch(session.resources, session.filesystemBranch))
 }
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.

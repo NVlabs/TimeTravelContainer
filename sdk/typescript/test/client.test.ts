@@ -125,8 +125,8 @@ test("command streams flow-controlled stdin and preserves status", async () => {
 
 test("default socket environment precedence", () => {
   assert.equal(
-    defaultSocketPath({ TTC_RUNTIME_DIR: "/run/a", XDG_RUNTIME_DIR: "/run/b" }),
-    "/run/a/ttcd.sock",
+    defaultSocketPath({ TTC_SOCKET: "/run/a/custom.sock", XDG_RUNTIME_DIR: "/run/b" }),
+    "/run/a/custom.sock",
   );
   assert.equal(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/b" }), "/run/b/ttc/ttcd.sock");
 });

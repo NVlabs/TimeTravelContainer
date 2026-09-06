@@ -129,6 +129,9 @@ const (
 	// ContMgrDrainDistributedForkMemory makes a target source-independent.
 	ContMgrDrainDistributedForkMemory = "containerManager.DrainDistributedForkMemory"
 
+	// ContMgrDrainDistributedForkFilesystems materializes only remote files.
+	ContMgrDrainDistributedForkFilesystems = "containerManager.DrainDistributedForkFilesystems"
+
 	// ContMgrHandoffDistributedForkMemory replaces live paging with sparse chunks.
 	ContMgrHandoffDistributedForkMemory = "containerManager.HandoffDistributedForkMemory"
 
@@ -1156,14 +1159,37 @@ func (cm *containerManager) SetDistributedForkPrefetchWindow(args *DistributedFo
 	return cm.l.family.SetDistributedForkPrefetchWindow(args.BranchID, args.PrefetchBehindBytes, args.PrefetchBytes)
 }
 
-// DrainDistributedForkMemory eagerly loads all remote pages for one branch.
+// DrainDistributedForkMemory eagerly loads all remote pages and filesystem
+// objects for one branch. A source relay may be released only after both are
+// locally complete.
 func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDependencyArgs, _ *struct{}) error {
-	return cm.l.family.DrainDistributedForkMemory(args.BranchID)
+	if err := cm.l.family.DrainDistributedForkMemory(args.BranchID); err != nil {
+		return err
+	}
+	return cm.materializeDistributedFilesystems()
+}
+
+// DrainDistributedForkFilesystems materializes filesystem dependencies without
+// forcing memory already backed by a durable sparse repository to become resident.
+func (cm *containerManager) DrainDistributedForkFilesystems(_ *DistributedForkDependencyArgs, _ *struct{}) error {
+	return cm.materializeDistributedFilesystems()
 }
 
 // HandoffDistributedForkMemory atomically replaces the target page reader.
 func (cm *containerManager) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs, _ *struct{}) error {
-	return cm.l.family.HandoffDistributedForkMemory(args)
+	if err := cm.l.family.HandoffDistributedForkMemory(args); err != nil {
+		return err
+	}
+	return cm.materializeDistributedFilesystems()
+}
+
+func (cm *containerManager) materializeDistributedFilesystems() error {
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		if err := volume.repository.MaterializeRemoteObjects(); err != nil {
+			return fmt.Errorf("materializing distributed filesystem %q: %w", source, err)
+		}
+	}
+	return nil
 }
 
 // DistributedForkSessionStatus returns token-free transfer progress.
@@ -1187,8 +1213,8 @@ func (cm *containerManager) CancelDistributedForkSession(args *DistributedForkSe
 	return cm.l.family.CancelDistributedForkSession(args.SessionID)
 }
 
-// CompleteDistributedForkSession releases drained memory but preserves the
-// target's persistent filesystem branches.
+// CompleteDistributedForkSession releases drained memory and source-only
+// filesystem generations.
 func (cm *containerManager) CompleteDistributedForkSession(args *DistributedForkSessionArgs, _ *struct{}) error {
 	if args == nil {
 		return errors.New("missing distributed fork session arguments")

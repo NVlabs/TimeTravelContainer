@@ -186,7 +186,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 		return err
 	}
 	hiddenBranch := "checkpoint-" + requestID
-	stageRoot := filepath.Join(b.dataRoot, "tmp")
+	stageRoot := filepath.Join(b.activeDataRoot(), "tmp")
 	if err := os.MkdirAll(stageRoot, 0700); err != nil {
 		return err
 	}
@@ -393,7 +393,7 @@ func copyCheckpointHostFile(source, destination string, mode os.FileMode) error 
 }
 
 func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retErr error) {
-	stageRoot := filepath.Join(b.dataRoot, "tmp")
+	stageRoot := filepath.Join(b.activeDataRoot(), "tmp")
 	if err := os.MkdirAll(stageRoot, 0700); err != nil {
 		return "", err
 	}

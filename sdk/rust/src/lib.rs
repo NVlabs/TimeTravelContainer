@@ -361,8 +361,8 @@ fn settle_stream(
 
 /// Returns ttcd's default per-user socket path.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = env::var_os("TTC_RUNTIME_DIR") {
-        return PathBuf::from(path).join("ttcd.sock");
+    if let Some(path) = env::var_os("TTC_SOCKET") {
+        return PathBuf::from(path);
     }
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("ttc").join("ttcd.sock");

@@ -25,7 +25,7 @@ to:
       "command": "npx",
       "args": ["-y", "ttcx-mcp"],
       "env": {
-        "TTC_RUNTIME_DIR": "/run/user/1000/ttc"
+        "TTC_SOCKET": "/run/user/1000/ttc/ttcd.sock"
       }
     }
   }
@@ -33,7 +33,8 @@ to:
 ```
 
 The environment entry is optional when the host inherits the same
-`TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR` used to start ttcd.
+`TTC_SOCKET` or `XDG_RUNTIME_DIR` used by the TTC client. The MCP server does
+not need access to the daemon's storage roots.
 
 ## Tools
 

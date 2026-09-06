@@ -343,12 +343,6 @@ func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {
 }
 
 func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
-	if strings.TrimSpace(os.Getenv("TTC_ROOT")) == "" {
-		if os.Getenv("TTC_DATA_ROOT") != "" {
-			return errors.New("TTC_DATA_ROOT is no longer supported; set TTC_ROOT to a fresh empty directory")
-		}
-		return errors.New("TTC_ROOT must be set explicitly before starting ttcd")
-	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err

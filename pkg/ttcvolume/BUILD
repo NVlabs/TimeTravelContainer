@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "gc.go",
         "metadata.go",
+        "remote.go",
         "repository.go",
         "snapshot.go",
     ],
@@ -22,6 +23,9 @@ go_library(
 go_test(
     name = "ttcvolume_test",
     size = "small",
-    srcs = ["repository_test.go"],
+    srcs = [
+        "remote_test.go",
+        "repository_test.go",
+    ],
     library = ":ttcvolume",
 )

@@ -37,6 +37,7 @@ import (
 	"time"
 
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -887,15 +888,6 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if _, err := placements.BeginMigration(info.ID, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
 		return err
 	}
-	if err := b.containerStore().PromoteContainerRepositories(info.ID); err != nil {
-		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
-		return fmt.Errorf("stabilizing migration filesystem repositories: %w", err)
-	}
-	info, err = b.containerStore().LoadContainer(info.ID)
-	if err != nil {
-		_, _ = placements.AbortMigration(target.container, target.branch, requestID, time.Now())
-		return err
-	}
 	rootfsDigest, err := distributedRootfsDigest(info, target.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {
 		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
@@ -1018,10 +1010,17 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if session.SessionID != requestID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return abort(errors.New("sparse migration capture returned incomplete session metadata"))
 	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], session.Token[:])
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, requestID, filesystemToken, relay)
+	if err != nil {
+		return abort(fmt.Errorf("sealing sparse migration filesystem generation: %w", err))
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes: dataPlaneMax,
+		MaxTransferBytes: dataPlaneMax, FilesystemMetadataPack: filesystemPack,
+		FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)
 	if err != nil {

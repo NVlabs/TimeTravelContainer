@@ -53,6 +53,7 @@ TTC is delivered as two static Linux binaries with no runtime dependencies.
 \<Download instruction TBA, do not remove this yet\>
 
 ```console
+$ export TTC_ROOT="$HOME/.local/share/ttc"
 $ ttc daemon start
 ttcd started
 $ ttc run -itd --network=ttc --nat -v /home:/home:ro \
@@ -191,6 +192,12 @@ Host requirements are deliberately small:
   fallback.
 - (optional) A delegated cgroup v2 subtree only when hard host CPU or memory limits are
   requested.
+
+`TTC_ROOT` is always explicit. In standalone mode it contains all TTC state.
+Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
+node-local `TTC_LOCAL_ROOT` for active runtimes and caches. `TTC_SOCKET` may
+override the per-user daemon socket; `--daemon-socket` takes precedence for a
+single client invocation.
 
 ## Current Limitations
 

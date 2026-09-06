@@ -197,7 +197,7 @@ func (p *branchPublisher) inheritedObjectIDs(manifestPath, source string) (map[s
 			if err != nil {
 				return nil, err
 			}
-			file, index, err := ttcpack.Open(filepath.Join(p.sharedRoot, "cold"), id)
+			file, index, err := ttcpack.OpenIndexed(filepath.Join(p.sharedRoot, "cold"), id)
 			if err != nil {
 				return nil, err
 			}

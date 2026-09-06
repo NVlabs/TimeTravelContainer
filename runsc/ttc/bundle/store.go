@@ -56,6 +56,8 @@ const (
 	DefaultLogDriver = "local"
 )
 
+// promotedRepositoryDir is retained by the legacy compatibility helper and
+// its cleanup tests. Production tiered-storage paths never invoke promotion.
 const promotedRepositoryDir = "repositories"
 
 // removedContainerDir is outside the active container namespace so that a
@@ -3987,11 +3989,12 @@ func (s Store) removeContainerInfo(info ContainerInfo) error {
 		log.Warningf("Container %q was removed; deferred physical cleanup of %q: %v", info.Name, tombstone, err)
 	}
 	s.removeActiveContainer(info.ID)
-	// Promoted repositories are global derived garbage. A failure here must not
-	// reverse or obscure the already-committed container removal; maintenance
-	// retries it independently.
+	// Also sweep the repository namespace used by experimental pre-tiered
+	// roots. Fresh format-v1 roots never populate it, but keeping deletion
+	// tolerant avoids leaking data created by tests or interrupted development
+	// builds that already carry the current root marker.
 	if err := s.gcPromotedRepositories(); err != nil {
-		log.Warningf("Container %q was removed; deferred promoted-repository cleanup: %v", info.Name, err)
+		log.Warningf("Container %q was removed; deferred legacy repository cleanup: %v", info.Name, err)
 	}
 	return nil
 }

@@ -85,8 +85,8 @@ class Result:
 
 def default_socket_path(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
-    if runtime := values.get("TTC_RUNTIME_DIR"):
-        return str(Path(runtime) / "ttcd.sock")
+    if socket := values.get("TTC_SOCKET"):
+        return socket
     if runtime := values.get("XDG_RUNTIME_DIR"):
         return str(Path(runtime) / "ttc" / "ttcd.sock")
     return f"/tmp/ttc-{os.geteuid()}/ttcd.sock"

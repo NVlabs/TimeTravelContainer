@@ -108,11 +108,13 @@ type CancelRequest struct {
 // Sentry page server to the target daemon. It is sent only over mutual TLS and
 // is never stored in the durable transaction record.
 type RemoteSessionDescriptor struct {
-	Address          string `json:"address"`
-	SnapshotToken    string `json:"snapshot_token"`
-	MetadataBytes    uint64 `json:"metadata_bytes"`
-	StreamBytes      uint64 `json:"stream_bytes"`
-	MaxTransferBytes uint64 `json:"max_transfer_bytes"`
+	Address                string `json:"address"`
+	SnapshotToken          string `json:"snapshot_token"`
+	MetadataBytes          uint64 `json:"metadata_bytes"`
+	StreamBytes            uint64 `json:"stream_bytes"`
+	MaxTransferBytes       uint64 `json:"max_transfer_bytes"`
+	FilesystemMetadataPack string `json:"filesystem_metadata_pack,omitempty"`
+	FilesystemBytes        uint64 `json:"filesystem_bytes,omitempty"`
 	// SharedMetadata is a clean data-root-relative path containing the
 	// authenticated SessionMetadata envelope. It permits restoring a
 	// process-free dehydrated source without a source page server.
@@ -147,7 +149,7 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if filepath.IsAbs(s.SharedMetadata) || clean != s.SharedMetadata || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("invalid shared distributed metadata path %q", s.SharedMetadata)
 		}
-		if s.Address != "" || s.SnapshotToken != "" {
+		if s.FilesystemMetadataPack == "" && (s.Address != "" || s.SnapshotToken != "") {
 			return errors.New("shared distributed metadata must not include a page-server address or token")
 		}
 	}
@@ -159,6 +161,24 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 	}
 	if s.MaxTransferBytes < negotiated.BasePageSize || s.MaxTransferBytes > negotiated.MaxTransferSize || s.MaxTransferBytes%negotiated.BasePageSize != 0 {
 		return fmt.Errorf("remote transfer size %d is outside negotiated bounds", s.MaxTransferBytes)
+	}
+	if s.FilesystemMetadataPack != "" {
+		decoded, err := hex.DecodeString(s.FilesystemMetadataPack)
+		if err != nil || len(decoded) != sha256.Size {
+			return errors.New("filesystem metadata pack must be a SHA-256 hexadecimal ID")
+		}
+		if s.Address == "" || s.SnapshotToken == "" {
+			return errors.New("volatile filesystem ranges require a peer address and token")
+		}
+		host, port, err := net.SplitHostPort(s.Address)
+		portNumber, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || host == "" || portErr != nil || portNumber == 0 {
+			return fmt.Errorf("invalid filesystem range address %q", s.Address)
+		}
+		token, err := hex.DecodeString(s.SnapshotToken)
+		if err != nil || len(token) != 16 {
+			return errors.New("filesystem snapshot token must be 16 bytes encoded as hexadecimal")
+		}
 	}
 	if s.SharedSnapshot != "" {
 		clean := filepath.Clean(s.SharedSnapshot)

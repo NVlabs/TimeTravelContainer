@@ -69,8 +69,9 @@ probe automatically and refuses to start in rootless mode when the probe fails,
 so an apparently healthy daemon cannot defer this error until container launch.
 Directly launching `ttcd` performs the same preflight.
 
-The daemon also probes the actual volume object store under `--data-root` with
-`FICLONE`. It fails startup if the backing filesystem lacks working reflinks.
+The daemon also probes the node-local volume object store under `TTC_ROOT`
+(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`. It fails
+startup if the backing filesystem lacks working reflinks.
 To explicitly trade first-write performance for compatibility, use:
 
 ```shell
@@ -109,12 +110,7 @@ volume-copy, or runtime-platform modes. Ordinary commands do not autostart the s
 tell you to run `ttc daemon start`.
 
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but
-removes host-side defense in depth. Do not use it for untrusted images. For a
-one-off recovery command that bypasses the daemon, the equivalent opt-in is:
-
-```shell
-ttc --direct --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
-```
+removes host-side defense in depth. Do not use it for untrusted images.
 
 ## Compile
 
@@ -150,8 +146,8 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc"
 
 ## Optional per-user installation
 
-Keep `ttc` and `ttcd` together so the client can locate its service and
-embedded runtime automatically:
+Keep `ttc` and `ttcd` together so `daemon start` can locate and build-check its
+matching service/runtime:
 
 ```shell
 mkdir -p "$HOME/.local/bin"
@@ -164,6 +160,7 @@ install -m 0755 bazel-bin/runsc/ttcd/ttcd_/ttcd \
 Add `$HOME/.local/bin` to `PATH` if necessary, then verify the installation:
 
 ```shell
+export TTC_ROOT="$HOME/.local/share/ttc"
 ttc --version
 ttc daemon start
 ttc daemon status
@@ -175,47 +172,38 @@ place both files together under `/usr/local/bin`.
 
 ## State and runtime paths
 
-Image content, materialized immutable roots, container metadata, and logs
-default to:
-
-```text
-$TTC_DATA_ROOT
-$XDG_DATA_HOME/ttc
-$HOME/.local/share/ttc
-```
-
-The first defined location wins. The native OCI content store is the
-`image-store` subdirectory of that data root.
-
-`TTC_RUNTIME_DIR` may set one private base directory containing both the
-runtime state and daemon socket. Otherwise, the default runtime root is
-`$XDG_RUNTIME_DIR/runsc`. Without
-`XDG_RUNTIME_DIR`, TTC uses `/tmp/ttc-$UID/runsc`, alongside its per-user
-daemon socket. Both locations are writable only by the invoking user. Explicit
-paths remain available for independent installations or test runs:
-
-Keep `TTC_RUNTIME_DIR` and the runsc state root on node-local storage. They
-must not be placed on NFS; `ttcd` rejects that configuration at startup. In a
-cluster, share `TTC_DATA_ROOT` instead.
+`ttcd` refuses to start until `TTC_ROOT` names an explicit absolute path. In
+standalone mode it contains the image store, container catalog, active runtime
+state, writable filesystems, and durable cold state:
 
 ```shell
-RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/ttc-$UID}"
-
-ttc \
-  --root "$RUNTIME_BASE/runsc" \
-  --daemon-socket "$RUNTIME_BASE/ttcd.sock" \
-  run --rm busybox:1.36 echo hello
+export TTC_ROOT="$HOME/.local/share/ttc"
+ttc daemon start
 ```
 
-Global options must appear before the command. Use a dedicated data root for
-each independent TTC installation or test run:
+Existing roots created before this format are deliberately not migrated; use
+a fresh directory. `TTC_DATA_ROOT`, `TTC_RUNTIME_DIR`, `--data-root`, runtime
+`--root` forwarding, and direct/embedded-daemon operation are unsupported.
+
+In cluster mode, every node uses the same shared `TTC_ROOT` and its own fast,
+node-local scratch directory:
 
 ```shell
-export TTC_DATA_ROOT="$HOME/.local/share/ttc"
-export TTC_RUNTIME_DIR="$HOME/.local/state/ttc/runtime"
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
+ttc daemon start --cluster-node-id node-a ...
 ```
 
-Do not point two incompatible TTC versions at the same live runtime root.
+`TTC_LOCAL_ROOT` is required in cluster mode, must differ from `TTC_ROOT`, and
+is exclusively locked to one daemon. Active filesystems, runtime state,
+console/exec buffers, caches, and publication staging remain local. Sealed
+generations publish asynchronously as immutable indexed packs; after a clean
+node drain, remaining local files are disposable caches or staging residue.
+
+The client locates the daemon through `TTC_SOCKET`, then
+`$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
+`--daemon-socket` takes precedence for one invocation. The client never needs
+access to either storage root.
 
 ## Images
 
@@ -394,9 +382,9 @@ ttc daemon start \
 
 Start node B with its own node ID, advertised address, and certificate.
 `--cluster-peer` remains available as a static override but is unnecessary
-when every daemon has `--cluster-advertise`. `TTC_DATA_ROOT`
-should name the shared repository path on both hosts; `TTC_RUNTIME_DIR` should
-remain a fast, node-local path. `ttc daemon status` reports the active cluster
+when every daemon has `--cluster-advertise`. `TTC_ROOT` names the same shared
+repository on both hosts, while each node's `TTC_LOCAL_ROOT` names fast local
+scratch. `ttc daemon status` reports the active cluster
 identity and negotiated capabilities. Both page-transfer addresses must use
 port `0`: TTC assigns an independent ephemeral listener to every concurrent
 remote fork.
@@ -492,7 +480,7 @@ If a drain or pressure rebalance has no feasible destination, TTC writes one
 durable request per source node to:
 
 ```text
-$TTC_DATA_ROOT/cluster/capacity-requests/<node-id>.json
+$TTC_ROOT/cluster/capacity-requests/<node-id>.json
 ```
 
 Configure exactly one delivery adapter on every daemon:
@@ -1033,8 +1021,6 @@ does not reconfigure an already-running daemon; stop it first if you want to
 change modes. `daemon status` returns the active platform and isolation mode in
 JSON.
 
-`--direct` bypasses `ttcd` for recovery and debugging. Do not routinely mix
-direct mutations with daemon-mediated commands against the same data root.
 Durable mutation records can be inspected with `ttc daemon requests` after an
 interrupted operation.
 

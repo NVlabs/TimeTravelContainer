@@ -429,8 +429,21 @@ func readXattrs(path string, symlink bool) (map[string][]byte, error) {
 	return result, nil
 }
 
-// Open verifies the content digest, header, footer, and footer checksum.
+// Open verifies the content digest, header, footer, and footer checksum. Use
+// OpenIndexed for demand-paged shared storage where reading the complete pack
+// would defeat range access.
 func Open(repository string, id ID) (*os.File, Index, error) {
+	return open(repository, id, true)
+}
+
+// OpenIndexed reads only the fixed header, footer, and indexed metadata. The
+// authoritative manifest has already committed the content-addressed pack;
+// every subsequently read data extent is independently checksummed.
+func OpenIndexed(repository string, id ID) (*os.File, Index, error) {
+	return open(repository, id, false)
+}
+
+func open(repository string, id ID, verifyContent bool) (*os.File, Index, error) {
 	file, err := os.Open(Path(repository, id))
 	if err != nil {
 		return nil, Index{}, err
@@ -443,15 +456,17 @@ func Open(repository string, id ID) (*os.File, Index, error) {
 	if err != nil || stat.Size() < 2*Alignment || stat.Size()%Alignment != 0 {
 		return fail(fmt.Errorf("invalid pack size: %w", err))
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return fail(err)
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return fail(err)
-	}
-	if !bytes.Equal(hash.Sum(nil), id[:]) {
-		return fail(errors.New("pack content digest mismatch"))
+	if verifyContent {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fail(err)
+		}
+		hash := sha256.New()
+		if _, err := io.Copy(hash, file); err != nil {
+			return fail(err)
+		}
+		if !bytes.Equal(hash.Sum(nil), id[:]) {
+			return fail(errors.New("pack content digest mismatch"))
+		}
 	}
 	var header packHeader
 	if err := readJSONBlock(file, 0, &header); err != nil || header.Magic != headerMagic || header.Version != formatVersion {
@@ -478,6 +493,23 @@ func Open(repository string, id ID) (*os.File, Index, error) {
 	}
 	if len(index.Entries) != tail.RecordCount {
 		return fail(errors.New("pack record count mismatch"))
+	}
+	for _, entry := range index.Entries {
+		if entry.RecordOffset < Alignment || entry.RecordOffset%Alignment != 0 ||
+			entry.StoredLength < Alignment || entry.StoredLength%Alignment != 0 ||
+			entry.RecordOffset > tail.IndexOffset-entry.StoredLength {
+			return fail(fmt.Errorf("pack record %q has an invalid extent", entry.Path))
+		}
+		if entry.Length < 0 || entry.Length > MaxDataExtent ||
+			entry.Length > entry.StoredLength-Alignment {
+			return fail(fmt.Errorf("pack record %q has an invalid payload length", entry.Path))
+		}
+		if entry.Length != 0 {
+			checksum, err := hex.DecodeString(entry.Checksum)
+			if err != nil || len(checksum) != sha256.Size {
+				return fail(fmt.Errorf("pack record %q has an invalid checksum", entry.Path))
+			}
+		}
 	}
 	return file, index, nil
 }
@@ -560,6 +592,12 @@ func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 	if entry.Length < 0 || entry.Length > MaxDataExtent || int64(len(destination)) < entry.Length {
 		return 0, errors.New("invalid pack extent buffer")
 	}
+	if entry.Length == 0 {
+		if entry.Checksum != "" {
+			return 0, errors.New("empty pack extent has a checksum")
+		}
+		return 0, nil
+	}
 	n, err := file.ReadAt(destination[:entry.Length], entry.RecordOffset+Alignment)
 	if err != nil {
 		return n, err
@@ -587,7 +625,7 @@ func MaterializeMissing(repository string, id ID, destination string) error {
 }
 
 func materialize(repository string, id ID, destination string, missingOnly bool) error {
-	file, index, err := Open(repository, id)
+	file, index, err := OpenIndexed(repository, id)
 	if err != nil {
 		return err
 	}

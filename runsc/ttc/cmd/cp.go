@@ -507,7 +507,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	if err != nil {
 		return err
 	}
-	tempRoot := filepath.Join(b.dataRoot, "tmp")
+	tempRoot := filepath.Join(b.activeDataRoot(), "tmp")
 	if err := os.MkdirAll(tempRoot, 0700); err != nil {
 		return fmt.Errorf("creating TTC temporary directory: %w", err)
 	}

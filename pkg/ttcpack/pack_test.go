@@ -26,6 +26,9 @@ func TestPackRoundTripAndRangeIndex(t *testing.T) {
 	if err := os.Symlink("a/b/large", filepath.Join(source, "link")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(source, "empty"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
 	repository := filepath.Join(root, "repository")
 	id, err := WriteDirectory(source, repository)
 	if err != nil {
@@ -60,6 +63,9 @@ func TestPackRoundTripAndRangeIndex(t *testing.T) {
 	second, _ := os.Stat(filepath.Join(destination, "hardlink"))
 	if !os.SameFile(first, second) {
 		t.Fatal("hardlink identity was not preserved")
+	}
+	if info, err := os.Stat(filepath.Join(destination, "empty")); err != nil || info.Size() != 0 {
+		t.Fatalf("empty file round trip: info=%v err=%v", info, err)
 	}
 }
 

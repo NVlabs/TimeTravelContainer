@@ -8,7 +8,7 @@ MCP packages in this directory.
 
 The default socket is selected in this order:
 
-1. `$TTC_RUNTIME_DIR/ttcd.sock`
+1. `$TTC_SOCKET`
 2. `$XDG_RUNTIME_DIR/ttc/ttcd.sock`
 3. `/tmp/ttc-$EUID/ttcd.sock`
 
