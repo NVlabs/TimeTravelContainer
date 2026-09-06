@@ -258,6 +258,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return err
 	}
+	info, err = r.backend.containerStore().RefreshContainerImageRoot(ctx, info.ID)
+	if err != nil {
+		return fmt.Errorf("materializing target image cache: %w", err)
+	}
 	filesystemConnections, err := r.backend.materializeDistributedFilesystemMetadata(info, targetBranch.FilesystemBranch, tx.Identity.TransactionID, session.FilesystemMetadataPack, peer)
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)

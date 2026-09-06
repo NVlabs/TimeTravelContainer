@@ -44,16 +44,19 @@ var branchPointerMagic = [8]byte{'T', 'T', 'C', 'M', 'R', 'O', 'O', 'T'}
 // pointers to manifests. Lease and transaction directories are created now so
 // later GC never needs to infer liveness from process-local reference counts.
 type MemoryRepository struct {
-	mu           sync.Mutex
-	root         string
-	chunks       *Store
-	manifestRoot string
-	branchRoot   string
-	consumedRoot string
-	leaseRoot    string
-	txnRoot      string
-	trashRoot    string
-	rootFD       *os.File
+	mu             sync.Mutex
+	root           string
+	chunks         *Store
+	manifestRoot   string
+	branchRoot     string
+	consumedRoot   string
+	leaseRoot      string
+	txnRoot        string
+	trashRoot      string
+	rootFD         *os.File
+	remoteMu       sync.Mutex
+	remotes        map[*remoteChunkClient]struct{}
+	remoteByObject map[ID]*remoteChunkClient
 }
 
 // OpenMemoryRepositoryFD opens a repository through an already-open directory
@@ -90,11 +93,23 @@ func OpenMemoryRepositoryFD(dir *os.File) (*MemoryRepository, error) {
 // Close releases a donated repository descriptor. Path-opened repositories
 // have no persistent descriptor and Close is a no-op.
 func (r *MemoryRepository) Close() error {
-	if r == nil || r.rootFD == nil {
+	if r == nil {
 		return nil
 	}
-	err := r.rootFD.Close()
-	r.rootFD = nil
+	var err error
+	r.remoteMu.Lock()
+	for remote := range r.remotes {
+		err = errors.Join(err, remote.conn.Close())
+	}
+	r.remotes = nil
+	r.remoteByObject = nil
+	r.remoteMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rootFD != nil {
+		err = errors.Join(err, r.rootFD.Close())
+		r.rootFD = nil
+	}
 	return err
 }
 
@@ -416,6 +431,34 @@ func (r *MemoryRepository) ImportManifest(source *MemoryRepository, id ManifestI
 	return id, nil
 }
 
+// ImportRemoteManifest installs only an immutable manifest and branch root.
+// Chunk objects are supplied later through an authenticated remote source and
+// cached locally on first use.
+func (r *MemoryRepository) ImportRemoteManifest(source *MemoryRepository, id ManifestID, branch string) error {
+	if r == nil || source == nil || r.rootFD != nil {
+		return errors.New("remote memory manifest import requires path-opened repositories")
+	}
+	manifest, err := source.LoadManifest(id)
+	if err != nil {
+		return err
+	}
+	data, encodedID, err := EncodeManifest(manifest)
+	if err != nil {
+		return err
+	}
+	if encodedID != id {
+		return fmt.Errorf("source memory manifest encoded as %s, want %s", encodedID, id)
+	}
+	r.mu.Lock()
+	dir, path := r.manifestPath(id)
+	err = publishImmutable(dir, r.manifestRoot, path, data)
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return r.SetBranchLazy(branch, id)
+}
+
 func (r *MemoryRepository) branchPath(branch string) (string, error) {
 	if branch == "" || len(branch) > 4096 {
 		return "", fmt.Errorf("invalid TTC memory branch ID %q", branch)
@@ -469,6 +512,30 @@ func (r *MemoryRepository) SetBranch(branch string, id ManifestID) (retErr error
 			retErr = fmt.Errorf("releasing branch publication lease: %w", err)
 		}
 	}()
+	return r.setBranchPointer(branch, id)
+}
+
+// SetBranchLazy atomically roots a manifest whose omitted chunks remain
+// authoritative in an immutable parent pack. The shared GC lock prevents the
+// local manifest from being reclaimed while the pointer is installed; unlike
+// SetBranch it deliberately does not require every payload to be local.
+func (r *MemoryRepository) SetBranchLazy(branch string, id ManifestID) (retErr error) {
+	lock, err := r.lockGarbageCollection(unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := unlockGarbageCollection(lock); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
+	if _, err := r.LoadManifest(id); err != nil {
+		return fmt.Errorf("loading lazy branch manifest %s: %w", id, err)
+	}
+	return r.setBranchPointer(branch, id)
+}
+
+func (r *MemoryRepository) setBranchPointer(branch string, id ManifestID) error {
 	path, err := r.branchPath(branch)
 	if err != nil {
 		return err
@@ -587,6 +654,13 @@ func (r *MemoryRepository) ListBranches() (map[string]ManifestID, error) {
 // named destinationBranch. This is suitable for packing or moving between
 // nodes without copying unrelated family memory.
 func (r *MemoryRepository) ExportBranch(branch, destinationBranch, destination string) (retErr error) {
+	return r.ExportBranchDelta(branch, destinationBranch, destination, nil)
+}
+
+// ExportBranchDelta writes a packable repository delta. Objects present in
+// inherited are represented by the manifest but omitted from the directory;
+// a parent cold-manifest pack chain supplies them on demand.
+func (r *MemoryRepository) ExportBranchDelta(branch, destinationBranch, destination string, inherited map[ID]struct{}) (retErr error) {
 	if r == nil || r.rootFD != nil {
 		return errors.New("exporting a memory branch requires a path-opened repository")
 	}
@@ -651,6 +725,9 @@ func (r *MemoryRepository) ExportBranch(branch, destinationBranch, destination s
 		objects[run.Object] = struct{}{}
 	}
 	for object := range objects {
+		if _, ok := inherited[object]; ok {
+			continue
+		}
 		_, source := r.chunks.path(object)
 		target := filepath.Join(destination, "chunks", object.String()[:4], object.String()+".chunk")
 		if err := linkImmutable(source, target); err != nil {

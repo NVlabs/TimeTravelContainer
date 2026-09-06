@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -55,6 +56,17 @@ func TestRemoteSnapshotFetchesExtentsAndPrivatizesWrites(t *testing.T) {
 	}()
 	if err := target.AttachRemoteObjectSource(client, token, key, "target-generation"); err != nil {
 		t.Fatal(err)
+	}
+	delta := filepath.Join(t.TempDir(), "delta")
+	inherited := make(map[string]struct{}, len(objects))
+	for object := range objects {
+		inherited[object] = struct{}{}
+	}
+	if _, err := target.ExportSnapshotDelta("target-generation", delta, inherited); err != nil {
+		t.Fatalf("metadata-only delta: %v", err)
+	}
+	if entries, err := os.ReadDir(filepath.Join(delta, "objects")); err != nil || len(entries) != 0 {
+		t.Fatalf("inherited objects were exported: entries=%v err=%v", entries, err)
 	}
 	got := make([]byte, 4096)
 	offset := int64(remoteExtentBytes + 123)

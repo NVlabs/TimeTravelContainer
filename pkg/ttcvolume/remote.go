@@ -116,7 +116,34 @@ func writeAll(writer io.Writer, data []byte) error {
 type RemoteObjectSource struct {
 	Key        RemoteSourceKey
 	Repository *Repository
-	Objects    map[string]int64
+	// Reader may serve immutable content from a shared pack rather than a live
+	// repository. Exactly one of Reader and Repository must be set.
+	Reader  RemoteObjectReader
+	Objects map[string]int64
+}
+
+// RemoteObjectReader reads an immutable object range. Implementations may be
+// backed by a repository, an indexed pack chain, or another fenced source.
+type RemoteObjectReader interface {
+	ReadObjectRange(object string, destination []byte, offset int64) (int, error)
+}
+
+type repositoryObjectReader struct{ repository *Repository }
+
+func (r repositoryObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
+	if r.repository == nil {
+		return 0, os.ErrInvalid
+	}
+	file, err := r.repository.openObject(object, os.O_RDONLY)
+	if err != nil {
+		return 0, err
+	}
+	n, readErr := file.ReadAt(destination, offset)
+	closeErr := file.Close()
+	if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(destination)) {
+		return n, errors.Join(readErr, closeErr)
+	}
+	return n, closeErr
 }
 
 // ServeRemoteObjects serves range requests until conn closes. The token and
@@ -125,7 +152,10 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 	defer conn.Close()
 	byKey := make(map[RemoteSourceKey]RemoteObjectSource, len(sources))
 	for _, source := range sources {
-		if source.Repository == nil || len(source.Objects) == 0 {
+		if source.Reader == nil && source.Repository != nil {
+			source.Reader = repositoryObjectReader{repository: source.Repository}
+		}
+		if source.Reader == nil || len(source.Objects) == 0 {
 			continue
 		}
 		byKey[source.Key] = source
@@ -145,20 +175,17 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 			return writeRemoteError(conn, request, "filesystem object or range is outside the captured generation")
 		}
 		payload := make([]byte, request.length)
-		if err := source.Repository.ensureObjectRange(object, size, int64(request.offset), int64(request.length)); err != nil {
-			return writeRemoteError(conn, request, err.Error())
+		if source.Repository != nil {
+			if err := source.Repository.ensureObjectRange(object, size, int64(request.offset), int64(request.length)); err != nil {
+				return writeRemoteError(conn, request, err.Error())
+			}
 		}
-		file, err := source.Repository.openObject(object, os.O_RDONLY)
-		if err != nil {
-			return writeRemoteError(conn, request, err.Error())
-		}
-		n, readErr := file.ReadAt(payload, int64(request.offset))
-		closeErr := file.Close()
+		n, readErr := source.Reader.ReadObjectRange(object, payload, int64(request.offset))
 		if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(payload)) {
 			return writeRemoteError(conn, request, readErr.Error())
 		}
-		if closeErr != nil || n != len(payload) {
-			return writeRemoteError(conn, request, fmt.Sprintf("short filesystem object read: %d/%d: %v", n, len(payload), closeErr))
+		if n != len(payload) {
+			return writeRemoteError(conn, request, fmt.Sprintf("short filesystem object read: %d/%d", n, len(payload)))
 		}
 		response := request
 		response.type_ = remoteData
@@ -193,57 +220,88 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if r == nil || conn == nil {
 		return errors.New("remote filesystem source requires repository and connection")
 	}
-	r.remoteMu.Lock()
-	defer r.remoteMu.Unlock()
-	if r.remote != nil {
-		return errors.New("remote filesystem source is already attached")
-	}
-	branch, err := r.readBranch(branchID)
+	objects, err := r.BranchObjects(branchID)
 	if err != nil {
 		return err
+	}
+	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, fetched: make(map[string]map[uint64]struct{}), objects: make(map[string]int64), repository: r}
+	r.remoteMu.Lock()
+	defer r.remoteMu.Unlock()
+	if r.remotes == nil {
+		r.remotes = make(map[*remoteObjectClient]struct{})
+		r.remoteByObject = make(map[string]*remoteObjectClient)
+	}
+	for object, size := range objects {
+		if _, exists := r.remoteByObject[object]; exists {
+			continue
+		}
+		remote.objects[object] = size
+		r.remoteByObject[object] = remote
+	}
+	if len(remote.objects) == 0 {
+		return conn.Close()
+	}
+	r.remotes[remote] = struct{}{}
+	return nil
+}
+
+// BranchObjects returns the immutable object allowlist referenced by branch.
+func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
+	branch, err := r.readBranch(branchID)
+	if err != nil {
+		return nil, err
 	}
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	state.mu.RLock()
+	defer state.mu.RUnlock()
 	objects := make(map[string]int64)
 	for _, inode := range state.inodes {
 		if inode.Type == "regular" && inode.Object != "" {
 			objects[inode.Object] = inode.Size
 		}
 	}
-	state.mu.RUnlock()
-	r.remote = &remoteObjectClient{conn: conn, token: token, source: source, next: 1, fetched: make(map[string]map[uint64]struct{}), objects: objects, repository: r}
-	return nil
+	return objects, nil
 }
 
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
 // source handoff or local durable publication.
 func (r *Repository) MaterializeRemoteObjects() error {
 	r.remoteMu.Lock()
-	remote := r.remote
+	remotes := make([]*remoteObjectClient, 0, len(r.remotes))
+	for remote := range r.remotes {
+		remotes = append(remotes, remote)
+	}
 	r.remoteMu.Unlock()
-	if remote == nil {
+	if len(remotes) == 0 {
 		return nil
 	}
-	for object, size := range remote.objects {
-		if err := remote.ensure(object, size, 0, size); err != nil {
+	for _, remote := range remotes {
+		for object, size := range remote.objects {
+			if err := remote.ensure(object, size, 0, size); err != nil {
+				return err
+			}
+		}
+		// Serialize behind any reader that obtained remote before the final
+		// extent completed. Once detached, all future reads are local.
+		remote.mu.Lock()
+		r.remoteMu.Lock()
+		delete(r.remotes, remote)
+		for object, owner := range r.remoteByObject {
+			if owner == remote {
+				delete(r.remoteByObject, object)
+			}
+		}
+		r.remoteMu.Unlock()
+		err := remote.conn.Close()
+		remote.mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}
-	// Serialize behind any reader that obtained remote before the final extent
-	// completed. Once detached, all future reads are provably local and closing
-	// the stream is the target's source-independence acknowledgement.
-	remote.mu.Lock()
-	r.remoteMu.Lock()
-	if r.remote == remote {
-		r.remote = nil
-	}
-	r.remoteMu.Unlock()
-	err := remote.conn.Close()
-	remote.mu.Unlock()
-	return err
+	return nil
 }
 
 // EnsureDataRange fetches every 1 MiB extent intersecting an arbitrary guest
@@ -279,7 +337,7 @@ func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length
 
 func (r *Repository) ensureObjectRange(object string, size, offset, length int64) error {
 	r.remoteMu.Lock()
-	remote := r.remote
+	remote := r.remoteByObject[object]
 	r.remoteMu.Unlock()
 	if remote == nil || length == 0 {
 		return nil

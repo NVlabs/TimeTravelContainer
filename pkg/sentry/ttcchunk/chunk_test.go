@@ -20,10 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +37,101 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
+
+type remoteReaderFunc func(ID) ([]byte, error)
+
+func (f remoteReaderFunc) ReadMemoryChunk(id ID) ([]byte, error) { return f(id) }
+
+func TestRemoteChunkFetchedAndCachedOnFirstRead(t *testing.T) {
+	logical := pgalloc.LogicalChunkID{Allocator: pgalloc.LogicalAllocatorID{1}, Sequence: 7}
+	version := pgalloc.PageVersionID{Allocator: logical.Allocator, Sequence: 9}
+	encoded, id, err := Encode(Chunk{Logical: logical, Pages: []Page{{Slot: 3, Version: version, Data: make([]byte, hostarch.PageSize)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	created, err := OpenMemoryRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := OpenMemoryRepositoryFD(dir)
+	dir.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, client := net.Pipe()
+	var token RemoteToken
+	token[0] = 0x42
+	done := make(chan error, 1)
+	var requests atomic.Int32
+	go func() {
+		done <- ServeRemoteChunks(server, token, remoteReaderFunc(func(got ID) ([]byte, error) {
+			requests.Add(1)
+			if got != id {
+				t.Fatalf("requested chunk %s, want %s", got, id)
+			}
+			return encoded, nil
+		}), map[ID]struct{}{id: {}})
+	}()
+	manifest := Manifest{Runs: []ManifestRun{{
+		ResourceID: checkpoint.ResourceID{}, OldOffset: 0, References: 1,
+		FirstPage:    pgalloc.LogicalPageID{Allocator: logical.Allocator, Sequence: logical.Sequence*PagesPerChunk + 3},
+		FirstVersion: version, Logical: logical, FirstSlot: 3, Pages: 1, Object: id,
+	}}}
+	manifestData, manifestID, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDir := filepath.Join(root, "manifests", manifestID.String()[:4])
+	if err := os.MkdirAll(manifestDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(manifestDir, manifestID.String()+".manifest"), manifestData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemoteChunkSource(client, token, manifestID); err != nil {
+		t.Fatal(err)
+	}
+	mf := newChunkTestMemoryFile(t, checkpoint.ResourceID{})
+	installed, err := target.InstallManifest(mf, manifest, usage.Anonymous, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("manifest installation fetched %d remote chunks, want 0", got)
+	}
+	if err := installed.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	mf.Destroy()
+	chunk, err := target.chunks.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Logical != logical {
+		t.Fatalf("logical chunk = %+v, want %+v", chunk.Logical, logical)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("first payload read fetched %d remote chunks, want 1", got)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("server exit = %v", err)
+	}
+	name := id.String()
+	if _, err := os.Stat(filepath.Join(root, "chunks", name[:4], name+".chunk")); err != nil {
+		t.Fatalf("cached chunk: %v", err)
+	}
+}
 
 func testAllocator(seed byte) pgalloc.LogicalAllocatorID {
 	var id pgalloc.LogicalAllocatorID
@@ -419,6 +516,53 @@ func TestMemoryRepositoryExportBranchIsSelfContained(t *testing.T) {
 		if _, err := exported.chunks.Get(object.ID); err != nil {
 			t.Fatalf("exported chunk %s: %v", object.ID, err)
 		}
+	}
+}
+
+func TestMemoryRepositoryLazyBranchAndDeltaPermitInheritedObjects(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID := publishLifecycleManifest(t, repository, 0x6d)
+	if err := repository.SetBranch("source", manifestID); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := repository.LoadManifest(manifestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := manifest.Runs[0].Object
+	delta := filepath.Join(t.TempDir(), "delta")
+	if err := repository.ExportBranchDelta("source", "child", delta, map[ID]struct{}{object: {}}); err != nil {
+		t.Fatal(err)
+	}
+	name := object.String()
+	if _, err := os.Stat(filepath.Join(delta, "chunks", name[:4], name+".chunk")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inherited chunk was exported: %v", err)
+	}
+	deltaRepository, err := OpenMemoryRepository(delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := deltaRepository.Branch("child"); err != nil || got != manifestID {
+		t.Fatalf("delta branch = (%s, %v), want %s", got, err, manifestID)
+	}
+	if err := deltaRepository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, objectPath := repository.chunks.path(object)
+	if err := os.Remove(objectPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SetBranch("strict-child", manifestID); err == nil {
+		t.Fatal("strict branch accepted unavailable object")
+	}
+	if err := repository.SetBranchLazy("lazy-child", manifestID); err != nil {
+		t.Fatalf("SetBranchLazy: %v", err)
+	}
+	if got, err := repository.Branch("lazy-child"); err != nil || got != manifestID {
+		t.Fatalf("lazy branch = (%s, %v), want %s", got, err, manifestID)
 	}
 }
 

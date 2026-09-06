@@ -5051,7 +5051,7 @@ func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
 	}
 
 	backend := &runtimeBackend{dataRoot: dataRoot}
-	if err := backend.cloneSparseMemoryRoot(containerID, "source-filesystem", "child-filesystem"); err != nil {
+	if err := backend.cloneSparseMemoryRoot(containerID, "source-filesystem", "child-filesystem", false); err != nil {
 		t.Fatalf("cloneSparseMemoryRoot: %v", err)
 	}
 	if got, err := repository.Branch("child-filesystem"); err != nil || got != manifest {

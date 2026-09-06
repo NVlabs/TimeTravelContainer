@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -63,7 +65,19 @@ type DurableDehydrationRestoreArgs struct {
 	ReusePeerApplicationMemoryFile bool
 	// Sparse uses Files as metadata, memory repository, and (for peer import)
 	// one empty target file per metadata MemoryFile.
-	Sparse bool
+	Sparse            bool
+	SparseRemote      bool
+	SparseRemoteToken ttcchunk.RemoteToken
+	// FilesystemConnections is the number of donated, fenced range streams at
+	// the end of Files. They lazily populate sparse active object caches from a
+	// committed cold pack chain.
+	FilesystemConnections int
+	FilesystemToken       ttcvolume.RemoteToken
+	// FilesystemRestoreIDs maps a logical mount source to the repository ID
+	// serialized by this particular branch. A long-lived Sentry may host cold
+	// branches captured across several local materializations, whose physical
+	// repository IDs differ while their logical mount is the same.
+	FilesystemRestoreIDs map[string]string
 }
 
 // DurableDehydrationRestoreInfo describes the newly installed runtime root.
@@ -106,13 +120,22 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if err != nil {
 		return nil, err
 	}
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(args.FilePayload.Files)-1 || (args.FilesystemConnections != 0 && args.FilesystemConnections != len(l.ttcVolumeRepositories)) {
+		return nil, fmt.Errorf("cold restore has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	payloadMemoryFiles := args.FilePayload.Files[:len(args.FilePayload.Files)-args.FilesystemConnections]
+	filesystemFiles := args.FilePayload.Files[len(payloadMemoryFiles):]
 	if !args.Sparse {
-		if got, want := len(args.FilePayload.Files)-1, len(metadata.Memories); got != want {
+		if got, want := len(payloadMemoryFiles)-1, len(metadata.Memories); got != want {
 			return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
 		}
-	} else if len(args.FilePayload.Files) != 2 || metadata.SparseManifest == (ttcchunk.ManifestID{}) {
+	} else if len(payloadMemoryFiles) != 2+boolInt(args.SparseRemote) || metadata.SparseManifest == (ttcchunk.ManifestID{}) {
 		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
+	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
+		return nil, err
+	}
+	args.FilePayload.Files = payloadMemoryFiles
 	if l.distributedMemoryFile == nil {
 		return nil, errors.New("dehydration target has no reserved application memory file")
 	}
@@ -218,6 +241,17 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 			}
 			return nil, openErr
 		}
+		if args.SparseRemote {
+			fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+			if dupErr != nil {
+				_ = repository.Close()
+				return nil, dupErr
+			}
+			if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
+				_ = repository.Close()
+				return nil, attachErr
+			}
+		}
 		loadOptions.OwnSparseRepository = true
 		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
 	} else {
@@ -264,6 +298,40 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	return &DurableDehydrationRestoreInfo{ID: args.ID, MemoryFiles: len(metadata.Memories)}, nil
 }
 
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func (l *Loader) attachColdFilesystemSources(files []*os.File, token ttcvolume.RemoteToken, branch string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	if len(files) != len(l.ttcVolumeRepositories) {
+		return fmt.Errorf("cold restore has %d filesystem streams for %d repositories", len(files), len(l.ttcVolumeRepositories))
+	}
+	volumes := make([]ttcVolumeRepository, 0, len(l.ttcVolumeRepositories))
+	for _, volume := range l.ttcVolumeRepositories {
+		volumes = append(volumes, volume)
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].config.Source < volumes[j].config.Source })
+	for index, volume := range volumes {
+		fd, err := unix.Dup(int(files[index].Fd()))
+		if err != nil {
+			return fmt.Errorf("duplicating cold filesystem stream %d: %w", index, err)
+		}
+		stream := os.NewFile(uintptr(fd), "ttc-cold-filesystem-stream")
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
+		if err := volume.repository.AttachRemoteObjectSource(stream, token, key, branch); err != nil {
+			stream.Close()
+			return fmt.Errorf("attaching cold filesystem source %q: %w", volume.config.Source, err)
+		}
+	}
+	return nil
+}
+
 func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreArgs) (*DurableDehydrationRestoreInfo, error) {
 	metadataFD, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
 	if err != nil {
@@ -276,10 +344,19 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	if err != nil {
 		return nil, err
 	}
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(args.FilePayload.Files)-1 || (args.FilesystemConnections != 0 && args.FilesystemConnections != len(l.ttcVolumeRepositories)) {
+		return nil, fmt.Errorf("cold peer restore has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	memoryFiles := args.FilePayload.Files[:len(args.FilePayload.Files)-args.FilesystemConnections]
+	filesystemFiles := args.FilePayload.Files[len(memoryFiles):]
+	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
+		return nil, err
+	}
+	args.FilePayload.Files = memoryFiles
 	n := len(metadata.Memories)
 	wantFiles := 1 + 2*n
 	if args.Sparse {
-		wantFiles = 2 + n
+		wantFiles = 2 + n + boolInt(args.SparseRemote)
 		if args.ReusePeerApplicationMemoryFile {
 			wantFiles--
 		}
@@ -312,7 +389,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 		targetStart := 1 + n
 		if args.Sparse {
-			targetStart = 2
+			targetStart = 2 + boolInt(args.SparseRemote)
 		}
 		targetIndex := targetStart + i
 		if args.Sparse && args.ReusePeerApplicationMemoryFile {
@@ -341,6 +418,25 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 	}()
 	err = l.family.RestoreDurablePeer(args, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		if len(args.FilesystemRestoreIDs) != 0 {
+			aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(args.FilesystemRestoreIDs))
+			for id, resource := range resources {
+				aliased[id] = resource
+			}
+			for _, volume := range l.ttcVolumeRepositories {
+				restoreID := args.FilesystemRestoreIDs[volume.config.Source]
+				if restoreID == "" {
+					continue
+				}
+				current := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: volume.repository.Info().ID}
+				resource, ok := resources[current]
+				if !ok {
+					return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
+				}
+				aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+			}
+			resources = aliased
+		}
 		// Branches in one Sentry share the platform. In particular, systrap's
 		// stub mapping and source subprocess are process-global; constructing a
 		// second platform here can collide with the active platform's mappings.
@@ -357,6 +453,17 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
 			if openErr != nil {
 				return nil, openErr
+			}
+			if args.SparseRemote {
+				fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+				if dupErr != nil {
+					_ = repository.Close()
+					return nil, dupErr
+				}
+				if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-peer-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
+					_ = repository.Close()
+					return nil, attachErr
+				}
 			}
 			if args.ReusePeerApplicationMemoryFile {
 				if source.MemoryFile() == nil {

@@ -139,6 +139,9 @@ func (s *Store) PutObject(object Object) error {
 
 // Get verifies and decodes id.
 func (s *Store) Get(id ID) (Chunk, error) {
+	if err := s.ensureLocal(id); err != nil {
+		return Chunk{}, err
+	}
 	if s.repository != nil && s.repository.rootFD != nil {
 		name := id.String()
 		file, err := openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
@@ -164,6 +167,9 @@ func (s *Store) Contains(id ID) error {
 		name := id.String()
 		file, err := openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && s.repository.remoteForObject(id) != nil {
+				return nil
+			}
 			return err
 		}
 		defer file.Close()
@@ -189,6 +195,9 @@ func (s *Store) Contains(id ID) error {
 
 // Open returns the immutable encoded chunk after verifying its content ID.
 func (s *Store) Open(id ID) (*os.File, error) {
+	if err := s.ensureLocal(id); err != nil {
+		return nil, err
+	}
 	var file *os.File
 	var err error
 	if s.repository != nil && s.repository.rootFD != nil {
@@ -210,4 +219,31 @@ func (s *Store) Open(id ID) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+func (s *Store) ensureLocal(id ID) error {
+	if s == nil || s.repository == nil {
+		return nil
+	}
+	remote := s.repository.remoteForObject(id)
+	if remote == nil {
+		return nil
+	}
+	name := id.String()
+	file, err := openFileRelative(int(s.repository.rootFD.Fd()), "chunks/"+name[:4]+"/"+name+".chunk", unix.O_RDONLY, 0)
+	if err == nil {
+		return file.Close()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	data, err := remote.get(id)
+	if err != nil {
+		return err
+	}
+	chunk, err := Decode(data, &id)
+	if err != nil {
+		return err
+	}
+	return s.PutObject(Object{ID: id, Logical: chunk.Logical, Data: data})
 }

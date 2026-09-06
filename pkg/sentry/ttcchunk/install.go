@@ -137,16 +137,20 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 			return InstallResult{}, fmt.Errorf("manifest resource %s does not match destination MemoryFile %s", run.ResourceID, mf.ResourceID())
 		}
 	}
-	objects := make(map[ID]Chunk)
+	// The manifest is content-addressed and contains all identity metadata
+	// required by InstallSparseChunks. Do not open object payloads here: for a
+	// cold remote restore that would eagerly fetch every 1 MiB chunk before the
+	// first guest instruction. Payload hashes and page contents are verified by
+	// ChunkReader when the corresponding resident range first faults in.
+	objects := make(map[ID]pgalloc.LogicalChunkID)
 	for _, run := range manifest.Runs {
-		if _, ok := objects[run.Object]; ok {
-			continue
+		if logical, ok := objects[run.Object]; ok {
+			if logical != run.Logical {
+				return InstallResult{}, fmt.Errorf("manifest object %s has conflicting logical coordinates %+v and %+v", run.Object, logical, run.Logical)
+			}
+		} else {
+			objects[run.Object] = run.Logical
 		}
-		chunk, err := r.chunks.Get(run.Object)
-		if err != nil {
-			return InstallResult{}, fmt.Errorf("loading memory object %s: %w", run.Object, err)
-		}
-		objects[run.Object] = chunk
 	}
 	objectIDs := make([]ID, 0, len(objects))
 	firstOldOffset := make(map[ID]uint64, len(objects))
@@ -167,13 +171,8 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 	})
 	installs := make([]pgalloc.SparseChunkInstall, 0, len(objects))
 	for _, object := range objectIDs {
-		chunk := objects[object]
-		pagesBySlot := make(map[uint8]Page, len(chunk.Pages))
-		for _, page := range chunk.Pages {
-			pagesBySlot[page.Slot] = page
-		}
 		install := pgalloc.SparseChunkInstall{
-			Object: pgalloc.SparseChunkObjectID(object), Logical: chunk.Logical,
+			Object: pgalloc.SparseChunkObjectID(object), Logical: objects[object],
 			Kind: kind, MemCgID: memCgID,
 		}
 		for _, run := range manifest.Runs {
@@ -182,11 +181,7 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 			}
 			for i := uint16(0); i < run.Pages; i++ {
 				slot := run.FirstSlot + uint8(i)
-				page, ok := pagesBySlot[slot]
 				version := pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + uint64(i)}
-				if !ok || page.Version != version {
-					return InstallResult{}, fmt.Errorf("manifest object %s slot %d version mismatch", object, slot)
-				}
 				install.Pages = append(install.Pages, pgalloc.SparseChunkPage{
 					Slot:    slot,
 					Page:    pgalloc.LogicalPageID{Allocator: run.FirstPage.Allocator, Sequence: run.FirstPage.Sequence + uint64(i)},

@@ -208,7 +208,7 @@ Putting the daemon sockets and runsc runtime roots on the NFS mount is an
 invalid layout: a later sibling import can observe unsafe live-runtime
 semantics rather than shared-repository semantics. TTC now detects NFS at
 daemon startup and rejects that layout with instructions to keep only
-`TTC_DATA_ROOT` shared.
+`TTC_ROOT` shared and use a distinct node-local `TTC_LOCAL_ROOT`.
 
 A follow-up cutover-hardening run completed locally in 7.306 seconds. It
 verified that a prepared migration remains physically paused and hidden while

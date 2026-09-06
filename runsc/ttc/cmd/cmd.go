@@ -4573,6 +4573,10 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 			switch branch.StorageState {
 			case "shared":
 				return waitResult{}
+			case "materializing":
+				if branch.StorageManifest != "" {
+					return waitResult{}
+				}
 			case "error":
 				if branch.StorageRetryAt.IsZero() {
 					return waitResult{err: fmt.Errorf("storage publication failed: %s", branch.StorageError)}
@@ -6362,7 +6366,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("querying active peers before starting %s: %w", target, err)
 	}
 	capture.Resume = true
-	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, snapshots); err != nil {
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, snapshots, false); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
 	}
 	return nil
@@ -9759,7 +9763,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		for i, branch := range branches {
 			records[i] = ttcbundle.BranchInfo{
 				ID: branch.ID, ParentID: branch.ParentID, FilesystemBranch: infos[i].FilesystemBranch,
-				State: branch.State, StorageState: "local", CreatedAt: branch.CreatedAt,
+				State: branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 			}
 		}
@@ -9785,7 +9789,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
 		}
 		for i := range records {
-			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch); err != nil {
+			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch, sourceRecord.StorageManifest != ""); err != nil {
 				var cleanupErr error
 				for _, cleanupDestination := range destinations {
 					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
@@ -9894,7 +9898,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
 		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", StorageState: "local", CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, CreatedAt: createdAt}
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
 		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
@@ -9913,7 +9917,11 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			if err != nil {
 				return nil, err
 			}
-			err = repository.SetBranch(filesystemBranch, capture.SparseManifest)
+			if sourceBranch.StorageManifest != "" {
+				err = repository.SetBranchLazy(filesystemBranch, capture.SparseManifest)
+			} else {
+				err = repository.SetBranch(filesystemBranch, capture.SparseManifest)
+			}
 			closeErr := repository.Close()
 			if err != nil {
 				return nil, fmt.Errorf("rooting sparse memory for %s@%s: %w", source.container, destination, err)
@@ -10122,7 +10130,7 @@ func (b *runtimeBackend) prepareStop(target selector) error {
 // cloneSparseMemoryRoot gives a newly forked branch an independent durable
 // root for any chunks that its source still faults on demand. A branch that
 // has never been restored from sparse storage has no root to clone.
-func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBranch, targetFilesystemBranch string) error {
+func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBranch, targetFilesystemBranch string, lazy bool) error {
 	if b.dataRoot == "" || sourceFilesystemBranch == "" || targetFilesystemBranch == "" {
 		return nil
 	}
@@ -10144,6 +10152,9 @@ func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBran
 			return nil
 		}
 		return err
+	}
+	if lazy {
+		return repository.SetBranchLazy(targetFilesystemBranch, manifest)
 	}
 	return repository.SetBranch(targetFilesystemBranch, manifest)
 }
@@ -10738,6 +10749,17 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 }
 
 func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
+	refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		return fmt.Errorf("materializing immutable image cache: %w", err)
+	}
+	info = refreshed
+	localImageBefore := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	_, localImageErr := os.Stat(localImageBefore)
+	needsColdMaterialization := errors.Is(localImageErr, os.ErrNotExist)
+	if localImageErr != nil && !needsColdMaterialization {
+		return localImageErr
+	}
 	if err := b.ensureLocalColdBranch(info, branch); err != nil {
 		return fmt.Errorf("materializing cold branch: %w", err)
 	}
@@ -10783,7 +10805,17 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		snapshots = append(snapshots, file)
 	}
 	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots)
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots, needsColdMaterialization)
+	}
+	var relays *coldFilesystemRelays
+	if needsColdMaterialization {
+		relays, err = b.prepareColdFilesystemRelays(info, branch)
+		if err != nil {
+			return fmt.Errorf("preparing lazy cold filesystem: %w", err)
+		}
+	}
+	if relays != nil {
+		defer relays.close()
 	}
 	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
 	if err != nil {
@@ -10807,6 +10839,18 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse,
+	}
+	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return err
+	}
+	if relays != nil {
+		restoreArgs.FilesystemConnections = len(relays.clients)
+		restoreArgs.FilesystemToken = relays.token
+		if relays.memoryClient != nil {
+			restoreArgs.SparseRemote = true
+			restoreArgs.SparseRemoteToken = relays.memoryToken
+		}
 	}
 	restoreArgs.NetworkArgs, err = dehydrationNetworkArgs(info)
 	if err != nil {
@@ -10841,9 +10885,19 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		defer repository.Close()
 		files = append(files, repository)
 		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
+		if relays != nil && relays.memoryClient != nil {
+			memoryRemoteFD := 3 + len(files)
+			files = append(files, relays.memoryClient)
+			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
+		}
 	} else {
 		files = append(files, snapshots...)
 		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
+	}
+	if relays != nil {
+		filesystemStartFD := 3 + len(files)
+		files = append(files, relays.clients...)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-filesystems-start-fd=%d", filesystemStartFD), fmt.Sprintf("--dehydration-filesystems-count=%d", len(relays.clients)))
 	}
 	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
@@ -10872,6 +10926,11 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
 		return err
 	}
+	if relays == nil {
+		if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.StorageGeneration, "local", "", time.Time{}); err != nil {
+			return err
+		}
+	}
 	// The live runtime and its persistent state are now committed. Failures in
 	// sidecar attachment or page-source bookkeeping must not delete it.
 	runtimeCreated = false
@@ -10896,7 +10955,18 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	return nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File) error {
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File, needsColdMaterialization bool) error {
+	var relays *coldFilesystemRelays
+	var err error
+	if needsColdMaterialization {
+		relays, err = b.prepareColdFilesystemRelays(info, branch)
+		if err != nil {
+			return fmt.Errorf("preparing lazy cold peer filesystem: %w", err)
+		}
+	}
+	if relays != nil {
+		defer relays.close()
+	}
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
@@ -10927,6 +10997,18 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse,
 		ReusePeerApplicationMemoryFile: sparse,
+	}
+	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return err
+	}
+	if relays != nil {
+		restoreArgs.FilesystemConnections = len(relays.clients)
+		restoreArgs.FilesystemToken = relays.token
+		if relays.memoryClient != nil {
+			restoreArgs.SparseRemote = true
+			restoreArgs.SparseRemoteToken = relays.memoryToken
+		}
 	}
 	networkArgs, err := dehydrationNetworkArgs(info)
 	if err != nil {
@@ -10964,6 +11046,12 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		files = append(files, repository)
 		targetStartFD = 6
 		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
+		if relays != nil && relays.memoryClient != nil {
+			memoryRemoteFD := 3 + len(files)
+			files = append(files, relays.memoryClient)
+			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
+			targetStartFD++
+		}
 	} else {
 		files = append(files, snapshots...)
 		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
@@ -10971,7 +11059,13 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	files = append(files, targets...)
 	commandArgs = append(commandArgs,
 		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
-		info.ID, "dehydrate-restore", target.branch)
+	)
+	if relays != nil {
+		filesystemStartFD := 3 + len(files)
+		files = append(files, relays.clients...)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-filesystems-start-fd=%d", filesystemStartFD), fmt.Sprintf("--dehydration-filesystems-count=%d", len(relays.clients)))
+	}
+	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
 	configReader.Close()
 	if err != nil {
@@ -10987,6 +11081,11 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
 		}
 		return err
+	}
+	if relays == nil {
+		if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.StorageGeneration, "local", "", time.Time{}); err != nil {
+			return err
+		}
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
 	// readers reachable and do not roll the peer back for artifact bookkeeping.

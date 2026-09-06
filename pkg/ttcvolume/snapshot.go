@@ -122,6 +122,17 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 // reachable from branch into a new directory. It never serializes unrelated
 // branches.
 func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo, error) {
+	return r.exportSnapshot(branchID, destination, nil)
+}
+
+// ExportSnapshotDelta exports full namespace metadata but omits objects that
+// are already reachable from an immutable parent pack. Locally changed
+// objects remain self-contained in the resulting delta.
+func (r *Repository) ExportSnapshotDelta(branchID, destination string, inherited map[string]struct{}) (SnapshotInfo, error) {
+	return r.exportSnapshot(branchID, destination, inherited)
+}
+
+func (r *Repository) exportSnapshot(branchID, destination string, inherited map[string]struct{}) (SnapshotInfo, error) {
 	if r == nil || r.path == "" {
 		return SnapshotInfo{}, errors.New("snapshot export requires a manager-side repository")
 	}
@@ -193,6 +204,9 @@ func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo,
 	}
 	sort.Strings(objectIDs)
 	for _, id := range objectIDs {
+		if _, ok := inherited[id]; ok {
+			continue
+		}
 		if err := r.ensureObjectRange(id, objects[id], 0, objects[id]); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("materializing remote object %q: %w", id, err)
 		}

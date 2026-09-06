@@ -256,8 +256,9 @@ type Repository struct {
 	journalMu   sync.Mutex
 	journals    map[string]*os.File
 
-	remoteMu sync.Mutex
-	remote   *remoteObjectClient
+	remoteMu       sync.Mutex
+	remotes        map[*remoteObjectClient]struct{}
+	remoteByObject map[string]*remoteObjectClient
 }
 
 type cachedBranch struct {
@@ -530,10 +531,11 @@ func (r *Repository) Close() error {
 	}
 	r.remoteMu.Lock()
 	var remoteErr error
-	if r.remote != nil {
-		remoteErr = r.remote.conn.Close()
-		r.remote = nil
+	for remote := range r.remotes {
+		remoteErr = errors.Join(remoteErr, remote.conn.Close())
 	}
+	r.remotes = nil
+	r.remoteByObject = nil
 	r.remoteMu.Unlock()
 	r.journalMu.Lock()
 	var journalErr error

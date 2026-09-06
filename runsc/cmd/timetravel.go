@@ -81,8 +81,11 @@ type TimeTravel struct {
 	dehydrationSnapshotsCount     int
 	dehydrationSnapshotAllowCopy  bool
 	dehydrationMemoryRepositoryFD int
+	dehydrationMemoryRemoteFD     int
 	dehydrationTargetsStartFD     int
 	dehydrationTargetsCount       int
+	dehydrationFilesystemsStartFD int
+	dehydrationFilesystemsCount   int
 	distributedSessionID          string
 	distributedFamilyID           string
 	distributedListen             string
@@ -172,8 +175,11 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
 	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
 	f.IntVar(&t.dehydrationMemoryRepositoryFD, "dehydration-memory-repository-fd", -1, "inherited sparse dehydration memory repository directory")
+	f.IntVar(&t.dehydrationMemoryRemoteFD, "dehydration-memory-remote-fd", -1, "inherited cold memory chunk stream")
 	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
 	f.IntVar(&t.dehydrationTargetsCount, "dehydration-targets-count", 0, "number of inherited dehydration target memory files")
+	f.IntVar(&t.dehydrationFilesystemsStartFD, "dehydration-filesystems-start-fd", -1, "first inherited cold filesystem range stream")
+	f.IntVar(&t.dehydrationFilesystemsCount, "dehydration-filesystems-count", 0, "number of inherited cold filesystem range streams")
 	f.StringVar(&t.distributedSessionID, "distributed-session", "", "distributed fork transaction/session ID")
 	f.StringVar(&t.distributedFamilyID, "distributed-family", "", "portable distributed fork family identity")
 	f.StringVar(&t.distributedListen, "distributed-listen", "", "host TCP address for the source page server")
@@ -535,7 +541,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			AllowCopy:   t.dehydrationSnapshotAllowCopy,
 		})
 	case "dehydrate-restore":
-		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) {
+		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) || t.dehydrationFilesystemsCount < 0 || (t.dehydrationFilesystemsCount != 0 && t.dehydrationFilesystemsStartFD < 0) {
 			util.Fatalf("--dehydration-config-fd, --dehydration-fd, and a valid snapshot range are required")
 		}
 		configFile := os.NewFile(uintptr(t.dehydrationConfigFD), "dehydration-restore-config")
@@ -573,6 +579,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
 			defer repository.Close()
+			if restoreArgs.SparseRemote {
+				if t.dehydrationMemoryRemoteFD < 0 {
+					util.Fatalf("sparse remote dehydration restore requires a cold memory stream")
+				}
+				remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "dehydration-restore-memory-remote")
+				if remote == nil {
+					util.Fatalf("invalid inherited cold memory FD %d", t.dehydrationMemoryRemoteFD)
+				}
+				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, remote)
+				defer remote.Close()
+			}
 		}
 		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
 			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-restore-snapshot-%d", i))
@@ -586,6 +603,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			file := os.NewFile(uintptr(t.dehydrationTargetsStartFD+i), fmt.Sprintf("dehydration-target-memory-%d", i))
 			if file == nil {
 				util.Fatalf("invalid inherited dehydration target FD %d", t.dehydrationTargetsStartFD+i)
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
+			defer file.Close()
+		}
+		if restoreArgs.FilesystemConnections != t.dehydrationFilesystemsCount {
+			util.Fatalf("dehydration restore configuration has %d filesystem streams, command inherited %d", restoreArgs.FilesystemConnections, t.dehydrationFilesystemsCount)
+		}
+		for i := 0; i < t.dehydrationFilesystemsCount; i++ {
+			file := os.NewFile(uintptr(t.dehydrationFilesystemsStartFD+i), fmt.Sprintf("dehydration-filesystem-stream-%d", i))
+			if file == nil {
+				util.Fatalf("invalid inherited dehydration filesystem FD %d", t.dehydrationFilesystemsStartFD+i)
 			}
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
 			defer file.Close()

@@ -78,7 +78,8 @@ private attach transport remains available. A rootless per-user `ttcd` now
 serves a versioned Unix-socket API, proxies command streams, and
 reconciles persisted families plus missing console drainers after restart;
 startup is explicit so its fixed isolation mode is never inferred from a
-client request, and `--direct` remains an explicit recovery path.
+client request. `ttc` is now a root-unaware RPC client; runtime execution and
+recovery remain exclusively daemon-owned.
 Writable roots and managed volumes are updated directly in disk-backed
 `ttcvol` repositories. Stop, start, restart, and branch removal therefore need
 no rootfs export/import archive or post-exit snapshot hook.
@@ -157,8 +158,8 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       inspected, restarted, and removed.
 - [x] Move default persistent-state ownership behind `ttcd`; metadata files
       use synchronized temp-file replacement, and structural requests use a
-      durable intent/result journal. Keep `--direct` as an explicit recovery
-      path rather than a second background owner.
+      durable intent/result journal. There is no client-side direct mutation
+      path or second background owner.
 
 ## `ttc` command surface
 
@@ -221,8 +222,7 @@ branch-local filesystems, or different simultaneous branch lifecycle states.
       caller without host namespaces or chroots while retaining Sentry guest
       namespaces and credentials. Configure this once on `ttc daemon start`;
       the daemon owns one fixed isolation mode and all ordinary commands
-      inherit it without sending or negotiating a mode. Keep the per-command
-      flag only for explicit `--direct` recovery.
+      inherit it without sending or negotiating a mode.
 - [x] Support Docker-style `--network/--net none|host|ttc` on run/create,
       persist the selected mode across start/restart, and report it through
       inspect. `none` remains the fork-safe default. Host networking is
@@ -674,8 +674,9 @@ and reason.
 - [x] Enforce a single writable sandbox-family attachment until coherent
       cross-Sentry invalidation is implemented; permit additional read-only
       attachments.
-- [ ] Add sparse-aware slow copying, quotas/accounting, branch/object garbage
-      collection, import/export, and explicit branch-head promotion.
+- [x] Add private/shared per-branch accounting and tracing branch/object
+      garbage collection.
+- [ ] Add quotas and explicit branch-head promotion.
 - [ ] Add device/FIFO/socket nodes, ACLs, exhaustive crash fault injection,
       and reflink end-to-end qualification on supported host filesystems.
 
@@ -684,7 +685,7 @@ and reason.
 - [x] Remove the containerd daemon and client dependency. Use the OCI registry,
       manifest, archive, and local content-store libraries in process while TTC
       owns its catalog, locking, lifecycle, and storage paths.
-- [x] Store digest-verified blobs in a private rootless CAS under `--data-root`,
+- [x] Store digest-verified blobs in the shared rootless CAS under `TTC_ROOT`,
       with atomic, versioned image metadata and target-guarded tag deletion.
 - [x] Add deterministic native content pins for every prepared family. The
       image target is pinned transactionally after materialization, the pin ID is
@@ -765,10 +766,10 @@ and reason.
 - [x] Add daemon-mediated request listing and inspection plus explicit, audited
       `succeeded`, `failed`, or `abandoned` resolution for interrupted pending
       intents; resolution never re-executes the original mutation.
-- [x] Add a versioned framed local API with explicit version rejection so the
-      CLI and daemon may be upgraded independently.
-- [x] Keep direct runsc invocation behind the daemon API and an explicit
-      `--direct` recovery path while preserving the branch-control API boundary.
+- [x] Add a versioned framed local API. Official CLI requests require an exact
+      daemon build match; SDK and MCP clients negotiate API features.
+- [x] Keep direct runsc invocation exclusively behind the daemon API while
+      preserving the branch-control boundary.
 
 ## Docker and containerd compatibility
 
