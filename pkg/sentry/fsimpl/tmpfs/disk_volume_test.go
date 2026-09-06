@@ -382,3 +382,18 @@ func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
 		t.Fatalf("source namespace was not restored: %+v", root.childMap)
 	}
 }
+
+func TestDiskNamespaceSaveAcceptsRegularFileRoot(t *testing.T) {
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.refs.InitRefs()
+	fs.root = &dentry{inode: &file.inode}
+
+	fs.pruneDiskNamespaceForSave()
+	if fs.diskSaveChildren != nil {
+		t.Fatalf("regular-file root unexpectedly created saved namespace: %+v", fs.diskSaveChildren)
+	}
+	fs.restoreDiskNamespaceAfterSave()
+}

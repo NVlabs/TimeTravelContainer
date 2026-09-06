@@ -256,6 +256,13 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 	if fs.diskVolume == nil || fs.diskSaveChildren != nil {
 		return
 	}
+	root, ok := fs.root.inode.impl.(*directory)
+	if !ok {
+		// A ttcvol may expose one regular file as its mount root. Such a
+		// filesystem has no cached directory namespace to prune; the root is
+		// already retained by the mount itself.
+		return
+	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.diskSaveChildren = make(map[*directory]map[string]*dentry)
@@ -269,7 +276,7 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 			}
 		}
 	}
-	collect(fs.root.inode.impl.(*directory))
+	collect(root)
 	filtered := make(map[*directory]map[string]*dentry, len(fs.diskSaveChildren))
 	for dir, original := range fs.diskSaveChildren {
 		kept := make(map[string]*dentry)
