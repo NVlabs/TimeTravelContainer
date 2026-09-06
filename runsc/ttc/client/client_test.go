@@ -6,10 +6,31 @@ package client
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
+	command := exec.Command("sh", "-c", "trap '' TERM; sleep 60")
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	started := time.Now()
+	terminateStartedDaemon(command, done)
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("startup cleanup took %v", elapsed)
+	}
+	if err := command.Process.Signal(syscall.Signal(0)); err == nil {
+		t.Fatal("failed daemon startup process survived cleanup")
+	}
+}
 
 func TestHelpAndCompletionAreOffline(t *testing.T) {
 	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))

@@ -384,15 +384,20 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
+	ready := func() bool {
+		conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		status, err := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard)
+		return err == nil && status == 0
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond); err == nil {
-			status, exchangeErr := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard)
-			conn.Close()
-			if exchangeErr == nil && status == 0 {
-				fmt.Fprintln(stdout, "ttcd started")
-				return nil
-			}
+		if ready() {
+			fmt.Fprintln(stdout, "ttcd started")
+			return nil
 		}
 		select {
 		case err := <-done:
@@ -401,8 +406,39 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+	// Close the deadline race with a daemon that became ready during the final
+	// sleep. If it is still unavailable, do not leave a late-starting orphan:
+	// slow or wedged shared storage can otherwise make `daemon start` report
+	// failure while ttcd appears several seconds (or minutes) later.
+	if ready() {
+		fmt.Fprintln(stdout, "ttcd started")
+		return nil
+	}
+	terminateStartedDaemon(command, done)
+	_ = os.Remove(socket)
 	data, _ := os.ReadFile(logPath)
 	return fmt.Errorf("ttcd did not become ready; startup log: %s\n%s", logPath, strings.TrimSpace(string(data)))
+}
+
+func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
+	if command == nil || command.Process == nil {
+		return
+	}
+	// ttcd is a session leader. Signal the entire startup session so any helper
+	// it managed to create before readiness cannot survive the failed launch.
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
+	select {
+	case <-done:
+		return
+	case <-time.After(500 * time.Millisecond):
+	}
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		// A task in uninterruptible kernel I/O cannot be reaped yet, but SIGKILL
+		// remains pending and prevents it from becoming a daemon after recovery.
+	}
 }
 
 // validateDaemonStartEnvironment enforces the daemon's explicit-root contract
