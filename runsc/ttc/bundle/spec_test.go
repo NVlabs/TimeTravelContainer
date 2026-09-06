@@ -2284,6 +2284,47 @@ func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectRepositoriesSkipsUnmaterializedPrivateRepository(t *testing.T) {
+	sharedRoot := t.TempDir()
+	localRoot := t.TempDir()
+	containerID := strings.Repeat("a", 64)
+	bundleDir := filepath.Join(sharedRoot, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource,
+		Path: filepath.Join(localRoot, "containers", containerID, "rootfs-upper"),
+		Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull),
+		Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(repositories),
+	}}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: containerID, Name: "remote-only", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "running", NodeID: "other-node"}},
+	}
+	if err := writeJSON(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := (Store{Root: sharedRoot, ActiveRoot: localRoot}).GarbageCollectRepositories()
+	if err != nil {
+		t.Fatalf("GarbageCollectRepositories: %v", err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected=%d, want 0 for an unmaterialized remote repository", collected)
+	}
+}
+
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}

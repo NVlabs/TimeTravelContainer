@@ -10468,6 +10468,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return errors.New("sparse dehydration export returned an empty manifest ID")
 		}
 		sparseFilesystemBranch = capture.FilesystemBranch
+		// Root the published manifest immediately. Publish deliberately leaves a
+		// transaction fence until SetBranch commits reachability; delaying this
+		// until after the control-directory rename leaked transactions and chunks
+		// whenever a later metadata step failed. The deferred rollback restores
+		// the previous root (or deletes this one), so this early commit remains
+		// atomic from the branch lifecycle's point of view.
+		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
+			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
+		}
+		sparseRootChanged = true
 		capture.SparseManifest = exportInfo.Manifest
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
@@ -10492,10 +10502,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
 			_ = dir.Sync()
 			_ = dir.Close()
-		}
-		sparseRootChanged = true
-		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
-			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
 		}
 		// Remote dependencies remain live until the asynchronous shared
 		// publication commits. The publisher advances the transaction only after

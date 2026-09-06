@@ -3868,6 +3868,17 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 	for _, path := range ordered {
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
+			// Cluster metadata describes the family on every node, while private
+			// rootfs and copied-host repositories exist only on nodes that have
+			// materialized the branch. A non-owner must not report routine GC
+			// failures for another node's absent active repository.
+			if errors.Is(err, fs.ErrNotExist) {
+				if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				} else if statErr != nil {
+					return collected, fmt.Errorf("stating repository %q: %w", path, statErr)
+				}
+			}
 			return collected, fmt.Errorf("opening repository %q: %w", path, err)
 		}
 		gcErr := repository.GarbageCollect()
