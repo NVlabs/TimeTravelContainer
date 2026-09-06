@@ -549,8 +549,10 @@ class Client:
             ["kill", *(["--signal", str(signal)] if signal is not None else []), target]
         )
 
-    def wait(self, target: str) -> Result:
-        return self.command(["wait", target], timeout=None)
+    def wait(self, target: str, *, condition: str = "not-running") -> Result:
+        if condition not in ("not-running", "durable"):
+            raise ValueError("condition must be 'not-running' or 'durable'")
+        return self.command(["wait", "--condition", condition, target], timeout=None)
 
     def remove(self, target: str, *, force: bool = False) -> Result:
         return self.command(["rm", *(["--force"] if force else []), target])

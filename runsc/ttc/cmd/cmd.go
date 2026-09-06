@@ -89,7 +89,6 @@ type options struct {
 	allowSlowVolumeCopy   bool
 	daemonSocket          string
 	direct                bool
-	clientExecutable      string
 }
 
 // Run executes ttc with args and returns a process exit status.
@@ -362,8 +361,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
 		err = runRemove(args[1:], stdout, stderr, backend)
-	case "_auto-remove":
-		err = runAutoRemove(args[1:], backend)
+	case "_auto-remove-now":
+		err = runAutoRemoveNow(args[1:], backend)
 	case "_purge-runtime":
 		if len(args) != 2 {
 			err = errors.New("internal runtime purge requires one family ID")
@@ -2952,44 +2951,13 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-func runAutoRemove(args []string, backend backend) error {
+func runAutoRemoveNow(args []string, backend backend) error {
 	if len(args) != 1 {
-		return errors.New("internal auto-remove requires one branch selector")
+		return errors.New("internal auto-remove-now requires one branch selector")
 	}
 	target, err := parseSelector(args[0])
 	if err != nil {
 		return fmt.Errorf("internal auto-remove target: %w", err)
-	}
-	if _, err := backend.wait(target); err != nil {
-		return fmt.Errorf("waiting to auto-remove %s: %w", target, err)
-	}
-	// A detached helper waits independently so daemon restarts do not lose the
-	// --rm policy. Once deletion is due, route it back through a live daemon: it
-	// owns attach/log client connections and can close them before unlinking
-	// console artifacts. If no daemon is running, no daemon-owned readers can
-	// remain, so direct removal is safe.
-	if runtime, ok := backend.(*runtimeBackend); ok && runtime.daemonSocket != "" {
-		if conn, err := connectRunningDaemon(runtime.daemonSocket); err == nil {
-			_ = conn.Close()
-			inspect, err := backend.inspect(target.container)
-			if err != nil {
-				return err
-			}
-			removeArgs := []string{"rm", "-f"}
-			if len(inspect.TTC.Branches) <= 1 {
-				removeArgs = append(removeArgs, "--volumes", target.container)
-			} else {
-				removeArgs = append(removeArgs, target.String())
-			}
-			status, err := runViaDaemon(options{daemonSocket: runtime.daemonSocket, dataRoot: runtime.dataRoot}, removeArgs, strings.NewReader(""), io.Discard, io.Discard)
-			if err != nil {
-				return fmt.Errorf("requesting daemon auto-removal of %s: %w", target, err)
-			}
-			if status != 0 {
-				return fmt.Errorf("daemon auto-removal of %s exited with status %d", target, status)
-			}
-			return nil
-		}
 	}
 	if err := autoRemoveTarget(target, backend); err != nil {
 		return fmt.Errorf("auto-removing %s: %w", target, err)
@@ -5385,7 +5353,6 @@ type runtimeBackend struct {
 	disableHostGSO        bool
 	allowSlowVolumeCopy   bool
 	volumeCopyMode        ttcvolume.CopyMode
-	clientExecutable      string
 	clientTERM            string
 	progressTerminal      bool
 	progressWidth         int
@@ -5477,6 +5444,16 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		return nil
 	}
 	store := b.containerStore()
+	// Publication intents are durable and may outlive the user-facing name or
+	// the daemon process that created them. Key them by the immutable container
+	// ID so publish completion, branch removal fencing, and restart recovery all
+	// address the same generation even when the lifecycle command used a name
+	// or ID prefix.
+	container, err := store.LoadContainer(target.container)
+	if err != nil {
+		return err
+	}
+	target.container = container.ID
 	generation, err := store.BeginBranchPublication(target.container, target.branch)
 	if err != nil {
 		return err
@@ -6517,30 +6494,20 @@ func (b *runtimeBackend) applyAutoRemove(target selector, detach bool, status in
 }
 
 func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
-	executable := b.clientExecutable
+	executable := b.runsc
 	if executable == "" {
 		executable = currentExecutable()
 	}
-	if executable == "" {
-		return errors.New("locating ttc executable")
+	if executable == "" || b.daemonSocket == "" {
+		return errors.New("locating ttcd auto-remove helper")
 	}
-	args := []string{}
-	if b.daemonSocket != "" {
-		args = append(args, "--daemon-socket", b.daemonSocket)
-	}
-	args = append(args, "_auto-remove", target.String())
+	args := []string{"_auto-remove-client", "--socket", b.daemonSocket, target.String()}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("opening auto-remove stdio: %w", err)
 	}
 	defer devNull.Close()
 	command := exec.Command(executable, args...)
-	for _, value := range os.Environ() {
-		if !strings.HasPrefix(value, "TTC_RUNTIME_PLATFORM=") {
-			command.Env = append(command.Env, value)
-		}
-	}
-	command.Env = append(command.Env, "TTC_RUNTIME_PLATFORM="+b.runtimePlatform)
 	command.Stdin = devNull
 	command.Stdout = devNull
 	// The helper is the process that ultimately unlinks the container tree. Its

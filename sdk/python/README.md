@@ -72,6 +72,7 @@ ttc.exec_session("demo@candidate-a", ["sh"], session="build1", tty=True).check()
 print(ttc.tty_stat("demo@candidate-a", "build1"))
 print(ttc.stats("demo@candidate-a"))
 print(ttc.diff("demo@candidate-a"))
+ttc.wait("demo@candidate-a", condition="durable").check()
 ttc.commit("demo@candidate-a", "local/result:latest",
            changes=["LABEL timetravel.usage=review"]).check()
 archive = ttc.save(["local/result:latest"]).stdout
@@ -129,7 +130,8 @@ working directory.
 
 Set `TTC_SOCKET` or `XDG_RUNTIME_DIR` as for the CLI, or pass
 `Client("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
-`TTC_LOCAL_ROOT`.
+`TTC_LOCAL_ROOT`. They negotiate the public API/features reported by `ping`;
+the exact-build restriction applies to the official `ttc` binary, not SDKs.
 
 ## Test
 

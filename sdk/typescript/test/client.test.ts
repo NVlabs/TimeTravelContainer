@@ -198,6 +198,22 @@ test("elastic cluster helpers use the current CLI shape", async () => {
   );
 });
 
+test("durable wait uses the current CLI shape", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "wait", "--condition", "durable", "demo@main",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      assert.equal((await new Client(path).wait(
+        "demo@main", { condition: "durable" },
+      )).ok, true);
+    },
+  );
+});
+
 test("image helpers use Docker-compatible command shapes", async () => {
   assert.throws(() => new Client("/unused").load(), /requires input or archive/);
 

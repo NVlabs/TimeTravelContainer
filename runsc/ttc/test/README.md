@@ -94,12 +94,12 @@ covers:
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
   over versioned timestamped records, including filtering and legacy-record decoding;
 - `exec`, selective stdin/stdout/stderr `attach`, transactional `fork`
-  rejection diagnostics, live `fork`, `pause`,
+  behavior, live `fork`, `pause`,
   `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, JSON
   creation timestamps, and branch-local writable/virtual `ps --size` accounting;
-- attached exec fork rejection while imported host stdio is live, successful
-  fork after the imported resource exits, and detached exec-session ID/PID cloning
+- live fork while a daemon-mediated attached exec is active, and detached
+  exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
 - user tmpfs copy-on-write isolation between a parent and child branch;
 - tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
@@ -162,7 +162,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 
@@ -171,7 +171,7 @@ No-userns example:
 ```shell
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 Use `TTC_E2E_ROOT` to retain the generated TTC state for inspection. Image
@@ -196,7 +196,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_cp
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_cp.sh"
 ```
 
@@ -227,7 +227,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
 
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
@@ -275,7 +275,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc \
   //runsc/ttc/test:e2e_local_registry
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/registry_fixture_/registry_fixture" \
 FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_/guest" \
   "$PWD/runsc/ttc/test/e2e_local_registry.sh"

@@ -56,6 +56,7 @@ Harness-oriented helpers are available directly:
 console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
 console.log(await ttc.stats("demo@candidate-a"));
 console.log(await ttc.diff("demo@candidate-a"));
+(await ttc.wait("demo@candidate-a", { condition: "durable" })).check();
 (await ttc.commit("demo@candidate-a", "local/result:latest",
                   { changes: ["LABEL timetravel.usage=review"] })).check();
 const archive = await ttc.save(["local/result:latest"]);
@@ -103,7 +104,8 @@ the daemon. Use absolute host paths in raw file-oriented commands because
 
 Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or construct
 `new Client({socketPath: "/path/to/ttcd.sock"})`. SDK clients never need
-`TTC_ROOT` or `TTC_LOCAL_ROOT`.
+`TTC_ROOT` or `TTC_LOCAL_ROOT`. They negotiate the public API/features
+reported by `ping`; exact build matching is specific to the official CLI.
 
 ## Develop and test
 

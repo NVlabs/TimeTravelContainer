@@ -41,6 +41,22 @@ func TestTTCSocketAndOverride(t *testing.T) {
 	}
 }
 
+func TestDaemonStartRequiresExplicitRootBeforeSideEffects(t *testing.T) {
+	t.Setenv("TTC_ROOT", "")
+	t.Setenv("TTC_DATA_ROOT", "")
+	if err := validateDaemonStartEnvironment(); err == nil || !strings.Contains(err.Error(), "TTC_ROOT") {
+		t.Fatalf("missing root error=%v", err)
+	}
+	t.Setenv("TTC_DATA_ROOT", "/legacy")
+	if err := validateDaemonStartEnvironment(); err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("legacy root error=%v", err)
+	}
+	t.Setenv("TTC_ROOT", "/fresh")
+	if err := validateDaemonStartEnvironment(); err != nil {
+		t.Fatalf("explicit root: %v", err)
+	}
+}
+
 func TestNormalizeClientRelativePaths(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {

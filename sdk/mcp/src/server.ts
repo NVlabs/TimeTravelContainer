@@ -408,15 +408,16 @@ export function createServer(client = new Client()): McpServer {
   server.registerTool(
     "ttc_wait",
     {
-      description: "Wait for a TTC branch to stop and return its exit status.",
+      description: "Wait for a TTC branch to stop, or for its captured state to become shared-durable.",
       inputSchema: {
         target: z.string().describe("Full container@branch selector"),
+        condition: z.enum(["not-running", "durable"]).default("not-running"),
         timeoutMs: z.number().int().positive().optional(),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ target, timeoutMs }) =>
-      commandResponse(await client.wait(target, { timeoutMs })),
+    async ({ target, condition, timeoutMs }) =>
+      commandResponse(await client.wait(target, { condition, timeoutMs })),
   );
 
   server.registerTool(

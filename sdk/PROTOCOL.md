@@ -15,6 +15,13 @@ The default socket is selected in this order:
 ttcd accepts clients owned by the same Unix user. Each operation uses a new
 connection.
 
+The official `ttc` binary includes its build ID and requires an exact match
+with `ttcd` for daemon operations. SDK and MCP clients intentionally omit that
+private build assertion: they negotiate the public API version and inspect the
+feature/status fields returned by `ping`. This lets an SDK remain usable across
+daemon builds that preserve the same public protocol. Storage roots never
+cross this interface.
+
 ## Request
 
 The client writes one newline-terminated JSON object:
@@ -42,6 +49,10 @@ destination is a branch name; a remote fork destination is a
 implicit `main` selection beyond what the CLI command itself documents.
 
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
+Inspection and statistics also expose storage placement (`local`,
+`publishing`, `shared`, `materializing`, or `error`) and any volatile source
+dependencies. `wait --condition durable` completes only after the selected
+generation is committed to shared storage.
 
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`

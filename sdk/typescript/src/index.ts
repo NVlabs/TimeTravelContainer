@@ -667,8 +667,14 @@ export class Client {
     ]);
   }
 
-  wait(target: string, options: Pick<CommandOptions, "timeoutMs"> = {}): Promise<Result> {
-    return this.command(["wait", target], options);
+  wait(
+    target: string,
+    options: Pick<CommandOptions, "timeoutMs"> & {
+      condition?: "not-running" | "durable";
+    } = {},
+  ): Promise<Result> {
+    const { condition = "not-running", ...commandOptions } = options;
+    return this.command(["wait", "--condition", condition, target], commandOptions);
   }
 
   remove(target: string, force = false): Promise<Result> {

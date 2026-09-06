@@ -74,6 +74,16 @@ const (
 	daemonRootlessProbeArg = "_rootless-userns-probe"
 )
 
+var daemonAPIFeatures = []string{
+	"batch-fork",
+	"durable-wait",
+	"elastic-cluster",
+	"filesystem-range-paging",
+	"named-exec",
+	"storage-status",
+	"tty-observation",
+}
+
 const repositoryMaintenanceInterval = 5 * time.Minute
 
 const daemonRootFormatVersion = 1
@@ -132,7 +142,6 @@ type daemonServer struct {
 	localRoot             string
 	root                  string
 	runsc                 string
-	clientExecutable      string
 	volumeCapability      ttcvolume.Capability
 	clusterCapabilities   *cluster.Capabilities
 	clusterListen         string
@@ -1360,7 +1369,6 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		disableHostGSO:        opts.disableHostGSO,
 		allowSlowVolumeCopy:   opts.allowSlowVolumeCopy,
-		clientExecutable:      opts.clientExecutable,
 		clientTERM:            os.Getenv("TERM"),
 		progressTerminal:      progressTerminal,
 		progressWidth:         progressWidth,
@@ -1575,7 +1583,6 @@ func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 	opts := optionsFromWire(w)
 	opts.root = s.root
 	opts.runsc = s.runsc
-	opts.clientExecutable = s.clientExecutable
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
@@ -1676,21 +1683,6 @@ func currentHostKernelRelease() (string, error) {
 		return "", errors.New("uname returned an empty host kernel release")
 	}
 	return release.String(), nil
-}
-
-func siblingTTCExecutable() string {
-	executable, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	if filepath.Base(executable) == "ttc" {
-		return executable
-	}
-	sibling := filepath.Join(filepath.Dir(executable), "ttc")
-	if info, err := os.Stat(sibling); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-		return sibling
-	}
-	return ""
 }
 
 func normalizeRuntimePlatform(value string) (string, error) {
@@ -2501,7 +2493,6 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		localRoot:             localRoot,
 		root:                  root,
 		runsc:                 runsc,
-		clientExecutable:      siblingTTCExecutable(),
 		volumeCapability:      volumeCapability,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
@@ -2831,6 +2822,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		status := map[string]any{
 			"version":                  daemonAPIVersion,
 			"build_id":                 version.Version(),
+			"features":                 daemonAPIFeatures,
 			"pid":                      os.Getpid(),
 			"runtime_platform":         s.runtimePlatform,
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
@@ -3159,7 +3151,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove", "_purge-runtime", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove-now", "_purge-runtime", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls" && args[1] != "_planner-resources"
@@ -3596,6 +3588,26 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 		return 1, fmt.Errorf("daemon mutation request %s: %w", request.RequestID, lastErr)
 	}
 	return 1, lastErr
+}
+
+// RunAutoRemoveClient is the daemon-owned helper used by detached --rm
+// containers. It waits through the normal daemon command path without
+// depending on, or executing, the lightweight ttc client binary.
+func RunAutoRemoveClient(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 3 || args[0] != "--socket" || args[1] == "" || args[2] == "" {
+		fmt.Fprintln(stderr, "ttcd: usage: ttcd _auto-remove-client --socket PATH CONTAINER@BRANCH")
+		return 2
+	}
+	opts := options{daemonSocket: args[1]}
+	status, err := runViaDaemon(opts, []string{"wait", args[2]}, strings.NewReader(""), io.Discard, stderr)
+	if err == nil && status == 0 {
+		status, err = runViaDaemon(opts, []string{"_auto-remove-now", args[2]}, strings.NewReader(""), stdout, stderr)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd: auto-remove helper: %v\n", err)
+		return 1
+	}
+	return status
 }
 
 // normalizeDaemonImageArchivePaths gives load/save the same client-relative

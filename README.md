@@ -42,8 +42,9 @@ TTC is designed for efficiency. Memory and writable storage are
 - **Dehydrate/rehydrate:** dehydrate a branch to free its CPU and memory, then
   rehydrate it later with its processes and CoW relationships intact.
 - **Remote fork/migration:** fork a branch to another TTC node and start it
-  without first transferring all of its memory. Missing memory is fetched on
-  demand over the network or from shared storage.
+  without first transferring all of its memory or filesystem. Missing 1 MiB
+  memory and filesystem ranges are fetched on demand from the fenced source or
+  shared storage; target writes are always node-local.
 
 ## Get Started
 
@@ -197,7 +198,9 @@ Host requirements are deliberately small:
 Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
 node-local `TTC_LOCAL_ROOT` for active runtimes and caches. `TTC_SOCKET` may
 override the per-user daemon socket; `--daemon-socket` takes precedence for a
-single client invocation.
+single client invocation. `ttc` owns its help and command grammar locally, so
+help, completion, and version output do not depend on a running daemon. For
+daemon operations, the official client and daemon builds must match exactly.
 
 ## Current Limitations
 
@@ -240,6 +243,7 @@ recovery, and nested execution.
 ### Development Docs
 
 - [Harness feature tracker and stress-test policy](g3doc/development/ttc_harness_features.md)
+- [Client/daemon boundary and size audit](g3doc/development/ttc_client_boundary.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
 - [Branch state machine](g3doc/ttc_state_machine.md)
 - [Distributed live-fork plan](g3doc/proposals/ttc_distributed_live_fork.md)

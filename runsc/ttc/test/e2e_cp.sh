@@ -17,7 +17,7 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
@@ -29,7 +29,7 @@ fail() {
 }
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
-[ -x "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
+[ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -39,8 +39,13 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+ln -sf "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+ln -sf "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 CONTAINER="cp-$$"
 VOLUME="cp-volume-$$"
 HOST_SOURCE="$TTC_E2E_ROOT/host-source"
@@ -49,12 +54,7 @@ HOST_CONTENTS="$TTC_E2E_ROOT/host-contents"
 ARCHIVE="$TTC_E2E_ROOT/export.tar"
 
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 cleanup() {

@@ -195,6 +195,17 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       "one:latest",
       "two:test",
     ]);
+
+    await client.callTool({
+      name: "ttc_wait",
+      arguments: { target: "demo@main", condition: "durable", timeoutMs: 60_000 },
+    });
+    assert.deepEqual(mock.requests[8].args, [
+      "wait",
+      "--condition",
+      "durable",
+      "demo@main",
+    ]);
   } finally {
     await client.close();
     await new Promise<void>((resolveClose) => mock.server.close(() => resolveClose()));

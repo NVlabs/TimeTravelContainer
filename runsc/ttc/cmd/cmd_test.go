@@ -2726,23 +2726,20 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 }
 
-func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
+func TestInternalAutoRemoveNowForcesRemoval(t *testing.T) {
 	b := &fakeBackend{
 		waitStatus: uint32(7 << 8),
 		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
 			Metadata: Branch{ID: "main", State: "exited"},
 		}}}},
 	}
-	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
-		t.Fatalf("runAutoRemove: %v", err)
-	}
-	if b.waited != (selector{container: "demo", branch: "main"}) {
-		t.Errorf("waited=%+v", b.waited)
+	if err := runAutoRemoveNow([]string{"demo@main"}, b); err != nil {
+		t.Fatalf("runAutoRemoveNow: %v", err)
 	}
 	if b.removed != "demo" || !b.removeForce || !b.removeVolumes {
 		t.Errorf("remove=(%q, force=%t, volumes=%t)", b.removed, b.removeForce, b.removeVolumes)
 	}
-	if err := runAutoRemove([]string{"demo"}, b); err == nil {
+	if err := runAutoRemoveNow([]string{"demo"}, b); err == nil {
 		t.Fatal("internal auto-remove accepted an unqualified family")
 	}
 }
@@ -2754,8 +2751,8 @@ func TestInternalAutoRemovePreservesForkedPeers(t *testing.T) {
 			{Metadata: Branch{ID: "child", State: "running"}},
 		}}},
 	}
-	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
-		t.Fatalf("runAutoRemove: %v", err)
+	if err := runAutoRemoveNow([]string{"demo@main"}, b); err != nil {
+		t.Fatalf("runAutoRemoveNow: %v", err)
 	}
 	if b.destroyed != (selector{container: "demo", branch: "main"}) || !b.destroyForce {
 		t.Errorf("destroyed=%+v force=%t", b.destroyed, b.destroyForce)

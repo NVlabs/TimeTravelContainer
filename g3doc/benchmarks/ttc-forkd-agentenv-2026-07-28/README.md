@@ -224,7 +224,7 @@ waiting sandbox "...": sandbox is still running: exit status 128
 
 The durable mutation record completed with status 1 and retained the container
 metadata. After the daemon exited, documented recovery mode
-`ttc --direct rm -f ttc-bench` removed that stale family immediately. This did
+`ttc rm -f ttc-bench` removed that stale family immediately. This did
 not affect benchmark samples because it happened after all measurements, but
 it is a real lifecycle/reconciliation bug. TTC should treat confirmed sandbox
 process death as authoritative during forced removal and clear stale runsc

@@ -242,8 +242,9 @@ request ID. A request looks like:
 ```
 
 Atomic publication makes the outbox safe to scan after either side restarts.
-Receivers should still deduplicate `request_id`. Native executable/HTTP
-adapters and release events are future additions.
+Receivers should still deduplicate `request_id`. Native executable and HTTP
+webhook adapters are implemented; a separate provider-specific capacity
+release adapter remains future work.
 
 ## Graceful drain
 
@@ -252,7 +253,8 @@ adapters and release events are future additions.
 3. Reserve every selected destination and migrate running and paused
    partitions; then transfer zero-resident cold branch ownership.
 4. Drain volatile page dependencies to shared chunks.
-5. Transfer filesystem and network leases.
+5. Transfer filesystem and network leases and publish any remaining sealed
+   filesystem generations.
 6. Verify no branch, transaction, chunk lease, port listener, or session proxy
    remains owned by the node.
 7. Mark offline, stop `ttcd`, and emit a capacity release event.

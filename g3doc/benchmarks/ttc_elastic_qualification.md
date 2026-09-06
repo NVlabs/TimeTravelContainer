@@ -210,6 +210,32 @@ semantics rather than shared-repository semantics. TTC now detects NFS at
 daemon startup and rejects that layout with instructions to keep only
 `TTC_ROOT` shared and use a distinct node-local `TTC_LOCAL_ROOT`.
 
+### Explicit-root and tiered-storage regression
+
+After separating the root-unaware client from daemon storage configuration,
+the capacity smoke was rerun with one shared `TTC_ROOT`, two distinct
+node-local `TTC_LOCAL_ROOT` values, and independent `TTC_SOCKET` paths. A
+two-branch BusyBox drain completed in 7.501 seconds, including one injected
+capacity-provider failure and retry. A nontrivial Ubuntu 24.04 run created
+1,000 files and a tar archive before migration, then verified every file and
+wrote and synchronized 8 MiB independently in both branches; it completed in
+10.044 seconds (0.261 seconds preparation, 0.082 and 0.169 seconds branch
+verification).
+
+The BusyBox case also passed with the shared root on a loopback NFSv3 mount in
+9.01 seconds. A heavier NFS attempt exposed a race between eager dependency
+drain and sparse target handoff: the eager drain could make the transaction
+source-independent before the target registered a sparse descriptor, causing
+the target to retry forever. The target now recognizes that fenced state as a
+completed handoff. The heavy Ubuntu case passed locally after the fix; the
+follow-up loopback-NFS run was not used as evidence because the local kernel
+NFS server itself stalled during remount. Earlier Rocky Linux and repeated
+crash/rejoin NFS results above continue to cover the full NFS workload path.
+
+The remote `/dev/kvm` qualification node was unreachable during this run
+(`No route to host`). KVM remains part of Phase 5 rather than being marked
+qualified by loopback evidence.
+
 A follow-up cutover-hardening run completed locally in 7.306 seconds. It
 verified that a prepared migration remains physically paused and hidden while
 placement still names the source, then publishes console/exec sidecars and

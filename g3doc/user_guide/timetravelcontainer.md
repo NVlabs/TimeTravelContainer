@@ -203,7 +203,12 @@ node drain, remaining local files are disposable caches or staging residue.
 The client locates the daemon through `TTC_SOCKET`, then
 `$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
 `--daemon-socket` takes precedence for one invocation. The client never needs
-access to either storage root.
+access to either storage root. Help, shell completion, argument validation, and
+`ttc --version` are client-local and work without a daemon. Ordinary CLI
+operations require the client and daemon build IDs to match exactly; `daemon
+stop` remains available as the version-independent recovery operation. SDK and
+MCP clients negotiate the public API and features instead of asserting a CLI
+build ID.
 
 ## Images
 
@@ -353,10 +358,12 @@ ttc fork web@archived candidate-a candidate-b
 ## Distributed live fork
 
 Configured TTC nodes can place a live child on another host without first
-copying all container memory or creating a checkpoint. The target starts from
-a sparse memory manifest. It can temporarily fetch missing 1 MiB chunks from
-the live source while immutable copies are published to shared storage; once a
-chunk is durable, the target no longer depends on the source process for it.
+copying all container memory or extracting its filesystem, and without
+creating a checkpoint. The target starts from sparse memory and filesystem
+manifests. It can temporarily fetch missing 1 MiB ranges from the transaction-
+fenced live source while immutable copies are published to shared storage;
+target writes always create target-local data. Once every required range is
+local or durable, the target no longer depends on the source process.
 
 The nodes must use the same shared TTC data root and repository ID, have the
 same image content available, and be able to reach each other's control and
@@ -405,11 +412,11 @@ ttc fork --target node-b web@main \
 
 Using one destination family lets compatible branches share one Sentry and
 resident page cache on node B. Each child still has an independent filesystem
-and process state. A child becomes source-independent when every live memory
-dependency has been promoted to shared storage; it need not fault every chunk
-into RAM. `ttc inspect` reports transaction state and transfer metrics. Source
-shutdown drains or promotes remaining dependencies before allowing the source
-daemon to exit.
+and process state. A child becomes source-independent when every volatile
+memory and filesystem dependency is cached locally or promoted to shared
+storage; it need not fault every range into RAM. `ttc inspect` and `ttc stats`
+report the source node and remaining dependent bytes. Source shutdown drains
+or promotes all dependencies before allowing the source daemon to exit.
 
 Distributed live fork currently targets one remote node per command. Use a
 durable checkpoint for offline transfer or for TTC installations that do not
@@ -440,10 +447,13 @@ Family-wide `ttc stop FAMILY`, `ttc dehydrate FAMILY`, and `ttc rm FAMILY`
 also work when the family's branches are spread across nodes. TTC coordinates
 the owner-local operations and prints one result for the original family.
 
-The current migration path uses a durable conservative cutover: it dehydrates
-the branch, transfers its fenced ownership, then rehydrates it on the target.
-The source cannot execute after ownership changes. External connections are
-interrupted according to the same policy as remote fork.
+Migration uses a live sparse cutover. It pauses and captures the selected
+branch once, prepares a paused target that can demand-page memory and
+filesystem ranges, atomically transfers fenced ownership, and only then lets
+the target run. The source cannot execute after ownership changes, while its
+sealed snapshot remains available until all target dependencies are local or
+shared-durable. External connections are interrupted according to the same
+policy as remote fork.
 
 To remove a compute node, drain it from any TTC client:
 
@@ -777,6 +787,15 @@ Resident memory counts mapped application pages in the Sentry; it deliberately
 does not estimate the Sentry's Go heap or unmapped cache. Filesystem sharing is
 reported at TTC's immutable file-object boundary, while durable memory backing
 is reported from still-present sparse chunk objects.
+
+JSON inspection reports storage separately from lifecycle. `storage_state` is
+`local`, `publishing`, `shared`, `materializing`, or `error`; publication
+errors include retry details. This lets an orchestrator use a branch as soon
+as local capture finishes while independently waiting for shared durability:
+
+```shell
+ttc wait --condition durable web@test-b
+```
 
 ## Filesystems and volumes
 

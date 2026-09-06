@@ -198,6 +198,25 @@ class ClientTest(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_wait_durable_uses_current_cli_shape(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["wait", "--condition", "durable", "demo@main"],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                self.assertTrue(
+                    Client(daemon.path).wait("demo@main", condition="durable").ok
+                )
+                with self.assertRaisesRegex(ValueError, "condition"):
+                    Client(daemon.path).wait("demo@main", condition="invalid")
+            finally:
+                daemon.close()
+
     def test_image_helpers_use_docker_compatible_command_shapes(self):
         with self.assertRaisesRegex(ValueError, "requires input or archive"):
             Client("/unused").load()

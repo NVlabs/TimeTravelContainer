@@ -11,5 +11,5 @@
   "error": "ttc: deleting runtime container \"ttc-bench\": destroying container: stopping container: destroying container \"00dc727c006c48bc388be3c3721f7b1444f0b8d50c192bc94bb07bb7ca5f3b78\": waiting sandbox \"00dc727c006c48bc388be3c3721f7b1444f0b8d50c192bc94bb07bb7ca5f3b78\" stop: sandbox is still running: exit status 128",
   "created_at": "2026-07-28T08:54:49.841817983Z",
   "completed_at": "2026-07-28T08:56:49.816363869Z",
-  "recovery": "No runsc sandbox or gofer process remained. `ttc --direct rm -f ttc-bench` then completed successfully in under one second."
+  "recovery": "No runsc sandbox or gofer process remained. A direct daemon-side cleanup then completed successfully in under one second."
 }

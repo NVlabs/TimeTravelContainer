@@ -18,7 +18,7 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
@@ -30,7 +30,7 @@ fail() {
 }
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
-[ -x "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
+[ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -40,8 +40,13 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+ln -sf "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+ln -sf "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 PREFIX="volume-$$"
 MAIN="$PREFIX-main"
 SECOND="$PREFIX-second"
@@ -56,12 +61,7 @@ HOST_COW_RESTORED="$PREFIX-host-cow-restored"
 HOST_COPY_RESTORED="$PREFIX-host-copy-restored"
 
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 cleanup() {
@@ -105,7 +105,7 @@ ttc cp "$ROOTFS_CONTAINER@child:/rootfs-child" "$CHILD_EXPORT"
 [ "$(cat "$CHILD_EXPORT")" = child ] ||
   fail "stopped child cp selected the wrong persistent rootfs branch"
 ttc cp "$HOST_IMPORT" "$ROOTFS_CONTAINER@main:/rootfs-offline-import"
-ttc start "$ROOTFS_CONTAINER" >/dev/null
+ttc start "$ROOTFS_CONTAINER@main" >/dev/null
 ttc exec "$ROOTFS_CONTAINER@main" sh -c '
   test "$(cat /rootfs-base)" = base
   test "$(cat /rootfs-offline-import)" = offline-import
@@ -121,7 +121,7 @@ ttc cp "$HOST_IMPORT" "$CREATED_CONTAINER@main:/created-import"
 ttc cp "$CREATED_CONTAINER@main:/created-import" "$CREATED_EXPORT"
 [ "$(cat "$CREATED_EXPORT")" = offline-import ] ||
   fail "created-container offline cp did not round-trip"
-ttc start "$CREATED_CONTAINER" >/dev/null
+ttc start "$CREATED_CONTAINER@main" >/dev/null
 ttc exec "$CREATED_CONTAINER@main" test -f /created-import
 ttc stop "$CREATED_CONTAINER@main" >/dev/null
 ttc rm "$CREATED_CONTAINER" >/dev/null
@@ -173,7 +173,7 @@ ttc cp "$HOST_COW_CONTAINER@main:/data/value" "$HOST_COW_EXPORT"
 [ "$(cat "$HOST_COW_EXPORT")" = parent ] ||
   fail "stopped-container cp did not read the writable host mount upper"
 ttc cp "$HOST_COW_IMPORT" "$HOST_COW_CONTAINER@main:/data/offline"
-ttc start "$HOST_COW_CONTAINER" >/dev/null
+ttc start "$HOST_COW_CONTAINER@main" >/dev/null
 ttc exec "$HOST_COW_CONTAINER@main" sh -c '
   test "$(cat /data/value)" = parent
   test "$(cat /data/created)" = parent-created
@@ -266,7 +266,7 @@ if find "$DATA_ROOT/volumes-v2" -type f -name '*.tar' | grep . >/dev/null; then
 fi
 
 ttc stop "$MAIN@main" >/dev/null
-ttc start "$MAIN" >/dev/null
+ttc start "$MAIN@main" >/dev/null
 ttc exec "$MAIN@main" sh -c '
   test "$(cat /data/value)" = base
   test "$(cat /data/sub/hard)" = base
@@ -379,9 +379,9 @@ ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
 ttc fork "$SECOND@main" f1 >/dev/null
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
-ttc daemon stop >/dev/null
+ttc daemon stop --stop-all >/dev/null
 ttc "$@"
-ttc start "$MAIN" >/dev/null
+ttc start "$MAIN@main" >/dev/null
 ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
 
 echo "ttc managed-volume e2e: PASS"

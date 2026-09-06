@@ -60,6 +60,8 @@ println!("{}", ttc.rebalance_node("node-a", Some("node-b"))?);
 named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
 accepts Docker-style image changes, while `load` and `save` exchange standard
 image archives. `copy` exposes branch-aware file transfer.
+`wait_for(target, "durable")` waits for shared publication instead of process
+exit.
 
 The byte-oriented `load`/`save` forms buffer archives in the client. Prefer
 daemon-host `input`/`output` paths or `stream` for large archives.
@@ -99,7 +101,8 @@ the daemon. Use absolute host paths in raw file-oriented commands because
 
 Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or use
 `Client::new("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
-`TTC_LOCAL_ROOT`.
+`TTC_LOCAL_ROOT`. They negotiate the public API/features returned by `ping`;
+exact build matching is specific to the official CLI.
 
 ## Test
 

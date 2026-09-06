@@ -34,7 +34,7 @@ import (
 )
 
 func TestDaemonWireOptionsContainNoClientPaths(t *testing.T) {
-	if got := wireOptions(options{root: "/runtime", dataRoot: "/data", clientExecutable: "/ttc"}); got != (daemonWireOptions{}) {
+	if got := wireOptions(options{root: "/runtime", dataRoot: "/data"}); got != (daemonWireOptions{}) {
 		t.Fatalf("wire options leak daemon-owned paths: %+v", got)
 	}
 }
@@ -46,7 +46,6 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 		runsc:                 "/opt/ttc/bin/ttcd",
 		dataRoot:              "/var/lib/ttc",
 		runtimePlatform:       "kvm",
-		clientExecutable:      "/opt/ttc/bin/ttc",
 		unsafeNoHostIsolation: true,
 		disableHostGSO:        true,
 	}
@@ -63,9 +62,6 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	if got, want := opts.daemonSocket, server.socket; got != want {
 		t.Errorf("daemon socket=%q, want %q", got, want)
 	}
-	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
-		t.Errorf("client executable=%q, want %q", got, want)
-	}
 	if got, want := opts.runtimePlatform, "kvm"; got != want {
 		t.Errorf("runtime platform=%q, want %q", got, want)
 	}
@@ -79,10 +75,9 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 
 func TestDaemonRequestOptionsCannotOverrideServerRuntime(t *testing.T) {
 	server := &daemonServer{
-		root:             "/default/root",
-		runsc:            "/default/ttcd",
-		dataRoot:         "/daemon/data",
-		clientExecutable: "/default/ttc",
+		root:     "/default/root",
+		runsc:    "/default/ttcd",
+		dataRoot: "/daemon/data",
 	}
 	opts := server.optionsFromRequest(daemonWireOptions{})
 	if got, want := opts.root, server.root; got != want {
@@ -93,9 +88,6 @@ func TestDaemonRequestOptionsCannotOverrideServerRuntime(t *testing.T) {
 	}
 	if got, want := opts.dataRoot, server.dataRoot; got != want {
 		t.Errorf("data root=%q, want daemon-owned %q", got, want)
-	}
-	if got, want := opts.clientExecutable, server.clientExecutable; got != want {
-		t.Errorf("client executable=%q, want %q", got, want)
 	}
 }
 
@@ -848,6 +840,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	status, stdout, stderr = exchange(daemonRequest{Version: daemonAPIVersion, Action: "ping"})
 	if status != 0 ||
 		!strings.Contains(stdout, `"build_id":"`+version.Version()+`"`) ||
+		!strings.Contains(stdout, `"features":["batch-fork"`) ||
 		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||

@@ -79,14 +79,17 @@ non-forkable for its entire lifetime.
 - Cross-node fork requires mutually authenticated TTC peers, common image
   content, a shared TTC data root, and a reachable page-transfer network. Use
   a checkpoint for offline transfer or unrelated TTC installations.
-- Elastic migration currently uses a conservative dehydrate/ownership-CAS/
-  rehydrate cutover rather than the live sparse handoff planned for later.
+- Elastic migration uses live sparse handoff. A newly running target may
+  temporarily depend on transaction-fenced memory or filesystem ranges served
+  by the source. Graceful drain resolves these dependencies; unexpected source
+  loss before they are cached or published is reported as unrecoverable
+  volatile-state loss.
   Automatic rebalancing uses exact resident-memory sharing edges, coalesced by
   branch membership and bounded at 4,096 distinct sets per family. TTC rejects
   a plan if this bound is exceeded rather than using incomplete accounting.
-  Capacity acquisition uses a durable shared-filesystem JSON outbox; native
-  executable and HTTP provider adapters are not yet included. An unsuccessful
-  drain or rebalance remains safely retryable after a requested node joins.
+  Capacity acquisition uses a durable shared-filesystem JSON outbox with
+  executable and HTTP webhook adapters. An unsuccessful drain or rebalance
+  remains safely retryable after a requested node joins.
 
 For the detailed resource matrix, measurements, and audit evidence, see the
 [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md).

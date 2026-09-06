@@ -57,7 +57,8 @@ feature such as host networking; the resulting family can never be forked.
 
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
-take longer.
+take longer. Set `ttc_wait.condition` to `durable` when an orchestrator must
+wait until the branch generation is committed to shared storage.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
 errors. `ttc_list` includes each non-root branch's `parent`, allowing MCP hosts

@@ -167,7 +167,6 @@ var commands = map[string]struct{}{
 	"pause": {}, "port": {}, "ps": {}, "pull": {}, "rehydrate": {}, "rename": {}, "restart": {},
 	"restore": {}, "resume": {}, "rm": {}, "rmi": {}, "run": {}, "save": {}, "start": {},
 	"stats": {}, "stop": {}, "top": {}, "tty": {}, "unpause": {}, "volume": {}, "wait": {},
-	"_auto-remove": {}, "_complete": {},
 }
 
 func knownCommand(command string) bool {
@@ -206,14 +205,14 @@ var commandHelp = map[string]string{
 	"logs": "Usage: ttc logs [OPTIONS] CONTAINER@BRANCH", "cp": "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 	"pull": "Usage: ttc pull [OPTIONS] IMAGE", "load": "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
 	"save": "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]", "commit": "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
-	"fork": "Usage: ttc fork [--paused] [--quarantine] SOURCE [DEST...]", "migrate": "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
+	"fork": "Usage: ttc fork [--paused] [--quarantine] [--target NODE] CONTAINER@BRANCH DEST...", "migrate": "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
 	"pause": "Usage: ttc pause TARGET...", "resume": "Usage: ttc resume TARGET...", "unpause": "Usage: ttc unpause TARGET...",
 	"dehydrate": "Usage: ttc dehydrate TARGET...", "rehydrate": "Usage: ttc rehydrate TARGET...",
 	"checkpoint": "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE", "restore": "Usage: ttc restore [--name NAME] FILE",
 	"ls": "Usage: ttc ls [--tree|--json]", "ps": "Usage: ttc ps [OPTIONS]", "inspect": "Usage: ttc inspect [OPTIONS] CONTAINER...",
 	"top": "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]", "stats": "Usage: ttc stats [--json] CONTAINER@BRANCH",
 	"diff": "Usage: ttc diff [--json] CONTAINER@BRANCH", "events": "Usage: ttc events [OPTIONS]",
-	"wait": "Usage: ttc wait [--condition CONDITION] TARGET...", "port": "Usage: ttc port publish|ls|unpublish [OPTIONS]",
+	"wait": "Usage: ttc wait [--condition not-running|durable] TARGET...", "port": "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 	"volume": "Usage: ttc volume create|ls|inspect|rm [OPTIONS]", "node": "Usage: ttc node ls|drain|rebalance [OPTIONS]",
 	"tty": "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]", "rename": "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
 	"kill": "Usage: ttc kill [OPTIONS] TARGET...", "image": "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
@@ -343,6 +342,9 @@ func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {
 }
 
 func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
+	if err := validateDaemonStartEnvironment(); err != nil {
+		return err
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -401,6 +403,19 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	}
 	data, _ := os.ReadFile(logPath)
 	return fmt.Errorf("ttcd did not become ready; startup log: %s\n%s", logPath, strings.TrimSpace(string(data)))
+}
+
+// validateDaemonStartEnvironment enforces the daemon's explicit-root contract
+// before the client creates a log, socket directory, or ttcd process. The
+// client deliberately does not interpret or forward the root.
+func validateDaemonStartEnvironment() error {
+	if strings.TrimSpace(os.Getenv("TTC_ROOT")) != "" {
+		return nil
+	}
+	if strings.TrimSpace(os.Getenv("TTC_DATA_ROOT")) != "" {
+		return errors.New("TTC_DATA_ROOT is no longer supported; set TTC_ROOT to a fresh absolute path")
+	}
+	return errors.New("TTC_ROOT must be explicitly set before starting ttcd")
 }
 
 func connect(socket string) (net.Conn, error) {
@@ -594,7 +609,7 @@ func commandCanRetry(args []string) bool {
 		args = args[1:]
 	}
 	switch args[0] {
-	case "create", "rmi", "rm", "_auto-remove", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "restore", "migrate":
+	case "create", "rmi", "rm", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls"

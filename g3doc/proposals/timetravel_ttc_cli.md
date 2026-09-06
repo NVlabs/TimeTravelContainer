@@ -549,12 +549,12 @@ state still forks entirely in memory.
       descendant console survives deletion of its source branch.
 - [x] Keep output draining after an ordinary attach client exits.
 - [x] Test detach-key parsing and detection across stdin read boundaries.
-- [x] Make an orderly `ttc daemon stop` resume paused branches and stop
-      descendants before ancestors with normal stop policy. Writable rootfs and
-      managed-volume state is already persistent, so daemon shutdown performs
-      no serialization. Leave the daemon running if container shutdown fails,
-      and preserve live sandboxes after an unexpected daemon crash for restart
-      reconciliation, including console drains and port sidecars.
+- [x] Make plain `ttc daemon stop` reject while managed branches are active.
+      `--stop-all` explicitly stops them and `--dehydrate-all` preserves their
+      complete process state before shutdown. Leave the daemon running if the
+      selected policy fails, and preserve live sandboxes after an unexpected
+      daemon crash for restart reconciliation, including console drains and
+      port sidecars.
 - [x] Propagate the invoking client's `TERM` for terminal runs and execs when no
       image/container or command value exists, with an `xterm` fallback.
 - [x] Test sidecar SIGKILL and lock-based replacement with a newly published

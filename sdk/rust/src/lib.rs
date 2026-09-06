@@ -783,7 +783,16 @@ impl Client {
     }
 
     pub fn wait(&self, target: &str) -> Result<CommandResult, Error> {
-        self.command(["wait", target])
+        self.wait_for(target, "not-running")
+    }
+
+    pub fn wait_for(&self, target: &str, condition: &str) -> Result<CommandResult, Error> {
+        if condition != "not-running" && condition != "durable" {
+            return Err(Error::InvalidArguments(
+                "condition must be 'not-running' or 'durable'".to_owned(),
+            ));
+        }
+        self.command(["wait", "--condition", condition, target])
     }
 
     pub fn remove(&self, target: &str, force: bool) -> Result<CommandResult, Error> {
@@ -1216,6 +1225,24 @@ mod tests {
             result.stdout,
             b"{\"version\":1,\"output_bytes\":4}\n{\"version\":1,\"output_bytes\":9}\n"
         );
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn durable_wait_uses_current_cli_shape() {
+        let path = temporary_socket("durable-wait");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["wait", "--condition", "durable", "demo@main"])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        assert!(Client::new(&path)
+            .wait_for("demo@main", "durable")
+            .unwrap()
+            .ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

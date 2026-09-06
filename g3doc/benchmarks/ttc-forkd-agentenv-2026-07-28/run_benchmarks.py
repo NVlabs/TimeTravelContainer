@@ -20,16 +20,10 @@ OUT = pathlib.Path("/bench/results/2026-07-28-kvm-node")
 OUT.mkdir(parents=True, exist_ok=True)
 TTC = [
     "/bench/ttc/bin/ttc",
-    "--data-root",
-    "/bench/ttc/data",
-    "--root",
-    "/bench/ttc/runsc",
     "--daemon-socket",
     "/bench/ttc/ttcd.sock",
-    "--runsc",
-    "/bench/ttc/bin/runsc",
 ]
-TTC_ENV = dict(os.environ, XDG_RUNTIME_DIR="/bench/ttc/runtime")
+TTC_ENV = dict(os.environ)
 FORKD_ENV = dict(
     os.environ,
     HOME="/bench/forkd/home",
@@ -138,7 +132,7 @@ def bench_ttc(n: int = 30) -> None:
         before_cpu = cpu_ticks(sentry)
         before_alloc = allocated_tree(upper)
         start = time.perf_counter_ns()
-        proc = run(TTC + ["fork", "ttc-bench", tag], env=TTC_ENV, timeout=30)
+        proc = run(TTC + ["fork", "ttc-bench@main", tag], env=TTC_ENV, timeout=30)
         fork_return_ms = ms_since(start)
         meta = ttc_branch_meta(tag)
         run(
@@ -385,10 +379,10 @@ def bench_ttc_fanout(n: int = 10, *, batch: bool = False) -> None:
     start = time.perf_counter_ns()
     try:
         if batch:
-            run(TTC + ["fork", "ttc-bench", *tags], env=TTC_ENV, timeout=30)
+            run(TTC + ["fork", "ttc-bench@main", *tags], env=TTC_ENV, timeout=30)
         else:
             for tag in tags:
-                run(TTC + ["fork", "ttc-bench", tag], env=TTC_ENV, timeout=30)
+                run(TTC + ["fork", "ttc-bench@main", tag], env=TTC_ENV, timeout=30)
         forked_ms = ms_since(start)
         for tag in tags:
             run(
