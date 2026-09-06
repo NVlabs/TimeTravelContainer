@@ -149,10 +149,13 @@ def main():
     def env(runtime):
         result = os.environ.copy()
         result.update({
-            "TTC_DATA_ROOT": str(data),
-            "TTC_RUNTIME_DIR": str(runtime),
+            "TTC_ROOT": str(data),
+            "TTC_LOCAL_ROOT": str(runtime / "data"),
+            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
             "TTC_CAPACITY_TEST_ROOT": str(root),
         })
+        result.pop("TTC_DATA_ROOT", None)
+        result.pop("TTC_RUNTIME_DIR", None)
         return result
 
     def ttc(runtime, *argv, check=True, timeout=180):
@@ -257,7 +260,11 @@ def main():
     finally:
         if args.preserve_on_failure and not succeeded:
             print(f"preserved failed qualification at {root}", file=sys.stderr)
-            return
+            # Preserve the environment without suppressing the exception that
+            # explains why qualification failed.
+            started_a = False
+            started_b = False
+            args.keep = True
         if started_a:
             # Remove image-owned mapped-UID trees while the daemon can still
             # enter its extraction namespace. A plain host rmtree may not own

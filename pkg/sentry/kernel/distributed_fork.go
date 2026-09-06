@@ -490,6 +490,10 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 		child.Release()
 		return nil, err
 	}
+	if got := vfs.RestoreFilesystemResourcesFromContext(loadCtx); len(got) != len(opts.RestoreFilesystemResources) {
+		child.Release()
+		return nil, fmt.Errorf("sparse distributed restore filesystem resources changed from %d to %d during load", len(opts.RestoreFilesystemResources), len(got))
+	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
 		return nil, vfs.PrependErrMsg("VFS sparse distributed-fork restore failed", err)
@@ -609,6 +613,10 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}); err != nil {
 		child.Release()
 		return nil, err
+	}
+	if got := vfs.RestoreFilesystemResourcesFromContext(loadCtx); len(got) != len(opts.RestoreFilesystemResources) {
+		child.Release()
+		return nil, fmt.Errorf("relocated distributed restore filesystem resources changed from %d to %d during load", len(opts.RestoreFilesystemResources), len(got))
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()

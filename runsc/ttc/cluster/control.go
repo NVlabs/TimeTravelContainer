@@ -852,8 +852,9 @@ func writeControlError(w http.ResponseWriter, status int, message string) {
 // Client calls one target ttcd control plane over a mutually authenticated
 // HTTP client.
 type Client struct {
-	BaseURL string
-	HTTP    *http.Client
+	BaseURL    string
+	HTTP       *http.Client
+	streamHTTP *http.Client
 }
 
 // NewClient constructs a client using tlsConfig for peer authentication.
@@ -865,8 +866,18 @@ func NewClient(baseURL string, tlsConfig *tls.Config, timeout time.Duration) (*C
 	if tlsConfig == nil || timeout <= 0 {
 		return nil, errors.New("cluster client requires TLS and a positive timeout")
 	}
-	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), ForceAttemptHTTP2: true}
-	return &Client{BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Transport: transport, Timeout: timeout}}, nil
+	// Keep bounded transaction RPCs on a transport separate from full-duplex
+	// daemon streams. Sharing an HTTP/2 connection lets a stalled or canceled
+	// stream affect transaction progress and has produced TLS record corruption
+	// under concurrent elastic routing. Control RPCs need no multiplexing;
+	// daemon proxy streams retain HTTP/2 full duplex on their own connections.
+	controlTransport := &http.Transport{TLSClientConfig: tlsConfig.Clone()}
+	streamTransport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), ForceAttemptHTTP2: true}
+	return &Client{
+		BaseURL:    strings.TrimSuffix(baseURL, "/"),
+		HTTP:       &http.Client{Transport: controlTransport, Timeout: timeout},
+		streamHTTP: &http.Client{Transport: streamTransport},
+	}, nil
 }
 
 // ProxyDaemon carries one framed TTC daemon connection over the authenticated
@@ -879,8 +890,7 @@ func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Wri
 	req.Header.Set("Content-Type", "application/vnd.ttc.daemon-stream")
 	// Streaming exec sessions may legitimately outlive the timeout used for
 	// individual transaction RPCs; their context is the lifetime bound.
-	client := &http.Client{Transport: c.HTTP.Transport}
-	resp, err := client.Do(req)
+	resp, err := c.streamHTTP.Do(req)
 	if err != nil {
 		return err
 	}

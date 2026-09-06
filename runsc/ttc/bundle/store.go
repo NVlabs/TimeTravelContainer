@@ -2491,9 +2491,12 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 				changed = true
 				continue
 			}
-			if _, err := os.Stat(repositories[i].Path); err == nil {
-				continue
-			}
+			// Canonical specs are shared by every node. Their repository paths
+			// may name the node that originally created the family and must
+			// never become authoritative merely because that path happens to be
+			// visible (for example two daemons running on one host, or a local
+			// scratch tree accidentally exported over NFS). Resolve every known
+			// TTC repository source into this node's active root.
 			switch {
 			case repositories[i].Source == specutils.TTCRootfsUpperSource:
 				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), rootfsUpperRepositoryDir)
@@ -2669,74 +2672,80 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		if !info.DistributedForkHidden {
-			return info, nil
-		}
-		info.DistributedForkHidden = false
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		if pending.Migration {
-			found := false
-			for i := range info.Branches {
-				branch := &info.Branches[i]
-				if branch.ID != pending.BranchID {
-					continue
-				}
-				owner := branch.NodeID
-				if owner == "" {
-					owner = info.NodeID
-				}
-				if owner != pending.SourceNode {
-					return ContainerInfo{}, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
-				}
-				branch.FilesystemBranch = pending.FilesystemBranch
-				branch.NodeID = pending.TargetNode
-				branch.State = pending.State
-				branch.StorageState = "local"
-				branch.SourceNode = pending.SourceNode
-				branch.DependentMemoryBytes = pending.DependentMemoryBytes
-				branch.DependentFilesystemBytes = pending.DependentFilesystemBytes
-				branch.DistributedForkTransactionID = transactionID
-				branch.DistributedSparseRepository = pending.SparseRepository
-				branch.DistributedSparseBranch = pending.SparseBranch
-				branch.DistributedMigration = true
-				found = true
-				break
+	var published ContainerInfo
+	err = s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID == transactionID {
+			if !current.DistributedForkHidden {
+				published = *current
+				return false, nil
 			}
-			if !found {
-				return ContainerInfo{}, fmt.Errorf("migration branch %q disappeared before publication", pending.BranchID)
+			current.DistributedForkHidden = false
+		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			if pending.Migration {
+				found := false
+				for i := range current.Branches {
+					branch := &current.Branches[i]
+					if branch.ID != pending.BranchID {
+						continue
+					}
+					owner := branch.NodeID
+					if owner == "" {
+						owner = current.NodeID
+					}
+					if owner != pending.SourceNode {
+						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
+					}
+					branch.FilesystemBranch = pending.FilesystemBranch
+					branch.NodeID = pending.TargetNode
+					branch.State = pending.State
+					branch.StorageState = "local"
+					branch.SourceNode = pending.SourceNode
+					branch.DependentMemoryBytes = pending.DependentMemoryBytes
+					branch.DependentFilesystemBytes = pending.DependentFilesystemBytes
+					branch.DistributedForkTransactionID = transactionID
+					branch.DistributedSparseRepository = pending.SparseRepository
+					branch.DistributedSparseBranch = pending.SparseBranch
+					branch.DistributedMigration = true
+					found = true
+					break
+				}
+				if !found {
+					return false, fmt.Errorf("migration branch %q disappeared before publication", pending.BranchID)
+				}
+			} else {
+				for _, branch := range current.Branches {
+					if branch.ID == pending.BranchID {
+						return false, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+					}
+				}
+				current.Branches = append(current.Branches, BranchInfo{
+					ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
+					NodeID: current.NodeID,
+					State:  pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
+					DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
+					DistributedForkTransactionID: transactionID,
+					DistributedSparseRepository:  pending.SparseRepository,
+					DistributedSparseBranch:      pending.SparseBranch,
+				})
 			}
+			delete(current.DistributedForkImports, transactionID)
+			recomputeContainerState(current)
 		} else {
-			for _, branch := range info.Branches {
-				if branch.ID == pending.BranchID {
-					return ContainerInfo{}, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+			for _, branch := range current.Branches {
+				if branch.DistributedForkTransactionID == transactionID {
+					published = *current
+					return false, nil
 				}
 			}
-			info.Branches = append(info.Branches, BranchInfo{
-				ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-				NodeID: info.NodeID,
-				State:  pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
-				DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
-				DistributedForkTransactionID: transactionID,
-				DistributedSparseRepository:  pending.SparseRepository,
-				DistributedSparseBranch:      pending.SparseBranch,
-			})
+			return false, fmt.Errorf("distributed fork transaction %q has no pending target", transactionID)
 		}
-		delete(info.DistributedForkImports, transactionID)
-		recomputeContainerState(&info)
-	} else {
-		// An idempotent retry after publication finds the branch marker.
-		for _, branch := range info.Branches {
-			if branch.DistributedForkTransactionID == transactionID {
-				return info, nil
-			}
-		}
-		return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q has no pending target", transactionID)
-	}
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		published = *current
+		return true, nil
+	})
+	if err != nil {
 		return ContainerInfo{}, err
 	}
-	return info, nil
+	return published, nil
 }
 
 // UpdateDistributedForkDependencies records volatile source bytes while a
@@ -2781,30 +2790,32 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 	if err != nil {
 		return err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		info.State = state
-		for i := range info.Branches {
-			if info.Branches[i].ID == "main" {
-				info.Branches[i].State = state
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID == transactionID {
+			current.State = state
+			for i := range current.Branches {
+				if current.Branches[i].ID == "main" {
+					current.Branches[i].State = state
+				}
 			}
-		}
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		pending.State = state
-		info.DistributedForkImports[transactionID] = pending
-	} else {
-		found := false
-		for i := range info.Branches {
-			if info.Branches[i].DistributedForkTransactionID == transactionID {
-				info.Branches[i].State = state
-				found = true
+		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.State = state
+			current.DistributedForkImports[transactionID] = pending
+		} else {
+			found := false
+			for i := range current.Branches {
+				if current.Branches[i].DistributedForkTransactionID == transactionID {
+					current.Branches[i].State = state
+					found = true
+				}
 			}
+			if !found {
+				return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+			}
+			recomputeContainerState(current)
 		}
-		if !found {
-			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-		}
-		recomputeContainerState(&info)
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		return true, nil
+	})
 }
 
 // UpdateDistributedForkSparseRoot records the shared sparse-memory root that

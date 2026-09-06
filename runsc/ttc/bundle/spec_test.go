@@ -2314,6 +2314,11 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
 		t.Fatal(err)
 	}
+	// The old node's path may still be visible to this process. It must not be
+	// selected in preference to the current node's local active root.
+	if err := os.MkdirAll(repositories[0].Path, 0700); err != nil {
+		t.Fatal(err)
+	}
 	digest := "sha256:" + strings.Repeat("b", 64)
 	info := ContainerInfo{
 		ID: id, Name: "demo", BundleDir: bundleDir, RootFS: spec.Root.Path, Digest: digest, Platform: "linux/amd64",

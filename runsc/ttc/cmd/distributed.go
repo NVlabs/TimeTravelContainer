@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -132,6 +133,7 @@ type distributedPageRelay struct {
 	mu             sync.Mutex
 	closed         bool
 	commands       map[*exec.Cmd]struct{}
+	connections    map[*net.TCPConn]struct{}
 	fsToken        ttcvolume.RemoteToken
 	fsSources      []ttcvolume.RemoteObjectSource
 	fsRepositories []*ttcvolume.Repository
@@ -140,7 +142,7 @@ type distributedPageRelay struct {
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
 	relay := &distributedPageRelay{
 		listener: listener, backend: backend, source: source, session: session,
-		commands: make(map[*exec.Cmd]struct{}),
+		commands: make(map[*exec.Cmd]struct{}), connections: make(map[*net.TCPConn]struct{}),
 	}
 	go relay.serve()
 	return relay
@@ -157,31 +159,52 @@ func (r *distributedPageRelay) serve() {
 			conn.Close()
 			continue
 		}
-		magic, err := peekDistributedMagic(tcp)
-		if err != nil {
-			conn.Close()
-			continue
-		}
-		if magic == [4]byte{'T', 'T', 'C', 'F'} {
-			r.mu.Lock()
-			token := r.fsToken
-			sources := append([]ttcvolume.RemoteObjectSource(nil), r.fsSources...)
-			closed := r.closed
+		r.mu.Lock()
+		if r.closed {
 			r.mu.Unlock()
-			if closed || len(sources) == 0 {
-				conn.Close()
-				continue
-			}
-			go func() { _ = ttcvolume.ServeRemoteObjects(tcp, token, sources) }()
+			tcp.Close()
 			continue
 		}
-		file, err := tcp.File()
-		conn.Close()
-		if err != nil {
-			continue
-		}
-		go r.serveFile(file)
+		r.connections[tcp] = struct{}{}
+		r.mu.Unlock()
+		// Filesystem sources are donated before memory streams, but remain idle
+		// until a guest actually reads an object. Classifying here synchronously
+		// would stop Accept at that first idle stream and deadlock the metadata
+		// connection behind it.
+		go r.serveConnection(tcp)
 	}
+}
+
+func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
+	defer func() {
+		r.mu.Lock()
+		delete(r.connections, tcp)
+		r.mu.Unlock()
+	}()
+	magic, err := peekDistributedMagic(tcp)
+	if err != nil {
+		tcp.Close()
+		return
+	}
+	if magic == [4]byte{'T', 'T', 'C', 'F'} {
+		r.mu.Lock()
+		token := r.fsToken
+		sources := append([]ttcvolume.RemoteObjectSource(nil), r.fsSources...)
+		closed := r.closed
+		r.mu.Unlock()
+		if closed || len(sources) == 0 {
+			tcp.Close()
+			return
+		}
+		_ = ttcvolume.ServeRemoteObjects(tcp, token, sources)
+		return
+	}
+	file, err := tcp.File()
+	tcp.Close()
+	if err != nil {
+		return
+	}
+	r.serveFile(file)
 }
 
 func peekDistributedMagic(tcp *net.TCPConn) ([4]byte, error) {
@@ -235,7 +258,8 @@ func (r *distributedPageRelay) serveFile(file *os.File) {
 	command.ExtraFiles = []*os.File{file}
 	command.Stdin = strings.NewReader("")
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	var commandError bytes.Buffer
+	command.Stderr = &commandError
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	r.mu.Lock()
 	if r.closed {
@@ -244,11 +268,15 @@ func (r *distributedPageRelay) serveFile(file *os.File) {
 	}
 	if err := command.Start(); err != nil {
 		r.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "ttcd: distributed page relay could not start: %v\n", err)
 		return
 	}
 	r.commands[command] = struct{}{}
 	r.mu.Unlock()
-	_ = command.Wait()
+	waitErr := command.Wait()
+	if waitErr != nil {
+		fmt.Fprintf(os.Stderr, "ttcd: distributed page relay failed: %v: %s\n", waitErr, strings.TrimSpace(commandError.String()))
+	}
 	r.mu.Lock()
 	delete(r.commands, command)
 	r.mu.Unlock()
@@ -264,10 +292,17 @@ func (r *distributedPageRelay) Close() {
 			for command := range r.commands {
 				commands = append(commands, command)
 			}
+			connections := make([]*net.TCPConn, 0, len(r.connections))
+			for connection := range r.connections {
+				connections = append(connections, connection)
+			}
 			repositories := r.fsRepositories
 			r.fsRepositories = nil
 			r.fsSources = nil
 			r.mu.Unlock()
+			for _, connection := range connections {
+				_ = connection.Close()
+			}
 			for _, command := range commands {
 				if command.Process != nil {
 					_ = command.Process.Kill()
@@ -416,14 +451,30 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 			return 0, fmt.Errorf("decoding remote repository %q identity: %w", config.Source, err)
 		}
 		if peer {
-			repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
-			if err != nil {
-				return 0, err
+			var repository *ttcvolume.Repository
+			if _, statErr := os.Stat(filepath.Join(config.Path, "volume.json")); statErr == nil {
+				repository, err = ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+				if err == nil {
+					_, err = repository.ImportRemoteBranchSnapshot(snapshot, filesystemBranch)
+				}
+			} else if errors.Is(statErr, os.ErrNotExist) {
+				// A family can exist in the shared catalog without having any
+				// active filesystem on this node. Materialize its first imported
+				// branch directly into the node-local canonical repository path.
+				repository, _, err = manager.ImportPrivateRemoteSnapshot(config.Path, "peer-"+fmt.Sprint(index), snapshot, filesystemBranch)
+			} else {
+				err = statErr
 			}
-			_, importErr := repository.ImportRemoteBranchSnapshot(snapshot, filesystemBranch)
+			if err != nil {
+				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
+			}
+			config.Branch = filesystemBranch
+			config.CopyMode = string(manager.Capability().Mode)
+			config.RestoreID = snapshotInfo.RepositoryID
+			config.Private = true
 			closeErr := repository.Close()
-			if importErr != nil || closeErr != nil {
-				return 0, errors.Join(importErr, closeErr)
+			if closeErr != nil {
+				return 0, closeErr
 			}
 			continue
 		}
@@ -1392,6 +1443,12 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 				case cluster.TransactionDraining, cluster.TransactionIndependent:
 					if current.SparseHandoff != nil && *current.SparseHandoff == sparse {
 						err = nil
+					} else if current.State == cluster.TransactionDraining && current.SparseHandoff == nil {
+						// A concurrent node drain may eagerly materialize the target
+						// before this optional sparse handoff is bound. Eager drain is
+						// already a valid route to independence; do not retry handoff
+						// forever merely because the faster strategy lost the race.
+						err = nil
 					} else if current.State == cluster.TransactionIndependent {
 						// The target faulted every page from TCP before handoff.
 						cancel()
@@ -1423,6 +1480,11 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 		relay.Close()
 		return
+	}
+	if tx.SparseHandoff == nil {
+		// Eager drain won the race, so this source-side sparse publication was
+		// never made authoritative and can be reclaimed immediately.
+		b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
 	}
 	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
 		// Retrying status/independence is safe; the target now has no source

@@ -179,7 +179,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			}
 		}
 	}()
-	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || (args.FilesystemConnections != 0 && args.FilesystemConnections != len(l.ttcVolumeRepositories)) {
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || args.FilesystemConnections != len(l.ttcVolumeRepositories) {
 		return nil, fmt.Errorf("distributed target has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
 	}
 	var filesystemToken ttcvolume.RemoteToken
@@ -530,6 +530,20 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 			}
 		}
 	}()
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || args.FilesystemConnections != len(l.ttcVolumeRepositories) {
+		return nil, fmt.Errorf("distributed peer has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], args.SnapshotToken[:])
+	connectionIndex := 0
+	for _, volume := range l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
+		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, volume.config.Branch); err != nil {
+			return nil, fmt.Errorf("attaching distributed peer filesystem source %q: %w", volume.config.Source, err)
+		}
+		connectionIndex++
+	}
+	donated = donated[args.FilesystemConnections:]
 	var pushConn net.Conn
 	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if len(donated) < 2 {
@@ -608,6 +622,18 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}()
 	var child *kernel.Kernel
 	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		// The live target filesystem records its node-local repository ID, while
+		// the incoming Kernel was serialized against the source repository ID.
+		// Both identities refer to the same imported generation. Make the source
+		// identity an alias for this restore without changing either persistent
+		// repository's identity.
+		for _, volume := range l.ttcVolumeRepositories {
+			restoreID := volume.config.RestoreID
+			if restoreID == "" {
+				continue
+			}
+			resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = volume.repository
+		}
 		loadOpts := kernel.DistributedForkLoadOptions{
 			// ChildBranchID selects the prepared persistent filesystem branch
 			// during an in-Sentry restore. TargetBranchID is the immutable remote

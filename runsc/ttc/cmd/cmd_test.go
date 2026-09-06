@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,35 @@ import (
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 )
+
+func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "source", "session")
+	defer relay.Close()
+	idle, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	active, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	if _, err := active.Write([]byte("TTCF")); err != nil {
+		t.Fatal(err)
+	}
+	if err := active.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := active.Read(one[:]); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("second stream was not classified while first stayed idle: %v", err)
+	}
+}
 
 func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "ttcd.sock")

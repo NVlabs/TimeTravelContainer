@@ -184,7 +184,11 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	resources := vfs.RestoreFilesystemResourcesFromContext(ctx)
 	resource, ok := resources[fs.diskVolume.ResourceID]
 	if !ok {
-		return fmt.Errorf("TTC volume restore resource %q was not provided", fs.diskVolume.ResourceID)
+		available := make([]checkpoint.ResourceID, 0, len(resources))
+		for id := range resources {
+			available = append(available, id)
+		}
+		return fmt.Errorf("TTC volume restore resource %q was not provided (available count=%d: %#v)", fs.diskVolume.ResourceID, len(available), available)
 	}
 	repository, ok := resource.Resource.(*ttcvolume.Repository)
 	if !ok {

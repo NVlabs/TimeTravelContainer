@@ -730,21 +730,13 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			}
 		}
 		if peer {
-			branches, listErr := r.backend.runtimeBranches(info.ID)
-			if listErr != nil {
-				return fmt.Errorf("checking canceled distributed target branch %q: %w", branch.ID, listErr)
-			}
-			present := false
-			for _, runtimeBranch := range branches {
-				if runtimeBranch.ID == branch.ID {
-					present = true
-					break
-				}
-			}
-			if present {
-				if _, destroyErr := r.backend.command("timetravel", info.ID, "destroy", branch.ID); destroyErr != nil {
-					return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
-				}
+			// Preparation can fail before a target Sentry exists. The
+			// runtime-only release helper is idempotent in that case. It also
+			// handles a pending import that is the only physical branch in this
+			// node's Sentry, where DestroyBranch deliberately rejects removal
+			// of the last branch.
+			if destroyErr := r.backend.releaseMigratedSourceRuntime(info.ID, branch.ID); destroyErr != nil {
+				return fmt.Errorf("destroying canceled distributed target branch %q: %w", branch.ID, destroyErr)
 			}
 		} else {
 			if _, deleteErr := r.backend.command("delete", "--force", info.ID); deleteErr != nil {
