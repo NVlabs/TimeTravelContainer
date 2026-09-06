@@ -6,6 +6,7 @@ the TTC_CAPACITY_REQUEST_ID environment variable selects provider mode.
 """
 
 import argparse
+import errno
 import json
 import os
 import pathlib
@@ -92,14 +93,26 @@ def wait_for(description, predicate, timeout=180):
 def remove_tree(path):
     # Images legitimately contain mode-000 files and non-writable directories.
     # Deletion depends on each parent directory's write bit, not the child's.
-    for current, directories, _files in os.walk(path, topdown=True):
-        if not os.path.islink(current):
-            os.chmod(current, 0o700)
-        for directory in directories:
-            child = os.path.join(current, directory)
-            if not os.path.islink(child):
-                os.chmod(child, 0o700)
-    shutil.rmtree(path)
+    # Network filesystems and asynchronous daemon teardown may report a short
+    # EBUSY/ENOTEMPTY window after the last TTC process exits. Retry removal of
+    # this dedicated test tree, but keep every unexpected or persistent error
+    # visible to the test.
+    deadline = time.monotonic() + 30
+    while path.exists():
+        for current, directories, _files in os.walk(path, topdown=True):
+            if not os.path.islink(current):
+                os.chmod(current, 0o700)
+            for directory in directories:
+                child = os.path.join(current, directory)
+                if not os.path.islink(child):
+                    os.chmod(child, 0o700)
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EBUSY, errno.ENOTEMPTY) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
 
 
 def main():
@@ -118,10 +131,18 @@ def main():
         help="shell command to run in the source before forking",
     )
     parser.add_argument(
+        "--workload-command",
+        help="override the long-running source command (default: counter loop)",
+    )
+    parser.add_argument(
         "--verify-command",
         help="shell command to run independently in every migrated branch",
     )
     parser.add_argument("--command-timeout", type=int, default=600)
+    parser.add_argument(
+        "--cluster-lease", default="3s",
+        help="cluster membership lease (increase when throttling shared storage)",
+    )
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--preserve-on-failure", action="store_true",
@@ -167,7 +188,7 @@ def main():
         "--cluster-ca", root / "ca.pem",
         "--cluster-page-listen", "127.0.0.1:0",
         "--cluster-page-advertise", "127.0.0.1:0",
-        "--cluster-lease", "3s",
+        "--cluster-lease", args.cluster_lease,
     ]
     started_a = False
     started_b = False
@@ -187,10 +208,10 @@ def main():
             run_args.append("--network=ttc")
         if args.nat:
             run_args.append("--nat")
-        run_args.extend([
-            args.image, "sh", "-c",
-            "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done",
-        ])
+        workload = args.workload_command or (
+            "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done"
+        )
+        run_args.extend([args.image, "sh", "-c", workload])
         ttc(runtime_a, *run_args, timeout=args.command_timeout)
         prepare_seconds = None
         if args.prepare_command:
@@ -281,7 +302,8 @@ def main():
             # disappear so that cleanup cannot recreate the test root.
             wait_for(
                 "daemon shutdown",
-                lambda: not (runtime_a / "ttcd.sock").exists() and not (runtime_b / "ttcd.sock").exists(),
+                lambda: not (runtime_a / "run" / "ttcd.sock").exists()
+                and not (runtime_b / "run" / "ttcd.sock").exists(),
                 timeout=30,
             )
             time.sleep(1)

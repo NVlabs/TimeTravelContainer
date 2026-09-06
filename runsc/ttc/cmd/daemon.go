@@ -344,6 +344,12 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 				return fmt.Errorf("preparing distributed migration target bundle: %w", err)
 			}
 			defer cleanup()
+		} else {
+			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedTargetBundle(info.ID, targetBranch.FilesystemBranch)
+			if err != nil {
+				return fmt.Errorf("preparing distributed target bundle: %w", err)
+			}
+			defer cleanup()
 		}
 		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
 		if err != nil {
@@ -3070,6 +3076,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	// mistake the in-progress runtime for stale state.
 	s.reconcile(backend)
 	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
+		unlock()
+		stdinReader.Close()
+		writeError(err)
+		return
+	}
+	if err := s.claimUnplacedRehydrateTargets(backend, request.Args); err != nil {
 		unlock()
 		stdinReader.Close()
 		writeError(err)

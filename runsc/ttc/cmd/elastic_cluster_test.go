@@ -139,6 +139,70 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	}
 }
 
+func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
+	root := t.TempDir()
+	local := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", Unplaced: true, State: "dehydrated", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{FamilyID: "web", BranchID: "main", State: cluster.PlacementUnplaced}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<30), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{clusterDirectory: directory, clusterCapabilities: &node.Capabilities}
+	backend := &runtimeBackend{dataRoot: root, localRoot: local, nodeID: "node-a"}
+	for range 2 {
+		if err := server.claimUnplacedRehydrateTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record, err := placements.Lookup("web", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.OwnerNode != "node-a" || record.OwnerIncarnation != node.Incarnation || record.State != cluster.PlacementPaused {
+		t.Fatalf("claimed placement=%+v", record)
+	}
+	claimed, err := (ttcbundle.Store{Root: root, ActiveRoot: local}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := claimed.BranchNodeID("main"); owner != "node-a" || claimed.Branches[0].Unplaced {
+		t.Fatalf("claimed metadata owner=%q unplaced=%t", owner, claimed.Branches[0].Unplaced)
+	}
+}
+
 func TestClusterAdvertiseRejectsUnreachableOrInsecureURLs(t *testing.T) {
 	for _, value := range []string{
 		"http://node-a.example:7443,node-a.example",

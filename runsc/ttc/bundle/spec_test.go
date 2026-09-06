@@ -69,6 +69,68 @@ func TestRehomeInternalMountsSurviveSourceRemoval(t *testing.T) {
 	}
 }
 
+func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "hidden-target-id", Name: "hidden-target", Digest: "sha256:" + strings.Repeat("a", 64),
+		Platform: "linux/amd64", DistributedForkHidden: true,
+		BundleDir: filepath.Join(root, "containers", "hidden-target-id", "bundle"),
+	}
+	info.RootFS = filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
+	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", info.ID)
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("ordinary lookup unexpectedly exposed hidden target")
+	}
+	if _, err := store.LoadSpec(info.ID); err != nil {
+		t.Fatalf("loading hidden target runtime spec: %v", err)
+	}
+	targetBundle, cleanup, err := store.PrepareDistributedTargetBundle(info.ID, "remote-filesystem")
+	if err != nil {
+		t.Fatalf("preparing hidden target runtime bundle: %v", err)
+	}
+	defer cleanup()
+	var targetSpec specs.Spec
+	encoded, err := os.ReadFile(filepath.Join(targetBundle, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &targetSpec); err != nil {
+		t.Fatal(err)
+	}
+	if !specutils.TTCDistributedTarget(&targetSpec) {
+		t.Fatal("hidden target runtime bundle is not marked as a distributed target")
+	}
+	if err := store.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		current.State = "paused"
+		return true, nil
+	}); err != nil {
+		t.Fatalf("mutating hidden target by exact ID: %v", err)
+	}
+	refreshed, err := store.RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.ID != info.ID || !refreshed.DistributedForkHidden {
+		t.Fatalf("refreshed target=%+v", refreshed)
+	}
+	if refreshed.State != "paused" {
+		t.Fatalf("refreshed target state=%q, want paused", refreshed.State)
+	}
+}
+
 func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

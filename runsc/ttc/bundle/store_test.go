@@ -56,6 +56,38 @@ func TestCompareAndSwapNodeID(t *testing.T) {
 	}
 }
 
+func TestCompareAndSwapBranchNodeIDClaimsUnplacedBranch(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "container-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: bundleDir, NodeID: "node-a",
+		Branches: []BranchInfo{{ID: "cold", Unplaced: true, State: "dehydrated"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	if err := store.CompareAndSwapBranchNodeID("example", "cold", "", "node-b"); err != nil {
+		t.Fatalf("claiming unplaced branch: %v", err)
+	}
+	info, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.BranchNodeID("cold"); got != "node-b" || info.Branches[0].Unplaced {
+		t.Fatalf("claimed branch owner=%q unplaced=%t", got, info.Branches[0].Unplaced)
+	}
+	if err := store.CompareAndSwapBranchNodeID("example", "cold", "", "node-c"); err == nil {
+		t.Fatal("stale unplaced owner changed claimed branch")
+	}
+}
+
 func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "example")

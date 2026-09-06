@@ -68,7 +68,7 @@ class Experiment:
         self.root = root
         self.runtime_a = root / "runtime-a"
         self.runtime_b = root / "runtime-b"
-        self.data = root / "data"
+        self.data = args.data_dir or (root / "data")
         unique = f"{os.getpid()}-{repetition}-{time.time_ns()}"
         self.source = f"bench-source-{unique}"
         self.targets = [f"bench-target-{unique}-{i}" for i in range(int(case.get("fanout", 1)))]
@@ -84,9 +84,18 @@ class Experiment:
     def env(self, node):
         runtime = self.runtime_a if node == "a" else self.runtime_b
         result = os.environ.copy()
-        result["TTC_RUNTIME_DIR"] = str(runtime)
-        result["TTC_DATA_ROOT"] = str(self.data)
+        result.update({
+            "TTC_ROOT": str(self.data),
+            "TTC_LOCAL_ROOT": str(runtime / "data"),
+            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
+        })
+        result.pop("TTC_DATA_ROOT", None)
+        result.pop("TTC_RUNTIME_DIR", None)
         return result
+
+    def runsc_root(self, node):
+        runtime = self.runtime_a if node == "a" else self.runtime_b
+        return runtime / "data" / "runtime" / "runsc"
 
     def ttc(self, node, *argv, timeout=120, check=True):
         return run([self.args.ttc, *argv], env=self.env(node), timeout=timeout, check=check)
@@ -101,6 +110,7 @@ class Experiment:
             "--cluster-ca", self.root / "ca.pem",
             "--cluster-page-listen", "127.0.0.1:0",
             "--cluster-page-advertise", "127.0.0.1:0",
+            "--cluster-lease", self.args.cluster_lease,
             "--cluster-transfer-bytes", self.case["transfer_bytes"],
             "--cluster-max-outstanding-bytes", self.case["max_outstanding_bytes"],
             "--cluster-max-parallel", self.case["max_parallel"],
@@ -172,7 +182,7 @@ class Experiment:
         if not self.source_id or not transaction:
             return None
         result = run([
-            self.args.ttcd, "runsc", "--root", self.runtime_a / "runsc",
+            self.args.ttcd, "runsc", "--root", self.runsc_root("a"),
             "timetravel", self.source_id, "distributed-status", transaction,
         ], check=False, timeout=15)
         if result.returncode:
@@ -183,7 +193,7 @@ class Experiment:
         if not target_id:
             return None
         result = run([
-            self.args.ttcd, "runsc", "--root", self.runtime_b / "runsc",
+            self.args.ttcd, "runsc", "--root", self.runsc_root("b"),
             "timetravel", target_id, "distributed-dependency", "main",
         ], check=False, timeout=15)
         if result.returncode:
@@ -299,7 +309,7 @@ class Experiment:
             for transaction in self.txids:
                 try:
                     run([
-                        self.args.ttcd, "runsc", "--root", self.runtime_a / "runsc",
+                        self.args.ttcd, "runsc", "--root", self.runsc_root("a"),
                         "timetravel", self.source_id, "distributed-cancel", transaction,
                     ], check=False, timeout=15)
                 except Exception:
@@ -366,8 +376,16 @@ def main():
     parser.add_argument("--matrix", help="JSON matrix file; omit for one default case")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--work-dir", help="persistent cache/results directory")
+    parser.add_argument(
+        "--data-dir",
+        help="fresh shared TTC_ROOT; defaults to WORK_DIR/data",
+    )
     parser.add_argument("--output", help="JSONL output (default: stdout only)")
     parser.add_argument("--independence-timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--cluster-lease", default="3s",
+        help="cluster membership lease (increase when shared storage is throttled)",
+    )
     parser.add_argument(
         "--dynamic-discovery", action="store_true",
         help="discover peers from shared lease records instead of --cluster-peer",
@@ -376,8 +394,16 @@ def main():
         "--verify-dehydrate", action="store_true",
         help="dehydrate and rehydrate every remote target before its workload",
     )
+    parser.add_argument(
+        "--preserve-on-failure", action="store_true",
+        help="leave daemons and dedicated roots intact when a run fails",
+    )
     args = parser.parse_args()
-    root = pathlib.Path(args.work_dir or tempfile.mkdtemp(prefix="ttc-distributed-benchmark."))
+    root = pathlib.Path(args.work_dir or tempfile.mkdtemp(prefix="ttc-distributed-benchmark.")).resolve()
+    if args.data_dir:
+        args.data_dir = pathlib.Path(args.data_dir).resolve()
+        if args.data_dir.exists():
+            parser.error("--data-dir must name a new, dedicated test directory")
     root.mkdir(parents=True, exist_ok=True)
     make_certificates(root)
     output = open(args.output, "a", encoding="utf-8") if args.output else None
@@ -385,18 +411,24 @@ def main():
         for case in load_cases(args.matrix):
             for repetition in range(args.repetitions):
                 experiment = Experiment(args, case, repetition, root)
+                failed = False
                 try:
                     record = experiment.run()
                 except Exception as error:
+                    failed = True
                     record = {
                         "schema_version": 2, "case": case,
                         "repetition": repetition, "error": str(error),
                     }
                 finally:
-                    try:
-                        experiment.cleanup()
-                    except Exception as cleanup_error:
-                        record["cleanup_error"] = str(cleanup_error)
+                    if failed and args.preserve_on_failure:
+                        record["preserved_work_dir"] = str(root)
+                        record["preserved_data_dir"] = str(experiment.data)
+                    else:
+                        try:
+                            experiment.cleanup()
+                        except Exception as cleanup_error:
+                            record["cleanup_error"] = str(cleanup_error)
                 line = json.dumps(record, sort_keys=True)
                 print(line, flush=True)
                 if output:

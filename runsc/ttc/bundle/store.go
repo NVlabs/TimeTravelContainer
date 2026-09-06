@@ -179,6 +179,16 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
+// PrepareDistributedTargetBundle creates the node-local OCI view used to boot
+// a new hidden remote-fork target. The canonical bundle is shared metadata and
+// may still contain another node's image-cache and repository paths.
+func (s Store) PrepareDistributedTargetBundle(name, filesystemBranch string) (string, func(), error) {
+	if filesystemBranch == "" {
+		return "", nil, errors.New("distributed target filesystem identity is empty")
+	}
+	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
+}
+
 // PrepareDistributedMigrationRestoreBundle creates a cold target bundle whose
 // bootstrap SandboxFamily already uses the migrated branch's visible identity.
 // Distributed restore later replaces that placeholder Kernel in place; it
@@ -191,7 +201,7 @@ func (s Store) PrepareDistributedMigrationRestoreBundle(name, branchID, filesyst
 }
 
 func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return "", nil, err
 	}
@@ -2254,12 +2264,28 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	return ContainerInfo{}, fmt.Errorf("container %q does not exist", identifier)
 }
 
+// loadRuntimeContainer resolves ordinary containers and an exact hidden
+// distributed-target ID. Hidden targets remain absent from all name and prefix
+// lookups, but runtime preparation must be able to consume their private bundle
+// before the target is atomically published.
+func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
+	info, err := s.LoadContainer(identifier)
+	if err == nil {
+		return info, nil
+	}
+	hidden, hiddenErr := s.loadContainerKey(identifier)
+	if hiddenErr == nil && hidden.DistributedForkHidden {
+		return hidden, nil
+	}
+	return ContainerInfo{}, err
+}
+
 // mutateContainer serializes catalog read-modify-write transactions across
 // foreground commands, background publication workers, and clustered daemons
 // sharing TTC_ROOT. The lock is deliberately separate from the JSON file so
 // atomic replacement of container.json does not replace the lock inode.
 func (s Store) mutateContainer(identifier string, mutate func(*ContainerInfo) (bool, error)) error {
-	resolved, err := s.LoadContainer(identifier)
+	resolved, err := s.loadRuntimeContainer(identifier)
 	if err != nil {
 		return err
 	}
@@ -2456,7 +2482,7 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
 func (s Store) LoadSpec(name string) (*specs.Spec, error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return nil, err
 	}
@@ -2535,7 +2561,7 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 // WriteActiveRepositoryMap records node-local materializations without
 // placing node-local host paths in the shared canonical OCI config.
 func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TTCVolumeRepository) error {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return err
 	}
@@ -2551,7 +2577,7 @@ func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TT
 // keeps containers created by older TTC builds startable after image backing
 // metadata gains new virtualization requirements.
 func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (ContainerInfo, error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
@@ -3341,8 +3367,11 @@ func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement 
 			if info.Branches[i].ID != branchID {
 				continue
 			}
-			owner := info.Branches[i].NodeID
-			if owner == "" {
+			owner := ""
+			if !info.Branches[i].Unplaced {
+				owner = info.Branches[i].NodeID
+			}
+			if owner == "" && !info.Branches[i].Unplaced {
 				owner = info.NodeID
 			}
 			if owner != expected {

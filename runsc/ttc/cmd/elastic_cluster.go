@@ -522,6 +522,83 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	}
 }
 
+// claimUnplacedRehydrateTargets turns admission of a durable cold branch into
+// a generation-fenced placement before its runtime is reconstructed. Without
+// this claim, two entry daemons may independently admit the same unplaced
+// branch, and a successful rehydrate may remain routed to its former owner.
+//
+// A claim intentionally remains owned by this node if rehydration itself
+// fails. Retrying is then routed back to the node that may hold local staging
+// state, while node drain can still move or republish the cold branch.
+func (s *daemonServer) claimUnplacedRehydrateTargets(backend *runtimeBackend, args []string) error {
+	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || args[0] != "rehydrate" {
+		return nil
+	}
+	node, err := s.clusterDirectory.Lookup(s.clusterCapabilities.NodeID)
+	if err != nil {
+		return fmt.Errorf("loading rehydration placement node: %w", err)
+	}
+	if !node.AcceptsPlacement(time.Now()) {
+		return fmt.Errorf("cluster node %q is not accepting rehydration placement (state=%s)", node.NodeID, node.State)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(backend.dataRoot, "cluster", "placements"))
+	if err != nil {
+		return err
+	}
+	store := backend.containerStore()
+	for _, operand := range args[1:] {
+		target, err := parseSelector(operand)
+		if err != nil {
+			return err
+		}
+		info, err := store.LoadContainer(target.container)
+		if err != nil {
+			return err
+		}
+		branch, err := persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return err
+		}
+		record, err := placements.Lookup(info.ID, branch.ID)
+		if errors.Is(err, os.ErrNotExist) {
+			if !branch.Unplaced {
+				// Legacy placed branches are enrolled by ordinary post-command
+				// reconciliation and require no cold-placement claim.
+				continue
+			}
+			record, err = placements.Create(cluster.PlacementRecord{
+				FamilyID: info.ID, BranchID: branch.ID, State: cluster.PlacementUnplaced,
+			}, time.Now())
+		}
+		if err != nil {
+			return fmt.Errorf("loading placement for %s: %w", target, err)
+		}
+		if record.State != cluster.PlacementUnplaced {
+			if record.OwnerNode != node.NodeID || record.OwnerIncarnation != node.Incarnation {
+				return fmt.Errorf("rehydration placement for %s belongs to %s/%s", target, record.OwnerNode, record.OwnerIncarnation)
+			}
+			if branch.Unplaced {
+				if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
+					return fmt.Errorf("repairing claimed branch owner for %s: %w", target, err)
+				}
+			}
+			continue
+		}
+		claimed, err := placements.ClaimUnplaced(info.ID, branch.ID, node.NodeID, node.Incarnation, info.ID, branch.ID, record.Generation, cluster.PlacementPaused, time.Now())
+		if err != nil {
+			return fmt.Errorf("claiming rehydration placement for %s: %w", target, err)
+		}
+		if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
+			_, releaseErr := placements.Unplace(info.ID, branch.ID, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
+			if releaseErr != nil {
+				return fmt.Errorf("recording rehydration owner for %s: %w; releasing placement also failed: %v", target, err, releaseErr)
+			}
+			return fmt.Errorf("recording rehydration owner for %s: %w", target, err)
+		}
+	}
+	return nil
+}
+
 func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, string, error) {
 	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: requestID, Args: append([]string(nil), args...)}
 	return executeRemoteDaemonRequest(ctx, peer, request)
@@ -2139,6 +2216,17 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 	}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	consecutiveFailures := uint(0)
+	retryDelay := func() time.Duration {
+		delay := interval
+		for i := uint(1); i < consecutiveFailures && delay < 30*time.Second; i++ {
+			delay *= 2
+		}
+		if delay > 30*time.Second {
+			return 30 * time.Second
+		}
+		return delay
+	}
 	for {
 		select {
 		case <-done:
@@ -2147,13 +2235,16 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 		}
 		intent, err := loadElasticDrainIntent(backend.dataRoot, nodeID)
 		if err != nil {
+			consecutiveFailures++
+			delay := retryDelay()
 			if stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: elastic drain recovery for node %s cannot read its intent: %v\n", nodeID, err)
+				fmt.Fprintf(stderr, "ttcd: elastic drain recovery for node %s cannot read its intent; retrying in %s: %v\n", nodeID, delay, err)
 			}
-			timer.Reset(interval)
+			timer.Reset(delay)
 			continue
 		}
 		if intent == nil {
+			consecutiveFailures = 0
 			timer.Reset(interval)
 			continue
 		}
@@ -2170,10 +2261,12 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 			return drainErr
 		})
 		if err != nil {
+			consecutiveFailures++
+			delay := retryDelay()
 			if stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s will retry: %v\n", intent.OperationID, nodeID, err)
+				fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s will retry in %s: %v\n", intent.OperationID, nodeID, delay, err)
 			}
-			timer.Reset(interval)
+			timer.Reset(delay)
 			continue
 		}
 		if stderr != nil {
