@@ -201,6 +201,25 @@ func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
 	if owner := claimed.BranchNodeID("main"); owner != "node-a" || claimed.Branches[0].Unplaced {
 		t.Fatalf("claimed metadata owner=%q unplaced=%t", owner, claimed.Branches[0].Unplaced)
 	}
+	// Model a publisher that passed its generation check just before the
+	// pre-command claim and commits an unplaced durable image while rehydrate
+	// is already executing. The post-command claim must repair both catalogs.
+	if _, err := placements.Unplace("web", "main", "node-a", node.Incarnation, record.Generation, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := (ttcbundle.Store{Root: root, ActiveRoot: local}).CompareAndSwapBranchNodeID("web", "main", "node-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.claimUnplacedRehydrateTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := placements.Lookup("web", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.OwnerNode != "node-a" || reclaimed.State != cluster.PlacementPaused {
+		t.Fatalf("post-publication claimed placement=%+v", reclaimed)
+	}
 }
 
 func TestClusterAdvertiseRejectsUnreachableOrInsecureURLs(t *testing.T) {

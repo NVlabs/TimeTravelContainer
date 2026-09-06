@@ -2555,6 +2555,43 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
 		}
 	}
+	// Restore aliases are one-shot resource keys and are recorded separately
+	// from the canonical OCI spec. Consult the map even in standalone mode so
+	// checkpoint restores can advance from a captured repository identity to
+	// the identity of the newly installed local repository.
+	if mappingData, err := os.ReadFile(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
+		activeMappings := make(map[string]activeRepositoryMapping)
+		if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
+			return nil, fmt.Errorf("decoding active repository map: %w", err)
+		}
+		repositories, err := specutils.TTCVolumeRepositories(&spec)
+		if err != nil {
+			return nil, err
+		}
+		changed := false
+		for i := range repositories {
+			if mapping, ok := activeMappings[repositories[i].Source]; ok {
+				repositories[i].Path = mapping.Path
+				repositories[i].RestoreID = mapping.RestoreID
+				if mapping.CopyMode != "" {
+					repositories[i].CopyMode = mapping.CopyMode
+				}
+				changed = true
+			}
+		}
+		if changed {
+			encoded, err := json.Marshal(repositories)
+			if err != nil {
+				return nil, err
+			}
+			if spec.Annotations == nil {
+				spec.Annotations = make(map[string]string)
+			}
+			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	return &spec, nil
 }
 
@@ -2570,6 +2607,39 @@ func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TT
 		mappings[repository.Source] = activeRepositoryMapping{Path: repository.Path, RestoreID: repository.RestoreID, CopyMode: repository.CopyMode}
 	}
 	return writeJSON(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json"), mappings)
+}
+
+// CommitActiveRepositoryRestoreIDs replaces one-shot restore aliases with the
+// identities of the repositories that are now installed on this node. Remote
+// and cold restores initially key VFS resources by the repository identity in
+// the captured Sentry. Once that restore has succeeded, any later capture is
+// made from the node-local repositories and therefore names their identities.
+// Keeping the old aliases would make a dehydrate/rehydrate cycle fail to
+// reconnect its filesystem resources.
+func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	for i := range repositories {
+		repository, err := ttcvolume.OpenRepository(repositories[i].Path, ttcvolume.CopyMode(repositories[i].CopyMode))
+		if err != nil {
+			return fmt.Errorf("opening restored repository %q: %w", repositories[i].Source, err)
+		}
+		repositories[i].RestoreID = repository.Info().ID
+		if err := repository.Close(); err != nil {
+			return fmt.Errorf("closing restored repository %q: %w", repositories[i].Source, err)
+		}
+	}
+	return s.WriteActiveRepositoryMap(info.ID, repositories)
 }
 
 // RefreshContainerImageRoot moves a stopped container bundle onto the current
@@ -3625,9 +3695,14 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *
 				continue
 			}
 			switch branch.State {
-			case "creating", "running", "paused", "dehydrating", "rehydrating":
+			case "creating", "running", "paused", "rehydrating":
 				branch.State = "exited"
 				changed = true
+			case "dehydrating":
+				// A successful dehydration deliberately removes the final
+				// Sentry before its asynchronous publication commits. The
+				// durable local capture and queue intent, rather than a live
+				// runtime, are authoritative throughout this state.
 			}
 		}
 		oldState := info.State

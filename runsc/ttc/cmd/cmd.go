@@ -4324,7 +4324,7 @@ func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, deh
 					return fmt.Errorf("cannot dehydrate %s in state %q", target.selector, target.state)
 				}
 			} else {
-				if target.state != "dehydrated" {
+				if target.state != "dehydrated" && target.state != "dehydrating" {
 					return fmt.Errorf("cannot rehydrate %s in state %q", target.selector, target.state)
 				}
 				err = db.rehydrate(target.selector)
@@ -10632,6 +10632,24 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		if err := b.publicationQueue.Cancel(info.ID, target.branch, generation); err != nil {
 			return fmt.Errorf("canceling dehydration publication for %s: %w", target, err)
 		}
+		// AbandonBranchPublication advances the generation fence. The cold
+		// restore must carry that new generation into its final storage update;
+		// using the BranchInfo loaded before cancellation would successfully
+		// restore the runtime and then report a stale-worker failure.
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return fmt.Errorf("reloading canceled dehydration for %s: %w", target, err)
+		}
+		persistentBranch = nil
+		for i := range info.Branches {
+			if info.Branches[i].ID == target.branch {
+				persistentBranch = &info.Branches[i]
+				break
+			}
+		}
+		if persistentBranch == nil {
+			return fmt.Errorf("branch %q disappeared while canceling dehydration", target.branch)
+		}
 		persistentBranch.State = "dehydrated"
 	}
 	if persistentBranch.State == "dehydrated" {
@@ -10941,6 +10959,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if status != 0 {
 		return fmt.Errorf("starting dehydration runtime exited with status %d", status)
 	}
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return fmt.Errorf("committing rehydrated filesystem identities: %w", err)
+	}
 	state := "paused"
 	if capture.Resume {
 		if _, err := b.command("timetravel", info.ID, "resume", target.branch); err != nil {
@@ -11095,6 +11116,9 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	configReader.Close()
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
+	}
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return fmt.Errorf("committing rehydrated peer filesystem identities: %w", err)
 	}
 	_ = metadata.Close()
 	state := "paused"

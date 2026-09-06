@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import errno
 import json
 import os
 import pathlib
@@ -25,6 +26,19 @@ def run(argv, *, env=None, timeout=120, check=True, capture=True):
             f"stdout:\n{result.stdout or ''}\nstderr:\n{result.stderr or ''}"
         )
     return result
+
+
+def remove_tree(path, timeout=30):
+    """Remove a dedicated test tree after network-FS close propagation."""
+    deadline = time.monotonic() + timeout
+    while path.exists():
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EBUSY, errno.ENOTEMPTY) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
 
 
 def make_certificates(root):
@@ -264,9 +278,23 @@ class Experiment:
             time.sleep(0.05)
         statuses = [self.source_status(txid) for txid in self.txids]
         target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
-        source_ok = self.ttc("a", "exec", self.branch(self.source), "true", check=False).returncode == 0
-        target_ok = [self.ttc("b", "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
-        routed_target_ok = [self.ttc("a", "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
+        source_probe = self.ttc("a", "exec", self.branch(self.source), "true", check=False)
+        target_probes = [self.ttc("b", "exec", self.branch(target), "true", check=False) for target in self.targets]
+        routed_target_probes = [self.ttc("a", "exec", self.branch(target), "true", check=False) for target in self.targets]
+        source_ok = source_probe.returncode == 0
+        target_ok = [probe.returncode == 0 for probe in target_probes]
+        routed_target_ok = [probe.returncode == 0 for probe in routed_target_probes]
+        if not source_ok or not all(target_ok) or not all(routed_target_ok):
+            diagnostics = []
+            if not source_ok:
+                diagnostics.append(f"source via node-a: {source_probe.stderr.strip()}")
+            for index, probe in enumerate(target_probes):
+                if probe.returncode:
+                    diagnostics.append(f"target {index} via node-b: {probe.stderr.strip()}")
+            for index, probe in enumerate(routed_target_probes):
+                if probe.returncode:
+                    diagnostics.append(f"target {index} via node-a: {probe.stderr.strip()}")
+            raise RuntimeError("post-workload cluster routing validation failed:\n" + "\n".join(diagnostics))
         return {
             "schema_version": 2,
             "case": self.case,
@@ -324,6 +352,8 @@ class Experiment:
             shutil.rmtree(self.runtime_a, ignore_errors=True)
         if stopped_b:
             shutil.rmtree(self.runtime_b, ignore_errors=True)
+        if stopped_a and stopped_b:
+            remove_tree(self.data)
 
 
 DEFAULT_CASE = {

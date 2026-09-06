@@ -344,6 +344,19 @@ func TestStopDaemonContainersTreatsLineageAsDisplayOnly(t *testing.T) {
 	}
 }
 
+func TestBranchOwnedByBackendFallsBackToFamilyOwner(t *testing.T) {
+	backend := &runtimeBackend{nodeID: "node-a"}
+	if branchOwnedByBackend(backend, Family{NodeID: "node-b"}, Branch{ID: "main"}) {
+		t.Fatal("branch with no explicit owner inherited a remote family owner")
+	}
+	if !branchOwnedByBackend(backend, Family{NodeID: "node-b"}, Branch{ID: "main", NodeID: "node-a"}) {
+		t.Fatal("explicit branch owner did not override the family owner")
+	}
+	if !branchOwnedByBackend(backend, Family{}, Branch{ID: "main"}) {
+		t.Fatal("legacy unowned branch should remain locally manageable")
+	}
+}
+
 func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	status := Run([]string{"--unsafe-no-host-isolation", "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)

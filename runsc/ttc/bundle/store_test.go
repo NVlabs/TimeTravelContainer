@@ -102,6 +102,7 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 		ID: "example", Name: "example", BundleDir: bundleDir, NodeID: "node-a", State: "running",
 		Branches: []BranchInfo{
 			{ID: "main", NodeID: "node-a", State: "running"},
+			{ID: "publishing", NodeID: "node-a", State: "dehydrating"},
 			{ID: "remote", NodeID: "node-b", State: "running"},
 		},
 	}
@@ -119,7 +120,10 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 	if state := got.Branches[0].State; state != "exited" {
 		t.Errorf("local branch state = %q, want exited", state)
 	}
-	if state := got.Branches[1].State; state != "running" {
+	if state := got.Branches[1].State; state != "dehydrating" {
+		t.Errorf("process-free publishing branch state = %q, want dehydrating", state)
+	}
+	if state := got.Branches[2].State; state != "running" {
 		t.Errorf("remote branch state = %q, want running", state)
 	}
 	if got.State != "running" {

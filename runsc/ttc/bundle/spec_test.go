@@ -2466,3 +2466,67 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 		t.Fatalf("repositories = %+v, want path %q", resolved, wantRepository)
 	}
 }
+
+func TestCommitActiveRepositoryRestoreIDsAdvancesOneShotAlias(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	id := strings.Repeat("c", 64)
+	bundleDir := filepath.Join(shared, "containers", id, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := ttcvolume.OpenManager(local, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(local, "containers", id, rootfsUpperRepositoryDir)
+	if err := os.MkdirAll(filepath.Dir(repositoryPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(repositoryPath, "target-rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localID := repository.Info().ID
+	copyMode := string(manager.Capability().Mode)
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: "/old-node/rootfs-upper",
+		Branch: ttcvolume.MainBranch, CopyMode: copyMode, RestoreID: strings.Repeat("d", 32), Private: true,
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{
+		Annotations: map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: id, Name: "demo", BundleDir: bundleDir, State: "paused"}
+	if err := writeJSON(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteActiveRepositoryMap(id, []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: repositoryPath, CopyMode: copyMode,
+		RestoreID: strings.Repeat("d", 32),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitActiveRepositoryRestoreIDs(id); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := specutils.TTCVolumeRepositories(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != repositoryPath || got[0].RestoreID != localID {
+		t.Fatalf("repositories=%+v, want path %q and restore ID %q", got, repositoryPath, localID)
+	}
+}

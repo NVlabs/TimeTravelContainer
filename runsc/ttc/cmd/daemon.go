@@ -587,6 +587,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 				return fmt.Errorf("starting paused distributed target exited with status %d", status)
 			}
 		}
+		if err := r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+			return fmt.Errorf("committing distributed filesystem identities: %w", err)
+		}
 	} else if runtimeState.Status != "running" {
 		return fmt.Errorf("distributed target runtime is unexpectedly %q", runtimeState.Status)
 	}
@@ -1394,9 +1397,16 @@ type daemonStopTarget struct {
 	selector selector
 }
 
-func branchOwnedByBackend(backend backend, branch Branch) bool {
+func branchOwnedByBackend(backend backend, family Family, branch Branch) bool {
 	runtime, ok := backend.(*runtimeBackend)
-	return !ok || runtime.nodeID == "" || branch.NodeID == "" || branch.NodeID == runtime.nodeID
+	if !ok || runtime.nodeID == "" {
+		return true
+	}
+	owner := branch.NodeID
+	if owner == "" {
+		owner = family.NodeID
+	}
+	return owner == "" || owner == runtime.nodeID
 }
 
 func stopDaemonContainers(backend backend) error {
@@ -1407,7 +1417,7 @@ func stopDaemonContainers(backend backend) error {
 	var targets []daemonStopTarget
 	for _, family := range families {
 		for _, branch := range family.Branches {
-			if !branchOwnedByBackend(backend, branch) {
+			if !branchOwnedByBackend(backend, family, branch) {
 				continue
 			}
 			switch branch.State {
@@ -1446,7 +1456,7 @@ func dehydrateDaemonContainers(backend backend) error {
 	}
 	for _, family := range families {
 		for _, branch := range family.Branches {
-			if !branchOwnedByBackend(backend, branch) {
+			if !branchOwnedByBackend(backend, family, branch) {
 				continue
 			}
 			switch branch.State {
@@ -1471,7 +1481,7 @@ func rejectActiveDaemonContainers(backend backend) error {
 	var active []string
 	for _, family := range families {
 		for _, branch := range family.Branches {
-			if !branchOwnedByBackend(backend, branch) {
+			if !branchOwnedByBackend(backend, family, branch) {
 				continue
 			}
 			switch branch.State {
@@ -3112,7 +3122,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
 		if status == 0 {
-			if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
+			// Publication runs outside the lifecycle lock. It may unplace a
+			// dehydration after the pre-command claim but before rehydrate
+			// consumes the durable image. Repeat the idempotent claim at the
+			// successful execution boundary before catalog reconciliation.
+			if err := s.claimUnplacedRehydrateTargets(mutationBackend, request.Args); err != nil {
+				fmt.Fprintf(&mutationStderr, "ttcd: claiming completed rehydration placement: %v\n", err)
+				status = 1
+			} else if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
 				fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
 		}
@@ -3135,7 +3152,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	if status == 0 {
-		if err := backend.reconcilePlacementCatalog(); err != nil {
+		if err := s.claimUnplacedRehydrateTargets(backend, request.Args); err != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
+			status = 1
+		} else if err := backend.reconcilePlacementCatalog(); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 		}
 	}

@@ -3082,6 +3082,20 @@ func TestFreshStartPeers(t *testing.T) {
 	}
 }
 
+func TestRehydrateAcceptsPublishingCapture(t *testing.T) {
+	target := selector{container: "web", branch: "main"}
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+		Metadata: Branch{ID: target.branch, State: "dehydrating"},
+	}}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"rehydrate", target.String()}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("rehydrate publishing capture status=%d stderr=%q", status, stderr.String())
+	}
+	if got := b.rehydratedTargets; !reflect.DeepEqual(got, []selector{target}) {
+		t.Fatalf("rehydrated targets=%+v, want %+v", got, []selector{target})
+	}
+}
+
 func TestAcquireConsoleStdinIsExclusiveAndReleasable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "main.stdin.lock")
 	target := selector{container: "demo", branch: "main"}
