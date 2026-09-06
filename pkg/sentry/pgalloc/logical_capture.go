@@ -15,6 +15,7 @@
 package pgalloc
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"sort"
@@ -52,6 +53,65 @@ type CapturedPageBinding struct {
 type CapturedMemoryLayout struct {
 	Regions  []RemoteSnapshotRegion
 	Bindings []CapturedPageBinding
+}
+
+// ChunkOrdered returns an equivalent layout whose packed stream keeps every
+// logical 1 MiB chunk contiguous. Physical MemoryFile offsets are unrelated to
+// logical page allocation order after CoW, so the ordinary address-ordered
+// layout cannot provide this property. Live remote readers require it to load
+// and publish a chunk atomically.
+func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
+	bindings := append([]CapturedPageBinding(nil), l.Bindings...)
+	sort.Slice(bindings, func(i, j int) bool {
+		left, right := bindings[i], bindings[j]
+		if cmp := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); cmp != 0 {
+			return cmp < 0
+		}
+		if left.Chunk.Sequence != right.Chunk.Sequence {
+			return left.Chunk.Sequence < right.Chunk.Sequence
+		}
+		if left.Slot != right.Slot {
+			return left.Slot < right.Slot
+		}
+		if left.ResourceID != right.ResourceID {
+			return left.ResourceID.String() < right.ResourceID.String()
+		}
+		return left.OldOffset < right.OldOffset
+	})
+	files := make(map[checkpoint.ResourceID]*MemoryFile)
+	for _, region := range l.Regions {
+		resource := region.File.ResourceID()
+		if previous := files[resource]; previous != nil && previous != region.File {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured resource %s refers to multiple MemoryFiles", resource)
+		}
+		files[resource] = region.File
+	}
+	ordered := CapturedMemoryLayout{Bindings: bindings}
+	var previousPage LogicalPageID
+	for i := range ordered.Bindings {
+		binding := &ordered.Bindings[i]
+		file := files[binding.ResourceID]
+		if file == nil {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured binding %s:%#x has no MemoryFile", binding.ResourceID, binding.OldOffset)
+		}
+		if i != 0 && binding.Page == previousPage {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured logical page %+v is repeated", binding.Page)
+		}
+		previousPage = binding.Page
+		binding.StreamOffset = uint64(i) * hostarch.PageSize
+		page := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + hostarch.PageSize}
+		if len(ordered.Regions) != 0 {
+			last := &ordered.Regions[len(ordered.Regions)-1]
+			if last.File == file && last.Range.End == page.Start {
+				last.Range.End = page.End
+				continue
+			}
+		}
+		ordered.Regions = append(ordered.Regions, RemoteSnapshotRegion{
+			ID: RemoteRegionID(len(ordered.Regions) + 1), File: file, Range: page,
+		})
+	}
+	return ordered, nil
 }
 
 type capturedReferencedRange struct {

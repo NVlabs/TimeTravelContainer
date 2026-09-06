@@ -22,7 +22,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
-	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -52,21 +51,19 @@ type DistributedForkCapture struct {
 	KernelMetadata    []byte
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
-	// MemoryBindings is the branch-scoped page graph. AllocatorMetadata and
-	// LoadRanges remain allocator-wide until the sparse merge importer is
-	// connected; new transport code must use MemoryBindings instead.
+	// MemoryBindings is the exact branch-scoped page graph. LoadRanges describes
+	// the same pages in their chunk-ordered packed stream. AllocatorMetadata is
+	// retained for wire compatibility; relocated restore uses MemoryBindings.
 	MemoryBindings []pgalloc.CapturedPageBinding
 	Snapshot       *pgalloc.RemoteSnapshot
 	Snapshots      []*pgalloc.RemoteSnapshot
-	// SparseSnapshot pins exactly MemoryBindings. Snapshot is retained only for
-	// the legacy allocator-wide transport and must never be paired with sparse
-	// branch bindings, whose packed stream has a different layout.
+	// SparseSnapshot independently pins exactly MemoryBindings for callers that
+	// publish a durable branch image instead of transferring the live stream.
 	SparseSnapshot  *pgalloc.RemoteSnapshot
 	SparseSnapshots []*pgalloc.RemoteSnapshot
-	// HandoffSnapshot mirrors the allocator-wide TCP stream exactly. It is a
+	// HandoffSnapshot mirrors the branch-scoped TCP stream exactly. It is a
 	// second fork-time reservation used to publish a reader-compatible sparse
-	// manifest after a live target is already visible. MemoryBindings remains
-	// branch-scoped; HandoffBindings describes this compatibility stream.
+	// manifest after a live target is already visible.
 	HandoffSnapshot  *pgalloc.RemoteSnapshot
 	HandoffSnapshots []*pgalloc.RemoteSnapshot
 	HandoffBindings  []pgalloc.CapturedPageBinding
@@ -228,7 +225,29 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			return fmt.Errorf("capturing distributed-fork kernel memory graph: %w", err)
 		}
 		k.mf.MarkSavable()
-		allocatorMetadata, regions, loads, snapshots, err := pgalloc.ExportMemoryFileMetadataAndSnapshotsForRemote(ctx, k.mf, len(childBranchIDs))
+		allocatorMetadata, _, _, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
+		if err != nil {
+			return err
+		}
+		layout, err := memoryCapture.SnapshotLayout()
+		if err != nil {
+			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
+		}
+		layout, err = layout.ChunkOrdered()
+		if err != nil {
+			return fmt.Errorf("ordering distributed-fork memory chunks: %w", err)
+		}
+		loads := make([]pgalloc.RemoteLoadRange, len(layout.Regions))
+		var streamOffset uint64
+		for i, region := range layout.Regions {
+			loads[i] = pgalloc.RemoteLoadRange{Target: region.Range, StreamOffset: streamOffset}
+			streamOffset += region.Range.Length()
+		}
+		// Keep independent reservations for the live stream, direct sparse
+		// publication, and asynchronous shared-filesystem handoff. All three are
+		// branch-scoped: allocator-wide snapshots can race sibling destruction and
+		// retain pages that the restored state graph can never reference.
+		snapshots, err := pgalloc.NewRemoteSnapshots(layout.Regions, len(childBranchIDs))
 		if err != nil {
 			return err
 		}
@@ -240,10 +259,6 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
-		layout, err := memoryCapture.SnapshotLayout()
-		if err != nil {
-			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
-		}
 		sparseSnapshots, err := pgalloc.NewRemoteSnapshots(layout.Regions, len(childBranchIDs))
 		if err != nil {
 			return err
@@ -256,7 +271,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
-		handoffSnapshots, err := pgalloc.NewRemoteSnapshots(regions, len(childBranchIDs))
+		handoffSnapshots, err := pgalloc.NewRemoteSnapshots(layout.Regions, len(childBranchIDs))
 		if err != nil {
 			return err
 		}
@@ -268,20 +283,6 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
-		handoffBindings := make([]pgalloc.CapturedPageBinding, 0)
-		for _, load := range loads {
-			for old, stream := load.Target.Start, load.StreamOffset; old < load.Target.End; old, stream = old+hostarch.PageSize, stream+hostarch.PageSize {
-				page, version, ok := k.mf.LogicalPageVersionAt(old)
-				if !ok {
-					return fmt.Errorf("allocator-wide distributed page %#x has no logical identity", old)
-				}
-				chunk, slot := page.Chunk()
-				handoffBindings = append(handoffBindings, pgalloc.CapturedPageBinding{
-					ResourceID: k.mf.ResourceID(), OldOffset: old, StreamOffset: stream, References: 1,
-					Page: page, Version: version, Chunk: chunk, Slot: slot,
-				})
-			}
-		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
@@ -304,7 +305,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		committed = true
 		capture = &DistributedForkCapture{
 			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
-			LoadRanges: loads, MemoryBindings: layout.Bindings, HandoffBindings: handoffBindings, FilesystemResources: fsResources,
+			LoadRanges: loads, MemoryBindings: layout.Bindings, HandoffBindings: layout.Bindings, FilesystemResources: fsResources,
 		}
 		if len(snapshots) == 1 {
 			capture.Snapshot = snapshots[0]

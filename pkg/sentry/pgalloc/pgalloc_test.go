@@ -248,6 +248,60 @@ func TestMemoryRangeCaptureSnapshotPinsOnlyCapturedPages(t *testing.T) {
 	f.DecRef(fr)
 }
 
+func TestCapturedMemoryLayoutChunkOrdered(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	fr, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: 3 * page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.DecRef(fr)
+	type identity struct {
+		page    LogicalPageID
+		version PageVersionID
+		chunk   LogicalChunkID
+		slot    uint8
+	}
+	identities := make([]identity, 3)
+	for i := range identities {
+		pageID, versionID, ok := f.LogicalPageVersionAt(fr.Start + uint64(i)*page)
+		if !ok {
+			t.Fatalf("page %d has no logical identity", i)
+		}
+		chunk, slot := pageID.Chunk()
+		identities[i] = identity{page: pageID, version: versionID, chunk: chunk, slot: slot}
+	}
+	// Model CoW relocation: logical pages 2, 0, 1 occupy physical offsets 0,
+	// 1, 2. Address order therefore splits the logical chunk, while chunk order
+	// must produce stream offsets 0, 1, 2 without changing physical sources.
+	physicalToLogical := []int{2, 0, 1}
+	layout := CapturedMemoryLayout{Regions: []RemoteSnapshotRegion{{
+		ID: 1, File: f, Range: fr,
+	}}}
+	for physical, logical := range physicalToLogical {
+		id := identities[logical]
+		layout.Bindings = append(layout.Bindings, CapturedPageBinding{
+			OldOffset: fr.Start + uint64(physical)*page, StreamOffset: uint64(physical) * page,
+			References: 1, Page: id.page, Version: id.version, Chunk: id.chunk, Slot: id.slot,
+		})
+	}
+	ordered, err := layout.ChunkOrdered()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ordered.Bindings) != 3 || len(ordered.Regions) != 2 {
+		t.Fatalf("ordered layout=%+v", ordered)
+	}
+	wantPhysical := []uint64{fr.Start + page, fr.Start + 2*page, fr.Start}
+	for i, binding := range ordered.Bindings {
+		if binding.Page != identities[i].page || binding.OldOffset != wantPhysical[i] || binding.StreamOffset != uint64(i)*page {
+			t.Fatalf("binding %d=%+v, want page=%+v old=%#x stream=%#x", i, binding, identities[i].page, wantPhysical[i], uint64(i)*page)
+		}
+	}
+}
+
 func TestMemoryRangeCaptureRejectsRetiredPage(t *testing.T) {
 	f := newLogicalPageTestMemoryFile()
 	fr, err := f.findAllocatableAndMarkUsed(&allocState{

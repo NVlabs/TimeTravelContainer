@@ -860,7 +860,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		metadata, err := (&ttcremote.SessionMetadata{
 			FamilyID: familyID, SourceBranchID: sourceID, TargetBranchID: child.TargetBranchID,
 			KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
-			LoadRanges: capture.LoadRanges, MemoryBindings: capture.HandoffBindings,
+			LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
 		}).MarshalBinary()
 		if err != nil {
 			_ = resume()
@@ -909,7 +909,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		sessions[i] = &distributedForkSession{
 			source: sourceID, address: address, filesystemBranch: volumeBranches[i],
 			resources: capture.FilesystemResources, server: server,
-			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.HandoffBindings,
+			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.MemoryBindings,
 		}
 		if capture.HandoffSnapshot != nil {
 			capture.HandoffSnapshot = nil

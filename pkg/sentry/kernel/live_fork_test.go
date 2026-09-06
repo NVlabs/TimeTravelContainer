@@ -598,10 +598,15 @@ func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
 		t.Fatalf("CaptureDistributedFork: %v", err)
 	}
 	parent.MemoryFile().DecRef(orphan)
-	if len(capture.HandoffBindings) <= len(capture.MemoryBindings) {
+	if !reflect.DeepEqual(capture.HandoffBindings, capture.MemoryBindings) {
 		capture.Close()
 		parent.Release()
-		t.Fatalf("test setup did not create allocator-only pages: handoff=%d exact=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
+		t.Fatalf("handoff bindings differ from exact branch graph: handoff=%d exact=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
+	}
+	if got, want := capture.HandoffSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); got != want {
+		capture.Close()
+		parent.Release()
+		t.Fatalf("handoff bytes=%d, live bytes=%d", got, want)
 	}
 	repositoryDir := t.TempDir()
 	publisher, err := ttcchunk.OpenMemoryRepository(repositoryDir)
@@ -699,8 +704,7 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	parent.PipeMount().IncRef()
 	parent.SetHostMount(parent.PipeMount())
 	// Keep an allocator page that is deliberately unreachable from this branch.
-	// The legacy transport snapshot includes it, while the sparse snapshot must
-	// use the exact branch binding layout.
+	// Neither the live nor the durable stream may retain it.
 	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		parent.Release()
@@ -717,12 +721,19 @@ func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
 	if capture.SparseSnapshot == nil || capture.Snapshot == nil {
 		capture.Close()
 		parent.Release()
-		t.Fatal("distributed capture omitted its sparse or legacy snapshot")
+		t.Fatal("distributed capture omitted its sparse or live snapshot")
 	}
-	if sparseBytes, legacyBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes >= legacyBytes {
+	if sparseBytes, liveBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes != liveBytes {
 		capture.Close()
 		parent.Release()
-		t.Fatalf("sparse snapshot bytes=%d, legacy bytes=%d; unreachable allocator page was not excluded", sparseBytes, legacyBytes)
+		t.Fatalf("sparse snapshot bytes=%d, live bytes=%d", sparseBytes, liveBytes)
+	}
+	for _, load := range capture.LoadRanges {
+		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
+			capture.Close()
+			parent.Release()
+			t.Fatal("branch-scoped live stream included unrelated allocator page")
+		}
 	}
 	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
 	if err != nil {
@@ -773,8 +784,7 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	parent.Pause()
 	defer parent.Release()
 	// Simulate a page owned by another branch in the family-wide MemoryFile.
-	// The legacy allocator export includes it, but the branch-scoped binding
-	// graph must not.
+	// No branch-scoped stream may include it.
 	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		t.Fatal(err)
@@ -796,15 +806,10 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 			t.Fatalf("branch-scoped capture included unrelated allocator page %+v", orphanPage)
 		}
 	}
-	legacyIncludedOrphan := false
 	for _, load := range capture.LoadRanges {
 		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
-			legacyIncludedOrphan = true
-			break
+			t.Fatal("branch-scoped transport included unrelated allocator page")
 		}
-	}
-	if !legacyIncludedOrphan {
-		t.Fatal("test setup failed: allocator-wide export did not include unrelated page")
 	}
 	if capture.Snapshot != nil || len(capture.Snapshots) != 2 {
 		t.Fatalf("capture snapshots: singular=%p siblings=%d", capture.Snapshot, len(capture.Snapshots))
@@ -812,8 +817,8 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	if capture.SparseSnapshot != nil || len(capture.SparseSnapshots) != 2 {
 		t.Fatalf("sparse capture snapshots: singular=%p siblings=%d", capture.SparseSnapshot, len(capture.SparseSnapshots))
 	}
-	// This portion tests legacy sibling acknowledgement in isolation. Sparse
-	// consumers have independent reservations over the exact branch graph.
+	// Test sibling acknowledgement in isolation. Sparse consumers have
+	// independent reservations over the same exact branch graph.
 	for i, snapshot := range capture.SparseSnapshots {
 		if err := snapshot.Close(); err != nil {
 			t.Fatal(err)
