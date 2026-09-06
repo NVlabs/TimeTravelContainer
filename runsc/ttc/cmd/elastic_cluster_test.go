@@ -222,6 +222,35 @@ func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
 	}
 }
 
+func TestRecoveredPublisherAdoptsAndUnplacesOldIncarnation(t *testing.T) {
+	root := t.TempDir()
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-old", State: cluster.PlacementRunning,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &branchPublisher{nodeID: "node-a", incarnation: "boot-new"}
+	if err := publisher.releasePublishedPlacement(placements, "family", "main"); err != nil {
+		t.Fatal(err)
+	}
+	released, err := placements.Lookup("family", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.State != cluster.PlacementUnplaced || released.OwnerNode != "" || released.OwnerIncarnation != "" || released.Generation != created.Generation+2 {
+		t.Fatalf("released placement = %+v", released)
+	}
+	if err := publisher.releasePublishedPlacement(placements, "family", "main"); err != nil {
+		t.Fatalf("idempotent release failed: %v", err)
+	}
+}
+
 func TestClusterAdvertiseRejectsUnreachableOrInsecureURLs(t *testing.T) {
 	for _, value := range []string{
 		"http://node-a.example:7443,node-a.example",

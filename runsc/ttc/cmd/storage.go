@@ -523,28 +523,20 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	if intent.Kind == "dehydrate" {
 		lifecycle = "dehydrated"
 	}
-	if err := store.CompleteBranchPublication(intent.Container, intent.Branch, intent.Generation, result.Manifest, lifecycle, true); err != nil {
-		return err
-	}
 	if p.nodeID != "" {
 		placements, err := cluster.OpenPlacementStore(filepath.Join(p.sharedRoot, "cluster", "placements"))
 		if err != nil {
 			return err
 		}
-		record, err := placements.Lookup(info.ID, intent.Branch)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			// Families created before the placement catalog are still valid.
-		case err != nil:
+		if err := p.releasePublishedPlacement(placements, info.ID, intent.Branch); err != nil {
 			return err
-		case record.State == cluster.PlacementUnplaced:
-		case record.OwnerNode != p.nodeID || record.OwnerIncarnation != p.incarnation:
-			return fmt.Errorf("published branch placement belongs to %s/%s, not local incarnation %s/%s", record.OwnerNode, record.OwnerIncarnation, p.nodeID, p.incarnation)
-		default:
-			if _, err := placements.Unplace(record.FamilyID, record.BranchID, p.nodeID, p.incarnation, record.Generation, time.Now()); err != nil {
-				return fmt.Errorf("releasing durable branch placement: %w", err)
-			}
 		}
+	}
+	// Publish branch-visible durability only after the placement is unplaced.
+	// Thus wait --condition=durable cannot return during the narrow interval in
+	// which a cold branch is still routed to a dead runtime incarnation.
+	if err := store.CompleteBranchPublication(intent.Container, intent.Branch, intent.Generation, result.Manifest, lifecycle, true); err != nil {
+		return err
 	}
 	if intent.Kind != "dehydrate" {
 		p.recordStorageEvent(intent, "shared", "", result.Manifest)
@@ -584,6 +576,37 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	default:
 		return fmt.Errorf("distributed fork transaction %q is %s", transactionID, tx.State)
 	}
+}
+
+// releasePublishedPlacement releases runtime ownership after a process-free
+// branch has become durable. A daemon that recovered an activated publication
+// intent may have a new incarnation. Node admission already proves that the
+// previous incarnation of the same node ID has expired, so adopt it before
+// releasing the placement. Both transitions are generation-fenced and a
+// crash between them is safe to retry from the next incarnation.
+func (p *branchPublisher) releasePublishedPlacement(placements *cluster.PlacementStore, family, branch string) error {
+	record, err := placements.Lookup(family, branch)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Families created before the placement catalog are still valid.
+		return nil
+	case err != nil:
+		return err
+	case record.State == cluster.PlacementUnplaced:
+		return nil
+	case record.OwnerNode != p.nodeID:
+		return fmt.Errorf("published branch placement belongs to %s/%s, not local incarnation %s/%s", record.OwnerNode, record.OwnerIncarnation, p.nodeID, p.incarnation)
+	}
+	if record.OwnerIncarnation != p.incarnation {
+		record, err = placements.AdoptOwnerIncarnation(family, branch, p.nodeID, record.OwnerIncarnation, p.incarnation, record.Generation, time.Now())
+		if err != nil {
+			return fmt.Errorf("adopting recovered publication placement: %w", err)
+		}
+	}
+	if _, err := placements.Unplace(record.FamilyID, record.BranchID, p.nodeID, p.incarnation, record.Generation, time.Now()); err != nil {
+		return fmt.Errorf("releasing durable branch placement: %w", err)
+	}
+	return nil
 }
 
 func (p *branchPublisher) Failed(intent ttcstorage.Intent, cause error, retryAt time.Time) error {
