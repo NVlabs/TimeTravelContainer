@@ -249,17 +249,51 @@ func (m *Manager) ImportPrivateRemoteSnapshot(path, name, source, targetBranch s
 	if err := validateName(targetBranch, "branch"); err != nil {
 		return nil, SnapshotInfo{}, err
 	}
-	repository, err := m.CreatePrivate(path, name)
+	path = filepath.Clean(path)
+	if _, err := os.Lstat(path); err == nil {
+		return nil, SnapshotInfo{}, fmt.Errorf("private repository path %q already exists", path)
+	} else if !os.IsNotExist(err) {
+		return nil, SnapshotInfo{}, err
+	}
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	stage, err := os.MkdirTemp(parent, "."+filepath.Base(path)+".remote-import-")
 	if err != nil {
 		return nil, SnapshotInfo{}, err
 	}
-	if snapshot, err := repository.importSnapshotMode(source, true, targetBranch); err != nil {
-		repository.Close()
+	if err := os.Remove(stage); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	keepStage := false
+	defer func() {
+		if !keepStage {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	repository, err := m.CreatePrivate(stage, name)
+	if err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	snapshot, err := repository.importSnapshotMode(source, true, targetBranch)
+	closeErr := repository.Close()
+	if err != nil || closeErr != nil {
+		return nil, SnapshotInfo{}, errors.Join(err, closeErr)
+	}
+	// Readers and background GC must see either no repository or its complete
+	// format, metadata, branches, and sparse objects. Publishing the populated
+	// sibling directory with one rename avoids exposing the creation sequence.
+	if err := os.Rename(stage, path); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	keepStage = true
+	repository, err = m.OpenPrivate(path)
+	if err != nil {
 		_ = os.RemoveAll(path)
 		return nil, SnapshotInfo{}, err
-	} else {
-		return repository, snapshot, nil
 	}
+	return repository, snapshot, nil
 }
 
 // ImportRemoteBranchSnapshot adds a sparse inherited branch to an existing
