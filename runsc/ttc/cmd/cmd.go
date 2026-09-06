@@ -8275,6 +8275,23 @@ func (b *runtimeBackend) purgeRuntime(containerID string) error {
 	return nil
 }
 
+// removeOrphanRuntime force-removes a local physical runtime after its shared
+// family metadata has disappeared. This is a last-resort daemon-shutdown path:
+// without metadata there is no durable branch state left to preserve or
+// publish, but the Sentry and its console followers must not survive forever.
+func (b *runtimeBackend) removeOrphanRuntime(containerID string) error {
+	consoleErr := b.stopContainerConsoleDrains(containerID)
+	_, deleteErr := b.command("delete", "--force", containerID)
+	if deleteErr != nil {
+		deleteErr = fmt.Errorf("deleting physical runtime: %w", deleteErr)
+	}
+	var localErr error
+	if deleteErr == nil {
+		localErr = os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+	}
+	return errors.Join(consoleErr, deleteErr, localErr)
+}
+
 // The gofer holds host descriptors for the dentries the sentry is holding —
 // close to two apiece — and it inherits this process's descriptor limit.
 //

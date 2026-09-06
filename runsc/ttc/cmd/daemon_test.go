@@ -344,6 +344,61 @@ func TestStopDaemonContainersTreatsLineageAsDisplayOnly(t *testing.T) {
 	}
 }
 
+func TestStopDaemonContainersRemovesRuntimeWithoutFamilyMetadata(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	printf '[{"id":"orphan","pid":%s,"status":"running"}]\n' "$PPID"
+	;;
+timetravel)
+	echo 'connecting to control server: connection refused' >&2
+	exit 128
+	;;
+delete)
+	if [ "$4" != "--force" ] || [ "$5" != "orphan" ]; then
+		echo "unexpected delete: $*" >&2
+		exit 2
+	fi
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	sharedRoot := filepath.Join(dir, "shared")
+	localRoot := filepath.Join(dir, "local")
+	orphanDir := filepath.Join(localRoot, "containers", "orphan")
+	if err := os.MkdirAll(orphanDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{
+		root:      "/runtime",
+		runsc:     runsc,
+		dataRoot:  sharedRoot,
+		localRoot: localRoot,
+	}
+	if err := stopDaemonContainers(b); err != nil {
+		t.Fatalf("stopDaemonContainers: %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Errorf("orphan runtime was not force-deleted: %v", err)
+	}
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Errorf("orphan local state still exists or could not be inspected: %v", err)
+	}
+}
+
 func TestBranchOwnedByBackendFallsBackToFamilyOwner(t *testing.T) {
 	backend := &runtimeBackend{nodeID: "node-a"}
 	if branchOwnedByBackend(backend, Family{NodeID: "node-b"}, Branch{ID: "main"}) {

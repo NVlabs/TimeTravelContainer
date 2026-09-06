@@ -269,6 +269,14 @@ func processElasticCapacityRequest(ctx context.Context, dataRoot, nodeID string,
 	if err != nil || request == nil {
 		return false, err
 	}
+	// The maintainer passes the timestamp delivered with its timer event. A
+	// request may be created concurrently after that timer fires but before it
+	// acquires the outbox lock. Never persist an attempt timestamp before the
+	// request itself; otherwise the next retry correctly rejects the durable
+	// record as causally impossible.
+	if now.Before(request.CreatedAt) {
+		now = request.CreatedAt
+	}
 	source, err := directory.Lookup(nodeID)
 	if err != nil {
 		return false, err

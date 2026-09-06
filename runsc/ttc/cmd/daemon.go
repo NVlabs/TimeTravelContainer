@@ -1416,6 +1416,21 @@ func stopDaemonContainers(backend backend) error {
 	}
 	var targets []daemonStopTarget
 	for _, family := range families {
+		if runtime, ok := backend.(*runtimeBackend); ok {
+			metadataPath := filepath.Join(runtime.dataRoot, "containers", family.ID, "container.json")
+			if _, err := os.Stat(metadataPath); errors.Is(err, os.ErrNotExist) {
+				// Shared metadata may have been removed by a failed cross-node
+				// cleanup while this node still owns a physical Sentry. It is no
+				// longer possible to perform branch-aware shutdown, but leaving the
+				// orphan behind would make every future daemon stop fail forever.
+				if err := runtime.removeOrphanRuntime(family.ID); err != nil {
+					return fmt.Errorf("removing orphan runtime %q: %w", family.ID, err)
+				}
+				continue
+			} else if err != nil {
+				return fmt.Errorf("inspecting metadata for runtime %q: %w", family.ID, err)
+			}
+		}
 		for _, branch := range family.Branches {
 			if !branchOwnedByBackend(backend, family, branch) {
 				continue

@@ -245,6 +245,7 @@ def main():
         wait_for(
             "automatic drain completion",
             lambda: json.loads(intent_path.read_text(encoding="utf-8")).get("state") == "complete",
+            timeout=args.command_timeout,
         )
         inspected = json.loads(ttc(runtime_a, "inspect", "capacity-smoke").stdout)[0]
         branches = inspected["TTC"]["container"]["branches"]
@@ -276,7 +277,10 @@ def main():
         if verification_seconds:
             result["verification_seconds"] = verification_seconds
         print(json.dumps(result, indent=2, sort_keys=True))
-        ttc(runtime_a, "rm", "-f", "capacity-smoke")
+        # Deliberately send this through the drained entry node: clustered
+        # family removal must coordinate every branch owner rather than depend
+        # on which daemon receives the client request.
+        ttc(runtime_a, "rm", "-f", "capacity-smoke", timeout=args.command_timeout)
         succeeded = True
     finally:
         if args.preserve_on_failure and not succeeded:
@@ -286,16 +290,21 @@ def main():
             started_a = False
             started_b = False
             args.keep = True
-        if started_a:
-            # Remove image-owned mapped-UID trees while the daemon can still
+        # On failure, retain shared family metadata until both physical owners
+        # have stopped their local branches. Removing it first strands
+        # unaddressable Sentries and turns cleanup failure into misleading
+        # migration failure. Source shutdown runs first so it can settle any
+        # dependency still served to B.
+        if started_a and succeeded:
+            # Remove image-owned mapped-UID trees while a daemon can still
             # enter its extraction namespace. A plain host rmtree may not own
             # those inodes, even in unsafe-no-host-isolation test mode.
-            ttc(runtime_a, "rm", "-f", "capacity-smoke", check=False, timeout=30)
-            ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=30)
-        if started_b:
-            ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=30)
+            # The family itself was already removed by its owner above.
+            ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=args.command_timeout)
         if started_a:
-            ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=30)
+            ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=args.command_timeout)
+        if started_b:
+            ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=args.command_timeout)
         if not args.keep:
             # The stop response precedes the serving goroutine's final durable
             # intent cleanup by a small interval. Wait for both sockets to
@@ -304,7 +313,7 @@ def main():
                 "daemon shutdown",
                 lambda: not (runtime_a / "run" / "ttcd.sock").exists()
                 and not (runtime_b / "run" / "ttcd.sock").exists(),
-                timeout=30,
+                timeout=args.command_timeout,
             )
             time.sleep(1)
             remove_tree(root)

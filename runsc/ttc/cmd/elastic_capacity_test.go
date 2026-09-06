@@ -219,6 +219,45 @@ func TestElasticCapacityRequestRetriesAndWaitsForCompatibleCapacity(t *testing.T
 	}
 }
 
+func TestElasticCapacityAttemptClampsStaleTimerTimestamp(t *testing.T) {
+	dataRoot := t.TempDir()
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(dataRoot, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Unix(20_000, 1234).UTC()
+	source, err := directory.Register(testElasticCapacityRecord("node-a", 7<<30, 8<<30), created.Add(-time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := directory.Transition(source.NodeID, source.Incarnation, cluster.NodeReady, created.Add(-time.Minute+time.Second), 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	request := elasticCapacityRequest{
+		Version: 1, RequestID: "capacity-race", Operation: "acquire", Nodes: 1,
+		MemoryBytesEach: 8 << 30, Architecture: "amd64", RepositoryID: "shared",
+		SourceNode: "node-a", Reason: "node-drain", CreatedAt: created,
+		Deadline: created.Add(elasticCapacityAcceptanceLease),
+	}
+	if err := withElasticCapacityRequest(dataRoot, "node-a", func(path string, current *elasticCapacityRequest) error {
+		*current = request
+		return writeDurableJSON(path, current)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sink := &testElasticCapacitySink{err: errors.New("injected outage")}
+	if _, err := processElasticCapacityRequest(context.Background(), dataRoot, "node-a", directory, sink, created.Add(-time.Millisecond)); err == nil {
+		t.Fatal("failed delivery unexpectedly succeeded")
+	}
+	stored, err := loadElasticCapacityRequest(dataRoot, "node-a")
+	if err != nil {
+		t.Fatalf("stale timer produced an invalid durable request: %v", err)
+	}
+	if stored.LastAttemptAt == nil || stored.LastAttemptAt.Before(stored.CreatedAt) || stored.NextAttemptAt == nil || stored.NextAttemptAt.Before(stored.CreatedAt) {
+		t.Fatalf("invalid clamped delivery timestamps: %+v", stored)
+	}
+}
+
 func TestElasticCapacitySinkConfigurationValidation(t *testing.T) {
 	if _, err := newElasticCapacitySink("relative", ""); err == nil {
 		t.Error("relative command was accepted")
