@@ -582,6 +582,98 @@ func (r *MemoryRepository) ListBranches() (map[string]ManifestID, error) {
 	return result, nil
 }
 
+// ExportBranch writes a self-contained mini repository containing only the
+// immutable manifest and chunks reachable from branch. The exported branch is
+// named destinationBranch. This is suitable for packing or moving between
+// nodes without copying unrelated family memory.
+func (r *MemoryRepository) ExportBranch(branch, destinationBranch, destination string) (retErr error) {
+	if r == nil || r.rootFD != nil {
+		return errors.New("exporting a memory branch requires a path-opened repository")
+	}
+	manifestID, err := r.Branch(branch)
+	if err != nil {
+		return err
+	}
+	manifest, err := r.LoadManifest(manifestID)
+	if err != nil {
+		return err
+	}
+	if err := os.Mkdir(destination, 0700); err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(destination)
+		}
+	}()
+	for _, name := range []string{"chunks", "manifests", "branches", "consumed", "leases", "transactions", "trash"} {
+		if err := os.Mkdir(filepath.Join(destination, name), 0700); err != nil {
+			return err
+		}
+	}
+	lock, err := os.OpenFile(filepath.Join(destination, garbageCollectionLockName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	if err := lock.Close(); err != nil {
+		return err
+	}
+	linkImmutable := func(source, target string) error {
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			return err
+		}
+		if err := os.Link(source, target); err == nil {
+			return nil
+		} else if !errors.Is(err, unix.EXDEV) && !errors.Is(err, unix.EPERM) && !errors.Is(err, unix.EOPNOTSUPP) {
+			return err
+		}
+		src, err := os.Open(source)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		dst, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(dst, src)
+		return errors.Join(copyErr, dst.Sync(), dst.Close())
+	}
+	manifestDir, manifestPath := r.manifestPath(manifestID)
+	_ = manifestDir
+	targetManifest := filepath.Join(destination, "manifests", manifestID.String()[:4], manifestID.String()+".manifest")
+	if err := linkImmutable(manifestPath, targetManifest); err != nil {
+		return fmt.Errorf("exporting memory manifest %s: %w", manifestID, err)
+	}
+	objects := make(map[ID]struct{})
+	for _, run := range manifest.Runs {
+		objects[run.Object] = struct{}{}
+	}
+	for object := range objects {
+		_, source := r.chunks.path(object)
+		target := filepath.Join(destination, "chunks", object.String()[:4], object.String()+".chunk")
+		if err := linkImmutable(source, target); err != nil {
+			return fmt.Errorf("exporting memory chunk %s: %w", object, err)
+		}
+	}
+	branchPath, err := (&MemoryRepository{branchRoot: filepath.Join(destination, "branches")}).branchPath(destinationBranch)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(branchPath, encodeBranchPointer(manifestID), 0600); err != nil {
+		return err
+	}
+	if err := syncDirectory(filepath.Dir(branchPath)); err != nil {
+		return err
+	}
+	if err := syncDirectory(destination); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
 // BranchMemoryUsage accounts durable logical pages named by one branch root.
 type BranchMemoryUsage struct {
 	ID           string `json:"id"`

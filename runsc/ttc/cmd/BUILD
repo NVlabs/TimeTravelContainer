@@ -22,6 +22,7 @@ go_library(
         "events.go",
         "idempotency.go",
         "runtime_command.go",
+		"storage.go",
     ],
     visibility = [
         "//runsc/ttc:__subpackages__",
@@ -36,6 +37,7 @@ go_library(
         "//pkg/sentry/ttcchunk",
         "//pkg/sentry/ttcremote",
         "//pkg/ttcremote",
+		"//pkg/ttcpack",
         "//pkg/ttcvolume",
         "//runsc/boot",
         "//runsc/container",
@@ -47,6 +49,7 @@ go_library(
         "//runsc/ttc/cluster",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
+		"//runsc/ttc/storage",
         "//runsc/version",
         "@com_github_moby_sys_signal//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go",

@@ -372,7 +372,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("reloading promoted source metadata: %w", err)
 	}
-	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
+	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
 	}
 	transactionID, err := newDistributedTransactionID()
@@ -501,6 +501,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 // durable kernel metadata and sparse memory graph. No source Sentry is
 // created, and the target is independent as soon as publication completes.
 func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {
+	sourceBranch, branchErr := persistentBranchInfo(sourceInfo, source.branch)
+	if branchErr != nil {
+		return selector{}, branchErr
+	}
+	if err := b.ensureLocalColdBranch(sourceInfo, sourceBranch); err != nil {
+		return selector{}, fmt.Errorf("materializing dehydrated remote-fork source: %w", err)
+	}
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
 		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -537,11 +544,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		}
 	}()
 
-	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
-	if err != nil {
-		return selector{}, err
-	}
-	imageDir := existingMemoryBranchDir(b.dataRoot, sourceInfo.ID, "dehydrated", sourceBranch)
+	imageDir := existingMemoryBranchDir(b.activeDataRoot(), sourceInfo.ID, "dehydrated", sourceBranch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
 	if err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated source control state: %w", err)
@@ -570,7 +573,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		return selector{}, fmt.Errorf("opening cluster memory repository: %w", err)
 	}
 	defer clusterRepository.Close()
-	sourceRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, "containers", sourceInfo.ID, "memory", "chunks"))
+	sourceRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", sourceInfo.ID, "memory", "chunks"))
 	if err != nil {
 		return selector{}, fmt.Errorf("opening dehydrated source memory repository: %w", err)
 	}
@@ -804,7 +807,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	if err != nil {
 		return nil, err
 	}
-	if normalizeLifecycleState(sourceBranch.State) == "dehydrated" {
+	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		results := make([]selector, 0, len(targetContainers))
 		transactions := make([]string, 0, len(targetContainers))
 		for _, target := range destinations {

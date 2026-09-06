@@ -2290,3 +2290,52 @@ func TestRepositoryCanonicalBranchBelongsToFamily(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	id := strings.Repeat("a", 64)
+	bundleDir := filepath.Join(shared, "containers", id, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: filepath.Join(shared, "old-upper"),
+		Branch: ttcvolume.MainBranch, CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: filepath.Join(shared, "images", "source", "rootfs")},
+		Annotations: map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("b", 64)
+	info := ContainerInfo{
+		ID: id, Name: "demo", BundleDir: bundleDir, RootFS: spec.Root.Path, Digest: digest, Platform: "linux/amd64",
+		State: "created", LiveForkEligible: true, Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created"}},
+	}
+	if err := writeJSON(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := filepath.Join(local, "images", imageRootKey(digest, "linux/amd64"), "rootfs")
+	if loaded.Root == nil || loaded.Root.Path != wantRoot {
+		t.Fatalf("root path = %+v, want %q", loaded.Root, wantRoot)
+	}
+	resolved, err := specutils.TTCVolumeRepositories(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRepository := filepath.Join(local, "containers", id, rootfsUpperRepositoryDir)
+	if len(resolved) != 1 || resolved[0].Path != wantRepository {
+		t.Fatalf("repositories = %+v, want path %q", resolved, wantRepository)
+	}
+}

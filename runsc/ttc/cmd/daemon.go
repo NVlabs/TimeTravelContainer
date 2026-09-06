@@ -51,6 +51,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -138,6 +139,7 @@ type daemonServer struct {
 	distributedSource     *distributedSourceRuntime
 	clusterStore          *cluster.Store
 	clusterDirectory      *cluster.NodeDirectory
+	publicationQueue      *ttcstorage.Queue
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -255,6 +257,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
+	}
+	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, session.StreamBytes, 0); err != nil {
+		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
 	if session.SharedMetadata == "" {
@@ -495,7 +500,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			if readErr != nil {
 				return fmt.Errorf("reading durable peer metadata: %w", readErr)
 			}
-			durableActiveDir = memoryBranchDir(r.backend.dataRoot, info.ID, "active", targetBranch)
+			durableActiveDir = memoryBranchDir(r.backend.activeDataRoot(), info.ID, "active", targetBranch)
 			if err := os.RemoveAll(durableActiveDir); err != nil {
 				return err
 			}
@@ -1013,6 +1018,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				}
 			}
 			if !status.Done {
+				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, status.BytesOutstanding, 0)
 				continue
 			}
 			if status.Error != "" {
@@ -1023,6 +1029,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			if tx.State != cluster.TransactionIndependent {
 				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
 			}
+			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
 			// The target MemoryFile now contains every page, so the immutable
 			// shared snapshot no longer owns storage for this branch.
 			_ = os.Remove(filepath.Join(r.backend.dataRoot, distributedSnapshotRelativePath(transactionID)))
@@ -1303,6 +1310,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		root:                  opts.root,
 		runsc:                 opts.runsc,
 		dataRoot:              opts.dataRoot,
+		localRoot:             opts.localRoot,
 		daemonSocket:          opts.daemonSocket,
 		runtimePlatform:       opts.runtimePlatform,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
@@ -1321,6 +1329,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.volumeCopyMode = s.volumeCapability.Mode
 	backend.allowSlowVolumeCopy = s.volumeCapability.Mode == ttcvolume.CopyModeFull
+	backend.publicationQueue = s.publicationQueue
 }
 
 type daemonStopTarget struct {
@@ -1527,6 +1536,7 @@ func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
 	opts.dataRoot = s.dataRoot
+	opts.localRoot = s.localRoot
 	opts.daemonSocket = s.socket
 	return opts
 }
@@ -1794,12 +1804,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: preparing node-local runtime storage: %v\n", err)
 		return 1
 	}
-	manager, err := ttcvolume.OpenManager(daemonDataRoot, allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(roots.local, allowSlowVolumeCopy)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
 	}
-	store := ttcbundle.Store{Root: daemonDataRoot}
+	store := ttcbundle.Store{Root: daemonDataRoot, ActiveRoot: roots.local}
 	// Namespace recovery must precede every startup inventory. In particular,
 	// image-root pruning uses a conservative container scan and should never be
 	// reached with a half-deleted legacy directory still in containers/.
@@ -2452,18 +2462,30 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	publisher := &branchPublisher{sharedRoot: dataRoot, localRoot: localRoot}
+	publisher.event = func(event DaemonEvent) { server.recordEvent(dataRoot, event) }
+	if clusterRuntime != nil {
+		publisher.nodeID = clusterRuntime.nodeRecord.NodeID
+		publisher.incarnation = clusterRuntime.nodeRecord.Incarnation
+	}
+	publicationQueue, err := ttcstorage.Open(localRoot, publisher)
+	if err != nil {
+		return fmt.Errorf("opening durable publication queue: %w", err)
+	}
+	server.publicationQueue = publicationQueue
+	defer publicationQueue.Close()
 	// Recover namespace-atomic deletions before announcing readiness. Failure
 	// to physically remove one tombstone is non-fatal: it is outside the active
 	// container namespace and periodic maintenance will retry it.
 	unlockRecovery := server.lockDataRoot(dataRoot)
-	_, recoveryErr := (ttcbundle.Store{Root: dataRoot}).RecoverContainerRemovals()
+	_, recoveryErr := (ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}).RecoverContainerRemovals()
 	unlockRecovery()
 	if recoveryErr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", recoveryErr)
 	}
 	maintenanceDone := make(chan struct{})
 	defer close(maintenanceDone)
-	go maintainRepositories(dataRoot, stderr, maintenanceDone, func() func() {
+	go maintainRepositories(dataRoot, localRoot, publicationQueue, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
 	})
 	clusterDone := make(chan struct{})
@@ -2489,7 +2511,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
 		targetBackend := directBackend(options{
-			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot,
+			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,
 			unsafeNoHostIsolation: server.unsafeNoHostIsolation,
 			disableHostGSO:        server.disableHostGSO,
@@ -2636,7 +2658,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 }
 
-func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	for {
@@ -2649,24 +2671,27 @@ func maintainRepositories(dataRoot string, stderr io.Writer, done <-chan struct{
 		if lock != nil {
 			unlock = lock()
 		}
-		store := ttcbundle.Store{Root: dataRoot}
+		store := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
 		if _, err := store.RecoverContainerRemovals(); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", err)
 		}
 		if _, err := store.GarbageCollectRepositories(); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
 		}
-		if err := collectSparseMemoryRepositories(dataRoot); err != nil && stderr != nil {
+		if err := collectSparseMemoryRepositories(dataRoot, localRoot); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)
+		}
+		if err := collectColdStorage(dataRoot, localRoot, publications); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
 		}
 		unlock()
 		timer.Reset(repositoryMaintenanceInterval)
 	}
 }
 
-func collectSparseMemoryRepositories(dataRoot string) error {
+func collectSparseMemoryRepositories(dataRoot, localRoot string) error {
 	paths := []string{filepath.Join(dataRoot, "cluster", "memory-chunks")}
-	containersRoot := filepath.Join(dataRoot, "containers")
+	containersRoot := filepath.Join(localRoot, "containers")
 	entries, err := os.ReadDir(containersRoot)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -2821,6 +2846,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if err != nil {
 				writeError(fmt.Errorf("stopping managed containers: %w", err))
 				return
+			}
+			if s.publicationQueue != nil {
+				if err := s.publicationQueue.Drain(context.Background()); err != nil {
+					writeError(fmt.Errorf("draining durable publications: %w", err))
+					return
+				}
 			}
 		}
 		_ = writeDaemonStatus(conn, &writeMu, 0)

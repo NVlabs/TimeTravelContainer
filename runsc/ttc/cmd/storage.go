@@ -1,0 +1,767 @@
+// Copyright 2026 The gVisor Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+package cmd
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/specutils"
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
+)
+
+type coldPackReference struct {
+	Source string `json:"source"`
+	Pack   string `json:"pack"`
+}
+
+type coldBranchManifest struct {
+	Version    int                 `json:"version"`
+	Container  string              `json:"container"`
+	Branch     string              `json:"branch"`
+	Generation uint64              `json:"generation"`
+	Kind       string              `json:"kind"`
+	CreatedAt  time.Time           `json:"created_at"`
+	Parent     string              `json:"parent,omitempty"`
+	Packs      []coldPackReference `json:"packs"`
+}
+
+type branchPublisher struct {
+	sharedRoot  string
+	localRoot   string
+	nodeID      string
+	incarnation string
+	event       func(DaemonEvent)
+}
+
+func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	info, err := store.LoadContainer(intent.Container)
+	if err != nil {
+		return ttcstorage.Result{}, err
+	}
+	branch, err := persistentBranchInfo(info, intent.Branch)
+	if err != nil {
+		return ttcstorage.Result{}, err
+	}
+	if branch.StorageGeneration != intent.Generation {
+		return ttcstorage.Result{}, fmt.Errorf("storage generation changed to %d", branch.StorageGeneration)
+	}
+	path := coldManifestPath(p.sharedRoot, info.ID, branch.ID, intent.Generation)
+	if existing, err := readColdBranchManifest(path); err == nil {
+		if existing.Container != info.ID || existing.Branch != branch.ID || existing.Generation != intent.Generation || existing.Kind != intent.Kind {
+			return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting identity")
+		}
+		for _, reference := range existing.Packs {
+			id, err := ttcpack.ParseID(reference.Pack)
+			if err != nil {
+				return ttcstorage.Result{}, err
+			}
+			file, _, err := ttcpack.Open(filepath.Join(p.sharedRoot, "cold"), id)
+			if err != nil {
+				return ttcstorage.Result{}, err
+			}
+			if err := file.Close(); err != nil {
+				return ttcstorage.Result{}, err
+			}
+		}
+		return ttcstorage.Result{Manifest: path}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ttcstorage.Result{}, err
+	}
+	staging := filepath.Join(p.localRoot, "publication-staging", intent.ID)
+	if err := os.RemoveAll(staging); err != nil {
+		return ttcstorage.Result{}, err
+	}
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return ttcstorage.Result{}, err
+	}
+	defer os.RemoveAll(staging)
+	manifest := coldBranchManifest{Version: 1, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC(), Parent: intent.ParentManifest}
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return ttcstorage.Result{}, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return ttcstorage.Result{}, err
+	}
+	seen := make(map[string]struct{})
+	for index, config := range repositories {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return ttcstorage.Result{}, fmt.Errorf("opening active repository %q: %w", config.Source, err)
+		}
+		snapshotPath := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
+		_, snapshotErr := repository.ExportSnapshot(intent.FilesystemBranch, snapshotPath)
+		closeErr := repository.Close()
+		if snapshotErr != nil || closeErr != nil {
+			return ttcstorage.Result{}, errors.Join(snapshotErr, closeErr)
+		}
+		if intent.ParentManifest != "" {
+			inherited, err := p.inheritedObjectIDs(intent.ParentManifest, config.Source)
+			if err != nil {
+				return ttcstorage.Result{}, err
+			}
+			for object := range inherited {
+				if err := os.Remove(filepath.Join(snapshotPath, "objects", object)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return ttcstorage.Result{}, err
+				}
+			}
+		}
+		pack, err := ttcpack.WriteDirectory(snapshotPath, filepath.Join(p.sharedRoot, "cold"))
+		if err != nil {
+			return ttcstorage.Result{}, err
+		}
+		manifest.Packs = append(manifest.Packs, coldPackReference{Source: config.Source, Pack: pack.String()})
+	}
+	if intent.Kind == "dehydrate" {
+		memory := publicationMemoryControlPath(p.localRoot, intent.MemoryControl)
+		if _, err := os.Stat(memory); err != nil {
+			return ttcstorage.Result{}, fmt.Errorf("opening local dehydration image: %w", err)
+		}
+		pack, err := ttcpack.WriteDirectory(memory, filepath.Join(p.sharedRoot, "cold"))
+		if err != nil {
+			return ttcstorage.Result{}, err
+		}
+		manifest.Packs = append(manifest.Packs, coldPackReference{Source: "memory-control", Pack: pack.String()})
+		chunks := filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks")
+		repository, err := ttcchunk.OpenMemoryRepository(chunks)
+		if err != nil {
+			return ttcstorage.Result{}, err
+		}
+		memorySnapshot := filepath.Join(staging, "memory-repository")
+		exportErr := repository.ExportBranch(intent.MemoryBranch, branch.FilesystemBranch, memorySnapshot)
+		closeErr := repository.Close()
+		if exportErr != nil || closeErr != nil {
+			return ttcstorage.Result{}, errors.Join(exportErr, closeErr)
+		}
+		pack, err = ttcpack.WriteDirectory(memorySnapshot, filepath.Join(p.sharedRoot, "cold"))
+		if err != nil {
+			return ttcstorage.Result{}, err
+		}
+		manifest.Packs = append(manifest.Packs, coldPackReference{Source: "memory-chunks", Pack: pack.String()})
+	}
+	sort.Slice(manifest.Packs, func(i, j int) bool { return manifest.Packs[i].Source < manifest.Packs[j].Source })
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return ttcstorage.Result{}, err
+	}
+	if err := writeDurableJSON(path, &manifest); err != nil {
+		return ttcstorage.Result{}, err
+	}
+	return ttcstorage.Result{Manifest: path}, nil
+}
+
+func (p *branchPublisher) inheritedObjectIDs(manifestPath, source string) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+	seen := make(map[string]struct{})
+	for manifestPath != "" {
+		if err := validateColdManifestPath(p.sharedRoot, manifestPath); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[manifestPath]; ok {
+			return nil, errors.New("cold manifest parent cycle")
+		}
+		seen[manifestPath] = struct{}{}
+		manifest, err := readColdBranchManifest(manifestPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, reference := range manifest.Packs {
+			if reference.Source != source {
+				continue
+			}
+			id, err := ttcpack.ParseID(reference.Pack)
+			if err != nil {
+				return nil, err
+			}
+			file, index, err := ttcpack.Open(filepath.Join(p.sharedRoot, "cold"), id)
+			if err != nil {
+				return nil, err
+			}
+			closeErr := file.Close()
+			if closeErr != nil {
+				return nil, closeErr
+			}
+			for _, entry := range index.Entries {
+				if strings.HasPrefix(entry.Path, "objects/") {
+					name := strings.TrimPrefix(entry.Path, "objects/")
+					if !strings.ContainsRune(name, '/') && name != "" {
+						result[name] = struct{}{}
+					}
+				}
+			}
+		}
+		manifestPath = manifest.Parent
+	}
+	return result, nil
+}
+
+func validateColdManifestPath(sharedRoot, path string) error {
+	base := filepath.Join(sharedRoot, "cold", "manifests")
+	relative, err := filepath.Rel(base, path)
+	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("cold manifest %q escapes TTC_ROOT", path)
+	}
+	return nil
+}
+
+func coldManifestPath(sharedRoot, container, branch string, generation uint64) string {
+	return filepath.Join(sharedRoot, "cold", "manifests", hex.EncodeToString([]byte(container)), hex.EncodeToString([]byte(branch)), fmt.Sprintf("%016x.json", generation))
+}
+
+func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, error) {
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	info, err := store.LoadContainer(intent.Container)
+	if err != nil {
+		return false, err
+	}
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return false, err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return false, err
+	}
+	seen := make(map[string]struct{})
+	for _, config := range repositories {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return false, err
+		}
+		_, branchErr := repository.Branch(intent.FilesystemBranch)
+		closeErr := repository.Close()
+		if errors.Is(branchErr, os.ErrNotExist) {
+			return false, closeErr
+		}
+		if branchErr != nil || closeErr != nil {
+			return false, errors.Join(branchErr, closeErr)
+		}
+	}
+	if intent.Kind == "dehydrate" {
+		if intent.MemoryControl == "" {
+			return false, errors.New("dehydration publication omits sealed control state")
+		}
+		if stat, err := os.Stat(publicationMemoryControlPath(p.localRoot, intent.MemoryControl)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		} else if !stat.IsDir() {
+			return false, errors.New("sealed dehydration control state is not a directory")
+		}
+		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks"))
+		if err != nil {
+			return false, err
+		}
+		_, branchErr := repository.Branch(intent.MemoryBranch)
+		closeErr := repository.Close()
+		if errors.Is(branchErr, os.ErrNotExist) {
+			return false, closeErr
+		}
+		if branchErr != nil || closeErr != nil {
+			return false, errors.Join(branchErr, closeErr)
+		}
+	}
+	return true, nil
+}
+
+func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	info, err := store.LoadContainer(intent.Container)
+	if err != nil {
+		return err
+	}
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{})
+	for _, config := range repositories {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return err
+		}
+		removeErr := repository.RemoveBranch(intent.FilesystemBranch)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		gcErr := repository.GarbageCollect()
+		closeErr := repository.Close()
+		if removeErr != nil || gcErr != nil || closeErr != nil {
+			return errors.Join(removeErr, gcErr, closeErr)
+		}
+	}
+	if intent.MemoryBranch != "" {
+		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks"))
+		if err != nil {
+			return err
+		}
+		removeErr := repository.DeleteBranch(intent.MemoryBranch)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		_, gcErr := repository.CollectGarbage(ttcchunk.GCOptions{})
+		closeErr := repository.Close()
+		return errors.Join(removeErr, gcErr, closeErr, os.RemoveAll(publicationMemoryControlPath(p.localRoot, intent.MemoryControl)))
+	}
+	return nil
+}
+
+func publicationMemoryControlPath(localRoot, capture string) string {
+	return filepath.Join(localRoot, "publication-captures", "memory-control", capture)
+}
+
+// snapshotImmutableTree seals the small process/control portion of a
+// dehydration image independently of the user-visible local image. Regular
+// files are hard-linked within TTC_LOCAL_ROOT and copied only if the backing
+// filesystem rejects links. The sparse memory payload is rooted separately in
+// ttcchunk, so this tree normally contains only metadata and control JSON.
+func snapshotImmutableTree(source, destination string) error {
+	if err := os.RemoveAll(destination); err != nil {
+		return err
+	}
+	if err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			return os.MkdirAll(target, info.Mode().Perm())
+		case entry.Type().IsRegular():
+			if err := os.Link(path, target); err == nil {
+				return nil
+			} else if !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EOPNOTSUPP) {
+				return err
+			}
+			input, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer input.Close()
+			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(output, input)
+			return errors.Join(copyErr, output.Sync(), output.Close())
+		default:
+			return fmt.Errorf("unsupported dehydration control entry %q (%s)", relative, info.Mode())
+		}
+	}); err != nil {
+		_ = os.RemoveAll(destination)
+		return err
+	}
+	directory, err := os.Open(destination)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.Result) error {
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	info, err := store.LoadContainer(intent.Container)
+	if err != nil {
+		return err
+	}
+	lifecycle := ""
+	if intent.Kind == "dehydrate" {
+		lifecycle = "dehydrated"
+	}
+	if err := store.CompleteBranchPublication(intent.Container, intent.Branch, intent.Generation, result.Manifest, lifecycle, true); err != nil {
+		return err
+	}
+	if p.nodeID != "" {
+		placements, err := cluster.OpenPlacementStore(filepath.Join(p.sharedRoot, "cluster", "placements"))
+		if err != nil {
+			return err
+		}
+		record, err := placements.Lookup(info.ID, intent.Branch)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// Families created before the placement catalog are still valid.
+		case err != nil:
+			return err
+		case record.State == cluster.PlacementUnplaced:
+		case record.OwnerNode != p.nodeID || record.OwnerIncarnation != p.incarnation:
+			return fmt.Errorf("published branch placement belongs to %s/%s, not local incarnation %s/%s", record.OwnerNode, record.OwnerIncarnation, p.nodeID, p.incarnation)
+		default:
+			if _, err := placements.Unplace(record.FamilyID, record.BranchID, p.nodeID, p.incarnation, record.Generation, time.Now()); err != nil {
+				return fmt.Errorf("releasing durable branch placement: %w", err)
+			}
+		}
+	}
+	if intent.Kind != "dehydrate" {
+		p.recordStorageEvent(intent, "shared", "", result.Manifest)
+		return nil
+	}
+	info, err = store.LoadContainer(intent.Container)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, intent.Branch)
+	if err != nil {
+		return err
+	}
+	transactionID := transactionIDForBranch(info, branch)
+	if transactionID == "" {
+		p.recordStorageEvent(intent, "shared", "", result.Manifest)
+		return nil
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(p.sharedRoot, "cluster", "transactions"))
+	if err != nil {
+		return err
+	}
+	tx, err := transactions.Load(transactionID)
+	if err != nil {
+		return err
+	}
+	switch tx.State {
+	case cluster.TransactionPublished, cluster.TransactionDraining:
+		_, err = transactions.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+		if err == nil {
+			p.recordStorageEvent(intent, "shared", "", result.Manifest)
+		}
+		return err
+	case cluster.TransactionIndependent:
+		p.recordStorageEvent(intent, "shared", "", result.Manifest)
+		return nil
+	default:
+		return fmt.Errorf("distributed fork transaction %q is %s", transactionID, tx.State)
+	}
+}
+
+func (p *branchPublisher) Failed(intent ttcstorage.Intent, cause error, retryAt time.Time) error {
+	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
+	err := store.UpdateBranchStorage(intent.Container, intent.Branch, intent.Generation, "error", cause.Error(), retryAt)
+	if err == nil {
+		p.recordStorageEvent(intent, "error", cause.Error(), "")
+	}
+	return err
+}
+
+func (p *branchPublisher) recordStorageEvent(intent ttcstorage.Intent, state, storageError, manifest string) {
+	if p.event == nil {
+		return
+	}
+	attributes := map[string]string{"state": state, "generation": fmt.Sprint(intent.Generation), "kind": intent.Kind}
+	if storageError != "" {
+		attributes["error"] = storageError
+	}
+	if manifest != "" {
+		attributes["manifest"] = manifest
+	}
+	p.event(DaemonEvent{Type: "storage", Action: state, Subject: intent.Container + "@" + intent.Branch, Attributes: attributes})
+}
+
+func readColdBranchManifest(path string) (coldBranchManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return coldBranchManifest{}, err
+	}
+	var manifest coldBranchManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return coldBranchManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
+	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	if _, err := os.Stat(localImage); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if branch.StorageState != "shared" || branch.StorageManifest == "" {
+		return fmt.Errorf("branch %s@%s has no local capture or committed shared manifest", info.Name, branch.ID)
+	}
+	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
+		return err
+	}
+	store := b.containerStore()
+	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{}); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "error", retErr.Error(), time.Time{})
+		}
+	}()
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return err
+	}
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
+		return errors.New("cold manifest identity does not match branch generation")
+	}
+	packBySource := make(map[string]ttcpack.ID, len(manifest.Packs))
+	for _, reference := range manifest.Packs {
+		id, err := ttcpack.ParseID(reference.Pack)
+		if err != nil {
+			return err
+		}
+		packBySource[reference.Source] = id
+	}
+	if err := os.MkdirAll(filepath.Join(b.activeDataRoot(), "containers", info.ID), 0700); err != nil {
+		return err
+	}
+	staging := filepath.Join(b.activeDataRoot(), "materialization-staging", fmt.Sprintf("%s-%s-%016x", info.ID, hex.EncodeToString([]byte(branch.ID)), branch.StorageGeneration))
+	if err := os.RemoveAll(staging); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	if err != nil {
+		return err
+	}
+	for index := range repositories {
+		repository := &repositories[index]
+		_, ok := packBySource[repository.Source]
+		if !ok {
+			return fmt.Errorf("cold manifest omits repository %q", repository.Source)
+		}
+		if _, err := os.Stat(repository.Path); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		snapshot := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
+		if err := b.materializeColdSource(manifest, repository.Source, snapshot); err != nil {
+			return fmt.Errorf("materializing repository %q: %w", repository.Source, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(repository.Path), 0700); err != nil {
+			return err
+		}
+		imported, snapshotInfo, err := manager.ImportPrivateSnapshot(repository.Path, fmt.Sprintf("cold-%d", index), snapshot)
+		if err != nil {
+			return err
+		}
+		repository.RestoreID = snapshotInfo.RepositoryID
+		repository.CopyMode = string(manager.Capability().Mode)
+		if err := imported.Close(); err != nil {
+			return err
+		}
+	}
+	if err := store.WriteActiveRepositoryMap(info.ID, repositories); err != nil {
+		return err
+	}
+	for _, source := range []string{"memory-control", "memory-chunks"} {
+		pack, ok := packBySource[source]
+		if !ok {
+			if source == "memory-control" {
+				return errors.New("cold manifest omits dehydration control state")
+			}
+			continue
+		}
+		destination := localImage
+		if source == "memory-chunks" {
+			destination = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
+		}
+		if _, err := os.Stat(destination); err == nil {
+			continue
+		}
+		if err := ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), pack, destination); err != nil {
+			return err
+		}
+	}
+	return store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "local", "", time.Time{})
+}
+
+func (b *runtimeBackend) materializeColdSource(manifest coldBranchManifest, source, destination string) error {
+	current := manifest
+	first := true
+	seen := make(map[string]struct{})
+	for {
+		var found *coldPackReference
+		for i := range current.Packs {
+			if current.Packs[i].Source == source {
+				found = &current.Packs[i]
+				break
+			}
+		}
+		if found != nil {
+			id, err := ttcpack.ParseID(found.Pack)
+			if err != nil {
+				return err
+			}
+			if first {
+				err = ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), id, destination)
+			} else {
+				err = ttcpack.MaterializeMissing(filepath.Join(b.dataRoot, "cold"), id, destination)
+			}
+			if err != nil {
+				return err
+			}
+			first = false
+		}
+		if current.Parent == "" {
+			break
+		}
+		if err := validateColdManifestPath(b.dataRoot, current.Parent); err != nil {
+			return err
+		}
+		if _, ok := seen[current.Parent]; ok {
+			return errors.New("cold manifest parent cycle")
+		}
+		seen[current.Parent] = struct{}{}
+		parent, err := readColdBranchManifest(current.Parent)
+		if err != nil {
+			return err
+		}
+		current = parent
+	}
+	if first {
+		return fmt.Errorf("cold manifest chain omits source %q", source)
+	}
+	return nil
+}
+
+// collectColdStorage traces every authoritative and pending manifest before
+// reclaiming immutable packs. A grace period protects a publisher between
+// writing its pack and atomically committing its manifest.
+func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue) error {
+	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
+	containers, err := store.ListContainers()
+	if err != nil {
+		return err
+	}
+	queue := make([]string, 0)
+	for _, info := range containers {
+		for _, branch := range info.Branches {
+			if branch.StorageManifest != "" {
+				queue = append(queue, branch.StorageManifest)
+			}
+		}
+	}
+	if publications != nil {
+		pending, err := publications.Pending()
+		if err != nil {
+			return err
+		}
+		for _, intent := range pending {
+			path := coldManifestPath(sharedRoot, intent.Container, intent.Branch, intent.Generation)
+			if _, err := os.Stat(path); err == nil {
+				queue = append(queue, path)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if intent.ParentManifest != "" {
+				queue = append(queue, intent.ParentManifest)
+			}
+		}
+	}
+	manifests := make(map[string]struct{})
+	packs := make(map[ttcpack.ID]struct{})
+	for len(queue) != 0 {
+		path := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if _, ok := manifests[path]; ok {
+			continue
+		}
+		if err := validateColdManifestPath(sharedRoot, path); err != nil {
+			return err
+		}
+		manifest, err := readColdBranchManifest(path)
+		if err != nil {
+			return fmt.Errorf("tracing cold manifest %q: %w", path, err)
+		}
+		manifests[path] = struct{}{}
+		if manifest.Parent != "" {
+			queue = append(queue, manifest.Parent)
+		}
+		for _, reference := range manifest.Packs {
+			id, err := ttcpack.ParseID(reference.Pack)
+			if err != nil {
+				return err
+			}
+			packs[id] = struct{}{}
+		}
+	}
+	grace := time.Now().Add(-10 * time.Minute)
+	root := filepath.Join(sharedRoot, "cold", "manifests")
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil
+		}
+		if _, ok := manifests[path]; ok {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(grace) {
+			return nil
+		}
+		return os.Remove(path)
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, grace.UnixNano())
+	return err
+}

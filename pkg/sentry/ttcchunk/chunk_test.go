@@ -374,6 +374,54 @@ func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryExportBranchIsSelfContained(t *testing.T) {
+	source, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	chunk := testChunk()
+	pages := make([]SourcePage, len(chunk.Pages))
+	for i, page := range chunk.Pages {
+		pages[i] = SourcePage{
+			Binding: pgalloc.CapturedPageBinding{
+				OldOffset: uint64(i) * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+				Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+			},
+			Zero: page.Zero, Data: page.Data,
+		}
+	}
+	objects, bindings, err := Assemble(pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := source.Publish(objects, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetBranch("capture", manifest); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "snapshot")
+	if err := source.ExportBranch("capture", "main", destination); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := OpenMemoryRepository(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exported.Close()
+	if got, err := exported.Branch("main"); err != nil || got != manifest {
+		t.Fatalf("exported Branch(main) = %s, %v; want %s", got, err, manifest)
+	}
+	for _, object := range objects {
+		if _, err := exported.chunks.Get(object.ID); err != nil {
+			t.Fatalf("exported chunk %s: %v", object.ID, err)
+		}
+	}
+}
+
 func TestMemoryRepositoryImportManifest(t *testing.T) {
 	source, err := OpenMemoryRepository(t.TempDir())
 	if err != nil {

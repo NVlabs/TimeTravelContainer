@@ -63,6 +63,7 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -4453,6 +4454,14 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+	queueExit := func() error {
+		if publisher, ok := backend.(interface{ queueBranchPublication(selector, string) error }); ok {
+			if err := publisher.queueBranchPublication(target.selector, "stop"); err != nil {
+				return fmt.Errorf("queueing durable filesystem publication for %s: %w", target.selector, err)
+			}
+		}
+		return nil
+	}
 	switch target.state {
 	case "running", "restarting":
 		if err := backend.prepareStop(target.selector); err != nil {
@@ -4479,14 +4488,17 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
 		}
+		return queueExit()
 	case "paused", "dehydrated":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
 		}
+		return queueExit()
 	case "exited":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing exited execution state for %s: %w", target.selector, err)
 		}
+		return queueExit()
 	case "created", "failed", "dead":
 		return nil
 	default:
@@ -4498,15 +4510,15 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	condition := fs.String("condition", "not-running", "wait condition (not-running only)")
+	condition := fs.String("condition", "not-running", "wait condition (not-running or durable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc wait [--condition not-running] TARGET [TARGET...]")
+		return errors.New("usage: ttc wait [--condition not-running|durable] TARGET [TARGET...]")
 	}
-	if *condition != "not-running" {
-		return fmt.Errorf("wait condition %q is not implemented; use 'not-running'", *condition)
+	if *condition != "not-running" && *condition != "durable" {
+		return fmt.Errorf("wait condition %q is not implemented; use 'not-running' or 'durable'", *condition)
 	}
 	targets := make([]selector, 0, fs.NArg())
 	for _, arg := range fs.Args() {
@@ -4521,6 +4533,10 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 		waited := make(chan waitResult, 1)
 		waiters[i] = waited
 		go func(target selector, waited chan<- waitResult) {
+			if *condition == "durable" {
+				waited <- waitForDurableBranch(target, backend)
+				return
+			}
 			status, err := backend.wait(target)
 			waited <- waitResult{status: status, err: err}
 		}(target, waited)
@@ -4530,9 +4546,45 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 		if result.err != nil {
 			return fmt.Errorf("waiting for %s: %w", targets[i], result.err)
 		}
-		fmt.Fprintln(stdout, waitStatusExitCode(result.status))
+		if *condition == "durable" {
+			fmt.Fprintln(stdout, targets[i])
+		} else {
+			fmt.Fprintln(stdout, waitStatusExitCode(result.status))
+		}
 	}
 	return nil
+}
+
+func waitForDurableBranch(target selector, backend backend) waitResult {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		family, err := backend.inspect(target.container)
+		if err != nil {
+			return waitResult{err: err}
+		}
+		found := false
+		for _, inspected := range family.TTC.Branches {
+			branch := inspected.Metadata
+			if branch.ID != target.branch {
+				continue
+			}
+			found = true
+			switch branch.StorageState {
+			case "shared":
+				return waitResult{}
+			case "error":
+				if branch.StorageRetryAt.IsZero() {
+					return waitResult{err: fmt.Errorf("storage publication failed: %s", branch.StorageError)}
+				}
+			}
+			break
+		}
+		if !found {
+			return waitResult{err: fmt.Errorf("branch %s does not exist", target)}
+		}
+		<-ticker.C
+	}
 }
 
 func runRestart(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -4838,17 +4890,25 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
-	ID               string    `json:"id"`
-	NodeID           string    `json:"node_id,omitempty"`
-	ParentID         string    `json:"parent,omitempty"`
-	State            string    `json:"state"`
-	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	InitPID          int32     `json:"init_pid,omitempty"`
-	InitState        string    `json:"init_state,omitempty"`
-	MemorySharing    string    `json:"memory_sharing,omitempty"`
+	ID                       string    `json:"id"`
+	NodeID                   string    `json:"node_id,omitempty"`
+	ParentID                 string    `json:"parent,omitempty"`
+	State                    string    `json:"state"`
+	StorageState             string    `json:"storage_state"`
+	StorageGeneration        uint64    `json:"storage_generation,omitempty"`
+	StorageError             string    `json:"storage_error,omitempty"`
+	StorageManifest          string    `json:"storage_manifest,omitempty"`
+	StorageRetryAt           time.Time `json:"storage_retry_at,omitempty"`
+	SourceNode               string    `json:"source_node,omitempty"`
+	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	ForkTotalNS              int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS         int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS             int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt                time.Time `json:"created_at"`
+	InitPID                  int32     `json:"init_pid,omitempty"`
+	InitState                string    `json:"init_state,omitempty"`
+	MemorySharing            string    `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttc ls --json.
@@ -4982,12 +5042,17 @@ type ResourceBytes struct {
 
 // BranchResourceStats is one branch's resource-accounting snapshot.
 type BranchResourceStats struct {
-	Target           string        `json:"target"`
-	State            string        `json:"state"`
-	ResidentMemory   ResourceBytes `json:"resident_memory"`
-	MemoryBacking    ResourceBytes `json:"memory_backing"`
-	Filesystem       ResourceBytes `json:"filesystem"`
-	FilesystemInodes uint64        `json:"filesystem_inodes"`
+	Target                   string        `json:"target"`
+	State                    string        `json:"state"`
+	StorageState             string        `json:"storage_state"`
+	StorageGeneration        uint64        `json:"storage_generation,omitempty"`
+	SourceNode               string        `json:"source_node,omitempty"`
+	DependentMemoryBytes     uint64        `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes uint64        `json:"dependent_filesystem_bytes,omitempty"`
+	ResidentMemory           ResourceBytes `json:"resident_memory"`
+	MemoryBacking            ResourceBytes `json:"memory_backing"`
+	Filesystem               ResourceBytes `json:"filesystem"`
+	FilesystemInodes         uint64        `json:"filesystem_inodes"`
 }
 
 // FamilyResourceStats includes branch attribution and non-double-counted totals.
@@ -4997,6 +5062,8 @@ type FamilyResourceStats struct {
 	ResidentMemoryUniqueBytes uint64                `json:"resident_memory_unique_bytes"`
 	MemoryBackingUniqueBytes  uint64                `json:"memory_backing_unique_bytes"`
 	FilesystemUniqueBytes     uint64                `json:"filesystem_unique_bytes"`
+	DependentMemoryBytes      uint64                `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes  uint64                `json:"dependent_filesystem_bytes,omitempty"`
 }
 
 type resourceStatsBackend interface {
@@ -5031,11 +5098,12 @@ func runStats(args []string, stdout, stderr io.Writer, b backend) error {
 		return encoder.Encode(stats)
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, 24, 0)
-	fmt.Fprintln(table, "TARGET\tSTATE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED")
+	fmt.Fprintln(table, "TARGET\tSTATE\tSTORAGE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED\tREMOTE DEPENDENT")
 	for _, branch := range stats.Branches {
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", branch.Target, branch.State,
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", branch.Target, branch.State, branch.StorageState,
 			formatImageSize(int64(branch.ResidentMemory.PrivateBytes)), formatImageSize(int64(branch.ResidentMemory.SharedBytes)),
-			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)))
+			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)),
+			formatImageSize(int64(branch.DependentMemoryBytes+branch.DependentFilesystemBytes)))
 	}
 	return table.Flush()
 }
@@ -5277,7 +5345,7 @@ func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 }
 
 func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
-	consoleDir := filepath.Join(b.dataRoot, "containers", containerID, "console")
+	consoleDir := filepath.Join(b.activeDataRoot(), "containers", containerID, "console")
 	var result error
 	err := filepath.WalkDir(consoleDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -5306,6 +5374,7 @@ type runtimeBackend struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	localRoot             string
 	daemonSocket          string
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
@@ -5327,7 +5396,8 @@ type runtimeBackend struct {
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
-	lifecycleReady func()
+	lifecycleReady   func()
+	publicationQueue *ttcstorage.Queue
 }
 
 func (b *runtimeBackend) signalLifecycleReady() {
@@ -5381,11 +5451,171 @@ func environmentHasKey(env []string, key string) bool {
 }
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot()}
 	if b.root != "" {
 		store.TransientRoot = filepath.Join(b.root, "ttc-transient-bundles")
 	}
 	return store
+}
+
+func (b *runtimeBackend) activeDataRoot() string {
+	if b.localRoot != "" {
+		return b.localRoot
+	}
+	return b.dataRoot
+}
+
+func (b *runtimeBackend) queueBranchPublication(target selector, kind string) error {
+	if b.publicationQueue == nil {
+		if kind == "dehydrate" && b.dataRoot != "" {
+			return b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
+		}
+		return nil
+	}
+	store := b.containerStore()
+	generation, err := store.BeginBranchPublication(target.container, target.branch)
+	if err != nil {
+		return err
+	}
+	prePublication, err := persistentBranchInfoFromStore(store, target)
+	if err != nil {
+		return err
+	}
+	captureBranch := fmt.Sprintf("ttc-publish-%016x", generation)
+	intent := ttcstorage.Intent{
+		Container: target.container, Branch: target.branch, Generation: generation, Kind: kind,
+		FilesystemBranch: captureBranch,
+		ParentManifest:   prePublication.StorageManifest,
+	}
+	if intent.ParentManifest == "" && prePublication.ParentID != "" {
+		if parent, parentErr := persistentBranchInfoFromStore(store, selector{container: target.container, branch: prePublication.ParentID}); parentErr == nil {
+			intent.ParentManifest = parent.StorageManifest
+		}
+	}
+	if kind == "dehydrate" {
+		intent.MemoryBranch = captureBranch
+		intent.MemoryControl = captureBranch
+	}
+	if err := b.publicationQueue.Enqueue(intent); err != nil {
+		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "error", err.Error(), time.Time{})
+		return err
+	}
+	captureComplete := false
+	var forks []*ttcvolume.ForkTransaction
+	var repositories []*ttcvolume.Repository
+	memoryPinned := false
+	memoryControlCaptured := false
+	defer func() {
+		for _, repository := range repositories {
+			_ = repository.Close()
+		}
+	}()
+	rollback := func(cause error) error {
+		if !captureComplete {
+			for i := len(forks) - 1; i >= 0; i-- {
+				cause = errors.Join(cause, forks[i].Abort())
+			}
+			if memoryPinned {
+				info, loadErr := store.LoadContainer(target.container)
+				if loadErr == nil {
+					repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
+					if openErr == nil {
+						removeErr := repository.DeleteBranch(captureBranch)
+						if errors.Is(removeErr, os.ErrNotExist) {
+							removeErr = nil
+						}
+						cause = errors.Join(cause, removeErr, repository.Close())
+					}
+				}
+			}
+			if memoryControlCaptured {
+				cause = errors.Join(cause, os.RemoveAll(publicationMemoryControlPath(b.activeDataRoot(), captureBranch)))
+			}
+		}
+		cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, generation))
+		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "local", "", time.Time{})
+		return cause
+	}
+	info, err := store.LoadContainer(target.container)
+	if err != nil {
+		return rollback(err)
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return rollback(err)
+	}
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = offlineCopyBranch(info, branch.ID)
+	}
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return rollback(err)
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return rollback(err)
+	}
+	seen := make(map[string]struct{})
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return rollback(err)
+		}
+		repositories = append(repositories, repository)
+		fork, err := repository.BeginFork(filesystemBranch, captureBranch)
+		if err != nil {
+			return rollback(fmt.Errorf("sealing repository %q: %w", config.Source, err))
+		}
+		forks = append(forks, fork)
+	}
+	if kind == "dehydrate" {
+		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
+		if err != nil {
+			return rollback(err)
+		}
+		manifest, branchErr := repository.Branch(filesystemBranch)
+		if branchErr == nil {
+			branchErr = repository.SetBranch(captureBranch, manifest)
+			memoryPinned = branchErr == nil
+		}
+		closeErr := repository.Close()
+		if branchErr != nil || closeErr != nil {
+			return rollback(errors.Join(branchErr, closeErr))
+		}
+		source := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+		destination := publicationMemoryControlPath(b.activeDataRoot(), captureBranch)
+		if err := snapshotImmutableTree(source, destination); err != nil {
+			return rollback(fmt.Errorf("sealing dehydration control state: %w", err))
+		}
+		memoryControlCaptured = true
+	}
+	for _, fork := range forks {
+		if err := fork.Commit(); err != nil {
+			return rollback(err)
+		}
+	}
+	captureComplete = true
+	if err := b.publicationQueue.Activate(target.container, target.branch, generation); err != nil {
+		// The committed hidden roots are immutable and safe for retry. Keep the
+		// pending intent so daemon restart can validate and activate it.
+		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "error", err.Error(), time.Time{})
+		return err
+	}
+	return nil
+}
+
+func persistentBranchInfoFromStore(store ttcbundle.Store, target selector) (ttcbundle.BranchInfo, error) {
+	info, err := store.LoadContainer(target.container)
+	if err != nil {
+		return ttcbundle.BranchInfo{}, err
+	}
+	return persistentBranchInfo(info, target.branch)
 }
 
 func (b *runtimeBackend) imageProgress() ttcimages.ProgressFunc {
@@ -5429,7 +5659,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	containers, err := store.ListContainers()
 	if err != nil {
 		return nil, err
@@ -5661,7 +5891,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 		return ImageRemoveResult{}, err
 	}
 	digest := matches[0].Digest
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	containers, err := store.ListContainers()
 	if err != nil {
 		return ImageRemoveResult{}, err
@@ -5706,7 +5936,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 }
 
 func (b *runtimeBackend) volumeManager() (*ttcvolume.Manager, error) {
-	manager, err := ttcvolume.OpenManager(b.dataRoot, b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
 	if err != nil {
 		return nil, err
 	}
@@ -6054,7 +6284,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
 		}
 	}
-	memoryRoot := filepath.Join(b.dataRoot, "containers", info.ID, "memory")
+	memoryRoot := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory")
 	if err := os.MkdirAll(memoryRoot, 0700); err != nil {
 		return fmt.Errorf("creating branch bootstrap memory root: %w", err)
 	}
@@ -8015,6 +8245,15 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := b.releaseDistributedSparseRoot(info); err != nil {
 		return fmt.Errorf("releasing distributed sparse memory: %w", err)
 	}
+	if b.publicationQueue != nil {
+		for _, branch := range info.Branches {
+			if branch.StorageGeneration != 0 {
+				if err := b.publicationQueue.Cancel(info.ID, branch.ID, branch.StorageGeneration); err != nil {
+					return fmt.Errorf("canceling publication for %s@%s: %w", info.Name, branch.ID, err)
+				}
+			}
+		}
+	}
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}
@@ -8844,7 +9083,7 @@ func allBranchesColdOnNode(info ttcbundle.ContainerInfo, nodeID string) (allCold
 		}
 		count++
 		switch normalizeLifecycleState(branch.State) {
-		case "created", "dehydrated", "exited", "failed", "dead":
+		case "created", "dehydrating", "dehydrated", "exited", "failed", "dead":
 		default:
 			allCold = false
 		}
@@ -9328,12 +9567,16 @@ func normalizeLifecycleState(state string) string {
 
 func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch {
 	nodeID := info.NodeID
-	if nodeID == "" {
+	if nodeID == "" && !info.Unplaced {
 		nodeID = fallbackNode
 	}
 	return Branch{
 		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
-		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
+		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
+		StorageManifest: info.StorageManifest,
+		StorageRetryAt:  info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
+		DependentFilesystemBytes: info.DependentFilesystemBytes,
+		ForkTotalNS:              info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 	}
 }
 
@@ -9386,6 +9629,14 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			// for lineage reconciliation.
 			branch.ParentID = recorded.ParentID
 			branch.NodeID = recorded.NodeID
+			branch.StorageState = recorded.StorageState
+			branch.StorageGeneration = recorded.StorageGeneration
+			branch.StorageError = recorded.StorageError
+			branch.StorageManifest = recorded.StorageManifest
+			branch.StorageRetryAt = recorded.StorageRetryAt
+			branch.SourceNode = recorded.SourceNode
+			branch.DependentMemoryBytes = recorded.DependentMemoryBytes
+			branch.DependentFilesystemBytes = recorded.DependentFilesystemBytes
 		}
 		byID[branch.ID] = branch
 	}
@@ -9470,7 +9721,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if err != nil {
 		return nil, err
 	}
-	if normalizeLifecycleState(sourceRecord.State) == "dehydrated" {
+	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
 		if quarantine {
 			return nil, errors.New("a dehydrated branch cannot be forked into quarantine: it has no connections to keep and nothing to ask")
 		}
@@ -9508,7 +9759,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		for i, branch := range branches {
 			records[i] = ttcbundle.BranchInfo{
 				ID: branch.ID, ParentID: branch.ParentID, FilesystemBranch: infos[i].FilesystemBranch,
-				State: branch.State, CreatedAt: branch.CreatedAt,
+				State: branch.State, StorageState: "local", CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 			}
 		}
@@ -9585,7 +9836,10 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
 	}
-	sourceDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", sourceBranch)
+	if err := b.ensureLocalColdBranch(info, sourceBranch); err != nil {
+		return nil, fmt.Errorf("materializing dehydrated source: %w", err)
+	}
+	sourceDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", sourceBranch)
 	controlData, err := os.ReadFile(filepath.Join(sourceDir, "control.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading dehydrated source control state: %w", err)
@@ -9640,7 +9894,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
 		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", StorageState: "local", CreatedAt: createdAt}
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
 		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
@@ -9655,7 +9909,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			}
 		}
 		if capture.SparseManifest != (ttcchunk.ManifestID{}) {
-			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks"))
+			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
 			if err != nil {
 				return nil, err
 			}
@@ -9872,7 +10126,7 @@ func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBran
 	if b.dataRoot == "" || sourceFilesystemBranch == "" || targetFilesystemBranch == "" {
 		return nil
 	}
-	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
+	repositoryPath := filepath.Join(b.activeDataRoot(), "containers", containerID, "memory", "chunks")
 	if _, err := os.Stat(repositoryPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -9901,7 +10155,7 @@ func (b *runtimeBackend) releaseSparseMemoryRoot(containerID, filesystemBranch s
 	if b.dataRoot == "" || filesystemBranch == "" {
 		return nil
 	}
-	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
+	repositoryPath := filepath.Join(b.activeDataRoot(), "containers", containerID, "memory", "chunks")
 	if _, err := os.Stat(repositoryPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -10005,7 +10259,7 @@ func (b *runtimeBackend) discard(target selector) error {
 	}
 
 	for _, kind := range []string{"active", "dehydrated"} {
-		path := existingMemoryBranchDir(b.dataRoot, info.ID, kind, branch)
+		path := existingMemoryBranchDir(b.activeDataRoot(), info.ID, kind, branch)
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
@@ -10140,7 +10394,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	}
 	var metadataFile *os.File
 	if b.dataRoot != "" {
-		metadataDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated")
+		metadataDir := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "dehydrated")
 		if err := os.MkdirAll(metadataDir, 0700); err != nil {
 			return fmt.Errorf("creating dehydration metadata directory: %w", err)
 		}
@@ -10178,7 +10432,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		sparseRepositoryPath = filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		sparseRepositoryPath = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 		memoryRepository, err := ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
 		if err != nil {
 			return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
@@ -10237,20 +10491,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
 			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
 		}
-		// A durable dehydration image contains every page needed by this
-		// branch, including pages formerly fetched from a remote fork source.
-		// Publish that fact before the process-free runtime disappears so the
-		// source may release its live snapshot without waiting for rehydration.
-		if err := b.completeDistributedTargetDehydration(info, persistentBranch); err != nil {
-			return fmt.Errorf("completing remote dependency for dehydrated %s: %w", target, err)
-		}
-		if transactionID := transactionIDForBranch(info, persistentBranch); transactionID != "" {
-			if err := b.releaseDistributedSparseRootTransaction(transactionID); err != nil && b.stderr != nil {
-				// The durable target image is already independent. Retaining the old
-				// immutable root is safe; repository maintenance may retry cleanup.
-				fmt.Fprintf(b.stderr, "ttc: warning: retaining superseded remote memory root for %s: %v\n", target, err)
-			}
-		}
+		// Remote dependencies remain live until the asynchronous shared
+		// publication commits. The publisher advances the transaction only after
+		// its manifest is authoritative.
 	}
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
@@ -10266,14 +10509,12 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = os.Remove(paths.PID)
 		}
 	}
-	if b.dataRoot != "" {
-		if err := b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated"); err != nil {
-			return err
-		}
+	if err := b.queueBranchPublication(target, "dehydrate"); err != nil {
+		return fmt.Errorf("queueing durable dehydration publication: %w", err)
 	}
 	dehydrated = true
 	if b.dataRoot != "" {
-		activeDir := existingMemoryBranchDir(b.dataRoot, info.ID, "active", persistentBranch)
+		activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
 			return fmt.Errorf("removing superseded active memory: %w", removeErr)
 		}
@@ -10343,6 +10584,19 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	}
 	if persistentBranch == nil {
 		return fmt.Errorf("branch %q is not recorded", target.branch)
+	}
+	if persistentBranch.State == "dehydrating" {
+		if b.publicationQueue == nil || persistentBranch.StorageGeneration == 0 {
+			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
+		}
+		generation := persistentBranch.StorageGeneration
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, generation); err != nil {
+			return fmt.Errorf("fencing dehydration publication for %s: %w", target, err)
+		}
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, generation); err != nil {
+			return fmt.Errorf("canceling dehydration publication for %s: %w", target, err)
+		}
+		persistentBranch.State = "dehydrated"
 	}
 	if persistentBranch.State == "dehydrated" {
 		if _, stateErr := b.command("state", info.ID); stateErr != nil {
@@ -10435,7 +10689,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch ttcbundle.BranchInfo, sourceDir string) {
 	branchID := branch.ID
 	if sourceDir == "" {
-		sourceDir = existingMemoryBranchDir(b.dataRoot, containerID, "dehydrated", branch)
+		sourceDir = existingMemoryBranchDir(b.activeDataRoot(), containerID, "dehydrated", branch)
 	}
 	if _, err := os.Lstat(sourceDir); os.IsNotExist(err) {
 		return
@@ -10461,7 +10715,7 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 			return
 		}
 	}
-	activeDir := memoryBranchDir(b.dataRoot, containerID, "active", branch)
+	activeDir := memoryBranchDir(b.activeDataRoot(), containerID, "active", branch)
 	if err := os.MkdirAll(activeDir, 0700); err != nil {
 		if b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
@@ -10484,7 +10738,10 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 }
 
 func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
-	imageDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", branch)
+	if err := b.ensureLocalColdBranch(info, branch); err != nil {
+		return fmt.Errorf("materializing cold branch: %w", err)
+	}
+	imageDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
 	if err != nil {
 		return fmt.Errorf("reading dehydration control state: %w", err)
@@ -10575,7 +10832,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	if sparse {
-		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 		repository, err := os.Open(repositoryPath)
 		if err != nil {
 			configReader.Close()
@@ -10697,7 +10954,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	targetStartFD := 5 + len(snapshots)
 	if sparse {
-		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+		repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 		repository, err := os.Open(repositoryPath)
 		if err != nil {
 			configReader.Close()
@@ -10907,6 +11164,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
+		if b.publicationQueue != nil && recorded.StorageGeneration != 0 {
+			if err := b.publicationQueue.Cancel(info.ID, recorded.ID, recorded.StorageGeneration); err != nil {
+				return fmt.Errorf("canceling pending publication for %s: %w", target, err)
+			}
+		}
 		if recorded.DistributedSparseRepository != "" || recorded.DistributedSparseBranch != "" {
 			if err := b.releaseSparseRoot(recorded.DistributedSparseRepository, recorded.DistributedSparseBranch); err != nil {
 				return fmt.Errorf("releasing distributed sparse memory for %s: %w", target, err)
@@ -11072,7 +11334,13 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	byID := make(map[string]*BranchResourceStats, len(branches))
 	filesystemBranches := make(map[string]string, len(branches))
 	for _, branch := range branches {
-		account := BranchResourceStats{Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State)}
+		account := BranchResourceStats{
+			Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State),
+			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration, SourceNode: branch.SourceNode,
+			DependentMemoryBytes: branch.DependentMemoryBytes, DependentFilesystemBytes: branch.DependentFilesystemBytes,
+		}
+		result.DependentMemoryBytes += branch.DependentMemoryBytes
+		result.DependentFilesystemBytes += branch.DependentFilesystemBytes
 		result.Branches = append(result.Branches, account)
 		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
 		filesystemBranch := branch.FilesystemBranch
@@ -11131,7 +11399,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 	}
 
-	memoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
+	memoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 	if _, statErr := os.Stat(memoryPath); statErr == nil {
 		memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
 		if openErr != nil {
@@ -11249,7 +11517,7 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 }
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	if info, err := store.LoadContainer(target.container); err == nil {
 		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
@@ -11262,7 +11530,7 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 }
 
 func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.BranchConsolePaths(target.container, target.branch)
 	if err != nil {
 		return 0, false, err
