@@ -193,3 +193,52 @@ func TestRenameBranchPromotesStableMemoryAndConsoleState(t *testing.T) {
 		t.Errorf("stable memory moved on second rename: %v", err)
 	}
 }
+
+func TestRemoveBranchArtifactsRemovesStableAndLegacyMemory(t *testing.T) {
+	root := t.TempDir()
+	containerID := "container-id"
+	containerDir := filepath.Join(root, "containers", containerID)
+	bundleDir := filepath.Join(root, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{ID: "reused", FilesystemBranch: "stable-filesystem-branch", State: "dehydrated"}
+	info := ContainerInfo{
+		ID: containerID, Name: "example", BundleDir: bundleDir, State: "dehydrated",
+		Branches: []BranchInfo{branch},
+	}
+	if err := os.MkdirAll(containerDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	stableKey := MemoryBranchKey(branch)
+	legacyKey := hex.EncodeToString([]byte(branch.ID))
+	for _, kind := range []string{"active", "dehydrated"} {
+		for _, key := range []string{stableKey, legacyKey} {
+			path := filepath.Join(containerDir, "memory", kind, key)
+			if err := os.MkdirAll(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, "control.json"), []byte("{}"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	store := Store{Root: root}
+	if err := store.RemoveBranchArtifacts("example", branch); err != nil {
+		t.Fatalf("RemoveBranchArtifacts: %v", err)
+	}
+	for _, kind := range []string{"active", "dehydrated"} {
+		for _, key := range []string{stableKey, legacyKey} {
+			if _, err := os.Lstat(filepath.Join(containerDir, "memory", kind, key)); !os.IsNotExist(err) {
+				t.Errorf("%s/%s remains after removal: %v", kind, key, err)
+			}
+		}
+	}
+}

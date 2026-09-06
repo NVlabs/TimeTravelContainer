@@ -9771,7 +9771,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				if filesystemErr := store.RemoveBranchFilesystems(source.container, record); filesystemErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reclaiming %q filesystems: %w", cleanupDestination, filesystemErr))
 				}
-				if artifactErr := store.RemoveBranchArtifacts(source.container, cleanupDestination); artifactErr != nil {
+				if artifactErr := store.RemoveBranchArtifacts(source.container, record); artifactErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("removing %q artifacts: %w", cleanupDestination, artifactErr))
 				}
 			}
@@ -11359,7 +11359,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("reclaiming filesystems for %s: %w", target, err)
 		}
-		if err := store.RemoveBranchArtifacts(target.container, target.branch); err != nil {
+		if err := store.RemoveBranchArtifacts(target.container, *recorded); err != nil {
 			return fmt.Errorf("removing persistent artifacts for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchRecord(target.container, target.branch); err != nil {

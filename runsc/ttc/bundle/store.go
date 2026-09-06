@@ -3032,7 +3032,7 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 			// A migration import borrows the existing logical branch's console
 			// and exec artifacts. Cancel only the unpublished filesystem fork.
 			if !pendingImport.Migration {
-				if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+				if err := s.RemoveBranchArtifacts(info.ID, branch); err != nil {
 					return err
 				}
 			}
@@ -3045,7 +3045,7 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 				return true, nil
 			})
 		}
-		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+		if err := s.RemoveBranchArtifacts(info.ID, branch); err != nil {
 			return err
 		}
 		return s.RemoveBranchRecord(info.ID, branch.ID)
@@ -3896,8 +3896,8 @@ func repositoryCanonicalBranchBelongsToFamily(config specutils.TTCVolumeReposito
 // RemoveBranchArtifacts deletes persistent state whose lifetime is exactly one
 // visible branch: active/dehydrated memory files, init logs, and managed-exec
 // logs.
-func (s Store) RemoveBranchArtifacts(name, branchID string) error {
-	if err := validateObjectName("branch", branchID); err != nil {
+func (s Store) RemoveBranchArtifacts(name string, branch BranchInfo) error {
+	if err := validateObjectName("branch", branch.ID); err != nil {
 		return err
 	}
 	info, err := s.LoadContainer(name)
@@ -3905,14 +3905,25 @@ func (s Store) RemoveBranchArtifacts(name, branchID string) error {
 		return err
 	}
 	containerDir := s.activeContainerDir(info.ID)
-	encodedBranch := hex.EncodeToString([]byte(branchID))
+	// Current memory images are keyed by the stable filesystem identity so a
+	// visible branch rename doesn't move a potentially large image. Remove that
+	// key as well as the visible-name key used by older TTC versions. Omitting
+	// the stable key leaks a dehydration image across branch-name reuse and the
+	// next dehydration fails with "image already exists".
+	memoryKeys := []string{MemoryBranchKey(branch)}
+	legacyKey := hex.EncodeToString([]byte(branch.ID))
+	if legacyKey != memoryKeys[0] {
+		memoryKeys = append(memoryKeys, legacyKey)
+	}
 	for _, kind := range []string{"active", "dehydrated"} {
-		if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, encodedBranch)); err != nil {
-			return err
+		for _, key := range memoryKeys {
+			if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, key)); err != nil {
+				return err
+			}
 		}
 	}
 	consoleDir := filepath.Join(containerDir, "console")
-	base := filepath.Join(consoleDir, branchID)
+	base := filepath.Join(consoleDir, branch.ID)
 	paths := []string{
 		base + ".log", base + ".lock", base + ".stdin.lock", base + ".error.log",
 		base + ".wait-status", base + ".log.retention.json", base + ".pid",
@@ -3929,7 +3940,7 @@ func (s Store) RemoveBranchArtifacts(name, branchID string) error {
 			return err
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(consoleDir, "exec", branchID)); err != nil {
+	if err := os.RemoveAll(filepath.Join(consoleDir, "exec", branch.ID)); err != nil {
 		return err
 	}
 	return nil
