@@ -3540,6 +3540,7 @@ func runList(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "aqls", "--filter", "-f", "--format", "--last", "-n")
 	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	all := fs.Bool("all", false, "show created and exited branches")

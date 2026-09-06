@@ -342,6 +342,14 @@ func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
 	if got, want := stdout.String(), "web@main\nweb@child\nweb@old\nprepared@main\n"; got != want {
 		t.Errorf("ps --all --quiet=%q, want %q", got, want)
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"ps", "-aq"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps -aq status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@main\nweb@child\nweb@old\nprepared@main\n"; got != want {
+		t.Errorf("ps -aq=%q, want %q", got, want)
+	}
 }
 
 func TestPsSizeUsesBranchAccounting(t *testing.T) {
