@@ -60,6 +60,8 @@ type Queue struct {
 	done      chan struct{}
 	stopped   chan struct{}
 	once      sync.Once
+	mu        sync.Mutex
+	inFlight  map[string]struct{}
 }
 
 // Open opens a node-local queue and starts its worker.
@@ -73,7 +75,11 @@ func Open(localRoot string, publisher Publisher) (*Queue, error) {
 			return nil, err
 		}
 	}
-	q := &Queue{root: root, publisher: publisher, wake: make(chan struct{}, 1), done: make(chan struct{}), stopped: make(chan struct{})}
+	q := &Queue{
+		root: root, publisher: publisher, wake: make(chan struct{}, 1),
+		done: make(chan struct{}), stopped: make(chan struct{}),
+		inFlight: make(map[string]struct{}),
+	}
 	if err := q.recoverCaptures(); err != nil {
 		return nil, err
 	}
@@ -135,11 +141,47 @@ func (q *Queue) Cancel(container, branch string, generation uint64) error {
 	if err := os.Remove(q.path("pending", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if readErr == nil && intent.ID != "" {
+	q.mu.Lock()
+	_, inFlight := q.inFlight[id]
+	q.mu.Unlock()
+	// The worker owns cleanup once publication has started. It observes the
+	// durable cancellation fence before completing or retrying the intent.
+	if !inFlight && readErr == nil && intent.ID != "" {
 		readErr = q.publisher.Cleanup(intent)
 	}
 	q.signal()
 	return readErr
+}
+
+// CancelPending cancels generation only when it still has a durable pending
+// intent. Successfully completed generations need no tombstone and may have
+// already discarded their local capture.
+func (q *Queue) CancelPending(container, branch string, generation uint64) error {
+	id := intentID(container, branch, generation)
+	if _, err := q.read(id + ".json"); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return q.Cancel(container, branch, generation)
+}
+
+// CancelBranch fences and removes all pending generations for one branch.
+// This is intentionally broader than the generation recorded in current
+// branch metadata: a previously failed generation must not keep daemon drain
+// alive after a later publication supersedes it or the branch is removed.
+func (q *Queue) CancelBranch(container, branch string) error {
+	intents, err := q.Pending()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, intent := range intents {
+		if intent.Container == container && intent.Branch == branch {
+			result = errors.Join(result, q.Cancel(intent.Container, intent.Branch, intent.Generation))
+		}
+	}
+	return result
 }
 
 // Close stops after the current publication boundary. Pending intents remain
@@ -225,29 +267,60 @@ func (q *Queue) process() time.Duration {
 	now := time.Now()
 	next := time.Hour
 	for _, intent := range intents {
+		q.mu.Lock()
 		if q.canceled(intent.ID) {
+			q.mu.Unlock()
 			_ = os.Remove(q.path("pending", intent.ID))
 			continue
 		}
 		if !intent.CaptureReady {
+			q.mu.Unlock()
 			continue
 		}
 		if intent.RetryAt.After(now) {
+			q.mu.Unlock()
 			if delay := time.Until(intent.RetryAt); delay < next {
 				next = delay
 			}
 			continue
 		}
+		q.inFlight[intent.ID] = struct{}{}
+		q.mu.Unlock()
+
 		result, publishErr := q.publisher.Publish(context.Background(), intent)
-		if publishErr == nil && !q.canceled(intent.ID) {
+		q.mu.Lock()
+		canceled := q.canceled(intent.ID)
+		if publishErr == nil && !canceled {
 			publishErr = q.publisher.Complete(intent, result)
+			canceled = q.canceled(intent.ID)
+		}
+		q.mu.Unlock()
+
+		if canceled {
+			_ = q.publisher.Cleanup(intent)
+			q.mu.Lock()
+			_ = os.Remove(q.path("pending", intent.ID))
+			delete(q.inFlight, intent.ID)
+			q.mu.Unlock()
+			continue
 		}
 		if publishErr == nil {
 			publishErr = q.publisher.Cleanup(intent)
 		}
+
+		q.mu.Lock()
+		canceled = q.canceled(intent.ID)
+		if canceled {
+			_ = os.Remove(q.path("pending", intent.ID))
+			delete(q.inFlight, intent.ID)
+			q.mu.Unlock()
+			continue
+		}
 		if publishErr == nil {
 			_ = writeJSONAtomic(q.path("complete", intent.ID), result)
 			_ = os.Remove(q.path("pending", intent.ID))
+			delete(q.inFlight, intent.ID)
+			q.mu.Unlock()
 			continue
 		}
 		intent.Attempts++
@@ -256,6 +329,8 @@ func (q *Queue) process() time.Duration {
 		intent.RetryAt = time.Now().Add(delay).UTC()
 		_ = q.publisher.Failed(intent, publishErr, intent.RetryAt)
 		_ = writeJSONAtomic(q.path("pending", intent.ID), intent)
+		delete(q.inFlight, intent.ID)
+		q.mu.Unlock()
 		if delay < next {
 			next = delay
 		}

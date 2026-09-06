@@ -5455,6 +5455,15 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		return err
 	}
 	target.container = container.ID
+	previous, err := persistentBranchInfo(container, target.branch)
+	if err != nil {
+		return err
+	}
+	if previous.StorageGeneration != 0 {
+		if err := b.publicationQueue.CancelPending(target.container, target.branch, previous.StorageGeneration); err != nil {
+			return fmt.Errorf("canceling superseded publication for %s: %w", target, err)
+		}
+	}
 	generation, err := store.BeginBranchPublication(target.container, target.branch)
 	if err != nil {
 		return err
@@ -8219,10 +8228,8 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	}
 	if b.publicationQueue != nil {
 		for _, branch := range info.Branches {
-			if branch.StorageGeneration != 0 {
-				if err := b.publicationQueue.Cancel(info.ID, branch.ID, branch.StorageGeneration); err != nil {
-					return fmt.Errorf("canceling publication for %s@%s: %w", info.Name, branch.ID, err)
-				}
+			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {
+				return fmt.Errorf("canceling publications for %s@%s: %w", info.Name, branch.ID, err)
 			}
 		}
 	}
@@ -11313,9 +11320,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
-		if b.publicationQueue != nil && recorded.StorageGeneration != 0 {
-			if err := b.publicationQueue.Cancel(info.ID, recorded.ID, recorded.StorageGeneration); err != nil {
-				return fmt.Errorf("canceling pending publication for %s: %w", target, err)
+		if b.publicationQueue != nil {
+			if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
+				return fmt.Errorf("canceling pending publications for %s: %w", target, err)
 			}
 		}
 		if recorded.DistributedSparseRepository != "" || recorded.DistributedSparseBranch != "" {
