@@ -5264,6 +5264,31 @@ func TestPersistentFamilyRequiredRuntime(t *testing.T) {
 	}
 }
 
+func TestPendingDistributedTargetProtectsHiddenMigrationRuntime(t *testing.T) {
+	container := ttcbundle.ContainerInfo{
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running"}},
+		DistributedForkImports: map[string]ttcbundle.DistributedForkImport{
+			"tx-migrate": {
+				BranchID: "main", TargetNode: "node-b", SourceNode: "node-a",
+				Migration: true, State: "paused",
+			},
+			"tx-fork": {
+				BranchID: "child", TargetNode: "node-b", SourceNode: "node-a",
+				Migration: false, State: "paused",
+			},
+		},
+	}
+	if !pendingDistributedTarget(container, "main", "node-b") {
+		t.Fatal("hidden migration target was not protected on its target node")
+	}
+	if pendingDistributedTarget(container, "main", "node-a") {
+		t.Fatal("hidden migration target protected the source node")
+	}
+	if pendingDistributedTarget(container, "child", "node-b") {
+		t.Fatal("ordinary remote fork import was mistaken for a migration replacement")
+	}
+}
+
 func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 	for _, args := range [][]string{
 		{"node", "drain", "--target", "node-b", "node-a"},
