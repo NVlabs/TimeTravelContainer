@@ -2,10 +2,12 @@
 
 ## Status
 
-This document defines the authoritative control-plane state machine for
-distributed TimeTravelContainer. It replaces shared-filesystem JSON records and
-advisory locks as the authority for membership, placement, distributed
-transactions, publication, durable roots, and garbage-collection roots.
+This document defines the implemented authoritative control-plane state
+machine for distributed TimeTravelContainer. It replaces shared-filesystem
+JSON records and advisory locks as the authority for membership, placement,
+distributed transactions, publication, and durable roots. Shared JSON remains
+as compatibility/materialization metadata in some data-plane paths, but it is
+not allowed to grant execution or storage authority.
 
 The cluster has exactly one Raft group. Families are keys in that state
 machine, not independent consensus groups. Memory pages, filesystem objects,
@@ -63,8 +65,6 @@ ClusterState
     session digest and non-secret handoff root
   publications[family, branch, storage generation]
     authorization, capture fence, candidate roots, status
-  gc epochs
-    committed root-set revision and tombstone grace boundary
 ```
 
 The state machine records dependency summaries and durable roots. It does not
@@ -125,9 +125,24 @@ commands and leases remain stale even when the human node ID is reused.
 ## Execution leases and fencing
 
 Raft leadership is not itself permission for every node to keep running guest
-code. The leader periodically commits a coalesced lease grant containing a
-sequence and deadline for admitted node incarnations. A node may execute only
-while its last locally observed committed grant is valid.
+code. Each daemon proposes its own renewal every one third of the lease period.
+The committed node record contains the exact incarnation, leader term, lease
+sequence, and deadline. A node may execute only while its last locally observed
+committed grant and its more conservative monotonic-local deadline are valid.
+
+After a renewal commits, but before the daemon extends its host guardian
+deadline, it performs a linearizable placement read while holding the local
+lifecycle lock. It removes every physical branch no longer assigned to its
+incarnation. If selective removal fails, the daemon immediately host-fences all
+of its Sentries and does not notify the guardian. Thus a renewal cannot extend
+execution of a placement that the daemon has already observed as revoked.
+
+Placement transitions that could otherwise create two executors do not rely on
+heartbeat observation: migration pauses the source before its atomic ownership
+CAS, branch removal tears down the owner before removing the placement, and
+node expiry is proposed only after the old lease deadline. The periodic
+projection is the recovery/backstop path for committed corruption and
+interrupted cleanup.
 
 Before its conservative monotonic-local deadline, a node that cannot renew
 closes client and peer ingress, durably records each Sentry PID plus host start
@@ -143,6 +158,13 @@ After communication returns, the node performs a linearizable read:
 * if authority moved, it destroys the stale local runtime;
 * if the node was removed, it stays fenced and drains or exits as instructed.
 
+A stopped Sentry may contain several branch Kernels. If restart finds a mixture
+of authorized and revoked branches, TTC does not resume the process to run a
+branch-level cleanup RPC. It marks the otherwise-authorized co-residents
+corrupted and kills the entire Sentry. This is deliberately conservative: it
+turns an availability loss into explicit state loss instead of briefly running
+a revoked guest.
+
 No other node may recover an expired owner's branch until Raft has committed
 the expiry/eviction after the old execution deadline. This pairs logical lease
 expiry with a physical execution fence.
@@ -154,17 +176,29 @@ expiry with a physical execution fence.
    generation.
 3. Commit `source-captured` with the snapshot identities and dependency
    summary; resume the source.
-4. Restore a hidden, paused target using authenticated peer readers.
-5. Commit the target branch and placement plus transaction `published` in one
-   command, then make the runtime visible and resume it if requested.
-6. Publish immutable memory/filesystem roots in the background and commit the
-   handoff.
-7. After the target proves that no source-local-only object remains, commit
-   `independent` and release the source retention.
+4. Restore a hidden target and keep every guest task paused.
+5. Commit the target branch, its first placement generation, and transaction
+   `published` in one Raft command.
+6. If a running target was requested, resume it only after step 5 and commit
+   the idempotent `activated` acknowledgement. A crash between these actions
+   leaves an authorized but paused runtime that recovery may roll forward.
+7. Publish immutable memory roots and materialize or durably hand off every
+   incomplete filesystem object in the background.
+8. After the target proves that no source-local-only page or object remains,
+   commit `independent`, clear the volatile dependency edge, and release the
+   source retention.
 
-The fork snapshot linearizes while the source is paused. Branch publication
-linearizes at step 5. Source writes after step 2 create new versions and cannot
-alter the retained snapshot.
+The fork snapshot linearizes while the source is paused. Branch authority
+linearizes at step 5, and execution begins no earlier than step 6. Source writes
+after step 2 create new versions and cannot alter the retained snapshot.
+
+Filesystem object IDs are immutable content identities. A target repository
+keeps a persistent marker for every object whose 1 MiB extents are not all
+local. The marker, not the existence or apparent size of a sparse host file,
+decides whether a network reader is required. A newer branch may replace a
+stale reader for the same object ID because both readers are required to return
+identical bytes. The marker is removed only after every extent is installed;
+only then may the transaction become source-independent.
 
 ## Migration
 
@@ -185,6 +219,25 @@ that command the source is authoritative and rollback is permitted. After it,
 only the target can roll forward. A target never executes the migrated branch
 before observing the committed placement generation.
 
+## Cold materialization
+
+A durable, unplaced branch is claimed with one compare-and-swap:
+
+```text
+unplaced/gen N
+    -> materializing(owner=node, incarnation=I, gen N+1)
+```
+
+Only that incarnation may construct the local filesystem and Sentry. The guest
+does not execute while the placement is `materializing`. A successful restore
+commits `running` or `paused`; a failed restore releases the placement back to
+`unplaced`. Expiry of the materializer also returns the placement to
+`unplaced`, rather than corrupting the branch, because its committed cold roots
+remain authoritative and unchanged.
+
+This claim serializes concurrent `start`, `rehydrate`, and remote placement
+without putting range reads or page faults through Raft.
+
 ## Publication and durable roots
 
 A publisher first uploads immutable objects and verifies them. It then proposes
@@ -202,13 +255,19 @@ publication authorizations in the same state-machine transition.
 
 ## Garbage collection
 
-GC obtains a linearizable state snapshot at revision R and traces all branch,
-transaction, publication, and reader-lease roots in that snapshot. It may
-quarantine objects absent from the set, but final deletion waits for a later
-Raft grace epoch and active-reader expiry. Newly committed roots after R either
-refer only to newly uploaded immutable objects or preserve their publication
-authorization as a trace root, so the collector cannot delete an object in the
-upload-to-commit window.
+The intended distributed collector obtains a linearizable state snapshot at
+revision R and traces all branch, transaction, publication, and reader-lease
+roots in that snapshot. It may quarantine objects absent from the set, but
+final deletion must wait for a later committed grace boundary and active-reader
+expiry. Newly committed roots after R either refer only to newly uploaded
+immutable objects or preserve their publication authorization as a trace root,
+so the collector cannot delete an object in the upload-to-commit window.
+
+The current state machine already generation-fences branch removal,
+publication, and name reuse. Replicated reader leases and the final global
+grace-boundary command are not implemented yet; current repository-local GC
+must therefore remain conservative. They are data-plane completion work, not
+execution-authority prerequisites.
 
 ## Failure semantics
 
@@ -224,6 +283,102 @@ upload-to-commit window.
 * A target with a source-local-only dependency is paused before the source can
   be declared lost, then becomes corrupted if no durable or replicated copy can
   satisfy the dependency.
+
+Shared storage and Raft deliberately have different failure domains. If shared
+storage fails while Raft still has quorum, a fully local running branch may
+continue; cold materialization, publication, or a fault requiring a shared-only
+extent waits or fails visibly. If Raft quorum is lost, no node can renew its
+execution lease, so all execution is physically fenced even if shared data is
+still readable.
+
+## Why the protocol is safe
+
+The safety argument assumes crash-stop, non-Byzantine daemons; durable Raft
+WALs on a majority; authenticated node identities; a host kernel that honors
+`SIGSTOP`/`SIGKILL`; collision-resistant content IDs and checksums; and the
+documented durability and atomic-rename behavior from shared storage. Raft
+does not protect against a malicious daemon, a compromised host, or Byzantine
+storage.
+
+The state machine and data plane maintain these invariants:
+
+1. **Single placement authority.** A branch generation has at most one owner
+   node and incarnation. Placement creation or transfer is one deterministic
+   Raft transition guarded by the previous generation.
+2. **Execution requires two grants.** Physical execution requires both the
+   exact committed placement and an unexpired execution lease for that same
+   node incarnation. Losing either grant causes host-level fencing.
+3. **Authority precedes execution.** A newly restored remote target remains
+   paused until its placement transition commits. Recovery may repeat
+   activation, but cannot activate an unplaced target.
+4. **Snapshot identity is immutable.** Fork pins memory versions and seals a
+   filesystem generation while the source is paused. Later source writes use
+   CoW versions and cannot mutate the child's snapshot.
+5. **Dependency precedes source release.** A source is retained while the
+   target references any source-local-only page or filesystem object. The edge
+   is cleared only after persistent target markers prove all required bytes
+   local or a durable immutable root proves them shared.
+6. **Data precedes authority.** A durable root may be committed only after its
+   immutable objects are uploaded and verified. A crash before the root commit
+   leaves garbage, not a partially authoritative snapshot.
+7. **Stale work cannot publish.** Every lifecycle, placement, and publication
+   mutation carries the expected revision/generation and operation ID. A late
+   worker from an old incarnation or deleted generation fails its compare-and-
+   swap instead of resurrecting state.
+8. **Unknown loss is explicit.** When TTC cannot prove that every required
+   authoritative byte survives, it stops the affected dependency closure and
+   marks it `corrupted`; it never silently resumes from an older root.
+
+These invariants give the important failure proofs:
+
+* During a fork, the source is the only executor before target placement
+  commits. The target is paused at the commit point, and starts afterward, so
+  there is no interval in which an unauthorized target executes.
+* During migration, the paused source owns generation N before the ownership
+  CAS; the paused target owns N+1 after it. A crash on either side of that one
+  log entry has a unique rollback or roll-forward direction.
+* During a partition, a minority cannot commit lease renewals. Its conservative
+  local deadline expires no later than its committed authority and the host
+  guardian stops the entire Sentry. A majority cannot reassign an expired
+  placement before the old deadline, preventing overlapping executors.
+* During retries, identical operation IDs return the recorded result and stale
+  revisions are rejected. Crashes between placement commit and activation
+  leave a paused authorized target, which is safe and recoverable.
+* During source loss, the committed dependency graph identifies the exact
+  transitive branches that still require source-local state. Independent
+  branches remain runnable; incomplete branches are fenced and corrupted.
+
+The protocol is not intended to make all observations linearizable. Statistics,
+progress events, cache contents, shared-JSON compatibility records, and normal
+guest reads/writes may lag or proceed locally. Placement, leases, lifecycle
+authority, transaction phase, publication authorization, and committed roots
+are the strongly ordered part.
+
+## Cost and scalability
+
+Normal guest instructions, memory faults, 4 KiB CoW, 1 MiB transfers, file
+operations, and cache hits perform zero Raft proposals. A fork or migration
+uses a small constant number of proposals independent of memory size and file
+count. Lease renewals are coalesced per node. Raft snapshots bound replay and
+WAL growth, so hundreds of branches enlarge state snapshots but do not put
+their data traffic through consensus.
+
+The remaining distributed performance bottleneck is not Raft: some
+compatibility metadata and filesystem setup paths still issue many small
+operations against the shared filesystem. Those paths must move to local
+caches and immutable packs without weakening the authority rules above.
+
+## Known safety and availability limits
+
+* A majority outage stops all execution after lease expiry; this sacrifices
+  availability to prevent split-brain.
+* Raft cannot recover volatile bytes whose only authoritative copy disappeared
+  with a failed source node. Such dependent branches become `corrupted`.
+* Several branch Kernels may share one Sentry host process. If restart cannot
+  selectively clean a revoked Kernel without running it, TTC kills the Sentry
+  and conservatively corrupts otherwise-authorized co-residents.
+* Replicated reader leases and the final globally fenced shared-pack collector
+  remain incomplete, so current GC is intentionally conservative.
 
 ## Rollout rule
 

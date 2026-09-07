@@ -14,7 +14,9 @@ near configured targets, requests capacity through an operator-provided event
 channel, and migrates branches without changing their identity or lineage.
 
 The design builds on the implemented distributed-fork and sparse-dehydration
-protocols described in [Distributed live fork](ttc_distributed_live_fork.md).
+protocols described in [Distributed live fork](ttc_distributed_live_fork.md)
+and the authority and failure rules in
+[Cluster-wide Raft control plane](ttc_raft_control_plane.md).
 It does not introduce distributed shared writable memory: branches share page
 versions while colocated and obtain independent resident copies after a
 cross-node cut.
@@ -277,7 +279,7 @@ unreferenced live filesystem writer.
 
 **Implemented.**
 
-* Add lease-bearing node records and heartbeats in the shared repository.
+* Add lease-bearing node records and renewals in the cluster-wide Raft group.
 * Add advertised control endpoints and dynamic peer client construction.
 * Retain static peers as explicit overrides during transition.
 * Include remote-owned persistent families in list and inspect JSON.

@@ -687,18 +687,18 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 	}
 	if tx.DesiredPaused {
 		if state != "paused" {
-			return fmt.Errorf("distributed migration target is %q, want paused", state)
+			return fmt.Errorf("distributed target is %q, want paused", state)
 		}
 	} else if state != "running" && state != "paused" {
-		return fmt.Errorf("distributed migration target is %q, want paused or running", state)
+		return fmt.Errorf("distributed target is %q, want paused or running", state)
 	}
 	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
 	if err != nil {
-		return fmt.Errorf("publishing distributed migration ownership: %w", err)
+		return fmt.Errorf("publishing distributed target ownership: %w", err)
 	}
 	if !tx.DesiredPaused && state == "paused" {
 		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
-			return fmt.Errorf("resuming distributed migration target: %w", err)
+			return fmt.Errorf("resuming distributed target: %w", err)
 		}
 	}
 	targetState := "running"
@@ -709,10 +709,13 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 		return err
 	}
 	if err := r.backend.ensurePublishedPortsForBranch(info, branch.ID); err != nil {
-		return fmt.Errorf("starting migrated published ports: %w", err)
+		return fmt.Errorf("starting distributed target published ports: %w", err)
 	}
-	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
-		return fmt.Errorf("starting migrated target console drain: %w", err)
+	// Publish may already have installed the console followers while keeping the
+	// guest paused. Activation must preserve and reuse those followers instead
+	// of treating their locks as a failed retry.
+	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, false); err != nil {
+		return fmt.Errorf("starting distributed target console drain: %w", err)
 	}
 	sessions, err := r.backend.execSessions(selector{container: info.ID, branch: branch.ID})
 	if err != nil {
@@ -722,8 +725,8 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 		if session.State != "running" {
 			continue
 		}
-		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, true); err != nil {
-			return fmt.Errorf("starting migrated target exec console %q: %w", session.ID, err)
+		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, false); err != nil {
+			return fmt.Errorf("starting distributed target exec console %q: %w", session.ID, err)
 		}
 	}
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
@@ -1045,10 +1048,10 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					sourceFailedPolls = 0
 				}
 			}
-			// Migration publication precedes the placement compare-and-swap. Do
-			// not let dependency completion race that cutover and advance the
-			// transaction before the target has become the authoritative owner.
-			if tx.Identity.Migration && !tx.Activated {
+			// Target publication precedes its post-placement activation record.
+			// Do not let dependency completion overtake that record: recovery
+			// uses Activated to decide whether a committed target may be resumed.
+			if !tx.Activated {
 				continue
 			}
 			targetBranch := tx.Identity.VisibleTargetBranch()

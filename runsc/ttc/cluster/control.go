@@ -793,6 +793,19 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if (tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent) && !tx.Activated {
+		if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
+			writeControlError(w, http.StatusConflict, "target placement is committed but activation retry failed: "+err.Error())
+			return
+		}
+		tx, err = c.Store.MarkActivated(id, tx.Revision, c.Now())
+		if err != nil {
+			writeControlError(w, http.StatusInternalServerError, "target resumed but activation recording retry failed: "+err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
 	if tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent {
 		writeControlJSON(w, http.StatusOK, tx)
 		return
@@ -801,8 +814,12 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionTargetPaused, request.Revision))
 		return
 	}
+	_, raftAuthority := c.Store.(AtomicTargetPublisher)
 	runtimePaused := request.Paused
-	if tx.Identity.Migration {
+	if tx.Identity.Migration || raftAuthority {
+		// Raft-backed targets never execute before the placement grant that
+		// authorizes them. Publish the physical target paused, commit authority,
+		// then activate it below.
 		runtimePaused = true
 	}
 	if err := c.TargetRuntime.Publish(r.Context(), tx, runtimePaused); err != nil {
@@ -831,6 +848,20 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 	if err != nil {
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if raftAuthority && !request.Paused && !tx.Activated {
+		if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
+			// Placement is already committed. Leave the target physically paused
+			// and let recovery retry activation; rolling authority back after the
+			// commit would be less safe than rolling this step forward.
+			writeControlError(w, http.StatusInternalServerError, "target placement committed but activation is pending recovery: "+err.Error())
+			return
+		}
+		tx, err = c.Store.MarkActivated(id, tx.Revision, c.Now())
+		if err != nil {
+			writeControlError(w, http.StatusInternalServerError, "target resumed but activation recording is pending recovery: "+err.Error())
+			return
+		}
 	}
 	writeControlJSON(w, http.StatusOK, tx)
 }
@@ -864,8 +895,9 @@ func (c *ControlPlane) activate(w http.ResponseWriter, r *http.Request, id, peer
 		writeControlError(w, http.StatusConflict, "migration placement ownership has not committed")
 		return
 	}
-	if tx.State != TransactionPublished || tx.Revision != request.Revision || !tx.Identity.Migration {
-		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is not an activatable published migration at revision %d", request.Revision))
+	activatable := tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent
+	if !activatable || tx.Revision != request.Revision {
+		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is not an activatable published target at revision %d", request.Revision))
 		return
 	}
 	if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {

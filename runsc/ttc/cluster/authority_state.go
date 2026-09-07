@@ -545,7 +545,10 @@ func (s *AuthorityState) applyForkPublish(command AuthorityCommand) (json.RawMes
 	if err := tx.Advance(TransactionPublished, "", command.IssuedAt); err != nil {
 		return nil, err
 	}
-	tx.DesiredPaused, tx.Activated = p.DesiredPaused, true
+	// The target is physically paused until this placement grant commits.
+	// A requested running target is activated as a separate, idempotent
+	// post-commit step; a requested paused target already reached its state.
+	tx.DesiredPaused, tx.Activated = p.DesiredPaused, p.DesiredPaused
 	if !transactionIDPattern.MatchString(p.Family) || !transactionIDPattern.MatchString(p.Branch) ||
 		!transactionIDPattern.MatchString(p.PhysicalContainer) || !transactionIDPattern.MatchString(p.PhysicalBranch) || p.Branch != tx.Identity.VisibleTargetBranch() {
 		return nil, errors.New("remote fork publication has invalid physical identity")
@@ -1165,7 +1168,8 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		if tx.Activated {
 			return authorityValue(tx)
 		}
-		if tx.Revision != p.Revision || tx.State != TransactionPublished || !tx.Identity.Migration || !tx.OwnershipCommitted {
+		activatable := tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent
+		if tx.Revision != p.Revision || !activatable || (tx.Identity.Migration && !tx.OwnershipCommitted) {
 			return nil, errors.New("transaction cannot activate")
 		}
 		tx.Activated = true

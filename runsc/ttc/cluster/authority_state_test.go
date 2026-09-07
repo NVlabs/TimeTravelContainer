@@ -227,11 +227,32 @@ func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
 		Family: "physical-family", Branch: "child", PhysicalContainer: "physical-family", PhysicalBranch: "child",
 		TargetIncarnation: "incarnation-b",
 	}))
-	if result.Transaction.State != TransactionPublished || !result.Transaction.Activated || result.Placement.OwnerNode != "node-b" || result.Placement.State != PlacementRunning {
+	if result.Transaction.State != TransactionPublished || result.Transaction.Activated || result.Placement.OwnerNode != "node-b" || result.Placement.State != PlacementRunning {
 		t.Fatalf("bad atomic fork publication: %+v", result)
 	}
 	if state.Revision != 3 { // register, ready, publish
 		t.Fatalf("fork publication did not consume one authority revision: state=%d", state.Revision)
+	}
+	activated := decodeAuthorityResultForTest[Transaction](t, applyAuthorityForTest(t, state, "activate-fork", at.Add(3*time.Second), AuthorityTransactionActivate, AuthorityTransactionPayload{
+		ID: "fork-1", Revision: result.Transaction.Revision,
+	}))
+	if !activated.Activated || activated.State != TransactionPublished {
+		t.Fatalf("activated fork = %+v", activated)
+	}
+}
+
+func TestAuthorityActivationMayRecoverAfterIndependence(t *testing.T) {
+	at := time.Unix(2100, 0)
+	state := NewAuthorityState()
+	state.Transactions["fork-1"] = Transaction{
+		Identity: ForkIdentity{TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b"},
+		State:    TransactionIndependent, Revision: 8, CreatedAt: at, UpdatedAt: at,
+	}
+	activated := decodeAuthorityResultForTest[Transaction](t, applyAuthorityForTest(t, state, "activate-late", at.Add(time.Second), AuthorityTransactionActivate, AuthorityTransactionPayload{
+		ID: "fork-1", Revision: 8,
+	}))
+	if !activated.Activated || activated.State != TransactionIndependent || activated.Revision != 9 {
+		t.Fatalf("late activation = %+v", activated)
 	}
 }
 

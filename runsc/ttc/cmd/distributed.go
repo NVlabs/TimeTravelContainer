@@ -1747,17 +1747,26 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 	localNode := runtime.controlPlane.Capabilities.NodeID
 	for i := range transactions {
 		tx := transactions[i]
-		if tx.Terminal() {
+		// Independent is normally terminal, but older or interrupted activation
+		// recording can leave an authorized target independent yet unactivated.
+		// Roll that safe paused state forward before applying the terminal fast
+		// path.
+		if tx.Terminal() && !(tx.State == cluster.TransactionIndependent && !tx.Activated) {
 			continue
 		}
-		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
+		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining || tx.State == cluster.TransactionIndependent) {
 			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
-				if tx.Identity.Migration && tx.State == cluster.TransactionPublished && tx.OwnershipCommitted && !tx.Activated {
+				if !tx.Activated {
 					if placements, openErr := backend.placementCatalog(); openErr == nil {
-						if placement, lookupErr := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); lookupErr == nil &&
-							placement.OwnerNode == localNode && placement.LastOperationID == tx.Identity.TransactionID && placement.State != cluster.PlacementMigrating {
+						placementBranch := tx.Identity.VisibleTargetBranch()
+						if tx.Identity.Migration {
+							placementBranch = tx.Identity.SourceBranch
+						}
+						if placement, lookupErr := placements.Lookup(tx.Identity.SourceContainer, placementBranch); lookupErr == nil &&
+							placement.OwnerNode == localNode && placement.OwnerIncarnation == targetRuntime.incarnation &&
+							(!tx.Identity.Migration || (placement.LastOperationID == tx.Identity.TransactionID && placement.State != cluster.PlacementMigrating)) {
 							txCopy := tx
-							go recoverTargetMigrationActivation(targetRuntime, runtime.controlPlane, &txCopy)
+							go recoverTargetActivation(targetRuntime, runtime.controlPlane, &txCopy)
 						}
 					}
 				}
@@ -1816,8 +1825,8 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 	}
 }
 
-func recoverTargetMigrationActivation(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
-	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.Activated || !tx.Identity.Migration {
+func recoverTargetActivation(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
+	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.Activated {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

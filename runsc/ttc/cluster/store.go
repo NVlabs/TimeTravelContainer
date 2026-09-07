@@ -180,8 +180,8 @@ func (s *Store) Publish(id string, revision uint64, desiredPaused, activated boo
 	return tx, nil
 }
 
-// MarkActivated durably records that a migrated target reached its requested
-// running state after ownership CAS.
+// MarkActivated durably records that a target reached its requested running
+// state after its placement grant committed.
 func (s *Store) MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error) {
 	path, err := s.path(id)
 	if err != nil {
@@ -196,7 +196,8 @@ func (s *Store) MarkActivated(id string, revision uint64, now time.Time) (*Trans
 	if tx.Activated {
 		return tx, nil
 	}
-	if tx.Revision != revision || tx.State != TransactionPublished || !tx.Identity.Migration {
+	activatable := tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent
+	if tx.Revision != revision || !activatable {
 		return nil, fmt.Errorf("transaction %q cannot activate from %s revision %d", id, tx.State, tx.Revision)
 	}
 	tx.Activated = true
