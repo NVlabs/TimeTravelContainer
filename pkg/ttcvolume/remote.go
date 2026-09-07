@@ -232,10 +232,17 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 		r.remoteByObject = make(map[string]*remoteObjectClient)
 	}
 	for object, size := range objects {
-		if _, exists := r.remoteByObject[object]; exists {
+		pending, err := r.remoteObjectPending(object)
+		if err != nil {
+			return err
+		}
+		if !pending {
 			continue
 		}
 		remote.objects[object] = size
+		// Object IDs are content-addressed, so any authorized source for the
+		// same object is equivalent. Prefer the newest live attachment over a
+		// reader retained by an older branch.
 		r.remoteByObject[object] = remote
 	}
 	if len(remote.objects) == 0 {
@@ -279,7 +286,18 @@ func (r *Repository) MaterializeRemoteObjects() error {
 		return nil
 	}
 	for _, remote := range remotes {
+		// A newer branch may have replaced this client's ownership of a
+		// content-addressed object. Do not contact a stale connection for it;
+		// the current owner below will materialize the same immutable bytes.
+		r.remoteMu.Lock()
+		owned := make(map[string]int64)
 		for object, size := range remote.objects {
+			if r.remoteByObject[object] == remote {
+				owned[object] = size
+			}
+		}
+		r.remoteMu.Unlock()
+		for object, size := range owned {
 			if err := remote.ensure(object, size, 0, size); err != nil {
 				return err
 			}
@@ -384,6 +402,12 @@ func (c *remoteObjectClient) ensure(object string, size, offset, length int64) e
 			return io.ErrShortWrite
 		}
 		resident[extent] = struct{}{}
+	}
+	needed := (uint64(size) + remoteExtentBytes - 1) / remoteExtentBytes
+	if uint64(len(resident)) == needed {
+		if err := c.repository.clearRemoteObjectPending(object); err != nil {
+			return err
+		}
 	}
 	return nil
 }

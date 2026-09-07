@@ -10627,15 +10627,14 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 }
 
 // ensureDistributedTargetMemoryIndependent drains a live target's original
-// peer-backed page loader before capturing a process-free image. A sparse
-// dehydration export can read outstanding pages through that loader, but the
-// target's distributed transaction and loader lifecycle would otherwise
-// overlap the replacement cold loader after rehydration. Besides retaining a
-// stale volatile dependency, that overlap can make guest faults fail when the
-// old source transaction is released. Dehydration is allowed to take time, so
-// resolve the dependency first and capture one self-contained memory graph.
+// peer-backed memory and filesystem readers before capturing a process-free
+// image. A sparse dehydration export can read outstanding memory through its
+// loader, but filesystem object holes have no process-free network reader.
+// Declaring the transaction independent while either remained would turn a
+// later source loss into EPIPE from an otherwise healthy rehydrated branch.
 func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
-	if transactionIDForBranch(info, branch) == "" || branch.DependentMemoryBytes == 0 {
+	transactionID := transactionIDForBranch(info, branch)
+	if transactionID == "" || (branch.DependentMemoryBytes == 0 && branch.DependentFilesystemBytes == 0) {
 		return nil
 	}
 	readStatus := func() (pgalloc.AsyncPagesFileLoadStats, error) {
@@ -10649,35 +10648,53 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 		}
 		return status, nil
 	}
-	status, err := readStatus()
+	action := "distributed-filesystem-drain"
+	if branch.DependentMemoryBytes != 0 {
+		action = "distributed-drain"
+	}
+	if _, err := b.command("timetravel", info.ID, action, branch.ID); err != nil {
+		return err
+	}
+	if branch.DependentMemoryBytes != 0 {
+		deadline := time.Now().Add(5 * time.Minute)
+		for {
+			status, err := readStatus()
+			if err != nil {
+				return err
+			}
+			if status.Done {
+				if status.Error != "" {
+					return errors.New(status.Error)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := b.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0); err != nil {
+		return err
+	}
+	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return err
 	}
-	if status.Done {
-		if status.Error != "" {
-			return errors.New(status.Error)
-		}
-		return nil
-	}
-	if _, err := b.command("timetravel", info.ID, "distributed-drain", branch.ID); err != nil {
+	tx, err := transactions.Load(transactionID)
+	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(5 * time.Minute)
-	for {
-		status, err = readStatus()
-		if err != nil {
-			return err
-		}
-		if status.Done {
-			if status.Error != "" {
-				return errors.New(status.Error)
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
-		}
-		time.Sleep(10 * time.Millisecond)
+	switch tx.State {
+	case cluster.TransactionPublished, cluster.TransactionDraining:
+		_, err = transactions.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+		return err
+	case cluster.TransactionIndependent:
+		return nil
+	case cluster.TransactionCanceled, cluster.TransactionFailed:
+		return fmt.Errorf("distributed fork transaction %q is %s: %s", transactionID, tx.State, tx.Failure)
+	default:
+		return fmt.Errorf("distributed fork transaction %q is unexpectedly %s", transactionID, tx.State)
 	}
 }
 

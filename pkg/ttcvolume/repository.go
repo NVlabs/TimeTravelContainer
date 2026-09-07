@@ -2506,6 +2506,69 @@ func (r *Repository) openFile(name string, flags int, mode fs.FileMode) (*os.Fil
 	return os.NewFile(uintptr(fd), name), nil
 }
 
+func (r *Repository) remoteObjectMarkerPath(id string) (string, error) {
+	if !validID(id) {
+		return "", fmt.Errorf("invalid object ID %q", id)
+	}
+	return filepath.Join("remote", id[:2], id[2:4], id), nil
+}
+
+// markRemoteObjectPending records that an object's apparent holes are absent
+// remote data, not ordinary sparse zero ranges. The marker is repository-wide
+// because object IDs are immutable and content-addressed; once one reader has
+// materialized the object, every branch referencing it is independent.
+func (r *Repository) markRemoteObjectPending(id string) error {
+	marker, err := r.remoteObjectMarkerPath(id)
+	if err != nil {
+		return err
+	}
+	if err := r.mkdirAll(filepath.Dir(marker), 0700); err != nil {
+		return err
+	}
+	file, err := r.openFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	r.markDirtyFile(marker)
+	return nil
+}
+
+func (r *Repository) remoteObjectPending(id string) (bool, error) {
+	marker, err := r.remoteObjectMarkerPath(id)
+	if err != nil {
+		return false, err
+	}
+	file, err := r.openFile(marker, os.O_RDONLY, 0)
+	if err == nil {
+		return true, file.Close()
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (r *Repository) clearRemoteObjectPending(id string) error {
+	marker, err := r.remoteObjectMarkerPath(id)
+	if err != nil {
+		return err
+	}
+	err = unix.Unlinkat(int(r.dir.Fd()), marker, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err == nil {
+		r.markDirtyDirectory(filepath.Dir(marker))
+	}
+	return err
+}
+
 func (r *Repository) readFile(name string) ([]byte, error) {
 	file, err := r.openFile(name, os.O_RDONLY, 0)
 	if err != nil {

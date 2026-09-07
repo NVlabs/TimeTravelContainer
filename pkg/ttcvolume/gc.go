@@ -167,7 +167,10 @@ func (r *Repository) garbageCollectLocked() error {
 		if _, ok := reachableObjects[id]; ok {
 			return nil
 		}
-		return os.Remove(path)
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		return r.clearRemoteObjectPending(id)
 	})
 	if err != nil {
 		return err

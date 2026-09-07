@@ -368,6 +368,12 @@ func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (Sn
 			if err != nil {
 				return err
 			}
+			if size != 0 {
+				if err := r.markRemoteObjectPending(object); err != nil {
+					_ = os.Remove(destination)
+					return err
+				}
+			}
 		}
 		if snapshot.NextInode > r.info.NextInode {
 			r.info.NextInode = snapshot.NextInode
@@ -517,6 +523,12 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 			}
 			if err != nil {
 				return SnapshotInfo{}, fmt.Errorf("creating sparse remote object %q: %w", object, err)
+			}
+			if size != 0 {
+				if err := r.markRemoteObjectPending(object); err != nil {
+					_ = os.Remove(destination)
+					return SnapshotInfo{}, fmt.Errorf("marking sparse remote object %q: %w", object, err)
+				}
 			}
 		} else if err := snapshotCopyFile(filepath.Join(objectsDir, object), destination, r.copyMode == CopyModeReflink); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("importing object %q: %w", object, err)

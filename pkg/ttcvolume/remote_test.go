@@ -91,3 +91,76 @@ func TestRemoteSnapshotFetchesExtentsAndPrivatizesWrites(t *testing.T) {
 		t.Fatal("source stream remained open after target materialization")
 	}
 }
+
+func TestRemoteSnapshotSharedObjectUsesNewestLiveSource(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "data", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("immutable-data-"), 100000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "remote-generation"); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := filepath.Join(t.TempDir(), "snapshot")
+	_, objects, err := source.ExportRemoteSnapshot("remote-generation", snapshotDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	targetPath := filepath.Join(targetManager.root, "target-repository")
+	target, _, err := targetManager.ImportPrivateRemoteSnapshot(targetPath, "target", snapshotDir, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	var token RemoteToken
+	copy(token[:], []byte("snapshot-token-1"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	server1, client1 := net.Pipe()
+	go ServeRemoteObjects(server1, token, []RemoteObjectSource{{Key: key, Repository: source, Objects: objects}})
+	if err := target.AttachRemoteObjectSource(client1, token, key, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.ImportRemoteBranchSnapshot(snapshotDir, "second"); err != nil {
+		t.Fatal(err)
+	}
+	server2, client2 := net.Pipe()
+	server2Done := make(chan error, 1)
+	go func() {
+		server2Done <- ServeRemoteObjects(server2, token, []RemoteObjectSource{{Key: key, Repository: source, Objects: objects}})
+	}()
+	if err := target.AttachRemoteObjectSource(client2, token, key, "second"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate loss of the older branch's source. Since both sources serve the
+	// same content-addressed object, repository-wide materialization must use
+	// the newer live connection and make both branches self-contained.
+	_ = server1.Close()
+	if err := target.MaterializeRemoteObjects(); err != nil {
+		t.Fatalf("MaterializeRemoteObjects: %v", err)
+	}
+	select {
+	case <-server2Done:
+	case <-time.After(time.Second):
+		t.Fatal("new source stream remained open after materialization")
+	}
+	for _, branch := range []string{"first", "second"} {
+		got := make([]byte, len(payload))
+		if n, err := target.ReadAt(branch, ino, got, 0); err != nil || n != len(got) {
+			t.Fatalf("ReadAt(%s): %d, %v", branch, n, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("%s contents differ", branch)
+		}
+	}
+}
