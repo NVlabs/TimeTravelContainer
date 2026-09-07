@@ -137,7 +137,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	now := time.Now().UTC()
 	for _, info := range []ContainerInfo{
 		{ID: "source-id", Name: "source", BundleDir: filepath.Join(root, "containers", "source-id", "bundle"), DistributedFamilyID: "global-family", State: "running", CreatedAt: now, Branches: []BranchInfo{{ID: "main", State: "running", CreatedAt: now}}},
-		{ID: "target-id", Name: "target", DistributedFamilyID: "global-family", DistributedForkNodeID: "node-b", NodeID: "node-b", State: "running", CreatedAt: now, BundleDir: filepath.Join(root, "containers", "target-id", "bundle"), Branches: []BranchInfo{{ID: "main", FilesystemBranch: "volume-main", State: "running", CreatedAt: now}}},
+		{ID: "target-id", Name: "target", DistributedFamilyID: "global-family", DistributedForkNodeID: "node-b", NodeID: "node-a", State: "running", CreatedAt: now, BundleDir: filepath.Join(root, "containers", "target-id", "bundle"), Branches: []BranchInfo{{ID: "main", FilesystemBranch: "volume-main", State: "running", CreatedAt: now}}},
 	} {
 		dir := filepath.Join(root, "containers", info.ID)
 		if err := os.MkdirAll(dir, 0700); err != nil {
@@ -155,7 +155,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	}
 	prepared, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
 		SourceContainer: "source", TargetName: "target", TargetBranch: "tx-physical",
-		VisibleBranch: "second", TransactionID: "tx-import", NodeID: "node-b",
+		VisibleBranch: "second", ParentBranch: "main", TransactionID: "tx-import", NodeID: "node-b",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,8 +167,27 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !peer || branch.ID != "second" || branch.FilesystemBranch != ttcvolume.ScopedBranchID("source-id", "tx-physical") {
+	if !peer || branch.ID != "second" || branch.ParentID != "main" || branch.FilesystemBranch != ttcvolume.ScopedBranchID("source-id", "tx-physical") {
 		t.Fatalf("pending peer=%t branch=%+v", peer, branch)
+	}
+	bundleDir, cleanup, err := store.PrepareDistributedBranchRestoreBundle("target", branch.ID, branch.FilesystemBranch)
+	if err != nil {
+		t.Fatalf("preparing first physical peer bundle: %v", err)
+	}
+	defer cleanup()
+	var bootstrap specs.Spec
+	encoded, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if got := bootstrap.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "second" {
+		t.Fatalf("peer bootstrap branch annotation=%q, want second", got)
+	}
+	if got := bootstrap.Annotations[specutils.AnnotationTTCInitialFilesystemBranch]; got != branch.FilesystemBranch {
+		t.Fatalf("peer bootstrap filesystem annotation=%q, want %q", got, branch.FilesystemBranch)
 	}
 	if err := store.UpdateDistributedForkSparseRoot("tx-import", "cluster/memory-chunks", "memory-root"); err != nil {
 		t.Fatal(err)
@@ -183,7 +202,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !peer || branch.State != "paused" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 {
+	if !peer || branch.State != "paused" || branch.NodeID != "node-b" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 {
 		t.Fatalf("published peer=%t branch=%+v family=%+v", peer, branch, info.Branches)
 	}
 	if err := store.RemoveDistributedForkTarget("tx-import"); err != nil {
@@ -242,7 +261,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	}
 
 	pending := prepare("tx-cancel")
-	bundleDir, cleanup, err := store.PrepareDistributedMigrationRestoreBundle("family", pending.ID, pending.FilesystemBranch)
+	bundleDir, cleanup, err := store.PrepareDistributedBranchRestoreBundle("family", pending.ID, pending.FilesystemBranch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,6 +369,39 @@ func TestConcurrentDistributedMigrationReservationsPreserveImports(t *testing.T)
 	}
 	if len(got.DistributedForkImports) != imports {
 		t.Fatalf("retained %d/%d concurrent imports: %+v", len(got.DistributedForkImports), imports, got.DistributedForkImports)
+	}
+}
+
+func TestDistributedForkAddsRemoteBranchToExistingFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	bundleDir := filepath.Join(root, "containers", "family-id", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "family-id", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a", BundleDir: bundleDir,
+		State: "running", Branches: []BranchInfo{{ID: "main", NodeID: "node-a", FilesystemBranch: "main", State: "running"}},
+	}
+	if err := writeJSON(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+		SourceContainer: "family", TargetName: "family", TargetBranch: "physical-child", VisibleBranch: "child",
+		TransactionID: "transaction-child", NodeID: "node-b", SourceNode: "node-a",
+	}); err != nil {
+		t.Fatalf("remote branch reservation: %v", err)
+	}
+	updated, err := store.LoadContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, ok := updated.DistributedForkImports["transaction-child"]
+	if !ok || pending.BranchID != "child" || pending.TargetNode != "node-b" || pending.Migration {
+		t.Fatalf("remote family import=%+v present=%t", pending, ok)
 	}
 }
 
@@ -2293,11 +2345,11 @@ func TestGarbageCollectRepositoriesSkipsUnmaterializedPrivateRepository(t *testi
 		t.Fatal(err)
 	}
 	repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
-		Source: specutils.TTCRootfsUpperSource,
-		Path: filepath.Join(localRoot, "containers", containerID, "rootfs-upper"),
-		Branch: ttcvolume.MainBranch,
+		Source:   specutils.TTCRootfsUpperSource,
+		Path:     filepath.Join(localRoot, "containers", containerID, "rootfs-upper"),
+		Branch:   ttcvolume.MainBranch,
 		CopyMode: string(ttcvolume.CopyModeFull),
-		Private: true,
+		Private:  true,
 	}})
 	if err != nil {
 		t.Fatal(err)

@@ -52,7 +52,17 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotLeaderError
 		if !errors.As(err, &redirect) {
-			return AuthorityResult{}, err
+			// A follower may know the elected leader before that daemon has
+			// finished opening its HTTP control endpoint during a simultaneous
+			// restart. The request ID makes a lost or refused forwarded proposal
+			// safe to retry through the local Raft view.
+			select {
+			case <-ctx.Done():
+				return AuthorityResult{}, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			result, err = c.node.Propose(ctx, requestID, kind, payload)
+			continue
 		}
 		if redirect.LeaderID == "" || c.leaderClient == nil {
 			select {
@@ -88,7 +98,13 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotLeaderError
 		if !errors.As(err, &redirect) {
-			return nil, err
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			state, err = c.node.LinearizableState(ctx)
+			continue
 		}
 		if redirect.LeaderID == "" || c.leaderClient == nil {
 			select {
@@ -475,6 +491,12 @@ func (c *RaftCatalog) LookupPlacement(family, branch string) (*PlacementRecord, 
 	if !ok {
 		return nil, os.ErrNotExist
 	}
+	if authority, ok := state.Branches[logicalBranchKey(family, branch)]; ok && authority.Corrupted {
+		record.State = PlacementCorrupted
+		record.OwnerNode, record.OwnerIncarnation = "", ""
+		record.PhysicalContainer, record.PhysicalBranch = "", ""
+		record.OperationID, record.TargetNode, record.ResumeState = "", "", ""
+	}
 	return &record, nil
 }
 
@@ -495,7 +517,13 @@ func (r raftPlacementCatalog) List() ([]PlacementRecord, error) {
 		return nil, err
 	}
 	records := make([]PlacementRecord, 0, len(state.Placements))
-	for _, record := range state.Placements {
+	for key, record := range state.Placements {
+		if authority, ok := state.Branches[key]; ok && authority.Corrupted {
+			record.State = PlacementCorrupted
+			record.OwnerNode, record.OwnerIncarnation = "", ""
+			record.PhysicalContainer, record.PhysicalBranch = "", ""
+			record.OperationID, record.TargetNode, record.ResumeState = "", "", ""
+		}
 		records = append(records, record)
 	}
 	sort.Slice(records, func(i, j int) bool {

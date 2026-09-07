@@ -326,6 +326,17 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	if dataRoot == "" {
 		return "", nil, nil
 	}
+	// Durable wait observes Raft publication state and shared metadata; it does
+	// not operate on a runtime. Routing it with the branch's old running
+	// placement creates a race with the publication commit that deliberately
+	// unplaces the branch before declaring it durable.
+	if len(args) > 0 && args[0] == "wait" {
+		for i := 1; i < len(args); i++ {
+			if args[i] == "--condition=durable" || (args[i] == "--condition" && i+1 < len(args) && args[i+1] == "durable") {
+				return "", nil, nil
+			}
+		}
+	}
 	// Route node-wide mutations before taking the receiving daemon's local
 	// lifecycle lock. Otherwise an arbitrary entry node can hold its lock while
 	// the source calls back into it as a migration target, deadlocking cutover.
@@ -549,7 +560,7 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "run", "create", "fork", "rehydrate", "restore":
+	case "run", "create", "start", "fork", "rehydrate", "restore":
 		return true
 	case "container":
 		return len(args) > 1 && (args[1] == "run" || args[1] == "create")
@@ -558,24 +569,25 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	}
 }
 
-// claimUnplacedRehydrateTargets turns admission of a durable cold branch into
+// claimUnplacedLifecycleTargets turns admission of a durable cold branch into
 // a generation-fenced placement before its runtime is reconstructed. Without
-// this claim, two entry daemons may independently admit the same unplaced
-// branch, and a successful rehydrate may remain routed to its former owner.
+// this claim, two entry daemons may independently start or rehydrate the same
+// unplaced branch, and a successful operation may remain routed to its former
+// owner.
 //
 // A claim intentionally remains owned by this node if rehydration itself
 // fails. Retrying is then routed back to the node that may hold local staging
 // state, while node drain can still move or republish the cold branch.
-func (s *daemonServer) claimUnplacedRehydrateTargets(backend *runtimeBackend, args []string) error {
-	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || args[0] != "rehydrate" {
+func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, args []string) error {
+	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start") {
 		return nil
 	}
 	node, err := s.clusterDirectory.Lookup(s.clusterCapabilities.NodeID)
 	if err != nil {
-		return fmt.Errorf("loading rehydration placement node: %w", err)
+		return fmt.Errorf("loading cold-branch placement node: %w", err)
 	}
 	if !node.AcceptsPlacement(time.Now()) {
-		return fmt.Errorf("cluster node %q is not accepting rehydration placement (state=%s)", node.NodeID, node.State)
+		return fmt.Errorf("cluster node %q is not accepting cold-branch placement (state=%s)", node.NodeID, node.State)
 	}
 	placements, err := backend.placementCatalog()
 	if err != nil {
@@ -611,25 +623,25 @@ func (s *daemonServer) claimUnplacedRehydrateTargets(backend *runtimeBackend, ar
 		}
 		if record.State != cluster.PlacementUnplaced {
 			if record.OwnerNode != node.NodeID || record.OwnerIncarnation != node.Incarnation {
-				return fmt.Errorf("rehydration placement for %s belongs to %s/%s", target, record.OwnerNode, record.OwnerIncarnation)
+				return fmt.Errorf("cold-branch placement for %s belongs to %s/%s", target, record.OwnerNode, record.OwnerIncarnation)
 			}
 			if branch.Unplaced {
 				if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
-					return fmt.Errorf("repairing claimed branch owner for %s: %w", target, err)
+					return fmt.Errorf("repairing claimed cold-branch owner for %s: %w", target, err)
 				}
 			}
 			continue
 		}
 		claimed, err := placements.ClaimUnplaced(info.ID, branch.ID, node.NodeID, node.Incarnation, info.ID, branch.ID, record.Generation, cluster.PlacementPaused, time.Now())
 		if err != nil {
-			return fmt.Errorf("claiming rehydration placement for %s: %w", target, err)
+			return fmt.Errorf("claiming cold-branch placement for %s: %w", target, err)
 		}
 		if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
 			_, releaseErr := placements.Unplace(info.ID, branch.ID, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
 			if releaseErr != nil {
-				return fmt.Errorf("recording rehydration owner for %s: %w; releasing placement also failed: %v", target, err, releaseErr)
+				return fmt.Errorf("recording cold-branch owner for %s: %w; releasing placement also failed: %v", target, err, releaseErr)
 			}
-			return fmt.Errorf("recording rehydration owner for %s: %w", target, err)
+			return fmt.Errorf("recording cold-branch owner for %s: %w", target, err)
 		}
 	}
 	return nil
@@ -2248,8 +2260,14 @@ func readUintFile(path string) (uint64, error) {
 }
 
 type elasticFencedProcess struct {
-	PID       int    `json:"pid"`
-	StartTime string `json:"start_time"`
+	PID         int    `json:"pid"`
+	StartTime   string `json:"start_time"`
+	ContainerID string `json:"container_id,omitempty"`
+	// Branches is the complete physical branch set in this Sentry at the
+	// fencing instant. The out-of-process guardian cannot obtain it after
+	// SIGSTOP, so crash fencing may leave this empty and restart recovery then
+	// derives a conservative set from shared container metadata.
+	Branches []string `json:"branches,omitempty"`
 }
 
 type elasticFenceRecord struct {
@@ -2403,7 +2421,11 @@ func sentryProcessesForRuntimeRoot(runtimeRoot string) ([]elasticFencedProcess, 
 		}
 		start, err := processStartTime(pid)
 		if err == nil {
-			processes = append(processes, elasticFencedProcess{PID: pid, StartTime: start})
+			containerID := arguments[len(arguments)-1]
+			if containerID == "" || strings.ContainsAny(containerID, `/\\`) {
+				containerID = ""
+			}
+			processes = append(processes, elasticFencedProcess{PID: pid, StartTime: start, ContainerID: containerID})
 		}
 	}
 	return processes, nil
@@ -2452,7 +2474,12 @@ func fenceElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) e
 		if err != nil {
 			continue
 		}
-		record.Processes = append(record.Processes, elasticFencedProcess{PID: family.SandboxPID, StartTime: start})
+		process := elasticFencedProcess{PID: family.SandboxPID, StartTime: start, ContainerID: family.ID}
+		for _, branch := range family.Branches {
+			process.Branches = append(process.Branches, branch.ID)
+		}
+		sort.Strings(process.Branches)
+		record.Processes = append(record.Processes, process)
 	}
 	path := elasticFencePath(backend.activeDataRoot())
 	var result error
@@ -2474,7 +2501,21 @@ func fenceElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) e
 	return result
 }
 
-func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID string) error {
+func fencedRuntimeAuthorized(family Family, nodeID, incarnation string, lookup func(string, string) (*cluster.PlacementRecord, error)) bool {
+	if family.ID == "" || len(family.Branches) == 0 {
+		return false
+	}
+	for _, branch := range family.Branches {
+		placement, err := lookup(family.ID, branch.ID)
+		if err != nil || placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation ||
+			(placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused) {
+			return false
+		}
+	}
+	return true
+}
+
+func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) error {
 	path := elasticFencePath(backend.activeDataRoot())
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -2496,6 +2537,40 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID string) error {
 		if err != nil || start != process.StartTime {
 			result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d identity changed", process.PID))
 			continue
+		}
+		containerID := process.ContainerID
+		if backend.distributedSource != nil && backend.distributedSource.authority != nil {
+			family := Family{ID: containerID}
+			for _, branchID := range process.Branches {
+				family.Branches = append(family.Branches, Branch{ID: branchID})
+			}
+			if len(family.Branches) == 0 && containerID != "" {
+				// Guardian-created records lack an in-Sentry branch snapshot. Shared
+				// metadata is safe to inspect without waking the process. Restrict
+				// the fallback to branches whose last physical owner was this node;
+				// ambiguity fails closed below.
+				if info, loadErr := backend.containerStore().LoadContainer(containerID); loadErr == nil {
+					for _, branch := range info.Branches {
+						if info.BranchNodeID(branch.ID) == nodeID && (normalizeLifecycleState(branch.State) == "running" || normalizeLifecycleState(branch.State) == "paused") {
+							family.Branches = append(family.Branches, Branch{ID: branch.ID})
+						}
+					}
+				}
+			}
+			authorized := containerID != "" && fencedRuntimeAuthorized(family, nodeID, incarnation, backend.distributedSource.authority.LookupPlacement)
+			if !authorized {
+				if containerID == "" {
+					result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d has no runtime identity and cannot be re-authorized", process.PID))
+					continue
+				}
+				// A host-stopped Sentry still has a usable runsc state file. Forced
+				// deletion kills the Sentry and its gofer without allowing guest
+				// execution, then releases bind mounts and open descriptors.
+				if _, err := backend.command("delete", "--force", containerID); err != nil {
+					result = errors.Join(result, fmt.Errorf("destroying unauthorized fenced runtime %q: %w", containerID, err))
+				}
+				continue
+			}
 		}
 		if err := syscall.Kill(process.PID, syscall.SIGCONT); err != nil && !errors.Is(err, syscall.ESRCH) {
 			result = errors.Join(result, err)

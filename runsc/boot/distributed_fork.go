@@ -539,7 +539,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	for _, volume := range l.ttcVolumeRepositories {
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
 		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, volume.config.Branch); err != nil {
-			return nil, fmt.Errorf("attaching distributed peer filesystem source %q: %w", volume.config.Source, err)
+			return nil, fmt.Errorf("attaching distributed peer filesystem source %q branch %q: %w", volume.config.Source, volume.config.Branch, err)
 		}
 		connectionIndex++
 	}

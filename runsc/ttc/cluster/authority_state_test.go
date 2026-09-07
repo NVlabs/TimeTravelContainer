@@ -177,6 +177,37 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 	if !branch.Corrupted || branch.Roots.MemoryRoot != "" {
 		t.Fatalf("corrupted branch was changed: %+v", branch)
 	}
+	if placement := state.Placements[logicalBranchKey("family", "main")]; placement.State != PlacementCorrupted {
+		t.Fatalf("corrupted branch retained placement state %+v", placement)
+	}
+}
+
+func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
+	at := time.Unix(3500, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
+	}}))
+	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "exited", BranchGeneration: created.Generation, StorageGeneration: 1,
+	}))
+	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
+	}))
+	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
+		Roots: DurableRoots{FilesystemRoot: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	})
+	placement := state.Placements[logicalBranchKey("family", "main")]
+	if placement.State != PlacementUnplaced {
+		t.Fatalf("durable healthy branch placement = %+v, want unplaced", placement)
+	}
+	branch := state.Branches[logicalBranchKey("family", "main")]
+	if branch.Corrupted || branch.Lifecycle != "exited" {
+		t.Fatalf("durable healthy branch authority = %+v", branch)
+	}
 }
 
 func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {

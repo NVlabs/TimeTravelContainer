@@ -841,6 +841,105 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	return store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{})
 }
 
+// ensureLocalColdFilesystem materializes the filesystem portion of a durable
+// stopped branch without requiring dehydration memory records. A stopped
+// branch has deliberately discarded execution state, but its next fresh start
+// must still reconstruct the committed writable repositories on whichever
+// node claims its unplaced Raft record.
+func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
+	if branch.StorageManifest == "" {
+		return nil
+	}
+	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
+		return err
+	}
+	store := b.containerStore()
+	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{}); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "error", retErr.Error(), time.Time{})
+		}
+	}()
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return err
+	}
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
+		return errors.New("cold manifest identity does not match branch generation")
+	}
+	packBySource := make(map[string]ttcpack.ID, len(manifest.Packs))
+	for _, reference := range manifest.Packs {
+		id, err := ttcpack.ParseID(reference.Pack)
+		if err != nil {
+			return err
+		}
+		packBySource[reference.Source] = id
+	}
+	if err := os.MkdirAll(filepath.Join(b.activeDataRoot(), "containers", info.ID), 0700); err != nil {
+		return err
+	}
+	staging := filepath.Join(b.activeDataRoot(), "materialization-staging", fmt.Sprintf("fs-%s-%s-%016x", info.ID, hex.EncodeToString([]byte(branch.ID)), branch.StorageGeneration))
+	if err := os.RemoveAll(staging); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	if err != nil {
+		return err
+	}
+	for index := range repositories {
+		repository := &repositories[index]
+		if _, ok := packBySource[repository.Source]; !ok {
+			return fmt.Errorf("cold manifest omits repository %q", repository.Source)
+		}
+		snapshot := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
+		if err := b.materializeColdSourceMetadata(manifest, repository.Source, snapshot); err != nil {
+			return fmt.Errorf("materializing repository %q: %w", repository.Source, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(repository.Path), 0700); err != nil {
+			return err
+		}
+		if _, statErr := os.Stat(filepath.Join(repository.Path, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
+			imported, snapshotInfo, err := manager.ImportPrivateRemoteSnapshot(repository.Path, fmt.Sprintf("cold-fs-%d", index), snapshot, branch.FilesystemBranch)
+			if err != nil {
+				return err
+			}
+			repository.RestoreID = snapshotInfo.RepositoryID
+			repository.CopyMode = string(manager.Capability().Mode)
+			if err := imported.Close(); err != nil {
+				return err
+			}
+		} else if statErr != nil {
+			return statErr
+		} else {
+			opened, err := ttcvolume.OpenRepository(repository.Path, ttcvolume.CopyMode(repository.CopyMode))
+			if err != nil {
+				return err
+			}
+			snapshotInfo, importErr := opened.ImportRemoteBranchSnapshot(snapshot, branch.FilesystemBranch)
+			closeErr := opened.Close()
+			if importErr != nil || closeErr != nil {
+				return errors.Join(importErr, closeErr)
+			}
+			repository.RestoreID = snapshotInfo.RepositoryID
+		}
+	}
+	return store.WriteActiveRepositoryMap(info.ID, repositories)
+}
+
 func (b *runtimeBackend) materializeColdSourceMetadata(manifest coldBranchManifest, source, destination string) error {
 	for _, reference := range manifest.Packs {
 		if reference.Source != source {

@@ -189,13 +189,15 @@ func (s Store) PrepareDistributedTargetBundle(name, filesystemBranch string) (st
 	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
-// PrepareDistributedMigrationRestoreBundle creates a cold target bundle whose
-// bootstrap SandboxFamily already uses the migrated branch's visible identity.
+// PrepareDistributedBranchRestoreBundle creates a cold target bundle whose
+// bootstrap SandboxFamily already uses the imported branch's visible identity.
 // Distributed restore later replaces that placeholder Kernel in place; it
-// must not silently fall back to the ordinary "main" bootstrap identity.
-func (s Store) PrepareDistributedMigrationRestoreBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+// must not silently fall back to the ordinary "main" bootstrap identity. This
+// applies both to migration and to the first physical branch of an existing
+// logical family placed on a new node.
+func (s Store) PrepareDistributedBranchRestoreBundle(name, branchID, filesystemBranch string) (string, func(), error) {
 	if branchID == "" || filesystemBranch == "" {
-		return "", nil, errors.New("distributed migration restore branch or filesystem identity is empty")
+		return "", nil, errors.New("distributed restore branch or filesystem identity is empty")
 	}
 	return s.prepareBranchBundle(name, branchID, filesystemBranch, true, false)
 }
@@ -235,6 +237,17 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 				if info.Branches[i].ID == branchID {
 					branch = &info.Branches[i]
 					break
+				}
+			}
+			if branch == nil {
+				// A distributed import is reserved before it becomes a stable
+				// BranchInfo. It must nevertheless be the bootstrap identity when
+				// this is the first physical Sentry for the family on this node.
+				for _, pending := range info.DistributedForkImports {
+					if pending.BranchID == branchID && pending.FilesystemBranch == filesystemBranch {
+						branch = &BranchInfo{ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch}
+						break
+					}
 				}
 			}
 			if branch == nil {
@@ -358,6 +371,7 @@ type DistributedForkOptions struct {
 	TargetName      string
 	TargetBranch    string
 	VisibleBranch   string
+	ParentBranch    string
 	TransactionID   string
 	NodeID          string
 	SourceNode      string
@@ -430,6 +444,7 @@ func MemoryBranchKey(branch BranchInfo) string {
 // into an already-running target family.
 type DistributedForkImport struct {
 	BranchID                 string    `json:"branch_id"`
+	ParentID                 string    `json:"parent_id,omitempty"`
 	FilesystemBranch         string    `json:"filesystem_branch"`
 	State                    string    `json:"state"`
 	CreatedAt                time.Time `json:"created_at"`
@@ -1386,9 +1401,9 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		// other's DistributedForkImports entry on a delayed shared filesystem.
 		var existing ContainerInfo
 		err := s.mutateContainer(existingTarget.ID, func(current *ContainerInfo) (bool, error) {
-			if !opts.Migration && current.NodeID != "" && current.NodeID != opts.NodeID {
-				return false, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, current.NodeID)
-			}
+			// A logical family spans nodes. An import into an existing family is a
+			// peer branch even when the target node does not yet have a physical
+			// Sentry for that family; the target runtime layer creates one lazily.
 			existingFamilyID := current.DistributedFamilyID
 			if existingFamilyID == "" {
 				existingFamilyID = current.ID
@@ -1425,7 +1440,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 				}
 			}
 			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-				BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
+				BranchID: opts.VisibleBranch, ParentID: opts.ParentBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
 				State: "created", CreatedAt: time.Now().UTC(), SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
 			}
 			existing = *current
@@ -2827,8 +2842,8 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					}
 				}
 				current.Branches = append(current.Branches, BranchInfo{
-					ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-					NodeID: current.NodeID,
+					ID: pending.BranchID, ParentID: pending.ParentID, FilesystemBranch: pending.FilesystemBranch,
+					NodeID: pending.TargetNode,
 					State:  pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
 					DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
 					DistributedForkTransactionID: transactionID,
@@ -2981,7 +2996,7 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no main branch")
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		branch = BranchInfo{ID: pending.BranchID, CreatedAt: pending.CreatedAt}
+		branch = BranchInfo{ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}
 		// A migration replaces an existing logical branch. Preserve its display
 		// lineage and other stable metadata while the pending import supplies the
 		// new runtime/filesystem identities.

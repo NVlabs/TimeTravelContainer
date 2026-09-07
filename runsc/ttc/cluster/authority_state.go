@@ -1265,7 +1265,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("publication cannot release stale or migrating placement")
 		}
 		placement.OwnerNode, placement.OwnerIncarnation, placement.PhysicalContainer, placement.PhysicalBranch = "", "", "", ""
-		placement.State = PlacementCorrupted
+		placement.State = PlacementUnplaced
 		placement.Generation++
 		placement.Revision++
 		placement.LastOperationID, placement.OperationID, placement.TargetNode, placement.ResumeState = "", "", "", ""
@@ -1369,7 +1369,7 @@ func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) B
 	s.Branches[key] = branch
 	if placement, ok := s.Placements[key]; ok {
 		placement.OwnerNode, placement.OwnerIncarnation, placement.PhysicalContainer, placement.PhysicalBranch = "", "", "", ""
-		placement.State = PlacementUnplaced
+		placement.State = PlacementCorrupted
 		placement.ResumeState, placement.OperationID, placement.LastOperationID, placement.TargetNode = "", "", "", ""
 		placement.Generation++
 		placement.Revision++

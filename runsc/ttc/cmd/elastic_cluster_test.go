@@ -88,6 +88,9 @@ func TestDaemonCommandOwner(t *testing.T) {
 	if owner, err := daemonCommandOwner(root, []string{"images"}); err != nil || owner != "" {
 		t.Fatalf("image command owner=(%q, %v)", owner, err)
 	}
+	if owner, claims, err := daemonCommandPlacement(root, []string{"wait", "--condition=durable", "web@main"}); err != nil || owner != "" || len(claims) != 0 {
+		t.Fatalf("durable wait placement=(%q, %+v, %v)", owner, claims, err)
+	}
 }
 
 func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
@@ -143,7 +146,7 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	}
 }
 
-func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
+func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")
@@ -187,7 +190,7 @@ func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
 	server := &daemonServer{clusterDirectory: directory, clusterCapabilities: &node.Capabilities}
 	backend := &runtimeBackend{dataRoot: root, localRoot: local, nodeID: "node-a"}
 	for range 2 {
-		if err := server.claimUnplacedRehydrateTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
+		if err := server.claimUnplacedLifecycleTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -214,7 +217,7 @@ func TestClaimUnplacedRehydrateTargetRecordsSelectedNode(t *testing.T) {
 	if err := (ttcbundle.Store{Root: root, ActiveRoot: local}).CompareAndSwapBranchNodeID("web", "main", "node-a", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.claimUnplacedRehydrateTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
+	if err := server.claimUnplacedLifecycleTargets(backend, []string{"start", "web@main"}); err != nil {
 		t.Fatal(err)
 	}
 	reclaimed, err := placements.Lookup("web", "main")
@@ -296,7 +299,7 @@ func TestResumeFencedElasticRuntimeChecksProcessIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &runtimeBackend{localRoot: localRoot}
-	if err := resumeFencedElasticRuntimes(backend, "node-a"); err != nil {
+	if err := resumeFencedElasticRuntimes(backend, "node-a", "new"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -315,6 +318,31 @@ func TestResumeFencedElasticRuntimeChecksProcessIdentity(t *testing.T) {
 			t.Fatal("fenced process remained stopped")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestFencedRuntimeRequiresEveryBranchInCurrentIncarnation(t *testing.T) {
+	family := Family{ID: "family", Branches: []Branch{{ID: "main"}, {ID: "child"}}}
+	placements := map[string]cluster.PlacementRecord{
+		"main":  {OwnerNode: "node-a", OwnerIncarnation: "new", State: cluster.PlacementRunning},
+		"child": {OwnerNode: "node-a", OwnerIncarnation: "new", State: cluster.PlacementPaused},
+	}
+	lookup := func(_, branch string) (*cluster.PlacementRecord, error) {
+		placement, ok := placements[branch]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return &placement, nil
+	}
+	if !fencedRuntimeAuthorized(family, "node-a", "new", lookup) {
+		t.Fatal("fully re-authorized runtime was rejected")
+	}
+	corrupted := placements["child"]
+	corrupted.State = cluster.PlacementCorrupted
+	corrupted.OwnerNode, corrupted.OwnerIncarnation = "", ""
+	placements["child"] = corrupted
+	if fencedRuntimeAuthorized(family, "node-a", "new", lookup) {
+		t.Fatal("runtime containing corrupted branch was re-authorized")
 	}
 }
 
@@ -355,11 +383,18 @@ func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	if err := json.Unmarshal(data, &record); err != nil || len(record.Processes) != 1 || record.Processes[0].PID != command.Process.Pid {
 		t.Fatalf("bad guardian fence record: %+v err=%v", record, err)
 	}
-	status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(status), "State:\tT") {
-		t.Fatalf("guardian target was not stopped:\n%s", status)
+	deadline = time.Now().Add(time.Second)
+	for {
+		status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(status), "State:\tT") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("guardian target was not stopped:\n%s", status)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

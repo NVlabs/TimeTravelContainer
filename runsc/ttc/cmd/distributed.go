@@ -500,6 +500,10 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 			if err != nil {
 				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
 			}
+			if _, err := repository.BranchObjects(filesystemBranch); err != nil {
+				_ = repository.Close()
+				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
+			}
 			config.Branch = filesystemBranch
 			config.CopyMode = string(manager.Capability().Mode)
 			config.RestoreID = snapshotInfo.RepositoryID

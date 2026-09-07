@@ -4168,20 +4168,19 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	destinationValues := fs.Args()[1:]
 	if len(destinationValues) == 0 {
 		generated := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-		if *targetNode != "" {
-			destinationValues = []string{generated + "@" + defaultBranchID}
-		} else {
-			destinationValues = []string{generated}
-		}
+		destinationValues = []string{generated}
 	}
 	if *targetNode != "" {
+		if *quarantine {
+			return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
+		}
 		distributed, ok := backend.(distributedForkBackend)
 		if !ok {
 			return errors.New("this backend does not support distributed forks")
 		}
 		targetContainers := make([]string, len(destinationValues))
 		for i, value := range destinationValues {
-			target, err := parseSelector(value)
+			target, err := parseDestination(source.container, value)
 			if err != nil {
 				return fmt.Errorf("invalid destination %q: %w", value, err)
 			}
@@ -4205,9 +4204,6 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 		destinations[i] = destination
 		destinationBranches[i] = destination.branch
-	}
-	if *quarantine && *targetNode != "" {
-		return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
 	}
 	branches, err := backend.forkMany(source, destinationBranches, *paused, *quarantine)
 	if err != nil {
@@ -4854,7 +4850,7 @@ func parseDestination(containerID, value string) (selector, error) {
 		return selector{}, errors.New("branch name must not be empty")
 	}
 	if strings.Contains(value, "@") {
-		return selector{}, errors.New("local fork destination must be a branch name, not CONTAINER@BRANCH")
+		return selector{}, errors.New("fork destination must be a branch name, not CONTAINER@BRANCH")
 	}
 	return selector{container: containerID, branch: value}, nil
 }
@@ -6223,6 +6219,11 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		branch, err = persistentBranchInfo(info, target.branch)
 		if err != nil {
 			return 1, err
+		}
+		if branch.StorageManifest != "" {
+			if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
+				return 1, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
+			}
 		}
 	}
 	filesystemBranch := branch.FilesystemBranch

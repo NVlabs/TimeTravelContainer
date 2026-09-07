@@ -269,6 +269,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
+		ParentBranch:  tx.Identity.SourceBranch,
 		TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
 		SourceNode: tx.Identity.SourceNodeID, Migration: tx.Identity.Migration,
 	})
@@ -350,12 +351,13 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		bundleDir := info.BundleDir
 		var cleanup func()
 		if peer {
-			if !tx.Identity.Migration {
-				return fmt.Errorf("distributed peer target runtime is unavailable: %w", stateErr)
-			}
-			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedMigrationRestoreBundle(info.ID, targetBranch.ID, targetBranch.FilesystemBranch)
+			// This is either a migration or the first physical branch of an
+			// existing logical family on this node. Bootstrap the exact visible
+			// branch and filesystem identities. Later forks into the same node use
+			// the ordinary peer-import path in the running Sentry.
+			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedBranchRestoreBundle(info.ID, targetBranch.ID, targetBranch.FilesystemBranch)
 			if err != nil {
-				return fmt.Errorf("preparing distributed migration target bundle: %w", err)
+				return fmt.Errorf("preparing distributed peer target bundle: %w", err)
 			}
 			defer cleanup()
 		} else {
@@ -2909,6 +2911,25 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				return err
 			}
 			clusterRuntime.nodeRecord.ControlURL = resolved
+			// Serve Raft authority traffic before this member registers and
+			// reconciles placements. During a simultaneous cluster restart,
+			// followers may already know this member is the leader and must be
+			// able to forward their own recovery proposals to it. Runtime target
+			// admission remains closed because this node is not ready yet.
+			clusterServer = &http.Server{
+				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
+			}
+			tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
+			go func() {
+				err := clusterServer.Serve(tlsListener)
+				if errors.Is(err, http.ErrServerClosed) {
+					err = nil
+				}
+				clusterErr <- err
+				listener.Close()
+			}()
+			defer clusterServer.Close()
 			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
 			drainIntent, err := loadElasticDrainIntent(dataRoot, clusterRuntime.nodeRecord.NodeID)
 			if err != nil {
@@ -2957,7 +2978,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				clusterListener.Close()
 				return fmt.Errorf("re-authorizing fenced branch placements: %w", err)
 			}
-			if err := resumeFencedElasticRuntimes(targetBackend, ready.NodeID); err != nil {
+			if err := resumeFencedElasticRuntimes(targetBackend, ready.NodeID, ready.Incarnation); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("resuming re-authorized fenced runtimes: %w", err)
 			}
@@ -2968,20 +2989,22 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		server.clusterPlacements = clusterRuntime.placements
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
-		clusterServer = &http.Server{
-			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
-		}
-		tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
-		go func() {
-			err := clusterServer.Serve(tlsListener)
-			if errors.Is(err, http.ErrServerClosed) {
-				err = nil
+		if clusterServer == nil {
+			clusterServer = &http.Server{
+				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
 			}
-			clusterErr <- err
-			listener.Close()
-		}()
-		defer clusterServer.Close()
+			tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
+			go func() {
+				err := clusterServer.Serve(tlsListener)
+				if errors.Is(err, http.ErrServerClosed) {
+					err = nil
+				}
+				clusterErr <- err
+				listener.Close()
+			}()
+			defer clusterServer.Close()
+		}
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
 			heartbeatFatal := make(chan error, 1)
@@ -3502,7 +3525,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(err)
 		return
 	}
-	if err := s.claimUnplacedRehydrateTargets(backend, request.Args); err != nil {
+	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 		unlock()
 		stdinReader.Close()
 		writeError(err)
@@ -3537,7 +3560,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			// dehydration after the pre-command claim but before rehydrate
 			// consumes the durable image. Repeat the idempotent claim at the
 			// successful execution boundary before catalog reconciliation.
-			if err := s.claimUnplacedRehydrateTargets(mutationBackend, request.Args); err != nil {
+			if err := s.claimUnplacedLifecycleTargets(mutationBackend, request.Args); err != nil {
 				fmt.Fprintf(&mutationStderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 				status = 1
 			} else if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
@@ -3563,7 +3586,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	if status == 0 {
-		if err := s.claimUnplacedRehydrateTargets(backend, request.Args); err != nil {
+		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 			status = 1
 		} else if err := backend.reconcilePlacementCatalog(); err != nil {

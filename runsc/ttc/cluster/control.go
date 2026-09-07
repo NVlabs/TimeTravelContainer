@@ -407,6 +407,12 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
+		// Request results are an internal replicated deduplication window. They
+		// are required in Raft snapshots, but never by catalog readers. Omitting
+		// them keeps the linearizable read path proportional to live control
+		// objects instead of the (deliberately much larger) retry window.
+		state.Requests = nil
+		state.RequestOrder = nil
 		writeControlJSON(w, http.StatusOK, state)
 	case controlAuthorityJoinPath:
 		if r.Method != http.MethodPost {
@@ -1165,14 +1171,14 @@ func (c *Client) ProposeAuthority(ctx context.Context, proposal AuthorityProposa
 // AuthorityState returns a linearizable cluster control snapshot.
 func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
 	var state AuthorityState
-	if err := c.call(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state); err != nil {
+	if err := c.callWithLimit(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state, maxAuthoritySnapshotBytes); err != nil {
 		return nil, err
 	}
 	return &state, nil
 }
 
-// JoinAuthority admits this client's authenticated node as a learner and then
-// promotes it after catch-up.
+// JoinAuthority admits this client's authenticated node as a learner. The
+// leader promotes it only after a ready execution record is committed.
 func (c *Client) JoinAuthority(ctx context.Context, request AuthorityJoinRequest) error {
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlAuthorityJoinPath, request, &response)
@@ -1307,6 +1313,10 @@ func (c *Client) advance(ctx context.Context, id, operation string, revision uin
 }
 
 func (c *Client) call(ctx context.Context, method, path string, request, response any) error {
+	return c.callWithLimit(ctx, method, path, request, response, maxControlBody)
+}
+
+func (c *Client) callWithLimit(ctx context.Context, method, path string, request, response any, responseLimit int64) error {
 	var body io.Reader
 	if request != nil {
 		data, err := json.Marshal(request)
@@ -1327,7 +1337,7 @@ func (c *Client) call(ctx context.Context, method, path string, request, respons
 		return err
 	}
 	defer resp.Body.Close()
-	limited := io.LimitReader(resp.Body, maxControlBody+1)
+	limited := io.LimitReader(resp.Body, responseLimit+1)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var remote controlError
 		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {

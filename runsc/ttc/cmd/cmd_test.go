@@ -910,13 +910,13 @@ func TestReconcileClusterSparseMemoryRootsProtectsNonterminalTransaction(t *test
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote@main"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "remote@main" || !b.targetPaused {
+	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "web@remote" || !b.targetPaused {
 		t.Fatalf("distributed fork call source=%+v node=%q container=%q paused=%t", b.source, b.targetNode, b.targetContainer, b.targetPaused)
 	}
-	if got, want := stdout.String(), "remote@main\n"; got != want {
+	if got, want := stdout.String(), "web@remote\n"; got != want {
 		t.Fatalf("fork output=%q, want %q", got, want)
 	}
 }
@@ -924,13 +924,13 @@ func TestForkTargetsRemoteNode(t *testing.T) {
 func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote-a@main", "remote-b@main"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if got, want := b.targetContainers, []string{"remote-a@main", "remote-b@main"}; !reflect.DeepEqual(got, want) {
+	if got, want := b.targetContainers, []string{"web@remote-a", "web@remote-b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("distributed targets=%q, want %q", got, want)
 	}
-	if got, want := stdout.String(), "remote-a@main\nremote-b@main\n"; got != want {
+	if got, want := stdout.String(), "web@remote-a\nweb@remote-b\n"; got != want {
 		t.Fatalf("fork output=%q, want %q", got, want)
 	}
 }
@@ -941,7 +941,7 @@ func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	if status := runCommand([]string{"fork", "--target", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if !strings.HasPrefix(b.targetContainer, "fork-") {
+	if !strings.HasPrefix(b.targetContainer, "web@fork-") {
 		t.Fatalf("generated remote container=%q", b.targetContainer)
 	}
 	if got, want := stdout.String(), b.targetContainer+"\n"; got != want {
@@ -949,18 +949,16 @@ func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	}
 }
 
-func TestForkAcceptsRemotePeerBranch(t *testing.T) {
+func TestForkRejectsQualifiedRemoteDestination(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote@second"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+		if !strings.Contains(stderr.String(), "must be a branch name") {
+			t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+		}
+		return
 	}
-	if got, want := b.targetContainer, "remote@second"; got != want {
-		t.Fatalf("distributed destination=%q, want %q", got, want)
-	}
-	if got, want := stdout.String(), "remote@second\n"; got != want {
-		t.Fatalf("fork output=%q, want %q", got, want)
-	}
+	t.Fatal("qualified remote destination was accepted")
 }
 
 func TestForkRejectsQualifiedLocalDestination(t *testing.T) {
