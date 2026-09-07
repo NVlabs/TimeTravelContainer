@@ -321,6 +321,31 @@ func TestAuthorityIndependenceDropsDependencyBeforeExpiry(t *testing.T) {
 	}
 }
 
+func TestAuthorityExpiryRevokesMaterializingWithoutCorruption(t *testing.T) {
+	at := time.Unix(3900, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	unplaced := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at.Add(time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", State: PlacementUnplaced,
+	}}))
+	applyAuthorityForTest(t, state, "claim", at.Add(2*time.Second), AuthorityPlacementClaim, AuthorityPlacementPayload{
+		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a",
+		PhysicalContainer: "family", PhysicalBranch: "main", Generation: unplaced.Generation, State: PlacementMaterializing,
+	})
+	node := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "expire", node.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+		NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
+	})
+	placement := state.Placements[logicalBranchKey("family", "main")]
+	branch := state.Branches[logicalBranchKey("family", "main")]
+	if placement.State != PlacementUnplaced || placement.OwnerNode != "" || placement.OwnerIncarnation != "" {
+		t.Fatalf("expired materializer retained ownership: %+v", placement)
+	}
+	if branch.Corrupted || branch.Lifecycle != string(PlacementUnplaced) || branch.Generation != placement.Generation {
+		t.Fatalf("durable branch was damaged by materializer expiry: branch=%+v placement=%+v", branch, placement)
+	}
+}
+
 func TestAuthoritySnapshotRoundTrip(t *testing.T) {
 	at := time.Unix(4000, 0).UTC()
 	state := NewAuthorityState()

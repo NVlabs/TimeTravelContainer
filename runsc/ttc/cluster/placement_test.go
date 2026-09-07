@@ -85,6 +85,29 @@ func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
 	}
 }
 
+func TestMaterializingPlacementBecomesStable(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(850, 0).UTC()
+	unplaced, err := store.Create(PlacementRecord{FamilyID: "family", BranchID: "main", State: PlacementUnplaced}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimUnplaced("family", "main", "node-a", "boot-a", "family", "main", unplaced.Generation, PlacementMaterializing, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := store.UpdateStableState("family", "main", "node-a", "boot-a", claimed.Generation, PlacementRunning, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running.State != PlacementRunning || running.Generation != claimed.Generation+1 {
+		t.Fatalf("stable placement=%+v after materializing=%+v", running, claimed)
+	}
+}
+
 func TestPlacementCatalogLocksReadsAgainstSnapshotWriter(t *testing.T) {
 	store, err := OpenPlacementStore(t.TempDir())
 	if err != nil {

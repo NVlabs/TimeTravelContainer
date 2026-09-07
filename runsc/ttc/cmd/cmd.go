@@ -4323,7 +4323,7 @@ func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, deh
 					return fmt.Errorf("cannot dehydrate %s in state %q", target.selector, target.state)
 				}
 			} else {
-				if target.state != "dehydrated" && target.state != "dehydrating" {
+				if target.state != "dehydrated" && target.state != "dehydrating" && target.state != "materializing" {
 					return fmt.Errorf("cannot rehydrate %s in state %q", target.selector, target.state)
 				}
 				err = db.rehydrate(target.selector)

@@ -865,7 +865,23 @@ func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, i
 		lost := false
 		if includePlacements {
 			if placement, ok := s.Placements[key]; ok && placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation {
-				lost = true
+				if placement.State == PlacementMaterializing {
+					// Construction never consumed the already durable roots. Revoke
+					// its exclusive claim and let another node retry it.
+					placement.OwnerNode, placement.OwnerIncarnation = "", ""
+					placement.PhysicalContainer, placement.PhysicalBranch = "", ""
+					placement.State = PlacementUnplaced
+					placement.Generation++
+					placement.Revision++
+					placement.UpdatedAt = at
+					s.Placements[key] = placement
+					branch.Generation = placement.Generation
+					branch.Lifecycle = string(PlacementUnplaced)
+					branch.UpdatedAt = at
+					s.Branches[key] = branch
+				} else {
+					lost = true
+				}
 			}
 		}
 		for _, dependency := range branch.VolatileDependencies {
@@ -992,7 +1008,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		if record.State != PlacementUnplaced || record.Generation != p.Generation {
 			return nil, errors.New("branch is placed or generation is stale")
 		}
-		if p.State != PlacementRunning && p.State != PlacementPaused {
+		if p.State != PlacementRunning && p.State != PlacementPaused && p.State != PlacementMaterializing {
 			return nil, errors.New("invalid claimed state")
 		}
 		record.OwnerNode, record.OwnerIncarnation, record.PhysicalContainer, record.PhysicalBranch = p.Owner, p.Incarnation, p.PhysicalContainer, p.PhysicalBranch
@@ -1002,7 +1018,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
 			return nil, fmt.Errorf("placement owner: %w", err)
 		}
-		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation || (record.State != PlacementRunning && record.State != PlacementPaused) {
+		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation || (record.State != PlacementRunning && record.State != PlacementPaused && record.State != PlacementMaterializing) {
 			return nil, errors.New("stale or unstable placement")
 		}
 		if p.State != PlacementRunning && p.State != PlacementPaused {

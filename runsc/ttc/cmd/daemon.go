@@ -132,6 +132,10 @@ type daemonPlacementClaim struct {
 	OwnerNode        string `json:"owner_node"`
 	OwnerIncarnation string `json:"owner_incarnation"`
 	Generation       uint64 `json:"generation"`
+	// AllowMaterializing is set only for the idempotent operation that turns a
+	// durable process-free branch into a runtime. Materializing ownership never
+	// authorizes any command that can execute guest code.
+	AllowMaterializing bool `json:"allow_materializing,omitempty"`
 }
 
 type daemonServer struct {

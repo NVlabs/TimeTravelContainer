@@ -198,7 +198,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.OwnerNode != "node-a" || record.OwnerIncarnation != node.Incarnation || record.State != cluster.PlacementPaused {
+	if record.OwnerNode != "node-a" || record.OwnerIncarnation != node.Incarnation || record.State != cluster.PlacementMaterializing {
 		t.Fatalf("claimed placement=%+v", record)
 	}
 	claimed, err := (ttcbundle.Store{Root: root, ActiveRoot: local}).LoadContainer("web")
@@ -224,8 +224,21 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reclaimed.OwnerNode != "node-a" || reclaimed.State != cluster.PlacementPaused {
+	if reclaimed.OwnerNode != "node-a" || reclaimed.State != cluster.PlacementMaterializing {
 		t.Fatalf("post-publication claimed placement=%+v", reclaimed)
+	}
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"rehydrate", "web@main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner != "node-a" || len(claims) != 1 || !claims[0].AllowMaterializing {
+		t.Fatalf("materializing rehydrate route=(%q, %+v)", owner, claims)
+	}
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-a", claims, placements); err != nil {
+		t.Fatalf("materializing rehydrate claim rejected: %v", err)
+	}
+	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
+		t.Fatal("materializing branch allowed guest execution")
 	}
 }
 

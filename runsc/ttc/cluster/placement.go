@@ -35,11 +35,15 @@ const maxPlacementRecordBytes = 1 << 20
 type PlacementState string
 
 const (
-	PlacementRunning   PlacementState = "running"
-	PlacementPaused    PlacementState = "paused"
-	PlacementMigrating PlacementState = "migrating"
-	PlacementUnplaced  PlacementState = "unplaced"
-	PlacementCorrupted PlacementState = "corrupted"
+	PlacementRunning PlacementState = "running"
+	PlacementPaused  PlacementState = "paused"
+	// PlacementMaterializing exclusively assigns construction of a durable
+	// process-free branch to one node. It is routable for idempotent start or
+	// rehydrate retries, but it grants no authority to execute guest code.
+	PlacementMaterializing PlacementState = "materializing"
+	PlacementMigrating     PlacementState = "migrating"
+	PlacementUnplaced      PlacementState = "unplaced"
+	PlacementCorrupted     PlacementState = "corrupted"
 )
 
 // PlacementRecord maps a stable logical branch to its current physical
@@ -72,7 +76,7 @@ func (r PlacementRecord) validate() error {
 		return errors.New("placement has invalid last operation")
 	}
 	switch r.State {
-	case PlacementRunning, PlacementPaused:
+	case PlacementRunning, PlacementPaused, PlacementMaterializing:
 		if !transactionIDPattern.MatchString(r.OwnerNode) || !transactionIDPattern.MatchString(r.OwnerIncarnation) ||
 			!transactionIDPattern.MatchString(r.PhysicalContainer) || !transactionIDPattern.MatchString(r.PhysicalBranch) {
 			return errors.New("placed branch lacks a valid owner or physical identity")
@@ -458,7 +462,7 @@ func (s *PlacementStore) Unplace(family, branch, owner, incarnation string, gene
 
 // ClaimUnplaced assigns a durable process-free branch to a ready node.
 func (s *PlacementStore) ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error) {
-	if state != PlacementRunning && state != PlacementPaused {
+	if state != PlacementRunning && state != PlacementPaused && state != PlacementMaterializing {
 		return nil, fmt.Errorf("invalid claimed placement state %q", state)
 	}
 	var result PlacementRecord
@@ -507,7 +511,7 @@ func (s *PlacementStore) UpdateStableState(family, branch, owner, incarnation st
 			return nil
 		}
 		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != incarnation ||
-			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			(record.State != PlacementRunning && record.State != PlacementPaused && record.State != PlacementMaterializing) {
 			return errors.New("stale or non-stable placement cannot change lifecycle")
 		}
 		record.State = state

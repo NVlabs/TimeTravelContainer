@@ -362,6 +362,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		return "", nil, errors.New("placement authority is unavailable")
 	}
 	owner := ""
+	allowMaterializing := len(args) != 0 && (args[0] == "start" || args[0] == "rehydrate")
 	var claims []daemonPlacementClaim
 	seen := make(map[string]struct{})
 	for _, arg := range args[1:] {
@@ -394,6 +395,9 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 			if placement.State == cluster.PlacementMigrating {
 				return "", nil, fmt.Errorf("branch %s is migrating from %q to %q; retry after cutover", selected, placement.OwnerNode, placement.TargetNode)
 			}
+			if placement.State == cluster.PlacementMaterializing && !allowMaterializing {
+				return "", nil, fmt.Errorf("branch %s is materializing on %q; only start or rehydrate may retry it", selected, placement.OwnerNode)
+			}
 			if placement.State != cluster.PlacementUnplaced {
 				branchOwner = placement.OwnerNode
 				key := placement.FamilyID + "\x00" + placement.BranchID
@@ -401,7 +405,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 					claims = append(claims, daemonPlacementClaim{
 						FamilyID: placement.FamilyID, BranchID: placement.BranchID,
 						OwnerNode: placement.OwnerNode, OwnerIncarnation: placement.OwnerIncarnation,
-						Generation: placement.Generation,
+						Generation: placement.Generation, AllowMaterializing: placement.State == cluster.PlacementMaterializing && allowMaterializing,
 					})
 					seen[key] = struct{}{}
 				}
@@ -445,7 +449,7 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims
 		if err != nil {
 			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, err)
 		}
-		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused {
+		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused && !(claim.AllowMaterializing && record.State == cluster.PlacementMaterializing) {
 			return fmt.Errorf("stale routed command: branch %s@%s is %s", claim.FamilyID, claim.BranchID, record.State)
 		}
 		if record.OwnerNode != localNode || record.OwnerNode != claim.OwnerNode || record.OwnerIncarnation != claim.OwnerIncarnation || record.Generation != claim.Generation {
@@ -632,7 +636,7 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 			}
 			continue
 		}
-		claimed, err := placements.ClaimUnplaced(info.ID, branch.ID, node.NodeID, node.Incarnation, info.ID, branch.ID, record.Generation, cluster.PlacementPaused, time.Now())
+		claimed, err := placements.ClaimUnplaced(info.ID, branch.ID, node.NodeID, node.Incarnation, info.ID, branch.ID, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {
 			return fmt.Errorf("claiming cold-branch placement for %s: %w", target, err)
 		}
@@ -882,6 +886,9 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.PlacementClaims, placements); err != nil {
 		return 1, stdout.String(), stderr.String(), err
 	}
+	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
+		return 1, stdout.String(), stderr.String(), err
+	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
 		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
 		if err != nil {
@@ -893,6 +900,9 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 		status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
 		if status == 0 {
+			if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
+				return 1, stdout.String(), stderr.String(), err
+			}
 			if err := backend.reconcilePlacementCatalog(); err != nil {
 				fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
@@ -906,6 +916,9 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	if status == 0 {
+		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
+			return 1, stdout.String(), stderr.String(), err
+		}
 		if err := backend.reconcilePlacementCatalog(); err != nil {
 			fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 		}
@@ -2563,9 +2576,14 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 					result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d has no runtime identity and cannot be re-authorized", process.PID))
 					continue
 				}
-				// A host-stopped Sentry still has a usable runsc state file. Forced
-				// deletion kills the Sentry and its gofer without allowing guest
-				// execution, then releases bind mounts and open descriptors.
+				// runsc delete normally asks the Sentry to destroy itself, but a
+				// host-stopped Sentry cannot answer that RPC. Its PID/start time was
+				// verified above and Raft denied execution authority, so kill it
+				// without SIGCONT before asking runsc to reap the gofer and files.
+				if err := syscall.Kill(process.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					result = errors.Join(result, fmt.Errorf("killing unauthorized fenced Sentry PID %d: %w", process.PID, err))
+					continue
+				}
 				if _, err := backend.command("delete", "--force", containerID); err != nil {
 					result = errors.Join(result, fmt.Errorf("destroying unauthorized fenced runtime %q: %w", containerID, err))
 				}
