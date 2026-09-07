@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/bits"
@@ -745,6 +746,117 @@ func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, b
 func distributedChildRequestID(parent string, ordinal int, args []string) string {
 	hash := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", parent, ordinal, strings.Join(args, "\x00"))))
 	return hex.EncodeToString(hash[:16])
+}
+
+// executeDistributedStats obtains one accounting snapshot per physical
+// runtime owner and reduces them at the entry daemon. A node-local ttcvolume
+// repository can only describe branches resident on that node; trying to
+// account a split family from any single owner either fails or reports false
+// sharing. Raft placements define the authoritative partition.
+func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int, []byte, []byte, error) {
+	if len(request.Args) < 2 || request.Args[0] != "stats" {
+		return false, 0, nil, nil, nil
+	}
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	var diagnostic bytes.Buffer
+	fs.SetOutput(&diagnostic)
+	jsonOutput := fs.Bool("json", false, "")
+	if err := fs.Parse(request.Args[1:]); err != nil {
+		return true, 1, nil, diagnostic.Bytes(), nil
+	}
+	if fs.NArg() != 1 {
+		return true, 1, nil, nil, errors.New("usage: ttc stats [--json] CONTAINER@BRANCH")
+	}
+	target, err := parseSelector(fs.Arg(0))
+	if err != nil {
+		return true, 1, nil, nil, err
+	}
+	store := ttcbundle.Store{Root: s.dataRoot}
+	info, err := store.LoadContainer(target.container)
+	if err != nil {
+		return true, 1, nil, nil, err
+	}
+	if _, err := persistentBranchInfo(info, target.branch); err != nil {
+		return true, 1, nil, nil, err
+	}
+	owners := make(map[string]string)
+	merged := FamilyResourceStats{Container: info.Name}
+	if merged.Container == "" {
+		merged.Container = target.container
+	}
+	for _, branch := range info.Branches {
+		record, lookupErr := s.clusterPlacements.Lookup(info.ID, branch.ID)
+		if lookupErr == nil && record.OwnerNode != "" && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused) {
+			if _, ok := owners[record.OwnerNode]; !ok {
+				owners[record.OwnerNode] = branch.ID
+			}
+			continue
+		}
+		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
+			return true, 1, nil, nil, fmt.Errorf("resolving stats placement for %s@%s: %w", info.Name, branch.ID, lookupErr)
+		}
+		// Process-free and corrupted branches have no node-local resident graph.
+		// Keep them visible in the cluster snapshot. Immutable cold packs are
+		// cluster storage rather than capacity attributable to a runtime owner.
+		state := normalizeLifecycleState(branch.State)
+		if lookupErr == nil {
+			state = string(record.State)
+		}
+		merged.Branches = append(merged.Branches, BranchResourceStats{
+			Target: merged.Container + "@" + branch.ID, State: state,
+			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration,
+			SourceNode: branch.SourceNode, DependentMemoryBytes: branch.DependentMemoryBytes,
+			DependentFilesystemBytes: branch.DependentFilesystemBytes,
+		})
+		merged.DependentMemoryBytes += branch.DependentMemoryBytes
+		merged.DependentFilesystemBytes += branch.DependentFilesystemBytes
+	}
+	nodes := make([]string, 0, len(owners))
+	for node := range owners {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for ordinal, node := range nodes {
+		args := []string{"_stats-local", "--json", info.Name + "@" + owners[node]}
+		child := daemonRequest{
+			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, ordinal, args),
+			Options: request.Options, Args: args, DistributedLeaf: true,
+		}
+		var status int
+		var stdout, stderr string
+		if node == s.clusterCapabilities.NodeID {
+			status, stdout, stderr, err = s.executeLocalDistributedCommand(child)
+		} else {
+			peer, peerErr := s.distributedSource.peer(node, false)
+			if peerErr != nil {
+				return true, 1, nil, diagnostic.Bytes(), peerErr
+			}
+			status, stdout, stderr, err = executeRemoteDaemonRequest(context.Background(), peer, child)
+		}
+		diagnostic.WriteString(stderr)
+		if err != nil {
+			return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("accounting branches on node %q: %w", node, err)
+		}
+		if status != 0 {
+			return true, status, nil, diagnostic.Bytes(), nil
+		}
+		var local FamilyResourceStats
+		if err := json.Unmarshal([]byte(stdout), &local); err != nil {
+			return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("decoding stats from node %q: %w", node, err)
+		}
+		merged.Branches = append(merged.Branches, local.Branches...)
+		merged.ResidentMemoryUniqueBytes += local.ResidentMemoryUniqueBytes
+		merged.MemoryBackingUniqueBytes += local.MemoryBackingUniqueBytes
+		merged.FilesystemUniqueBytes += local.FilesystemUniqueBytes
+		merged.DependentMemoryBytes += local.DependentMemoryBytes
+		merged.DependentFilesystemBytes += local.DependentFilesystemBytes
+	}
+	sort.Slice(merged.Branches, func(i, j int) bool { return merged.Branches[i].Target < merged.Branches[j].Target })
+	var output bytes.Buffer
+	if err := writeResourceStats(&output, merged, *jsonOutput); err != nil {
+		return true, 1, nil, diagnostic.Bytes(), err
+	}
+	return true, 0, output.Bytes(), diagnostic.Bytes(), nil
 }
 
 // executeDistributedFamilyMutation coordinates family-wide lifecycle changes
@@ -2528,6 +2640,80 @@ func fencedRuntimeAuthorized(family Family, nodeID, incarnation string, lookup f
 	return true
 }
 
+// enforceLocalRaftPlacements projects committed branch authority into the
+// running Sentry. Node leases are renewed only after this succeeds. Therefore
+// a branch revoked since the preceding lease grant can run only through that
+// grant's bounded interval; failure to evict it fences the whole node before
+// the guardian is allowed to extend execution.
+func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation string) error {
+	if backend == nil || backend.distributedSource == nil || backend.distributedSource.authority == nil {
+		return nil
+	}
+	families, err := backend.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	for _, family := range families {
+		var revoked []Branch
+		for _, branch := range family.Branches {
+			placement, lookupErr := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
+			if lookupErr == nil && placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation &&
+				(placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused || placement.State == cluster.PlacementMigrating) {
+				continue
+			}
+			revoked = append(revoked, branch)
+		}
+		if len(revoked) == 0 {
+			continue
+		}
+		if len(revoked) == len(family.Branches) {
+			if _, err := backend.command("delete", "--force", family.ID); err != nil {
+				return fmt.Errorf("destroying wholly unauthorized runtime %q: %w", family.ID, err)
+			}
+			continue
+		}
+		for _, branch := range revoked {
+			if branch.State == "running" || branch.State == "restarting" {
+				if _, err := backend.command("timetravel", family.ID, "prepare-stop", branch.ID); err != nil {
+					return fmt.Errorf("quiescing revoked branch %s@%s: %w", family.ID, branch.ID, err)
+				}
+			}
+			if _, err := backend.command("timetravel", family.ID, "destroy", branch.ID); err != nil {
+				return fmt.Errorf("destroying revoked branch %s@%s: %w", family.ID, branch.ID, err)
+			}
+			if placement, err := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID); err == nil && placement.State == cluster.PlacementCorrupted {
+				_ = backend.containerStore().UpdateBranchState(family.ID, branch.ID, "corrupted")
+			}
+		}
+	}
+	return nil
+}
+
+// corruptFencedRuntimePeers records the unavoidable blast radius when a
+// host-stopped Sentry contains a mix of authorized and revoked branches. The
+// stopped Go runtime cannot safely delete only one branch. Resuming it would
+// execute the revoked branch, so all otherwise-authorized co-residents are
+// fenced permanently before the physical Sentry is killed.
+func corruptFencedRuntimePeers(backend *runtimeBackend, family Family, nodeID, incarnation, reason string) error {
+	if backend == nil || backend.distributedSource == nil || backend.distributedSource.authority == nil {
+		return nil
+	}
+	var result error
+	for _, branch := range family.Branches {
+		placement, err := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
+		if err != nil || placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation ||
+			(placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused) {
+			continue
+		}
+		if _, err := backend.distributedSource.authority.MarkBranchCorrupted(family.ID, branch.ID, reason); err != nil {
+			result = errors.Join(result, fmt.Errorf("marking co-resident branch %s@%s corrupted: %w", family.ID, branch.ID, err))
+			continue
+		}
+		_ = backend.containerStore().UpdateBranchState(family.ID, branch.ID, "corrupted")
+	}
+	return result
+}
+
 func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) error {
 	path := elasticFencePath(backend.activeDataRoot())
 	data, err := os.ReadFile(path)
@@ -2576,6 +2762,8 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 					result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d has no runtime identity and cannot be re-authorized", process.PID))
 					continue
 				}
+				result = errors.Join(result, corruptFencedRuntimePeers(backend, family, nodeID, incarnation,
+					"co-resident runtime contained a branch without execution authority during fence recovery"))
 				// runsc delete normally asks the Sentry to destroy itself, but a
 				// host-stopped Sentry cannot answer that RPC. Its PID/start time was
 				// verified above and Raft denied execution authority, so kill it

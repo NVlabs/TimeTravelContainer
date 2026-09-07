@@ -3017,6 +3017,16 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			go func(record cluster.NodeRecord) {
 				defer close(heartbeatStopped)
 				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func() error {
+					unlock := server.lockDataRoot(server.dataRoot)
+					enforceErr := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation)
+					unlock()
+					if enforceErr != nil {
+						// A committed revocation must be enforced before this node may
+						// consume its renewed lease. Fail closed immediately rather than
+						// waiting for the guardian deadline.
+						_ = fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
+						return fmt.Errorf("enforcing Raft branch authority: %w", enforceErr)
+					}
 					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
 						return fmt.Errorf("notifying execution-lease guardian: %w", err)
 					}
@@ -3353,6 +3363,17 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if len(request.Args) == 0 {
 		writeError(errors.New("empty command"))
 		return
+	}
+	if s.distributedSource != nil && s.clusterCapabilities != nil && !request.DistributedLeaf {
+		handled, status, stdout, stderr, err := s.executeDistributedStats(request)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		if handled {
+			writeDaemonBufferedResult(conn, &writeMu, stdout, stderr, status)
+			return
+		}
 	}
 	if s.distributedSource != nil && s.clusterCapabilities != nil && !request.DistributedLeaf {
 		handled, status, stdout, stderr, err := s.executeDistributedFamilyMutation(request)

@@ -359,6 +359,8 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runDiff(args[1:], stdout, stderr, backend)
 	case "stats":
 		err = runStats(args[1:], stdout, stderr, backend)
+	case "_stats-local":
+		err = runStats(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
@@ -5064,6 +5066,13 @@ func runStats(args []string, stdout, stderr io.Writer, b backend) error {
 		return fmt.Errorf("accounting %s: %w", target, err)
 	}
 	if *jsonOutput {
+		return writeResourceStats(stdout, stats, true)
+	}
+	return writeResourceStats(stdout, stats, false)
+}
+
+func writeResourceStats(stdout io.Writer, stats FamilyResourceStats, jsonOutput bool) error {
+	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(stats)
@@ -11586,6 +11595,24 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.Container = target.container
 	}
 	branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	if b.nodeID != "" {
+		placements, placementErr := b.placementCatalog()
+		filtered := branches[:0]
+		for _, branch := range branches {
+			owned := false
+			if placementErr == nil {
+				if record, err := placements.Lookup(info.ID, branch.ID); err == nil {
+					owned = record.OwnerNode == b.nodeID && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused)
+				}
+			} else {
+				owned = info.BranchNodeID(branch.ID) == b.nodeID
+			}
+			if owned {
+				filtered = append(filtered, branch)
+			}
+		}
+		branches = filtered
+	}
 	sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
 	result.Branches = make([]BranchResourceStats, 0, len(branches))
 	byID := make(map[string]*BranchResourceStats, len(branches))
