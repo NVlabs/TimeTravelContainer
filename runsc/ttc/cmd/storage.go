@@ -99,11 +99,14 @@ type coldBranchManifest struct {
 }
 
 type branchPublisher struct {
-	sharedRoot  string
-	localRoot   string
-	nodeID      string
-	incarnation string
-	event       func(DaemonEvent)
+	sharedRoot   string
+	localRoot    string
+	nodeID       string
+	incarnation  string
+	placements   cluster.PlacementCatalog
+	transactions cluster.TransactionCatalog
+	authority    *cluster.RaftCatalog
+	event        func(DaemonEvent)
 }
 
 func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
@@ -399,10 +402,24 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			return false, errors.Join(branchErr, closeErr)
 		}
 	}
+	if p.authority != nil {
+		lifecycle := "exited"
+		if intent.Kind == "dehydrate" {
+			lifecycle = "dehydrated"
+		}
+		if _, err := p.authority.EnsurePublicationReady(info.ID, intent.Branch, intent.Generation, lifecycle); err != nil {
+			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
+		}
+	}
 	return true, nil
 }
 
 func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
+	if p.authority != nil {
+		if err := p.authority.CancelPublication(intent.Container, intent.Branch, intent.Generation); err != nil {
+			return fmt.Errorf("canceling publication authority: %w", err)
+		}
+	}
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
 	if err != nil {
@@ -523,12 +540,25 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	if intent.Kind == "dehydrate" {
 		lifecycle = "dehydrated"
 	}
-	if p.nodeID != "" {
-		placements, err := cluster.OpenPlacementStore(filepath.Join(p.sharedRoot, "cluster", "placements"))
+	if p.authority != nil {
+		digest, err := fileSHA256Digest(result.Manifest)
 		if err != nil {
-			return err
+			return fmt.Errorf("digesting cold manifest: %w", err)
 		}
-		if err := p.releasePublishedPlacement(placements, info.ID, intent.Branch); err != nil {
+		roots := cluster.DurableRoots{FilesystemRoot: digest}
+		if intent.Kind == "dehydrate" {
+			// The content-addressed branch manifest reaches both the control/memory
+			// packs and the filesystem packs, so it is the durable root for each.
+			roots.MemoryRoot = digest
+		}
+		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.Generation, roots); err != nil {
+			return fmt.Errorf("committing publication roots in Raft: %w", err)
+		}
+	} else if p.nodeID != "" {
+		if p.placements == nil {
+			return errors.New("placement authority is unavailable")
+		}
+		if err := p.releasePublishedPlacement(p.placements, info.ID, intent.Branch); err != nil {
 			return err
 		}
 	}
@@ -555,9 +585,9 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		p.recordStorageEvent(intent, "shared", "", result.Manifest)
 		return nil
 	}
-	transactions, err := cluster.OpenStore(filepath.Join(p.sharedRoot, "cluster", "transactions"))
-	if err != nil {
-		return err
+	transactions := p.transactions
+	if transactions == nil {
+		return errors.New("transaction authority is unavailable")
 	}
 	tx, err := transactions.Load(transactionID)
 	if err != nil {
@@ -578,13 +608,23 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	}
 }
 
+func fileSHA256Digest(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	_, copyErr := io.Copy(hash, file)
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), errors.Join(copyErr, file.Close())
+}
+
 // releasePublishedPlacement releases runtime ownership after a process-free
 // branch has become durable. A daemon that recovered an activated publication
 // intent may have a new incarnation. Node admission already proves that the
 // previous incarnation of the same node ID has expired, so adopt it before
 // releasing the placement. Both transitions are generation-fenced and a
 // crash between them is safe to retry from the next incarnation.
-func (p *branchPublisher) releasePublishedPlacement(placements *cluster.PlacementStore, family, branch string) error {
+func (p *branchPublisher) releasePublishedPlacement(placements cluster.PlacementCatalog, family, branch string) error {
 	record, err := placements.Lookup(family, branch)
 	switch {
 	case errors.Is(err, os.ErrNotExist):

@@ -368,9 +368,9 @@ local or durable, the target no longer depends on the source process.
 The nodes must use the same shared TTC data root and repository ID, have the
 same image content available, and be able to reach each other's control and
 page-transfer listeners. Give every daemon a certificate issued by one cluster
-CA whose identity matches its node ID. Dynamic discovery is preferred: a node
-publishes a lease and advertised mTLS endpoint in the shared root, so other
-daemons discover it without restarting. For example, start node A with:
+CA whose identity matches its node ID. Cluster authority is one Raft group;
+its WAL and snapshots live in each node's local root, never on the shared
+filesystem. For example, bootstrap node A with:
 
 ```shell
 ttc daemon start \
@@ -378,6 +378,9 @@ ttc daemon start \
   --cluster-repository-id team-repository \
   --cluster-listen 0.0.0.0:7443 \
   --cluster-advertise https://node-a.example:7443,node-a.example \
+  --cluster-raft-bootstrap \
+  --cluster-raft-listen 0.0.0.0:7453 \
+  --cluster-raft-advertise node-a.example:7453,node-a.example \
   --cluster-page-listen 0.0.0.0:0 \
   --cluster-cert /shared/cluster/node-a.pem \
   --cluster-key /shared/cluster/node-a.key \
@@ -387,14 +390,24 @@ ttc daemon start \
   --cluster-capacity-webhook https://scheduler.example/v1/ttc-capacity
 ```
 
-Start node B with its own node ID, advertised address, and certificate.
-`--cluster-peer` remains available as a static override but is unnecessary
-when every daemon has `--cluster-advertise`. `TTC_ROOT` names the same shared
+Start node B with its own node ID, control and Raft advertised addresses, and
+certificate. Omit `--cluster-raft-bootstrap` and give it at least one existing
+seed such as
+`--cluster-peer node-a=https://node-a.example:7443,node-a.example`.
+After admission, node and leader discovery comes from Raft, so every peer does
+not need to appear on every command line. `TTC_ROOT` names the same shared
 repository on both hosts, while each node's `TTC_LOCAL_ROOT` names fast local
 scratch. `ttc daemon status` reports the active cluster
 identity and negotiated capabilities. Both page-transfer addresses must use
 port `0`: TTC assigns an independent ephemeral listener to every concurrent
 remote fork.
+
+The first three admitted members are voting replicas; further elastic compute
+nodes remain non-voting replicas. Thus a large worker fleet does not enlarge
+the commit quorum. Membership, leases, placements, distributed transactions,
+publication generations, and durable root IDs are Raft state. Memory pages,
+filesystem extents, and immutable packs remain on the data plane and ordinary
+guest reads and writes perform no consensus operation.
 
 From node A, create one child on node B:
 

@@ -48,7 +48,10 @@ import (
 type distributedSourceRuntime struct {
 	capabilities  cluster.Capabilities
 	peers         map[string]*cluster.Client
-	directory     *cluster.NodeDirectory
+	directory     cluster.NodeCatalog
+	placements    cluster.PlacementCatalog
+	transactions  cluster.TransactionCatalog
+	authority     *cluster.RaftCatalog
 	certFile      string
 	keyFile       string
 	caFile        string
@@ -63,6 +66,26 @@ type dynamicClusterPeer struct {
 	controlURL  string
 	serverName  string
 	client      *cluster.Client
+}
+
+func (b *runtimeBackend) placementCatalog() (cluster.PlacementCatalog, error) {
+	if b != nil && b.distributedSource != nil && b.distributedSource.placements != nil {
+		return b.distributedSource.placements, nil
+	}
+	if b == nil || b.dataRoot == "" {
+		return nil, errors.New("placement authority is unavailable")
+	}
+	return cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+}
+
+func (b *runtimeBackend) transactionCatalog() (cluster.TransactionCatalog, error) {
+	if b != nil && b.distributedSource != nil && b.distributedSource.transactions != nil {
+		return b.distributedSource.transactions, nil
+	}
+	if b == nil || b.dataRoot == "" {
+		return nil, errors.New("transaction authority is unavailable")
+	}
+	return cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
 }
 
 func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*cluster.Client, error) {
@@ -98,6 +121,15 @@ func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*clus
 	if record.Capabilities.BuildID != r.capabilities.BuildID {
 		return nil, fmt.Errorf("cluster target node %q uses TTC build %q, want exact build %q", nodeID, record.Capabilities.BuildID, r.capabilities.BuildID)
 	}
+	return r.peerForRecord(*record)
+}
+
+// peerForRecord constructs a control-plane client from an already-authorized
+// Raft membership record. In particular, Raft leader redirection must use a
+// locally applied record: resolving it through directory.Lookup would recurse
+// into the same linearizable read that is being redirected.
+func (r *distributedSourceRuntime) peerForRecord(record cluster.NodeRecord) (*cluster.Client, error) {
+	nodeID := record.NodeID
 	r.peerMu.Lock()
 	defer r.peerMu.Unlock()
 	if cached, ok := r.dynamicPeers[nodeID]; ok && cached.incarnation == record.Incarnation &&
@@ -1549,7 +1581,7 @@ func (b *runtimeBackend) reconcileClusterSparseMemoryRoots() error {
 			}
 		}
 	}
-	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return err
 	}
@@ -1716,8 +1748,8 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		}
 		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
 			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
-				if tx.Identity.Migration && tx.State == cluster.TransactionPublished && !tx.Activated {
-					if placements, openErr := cluster.OpenPlacementStore(filepath.Join(backend.dataRoot, "cluster", "placements")); openErr == nil {
+				if tx.Identity.Migration && tx.State == cluster.TransactionPublished && tx.OwnershipCommitted && !tx.Activated {
+					if placements, openErr := backend.placementCatalog(); openErr == nil {
 						if placement, lookupErr := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); lookupErr == nil &&
 							placement.OwnerNode == localNode && placement.LastOperationID == tx.Identity.TransactionID && placement.State != cluster.PlacementMigrating {
 							txCopy := tx
@@ -1740,7 +1772,7 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		if err != nil {
 			continue
 		}
-		if tx.Identity.Migration && tx.State == cluster.TransactionPublished && !tx.Activated {
+		if tx.Identity.Migration && tx.State == cluster.TransactionPublished && tx.OwnershipCommitted && !tx.Activated {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			activated, activateErr := peer.Activate(ctx, tx.Identity.TransactionID, tx.Revision)
 			cancel()

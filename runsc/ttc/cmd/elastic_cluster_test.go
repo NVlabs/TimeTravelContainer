@@ -16,8 +16,12 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -261,5 +265,101 @@ func TestClusterAdvertiseRejectsUnreachableOrInsecureURLs(t *testing.T) {
 		if _, _, err := parseClusterAdvertise(value); err == nil {
 			t.Errorf("parseClusterAdvertise(%q) succeeded", value)
 		}
+	}
+}
+
+func TestResumeFencedElasticRuntimeChecksProcessIdentity(t *testing.T) {
+	command := exec.Command("sleep", "60")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	start, err := processStartTime(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRoot := t.TempDir()
+	path := elasticFencePath(localRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDurableJSON(path, elasticFenceRecord{
+		Version: 1, NodeID: "node-a", Incarnation: "old", FencedAt: time.Now(),
+		Processes: []elasticFencedProcess{{PID: command.Process.Pid, StartTime: start}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{localRoot: localRoot}
+	if err := resumeFencedElasticRuntimes(backend, "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("execution fence remains after resume: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(status), "State:\tT") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fenced process remained stopped")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	command := exec.Command("bash", "-c", "exec -a 'ttc-sentry[guardian-test]' bash -c 'while :; do sleep 1; done' -- --root="+runtimeRoot)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Signal(syscall.SIGCONT)
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	localRoot := t.TempDir()
+	deadline := time.Now().Add(time.Second)
+	for {
+		processes, err := sentryProcessesForRuntimeRoot(runtimeRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(processes) == 1 && processes[0].PID == command.Process.Pid {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("guardian did not discover process %d: %+v", command.Process.Pid, processes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := fenceElasticRuntimeRoot(localRoot, runtimeRoot, "node-a", "incarnation-a"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(elasticFencePath(localRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record elasticFenceRecord
+	if err := json.Unmarshal(data, &record); err != nil || len(record.Processes) != 1 || record.Processes[0].PID != command.Process.Pid {
+		t.Fatalf("bad guardian fence record: %+v err=%v", record, err)
+	}
+	status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(status), "State:\tT") {
+		t.Fatalf("guardian target was not stopped:\n%s", status)
 	}
 }

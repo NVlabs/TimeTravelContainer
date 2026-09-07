@@ -52,6 +52,26 @@ func waitAuthorityLeader(t *testing.T, nodes ...*AuthorityRaftNode) *AuthorityRa
 	return nil
 }
 
+func registerReadyRaftNode(t *testing.T, leader *AuthorityRaftNode, id, incarnation string) {
+	t.Helper()
+	at := time.Now().UTC()
+	node := testAuthorityNode(at)
+	node.NodeID, node.Incarnation, node.Capabilities.NodeID = id, incarnation, id
+	for _, entry := range []struct {
+		id      string
+		kind    AuthorityCommandKind
+		payload any
+	}{
+		{"register-state-" + id, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: node, LeaseDuration: time.Hour}},
+		{"ready-state-" + id, AuthorityNodeTransition, AuthorityNodeTransitionPayload{NodeID: id, Incarnation: incarnation, State: NodeReady, LeaseDuration: time.Hour}},
+	} {
+		result, err := leader.Propose(context.Background(), entry.id, entry.kind, entry.payload)
+		if err != nil || result.Err() != nil {
+			t.Fatalf("applying %s: result=%+v err=%v", entry.kind, result, err)
+		}
+	}
+}
+
 func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	serverTLS, clientTLS := newAuthorityRaftTLS(t)
 	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
@@ -64,15 +84,11 @@ func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	}
 	defer node.Close()
 	waitAuthorityLeader(t, node)
-	at := time.Now().UTC()
-	command, err := NewAuthorityCommand("placement-create", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+	registerReadyRaftNode(t, node, "node-a", "incarnation-a")
+	result, err := node.Propose(context.Background(), "placement-create", AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := node.Apply(context.Background(), command)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,15 +148,13 @@ func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {
 			t.Fatalf("promoting %s: %v", follower.id, err)
 		}
 	}
-	at := time.Now().UTC()
-	command, err := NewAuthorityCommand("replicated-place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+	registerReadyRaftNode(t, leader, "node-a", "incarnation-a")
+	registerReadyRaftNode(t, leader, "node-b", "incarnation-b")
+	result, err := leader.Propose(ctx, "replicated-place", AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result, err := leader.Apply(ctx, command); err != nil || result.Err() != nil {
+	if err != nil || result.Err() != nil {
 		t.Fatalf("replicated apply: result=%+v err=%v", result, err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -162,14 +176,24 @@ func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {
 	}
 	closedA = true
 	leader = waitAuthorityLeader(t, b, c)
-	command, err = NewAuthorityCommand("post-failover-place", time.Now().UTC(), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+	result, err = leader.Propose(ctx, "post-failover-place-stale", AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "second", PhysicalContainer: "family", PhysicalBranch: "second",
 		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", State: PlacementPaused,
 	}})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || result.Err() == nil {
+		t.Fatalf("prior-term lease authorized placement: result=%+v err=%v", result, err)
 	}
-	if result, err := leader.Apply(ctx, command); err != nil || result.Err() != nil {
+	result, err = leader.Propose(ctx, "renew-after-failover", AuthorityNodeRenew, AuthorityNodeRenewPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", LeaseDuration: time.Hour,
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("renewing in new term: result=%+v err=%v", result, err)
+	}
+	result, err = leader.Propose(ctx, "post-failover-place", AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "second", PhysicalContainer: "family", PhysicalBranch: "second",
+		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", State: PlacementPaused,
+	}})
+	if err != nil || result.Err() != nil {
 		t.Fatalf("post-failover apply: result=%+v err=%v", result, err)
 	}
 }

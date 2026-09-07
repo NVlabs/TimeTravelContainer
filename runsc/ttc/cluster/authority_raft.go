@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,12 +55,18 @@ type AuthorityRaftOptions struct {
 
 // AuthorityNotLeaderError tells callers where to retry an authority request.
 type AuthorityNotLeaderError struct {
-	Leader string
+	LeaderID         string
+	Leader           string
+	LeaderControlURL string
+	LeaderServerName string
 }
 
 func (e *AuthorityNotLeaderError) Error() string {
 	if e.Leader == "" {
 		return "TTC authority has no elected Raft leader"
+	}
+	if e.LeaderID != "" {
+		return fmt.Sprintf("TTC authority request must be sent to Raft leader %s at %q", e.LeaderID, e.Leader)
 	}
 	return fmt.Sprintf("TTC authority request must be sent to Raft leader %q", e.Leader)
 }
@@ -189,13 +196,16 @@ func (l *authorityTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.
 
 // AuthorityRaftNode owns the consensus engine and node-local durable log.
 type AuthorityRaftNode struct {
-	id        string
-	raft      *raft.Raft
-	fsm       *AuthorityFSM
-	transport *raft.NetworkTransport
-	store     *raftboltdb.BoltStore
-	listener  net.Listener
-	timeout   time.Duration
+	id          string
+	raft        *raft.Raft
+	fsm         *AuthorityFSM
+	transport   *raft.NetworkTransport
+	store       *raftboltdb.BoltStore
+	listener    net.Listener
+	timeout     time.Duration
+	hadState    bool
+	leaderMu    sync.RWMutex
+	leaderSince time.Time
 }
 
 // OpenAuthorityRaftNode opens or creates one persistent Raft member.
@@ -269,29 +279,70 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 		plainListener.Close()
 		return nil, fmt.Errorf("starting Raft: %w", err)
 	}
-	node := &AuthorityRaftNode{id: options.NodeID, raft: engine, fsm: fsm, transport: transport, store: store, listener: plainListener, timeout: options.ApplyTimeout}
+	node := &AuthorityRaftNode{id: options.NodeID, raft: engine, fsm: fsm, transport: transport, store: store, listener: plainListener, timeout: options.ApplyTimeout, hadState: hasState}
+	go node.observeLeadership(engine.LeaderCh())
 	if node.timeout == 0 {
 		node.timeout = defaultAuthorityApplyTimeout
 	}
 	if options.Bootstrap {
-		if hasState {
-			node.Close()
-			return nil, errors.New("refusing to bootstrap a Raft member with existing state")
-		}
-		configuration := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(options.NodeID), Address: raft.ServerAddress(advertise), Suffrage: raft.Voter}}}
-		if err := engine.BootstrapCluster(configuration).Error(); err != nil {
-			node.Close()
-			return nil, fmt.Errorf("bootstrapping TTC Raft cluster: %w", err)
+		if !hasState {
+			configuration := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(options.NodeID), Address: raft.ServerAddress(advertise), Suffrage: raft.Voter}}}
+			if err := engine.BootstrapCluster(configuration).Error(); err != nil {
+				node.Close()
+				return nil, fmt.Errorf("bootstrapping TTC Raft cluster: %w", err)
+			}
 		}
 	}
 	return node, nil
 }
+
+// HadExistingState reports whether this member opened a prior WAL/snapshot.
+func (n *AuthorityRaftNode) HadExistingState() bool { return n != nil && n.hadState }
 
 // Address returns the identity-bearing advertised Raft address.
 func (n *AuthorityRaftNode) Address() string { return string(n.transport.LocalAddr()) }
 
 func (n *AuthorityRaftNode) IsLeader() bool {
 	return n != nil && n.raft != nil && n.raft.State() == raft.Leader
+}
+
+func (n *AuthorityRaftNode) observeLeadership(ch <-chan bool) {
+	for leader := range ch {
+		n.leaderMu.Lock()
+		if leader {
+			n.leaderSince = time.Now()
+		} else {
+			n.leaderSince = time.Time{}
+		}
+		n.leaderMu.Unlock()
+	}
+}
+
+// LeadershipSafeFor reports whether every execution lease issued by a prior
+// leader has had enough real time to self-fence. It uses this host's monotonic
+// clock and is required before expiring or replacing another incarnation.
+func (n *AuthorityRaftNode) LeadershipSafeFor(duration time.Duration) bool {
+	if !n.IsLeader() {
+		return false
+	}
+	n.leaderMu.RLock()
+	since := n.leaderSince
+	n.leaderMu.RUnlock()
+	return !since.IsZero() && time.Since(since) >= duration
+}
+
+func (n *AuthorityRaftNode) currentTerm() (uint64, error) {
+	if n == nil || n.raft == nil {
+		return 0, errors.New("nil Raft authority")
+	}
+	term, err := strconv.ParseUint(n.raft.Stats()["term"], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("reading current Raft term: %w", err)
+	}
+	if term == 0 {
+		return 0, errors.New("current Raft term is zero")
+	}
+	return term, nil
 }
 
 func (n *AuthorityRaftNode) Leader() string {
@@ -301,6 +352,29 @@ func (n *AuthorityRaftNode) Leader() string {
 	return string(n.raft.Leader())
 }
 
+// LeaderID returns the Raft server identity associated with Leader.
+func (n *AuthorityRaftNode) LeaderID() string {
+	if n == nil || n.raft == nil {
+		return ""
+	}
+	_, id := n.raft.LeaderWithID()
+	return string(id)
+}
+
+// AppliedState returns the local applied state without claiming a linearizable
+// read. It is suitable for diagnostics and locating the current leader, never
+// for an ownership decision.
+func (n *AuthorityRaftNode) AppliedState() (*AuthorityState, error) {
+	if n == nil || n.fsm == nil {
+		return nil, errors.New("nil Raft authority")
+	}
+	state, err := n.fsm.copyState()
+	if err == nil {
+		state.LeaderObservedAt = time.Now().UTC()
+	}
+	return state, err
+}
+
 // Apply appends one already timestamped deterministic command. Remote callers
 // should send an untimestamped proposal to the leader-facing API instead.
 func (n *AuthorityRaftNode) Apply(ctx context.Context, command AuthorityCommand) (AuthorityResult, error) {
@@ -308,7 +382,14 @@ func (n *AuthorityRaftNode) Apply(ctx context.Context, command AuthorityCommand)
 		return AuthorityResult{}, errors.New("nil Raft authority")
 	}
 	if !n.IsLeader() {
-		return AuthorityResult{}, &AuthorityNotLeaderError{Leader: n.Leader()}
+		return AuthorityResult{}, &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	term, err := n.currentTerm()
+	if err != nil {
+		return AuthorityResult{}, err
+	}
+	if command.LeaderTerm != term {
+		return AuthorityResult{}, errors.New("authority command was not issued in the current Raft term")
 	}
 	data, err := json.Marshal(command)
 	if err != nil {
@@ -329,6 +410,55 @@ func (n *AuthorityRaftNode) Apply(ctx context.Context, command AuthorityCommand)
 	return result, nil
 }
 
+// Propose timestamps a mutation on the elected leader. Durations in command
+// payloads are consequently interpreted against one clock before replication.
+func (n *AuthorityRaftNode) Propose(ctx context.Context, requestID string, kind AuthorityCommandKind, payload any) (AuthorityResult, error) {
+	if !n.IsLeader() {
+		return AuthorityResult{}, &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	command, err := NewAuthorityCommand(requestID, time.Now().UTC(), kind, payload)
+	if err != nil {
+		return AuthorityResult{}, err
+	}
+	// Replacing or expiring an incarnation can authorize execution elsewhere.
+	// After leader failover, wait at least the old grant duration so a node
+	// using only its conservative monotonic-local deadline has self-fenced.
+	if kind == AuthorityNodeRegister || kind == AuthorityNodeExpire {
+		state, stateErr := n.AppliedState()
+		if stateErr != nil {
+			return AuthorityResult{}, stateErr
+		}
+		var nodeID, incarnation string
+		var safety time.Duration
+		if kind == AuthorityNodeRegister {
+			decoded, decodeErr := decodeAuthorityPayload[AuthorityNodeRegisterPayload](command)
+			if decodeErr != nil {
+				return AuthorityResult{}, decodeErr
+			}
+			nodeID, incarnation = decoded.Record.NodeID, decoded.Record.Incarnation
+		} else {
+			decoded, decodeErr := decodeAuthorityPayload[AuthorityNodeExpirePayload](command)
+			if decodeErr != nil {
+				return AuthorityResult{}, decodeErr
+			}
+			nodeID, incarnation = decoded.NodeID, decoded.Incarnation
+		}
+		if current, ok := state.Nodes[nodeID]; ok && current.Incarnation != incarnation || kind == AuthorityNodeExpire {
+			if current, ok := state.Nodes[nodeID]; ok {
+				safety = current.LeaseDuration
+			}
+			if safety > 0 && !n.LeadershipSafeFor(safety) {
+				return AuthorityResult{}, errors.New("Raft leader is waiting for prior-term execution leases to self-fence")
+			}
+		}
+	}
+	command.LeaderTerm, err = n.currentTerm()
+	if err != nil {
+		return AuthorityResult{}, err
+	}
+	return n.Apply(ctx, command)
+}
+
 func (n *AuthorityRaftNode) contextTimeout(ctx context.Context) time.Duration {
 	timeout := n.timeout
 	if deadline, ok := ctx.Deadline(); ok {
@@ -346,7 +476,7 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 		return nil, errors.New("nil Raft authority")
 	}
 	if !n.IsLeader() {
-		return nil, &AuthorityNotLeaderError{Leader: n.Leader()}
+		return nil, &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	timeout := n.contextTimeout(ctx)
 	if err := n.raft.VerifyLeader().Error(); err != nil {
@@ -362,7 +492,7 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 // cannot immediately affect quorum.
 func (n *AuthorityRaftNode) AddNonvoter(ctx context.Context, id, address string) error {
 	if !n.IsLeader() {
-		return &AuthorityNotLeaderError{Leader: n.Leader()}
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	if !transactionIDPattern.MatchString(id) {
 		return fmt.Errorf("invalid Raft member ID %q", id)
@@ -376,7 +506,7 @@ func (n *AuthorityRaftNode) AddNonvoter(ctx context.Context, id, address string)
 // Promote promotes a caught-up learner to a voter.
 func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) error {
 	if !n.IsLeader() {
-		return &AuthorityNotLeaderError{Leader: n.Leader()}
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	return n.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
 }
@@ -385,9 +515,70 @@ func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) err
 // before calling this method.
 func (n *AuthorityRaftNode) RemoveMember(ctx context.Context, id string) error {
 	if !n.IsLeader() {
-		return &AuthorityNotLeaderError{Leader: n.Leader()}
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	return n.raft.RemoveServer(raft.ServerID(id), 0, n.contextTimeout(ctx)).Error()
+}
+
+// RetireMember maintains a compact three-voter control plane when possible,
+// transfers leadership away from the retiring node, then removes it. The
+// caller must first commit the node offline and prove that it owns no branch.
+func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
+	if !n.IsLeader() {
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	configuration, err := n.Configuration()
+	if err != nil {
+		return err
+	}
+	var retiring *raft.Server
+	var voters []raft.Server
+	var learners []raft.Server
+	for i := range configuration.Servers {
+		server := configuration.Servers[i]
+		if string(server.ID) == id {
+			copy := server
+			retiring = &copy
+		}
+		if server.Suffrage == raft.Voter {
+			voters = append(voters, server)
+		} else if server.Suffrage == raft.Nonvoter {
+			learners = append(learners, server)
+		}
+	}
+	if retiring == nil {
+		return nil
+	}
+	if retiring.Suffrage == raft.Voter && len(voters) == 1 {
+		return errors.New("refusing to retire the last Raft voter")
+	}
+	if retiring.Suffrage == raft.Voter && len(voters) <= 3 {
+		state, _ := n.AppliedState()
+		for _, learner := range learners {
+			record, ok := state.Nodes[string(learner.ID)]
+			if !ok || !record.LeaseActive(time.Now()) || (record.State != NodeReady && record.State != NodePressured) {
+				continue
+			}
+			if err := n.Promote(ctx, string(learner.ID), string(learner.Address)); err != nil {
+				return fmt.Errorf("promoting replacement voter: %w", err)
+			}
+			voters = append(voters, learner)
+			break
+		}
+	}
+	if id == n.id {
+		for _, voter := range voters {
+			if string(voter.ID) == id {
+				continue
+			}
+			if err := n.raft.LeadershipTransferToServer(voter.ID, voter.Address).Error(); err != nil {
+				return fmt.Errorf("transferring Raft leadership before retirement: %w", err)
+			}
+			break
+		}
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	return n.RemoveMember(ctx, id)
 }
 
 func (n *AuthorityRaftNode) Configuration() (raft.Configuration, error) {

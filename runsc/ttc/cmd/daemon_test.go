@@ -1028,7 +1028,7 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 }
 
 func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
-	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir())
+	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
 	}
@@ -1042,6 +1042,32 @@ func TestClusterPageAddressesRequireEphemeralPorts(t *testing.T) {
 	}
 	if err := requireEphemeralClusterPagePort("--cluster-page-listen", "127.0.0.1:7444"); err == nil || !strings.Contains(err.Error(), "port 0") {
 		t.Fatalf("fixed cluster page port error=%v, want port 0 guidance", err)
+	}
+}
+
+func TestRaftClusterIdentityPreventsSecondBootstrap(t *testing.T) {
+	shared := t.TempDir()
+	localA := filepath.Join(t.TempDir(), "raft")
+	clusterID, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clusterID == "" {
+		t.Fatal("bootstrap produced an empty cluster ID")
+	}
+	// Retrying startup with the same local root is safe even if Raft failed
+	// before creating its WAL.
+	if retry, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a", true, false); err != nil || retry != clusterID {
+		t.Fatalf("same-root bootstrap retry=(%q, %v), want %q", retry, err, clusterID)
+	}
+	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b", true, false); err == nil || !strings.Contains(err.Error(), "second Raft group") {
+		t.Fatalf("second bootstrap error=%v", err)
+	}
+	if joined, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b", false, false); err != nil || joined != clusterID {
+		t.Fatalf("join identity=(%q, %v), want %q", joined, err, clusterID)
+	}
+	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "another-repository", "node-c", false, false); err == nil {
+		t.Fatal("mismatched repository joined Raft cluster")
 	}
 }
 

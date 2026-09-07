@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -314,6 +315,14 @@ func daemonCommandOwner(dataRoot string, args []string) (string, error) {
 }
 
 func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPlacementClaim, error) {
+	placements, placementErr := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
+	if placementErr != nil {
+		return "", nil, placementErr
+	}
+	return daemonCommandPlacementWithCatalog(dataRoot, placements, args)
+}
+
+func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
 	if dataRoot == "" {
 		return "", nil, nil
 	}
@@ -338,9 +347,8 @@ func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPla
 		}
 	}
 	store := ttcbundle.Store{Root: dataRoot}
-	placements, placementErr := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
-	if placementErr != nil {
-		return "", nil, placementErr
+	if placements == nil {
+		return "", nil, errors.New("placement authority is unavailable")
 	}
 	owner := ""
 	var claims []daemonPlacementClaim
@@ -401,12 +409,19 @@ func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPla
 }
 
 func validateDaemonPlacementClaims(dataRoot, localNode string, claims []daemonPlacementClaim) error {
-	if len(claims) == 0 {
-		return nil
-	}
 	placements, err := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
 	if err != nil {
 		return err
+	}
+	return validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode, claims, placements)
+}
+
+func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	if placements == nil {
+		return errors.New("placement authority is unavailable")
 	}
 	for _, claim := range claims {
 		record, err := placements.Lookup(claim.FamilyID, claim.BranchID)
@@ -438,7 +453,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	if err != nil {
 		return err
 	}
-	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
 	}
@@ -460,12 +475,22 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			}
 			record, lookupErr := placements.Lookup(info.ID, branch.ID)
 			if errors.Is(lookupErr, os.ErrNotExist) {
+				// During restart recovery, first adopt all existing placements
+				// while the node is still unschedulable. Previously untracked
+				// local branches are enrolled after the node becomes ready.
+				if current.State == cluster.NodeJoining {
+					continue
+				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
 					FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
 					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
 				}, now)
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
 					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
+				} else if createErr == nil && b.distributedSource.authority != nil {
+					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {
+						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
+					}
 				}
 				continue
 			}
@@ -486,6 +511,11 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if record.State != state {
 				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
 					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
+				}
+			}
+			if b.distributedSource.authority != nil {
+				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {
+					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
 				}
 			}
 		}
@@ -541,7 +571,7 @@ func (s *daemonServer) claimUnplacedRehydrateTargets(backend *runtimeBackend, ar
 	if !node.AcceptsPlacement(time.Now()) {
 		return fmt.Errorf("cluster node %q is not accepting rehydration placement (state=%s)", node.NodeID, node.State)
 	}
-	placements, err := cluster.OpenPlacementStore(filepath.Join(backend.dataRoot, "cluster", "placements"))
+	placements, err := backend.placementCatalog()
 	if err != nil {
 		return err
 	}
@@ -827,7 +857,11 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	defer unlock()
-	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
+	placements, err := backend.placementCatalog()
+	if err != nil && len(request.PlacementClaims) != 0 {
+		return 1, stdout.String(), stderr.String(), err
+	}
+	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.PlacementClaims, placements); err != nil {
 		return 1, stdout.String(), stderr.String(), err
 	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
@@ -938,7 +972,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
-	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
 	}
@@ -1111,9 +1145,14 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		}
 		tx = status
 	}
-	if _, err := placements.CommitMigration(info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch, time.Now()); err != nil {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return abort(errors.New("Raft migration authority is unavailable"))
+	}
+	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch)
+	if err != nil {
 		return abort(fmt.Errorf("publishing migration placement: %w", err))
 	}
+	tx = &cutover.Transaction
 	published = true
 	tx, err = peer.Activate(ctx, requestID, tx.Revision)
 	if err != nil {
@@ -1332,7 +1371,7 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 	if b.dataRoot == "" || b.nodeID == "" {
 		return false
 	}
-	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return false
 	}
@@ -1364,7 +1403,7 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return nil, nil
 	}
-	placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements"))
+	placements, err := b.placementCatalog()
 	if err != nil {
 		return nil, err
 	}
@@ -1372,7 +1411,7 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 	if err != nil {
 		return nil, err
 	}
-	transactions, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return nil, err
 	}
@@ -1557,8 +1596,18 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 				result = errors.Join(result, fmt.Errorf("restored migration target %s has persistent state %q and runtime state %q, want %q: %v", target, state, runtimeState, placement.ResumeState, runtimeErr))
 				continue
 			}
-			if _, err := placements.CommitMigration(placement.FamilyID, placement.BranchID, placement.OperationID,
-				placement.TargetNode, current.Incarnation, info.ID, placement.BranchID, time.Now()); err != nil {
+			if b.distributedSource.authority == nil {
+				result = errors.Join(result, fmt.Errorf("publishing recovered migration target %s: Raft authority is unavailable", target))
+				continue
+			}
+			tx, txErr := b.distributedSource.transactions.Load(placement.OperationID)
+			if txErr != nil {
+				result = errors.Join(result, fmt.Errorf("loading recovered migration transaction %s: %w", target, txErr))
+				continue
+			}
+			if _, err := b.distributedSource.authority.CutoverMigration(placement.OperationID, tx.Revision,
+				placement.FamilyID, placement.BranchID, placement.OperationID, placement.TargetNode,
+				current.Incarnation, info.ID, placement.BranchID); err != nil {
 				result = errors.Join(result, fmt.Errorf("publishing recovered migration target %s: %w", target, err))
 				continue
 			}
@@ -2098,7 +2147,7 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 		}
 		moved = append(moved, item.target)
 	}
-	transactionStore, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	transactionStore, err := b.transactionCatalog()
 	if err != nil {
 		return moved, err
 	}
@@ -2192,7 +2241,267 @@ func readUintFile(path string) (uint64, error) {
 	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }
 
-func maintainElasticNode(directory *cluster.NodeDirectory, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, fatal chan<- error) {
+type elasticFencedProcess struct {
+	PID       int    `json:"pid"`
+	StartTime string `json:"start_time"`
+}
+
+type elasticFenceRecord struct {
+	Version     int                    `json:"version"`
+	NodeID      string                 `json:"node_id"`
+	Incarnation string                 `json:"incarnation"`
+	FencedAt    time.Time              `json:"fenced_at"`
+	Processes   []elasticFencedProcess `json:"processes"`
+}
+
+func elasticFencePath(localRoot string) string {
+	return filepath.Join(localRoot, "cluster", "execution-fence.json")
+}
+
+func processStartTime(pid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return "", err
+	}
+	end := strings.LastIndex(string(data), ") ")
+	if end < 0 {
+		return "", errors.New("malformed process stat")
+	}
+	fields := strings.Fields(string(data)[end+2:])
+	if len(fields) <= 19 {
+		return "", errors.New("process stat omits start time")
+	}
+	return fields[19], nil
+}
+
+// RunLeaseGuardian is the private ttcd child entry point. It intentionally
+// lives outside the daemon process: a SIGKILL, panic, or deadlock in ttcd
+// closes/stalls the heartbeat pipe and the guardian still physically stops
+// every Sentry using this daemon's runtime root.
+func RunLeaseGuardian(args []string, stderr io.Writer) int {
+	if len(args) != 5 {
+		fmt.Fprintln(stderr, "ttcd lease guardian: invalid invocation")
+		return 2
+	}
+	localRoot, runtimeRoot, nodeID, incarnation := args[0], args[1], args[2], args[3]
+	leaseNS, err := strconv.ParseInt(args[4], 10, 64)
+	if err != nil || leaseNS <= 0 || localRoot == "" || runtimeRoot == "" || nodeID == "" || incarnation == "" {
+		fmt.Fprintln(stderr, "ttcd lease guardian: invalid lease configuration")
+		return 2
+	}
+	heartbeats := os.NewFile(3, "ttcd-lease-heartbeats")
+	if heartbeats == nil {
+		fmt.Fprintln(stderr, "ttcd lease guardian: heartbeat pipe is unavailable")
+		return 2
+	}
+	defer heartbeats.Close()
+	events := make(chan bool, 1)
+	go func() {
+		var buffer [1]byte
+		for {
+			if _, err := heartbeats.Read(buffer[:]); err != nil {
+				events <- false
+				return
+			}
+			select {
+			case events <- true:
+			default:
+			}
+		}
+	}()
+	timer := time.NewTimer(time.Duration(leaseNS))
+	defer timer.Stop()
+	for {
+		select {
+		case alive := <-events:
+			if !alive {
+				if err := fenceElasticRuntimeRoot(localRoot, runtimeRoot, nodeID, incarnation); err != nil {
+					fmt.Fprintf(stderr, "ttcd lease guardian: fencing after daemon exit: %v\n", err)
+					return 1
+				}
+				return 0
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Duration(leaseNS))
+		case <-timer.C:
+			if err := fenceElasticRuntimeRoot(localRoot, runtimeRoot, nodeID, incarnation); err != nil {
+				fmt.Fprintf(stderr, "ttcd lease guardian: fencing after heartbeat timeout: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+	}
+}
+
+func startLeaseGuardian(localRoot, runtimeRoot, nodeID, incarnation string, lease time.Duration) (*os.File, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	command := exec.Command(executable, "_lease-guardian", localRoot, runtimeRoot, nodeID, incarnation, strconv.FormatInt(int64(lease), 10))
+	command.ExtraFiles = []*os.File{reader}
+	command.Stdin, command.Stdout, command.Stderr = nil, nil, os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		reader.Close()
+		writer.Close()
+		return nil, err
+	}
+	reader.Close()
+	_ = command.Process.Release()
+	if _, err := writer.Write([]byte{1}); err != nil {
+		writer.Close()
+		return nil, err
+	}
+	return writer, nil
+}
+
+func sentryProcessesForRuntimeRoot(runtimeRoot string) ([]elasticFencedProcess, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	rootArgument := "--root=" + runtimeRoot
+	var processes []elasticFencedProcess
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		arguments := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+		if len(arguments) == 0 || !strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[") {
+			continue
+		}
+		matchesRoot := false
+		for _, argument := range arguments[1:] {
+			if argument == rootArgument {
+				matchesRoot = true
+				break
+			}
+		}
+		if !matchesRoot {
+			continue
+		}
+		start, err := processStartTime(pid)
+		if err == nil {
+			processes = append(processes, elasticFencedProcess{PID: pid, StartTime: start})
+		}
+	}
+	return processes, nil
+}
+
+func fenceElasticRuntimeRoot(localRoot, runtimeRoot, nodeID, incarnation string) error {
+	processes, err := sentryProcessesForRuntimeRoot(runtimeRoot)
+	if err != nil {
+		return err
+	}
+	if len(processes) == 0 {
+		return nil
+	}
+	record := elasticFenceRecord{Version: 1, NodeID: nodeID, Incarnation: incarnation, FencedAt: time.Now().UTC(), Processes: processes}
+	path := elasticFencePath(localRoot)
+	var result error
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		result = errors.Join(result, err)
+	} else if err := writeDurableJSON(path, record); err != nil {
+		result = errors.Join(result, fmt.Errorf("recording execution fence: %w", err))
+	}
+	for _, process := range processes {
+		if err := syscall.Kill(process.PID, syscall.SIGSTOP); err != nil && !errors.Is(err, syscall.ESRCH) {
+			killErr := syscall.Kill(process.PID, syscall.SIGKILL)
+			result = errors.Join(result, fmt.Errorf("stopping Sentry PID %d: %w (kill fallback: %v)", process.PID, err, killErr))
+		}
+	}
+	return result
+}
+
+// fenceElasticRuntimes uses SIGSTOP as the final physical lease fence. Unlike
+// a logical branch pause, this freezes every branch and every in-flight Sentry
+// operation in one host-kernel action. The durable PID/start-time record lets
+// a later daemon resume only the exact processes it has re-authorized.
+func fenceElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) error {
+	families, err := backend.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	record := elasticFenceRecord{Version: 1, NodeID: nodeID, Incarnation: incarnation, FencedAt: time.Now().UTC()}
+	for _, family := range families {
+		if family.SandboxPID <= 0 {
+			continue
+		}
+		start, err := processStartTime(family.SandboxPID)
+		if err != nil {
+			continue
+		}
+		record.Processes = append(record.Processes, elasticFencedProcess{PID: family.SandboxPID, StartTime: start})
+	}
+	path := elasticFencePath(backend.activeDataRoot())
+	var result error
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		result = errors.Join(result, err)
+	} else if err := writeDurableJSON(path, record); err != nil {
+		// Failure to record resumable identity must not prevent the physical
+		// fence. These Sentries will stay stopped (or be killed) for manual
+		// recovery rather than execute outside their lease.
+		result = errors.Join(result, fmt.Errorf("recording execution fence: %w", err))
+	}
+	for _, process := range record.Processes {
+		if err := syscall.Kill(process.PID, syscall.SIGSTOP); err != nil && !errors.Is(err, syscall.ESRCH) {
+			// Failure to stop before lease expiry must fail closed.
+			killErr := syscall.Kill(process.PID, syscall.SIGKILL)
+			result = errors.Join(result, fmt.Errorf("stopping Sentry PID %d: %w (kill fallback: %v)", process.PID, err, killErr))
+		}
+	}
+	return result
+}
+
+func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID string) error {
+	path := elasticFencePath(backend.activeDataRoot())
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var record elasticFenceRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.Version != 1 || record.NodeID != nodeID {
+		return fmt.Errorf("invalid local execution fence for node %q", nodeID)
+	}
+	var result error
+	for _, process := range record.Processes {
+		start, err := processStartTime(process.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || start != process.StartTime {
+			result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d identity changed", process.PID))
+			continue
+		}
+		if err := syscall.Kill(process.PID, syscall.SIGCONT); err != nil && !errors.Is(err, syscall.ESRCH) {
+			result = errors.Join(result, err)
+		}
+	}
+	if result != nil {
+		return result
+	}
+	return os.Remove(path)
+}
+
+func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func() error, fence func() error, fatal chan<- error) {
 	interval := lease / 3
 	if interval < 250*time.Millisecond {
 		interval = 250 * time.Millisecond
@@ -2200,29 +2509,85 @@ func maintainElasticNode(directory *cluster.NodeDirectory, initial cluster.NodeR
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	record := initial
-	lastExpiry := initial.LeaseExpiresAt
+	// This is deliberately monotonic-local, not the leader's absolute wall
+	// clock deadline. Starting it before each renewal request makes network RTT
+	// conservative and avoids assuming synchronized clocks for physical fencing.
+	localDeadline := time.Now().Add(lease)
 	for {
 		select {
 		case <-done:
 			return
 		case now := <-ticker.C:
+			renewalStarted := time.Now()
 			current, err := currentNodeMemoryBytes()
 			if err == nil {
 				record, err = heartbeatElasticNode(directory, record, current, now, lease)
+				if err == nil && renewed != nil {
+					err = renewed()
+				}
 				if err == nil {
-					lastExpiry = record.LeaseExpiresAt
+					localDeadline = renewalStarted.Add(lease)
 					continue
 				}
 			}
 			if stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: elastic cluster heartbeat failed: %v\n", err)
 			}
-			if !now.Before(lastExpiry) {
+			margin := lease / 3
+			if margin < 500*time.Millisecond {
+				margin = 500 * time.Millisecond
+			}
+			if !time.Now().Before(localDeadline.Add(-margin)) {
+				fenceErr := error(nil)
+				if fence != nil {
+					fenceErr = fence()
+				}
 				select {
-				case fatal <- fmt.Errorf("elastic cluster lease expired after heartbeat failure: %w", err):
+				case fatal <- fmt.Errorf("elastic cluster lease self-fenced before expiry after heartbeat failure: %w", errors.Join(err, fenceErr)):
 				default:
 				}
 				return
+			}
+		}
+	}
+}
+
+// maintainAuthorityExpirations is leader-only failure reconciliation. The
+// resulting Raft command atomically revokes the expired incarnation, its
+// placements, and every branch with an irreplaceable dependency on it.
+func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cluster.RaftCatalog, lease time.Duration, stderr io.Writer, done <-chan struct{}) {
+	if node == nil || authority == nil {
+		return
+	}
+	interval := lease / 4
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		if !node.LeadershipSafeFor(lease) {
+			continue
+		}
+		records, err := authority.List()
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: listing execution leases for expiry: %v\n", err)
+			}
+			continue
+		}
+		now := time.Now()
+		for _, record := range records {
+			if record.State == cluster.NodeOffline || record.LeaseActive(now) {
+				continue
+			}
+			if _, err := authority.ExpireNode(record.NodeID, record.Incarnation, record.Revision); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: expiring node %s/%s: %v\n", record.NodeID, record.Incarnation, err)
 			}
 		}
 	}
@@ -2368,7 +2733,7 @@ func maintainElasticMigrationRecovery(backend *runtimeBackend, lease time.Durati
 	}
 }
 
-func heartbeatElasticNode(directory *cluster.NodeDirectory, record cluster.NodeRecord, current uint64, now time.Time, lease time.Duration) (cluster.NodeRecord, error) {
+func heartbeatElasticNode(directory cluster.NodeCatalog, record cluster.NodeRecord, current uint64, now time.Time, lease time.Duration) (cluster.NodeRecord, error) {
 	updated, err := directory.Heartbeat(record.NodeID, record.Incarnation, current, now, lease)
 	if err != nil {
 		return cluster.NodeRecord{}, err

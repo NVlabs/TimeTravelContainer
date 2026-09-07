@@ -35,6 +35,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 const (
@@ -288,17 +290,252 @@ type TargetRuntime interface {
 	MarkIndependent(context.Context, *Transaction) error
 }
 
+// PublishedTargetIdentity reports the immutable physical identity created by
+// a target runtime. Logical target names are insufficient because TTC assigns
+// a random family ID when a remote fork creates a new family.
+type PublishedTargetIdentity interface {
+	PublishedTarget(*Transaction) (family, branch, physicalContainer, physicalBranch, incarnation string, err error)
+}
+
 type controlError struct {
-	Error string `json:"error"`
+	Error            string `json:"error"`
+	LeaderID         string `json:"leader_id,omitempty"`
+	LeaderAddress    string `json:"leader_address,omitempty"`
+	LeaderControlURL string `json:"leader_control_url,omitempty"`
+	LeaderServerName string `json:"leader_server_name,omitempty"`
+}
+
+const (
+	controlAuthorityProposePath = "/v1/authority/propose"
+	controlAuthorityStatePath   = "/v1/authority/state"
+	controlAuthorityJoinPath    = "/v1/authority/join"
+	controlAuthorityRetirePath  = "/v1/authority/retire"
+)
+
+// AuthorityProposal deliberately omits a timestamp. The elected leader adds
+// its time immediately before appending the command.
+type AuthorityProposal struct {
+	RequestID string               `json:"request_id"`
+	Kind      AuthorityCommandKind `json:"kind"`
+	Payload   json.RawMessage      `json:"payload"`
+}
+
+// AuthorityJoinRequest adds an already-listening learner to the one cluster
+// Raft group. Node registration follows through the ordinary state machine.
+type AuthorityJoinRequest struct {
+	NodeID       string       `json:"node_id"`
+	RaftAddress  string       `json:"raft_address"`
+	ClusterID    string       `json:"cluster_id"`
+	Capabilities Capabilities `json:"capabilities"`
+}
+
+type AuthorityRetireRequest struct {
+	NodeID      string `json:"node_id"`
+	Incarnation string `json:"incarnation"`
+}
+
+// AuthorityService exposes leader proposals and membership changes over the
+// existing mutually authenticated cluster HTTP endpoint.
+type AuthorityService struct {
+	Node         *AuthorityRaftNode
+	Capabilities Capabilities
+	// MaxVoters bounds quorum size. Additional elastic compute nodes remain
+	// non-voting replicas, so adding hundreds of workers does not make every
+	// control-plane commit wait for or depend on all of them.
+	MaxVoters int
+	ClusterID string
+}
+
+func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, peer string) {
+	if a == nil || a.Node == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "Raft authority is unavailable")
+		return
+	}
+	notLeader := func(err error) bool {
+		var redirect *AuthorityNotLeaderError
+		if !errors.As(err, &redirect) {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		response := controlError{Error: err.Error(), LeaderID: a.Node.LeaderID(), LeaderAddress: a.Node.Leader()}
+		// A Raft transport address is not an HTTP endpoint. Include the
+		// leader's committed control endpoint so joining through any seed also
+		// works when that seed is a follower.
+		if state, stateErr := a.Node.AppliedState(); stateErr == nil {
+			if leader, ok := state.Nodes[response.LeaderID]; ok {
+				response.LeaderControlURL = leader.ControlURL
+				response.LeaderServerName = leader.ControlServerName
+			}
+		}
+		_ = json.NewEncoder(w).Encode(response)
+		return true
+	}
+	switch r.URL.Path {
+	case controlAuthorityProposePath:
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority proposal requires POST")
+			return
+		}
+		var proposal AuthorityProposal
+		if err := decodeControlJSON(r.Body, &proposal); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !transactionIDPattern.MatchString(proposal.RequestID) || len(proposal.Payload) > maxControlBody {
+			writeControlError(w, http.StatusBadRequest, "invalid authority proposal")
+			return
+		}
+		var payload any = json.RawMessage(proposal.Payload)
+		result, err := a.Node.Propose(r.Context(), proposal.RequestID, proposal.Kind, payload)
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, result)
+	case controlAuthorityStatePath:
+		if r.Method != http.MethodGet {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority state requires GET")
+			return
+		}
+		state, err := a.Node.LinearizableState(r.Context())
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, state)
+	case controlAuthorityJoinPath:
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority join requires POST")
+			return
+		}
+		var request AuthorityJoinRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if request.NodeID != peer || request.Capabilities.NodeID != request.NodeID {
+			writeControlError(w, http.StatusForbidden, "joining node ID does not match its client certificate")
+			return
+		}
+		if request.ClusterID == "" || request.ClusterID != a.ClusterID {
+			writeControlError(w, http.StatusConflict, "joining node belongs to another Raft cluster")
+			return
+		}
+		if _, err := Negotiate(a.Capabilities, request.Capabilities); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if err := a.Node.AddNonvoter(r.Context(), request.NodeID, request.RaftAddress); err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		configuration, err := a.Node.Configuration()
+		if err != nil {
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		maxVoters := a.MaxVoters
+		if maxVoters <= 0 {
+			maxVoters = 3
+		}
+		voters := 0
+		for _, server := range configuration.Servers {
+			if server.Suffrage == raft.Voter {
+				voters++
+			}
+		}
+		if voters < maxVoters {
+			if err := a.Node.Promote(r.Context(), request.NodeID, request.RaftAddress); err != nil {
+				if notLeader(err) {
+					return
+				}
+				writeControlError(w, http.StatusConflict, err.Error())
+				return
+			}
+		}
+		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID, "raft_address": request.RaftAddress})
+	case controlAuthorityRetirePath:
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority retirement requires POST")
+			return
+		}
+		var request AuthorityRetireRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if request.NodeID != peer {
+			writeControlError(w, http.StatusForbidden, "only a node may retire its own Raft member")
+			return
+		}
+		state, err := a.Node.LinearizableState(r.Context())
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		node, ok := state.Nodes[request.NodeID]
+		if !ok || node.Incarnation != request.Incarnation || node.State != NodeOffline {
+			writeControlError(w, http.StatusConflict, "node must commit its exact incarnation offline before Raft retirement")
+			return
+		}
+		for _, placement := range state.Placements {
+			if placement.OwnerNode == request.NodeID {
+				writeControlError(w, http.StatusConflict, "node still owns branch placements")
+				return
+			}
+		}
+		for _, tx := range state.Transactions {
+			if tx.Terminal() {
+				continue
+			}
+			if (tx.Identity.SourceNodeID == request.NodeID && tx.SourceIncarnation == request.Incarnation && tx.SourceNeeded) ||
+				(tx.Identity.TargetNodeID == request.NodeID && tx.TargetIncarnation == request.Incarnation) {
+				writeControlError(w, http.StatusConflict, "node still participates in a nonterminal distributed transaction")
+				return
+			}
+		}
+		for _, other := range state.Nodes {
+			for _, reservation := range other.IncomingReservations {
+				if reservation.SourceNode == request.NodeID {
+					writeControlError(w, http.StatusConflict, "node still owns an incoming-capacity reservation")
+					return
+				}
+			}
+		}
+		if err := a.Node.RetireMember(r.Context(), request.NodeID); err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID})
+	default:
+		writeControlError(w, http.StatusNotFound, "unknown Raft authority endpoint")
+	}
 }
 
 // ControlPlane is the mutually authenticated target-side HTTP handler.
 type ControlPlane struct {
 	Capabilities    Capabilities
-	Store           *Store
+	Store           TransactionCatalog
 	MaxTransactions int
 	Now             func() time.Time
 	TargetRuntime   TargetRuntime
+	Authority       *AuthorityService
 	// CommandProxy forwards the TTC daemon wire protocol after mTLS peer
 	// authentication. It is optional for non-elastic deployments.
 	CommandProxy  http.Handler
@@ -331,6 +568,14 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.CommandProxy.ServeHTTP(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
+		if c.Authority == nil {
+			writeControlError(w, http.StatusNotImplemented, "Raft authority is unavailable")
+			return
+		}
+		c.Authority.serveHTTP(w, r, peer)
 		return
 	}
 	if r.URL.Path == controlReservePath {
@@ -580,7 +825,25 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
-	tx, err = c.Store.Publish(id, tx.Revision, request.Paused, !tx.Identity.Migration, c.Now())
+	if !tx.Identity.Migration {
+		if publisher, ok := c.Store.(AtomicTargetPublisher); ok {
+			identity, ok := c.TargetRuntime.(PublishedTargetIdentity)
+			if !ok {
+				writeControlError(w, http.StatusInternalServerError, "target runtime cannot report its published identity")
+				return
+			}
+			family, branch, physicalContainer, physicalBranch, incarnation, identityErr := identity.PublishedTarget(tx)
+			if identityErr != nil {
+				writeControlError(w, http.StatusInternalServerError, identityErr.Error())
+				return
+			}
+			tx, err = publisher.PublishTarget(id, tx.Revision, request.Paused, family, branch, physicalContainer, physicalBranch, incarnation)
+		} else {
+			tx, err = c.Store.Publish(id, tx.Revision, request.Paused, true, c.Now())
+		}
+	} else {
+		tx, err = c.Store.Publish(id, tx.Revision, request.Paused, false, c.Now())
+	}
 	if err != nil {
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -611,6 +874,10 @@ func (c *ControlPlane) activate(w http.ResponseWriter, r *http.Request, id, peer
 	}
 	if tx.Activated {
 		writeControlJSON(w, http.StatusOK, tx)
+		return
+	}
+	if _, raftAuthority := c.Store.(AtomicTargetPublisher); raftAuthority && tx.Identity.Migration && !tx.OwnershipCommitted {
+		writeControlError(w, http.StatusConflict, "migration placement ownership has not committed")
 		return
 	}
 	if tx.State != TransactionPublished || tx.Revision != request.Revision || !tx.Identity.Migration {
@@ -907,6 +1174,37 @@ func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Wri
 	return err
 }
 
+// ProposeAuthority forwards a deterministic mutation envelope to the current
+// cluster leader. The leader supplies the command timestamp.
+func (c *Client) ProposeAuthority(ctx context.Context, proposal AuthorityProposal) (AuthorityResult, error) {
+	var result AuthorityResult
+	if err := c.call(ctx, http.MethodPost, controlAuthorityProposePath, proposal, &result); err != nil {
+		return AuthorityResult{}, err
+	}
+	return result, nil
+}
+
+// AuthorityState returns a linearizable cluster control snapshot.
+func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
+	var state AuthorityState
+	if err := c.call(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// JoinAuthority admits this client's authenticated node as a learner and then
+// promotes it after catch-up.
+func (c *Client) JoinAuthority(ctx context.Context, request AuthorityJoinRequest) error {
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlAuthorityJoinPath, request, &response)
+}
+
+func (c *Client) RetireAuthority(ctx context.Context, request AuthorityRetireRequest) error {
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlAuthorityRetirePath, request, &response)
+}
+
 // Reserve negotiates and reserves an unpublished target transaction.
 func (c *Client) Reserve(ctx context.Context, request ReserveRequest) (*Transaction, error) {
 	var tx Transaction
@@ -1056,6 +1354,12 @@ func (c *Client) call(ctx context.Context, method, path string, request, respons
 		var remote controlError
 		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {
 			return fmt.Errorf("cluster peer returned HTTP %s", resp.Status)
+		}
+		if remote.LeaderID != "" || remote.LeaderAddress != "" {
+			return &AuthorityNotLeaderError{
+				LeaderID: remote.LeaderID, Leader: remote.LeaderAddress,
+				LeaderControlURL: remote.LeaderControlURL, LeaderServerName: remote.LeaderServerName,
+			}
 		}
 		return fmt.Errorf("cluster peer: %s", remote.Error)
 	}

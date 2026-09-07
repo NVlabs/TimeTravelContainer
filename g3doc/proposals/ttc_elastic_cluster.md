@@ -1,9 +1,10 @@
 # Elastic TimeTravelContainer clusters
 
-Status: phases 1 through 4 are implemented. Identity-preserving migration uses
-live sparse memory transfer, and placement uses a cluster-global hypergraph
-with event-local movable vertices and fixed node terminals. Phase 5
-physical-host and failure-injection qualification remains in progress.
+Status: the cluster authority has moved to one persistent cluster-wide Raft
+group. Identity-preserving migration uses live sparse memory transfer, and
+placement uses a cluster-global hypergraph with event-local movable vertices
+and fixed node terminals. Stressed physical-host and failure-injection
+qualification remains in progress.
 
 This document specifies an elastic TTC cluster in which compute nodes may join
 and leave without restarting existing daemons. A client connected to any
@@ -25,8 +26,9 @@ one shared `TTC_ROOT`, a common architecture and base-page size, exact daemon
 build compatibility, and reliable host networking. Every node also configures
 a distinct, node-local `TTC_LOCAL_ROOT`. Active filesystems, runtime state,
 mutable metadata, staging data, and caches stay local; immutable image content,
-committed cold manifests and packs, and the cluster catalog live in the shared
-repository. The daemon socket is selected independently with `TTC_SOCKET` (or
+committed cold manifests and packs live in the shared repository. The Raft WAL,
+snapshots, active catalog view, and all hot journals are node-local; the shared
+filesystem is not the coordination database. The daemon socket is selected independently with `TTC_SOCKET` (or
 the normal per-user runtime default).
 
 Unexpected node loss is distinct from graceful elasticity. A clean drain is
@@ -65,15 +67,13 @@ and reserved memory, labels, and lease timestamps. `Incarnation` changes on
 every daemon start and prevents an old daemon from renewing or deleting a
 newer process's lease.
 
-The first implementation stores node records atomically under
-`cluster/nodes/` in the shared root and locks each node record while changing
-it. Branch ownership uses a separate CAS-shaped `PlacementCatalog`. Its shared
-filesystem backend locks reads as well as writes, takes an exclusive catalog
-lock for a linearizable `List` snapshot, and uses a bounded set of record-lock
-shards so deleted branch names do not accumulate lock files. This backend
-requires coherent POSIX advisory locking from the shared filesystem (as in the
-qualified NFS setup). A consensus-backed service can replace it through the
-same interface when the storage environment cannot provide that guarantee.
+One cluster-wide Raft state machine owns node records, branch placement,
+capacity reservations, fork/migration transactions, publication generations,
+corruption decisions, and committed memory/filesystem root IDs. There is no
+per-family consensus group and no shared-filesystem locking authority. The
+first three admitted members vote; later elastic workers are learners unless a
+membership rebalance promotes one. Bulk pages, chunks, extents, and packs never
+enter the Raft log.
 
 A branch placement record identifies the family, branch, owner node and
 incarnation, monotonically increasing ownership generation, lifecycle state,
@@ -81,16 +81,13 @@ filesystem lease, and active operation ID. Dehydrated and exited branches are
 unplaced. Rehydration chooses a compatible node and acquires a new placement
 generation. Running and paused branches have exactly one owner.
 
-Interrupted migration recovery uses three durable facts: the placement record
-is the fenced transaction intent, the branch's persistent node ID says whether
-ownership cutover happened, and the branch lifecycle says whether runtime
-restoration is required. Before ownership cutover, recovery never touches an
-operation while its exact source incarnation retains a live lease; after lease
-loss, source-owned transactions restore and atomically roll back to the
-source's new incarnation. Once ownership has moved, it is never rolled back:
-the target may restore and commit immediately, even if the source remains
-online after losing a response. Restoration is verified in the Sentry before a
-stable placement is published.
+Interrupted migration recovery uses the transaction and placement from one
+Raft revision. Before cutover, the source placement remains authoritative and
+the hidden target cannot execute. Cutover validates the published paused target
+and changes both the transaction's ownership marker and placement generation
+in one log entry. Once ownership has moved, it is never rolled back: only the
+target can activate and roll forward. Shared container metadata is a
+materialized data-plane cache, not an ownership fact.
 
 ```text
 joining -> ready -> pressured -> ready
@@ -99,9 +96,11 @@ joining -----------------------> offline
 ```
 
 A draining node refuses new runs, forks, rehydrations, and incoming
-migrations. Lease expiry marks a node unavailable but does not prove guest
-execution stopped; ownership must pair lease loss with a local watchdog and
-fencing action.
+migrations. A node that cannot renew uses a conservative monotonic-local
+deadline, closes ingress, durably records the fence, and sends `SIGSTOP` to
+each Sentry before its lease may expire. Restart adopts placements through
+linearizable Raft CASes before sending `SIGCONT`; a failed stop falls back to
+`SIGKILL`. Thus logical lease loss is paired with a host-kernel execution fence.
 
 ## Unified client view and routing
 

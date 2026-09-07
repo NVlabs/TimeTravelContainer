@@ -51,6 +51,16 @@ func testAuthorityNode(at time.Time) NodeRecord {
 	}
 }
 
+func registerReadyAuthorityNode(t *testing.T, state *AuthorityState, id, incarnation string, at time.Time) {
+	t.Helper()
+	node := testAuthorityNode(at)
+	node.NodeID, node.Incarnation, node.Capabilities.NodeID = id, incarnation, id
+	registered := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "register-"+id, at, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: node, LeaseDuration: time.Hour}))
+	applyAuthorityForTest(t, state, "ready-"+id, at.Add(time.Millisecond), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: registered.NodeID, Incarnation: registered.Incarnation, State: NodeReady, LeaseDuration: time.Hour,
+	})
+}
+
 func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 	at := time.Unix(1000, 0).UTC()
 	state := NewAuthorityState()
@@ -81,6 +91,8 @@ func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	at := time.Unix(2000, 0).UTC()
 	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
@@ -88,11 +100,22 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	begin := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "begin", at.Add(time.Second), AuthorityPlacementBegin, AuthorityPlacementPayload{
 		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: created.Generation, Operation: "migration-1", Target: "node-b",
 	}))
-	committed := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "commit", at.Add(2*time.Second), AuthorityPlacementCommit, AuthorityPlacementPayload{
-		Family: "family", Branch: "main", Operation: "migration-1", Target: "node-b", TargetIncarnation: "incarnation-b", PhysicalContainer: "family", PhysicalBranch: "main",
+	state.Transactions["migration-1"] = Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "migration-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			TargetBranch: "physical-main", TargetVisibleBranch: "main", Migration: true,
+		},
+		State: TransactionPublished, Revision: 6,
+	}
+	cutover := decodeAuthorityResultForTest[MigrationCutoverResult](t, applyAuthorityForTest(t, state, "cutover", at.Add(2*time.Second), AuthorityMigrationCutover, AuthorityMigrationCutoverPayload{
+		TransactionID: "migration-1", TransactionRevision: 6,
+		Family: "family", Branch: "main", Operation: "migration-1", Target: "node-b",
+		TargetIncarnation: "incarnation-b", PhysicalContainer: "family", PhysicalBranch: "main",
 	}))
+	committed := cutover.Placement
 	if committed.OwnerNode != "node-b" || committed.Generation != begin.Generation+1 || committed.State != PlacementRunning {
-		t.Fatalf("bad migration cutover: %+v", committed)
+		t.Fatalf("bad atomic migration cutover: %+v", cutover)
 	}
 	stale, _ := NewAuthorityCommand("stale-state", at.Add(3*time.Second), AuthorityPlacementStableState, AuthorityPlacementPayload{
 		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: begin.Generation, State: PlacementPaused,
@@ -109,12 +132,13 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
 	}}))
 	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1,
+		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation, StorageGeneration: 1,
 	}))
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
@@ -135,9 +159,121 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 	}
 }
 
+func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
+	at := time.Unix(3500, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at)
+	state.Transactions["fork-1"] = Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "source", SourceBranch: "main", TargetContainer: "friendly-name",
+			TargetBranch: "hidden-fork", TargetVisibleBranch: "child",
+		},
+		State: TransactionTargetPaused, Revision: 5,
+	}
+	result := decodeAuthorityResultForTest[ForkPublishResult](t, applyAuthorityForTest(t, state, "publish-fork", at.Add(2*time.Second), AuthorityForkPublish, AuthorityForkPublishPayload{
+		TransactionID: "fork-1", TransactionRevision: 5, DesiredPaused: false,
+		Family: "physical-family", Branch: "child", PhysicalContainer: "physical-family", PhysicalBranch: "child",
+		TargetIncarnation: "incarnation-b",
+	}))
+	if result.Transaction.State != TransactionPublished || !result.Transaction.Activated || result.Placement.OwnerNode != "node-b" || result.Placement.State != PlacementRunning {
+		t.Fatalf("bad atomic fork publication: %+v", result)
+	}
+	if state.Revision != 3 { // register, ready, publish
+		t.Fatalf("fork publication did not consume one authority revision: state=%d", state.Revision)
+	}
+}
+
+func TestAuthorityExpiryCorruptsExactDependencyClosure(t *testing.T) {
+	at := time.Unix(3700, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at)
+	state.Transactions["fork-1"] = Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "source", SourceBranch: "main", TargetContainer: "target",
+			TargetBranch: "hidden", TargetVisibleBranch: "main",
+		},
+		SourceIncarnation: "incarnation-a", TargetIncarnation: "incarnation-b",
+		SourceNeeded: true, State: TransactionTargetPaused, Revision: 5,
+	}
+	applyAuthorityForTest(t, state, "publish-fork", at.Add(2*time.Second), AuthorityForkPublish, AuthorityForkPublishPayload{
+		TransactionID: "fork-1", TransactionRevision: 5,
+		Family: "target", Branch: "main", PhysicalContainer: "target", PhysicalBranch: "main",
+		TargetIncarnation: "incarnation-b",
+	})
+	childPlacement := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place-child", at.Add(3*time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "target", BranchID: "child", PhysicalContainer: "target", PhysicalBranch: "child",
+		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", State: PlacementRunning,
+	}}))
+	applyAuthorityForTest(t, state, "inherit-child", at.Add(4*time.Second), AuthorityBranchInherit, AuthorityBranchInheritPayload{
+		Family: "target", Branch: "child", SourceBranch: "main", BranchGeneration: childPlacement.Generation,
+	})
+	independentPlacement := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place-independent", at.Add(5*time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "other", BranchID: "main", PhysicalContainer: "other", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", State: PlacementRunning,
+	}}))
+	applyAuthorityForTest(t, state, "inherit-independent", at.Add(6*time.Second), AuthorityBranchInherit, AuthorityBranchInheritPayload{
+		Family: "other", Branch: "main", BranchGeneration: independentPlacement.Generation,
+	})
+
+	source := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "expire-source", source.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+		NodeID: source.NodeID, Incarnation: source.Incarnation, Revision: source.Revision,
+	})
+	for _, key := range []string{logicalBranchKey("target", "main"), logicalBranchKey("target", "child")} {
+		if branch := state.Branches[key]; !branch.Corrupted {
+			t.Fatalf("dependent branch %q survived source expiry: %+v", key, branch)
+		}
+	}
+	if branch := state.Branches[logicalBranchKey("other", "main")]; branch.Corrupted {
+		t.Fatalf("independent branch was corrupted: %+v", branch)
+	}
+	if tx := state.Transactions["fork-1"]; tx.State != TransactionFailed || tx.SourceNeeded {
+		t.Fatalf("source-lost transaction remains usable: %+v", tx)
+	}
+}
+
+func TestAuthorityIndependenceDropsDependencyBeforeExpiry(t *testing.T) {
+	at := time.Unix(3800, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at)
+	state.Transactions["fork-1"] = Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "source", SourceBranch: "main", TargetContainer: "target",
+			TargetBranch: "hidden", TargetVisibleBranch: "main",
+		},
+		SourceIncarnation: "incarnation-a", TargetIncarnation: "incarnation-b",
+		SourceNeeded: true, State: TransactionTargetPaused, Revision: 5,
+	}
+	published := decodeAuthorityResultForTest[ForkPublishResult](t, applyAuthorityForTest(t, state, "publish-fork", at.Add(2*time.Second), AuthorityForkPublish, AuthorityForkPublishPayload{
+		TransactionID: "fork-1", TransactionRevision: 5,
+		Family: "target", Branch: "main", PhysicalContainer: "target", PhysicalBranch: "main",
+		TargetIncarnation: "incarnation-b",
+	}))
+	applyAuthorityForTest(t, state, "independent", at.Add(3*time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
+		ID: "fork-1", Revision: published.Transaction.Revision, Next: TransactionIndependent,
+		Metrics: &TransferMetrics{PagesTotal: 1, PagesReleased: 1},
+	})
+	if dependencies := state.Branches[logicalBranchKey("target", "main")].VolatileDependencies; len(dependencies) != 0 {
+		t.Fatalf("independent branch retains dependencies: %+v", dependencies)
+	}
+	source := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "expire-source", source.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+		NodeID: source.NodeID, Incarnation: source.Incarnation, Revision: source.Revision,
+	})
+	if branch := state.Branches[logicalBranchKey("target", "main")]; branch.Corrupted {
+		t.Fatalf("independent branch was corrupted: %+v", branch)
+	}
+}
+
 func TestAuthoritySnapshotRoundTrip(t *testing.T) {
 	at := time.Unix(4000, 0).UTC()
 	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,

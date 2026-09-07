@@ -35,6 +35,29 @@ type Store struct {
 	mu  sync.Mutex
 }
 
+// TransactionCatalog is the linearizable distributed-operation authority.
+// Store is the previous local/shared-file implementation; cluster mode uses
+// the Raft implementation through this interface.
+type TransactionCatalog interface {
+	Create(*Transaction) error
+	Load(id string) (*Transaction, error)
+	Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error)
+	AdvanceIndependent(id string, revision uint64, metrics TransferMetrics, now time.Time) (*Transaction, error)
+	Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error)
+	MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error)
+	BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error)
+	BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error)
+	List() ([]Transaction, error)
+}
+
+// AtomicTargetPublisher is implemented by the cluster Raft catalog. It binds
+// a published remote-fork transaction to its first placement in one revision.
+type AtomicTargetPublisher interface {
+	PublishTarget(id string, revision uint64, desiredPaused bool, family, branch, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error)
+}
+
+var _ TransactionCatalog = (*Store)(nil)
+
 // OpenStore opens or creates a private transaction directory.
 func OpenStore(dir string) (*Store, error) {
 	if dir == "" {

@@ -256,6 +256,8 @@ Commands:
 		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
 		       [--cluster-memory-target SIZE --cluster-auto-rebalance]
 		       [--cluster-capacity-command PATH | --cluster-capacity-webhook URL]
+		       [--cluster-raft-listen ADDR --cluster-raft-advertise HOST:PORT,SERVER_NAME]
+		       [--cluster-raft-bootstrap | --cluster-peer NODE=https://HOST:PORT,SERVER_NAME]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -8137,7 +8139,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
 	if transactionID := containerInfo.DistributedForkTransactionID; transactionID != "" {
-		if store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions")); err == nil {
+		if store, err := b.transactionCatalog(); err == nil {
 			if transaction, err := store.Load(transactionID); err == nil {
 				result.TTC.DistributedFork = transaction
 			}
@@ -9122,7 +9124,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	// source for older/cold branches, but must not expose a half-published target
 	// during ownership cutover.
 	if b.nodeID != "" {
-		if placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements")); err == nil {
+		if placements, err := b.placementCatalog(); err == nil {
 			if records, err := placements.List(); err == nil {
 				for _, record := range records {
 					family, ok := byID[record.FamilyID]
@@ -10606,7 +10608,7 @@ func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.Con
 	if transactionID == "" || b.dataRoot == "" {
 		return nil
 	}
-	store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	store, err := b.transactionCatalog()
 	if err != nil {
 		return err
 	}

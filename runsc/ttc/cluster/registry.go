@@ -59,6 +59,7 @@ type NodeRecord struct {
 	State                 NodeState                      `json:"state"`
 	ControlURL            string                         `json:"control_url"`
 	ControlServerName     string                         `json:"control_server_name"`
+	RaftAddress           string                         `json:"raft_address,omitempty"`
 	Capabilities          Capabilities                   `json:"capabilities"`
 	MemoryTargetBytes     uint64                         `json:"memory_target_bytes,omitempty"`
 	MemoryCurrentBytes    uint64                         `json:"memory_current_bytes,omitempty"`
@@ -69,6 +70,10 @@ type NodeRecord struct {
 	StartedAt             time.Time                      `json:"started_at"`
 	UpdatedAt             time.Time                      `json:"updated_at"`
 	LeaseExpiresAt        time.Time                      `json:"lease_expires_at"`
+	LeaseDuration         time.Duration                  `json:"lease_duration,omitempty"`
+	// LeaseTerm proves that this incarnation renewed with the current Raft
+	// leader. A prior-term wall-clock deadline alone never authorizes work.
+	LeaseTerm uint64 `json:"lease_term,omitempty"`
 }
 
 // IncomingReservation fences capacity promised to one placement operation.
@@ -125,7 +130,12 @@ func (r NodeRecord) Validate() error {
 	if strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName {
 		return fmt.Errorf("invalid control TLS server name %q", r.ControlServerName)
 	}
-	if r.Revision == 0 || r.StartedAt.IsZero() || r.UpdatedAt.Before(r.StartedAt) || r.LeaseExpiresAt.Before(r.UpdatedAt) {
+	if r.RaftAddress != "" {
+		if _, _, err := parseRaftAddress(r.RaftAddress); err != nil {
+			return fmt.Errorf("invalid node Raft address: %w", err)
+		}
+	}
+	if r.Revision == 0 || r.LeaseDuration <= 0 || r.StartedAt.IsZero() || r.UpdatedAt.Before(r.StartedAt) || r.LeaseExpiresAt.Before(r.UpdatedAt) {
 		return errors.New("invalid node revision or lease timestamps")
 	}
 	if len(r.Labels) > 64 {
@@ -160,6 +170,29 @@ func (r NodeRecord) Validate() error {
 type NodeDirectory struct {
 	dir string
 }
+
+// NodeCatalog is the linearizable membership and capacity authority consumed
+// by elastic placement. NodeDirectory is retained only for standalone tests
+// and old-format rejection; clustered TTC uses the Raft implementation.
+type NodeCatalog interface {
+	Register(NodeRecord, time.Time, time.Duration) (*NodeRecord, error)
+	Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*NodeRecord, error)
+	ReserveIncoming(nodeID, incarnation, operation, sourceNode string, bytes uint64, now time.Time, ttl time.Duration) (*NodeRecord, error)
+	ReleaseIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error)
+	CompleteIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error)
+	Transition(nodeID, incarnation string, next NodeState, now time.Time, lease time.Duration) (*NodeRecord, error)
+	Lookup(nodeID string) (*NodeRecord, error)
+	List() ([]NodeRecord, error)
+}
+
+// NodeExpiryCatalog commits the consequences of one exact expired execution
+// lease. It is separate from NodeCatalog because the legacy filesystem
+// directory is not a distributed fencing authority.
+type NodeExpiryCatalog interface {
+	ExpireNode(nodeID, incarnation string, revision uint64) (*NodeRecord, error)
+}
+
+var _ NodeCatalog = (*NodeDirectory)(nil)
 
 // OpenNodeDirectory opens or creates a private shared discovery directory.
 func OpenNodeDirectory(dir string) (*NodeDirectory, error) {
@@ -220,6 +253,7 @@ func (d *NodeDirectory) Register(record NodeRecord, now time.Time, lease time.Du
 	record.StartedAt = now
 	record.UpdatedAt = now
 	record.LeaseExpiresAt = now.Add(lease)
+	record.LeaseDuration = lease
 	if err := record.Validate(); err != nil {
 		return nil, err
 	}
@@ -275,6 +309,7 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 		record.Revision++
 		record.UpdatedAt = now
 		record.LeaseExpiresAt = now.Add(lease)
+		record.LeaseDuration = lease
 		if err := d.store(record); err != nil {
 			return err
 		}
@@ -466,6 +501,7 @@ func (d *NodeDirectory) Transition(nodeID, incarnation string, next NodeState, n
 			record.LeaseExpiresAt = now
 		} else {
 			record.LeaseExpiresAt = now.Add(lease)
+			record.LeaseDuration = lease
 		}
 		if err := d.store(record); err != nil {
 			return err

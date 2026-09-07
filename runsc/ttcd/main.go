@@ -32,6 +32,9 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "_auto-remove-client" {
 		os.Exit(cmd.RunAutoRemoveClient(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "_lease-guardian" {
+		os.Exit(cmd.RunLeaseGuardian(os.Args[2:], os.Stderr))
+	}
 	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true

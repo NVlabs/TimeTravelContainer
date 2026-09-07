@@ -141,15 +141,20 @@ func validateSHA256Digest(digest string) error {
 // Transaction is the durable control-plane record. A target container is not
 // externally visible until State reaches TransactionPublished.
 type Transaction struct {
-	Identity     ForkIdentity           `json:"identity"`
-	Negotiated   NegotiatedCapabilities `json:"negotiated"`
-	State        TransactionState       `json:"state"`
-	Revision     uint64                 `json:"revision"`
-	CreatedAt    time.Time              `json:"created_at"`
-	UpdatedAt    time.Time              `json:"updated_at"`
-	Failure      string                 `json:"failure,omitempty"`
-	SourceNeeded bool                   `json:"source_needed"`
-	Metrics      *TransferMetrics       `json:"metrics,omitempty"`
+	Identity   ForkIdentity           `json:"identity"`
+	Negotiated NegotiatedCapabilities `json:"negotiated"`
+	State      TransactionState       `json:"state"`
+	Revision   uint64                 `json:"revision"`
+	CreatedAt  time.Time              `json:"created_at"`
+	UpdatedAt  time.Time              `json:"updated_at"`
+	Failure    string                 `json:"failure,omitempty"`
+	// SourceIncarnation is assigned by the replicated state machine when the
+	// transaction is created. Reusing a human node ID cannot satisfy an old
+	// target's volatile dependency.
+	SourceIncarnation string           `json:"source_incarnation,omitempty"`
+	TargetIncarnation string           `json:"target_incarnation,omitempty"`
+	SourceNeeded      bool             `json:"source_needed"`
+	Metrics           *TransferMetrics `json:"metrics,omitempty"`
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`
@@ -162,6 +167,10 @@ type Transaction struct {
 	// completed. For a requested paused target, Activated is immediately true.
 	DesiredPaused bool `json:"desired_paused,omitempty"`
 	Activated     bool `json:"activated,omitempty"`
+	// OwnershipCommitted is set in the same Raft entry that moves a migrated
+	// branch's placement. It separates a physically prepared target from the
+	// sole authoritative target before activation.
+	OwnershipCommitted bool `json:"ownership_committed,omitempty"`
 }
 
 var transactionTransitions = map[TransactionState]map[TransactionState]bool{

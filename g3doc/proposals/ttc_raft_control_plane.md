@@ -107,9 +107,17 @@ checks repository identity, exact TTC build, architecture, base-page size, and
 required protocol features.
 
 The node is first added as a non-voting learner. It receives the log or a
-snapshot, proves that it applied the current revision, and is then promoted to
-a voter according to the configured replica policy. A node is not eligible for
-branch placement while it is merely joining.
+snapshot before admission. The first three members are promoted to voters;
+additional elastic compute nodes remain learners, so a large worker fleet does
+not enlarge the quorum. A node is not eligible for branch placement while it
+is merely joining. Graceful voter retirement promotes a caught-up learner
+before removing the old voter when that is required to retain the replica
+target.
+
+The shared repository contains a small immutable cluster identity. A fresh
+local WAL must either create that identity as the explicit first bootstrap or
+join the group named by it. The same shared root cannot silently host two Raft
+groups, and a local WAL from another cluster is rejected.
 
 Restarting a daemon creates a new random incarnation. The old incarnation's
 commands and leases remain stale even when the human node ID is reused.
@@ -121,15 +129,17 @@ code. The leader periodically commits a coalesced lease grant containing a
 sequence and deadline for admitted node incarnations. A node may execute only
 while its last locally observed committed grant is valid.
 
-Before its conservative local deadline, a node that cannot renew must pause all
-owned Sentries and stop host-side writers and sidecars. It then enters
-`self-fenced`. Pausing must complete before authority can expire. If it cannot
-guarantee that, it kills the affected runtime rather than run outside its
-lease.
+Before its conservative monotonic-local deadline, a node that cannot renew
+closes client and peer ingress, durably records each Sentry PID plus host start
+time, and sends `SIGSTOP` to every Sentry. This host-kernel fence also stops an
+in-flight fork or resume that a branch-by-branch RPC could miss. If a Sentry
+cannot be stopped before authority expires, TTC sends `SIGKILL` rather than run
+outside its lease.
 
 After communication returns, the node performs a linearizable read:
 
-* if every placement still names its incarnation and generation, it may resume;
+* after adopting every retained placement into its new incarnation, it may
+  `SIGCONT` only PIDs whose host start time still matches the fence record;
 * if authority moved, it destroys the stale local runtime;
 * if the node was removed, it stays fenced and drains or exits as instructed.
 
@@ -226,4 +236,3 @@ linearizable Raft reads.
 Standalone TTC does not need a multi-node Raft group. It uses the same
 deterministic state-machine implementation with a local single-node authority,
 keeping lifecycle semantics shared without adding a network dependency.
-

@@ -86,7 +86,10 @@ var daemonAPIFeatures = []string{
 
 const repositoryMaintenanceInterval = 5 * time.Minute
 
-const daemonRootFormatVersion = 1
+const (
+	daemonRootFormatVersion        = 1
+	daemonClusterRootFormatVersion = 2
+)
 
 var (
 	createDaemonRootlessProbe = createRootlessProbe
@@ -146,8 +149,9 @@ type daemonServer struct {
 	clusterCapabilities   *cluster.Capabilities
 	clusterListen         string
 	distributedSource     *distributedSourceRuntime
-	clusterStore          *cluster.Store
-	clusterDirectory      *cluster.NodeDirectory
+	clusterStore          cluster.TransactionCatalog
+	clusterDirectory      cluster.NodeCatalog
+	clusterPlacements     cluster.PlacementCatalog
 	publicationQueue      *ttcstorage.Queue
 
 	stopOnce  sync.Once
@@ -198,6 +202,10 @@ type daemonClusterOptions struct {
 	PageListen      string
 	PageAdvertise   string
 	Peers           []string
+	RaftListen      string
+	RaftAdvertise   string
+	RaftServerName  string
+	RaftBootstrap   bool
 	PagingPolicy    ttcpolicy.Policy
 }
 
@@ -213,9 +221,14 @@ type daemonClusterRuntime struct {
 	tlsConfig     *tls.Config
 	controlPlane  *cluster.ControlPlane
 	source        *distributedSourceRuntime
-	directory     *cluster.NodeDirectory
+	directory     cluster.NodeCatalog
+	placements    cluster.PlacementCatalog
+	transactions  cluster.TransactionCatalog
+	raft          *cluster.AuthorityRaftNode
+	raftCatalog   *cluster.RaftCatalog
 	nodeRecord    cluster.NodeRecord
 	lease         time.Duration
+	clusterID     string
 	autoRebalance bool
 	capacitySink  elasticCapacitySink
 }
@@ -224,8 +237,9 @@ type daemonTargetRuntime struct {
 	backend     *runtimeBackend
 	nodeID      string
 	incarnation string
-	directory   *cluster.NodeDirectory
-	store       *cluster.Store
+	directory   cluster.NodeCatalog
+	store       cluster.TransactionCatalog
+	authority   *cluster.RaftCatalog
 	done        <-chan struct{}
 	watch       sync.Map
 	locks       sync.Map
@@ -642,6 +656,19 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 	return nil
 }
 
+func (r *daemonTargetRuntime) PublishedTarget(tx *cluster.Transaction) (family, branch, physicalContainer, physicalBranch, incarnation string, err error) {
+	if r == nil || tx == nil {
+		err = errors.New("distributed target runtime is unavailable")
+		return
+	}
+	info, targetBranch, _, loadErr := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	if loadErr != nil {
+		err = loadErr
+		return
+	}
+	return info.ID, targetBranch.ID, info.ID, targetBranch.ID, r.incarnation, nil
+}
+
 func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transaction) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
@@ -1002,8 +1029,9 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					if info, loadErr := r.backend.containerStore().LoadDistributedForkTarget(transactionID); loadErr == nil {
 						if branch, branchErr := persistentBranchInfo(info, tx.Identity.VisibleTargetBranch()); branchErr == nil &&
 							(branch.DependentMemoryBytes != 0 || branch.DependentFilesystemBytes != 0) {
-							_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
-								"unrecoverable volatile-state loss: source node disappeared before memory and filesystem dependencies became durable", time.Now())
+							reason := "unrecoverable volatile-state loss: source node disappeared before memory and filesystem dependencies became durable"
+							_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed, reason, time.Now())
+							r.corruptDependentTarget(info.ID, branch.ID, reason)
 							return
 						}
 					}
@@ -1104,6 +1132,16 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			return
 		}
 	}()
+}
+
+func (r *daemonTargetRuntime) corruptDependentTarget(family, branch, reason string) {
+	if state, err := r.backend.runtimeBranchLifecycle(family, branch); err == nil && state == "running" {
+		_, _ = r.backend.command("timetravel", family, "pause", branch)
+	}
+	if r.authority != nil {
+		_, _ = r.authority.MarkBranchCorrupted(family, branch, reason)
+	}
+	_ = r.backend.containerStore().UpdateBranchState(family, branch, "corrupted")
 }
 
 type daemonFrameWriter struct {
@@ -1512,11 +1550,11 @@ func rejectActiveDaemonContainers(backend backend) error {
 	return nil
 }
 
-func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID string) error {
+func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID string) error {
 	return drainSourceDependenciesMatching(backend, source, store, nodeID, "", "")
 }
 
-func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store *cluster.Store, nodeID, containerID, branchID string) error {
+func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	if backend == nil || source == nil || store == nil || nodeID == "" {
 		return nil
 	}
@@ -1589,7 +1627,7 @@ func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchI
 	if b == nil || b.distributedSource == nil || b.nodeID == "" || b.dataRoot == "" {
 		return nil
 	}
-	store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	store, err := b.transactionCatalog()
 	if err != nil {
 		return err
 	}
@@ -1891,7 +1929,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: pruning stale image roots: %v\n", err)
 		return 1
 	}
-	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot)
+	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
 		return 1
@@ -1981,7 +2019,13 @@ func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
 		return err
 	}
 	markerPath := filepath.Join(root, ".ttc-root-format")
-	want := daemonRootMarker{Version: daemonRootFormatVersion, Kind: kind, RepositoryID: repositoryID, NodeID: nodeID}
+	formatVersion := daemonRootFormatVersion
+	if repositoryID != "" {
+		// Version 2 makes the single cluster-wide Raft authority mandatory for
+		// clustered roots. There is deliberately no mixed shared-JSON/Raft mode.
+		formatVersion = daemonClusterRootFormatVersion
+	}
+	want := daemonRootMarker{Version: formatVersion, Kind: kind, RepositoryID: repositoryID, NodeID: nodeID}
 	data, err := os.ReadFile(markerPath)
 	if err == nil {
 		var got daemonRootMarker
@@ -2063,6 +2107,11 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return 1, nil
 	}
+	if args[0] == "--cluster-raft-bootstrap" {
+		opts.RaftBootstrap = true
+		opts.Configured = true
+		return 1, nil
+	}
 	setString := func(name string, dst *string) (int, error) {
 		if args[0] == name {
 			if len(args) < 2 || args[1] == "" {
@@ -2102,6 +2151,8 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		"--cluster-capacity-command": &opts.CapacityCommand,
 		"--cluster-capacity-webhook": &opts.CapacityWebhook,
 		"--cluster-page-listen":      &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
+		"--cluster-raft-listen":    &opts.RaftListen,
+		"--cluster-raft-advertise": &opts.RaftAdvertise,
 	} {
 		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
 			if consumed != 0 {
@@ -2240,15 +2291,31 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 	return 0, nil
 }
 
-func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonClusterRuntime, error) {
+func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string) (*daemonClusterRuntime, error) {
 	if !opts.Configured {
 		return nil, nil
 	}
 	if opts.LeaseDuration == 0 {
 		opts.LeaseDuration = 15 * time.Second
 	}
-	if opts.Listen == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
-		return nil, errors.New("cluster mode requires listen address, node ID, repository ID, certificate, key, and CA")
+	if opts.Listen == "" || opts.Advertise == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
+		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, repository ID, certificate, key, and CA")
+	}
+	if opts.RaftListen == "" || opts.RaftAdvertise == "" {
+		return nil, errors.New("cluster mode requires --cluster-raft-listen and --cluster-raft-advertise")
+	}
+	raftLocalDir := filepath.Join(localRoot, "cluster", "raft")
+	_, localRaftErr := os.Stat(filepath.Join(raftLocalDir, "raft.db"))
+	localRaftState := localRaftErr == nil
+	if localRaftErr != nil && !errors.Is(localRaftErr, os.ErrNotExist) {
+		return nil, localRaftErr
+	}
+	if !opts.RaftBootstrap && !localRaftState && len(opts.Peers) == 0 {
+		return nil, errors.New("a new Raft member requires --cluster-peer; use --cluster-raft-bootstrap only for the first node")
+	}
+	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID, opts.RaftBootstrap, localRaftState)
+	if err != nil {
+		return nil, err
 	}
 	capacitySink, err := newElasticCapacitySink(opts.CapacityCommand, opts.CapacityWebhook)
 	if err != nil {
@@ -2293,10 +2360,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	if err != nil {
 		return nil, err
 	}
-	store, err := cluster.OpenStore(filepath.Join(dataRoot, "cluster", "transactions"))
-	if err != nil {
-		return nil, err
-	}
 	capabilities := cluster.Capabilities{
 		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
 		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
@@ -2309,23 +2372,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 	}
 	if err := capabilities.Validate(); err != nil {
 		return nil, err
-	}
-	var directory *cluster.NodeDirectory
-	var nodeRecord cluster.NodeRecord
-	if advertiseURL != "" {
-		directory, err = cluster.OpenNodeDirectory(filepath.Join(dataRoot, "cluster", "nodes"))
-		if err != nil {
-			return nil, err
-		}
-		incarnation, err := cluster.NewNodeIncarnation()
-		if err != nil {
-			return nil, err
-		}
-		nodeRecord = cluster.NodeRecord{
-			NodeID: opts.NodeID, Incarnation: incarnation,
-			ControlURL: advertiseURL, ControlServerName: advertiseServerName,
-			Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
-		}
 	}
 	clients := make(map[string]*cluster.Client, len(opts.Peers))
 	for _, peerSpec := range opts.Peers {
@@ -2349,20 +2395,242 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot string) (*daemonCl
 		}
 		clients[nodeID] = client
 	}
+	raftHost, raftServerName, err := parseClusterRaftAdvertise(opts.RaftAdvertise)
+	if err != nil {
+		return nil, err
+	}
+	raftClientTLS, err := cluster.LoadClientTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile, raftServerName)
+	if err != nil {
+		return nil, fmt.Errorf("configuring Raft client TLS: %w", err)
+	}
+	raftNode, err := cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
+		NodeID: opts.NodeID, LocalDir: raftLocalDir,
+		ListenAddress: opts.RaftListen, AdvertiseHost: raftHost, ServerName: raftServerName,
+		ServerTLS: tlsConfig, ClientTLS: raftClientTLS, Bootstrap: opts.RaftBootstrap,
+	})
+	if err != nil {
+		return nil, err
+	}
+	closeRaft := true
+	defer func() {
+		if closeRaft {
+			_ = raftNode.Close()
+		}
+	}()
+	if raftNode.HadExistingState() {
+		deadline := time.Now().Add(15 * time.Second)
+		for raftNode.Leader() == "" && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if raftNode.Leader() == "" {
+			return nil, errors.New("existing TTC Raft member could not discover a leader")
+		}
+	} else if opts.RaftBootstrap {
+		deadline := time.Now().Add(15 * time.Second)
+		for !raftNode.IsLeader() && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !raftNode.IsLeader() {
+			return nil, errors.New("bootstrapped TTC Raft group did not elect its leader")
+		}
+	} else {
+		joined := false
+		var joinErr error
+		request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
+		for _, peer := range clients {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			joinErr = joinAuthorityThroughSeed(ctx, peer, request, opts.CertFile, opts.KeyFile, opts.CAFile)
+			cancel()
+			if joinErr == nil {
+				joined = true
+				break
+			}
+		}
+		if !joined {
+			return nil, fmt.Errorf("joining TTC Raft group through configured peers: %w", joinErr)
+		}
+	}
+	catalog, err := cluster.NewRaftCatalog(raftNode)
+	if err != nil {
+		return nil, err
+	}
+	incarnation, err := cluster.NewNodeIncarnation()
+	if err != nil {
+		return nil, err
+	}
+	nodeRecord := cluster.NodeRecord{
+		NodeID: opts.NodeID, Incarnation: incarnation,
+		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: raftNode.Address(),
+		Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+	}
+	transactions := catalog.Transactions()
+	placements := catalog.Placements()
+	source := &distributedSourceRuntime{
+		capabilities: capabilities, peers: clients,
+		directory: catalog, placements: placements, transactions: transactions, authority: catalog,
+		certFile: opts.CertFile, keyFile: opts.KeyFile, caFile: opts.CAFile,
+		dynamicPeers: make(map[string]dynamicClusterPeer),
+		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
+	}
+	catalog.SetLeaderClientResolver(func(nodeID string) (*cluster.Client, error) {
+		if peer := clients[nodeID]; peer != nil {
+			return peer, nil
+		}
+		// A node only needs one seed to join. After elections, discover any
+		// leader from the replicated membership map rather than requiring every
+		// peer to be repeated on every daemon command line.
+		state, err := raftNode.AppliedState()
+		if err != nil {
+			return nil, err
+		}
+		record, ok := state.Nodes[nodeID]
+		if !ok {
+			return nil, fmt.Errorf("Raft leader %q has no replicated node record", nodeID)
+		}
+		return source.peerForRecord(record)
+	})
+	closeRaft = false
 	return &daemonClusterRuntime{
 		listen: opts.Listen, tlsConfig: tlsConfig,
 		controlPlane: &cluster.ControlPlane{
-			Capabilities: capabilities, Store: store, MaxTransactions: opts.MaxTransactions, Now: time.Now,
+			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
+			Authority: &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID},
 		},
-		source: &distributedSourceRuntime{
-			capabilities: capabilities, peers: clients,
-			directory: directory, certFile: opts.CertFile, keyFile: opts.KeyFile, caFile: opts.CAFile,
-			dynamicPeers: make(map[string]dynamicClusterPeer),
-			pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
-		},
-		directory: directory, nodeRecord: nodeRecord, lease: opts.LeaseDuration,
+		source: source, directory: catalog, placements: placements, transactions: transactions,
+		raft: raftNode, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
 		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink,
 	}, nil
+}
+
+// joinAuthorityThroughSeed follows Raft-leader redirects at the control-plane
+// layer. A deployment only needs to configure one reachable seed; the seed
+// need not currently be the leader.
+func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityJoinRequest, certFile, keyFile, caFile string) error {
+	peer := seed
+	seen := make(map[string]bool)
+	for redirects := 0; redirects < 5; redirects++ {
+		err := peer.JoinAuthority(ctx, request)
+		if err == nil {
+			return nil
+		}
+		var redirect *cluster.AuthorityNotLeaderError
+		if !errors.As(err, &redirect) {
+			return err
+		}
+		if redirect.LeaderControlURL == "" || redirect.LeaderServerName == "" {
+			return fmt.Errorf("joining through a follower that cannot resolve its Raft leader: %w", err)
+		}
+		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
+		if seen[key] {
+			return fmt.Errorf("Raft leader redirect loop through %q", redirect.LeaderID)
+		}
+		seen[key] = true
+		clientTLS, tlsErr := cluster.LoadClientTLSConfig(certFile, keyFile, caFile, redirect.LeaderServerName)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring redirected Raft leader %q TLS: %w", redirect.LeaderID, tlsErr)
+		}
+		peer, tlsErr = cluster.NewClient(redirect.LeaderControlURL, clientTLS, 2*time.Minute)
+		if tlsErr != nil {
+			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, tlsErr)
+		}
+	}
+	return errors.New("too many Raft leader redirects while joining cluster")
+}
+
+type daemonRaftClusterIdentity struct {
+	Version      int       `json:"version"`
+	ClusterID    string    `json:"cluster_id"`
+	RepositoryID string    `json:"repository_id"`
+	CreatedBy    string    `json:"created_by"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+func prepareClusterRaftIdentity(sharedRoot, localRaftDir, repositoryID, nodeID string, bootstrap, localState bool) (string, error) {
+	sharedPath := filepath.Join(sharedRoot, ".ttc-raft-cluster.json")
+	var identity daemonRaftClusterIdentity
+	createdIdentity := false
+	data, err := os.ReadFile(sharedPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if !bootstrap || localState {
+			return "", errors.New("shared TTC_ROOT has no Raft cluster identity; only a fresh first node may bootstrap it")
+		}
+		clusterID, idErr := newDaemonRequestID()
+		if idErr != nil {
+			return "", idErr
+		}
+		identity = daemonRaftClusterIdentity{Version: 1, ClusterID: clusterID, RepositoryID: repositoryID, CreatedBy: nodeID, CreatedAt: time.Now().UTC()}
+		createdIdentity = true
+		encoded, marshalErr := json.Marshal(identity)
+		if marshalErr != nil {
+			return "", marshalErr
+		}
+		file, createErr := os.OpenFile(sharedPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if createErr != nil {
+			return "", fmt.Errorf("creating Raft cluster identity: %w", createErr)
+		}
+		_, writeErr := file.Write(encoded)
+		closeErr := errors.Join(file.Sync(), file.Close())
+		if writeErr != nil || closeErr != nil {
+			_ = os.Remove(sharedPath)
+			return "", errors.Join(writeErr, closeErr)
+		}
+	} else if err != nil {
+		return "", err
+	} else if err := json.Unmarshal(data, &identity); err != nil {
+		return "", fmt.Errorf("decoding Raft cluster identity: %w", err)
+	}
+	if identity.Version != 1 || !transactionIDPatternForDaemon(identity.ClusterID) || identity.RepositoryID != repositoryID {
+		return "", errors.New("shared TTC_ROOT has an incompatible Raft cluster identity")
+	}
+	localPath := filepath.Join(localRaftDir, "cluster-id")
+	localIdentity, localIdentityErr := os.ReadFile(localPath)
+	localIdentityMatches := localIdentityErr == nil && strings.TrimSpace(string(localIdentity)) == identity.ClusterID
+	if bootstrap && !localState && !createdIdentity && !localIdentityMatches {
+		return "", fmt.Errorf("refusing to bootstrap a second Raft group for cluster %q", identity.ClusterID)
+	}
+	if err := os.MkdirAll(localRaftDir, 0700); err != nil {
+		return "", err
+	}
+	if local, err := os.ReadFile(localPath); err == nil {
+		if strings.TrimSpace(string(local)) != identity.ClusterID {
+			return "", errors.New("TTC_LOCAL_ROOT belongs to another Raft cluster")
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(localPath, []byte(identity.ClusterID+"\n"), 0600); err != nil {
+			return "", err
+		}
+	} else {
+		return "", err
+	}
+	return identity.ClusterID, nil
+}
+
+func transactionIDPatternForDaemon(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune("._-", character) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func parseClusterRaftAdvertise(value string) (host, serverName string, err error) {
+	comma := strings.LastIndexByte(value, ',')
+	if comma <= 0 || comma == len(value)-1 {
+		return "", "", fmt.Errorf("invalid --cluster-raft-advertise %q; want HOST:PORT,SERVER_NAME", value)
+	}
+	host, serverName = value[:comma], value[comma+1:]
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		return "", "", fmt.Errorf("invalid Raft advertise address %q: %w", host, err)
+	}
+	if strings.TrimSpace(serverName) != serverName || serverName == "" {
+		return "", "", errors.New("invalid Raft TLS server name")
+	}
+	return host, serverName, nil
 }
 
 func requireEphemeralClusterPagePort(option, address string) error {
@@ -2482,6 +2750,9 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 }
 
 func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+	if clusterRuntime != nil && clusterRuntime.raft != nil {
+		defer clusterRuntime.raft.Close()
+	}
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -2533,6 +2804,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	if clusterRuntime != nil {
 		publisher.nodeID = clusterRuntime.nodeRecord.NodeID
 		publisher.incarnation = clusterRuntime.nodeRecord.Incarnation
+		publisher.placements = clusterRuntime.placements
+		publisher.transactions = clusterRuntime.transactions
+		publisher.authority = clusterRuntime.raftCatalog
 	}
 	publicationQueue, err := ttcstorage.Open(localRoot, publisher)
 	if err != nil {
@@ -2557,20 +2831,36 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
 	var elasticRecord *cluster.NodeRecord
+	var clusterTargetBackend *runtimeBackend
+	var leaseGuardian *os.File
 	defer func() {
 		close(clusterDone)
 		if elasticHeartbeatStopped != nil {
 			<-elasticHeartbeatStopped
 		}
 		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
-			if _, err := clusterRuntime.directory.Transition(elasticRecord.NodeID, elasticRecord.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease); err != nil && stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: warning: publishing cluster node offline state: %v\n", err)
+			if !server.cleanStop.Load() && clusterTargetBackend != nil {
+				if err := fenceElasticRuntimes(clusterTargetBackend, elasticRecord.NodeID, elasticRecord.Incarnation); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: fencing runtimes during unclean cluster shutdown: %v\n", err)
+				}
+			}
+			offline, transitionErr := clusterRuntime.directory.Transition(elasticRecord.NodeID, elasticRecord.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease)
+			if transitionErr != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: publishing cluster node offline state: %v\n", transitionErr)
 			}
 			if server.cleanStop.Load() {
+				if intent, err := loadElasticDrainIntent(dataRoot, elasticRecord.NodeID); err == nil && intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
+					if err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation); err != nil && stderr != nil {
+						fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
+					}
+				}
 				if err := removeCompletedElasticDrainIntent(dataRoot, elasticRecord.NodeID); err != nil && stderr != nil {
 					fmt.Fprintf(stderr, "ttcd: warning: consuming completed drain intent: %v\n", err)
 				}
 			}
+		}
+		if leaseGuardian != nil {
+			_ = leaseGuardian.Close()
 		}
 	}()
 	var clusterServer *http.Server
@@ -2582,6 +2872,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			unsafeNoHostIsolation: server.unsafeNoHostIsolation,
 			disableHostGSO:        server.disableHostGSO,
 		}, strings.NewReader(""), io.Discard, io.Discard)
+		clusterTargetBackend = targetBackend
 		server.configureVolumeBackend(targetBackend)
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
@@ -2589,7 +2880,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
-			store: clusterRuntime.controlPlane.Store, done: clusterDone,
+			store: clusterRuntime.controlPlane.Store, authority: clusterRuntime.raftCatalog, done: clusterDone,
 		}
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
@@ -2616,6 +2907,19 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
 			}
+			leaseGuardian, err = startLeaseGuardian(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation, clusterRuntime.lease)
+			if err != nil {
+				_ = fenceElasticRuntimes(targetBackend, registered.NodeID, registered.Incarnation)
+				clusterListener.Close()
+				return fmt.Errorf("starting execution-lease guardian: %w", err)
+			}
+			// While joining, recover every retained placement into this exact
+			// incarnation. The ready transition then fences any old placement
+			// that was not found locally; only afterward may new work arrive.
+			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("recovering fenced branch placements: %w", err)
+			}
 			admittedState := cluster.NodeReady
 			if drainIntent != nil {
 				admittedState = cluster.NodeDraining
@@ -2633,10 +2937,22 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				}
 			}
 			elasticRecord = ready
+			// Enroll any legacy/untracked local branch now that ordinary placement
+			// creation is authorized. A prior lease failure may have left every
+			// Sentry physically stopped, so resume only after both passes succeed.
+			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("re-authorizing fenced branch placements: %w", err)
+			}
+			if err := resumeFencedElasticRuntimes(targetBackend, ready.NodeID); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("resuming re-authorized fenced runtimes: %w", err)
+			}
 		}
 		server.clusterCapabilities = &clusterRuntime.controlPlane.Capabilities
 		server.clusterStore = clusterRuntime.controlPlane.Store
 		server.clusterDirectory = clusterRuntime.directory
+		server.clusterPlacements = clusterRuntime.placements
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
 		clusterServer = &http.Server{
@@ -2654,12 +2970,24 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}()
 		defer clusterServer.Close()
 		if elasticRecord != nil {
+			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})
 			elasticHeartbeatStopped = heartbeatStopped
 			go func(record cluster.NodeRecord) {
 				defer close(heartbeatStopped)
-				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, heartbeatFatal)
+				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func() error {
+					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
+						return fmt.Errorf("notifying execution-lease guardian: %w", err)
+					}
+					return nil
+				}, func() error {
+					// Stop all ingress before the host-level execution fence so no
+					// command can create new runnable work after the Sentry snapshot.
+					_ = listener.Close()
+					_ = clusterServer.Close()
+					return fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
+				}, heartbeatFatal)
 			}(*elasticRecord)
 			go func() {
 				select {
@@ -2722,6 +3050,27 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		go server.handle(conn, stderr)
 	}
+}
+
+func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation string) error {
+	if runtime == nil || runtime.raft == nil || runtime.source == nil {
+		return errors.New("Raft retirement is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := runtime.raft.RetireMember(ctx, nodeID)
+	for attempts := 0; attempts < 3; attempts++ {
+		var redirect *cluster.AuthorityNotLeaderError
+		if !errors.As(err, &redirect) || redirect.LeaderID == "" {
+			return err
+		}
+		peer, peerErr := runtime.source.peer(redirect.LeaderID, false)
+		if peerErr != nil {
+			return peerErr
+		}
+		err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
+	}
+	return err
 }
 
 func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, stderr io.Writer, done <-chan struct{}, lock func() func()) {
@@ -2953,7 +3302,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		owner := ""
 		var err error
 		if len(request.PlacementClaims) == 0 {
-			owner, request.PlacementClaims, err = daemonCommandPlacement(s.dataRoot, request.Args)
+			owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, request.Args)
 		} else {
 			for _, claim := range request.PlacementClaims {
 				if owner != "" && owner != claim.OwnerNode {
@@ -3100,7 +3449,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	// its state file is published but before its control server is ready and
 	// mistake the in-progress runtime for stale state.
 	s.reconcile(backend)
-	if err := validateDaemonPlacementClaims(opts.dataRoot, backend.nodeID, request.PlacementClaims); err != nil {
+	placements, placementErr := backend.placementCatalog()
+	if placementErr != nil && len(request.PlacementClaims) != 0 {
+		unlock()
+		stdinReader.Close()
+		writeError(placementErr)
+		return
+	}
+	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.PlacementClaims, placements); err != nil {
 		unlock()
 		stdinReader.Close()
 		writeError(err)
@@ -3854,6 +4210,8 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, a
 			"--cluster-lease", clusterOpts.LeaseDuration.String(),
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 			"--cluster-page-listen", clusterOpts.PageListen,
+			"--cluster-raft-listen", clusterOpts.RaftListen,
+			"--cluster-raft-advertise", clusterOpts.RaftAdvertise,
 			"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
 			"--cluster-max-outstanding-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.MaxOutstandingBytes, 10),
 			"--cluster-max-parallel", strconv.Itoa(clusterOpts.PagingPolicy.MaxConcurrency),
@@ -3870,6 +4228,9 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, a
 		}
 		if clusterOpts.AutoRebalance {
 			commandArgs = append(commandArgs, "--cluster-auto-rebalance")
+		}
+		if clusterOpts.RaftBootstrap {
+			commandArgs = append(commandArgs, "--cluster-raft-bootstrap")
 		}
 		if clusterOpts.CapacityCommand != "" {
 			commandArgs = append(commandArgs, "--cluster-capacity-command", clusterOpts.CapacityCommand)

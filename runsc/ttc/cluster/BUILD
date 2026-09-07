@@ -16,6 +16,7 @@ go_library(
         "placement.go",
 		"planner.go",
 		"policy.go",
+		"raft_catalog.go",
         "registry.go",
 		"resource_window.go",
         "store.go",
