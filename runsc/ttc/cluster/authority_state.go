@@ -441,14 +441,16 @@ type AuthorityPlacementPayload struct {
 
 // Transaction command payload.
 type AuthorityTransactionPayload struct {
-	Transaction              Transaction              `json:"transaction,omitempty"`
-	ID                       string                   `json:"id,omitempty"`
-	Revision                 uint64                   `json:"revision,omitempty"`
-	Next                     TransactionState         `json:"next,omitempty"`
-	Failure, Digest          string                   `json:"failure,omitempty"`
-	Metrics                  *TransferMetrics         `json:"metrics,omitempty"`
-	Sparse                   *SparseHandoffDescriptor `json:"sparse,omitempty"`
-	DesiredPaused, Activated bool
+	Transaction   Transaction              `json:"transaction,omitempty"`
+	ID            string                   `json:"id,omitempty"`
+	Revision      uint64                   `json:"revision,omitempty"`
+	Next          TransactionState         `json:"next,omitempty"`
+	Failure       string                   `json:"failure,omitempty"`
+	Digest        string                   `json:"digest,omitempty"`
+	Metrics       *TransferMetrics         `json:"metrics,omitempty"`
+	Sparse        *SparseHandoffDescriptor `json:"sparse,omitempty"`
+	DesiredPaused bool                     `json:"desired_paused,omitempty"`
+	Activated     bool                     `json:"activated,omitempty"`
 }
 
 // Publication command payload.
@@ -1263,7 +1265,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("publication cannot release stale or migrating placement")
 		}
 		placement.OwnerNode, placement.OwnerIncarnation, placement.PhysicalContainer, placement.PhysicalBranch = "", "", "", ""
-		placement.State = PlacementUnplaced
+		placement.State = PlacementCorrupted
 		placement.Generation++
 		placement.Revision++
 		placement.LastOperationID, placement.OperationID, placement.TargetNode, placement.ResumeState = "", "", "", ""

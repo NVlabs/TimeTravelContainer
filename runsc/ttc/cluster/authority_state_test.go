@@ -42,6 +42,26 @@ func decodeAuthorityResultForTest[T any](t *testing.T, result AuthorityResult) T
 	return value
 }
 
+func TestAuthorityTransactionPayloadJSONKeepsFailureAndDigestDistinct(t *testing.T) {
+	want := AuthorityTransactionPayload{
+		Failure:       "restore failed",
+		Digest:        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		DesiredPaused: true,
+		Activated:     true,
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got AuthorityTransactionPayload
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Failure != want.Failure || got.Digest != want.Digest || got.DesiredPaused != want.DesiredPaused || got.Activated != want.Activated {
+		t.Fatalf("JSON round trip got %+v, want %+v (encoded %s)", got, want, encoded)
+	}
+}
+
 func testAuthorityNode(at time.Time) NodeRecord {
 	capabilities := testCapabilities("node-a")
 	return NodeRecord{

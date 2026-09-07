@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 func newAuthorityRaftTLS(t *testing.T) (*tls.Config, *tls.Config) {
@@ -112,6 +114,76 @@ func TestAuthorityRaftFollowerRejectsLocalMutation(t *testing.T) {
 	if !errors.As(err, &notLeader) {
 		t.Fatalf("Apply error = %v, want not-leader", err)
 	}
+}
+
+func TestAuthorityRaftPromotesOnlyReadyLearner(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	open := func(id string, bootstrap bool) *AuthorityRaftNode {
+		t.Helper()
+		node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+			NodeID: id, LocalDir: filepath.Join(t.TempDir(), "raft"),
+			ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+			ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: bootstrap,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return node
+	}
+	a, b := open("node-a", true), open("node-b", false)
+	defer a.Close()
+	defer b.Close()
+	leader := waitAuthorityLeader(t, a)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.ReconcileVoters(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := leader.Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range configuration.Servers {
+		if server.ID == "node-b" && server.Suffrage != raft.Nonvoter {
+			t.Fatalf("unregistered learner was promoted: %+v", server)
+		}
+	}
+	at := time.Now().UTC()
+	record := testAuthorityNode(at)
+	record.NodeID, record.Incarnation, record.Capabilities.NodeID = "node-b", "incarnation-b", "node-b"
+	record.RaftAddress = b.Address()
+	for _, entry := range []struct {
+		id      string
+		kind    AuthorityCommandKind
+		payload any
+	}{
+		{"register-ready-learner", AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: record, LeaseDuration: time.Hour}},
+		{"ready-learner", AuthorityNodeTransition, AuthorityNodeTransitionPayload{NodeID: record.NodeID, Incarnation: record.Incarnation, State: NodeReady, LeaseDuration: time.Hour}},
+	} {
+		result, err := leader.Propose(ctx, entry.id, entry.kind, entry.payload)
+		if err != nil || result.Err() != nil {
+			t.Fatalf("%s: result=%+v err=%v", entry.kind, result, err)
+		}
+	}
+	if err := leader.ReconcileVoters(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err = leader.Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range configuration.Servers {
+		if server.ID == "node-b" {
+			if server.Suffrage != raft.Voter {
+				t.Fatalf("ready learner was not promoted: %+v", server)
+			}
+			return
+		}
+	}
+	t.Fatal("ready learner disappeared from configuration")
 }
 
 func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {

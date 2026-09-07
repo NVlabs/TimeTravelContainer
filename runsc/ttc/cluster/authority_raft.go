@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ import (
 const (
 	defaultAuthorityApplyTimeout = 15 * time.Second
 	authoritySnapshotRetain      = 3
+	maxAuthoritySnapshotBytes    = 512 << 20
 )
 
 // AuthorityRaftOptions configures one member of the single cluster-wide Raft
@@ -101,9 +103,12 @@ func (f *AuthorityFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 func (f *AuthorityFSM) Restore(reader io.ReadCloser) error {
 	defer reader.Close()
-	data, err := io.ReadAll(io.LimitReader(reader, 64<<20))
+	data, err := io.ReadAll(io.LimitReader(reader, maxAuthoritySnapshotBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(data) > maxAuthoritySnapshotBytes {
+		return fmt.Errorf("Raft authority snapshot exceeds %d bytes", maxAuthoritySnapshotBytes)
 	}
 	state, err := RestoreAuthorityState(data)
 	if err != nil {
@@ -509,6 +514,58 @@ func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) err
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	return n.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
+}
+
+// ReconcileVoters promotes admitted, healthy learners until the bounded
+// control-plane quorum reaches maxVoters. Joining itself never promotes: a
+// process that crashes before committing its NodeReady record must remain
+// unable to increase the quorum requirement.
+func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) error {
+	if !n.IsLeader() {
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	if maxVoters <= 0 {
+		maxVoters = 3
+	}
+	configuration, err := n.Configuration()
+	if err != nil {
+		return err
+	}
+	voters := 0
+	var learners []raft.Server
+	for _, server := range configuration.Servers {
+		switch server.Suffrage {
+		case raft.Voter:
+			voters++
+		case raft.Nonvoter:
+			learners = append(learners, server)
+		}
+	}
+	if voters >= maxVoters {
+		return nil
+	}
+	state, err := n.AppliedState()
+	if err != nil {
+		return err
+	}
+	sort.Slice(learners, func(i, j int) bool { return learners[i].ID < learners[j].ID })
+	for _, learner := range learners {
+		record, ok := state.Nodes[string(learner.ID)]
+		if !ok || record.RaftAddress != string(learner.Address) || !record.LeaseActive(time.Now()) {
+			continue
+		}
+		if record.State != NodeReady && record.State != NodePressured {
+			continue
+		}
+		if err := n.Promote(ctx, string(learner.ID), string(learner.Address)); err != nil {
+			return fmt.Errorf("promoting admitted learner %q: %w", learner.ID, err)
+		}
+		voters++
+		if voters >= maxVoters {
+			return nil
+		}
+	}
+	return nil
 }
 
 // RemoveMember removes a node from quorum. Runtime drain/fencing must complete

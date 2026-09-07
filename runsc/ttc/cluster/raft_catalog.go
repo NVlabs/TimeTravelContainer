@@ -47,15 +47,31 @@ func (c *RaftCatalog) SetLeaderClientResolver(resolve func(string) (*Client, err
 }
 
 func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind AuthorityCommandKind, payload any) (AuthorityResult, error) {
+	deadline := time.Now().Add(15 * time.Second)
 	result, err := c.node.Propose(ctx, requestID, kind, payload)
-	for attempts := 0; err != nil && attempts < 3; attempts++ {
+	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotLeaderError
-		if !errors.As(err, &redirect) || redirect.LeaderID == "" || c.leaderClient == nil {
+		if !errors.As(err, &redirect) {
 			return AuthorityResult{}, err
+		}
+		if redirect.LeaderID == "" || c.leaderClient == nil {
+			select {
+			case <-ctx.Done():
+				return AuthorityResult{}, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			result, err = c.node.Propose(ctx, requestID, kind, payload)
+			continue
 		}
 		peer, resolveErr := c.leaderClient(redirect.LeaderID)
 		if resolveErr != nil {
-			return AuthorityResult{}, resolveErr
+			select {
+			case <-ctx.Done():
+				return AuthorityResult{}, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			result, err = c.node.Propose(ctx, requestID, kind, payload)
+			continue
 		}
 		encoded, encodeErr := json.Marshal(payload)
 		if encodeErr != nil {
@@ -67,15 +83,31 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 }
 
 func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, error) {
+	deadline := time.Now().Add(15 * time.Second)
 	state, err := c.node.LinearizableState(ctx)
-	for attempts := 0; err != nil && attempts < 3; attempts++ {
+	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotLeaderError
-		if !errors.As(err, &redirect) || redirect.LeaderID == "" || c.leaderClient == nil {
+		if !errors.As(err, &redirect) {
 			return nil, err
+		}
+		if redirect.LeaderID == "" || c.leaderClient == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			state, err = c.node.LinearizableState(ctx)
+			continue
 		}
 		peer, resolveErr := c.leaderClient(redirect.LeaderID)
 		if resolveErr != nil {
-			return nil, resolveErr
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			state, err = c.node.LinearizableState(ctx)
+			continue
 		}
 		state, err = peer.AuthorityState(ctx)
 	}
@@ -255,6 +287,56 @@ func (c *RaftCatalog) MarkBranchCorrupted(family, branch, reason string) (*Branc
 	}
 	return applyRaftValue[BranchAuthority](c, time.Now().UTC(), AuthorityBranchCorrupt, AuthorityPublicationPayload{
 		Family: family, Branch: branch, BranchGeneration: record.Generation, Failure: reason,
+	})
+}
+
+// Branches returns a linearizable snapshot of logical branch authority. Bulk
+// memory and filesystem objects are intentionally absent; only lifecycle,
+// fencing generations, durable roots, and coarse volatile dependencies live
+// in the replicated control plane.
+func (c *RaftCatalog) Branches() ([]BranchAuthority, error) {
+	state, err := c.state()
+	if err != nil {
+		return nil, err
+	}
+	records := make([]BranchAuthority, 0, len(state.Branches))
+	for _, record := range state.Branches {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].FamilyID != records[j].FamilyID {
+			return records[i].FamilyID < records[j].FamilyID
+		}
+		return records[i].BranchID < records[j].BranchID
+	})
+	return records, nil
+}
+
+// Branch returns one linearizable logical branch record.
+func (c *RaftCatalog) Branch(family, branch string) (*BranchAuthority, error) {
+	state, err := c.state()
+	if err != nil {
+		return nil, err
+	}
+	record, ok := state.Branches[logicalBranchKey(family, branch)]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &record, nil
+}
+
+// RemoveCorruptedBranch removes a permanently fenced branch from authority.
+// Healthy branches must use the ordinary lifecycle/placement transaction.
+func (c *RaftCatalog) RemoveCorruptedBranch(family, branch string) error {
+	record, err := c.Branch(family, branch)
+	if err != nil {
+		return err
+	}
+	if !record.Corrupted {
+		return errors.New("branch is not corrupted")
+	}
+	return applyRaftNoValue(c, time.Now().UTC(), AuthorityBranchRemoveCorrupted, AuthorityPublicationPayload{
+		Family: family, Branch: branch, BranchGeneration: record.Generation,
 	})
 }
 

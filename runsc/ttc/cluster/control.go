@@ -35,8 +35,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/hashicorp/raft"
 )
 
 const (
@@ -439,30 +437,10 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
-		configuration, err := a.Node.Configuration()
-		if err != nil {
-			writeControlError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		maxVoters := a.MaxVoters
-		if maxVoters <= 0 {
-			maxVoters = 3
-		}
-		voters := 0
-		for _, server := range configuration.Servers {
-			if server.Suffrage == raft.Voter {
-				voters++
-			}
-		}
-		if voters < maxVoters {
-			if err := a.Node.Promote(r.Context(), request.NodeID, request.RaftAddress); err != nil {
-				if notLeader(err) {
-					return
-				}
-				writeControlError(w, http.StatusConflict, err.Error())
-				return
-			}
-		}
+		// Joining is deliberately learner-only. Promoting a member before its
+		// execution-lease record is committed can let a failed startup enlarge
+		// the quorum and make the healthy cluster unavailable. The leader's
+		// membership reconciler promotes only admitted ready learners.
 		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID, "raft_address": request.RaftAddress})
 	case controlAuthorityRetirePath:
 		if r.Method != http.MethodPost {

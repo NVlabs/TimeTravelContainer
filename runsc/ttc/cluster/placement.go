@@ -39,6 +39,7 @@ const (
 	PlacementPaused    PlacementState = "paused"
 	PlacementMigrating PlacementState = "migrating"
 	PlacementUnplaced  PlacementState = "unplaced"
+	PlacementCorrupted PlacementState = "corrupted"
 )
 
 // PlacementRecord maps a stable logical branch to its current physical
@@ -85,7 +86,7 @@ func (r PlacementRecord) validate() error {
 			(r.ResumeState != PlacementRunning && r.ResumeState != PlacementPaused) {
 			return errors.New("migrating placement lacks source, target, operation, or resume state")
 		}
-	case PlacementUnplaced:
+	case PlacementUnplaced, PlacementCorrupted:
 		if r.OwnerNode != "" || r.OwnerIncarnation != "" || r.PhysicalContainer != "" || r.PhysicalBranch != "" ||
 			r.OperationID != "" || r.LastOperationID != "" || r.TargetNode != "" || r.ResumeState != "" {
 			return errors.New("unplaced branch retains an owner")

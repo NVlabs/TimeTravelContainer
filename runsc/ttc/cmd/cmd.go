@@ -5632,6 +5632,14 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	}
 	if b.nodeID != "" {
+		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			if authority, authorityErr := b.distributedSource.authority.Branch(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
+				target.container = info.ID
+				return target, info, nil
+			} else if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) {
+				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
+			}
+		}
 		owner := info.BranchNodeID(target.branch)
 		if owner != "" && owner != b.nodeID {
 			return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, owner)
@@ -8238,6 +8246,22 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		for _, branch := range info.Branches {
+			authority, err := b.distributedSource.authority.Branch(info.ID, branch.ID)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("loading removed branch authority for %s@%s: %w", info.Name, branch.ID, err)
+			}
+			if authority.Corrupted {
+				if err := b.distributedSource.authority.RemoveCorruptedBranch(info.ID, branch.ID); err != nil {
+					return fmt.Errorf("removing corrupted branch authority for %s@%s: %w", info.Name, branch.ID, err)
+				}
+			}
+		}
+	}
 	if volumes {
 		manager, err := b.volumeManager()
 		if err != nil {
@@ -9269,6 +9293,50 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		for id, family := range byID {
 			family.Error = runtimeErr.Error()
 			byID[id] = family
+		}
+	}
+	// In clustered TTC, Raft is the lifecycle authority. Shared container JSON
+	// is a materialization catalog and may lag a lease-expiry or migration
+	// decision; never let it make a fenced/corrupted branch appear runnable.
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		authorities, err := b.distributedSource.authority.Branches()
+		if err != nil {
+			return nil, fmt.Errorf("reading cluster branch authority: %w", err)
+		}
+		placementByBranch := make(map[string]cluster.PlacementRecord)
+		if placements, err := b.placementCatalog(); err == nil {
+			if records, err := placements.List(); err == nil {
+				for _, record := range records {
+					placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
+				}
+			}
+		}
+		for _, authority := range authorities {
+			family, ok := byID[authority.FamilyID]
+			if !ok {
+				continue
+			}
+			for i := range family.Branches {
+				if family.Branches[i].ID != authority.BranchID {
+					continue
+				}
+				family.Branches[i].State = authority.Lifecycle
+				if authority.Roots.FilesystemRoot != "" {
+					family.Branches[i].StorageManifest = authority.Roots.FilesystemRoot
+				}
+				placement, placed := placementByBranch[authority.FamilyID+"\x00"+authority.BranchID]
+				if !placed || placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {
+					family.Branches[i].NodeID = ""
+				} else {
+					family.Branches[i].NodeID = placement.OwnerNode
+				}
+				if authority.Corrupted {
+					family.Error = fmt.Sprintf("branch %s is corrupted: %s", authority.BranchID, authority.CorruptionReason)
+				}
+				break
+			}
+			family.State = familyStateFromBranches(family.Branches)
+			byID[authority.FamilyID] = family
 		}
 	}
 	families := make([]Family, 0, len(byID))
@@ -11375,6 +11443,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("persisting deletion of %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
+		}
+		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			if authority, err := b.distributedSource.authority.Branch(info.ID, target.branch); err == nil && authority.Corrupted {
+				if err := b.distributedSource.authority.RemoveCorruptedBranch(info.ID, target.branch); err != nil {
+					return fmt.Errorf("removing corrupted branch authority for %s: %w", target, err)
+				}
+			}
 		}
 		latest, err := store.LoadContainer(target.container)
 		if err != nil {

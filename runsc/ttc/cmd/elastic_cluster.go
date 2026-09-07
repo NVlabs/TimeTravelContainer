@@ -374,6 +374,12 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		placement, err := placements.Lookup(info.ID, selected.branch)
 		switch {
 		case err == nil:
+			if placement.State == cluster.PlacementCorrupted {
+				if args[0] == "rm" {
+					continue
+				}
+				return "", nil, fmt.Errorf("branch %s is corrupted; only rm is permitted", selected)
+			}
 			if placement.State == cluster.PlacementMigrating {
 				return "", nil, fmt.Errorf("branch %s is migrating from %q to %q; retry after cutover", selected, placement.OwnerNode, placement.TargetNode)
 			}
@@ -2570,6 +2576,18 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 		case <-done:
 			return
 		case <-ticker.C:
+		}
+		// Membership is reconciled independently of lease expiry. In
+		// particular, a newly joined process remains a learner until its ready
+		// execution record is committed, so a failed startup cannot enlarge the
+		// quorum and strand the existing cluster.
+		if node.IsLeader() {
+			ctx, cancel := context.WithTimeout(context.Background(), lease)
+			err := node.ReconcileVoters(ctx, 3)
+			cancel()
+			if err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: reconciling Raft voters: %v\n", err)
+			}
 		}
 		if !node.LeadershipSafeFor(lease) {
 			continue

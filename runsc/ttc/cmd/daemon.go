@@ -2447,7 +2447,20 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 			}
 		}
 		if !joined {
+			// No membership change committed. A freshly opened Bolt store still
+			// counts as existing Raft state, so retaining it would make the next
+			// attempt wait forever as a member that was never admitted.
+			_ = raftNode.Close()
+			closeRaft = false
+			_ = os.RemoveAll(raftLocalDir)
 			return nil, fmt.Errorf("joining TTC Raft group through configured peers: %w", joinErr)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for raftNode.Leader() == "" && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if raftNode.Leader() == "" {
+			return nil, errors.New("joined TTC Raft member could not discover the elected leader")
 		}
 	}
 	catalog, err := cluster.NewRaftCatalog(raftNode)
@@ -2902,7 +2915,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				clusterListener.Close()
 				return fmt.Errorf("loading elastic drain recovery state: %w", err)
 			}
-			registered, err := clusterRuntime.directory.Register(clusterRuntime.nodeRecord, time.Now(), clusterRuntime.lease)
+			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
@@ -3049,6 +3062,33 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		go server.handle(conn, stderr)
+	}
+}
+
+// registerClusterNodeWithRetry keeps an existing Raft member alive while a
+// restarted quorum elects a leader and waits out execution leases granted in
+// the prior term. Exiting during this interval can collapse the quorum before
+// any member is able to re-register and expose its control endpoint.
+func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration) (*cluster.NodeRecord, error) {
+	if directory == nil {
+		return nil, errors.New("cluster node directory is unavailable")
+	}
+	timeout := 2*lease + 30*time.Second
+	if timeout < time.Minute {
+		timeout = time.Minute
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		registered, err := directory.Register(record, time.Now(), lease)
+		if err == nil {
+			return registered, nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			return nil, lastErr
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
