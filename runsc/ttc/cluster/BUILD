@@ -8,6 +8,7 @@ package(
 go_library(
     name = "cluster",
     srcs = [
+		"authority_raft.go",
 		"authority_state.go",
         "capabilities.go",
         "control.go",
@@ -21,6 +22,8 @@ go_library(
         "transaction.go",
     ],
     deps = [
+		"@com_github_hashicorp_raft//:raft",
+		"@com_github_hashicorp_raft_boltdb_v2//:raft-boltdb",
 		"//pkg/hostarch",
 		"//pkg/ttcremote",
 	],
@@ -31,6 +34,7 @@ go_test(
     name = "cluster_test",
     size = "small",
     srcs = [
+		"authority_raft_test.go",
 		"authority_state_test.go",
         "cluster_test.go",
         "control_test.go",

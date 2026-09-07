@@ -188,6 +188,8 @@ use_repo(
     "com_github_googleapis_gax_go_v2",
     "com_github_googleapis_gnostic",
     "com_github_hanwen_go_fuse_v2",
+	"com_github_hashicorp_raft",
+	"com_github_hashicorp_raft_boltdb_v2",
     "com_github_ianlancetaylor_demangle",
     "com_github_imdario_mergo",
     "com_github_josharian_intern",
