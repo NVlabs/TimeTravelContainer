@@ -77,8 +77,8 @@ export interface CommandOptions {
 }
 
 export interface ForkOptions {
-  paused?: boolean;
-  targetNode?: string;
+	paused?: boolean;
+	node?: string;
 }
 
 export interface CommitOptions {
@@ -469,12 +469,13 @@ export class Client {
     image: string,
     command: readonly string[] = [],
     options: readonly string[] = [],
+	node?: string,
   ): Promise<Result> {
-    return this.command(["run", ...options, image, ...command]);
+	return this.command(["run", ...(node ? ["--node", node] : []), ...options, image, ...command]);
   }
 
-  start(target: string): Promise<Result> {
-    return this.command(["start", target]);
+  start(target: string, node?: string): Promise<Result> {
+	return this.command(["start", ...(node ? ["--node", node] : []), target]);
   }
 
   exec(
@@ -579,32 +580,28 @@ export class Client {
     return this.command([
       "fork",
       ...(options.paused ? ["--paused"] : []),
-      ...(options.targetNode ? ["--target", options.targetNode] : []),
+	  ...(options.node ? ["--node", options.node] : []),
       source,
       ...destinations,
     ]);
   }
 
-  migrate(target: string, targetNode: string): Promise<Result> {
-    return this.command(["migrate", "--target", targetNode, target]);
+  migrate(target: string, node: string): Promise<Result> {
+	return this.command(["migrate", "--node", node, target]);
   }
 
   async nodes<T = unknown>(): Promise<T> {
     return (await this.command(["node", "ls", "--json"], { check: true })).json<T>();
   }
 
-  drainNode(node: string, targetNode?: string): Promise<Result> {
-    return this.command([
-      "node", "drain",
-      ...(targetNode ? ["--target", targetNode] : []),
-      node,
-    ]);
+  stopNode(node: string, policy?: "stop" | "dehydrate" | "migrate"): Promise<Result> {
+	return this.command(["node", "stop", ...(policy ? [`--${policy}-all`] : []), node]);
   }
 
-  async rebalanceNode<T = unknown>(node: string, targetNode?: string): Promise<T> {
+  async rebalanceNode<T = unknown>(node: string, destinationNode?: string): Promise<T> {
     return (await this.command([
       "node", "rebalance",
-      ...(targetNode ? ["--target", targetNode] : []),
+      ...(destinationNode ? ["--node", destinationNode] : []),
       node,
     ], { check: true })).json<T>();
   }
@@ -629,8 +626,8 @@ export class Client {
     return this.command(["dehydrate", target]);
   }
 
-  rehydrate(target: string): Promise<Result> {
-    return this.command(["rehydrate", target]);
+  rehydrate(target: string, node?: string): Promise<Result> {
+	return this.command(["rehydrate", ...(node ? ["--node", node] : []), target]);
   }
 
   checkpoint(
@@ -647,8 +644,8 @@ export class Client {
     ]);
   }
 
-  restore(file: string, name?: string): Promise<Result> {
-    return this.command(["restore", ...(name ? ["--name", name] : []), resolve(file)]);
+  restore(file: string, name?: string, node?: string): Promise<Result> {
+	return this.command(["restore", ...(node ? ["--node", node] : []), ...(name ? ["--name", name] : []), resolve(file)]);
   }
 
   stop(target: string, timeoutSeconds?: number): Promise<Result> {

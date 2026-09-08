@@ -974,15 +974,37 @@ func TestDefaultDaemonSocketHonorsTTCSocket(t *testing.T) {
 	}
 }
 
+func TestExtractPlacementNode(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want []string
+		node string
+	}{
+		{name: "run", args: []string{"run", "--node", "node-b", "--name", "demo", "alpine", "echo"}, want: []string{"run", "--name", "demo", "alpine", "echo"}, node: "node-b"},
+		{name: "container start", args: []string{"container", "start", "--node=node-c", "demo@main"}, want: []string{"container", "start", "demo@main"}, node: "node-c"},
+		{name: "restore", args: []string{"restore", "--name", "copy", "--node", "node-b", "/tmp/state.ttc"}, want: []string{"restore", "--name", "copy", "/tmp/state.ttc"}, node: "node-b"},
+		{name: "guest argument", args: []string{"run", "alpine", "tool", "--node", "guest-value"}, want: []string{"run", "alpine", "tool", "--node", "guest-value"}},
+		{name: "explicit separator", args: []string{"run", "--node", "node-b", "alpine", "--", "--node", "guest-value"}, want: []string{"run", "alpine", "--", "--node", "guest-value"}, node: "node-b"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, node, err := extractPlacementNode(test.args)
+			if err != nil || node != test.node || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("extractPlacementNode(%q)=(%q, %q, %v), want (%q, %q, nil)", test.args, got, node, err, test.want, test.node)
+			}
+		})
+	}
+	if _, _, err := extractPlacementNode([]string{"start", "--node", "a", "--node", "b", "demo@main"}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("conflicting placement error=%v", err)
+	}
+}
+
 func TestConsumeDaemonClusterOptions(t *testing.T) {
 	args := []string{
 		"--cluster-listen=127.0.0.1:7443",
 		"--cluster-node-id", "node-a",
 		"--cluster-repository-id", "repo",
-		"--cluster-cert", "cert.pem",
-		"--cluster-key", "key.pem",
-		"--cluster-ca", "ca.pem",
-		"--cluster-advertise", "https://node-a.example:0,node-a.example",
+		"--cluster-advertise", "node-a.example:0",
 		"--cluster-memory-target", "8GiB",
 		"--cluster-auto-rebalance",
 		"--cluster-capacity-command", "/usr/bin/provision-ttc",
@@ -997,7 +1019,7 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		"--cluster-ack-interval", "250us",
 		"--cluster-prefetch", "adaptive",
 		"--cluster-push", "eager-drain",
-		"--cluster-peer", "node-b=https://10.0.0.2:7443,node-b.example",
+		"--cluster-peer", "node-b=10.0.0.2:7443",
 	}
 	opts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
@@ -1011,19 +1033,52 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		args = args[consumed:]
 	}
 	if !opts.Configured || opts.Listen != "127.0.0.1:7443" || opts.NodeID != "node-a" ||
-		opts.RepositoryID != "repo" || opts.CertFile != "cert.pem" || opts.KeyFile != "key.pem" ||
-		opts.CAFile != "ca.pem" || opts.Advertise != "https://node-a.example:0,node-a.example" ||
+		opts.RepositoryID != "repo" || opts.Advertise != "node-a.example:0" ||
 		opts.MemoryTarget != 8<<30 || !opts.AutoRebalance || opts.CapacityCommand != "/usr/bin/provision-ttc" || opts.LeaseDuration != 30*time.Second || opts.MaxTransactions != 17 || opts.PageListen != "0.0.0.0:0" ||
 		opts.PageAdvertise != "node-a.example:0" || opts.PagingPolicy.TransferBytes != 128<<10 ||
 		opts.PagingPolicy.MaxOutstandingBytes != 8<<20 || opts.PagingPolicy.MaxConcurrency != 8 ||
 		opts.PagingPolicy.AckBatchPages != 128 || opts.PagingPolicy.AckInterval != 250*time.Microsecond ||
 		opts.PagingPolicy.Prefetch != ttcpolicy.PrefetchAdaptive || !opts.PagingPolicy.Adaptive ||
 		opts.PagingPolicy.Push != ttcpolicy.PushEagerDrain ||
-		!reflect.DeepEqual(opts.Peers, []string{"node-b=https://10.0.0.2:7443,node-b.example"}) {
+		!reflect.DeepEqual(opts.Peers, []string{"node-b=10.0.0.2:7443"}) {
 		t.Fatalf("cluster options=%+v", opts)
 	}
-	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "https://10.0.0.2:7443" || name != "node-b.example" {
+	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "http://10.0.0.2:7443" || name != "" {
 		t.Fatalf("parseClusterPeer=(%q, %q, %q, %v)", node, url, name, err)
+	}
+}
+
+func TestSimpleClusterOptions(t *testing.T) {
+	opts := defaultDaemonClusterOptions()
+	args := []string{"--cluster-init", "--node", "node-a", "--listen", "127.0.0.1:7443", "--advertise", "node-a.example:7443", "--memory-target", "8GiB"}
+	for len(args) != 0 {
+		consumed, err := consumeDaemonClusterOption(args, &opts)
+		if err != nil || consumed == 0 {
+			t.Fatalf("consuming %q: consumed=%d err=%v", args[0], consumed, err)
+		}
+		args = args[consumed:]
+	}
+	roots := daemonRoots{shared: t.TempDir(), local: t.TempDir()}
+	if err := resolveSimpleClusterOptions(&opts, roots); err != nil {
+		t.Fatal(err)
+	}
+	if !opts.RaftBootstrap || opts.NodeID != "node-a" || opts.MemoryTarget != 8<<30 || opts.RaftListen != "127.0.0.1:7444" || opts.RaftAdvertise != "node-a.example:7444" || opts.RepositoryID == "" {
+		t.Fatalf("simple cluster options=%+v", opts)
+	}
+
+	conflict := defaultDaemonClusterOptions()
+	conflict.RaftBootstrap = true
+	conflict.Peers = []string{"seed=node-a.example:7443"}
+	if err := resolveSimpleClusterOptions(&conflict, roots); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("bootstrap/join conflict error=%v", err)
+	}
+
+	join := defaultDaemonClusterOptions()
+	if consumed, err := consumeDaemonClusterOption([]string{"--cluster-join=node-a.example:7443"}, &join); err != nil || consumed != 1 {
+		t.Fatalf("consuming equals-form join: consumed=%d err=%v", consumed, err)
+	}
+	if !reflect.DeepEqual(join.Peers, []string{"seed=node-a.example:7443"}) {
+		t.Fatalf("equals-form join peers=%q", join.Peers)
 	}
 }
 
@@ -1031,6 +1086,37 @@ func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
+	}
+}
+
+func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
+	root := t.TempDir()
+	bootstrap := defaultDaemonClusterOptions()
+	bootstrap.PagingPolicy.MaxConcurrency = 7
+	bootstrap.LeaseDuration = 23 * time.Second
+	bootstrap.MaxTransactions = 41
+	bootstrap.AutoRebalance = true
+	if err := applyImmutableClusterConfig(root, true, false, &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	join := defaultDaemonClusterOptions()
+	if err := applyImmutableClusterConfig(root, false, false, &join); err != nil {
+		t.Fatal(err)
+	}
+	if join.PagingPolicy != bootstrap.PagingPolicy || join.LeaseDuration != bootstrap.LeaseDuration || join.MaxTransactions != bootstrap.MaxTransactions || join.AutoRebalance != bootstrap.AutoRebalance {
+		t.Fatalf("joining policy=%+v, want bootstrap policy=%+v", join, bootstrap)
+	}
+
+	mismatch := defaultDaemonClusterOptions()
+	if err := applyImmutableClusterConfig(root, true, true, &mismatch); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("bootstrap mismatch error=%v", err)
+	}
+}
+
+func TestImmutableClusterConfigRequiresBootstrap(t *testing.T) {
+	opts := defaultDaemonClusterOptions()
+	if err := applyImmutableClusterConfig(t.TempDir(), false, false, &opts); err == nil || !strings.Contains(err.Error(), "fresh first node") {
+		t.Fatalf("missing config error=%v", err)
 	}
 }
 

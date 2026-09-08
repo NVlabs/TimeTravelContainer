@@ -141,7 +141,7 @@ func TestQuarantineCommandsAddressBranchState(t *testing.T) {
 func TestMigrateCommand(t *testing.T) {
 	backend := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"migrate", "--target", "node-b", "web@main"}, &stdout, &stderr, backend); status != 0 {
+	if status := runCommand([]string{"migrate", "--node", "node-b", "web@main"}, &stdout, &stderr, backend); status != 0 {
 		t.Fatalf("status=%d stderr=%q", status, stderr.String())
 	}
 	if backend.migrateTarget.String() != "web@main" || backend.migrateNode != "node-b" || stdout.String() != "web@main\n" {
@@ -689,6 +689,36 @@ type fakeDistributedBackend struct {
 	targetPaused     bool
 }
 
+type fakeElasticNodeBackend struct {
+	*fakeBackend
+	stoppedNode  string
+	stoppedMode  string
+	stoppedLocal bool
+}
+
+func (*fakeElasticNodeBackend) clusterNodes() ([]cluster.NodeRecord, error) { return nil, nil }
+func (b *fakeElasticNodeBackend) stopNode(node, mode string, local bool) ([]selector, error) {
+	b.stoppedNode, b.stoppedMode, b.stoppedLocal = node, mode, local
+	return nil, nil
+}
+func (*fakeElasticNodeBackend) rebalanceNode(string, string, bool) (cluster.FixedTerminalPlan, error) {
+	return cluster.FixedTerminalPlan{}, nil
+}
+func (*fakeElasticNodeBackend) plannerSnapshot(string, bool) (cluster.PlannerSnapshot, error) {
+	return cluster.PlannerSnapshot{}, nil
+}
+
+func TestNodeStopAcceptsPolicyAfterNode(t *testing.T) {
+	b := &fakeElasticNodeBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"node", "stop", "node-b", "--migrate-all"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("node stop status=%d stderr=%q", status, stderr.String())
+	}
+	if b.stoppedNode != "node-b" || b.stoppedMode != "migrate" || b.stoppedLocal {
+		t.Fatalf("node stop call=(%q, %q, %t)", b.stoppedNode, b.stoppedMode, b.stoppedLocal)
+	}
+}
+
 func (b *fakeDistributedBackend) forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error) {
 	b.source = source
 	b.targetNode = targetNode
@@ -933,7 +963,7 @@ func TestReconcileClusterSparseMemoryRootsProtectsNonterminalTransaction(t *test
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "--node", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "web@remote" || !b.targetPaused {
@@ -947,7 +977,7 @@ func TestForkTargetsRemoteNode(t *testing.T) {
 func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@main", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if got, want := b.targetContainers, []string{"web@remote-a", "web@remote-b"}; !reflect.DeepEqual(got, want) {
@@ -961,7 +991,7 @@ func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
 	if !strings.HasPrefix(b.targetContainer, "web@fork-") {
@@ -975,7 +1005,7 @@ func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 func TestForkRejectsQualifiedRemoteDestination(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote@second"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@main", "remote@second"}, &stdout, &stderr, b); status != 0 {
 		if !strings.Contains(stderr.String(), "must be a branch name") {
 			t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 		}
@@ -4884,6 +4914,7 @@ func TestNormalizeCheckpointCommandArgs(t *testing.T) {
 	}{
 		{args: []string{"checkpoint", "--compression=none", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
 		{args: []string{"restore", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
+		{args: []string{"restore", "--node", "node-b", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
 	}
 	for _, test := range tests {
 		got, err := normalizeCheckpointCommandArgs(test.args)
@@ -5262,7 +5293,7 @@ func TestElasticDrainIntentSurvivesRetryAndIsConsumedAfterCompletion(t *testing.
 }
 
 func TestElasticCommandsTakeMutationLock(t *testing.T) {
-	for _, args := range [][]string{{"migrate", "--target", "node-b", "demo@main"}, {"node", "drain", "node-a"}, {"node", "rebalance", "node-a"}} {
+	for _, args := range [][]string{{"migrate", "--node", "node-b", "demo@main"}, {"node", "stop", "--migrate-all", "node-a"}, {"node", "rebalance", "node-a"}} {
 		if !daemonCommandNeedsMutationLock(args) {
 			t.Errorf("%v does not take the mutation lock", args)
 		}
@@ -5320,8 +5351,8 @@ func TestPendingDistributedTargetProtectsHiddenMigrationRuntime(t *testing.T) {
 
 func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 	for _, args := range [][]string{
-		{"node", "drain", "--target", "node-b", "node-a"},
-		{"node", "drain", "--_local", "--target=node-b", "node-a"},
+		{"node", "stop", "--migrate-all", "node-a"},
+		{"node", "stop", "--_local", "--dehydrate-all", "node-a"},
 		{"node", "rebalance", "node-a"},
 	} {
 		owner, err := daemonCommandOwner(t.TempDir(), args)

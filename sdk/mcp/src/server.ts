@@ -124,6 +124,7 @@ export function createServer(client = new Client()): McpServer {
       inputSchema: {
         image: z.string(),
         name: z.string().optional(),
+        node: z.string().optional().describe("Preferred cluster node; omit for scheduler placement"),
         command: z.array(z.string()).default([]),
         detach: z.boolean().default(true),
         waiveLiveFork: z
@@ -139,12 +140,12 @@ export function createServer(client = new Client()): McpServer {
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    async ({ image, name, command, detach, waiveLiveFork, options }) => {
+    async ({ image, name, node, command, detach, waiveLiveFork, options }) => {
       const runOptions = [...options];
       if (detach) runOptions.push("-d");
       if (name) runOptions.push("--name", name);
       if (waiveLiveFork) runOptions.push("--waive-live-fork");
-      return commandResponse(await client.run(image, command, runOptions));
+      return commandResponse(await client.run(image, command, runOptions, node));
     },
   );
 
@@ -279,15 +280,15 @@ export function createServer(client = new Client()): McpServer {
         source: z.string().describe("Full source container@branch selector"),
         destination: z
           .string()
-          .describe("Local branch name, or remote container@branch selector"),
+          .describe("New branch name in the source family"),
         paused: z.boolean().default(false),
-        targetNode: z.string().optional().describe("Configured remote TTC node"),
+        node: z.string().optional().describe("Configured remote TTC node"),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ source, destination, paused, targetNode }) =>
-      commandResponse(
-        await client.fork(source, destination, { paused, targetNode }),
+	async ({ source, destination, paused, node }) =>
+	  commandResponse(
+		await client.fork(source, destination, { paused, node }),
       ),
   );
 
@@ -299,13 +300,13 @@ export function createServer(client = new Client()): McpServer {
         source: z.string().describe("Full source container@branch selector"),
         destinations: z.array(z.string()).min(1),
         paused: z.boolean().default(false),
-        targetNode: z.string().optional().describe("Configured remote TTC node"),
+        node: z.string().optional().describe("Configured remote TTC node"),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ source, destinations, paused, targetNode }) =>
-      commandResponse(
-        await client.forkMany(source, destinations, { paused, targetNode }),
+	async ({ source, destinations, paused, node }) =>
+	  commandResponse(
+		await client.forkMany(source, destinations, { paused, node }),
       ),
   );
 
@@ -315,12 +316,12 @@ export function createServer(client = new Client()): McpServer {
       description: "Move a TTC branch to another elastic-cluster node without changing its identity.",
       inputSchema: {
         target: z.string().describe("Full container@branch selector"),
-        targetNode: z.string().describe("Destination TTC node ID"),
+        node: z.string().describe("Destination TTC node ID"),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ target, targetNode }) =>
-      commandResponse(await client.migrate(target, targetNode)),
+	async ({ target, node }) =>
+	  commandResponse(await client.migrate(target, node)),
   );
 
   server.registerTool(
@@ -334,38 +335,37 @@ export function createServer(client = new Client()): McpServer {
   );
 
   server.registerTool(
-    "ttc_drain_node",
+    "ttc_stop_node",
     {
-      description: "Cordon a node and evacuate all of its TTC branches.",
-      inputSchema: {
-        node: z.string(),
-        targetNode: z.string().optional().describe("Restrict evacuation to one node"),
+      description: "Cordon a node, apply an explicit branch policy, and stop its daemon.",
+	  inputSchema: {
+		node: z.string(),
+		policy: z.enum(["stop", "dehydrate", "migrate"]).optional(),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ node, targetNode }) =>
-      commandResponse(await client.drainNode(node, targetNode)),
+	async ({ node, policy }) =>
+	  commandResponse(await client.stopNode(node, policy)),
   );
 
   server.registerTool(
     "ttc_rebalance_node",
     {
       description: "Relieve a node's configured memory pressure using CoW-aware placement.",
-      inputSchema: {
-        node: z.string(),
-        targetNode: z.string().optional().describe("Restrict placement to one node"),
+	  inputSchema: {
+		node: z.string(),
+		destinationNode: z.string().optional().describe("Restrict placement to one node"),
       },
       annotations: { destructiveHint: true },
     },
-    async ({ node, targetNode }) =>
-      jsonResponse(await client.rebalanceNode(node, targetNode)),
+	async ({ node, destinationNode }) =>
+	  jsonResponse(await client.rebalanceNode(node, destinationNode)),
   );
 
   for (const [name, description] of [
     ["pause", "Pause a running TTC branch."],
     ["resume", "Resume a paused TTC branch."],
     ["dehydrate", "Persist a TTC branch's complete live state and release its runtime."],
-    ["rehydrate", "Restore a dehydrated TTC branch."],
   ] as const) {
     server.registerTool(
       `ttc_${name}`,
@@ -379,13 +379,29 @@ export function createServer(client = new Client()): McpServer {
   }
 
   server.registerTool(
+    "ttc_rehydrate",
+    {
+      description: "Restore a dehydrated TTC branch on a chosen or scheduler-selected node.",
+      inputSchema: {
+        target: z.string(),
+        node: z.string().optional().describe("Preferred cluster node; omit for scheduler placement"),
+      },
+      annotations: { destructiveHint: true, idempotentHint: true },
+    },
+    async ({ target, node }) => commandResponse(await client.rehydrate(target, node)),
+  );
+
+  server.registerTool(
     "ttc_start",
     {
       description: "Start a created or exited TTC branch.",
-      inputSchema: { target: z.string().describe("Full container@branch selector") },
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+        node: z.string().optional().describe("Preferred cluster node; omit for scheduler placement"),
+      },
       annotations: { destructiveHint: true },
     },
-    async ({ target }) => commandResponse(await client.start(target)),
+    async ({ target, node }) => commandResponse(await client.start(target, node)),
   );
 
   server.registerTool(
@@ -466,10 +482,11 @@ export function createServer(client = new Client()): McpServer {
       inputSchema: {
         file: z.string().describe("Checkpoint path on the daemon host"),
         name: z.string().optional(),
+        node: z.string().optional().describe("Preferred cluster node; omit for scheduler placement"),
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    async ({ file, name }) => commandResponse(await client.restore(file, name)),
+    async ({ file, name, node }) => commandResponse(await client.restore(file, name, node)),
   );
 
   server.registerTool(

@@ -79,7 +79,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     assert(listed.tools.some((tool) => tool.name === "ttc_fork_many"));
     assert(listed.tools.some((tool) => tool.name === "ttc_migrate"));
     assert(listed.tools.some((tool) => tool.name === "ttc_nodes"));
-    assert(listed.tools.some((tool) => tool.name === "ttc_drain_node"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_stop_node"));
     assert(listed.tools.some((tool) => tool.name === "ttc_rebalance_node"));
     assert(listed.tools.some((tool) => tool.name === "ttc_checkpoint"));
     assert(listed.tools.some((tool) => tool.name === "ttc_restore"));
@@ -105,13 +105,13 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
         source: "demo@main",
         destinations: ["remote@one", "remote@two"],
         paused: true,
-        targetNode: "node-b",
+        node: "node-b",
       },
     });
     assert.deepEqual(mock.requests[2].args, [
       "fork",
       "--paused",
-      "--target",
+      "--node",
       "node-b",
       "demo@main",
       "remote@one",
@@ -150,12 +150,15 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       arguments: {
         image: "alpine:3.20",
         name: "hosted",
+        node: "node-b",
         options: ["--network=host"],
         waiveLiveFork: true,
       },
     });
     assert.deepEqual(mock.requests[5].args, [
       "run",
+      "--node",
+      "node-b",
       "--network=host",
       "-d",
       "--name",

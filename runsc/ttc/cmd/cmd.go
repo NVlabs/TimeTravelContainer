@@ -211,9 +211,9 @@ Commands:
   load [OPTIONS]                 Load images from a tar archive or standard input
   save [OPTIONS] IMAGE...        Save images to a tar archive or standard output
   commit [OPTIONS] TARGET IMAGE  Commit a branch rootfs as a new OCI image
-  run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
+  run [--node NODE] [OPTIONS] IMAGE [COMMAND] Pull, create, and run a container
   create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
-  start [OPTIONS] TARGET         Start a prepared or exited branch
+  start [--node NODE] [OPTIONS] TARGET Start a prepared or exited branch
   attach [OPTIONS] TARGET        Attach to a branch init or managed exec console
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
@@ -230,11 +230,11 @@ Commands:
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
   stats [--json] TARGET           Show branch/family CoW resource accounting
   tty stat|watch TARGET --session NAME Observe or stream a named terminal
-  fork [--paused] [--quarantine] SOURCE [DEST...] Fork SOURCE into live branches
-  migrate --target NODE TARGET    Move a running branch to another cluster node
+  fork [--node NODE] [--paused] SOURCE [DEST...] Fork SOURCE into live branches
+  migrate --node NODE TARGET     Move a running branch to another cluster node
   node ls [--json]                 List elastic cluster nodes and memory load
-  node drain [--target NODE] NODE  Evacuate a node and reject new placement
-  node rebalance [--target NODE] NODE Relieve a node's configured memory pressure
+  node stop [POLICY] NODE         Evacuate a node and stop its daemon
+  node rebalance [--node NODE] NODE Relieve a node's configured memory pressure
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
@@ -252,14 +252,9 @@ Commands:
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--unsafe-no-host-isolation]
                [--allow-slow-volume-copy]
-               [--cluster-listen ADDR --cluster-node-id ID
-                --cluster-repository-id ID --cluster-cert FILE
-                --cluster-key FILE --cluster-ca FILE]
-		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
-		       [--cluster-memory-target SIZE --cluster-auto-rebalance]
-		       [--cluster-capacity-command PATH | --cluster-capacity-webhook URL]
-		       [--cluster-raft-listen ADDR --cluster-raft-advertise HOST:PORT,SERVER_NAME]
-		       [--cluster-raft-bootstrap | --cluster-peer NODE=https://HOST:PORT,SERVER_NAME]
+               [--cluster-init | --cluster-join HOST:PORT]
+               [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
+               [--memory-target SIZE]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -281,7 +276,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"commit":       "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":         "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"completion":   "Usage: ttc completion bash|zsh|fish",
-			"daemon":       "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
+			"daemon":       "Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [OPTIONS] | status | stop [--migrate-all|--dehydrate-all|--stop-all]",
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
 			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
@@ -296,9 +291,9 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"tty":          "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
 			"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint":   "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
-			"migrate":      "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
-			"node":         "Usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE",
-			"restore":      "Usage: ttc restore [--name NAME] FILE",
+			"migrate":      "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
+			"node":         "Usage: ttc node ls [--json] | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance [--node NODE] NODE",
+			"restore":      "Usage: ttc restore [--node NODE] [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
 			fmt.Fprintln(stdout, text)
@@ -458,14 +453,14 @@ type elasticMigrationBackend interface {
 
 type elasticNodeBackend interface {
 	clusterNodes() ([]cluster.NodeRecord, error)
-	drainNode(sourceNode, targetNode string, local bool) ([]selector, error)
+	stopNode(sourceNode, mode string, local bool) ([]selector, error)
 	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.FixedTerminalPlan, error)
 	plannerSnapshot(node string, local bool) (cluster.PlannerSnapshot, error)
 }
 
 func runNode(args []string, stdout io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE")
+		return errors.New("usage: ttc node ls [--json] | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE")
 	}
 	nodes, ok := backend.(elasticNodeBackend)
 	if !ok {
@@ -504,18 +499,51 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 				formatImageSize(int64(record.IncomingReservedBytes)), lease)
 		}
 		return writer.Flush()
-	case "drain":
-		fs := flag.NewFlagSet("node drain", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		target := fs.String("target", "", "force all branches to one destination node")
-		local := fs.Bool("_local", false, "execute only on the addressed daemon")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+	case "stop":
+		var sourceNode string
+		var stopAll, dehydrateAll, migrateAll, local bool
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--stop-all":
+				stopAll = true
+			case "--dehydrate-all":
+				dehydrateAll = true
+			case "--migrate-all":
+				migrateAll = true
+			case "--_local":
+				local = true
+			default:
+				if strings.HasPrefix(arg, "-") {
+					return fmt.Errorf("unknown node stop option %q", arg)
+				}
+				if sourceNode != "" {
+					return errors.New("usage: ttc node stop NODE [--stop-all|--dehydrate-all|--migrate-all]")
+				}
+				sourceNode = arg
+			}
 		}
-		if fs.NArg() != 1 {
-			return errors.New("usage: ttc node drain [--target NODE] NODE")
+		if sourceNode == "" {
+			return errors.New("usage: ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE")
 		}
-		moved, err := nodes.drainNode(fs.Arg(0), *target, *local)
+		selected := 0
+		for _, enabled := range []bool{stopAll, dehydrateAll, migrateAll} {
+			if enabled {
+				selected++
+			}
+		}
+		if selected > 1 {
+			return errors.New("--stop-all, --dehydrate-all, and --migrate-all are mutually exclusive")
+		}
+		mode := ""
+		switch {
+		case stopAll:
+			mode = "stop"
+		case dehydrateAll:
+			mode = "dehydrate"
+		case migrateAll:
+			mode = "migrate"
+		}
+		moved, err := nodes.stopNode(sourceNode, mode, local)
 		if err != nil {
 			return err
 		}
@@ -526,15 +554,14 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 	case "rebalance":
 		fs := flag.NewFlagSet("node rebalance", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
-		target := fs.String("target", "", "restrict the destination node")
 		local := fs.Bool("_local", false, "execute only on the addressed daemon")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 1 {
-			return errors.New("usage: ttc node rebalance [--target NODE] NODE")
+			return errors.New("usage: ttc node rebalance NODE")
 		}
-		plan, err := nodes.rebalanceNode(fs.Arg(0), *target, *local)
+		plan, err := nodes.rebalanceNode(fs.Arg(0), "", *local)
 		if err != nil {
 			return err
 		}
@@ -564,12 +591,12 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 func runMigrate(args []string, stdout io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	targetNode := fs.String("target", "", "destination cluster node")
+	targetNode := fs.String("node", "", "destination cluster node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *targetNode == "" || fs.NArg() != 1 {
-		return errors.New("usage: ttc migrate --target NODE CONTAINER@BRANCH")
+		return errors.New("usage: ttc migrate --node NODE CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -4164,12 +4191,12 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
 	quarantine := fs.Bool("quarantine", false, "cut the child off from outside the sandbox: its connections stay up and lead nowhere, and nothing outside can tell it exists")
-	targetNode := fs.String("target", "", "fork into a container on another configured ttcd node")
+	targetNode := fs.String("node", "", "fork into a container on another configured ttcd node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: ttc fork [--paused] [--quarantine] [--target NODE] SOURCE [DEST...]")
+		return errors.New("usage: ttc fork [--paused] [--quarantine] [--node NODE] SOURCE [DEST...]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -4180,7 +4207,18 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		generated := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
 		destinationValues = []string{generated}
 	}
-	if *targetNode != "" {
+	selectedNode := *targetNode
+	remote := selectedNode != ""
+	if placer, ok := backend.(distributedForkPlacementBackend); ok && !*quarantine {
+		selectedNode, remote, err = placer.selectForkNode(selectedNode)
+		if err != nil {
+			return fmt.Errorf("selecting a node for fork: %w", err)
+		}
+	}
+	if selectedNode != "" && *quarantine {
+		return errors.New("a quarantined fork stays on this node: omit --node")
+	}
+	if remote {
 		if *quarantine {
 			return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
 		}
@@ -4196,9 +4234,9 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 			}
 			targetContainers[i] = target.String()
 		}
-		targets, err := distributed.forkRemoteMany(source, *targetNode, targetContainers, *paused)
+		targets, err := distributed.forkRemoteMany(source, selectedNode, targetContainers, *paused)
 		if err != nil {
-			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, strings.Join(destinationValues, ", "), err)
+			return fmt.Errorf("forking %s to node %s as %s: %w", source, selectedNode, strings.Join(destinationValues, ", "), err)
 		}
 		for _, target := range targets {
 			fmt.Fprintln(stdout, target)
@@ -5415,6 +5453,9 @@ type runtimeBackend struct {
 	// guest. Detached commands release the lock when the command returns.
 	lifecycleReady   func()
 	publicationQueue *ttcstorage.Queue
+	// daemonStopRequested is set only after a node-stop policy has completed.
+	// The daemon sends the command result before closing its listener.
+	daemonStopRequested bool
 }
 
 func (b *runtimeBackend) signalLifecycleReady() {

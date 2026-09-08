@@ -23,9 +23,10 @@ cross-node cut.
 
 ## Scope and assumptions
 
-Elastic cluster mode assumes mutually trusted mTLS-authenticated `ttcd` nodes,
-one shared `TTC_ROOT`, a common architecture and base-page size, exact daemon
-build compatibility, and reliable host networking. Every node also configures
+Elastic cluster mode assumes an OpenMPI-style trusted private network between
+`ttcd` nodes, optionally protected by one shared `TTC_CLUSTER_TOKEN`, one
+shared `TTC_ROOT`, a common architecture and base-page size, exact daemon build
+compatibility, and reliable host networking. Every node also configures
 a distinct, node-local `TTC_LOCAL_ROOT`. Active filesystems, runtime state,
 mutable metadata, staging data, and caches stay local; immutable image content,
 committed cold manifests and packs live in the shared repository. The Raft WAL,
@@ -305,7 +306,7 @@ Daemons reconcile interrupted source- and target-owned transactions after lease
 expiry, including the boundaries immediately before and after ownership CAS.
 
 * Add daemon-to-daemon command proxying with placement-generation fencing.
-* Implement `ttc migrate CONTAINER@BRANCH --target NODE` without changing
+* Implement `ttc migrate --node NODE CONTAINER@BRANCH` without changing
   branch identity or parent.
 * Transfer the filesystem writer lease atomically and reconnect named exec
   sessions after cutover.
@@ -317,19 +318,19 @@ state, never runs both copies, and survives retries at every boundary.
 ### Phase 3: draining and capacity integration
 
 **Implemented with a durable capacity-provider interface.** `ttc node ls` and
-`ttc node drain` provide dynamic membership diagnostics, admission fencing,
+`ttc node stop --migrate-all` provide dynamic membership diagnostics, admission fencing,
 active and cold branch evacuation, restart-safe retry, and dependency draining.
 A durable per-node intent is written before cordoning. A restarted daemon
 rejoins directly in `draining`, reconciles surviving Sentries, and resumes the
-remaining ownership scan automatically. A drained daemon remains online for
-diagnostics until `ttc daemon stop` marks it offline and consumes the completed
-intent. Drain and rebalance publish a coalesced durable capacity request when
+remaining ownership scan automatically. A completed node stop marks the daemon
+offline, retires its Raft membership, and exits automatically. Stop and
+rebalance publish a coalesced durable capacity request when
 there is no feasible target. A daemon can deliver that request to either an
 executable or an HTTP webhook. Attempts, failures, acceptance, retry timing,
 and a stable idempotency key survive restart. TTC, rather than the provider,
 removes the request after compatible usable capacity appears in membership.
 
-* Add `ttc node drain`, admission control, dependency draining, and offline
+* Add `ttc node stop`, admission control, dependency draining, and offline
   verification.
 * Add executable and webhook adapters over the durable capacity outbox.
   **Implemented.**
@@ -341,7 +342,7 @@ leave without branch loss or repository garbage.
 ### Phase 4: placement planner
 
 **Implemented as a reduced global fixed-terminal planner.** `ttc node
-rebalance`, `ttc node drain`, and the opt-in `--cluster-auto-rebalance` loop use
+rebalance`, `ttc node stop --migrate-all`, and the opt-in automatic-rebalance loop use
 cgroup memory as the hard signal and stable resident page-version identity for
 move selection. Only source branches are variables; all other live nodes are
 queried and represented as fixed terminals even when they are not legal

@@ -56,7 +56,11 @@ ttc.fork_many(
 ttc.migrate("demo@candidate-a", "node-b")?.check()?;
 println!("{}", ttc.nodes()?);
 println!("{}", ttc.rebalance_node("node-a", Some("node-b"))?);
+ttc.stop_node("node-a", Some("migrate"))?.check()?;
 ```
+
+Use `run_on`, `start_on`, `fork_many`, `rehydrate_on`, or `restore_on` to
+request a node. Their ordinary counterparts leave placement to TTC.
 
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
 named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`

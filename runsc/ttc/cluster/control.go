@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -42,6 +43,7 @@ const (
 	controlForkPrefix  = "/v1/forks/"
 	controlProxyPath   = "/v1/daemon"
 	maxControlBody     = 1 << 20
+	controlNodeHeader  = "X-TTC-Node"
 )
 
 // LoadServerTLSConfig constructs a TLS 1.3 configuration that requires a
@@ -105,8 +107,8 @@ type CancelRequest struct {
 }
 
 // RemoteSessionDescriptor is the secret-bearing handoff from the source
-// Sentry page server to the target daemon. It is sent only over mutual TLS and
-// is never stored in the durable transaction record.
+// Sentry page server to the target daemon. It is sent only over the trusted
+// cluster control channel and is never stored in the durable transaction record.
 type RemoteSessionDescriptor struct {
 	Address                string `json:"address"`
 	SnapshotToken          string `json:"snapshot_token"`
@@ -493,7 +495,10 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		}
 		for _, other := range state.Nodes {
 			for _, reservation := range other.IncomingReservations {
-				if reservation.SourceNode == request.NodeID {
+				// A completed reservation only keeps the destination's capacity
+				// charged until its next memory heartbeat. The source no longer
+				// owns it and must not be prevented from retiring.
+				if reservation.SourceNode == request.NodeID && reservation.CompletedAt.IsZero() {
 					writeControlError(w, http.StatusConflict, "node still owns an incoming-capacity reservation")
 					return
 				}
@@ -520,7 +525,10 @@ type ControlPlane struct {
 	Now             func() time.Time
 	TargetRuntime   TargetRuntime
 	Authority       *AuthorityService
-	// CommandProxy forwards the TTC daemon wire protocol after mTLS peer
+	// AuthToken optionally authenticates peers on a trusted plaintext network.
+	// It provides admission control only; it does not provide confidentiality.
+	AuthToken string
+	// CommandProxy forwards the TTC daemon wire protocol after peer
 	// authentication. It is optional for non-elastic deployments.
 	CommandProxy  http.Handler
 	operationMu   sync.Mutex // serializes reservation/quota accounting
@@ -534,14 +542,15 @@ func (c *ControlPlane) lockTransaction(id string) func() {
 	return mu.Unlock
 }
 
-// ServeHTTP serves the versioned reservation/status/cancel API. The HTTP
-// server must use a configuration returned by LoadServerTLSConfig.
+// ServeHTTP serves the versioned reservation/status/cancel API. TTC's daemon
+// uses plaintext HTTP on a trusted private network and may require AuthToken;
+// TLS remains usable by embedders of this package.
 func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if c.Store == nil || c.Now == nil || c.MaxTransactions <= 0 {
 		writeControlError(w, http.StatusServiceUnavailable, "cluster control plane is not configured")
 		return
 	}
-	peer, err := verifiedPeerNodeID(r)
+	peer, err := verifiedPeerNodeID(r, c.AuthToken)
 	if err != nil {
 		writeControlError(w, http.StatusUnauthorized, err.Error())
 		return
@@ -1099,13 +1108,23 @@ func (c *ControlPlane) cancel(w http.ResponseWriter, r *http.Request, id, peer s
 	writeControlJSON(w, http.StatusOK, tx)
 }
 
-func verifiedPeerNodeID(r *http.Request) (string, error) {
-	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
-		return "", errors.New("verified client certificate is required")
+func verifiedPeerNodeID(r *http.Request, token string) (string, error) {
+	if r.TLS != nil && len(r.TLS.VerifiedChains) != 0 && len(r.TLS.VerifiedChains[0]) != 0 {
+		nodeID := r.TLS.VerifiedChains[0][0].Subject.CommonName
+		if nodeID == "" {
+			return "", errors.New("client certificate common name must contain the TTC node ID")
+		}
+		return nodeID, nil
 	}
-	nodeID := r.TLS.VerifiedChains[0][0].Subject.CommonName
+	if token != "" {
+		value := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(value), []byte(token)) != 1 {
+			return "", errors.New("invalid cluster authentication token")
+		}
+	}
+	nodeID := r.Header.Get(controlNodeHeader)
 	if nodeID == "" {
-		return "", errors.New("client certificate common name must contain the TTC node ID")
+		return "", errors.New("cluster peer node identity is required")
 	}
 	return nodeID, nil
 }
@@ -1132,12 +1151,34 @@ func writeControlError(w http.ResponseWriter, status int, message string) {
 	writeControlJSON(w, status, controlError{Error: message})
 }
 
-// Client calls one target ttcd control plane over a mutually authenticated
-// HTTP client.
+// Client calls one target ttcd control plane over HTTP or HTTPS.
 type Client struct {
 	BaseURL    string
 	HTTP       *http.Client
 	streamHTTP *http.Client
+	nodeID     string
+	authToken  string
+}
+
+// NewPlainClient constructs a client for TTC's trusted private-network mode.
+func NewPlainClient(baseURL, nodeID, authToken string, timeout time.Duration) (*Client, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.Path != "" {
+		return nil, fmt.Errorf("invalid plaintext cluster peer URL %q", baseURL)
+	}
+	if nodeID == "" || timeout <= 0 {
+		return nil, errors.New("cluster client requires a node ID and positive timeout")
+	}
+	return &Client{BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: timeout}, streamHTTP: &http.Client{}, nodeID: nodeID, authToken: authToken}, nil
+}
+
+func (c *Client) authenticate(req *http.Request) {
+	if c.nodeID != "" {
+		req.Header.Set(controlNodeHeader, c.nodeID)
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 }
 
 // NewClient constructs a client using tlsConfig for peer authentication.
@@ -1171,6 +1212,7 @@ func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Wri
 		return err
 	}
 	req.Header.Set("Content-Type", "application/vnd.ttc.daemon-stream")
+	c.authenticate(req)
 	// Streaming exec sessions may legitimately outlive the timeout used for
 	// individual transaction RPCs; their context is the lifetime bound.
 	resp, err := c.streamHTTP.Do(req)
@@ -1364,6 +1406,7 @@ func (c *Client) callWithLimit(ctx context.Context, method, path string, request
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.authenticate(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err

@@ -30,18 +30,18 @@ import (
 )
 
 func TestClusterAdvertiseResolution(t *testing.T) {
-	base, name, err := parseClusterAdvertise("https://node-a.example:0,node-a.example")
+	base, name, err := parseClusterAdvertise("node-a.example:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "node-a.example" {
+	if name != "" {
 		t.Fatalf("server name=%q", name)
 	}
 	resolved, err := resolveClusterAdvertise(base, "[::]:17443")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved != "https://node-a.example:17443" {
+	if resolved != "http://node-a.example:17443" {
 		t.Fatalf("resolved URL=%q", resolved)
 	}
 	page, err := advertisedPageAddress(base)
@@ -271,12 +271,9 @@ func TestRecoveredPublisherAdoptsAndUnplacesOldIncarnation(t *testing.T) {
 	}
 }
 
-func TestClusterAdvertiseRejectsUnreachableOrInsecureURLs(t *testing.T) {
+func TestClusterAdvertiseRejectsMalformedOrUnreachableAddresses(t *testing.T) {
 	for _, value := range []string{
-		"http://node-a.example:7443,node-a.example",
-		"https://0.0.0.0:7443,node-a.example",
-		"https://node-a.example,node-a.example",
-		"https://node-a.example:7443/path,node-a.example",
+		"http://node-a.example:7443", "0.0.0.0:7443", "node-a.example", "node-a.example:7443/path",
 	} {
 		if _, _, err := parseClusterAdvertise(value); err == nil {
 			t.Errorf("parseClusterAdvertise(%q) succeeded", value)

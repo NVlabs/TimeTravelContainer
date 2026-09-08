@@ -341,13 +341,11 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	// Route node-wide mutations before taking the receiving daemon's local
 	// lifecycle lock. Otherwise an arbitrary entry node can hold its lock while
 	// the source calls back into it as a migration target, deadlocking cutover.
-	if len(args) >= 3 && args[0] == "node" && (args[1] == "drain" || args[1] == "rebalance" || args[1] == "_planner-resources") {
+	if len(args) >= 3 && args[0] == "node" && (args[1] == "stop" || args[1] == "rebalance" || args[1] == "_planner-resources") {
 		var positional []string
 		for i := 2; i < len(args); i++ {
 			switch {
-			case args[i] == "--target":
-				i++
-			case strings.HasPrefix(args[i], "--target=") || args[i] == "--_local":
+			case args[i] == "--_local" || args[i] == "--stop-all" || args[i] == "--dehydrate-all" || args[i] == "--migrate-all":
 			case strings.HasPrefix(args[i], "-"):
 				// Let runNode diagnose unknown flags on the selected daemon.
 			default:
@@ -2105,7 +2103,7 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 		}
 		args := []string{"node", "rebalance", "--_local"}
 		if targetNode != "" {
-			args = append(args, "--target", targetNode)
+			args = append(args, "--node", targetNode)
 		}
 		args = append(args, sourceNode)
 		status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, args)
@@ -2156,18 +2154,15 @@ func (b *runtimeBackend) rebalanceNode(sourceNode, targetNode string, local bool
 	return plan, nil
 }
 
-// drainNode implements a restart-safe conservative drain. It rejects new
-// placements first, then migrates active branches and transfers cold branch
-// ownership. A failed step leaves the node draining so retry cannot race new
-// work onto it. The daemon remains available for diagnostics until explicitly
-// stopped, at which point its membership record becomes offline.
-func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (moved []selector, retErr error) {
+// stopNode applies an explicit shutdown policy and requests daemon termination
+// only after the node has ceased to own authoritative branch state.
+func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]selector, error) {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
-		return nil, errors.New("elastic node drain requires dynamic cluster discovery")
+		return nil, errors.New("node stop requires distributed mode")
 	}
 	if sourceNode != b.nodeID {
 		if local {
-			return nil, fmt.Errorf("node drain reached %q, want %q", b.nodeID, sourceNode)
+			return nil, fmt.Errorf("node stop reached %q, want %q", b.nodeID, sourceNode)
 		}
 		peer, err := b.distributedSource.peer(sourceNode, false)
 		if err != nil {
@@ -2177,9 +2172,17 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 		if err != nil {
 			return nil, err
 		}
-		args := []string{"node", "drain", "--_local"}
-		if targetNode != "" {
-			args = append(args, "--target", targetNode)
+		args := []string{"node", "stop", "--_local"}
+		switch mode {
+		case "":
+		case "stop":
+			args = append(args, "--stop-all")
+		case "dehydrate":
+			args = append(args, "--dehydrate-all")
+		case "migrate":
+			args = append(args, "--migrate-all")
+		default:
+			return nil, fmt.Errorf("unknown node stop mode %q", mode)
 		}
 		args = append(args, sourceNode)
 		status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, args)
@@ -2196,11 +2199,73 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 			}
 			selected, err := parseSelector(line)
 			if err != nil {
-				return nil, fmt.Errorf("decoding remote drain result %q: %w", line, err)
+				return nil, fmt.Errorf("decoding node stop result %q: %w", line, err)
 			}
 			moved = append(moved, selected)
 		}
 		return moved, nil
+	}
+	// Cordon before applying the requested policy. Otherwise another daemon
+	// could admit work here while stop-all or dehydrate-all is walking the
+	// local inventory.
+	source, err := b.distributedSource.directory.Lookup(sourceNode)
+	if err != nil {
+		return nil, err
+	}
+	if !source.LeaseActive(time.Now()) {
+		return nil, fmt.Errorf("source node %q lease is expired or offline", sourceNode)
+	}
+	if source.State != cluster.NodeReady && source.State != cluster.NodePressured && source.State != cluster.NodeDraining {
+		return nil, fmt.Errorf("node %q cannot stop from state %s", sourceNode, source.State)
+	}
+	if source.State != cluster.NodeDraining {
+		lease := source.LeaseExpiresAt.Sub(source.UpdatedAt)
+		if _, err := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, cluster.NodeDraining, time.Now(), lease); err != nil {
+			return nil, fmt.Errorf("cordoning node %q: %w", sourceNode, err)
+		}
+	}
+
+	switch mode {
+	case "":
+		if err := rejectActiveDaemonContainers(b); err != nil {
+			return nil, err
+		}
+	case "stop":
+		if err := stopDaemonContainers(b); err != nil {
+			return nil, err
+		}
+	case "dehydrate":
+		if err := dehydrateDaemonContainers(b); err != nil {
+			return nil, err
+		}
+	case "migrate":
+	default:
+		return nil, fmt.Errorf("unknown node stop mode %q", mode)
+	}
+	if b.publicationQueue != nil && mode != "migrate" {
+		if err := b.publicationQueue.Drain(context.Background()); err != nil {
+			return nil, fmt.Errorf("waiting for durable branch publication: %w", err)
+		}
+	}
+	moved, err := b.drainNode(sourceNode, "")
+	if err != nil {
+		return moved, err
+	}
+	b.daemonStopRequested = true
+	return moved, nil
+}
+
+// drainNode implements the owner-local, restart-safe evacuation used by node
+// stop and crash recovery. It rejects new
+// placements first, then migrates active branches and transfers cold branch
+// ownership. A failed step leaves the node draining so retry cannot race new
+// work onto it.
+func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selector, retErr error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return nil, errors.New("elastic node drain requires dynamic cluster discovery")
+	}
+	if sourceNode != b.nodeID {
+		return nil, fmt.Errorf("internal evacuation reached %q, want %q", b.nodeID, sourceNode)
 	}
 
 	source, err := b.distributedSource.directory.Lookup(b.nodeID)
@@ -2228,6 +2293,35 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 			return nil, fmt.Errorf("cordoning node %q: %w", b.nodeID, err)
 		}
 	}
+	// stop-all and dehydrate-all publish their process-free state and release
+	// placement ownership before they reach this point. An empty node can stop
+	// without requiring a second node merely to accept no work.
+	containers, err := b.containerStore().ListContainers()
+	if err != nil {
+		return nil, err
+	}
+	ownsBranches := false
+	for _, info := range containers {
+		for _, branch := range info.Branches {
+			if info.BranchNodeID(branch.ID) == b.nodeID {
+				ownsBranches = true
+				break
+			}
+		}
+		if ownsBranches {
+			break
+		}
+	}
+	if !ownsBranches {
+		transactionStore, err := b.transactionCatalog()
+		if err != nil {
+			return nil, err
+		}
+		if err := drainSourceDependencies(b, b.distributedSource, transactionStore, b.nodeID); err != nil {
+			return nil, fmt.Errorf("draining remote page dependencies: %w", err)
+		}
+		return nil, nil
+	}
 	targets, err := b.drainTargets(targetNode)
 	if err != nil {
 		request, requestErr := b.emitCapacityRequest(*source, "node-drain")
@@ -2254,7 +2348,7 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 		}
 		moved = append(moved, selected)
 	}
-	containers, err := b.containerStore().ListContainers()
+	containers, err = b.containerStore().ListContainers()
 	if err != nil {
 		return nil, err
 	}
@@ -2301,25 +2395,21 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string, local bool) (m
 }
 
 func parseClusterAdvertise(value string) (baseURL, serverName string, err error) {
-	comma := strings.LastIndexByte(value, ',')
-	if comma <= 0 || comma == len(value)-1 {
-		return "", "", fmt.Errorf("invalid --cluster-advertise %q; want https://HOST:PORT,SERVER_NAME", value)
+	if strings.ContainsAny(value, "/?#") {
+		return "", "", fmt.Errorf("invalid --cluster-advertise %q; want HOST:PORT", value)
 	}
-	baseURL, serverName = value[:comma], value[comma+1:]
-	if strings.TrimSpace(serverName) != serverName || serverName == "" {
-		return "", "", fmt.Errorf("invalid TLS server name in --cluster-advertise %q", value)
+	if _, _, err := net.SplitHostPort(value); err != nil {
+		return "", "", fmt.Errorf("invalid --cluster-advertise %q; want HOST:PORT", value)
 	}
+	baseURL = "http://" + value
 	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", "", fmt.Errorf("invalid --cluster-advertise URL %q", baseURL)
-	}
 	if parsed.Port() == "" {
 		return "", "", fmt.Errorf("--cluster-advertise URL %q must include a port", baseURL)
 	}
 	if host := parsed.Hostname(); host == "" || host == "0.0.0.0" || host == "::" {
 		return "", "", fmt.Errorf("--cluster-advertise URL %q must name a reachable host", baseURL)
 	}
-	return baseURL, serverName, nil
+	return baseURL, "", nil
 }
 
 func resolveClusterAdvertise(baseURL, listenerAddress string) (string, error) {
@@ -2980,7 +3070,7 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 				return recoverErr
 			}
 			var drainErr error
-			moved, drainErr = backend.drainNode(nodeID, intent.TargetNode, true)
+			moved, drainErr = backend.drainNode(nodeID, intent.TargetNode)
 			return drainErr
 		})
 		if err != nil {

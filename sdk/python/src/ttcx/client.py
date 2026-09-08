@@ -349,11 +349,11 @@ class Client:
     def pull(self, image: str) -> Result:
         return self.command(["pull", image])
 
-    def run(self, image: str, command: Sequence[str] = (), *, options: Sequence[str] = ()) -> Result:
-        return self.command(["run", *options, image, *command])
+    def run(self, image: str, command: Sequence[str] = (), *, options: Sequence[str] = (), node: str | None = None) -> Result:
+        return self.command(["run", *(["--node", node] if node else []), *options, image, *command])
 
-    def start(self, target: str) -> Result:
-        return self.command(["start", target])
+    def start(self, target: str, *, node: str | None = None) -> Result:
+        return self.command(["start", *(["--node", node] if node else []), target])
 
     def exec(self, target: str, command: Sequence[str], *, input: bytes | str | None = None) -> Result:
         return self.command(["exec", target, *command], input=input)
@@ -461,10 +461,10 @@ class Client:
         destination: str,
         *,
         paused: bool = False,
-        target_node: str | None = None,
+        node: str | None = None,
     ) -> Result:
         return self.fork_many(
-            source, [destination], paused=paused, target_node=target_node
+            source, [destination], paused=paused, node=node
         )
 
     def fork_many(
@@ -473,35 +473,35 @@ class Client:
         destinations: Sequence[str],
         *,
         paused: bool = False,
-        target_node: str | None = None,
+        node: str | None = None,
     ) -> Result:
         if not destinations:
             raise ValueError("destinations must not be empty")
         args = ["fork"]
         if paused:
             args.append("--paused")
-        if target_node is not None:
-            args.extend(["--target", target_node])
+        if node is not None:
+            args.extend(["--node", node])
         return self.command([*args, source, *destinations])
 
-    def migrate(self, target: str, target_node: str) -> Result:
+    def migrate(self, target: str, node: str) -> Result:
         """Move a branch to another elastic-cluster node without renaming it."""
-        return self.command(["migrate", "--target", target_node, target])
+        return self.command(["migrate", "--node", node, target])
 
     def nodes(self) -> Any:
         """Return dynamic cluster membership and current memory accounting."""
         return self.command(["node", "ls", "--json"], check=True).json()
 
-    def drain_node(self, node: str, *, target_node: str | None = None) -> Result:
-        args = ["node", "drain"]
-        if target_node is not None:
-            args.extend(["--target", target_node])
-        return self.command([*args, node])
+    def stop_node(self, node: str, *, policy: str | None = None) -> Result:
+        if policy not in (None, "stop", "dehydrate", "migrate"):
+            raise ValueError("policy must be stop, dehydrate, migrate, or None")
+        option = f"--{policy}-all" if policy else None
+        return self.command(["node", "stop", *([option] if option else []), node])
 
-    def rebalance_node(self, node: str, *, target_node: str | None = None) -> Any:
+    def rebalance_node(self, node: str, *, destination_node: str | None = None) -> Any:
         args = ["node", "rebalance"]
-        if target_node is not None:
-            args.extend(["--target", target_node])
+        if destination_node is not None:
+            args.extend(["--node", destination_node])
         return self.command([*args, node], check=True).json()
 
     def pause(self, target: str) -> Result:
@@ -521,8 +521,8 @@ class Client:
     def dehydrate(self, target: str) -> Result:
         return self.command(["dehydrate", target])
 
-    def rehydrate(self, target: str) -> Result:
-        return self.command(["rehydrate", target])
+    def rehydrate(self, target: str, *, node: str | None = None) -> Result:
+        return self.command(["rehydrate", *(["--node", node] if node else []), target])
 
     def checkpoint(
         self,
@@ -537,10 +537,10 @@ class Client:
         )
 
     def restore(
-        self, file: str | os.PathLike[str], *, name: str | None = None
+        self, file: str | os.PathLike[str], *, name: str | None = None, node: str | None = None
     ) -> Result:
         source = str(Path(file).expanduser().resolve())
-        return self.command(["restore", *(["--name", name] if name else []), source])
+        return self.command(["restore", *(["--node", node] if node else []), *(["--name", name] if name else []), source])
 
     def stop(self, target: str, *, timeout: int | None = None) -> Result:
         return self.command(

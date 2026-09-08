@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -124,14 +125,18 @@ func (r NodeRecord) Validate() error {
 		return fmt.Errorf("capability node %q does not match record node %q", r.Capabilities.NodeID, r.NodeID)
 	}
 	parsed, err := url.Parse(r.ControlURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("invalid node control URL %q", r.ControlURL)
 	}
-	if strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName {
+	if parsed.Scheme == "https" && (strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName) {
 		return fmt.Errorf("invalid control TLS server name %q", r.ControlServerName)
 	}
 	if r.RaftAddress != "" {
-		if _, _, err := parseRaftAddress(r.RaftAddress); err != nil {
+		if strings.Contains(r.RaftAddress, "@") {
+			if _, _, err := parseRaftAddress(r.RaftAddress); err != nil {
+				return fmt.Errorf("invalid node Raft address: %w", err)
+			}
+		} else if _, _, err := net.SplitHostPort(r.RaftAddress); err != nil {
 			return fmt.Errorf("invalid node Raft address: %w", err)
 		}
 	}

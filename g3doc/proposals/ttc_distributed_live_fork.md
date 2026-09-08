@@ -264,7 +264,8 @@ The source `ttcd` coordinates a distributed-fork transaction with the target
 4. Creates a `RemoteSnapshot`, resumes A with CoW protection in place, and
    exports its packed page stream into a temporary shared file.
 5. Syncs and atomically publishes the shared snapshot, then sends B the small
-   metadata envelope and relative snapshot path over mutual TLS.
+   metadata envelope and relative snapshot path over the authenticated cluster
+   control channel.
 6. Constructs B with an asynchronous reader backed by the shared snapshot and
    publishes it as paused or running.
 7. Marks the transaction source-independent and releases A's `RemoteSnapshot`.
@@ -613,15 +614,14 @@ budget selected below.
   independence separate. A private per-daemon store atomically persists each
   revision, rejects stale writers, reloads after restart, and permits deletion
   only after a terminal state.
-* A TLS 1.3 control plane now requires CA-verified client certificates and
-  binds the certificate common name to the claimed TTC node ID. Its bounded
-  JSON API supports idempotent hidden-target reservation, reconnect-safe
-  status, and revisioned cancellation; per-target active transaction quotas
-  are enforced before reservation. `ttcd` and `ttc daemon start` now accept
-  the cluster listen/node/repository/certificate/key/CA/quota configuration,
-  start the peer listener only with a complete configuration, report its
-  capabilities through daemon status, and shut it down with the local daemon.
-* `ttc fork --target` publishes a restored target through the ordinary TTC API;
+* The control plane uses plaintext TCP on a trusted private cluster network.
+  `TTC_CLUSTER_TOKEN` optionally authenticates HTTP control requests and Raft
+  streams. Its bounded JSON API supports idempotent hidden-target reservation,
+  reconnect-safe status, and revisioned cancellation; per-target active
+  transaction quotas are enforced before reservation. `ttc daemon start`
+  exposes a small bootstrap/join interface while cluster-wide transport policy
+  is created once and adopted by later nodes.
+* `ttc fork --node` publishes a restored target through the ordinary TTC API;
   the language SDKs use the same versioned daemon command contract.
 * Filesystem publication is transactional on the common repository and target
   cleanup is idempotent.
@@ -643,7 +643,7 @@ references nor filesystem transaction debris.
   transaction. Final pull, push, ACK, byte, page-release, and independence-time
   counters are committed atomically with the independent transition.
 * `tools/ttc/distributed_benchmark` runs two real daemons with independent
-  runtime roots, short-lived mutual-TLS identities, a shared repository, an
+  runtime roots, an optional shared cluster token, a shared repository, an
   unmodified OCI image, and an in-container page workload. It supports
   `tc netem` delay, rate, and loss, emits raw JSONL, and verifies both source
   and target after every fork.
@@ -682,7 +682,7 @@ experimental target, not a correctness requirement.
 
 ### Phase 6: multiple children and advanced transports
 
-`ttc fork --target NODE SOURCE CHILD...` now creates all requested siblings
+`ttc fork --node NODE SOURCE CHILD...` now creates all requested siblings
 from one atomic source pause and one kernel-metadata capture. The allocator
 adds one physical snapshot reference per source page, not one per child. Each
 child has its own release bitmap, leases, metrics, page session, filesystem

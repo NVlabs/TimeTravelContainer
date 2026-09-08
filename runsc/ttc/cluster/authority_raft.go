@@ -16,7 +16,9 @@ package cluster
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,7 @@ type AuthorityRaftOptions struct {
 	ServerName    string
 	ServerTLS     *tls.Config
 	ClientTLS     *tls.Config
+	AuthToken     string
 	Bootstrap     bool
 	ApplyTimeout  time.Duration
 }
@@ -171,32 +174,100 @@ func parseRaftAddress(address string) (serverName, host string, err error) {
 	return serverName, host, nil
 }
 
-type authorityTLSStreamLayer struct {
+func validateRaftServerAddress(address string) error {
+	if strings.Contains(address, "@") {
+		_, _, err := parseRaftAddress(address)
+		return err
+	}
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		return fmt.Errorf("invalid Raft address %q: %w", address, err)
+	}
+	return nil
+}
+
+type authorityStreamLayer struct {
 	net.Listener
 	advertise authorityRaftAddress
 	clientTLS *tls.Config
+	authToken string
 }
 
-func (l *authorityTLSStreamLayer) Addr() net.Addr { return l.advertise }
+func (l *authorityStreamLayer) Addr() net.Addr { return l.advertise }
 
-func (l *authorityTLSStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
-	serverName, host, err := parseRaftAddress(string(address))
-	if err != nil {
-		return nil, err
+func (l *authorityStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	host := string(address)
+	serverName := ""
+	var err error
+	if l.clientTLS != nil {
+		serverName, host, err = parseRaftAddress(host)
+		if err != nil {
+			return nil, err
+		}
 	}
 	dialer := &net.Dialer{Timeout: timeout}
-	plain, err := dialer.Dial("tcp", host)
+	connection, err := dialer.Dial("tcp", host)
 	if err != nil {
 		return nil, err
 	}
-	config := l.clientTLS.Clone()
-	config.ServerName = serverName
-	connection := tls.Client(plain, config)
-	if err := connection.Handshake(); err != nil {
-		plain.Close()
+	if l.clientTLS != nil {
+		config := l.clientTLS.Clone()
+		config.ServerName = serverName
+		tlsConnection := tls.Client(connection, config)
+		if err := tlsConnection.Handshake(); err != nil {
+			connection.Close()
+			return nil, err
+		}
+		connection = tlsConnection
+	}
+	if err := writeRaftToken(connection, l.authToken); err != nil {
+		connection.Close()
 		return nil, err
 	}
 	return connection, nil
+}
+
+func (l *authorityStreamLayer) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if err := readRaftToken(connection, l.authToken); err != nil {
+		connection.Close()
+		return nil, err
+	}
+	return connection, nil
+}
+
+func writeRaftToken(w io.Writer, token string) error {
+	if len(token) > 4096 {
+		return errors.New("cluster authentication token is too long")
+	}
+	var size [2]byte
+	binary.BigEndian.PutUint16(size[:], uint16(len(token)))
+	if _, err := w.Write(size[:]); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, token)
+	return err
+}
+
+func readRaftToken(r io.Reader, want string) error {
+	var size [2]byte
+	if _, err := io.ReadFull(r, size[:]); err != nil {
+		return err
+	}
+	n := int(binary.BigEndian.Uint16(size[:]))
+	if n > 4096 {
+		return errors.New("cluster authentication token is too long")
+	}
+	got := make([]byte, n)
+	if _, err := io.ReadFull(r, got); err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare(got, []byte(want)) != 1 {
+		return errors.New("invalid cluster authentication token")
+	}
+	return nil
 }
 
 // AuthorityRaftNode owns the consensus engine and node-local durable log.
@@ -221,8 +292,11 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	if options.LocalDir == "" || !filepath.IsAbs(options.LocalDir) {
 		return nil, errors.New("Raft local directory must be an absolute node-local path")
 	}
-	if options.ListenAddress == "" || options.AdvertiseHost == "" || options.ServerTLS == nil || options.ClientTLS == nil {
-		return nil, errors.New("Raft listen, advertise, and mutual TLS configuration are required")
+	if options.ListenAddress == "" || options.AdvertiseHost == "" {
+		return nil, errors.New("Raft listen and advertise addresses are required")
+	}
+	if (options.ServerTLS == nil) != (options.ClientTLS == nil) {
+		return nil, errors.New("Raft server and client TLS must be configured together")
 	}
 	if err := os.MkdirAll(options.LocalDir, 0700); err != nil {
 		return nil, err
@@ -240,13 +314,19 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 		}
 		advertiseHost = net.JoinHostPort(host, actualPort)
 	}
-	advertise, err := raftAddress(options.ServerName, advertiseHost)
-	if err != nil {
-		plainListener.Close()
-		return nil, err
+	advertise := advertiseHost
+	listener := net.Listener(plainListener)
+	var clientTLS *tls.Config
+	if options.ServerTLS != nil {
+		advertise, err = raftAddress(options.ServerName, advertiseHost)
+		if err != nil {
+			plainListener.Close()
+			return nil, err
+		}
+		listener = tls.NewListener(plainListener, options.ServerTLS.Clone())
+		clientTLS = options.ClientTLS.Clone()
 	}
-	tlsListener := tls.NewListener(plainListener, options.ServerTLS.Clone())
-	stream := &authorityTLSStreamLayer{Listener: tlsListener, advertise: authorityRaftAddress(advertise), clientTLS: options.ClientTLS.Clone()}
+	stream := &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(advertise), clientTLS: clientTLS, authToken: options.AuthToken}
 	transport := raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 		Stream: stream, MaxPool: 4, MaxRPCsInFlight: 2, Timeout: 10 * time.Second,
 	})
@@ -502,7 +582,7 @@ func (n *AuthorityRaftNode) AddNonvoter(ctx context.Context, id, address string)
 	if !transactionIDPattern.MatchString(id) {
 		return fmt.Errorf("invalid Raft member ID %q", id)
 	}
-	if _, _, err := parseRaftAddress(address); err != nil {
+	if err := validateRaftServerAddress(address); err != nil {
 		return err
 	}
 	return n.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
@@ -631,9 +711,13 @@ func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
 			if err := n.raft.LeadershipTransferToServer(voter.ID, voter.Address).Error(); err != nil {
 				return fmt.Errorf("transferring Raft leadership before retirement: %w", err)
 			}
-			break
+			// LeadershipTransferToServer waits for the handoff, but LeaderID's
+			// observation may lag the completed future. Return the exact voter
+			// selected above so the retiring daemon can ask that node to commit
+			// RemoveServer without ever depending on the stale observation.
+			return &AuthorityNotLeaderError{LeaderID: string(voter.ID), Leader: string(voter.Address)}
 		}
-		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+		return errors.New("retiring Raft leader has no replacement voter")
 	}
 	return n.RemoveMember(ctx, id)
 }

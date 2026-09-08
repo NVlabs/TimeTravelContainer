@@ -18,12 +18,77 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
 )
+
+func TestAuthorityPlainStreamToken(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(listener.Addr().String()), authToken: "secret"}
+	client := &authorityStreamLayer{authToken: "secret"}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := server.Accept()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := client.Dial(raft.ServerAddress(listener.Addr().String()), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("accepting matching token: %v", err)
+	}
+	_ = listener.Close()
+
+	listener, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server = &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(listener.Addr().String()), authToken: "secret"}
+	client = &authorityStreamLayer{authToken: "wrong"}
+	accepted = make(chan error, 1)
+	go func() {
+		conn, err := server.Accept()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err = client.Dial(raft.ServerAddress(listener.Addr().String()), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if err := <-accepted; err == nil || !strings.Contains(err.Error(), "authentication token") {
+		t.Fatalf("accepting wrong token error=%v", err)
+	}
+}
+
+func TestValidateRaftServerAddress(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:7444", "node-a@127.0.0.1:7444"} {
+		if err := validateRaftServerAddress(address); err != nil {
+			t.Errorf("validateRaftServerAddress(%q): %v", address, err)
+		}
+	}
+	for _, address := range []string{"", "127.0.0.1", "@127.0.0.1:7444"} {
+		if err := validateRaftServerAddress(address); err == nil {
+			t.Errorf("validateRaftServerAddress(%q) unexpectedly succeeded", address)
+		}
+	}
+}
 
 func newAuthorityRaftTLS(t *testing.T) (*tls.Config, *tls.Config) {
 	t.Helper()

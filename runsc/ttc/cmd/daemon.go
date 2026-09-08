@@ -18,7 +18,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -89,7 +88,7 @@ const repositoryMaintenanceInterval = 5 * time.Minute
 
 const (
 	daemonRootFormatVersion        = 1
-	daemonClusterRootFormatVersion = 2
+	daemonClusterRootFormatVersion = 3
 )
 
 var (
@@ -137,6 +136,91 @@ type daemonPlacementClaim struct {
 	// durable process-free branch into a runtime. Materializing ownership never
 	// authorizes any command that can execute guest code.
 	AllowMaterializing bool `json:"allow_materializing,omitempty"`
+}
+
+// extractPlacementNode removes the user-facing --node admission constraint
+// from commands whose execution location is selected before command parsing.
+// Fork and migrate consume --node themselves because their source must first
+// be routed to its current owner. A literal "--" ends TTC option parsing and
+// protects command arguments that happen to be named --node.
+func extractPlacementNode(args []string) ([]string, string, error) {
+	if len(args) == 0 {
+		return args, "", nil
+	}
+	command := args[0]
+	if command == "container" {
+		if len(args) < 2 {
+			return args, "", nil
+		}
+		command = args[1]
+	}
+	switch command {
+	case "run", "start", "restore", "rehydrate":
+	default:
+		return args, "", nil
+	}
+	optionStart := 1
+	if args[0] == "container" {
+		optionStart = 2
+	}
+	clean := append([]string(nil), args[:optionStart]...)
+	node := ""
+	for i := optionStart; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		// Go's flag package stops at the first positional operand. Honor the
+		// same boundary so `ttc run IMAGE command --node value` passes that
+		// argument to the guest instead of changing cluster placement.
+		if arg == "" || arg[0] != '-' || arg == "-" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		value := ""
+		matched := false
+		switch {
+		case arg == "--node":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return nil, "", errors.New("--node requires a node name")
+			}
+			i++
+			value, matched = args[i], true
+		case strings.HasPrefix(arg, "--node="):
+			value, matched = strings.TrimPrefix(arg, "--node="), true
+			if value == "" {
+				return nil, "", errors.New("--node requires a node name")
+			}
+		}
+		if matched {
+			if node != "" && node != value {
+				return nil, "", fmt.Errorf("conflicting --node values %q and %q", node, value)
+			}
+			node = value
+			continue
+		}
+		clean = append(clean, arg)
+		if placementOptionConsumesValue(command, arg) && !strings.Contains(arg, "=") && i+1 < len(args) {
+			i++
+			clean = append(clean, args[i])
+		}
+	}
+	return clean, node, nil
+}
+
+func placementOptionConsumesValue(command, arg string) bool {
+	name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+	switch command {
+	case "restore":
+		return name == "name"
+	case "run":
+		switch name {
+		case "name", "pull", "workdir", "w", "user", "u", "hostname", "h", "network", "net", "ip", "mac-address", "publish", "p", "add-host", "dns", "dns-search", "dns-option", "dns-opt", "entrypoint", "stop-signal", "stop-timeout", "pids-limit", "memory", "m", "cpus", "cpu-shares", "cpu-period", "cpu-quota", "shm-size", "group-add", "cap-add", "cap-drop", "ulimit", "env", "e", "env-file", "label", "l", "label-file", "volume", "v", "mount", "tmpfs", "log-driver", "log-opt":
+			return true
+		}
+	}
+	return false
 }
 
 type daemonServer struct {
@@ -194,10 +278,8 @@ type daemonClusterOptions struct {
 	Listen          string
 	NodeID          string
 	RepositoryID    string
-	CertFile        string
-	KeyFile         string
-	CAFile          string
 	Advertise       string
+	AuthToken       string
 	MemoryTarget    uint64
 	AutoRebalance   bool
 	CapacityCommand string
@@ -223,7 +305,7 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 
 type daemonClusterRuntime struct {
 	listen        string
-	tlsConfig     *tls.Config
+	authToken     string
 	controlPlane  *cluster.ControlPlane
 	source        *distributedSourceRuntime
 	directory     cluster.NodeCatalog
@@ -1556,7 +1638,7 @@ func rejectActiveDaemonContainers(backend backend) error {
 	}
 	if len(active) != 0 {
 		sort.Strings(active)
-		return fmt.Errorf("managed branches are still active: %s; use --dehydrate-all or --stop-all", strings.Join(active, ", "))
+		return fmt.Errorf("managed branches are still active: %s; use --migrate-all, --dehydrate-all, or --stop-all", strings.Join(active, ", "))
 	}
 	return nil
 }
@@ -1865,6 +1947,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
 	}
+	if clusterOpts.Configured {
+		if err := resolveSimpleClusterOptions(&clusterOpts, roots); err != nil {
+			fmt.Fprintf(stderr, "ttcd: configuring cluster identity: %v\n", err)
+			return 2
+		}
+	}
 	daemonDataRoot := roots.shared
 	daemonRoot := roots.runtime
 	daemonRunsc, err := os.Executable()
@@ -1956,6 +2044,85 @@ type daemonRoots struct {
 	shared  string
 	local   string
 	runtime string
+}
+
+func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) error {
+	if opts.RaftBootstrap && len(opts.Peers) != 0 {
+		return errors.New("--cluster-init and --cluster-join are mutually exclusive")
+	}
+	if opts.Listen == "" {
+		opts.Listen = "0.0.0.0:7443"
+	}
+	if opts.NodeID == "" {
+		path := filepath.Join(roots.local, ".ttc-root-format")
+		if data, err := os.ReadFile(path); err == nil {
+			var marker daemonRootMarker
+			if err := json.Unmarshal(data, &marker); err != nil {
+				return err
+			}
+			opts.NodeID = marker.NodeID
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		} else {
+			id, err := newDaemonRequestID()
+			if err != nil {
+				return err
+			}
+			opts.NodeID = "node-" + strings.TrimPrefix(id, "req-")
+		}
+	}
+	if opts.RepositoryID == "" {
+		markerPath := filepath.Join(roots.shared, ".ttc-root-format")
+		if data, err := os.ReadFile(markerPath); err == nil {
+			var marker daemonRootMarker
+			if err := json.Unmarshal(data, &marker); err != nil {
+				return err
+			}
+			opts.RepositoryID = marker.RepositoryID
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		} else if opts.RaftBootstrap {
+			id, err := newDaemonRequestID()
+			if err != nil {
+				return err
+			}
+			opts.RepositoryID = "repo-" + strings.TrimPrefix(id, "req-")
+		} else {
+			return errors.New("joining a cluster requires an initialized shared TTC_ROOT")
+		}
+	}
+	host, port, err := net.SplitHostPort(opts.Listen)
+	if err != nil {
+		return fmt.Errorf("invalid --listen %q: %w", opts.Listen, err)
+	}
+	advertiseHost, advertisePort := "", port
+	if opts.Advertise == "" {
+		advertiseHost, err = os.Hostname()
+		if err != nil || advertiseHost == "" {
+			return errors.New("cannot derive cluster advertise hostname; set --advertise")
+		}
+		opts.Advertise = net.JoinHostPort(advertiseHost, port)
+	} else {
+		advertiseHost, advertisePort, err = net.SplitHostPort(opts.Advertise)
+		if err != nil {
+			return fmt.Errorf("invalid --advertise %q: %w", opts.Advertise, err)
+		}
+	}
+	if opts.RaftListen == "" {
+		opts.RaftListen = net.JoinHostPort(host, adjacentPort(port))
+	}
+	if opts.RaftAdvertise == "" {
+		opts.RaftAdvertise = net.JoinHostPort(advertiseHost, adjacentPort(advertisePort))
+	}
+	return nil
+}
+
+func adjacentPort(port string) string {
+	value, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || value == 0 || value == 65535 {
+		return "0"
+	}
+	return strconv.FormatUint(value+1, 10)
 }
 
 // daemonRootsFromEnvironment is the only source of daemon storage paths.
@@ -2123,6 +2290,11 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return 1, nil
 	}
+	if args[0] == "--cluster-init" {
+		opts.RaftBootstrap = true
+		opts.Configured = true
+		return 1, nil
+	}
 	setString := func(name string, dst *string) (int, error) {
 		if args[0] == name {
 			if len(args) < 2 || args[1] == "" {
@@ -2154,11 +2326,20 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return consumed, nil
 	}
+	var clusterJoin string
+	if consumed, err := setString("--cluster-join", &clusterJoin); consumed != 0 || err != nil {
+		if err != nil {
+			return consumed, err
+		}
+		opts.Peers = append(opts.Peers, "seed="+clusterJoin)
+		opts.Configured = true
+		return consumed, nil
+	}
 	for name, dst := range map[string]*string{
 		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
-		"--cluster-repository-id": &opts.RepositoryID, "--cluster-cert": &opts.CertFile,
-		"--cluster-key": &opts.KeyFile, "--cluster-ca": &opts.CAFile,
-		"--cluster-advertise":        &opts.Advertise,
+		"--listen": &opts.Listen, "--node": &opts.NodeID,
+		"--cluster-repository-id": &opts.RepositoryID,
+		"--cluster-advertise":     &opts.Advertise, "--advertise": &opts.Advertise,
 		"--cluster-capacity-command": &opts.CapacityCommand,
 		"--cluster-capacity-webhook": &opts.CapacityWebhook,
 		"--cluster-page-listen":      &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
@@ -2214,6 +2395,18 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		parsed, err := ttcbundle.ParseShmSize(value)
 		if err != nil || parsed <= 0 {
 			return 0, fmt.Errorf("--cluster-memory-target must be a positive byte size")
+		}
+		opts.MemoryTarget = uint64(parsed)
+		opts.Configured = true
+		return consumed, nil
+	}
+	if value, consumed, matched, err := optionValue("--memory-target"); matched {
+		if err != nil {
+			return 0, err
+		}
+		parsed, err := ttcbundle.ParseShmSize(value)
+		if err != nil || parsed <= 0 {
+			return 0, errors.New("--memory-target must be a positive byte size")
 		}
 		opts.MemoryTarget = uint64(parsed)
 		opts.Configured = true
@@ -2309,9 +2502,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	if opts.LeaseDuration == 0 {
 		opts.LeaseDuration = 15 * time.Second
 	}
-	if opts.Listen == "" || opts.Advertise == "" || opts.NodeID == "" || opts.RepositoryID == "" || opts.CertFile == "" || opts.KeyFile == "" || opts.CAFile == "" {
-		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, repository ID, certificate, key, and CA")
+	if opts.Listen == "" || opts.Advertise == "" || opts.NodeID == "" || opts.RepositoryID == "" {
+		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, and repository ID")
 	}
+	opts.AuthToken = os.Getenv("TTC_CLUSTER_TOKEN")
 	if opts.RaftListen == "" || opts.RaftAdvertise == "" {
 		return nil, errors.New("cluster mode requires --cluster-raft-listen and --cluster-raft-advertise")
 	}
@@ -2323,6 +2517,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	}
 	if !opts.RaftBootstrap && !localRaftState && len(opts.Peers) == 0 {
 		return nil, errors.New("a new Raft member requires --cluster-peer; use --cluster-raft-bootstrap only for the first node")
+	}
+	if err := applyImmutableClusterConfig(dataRoot, opts.RaftBootstrap, localRaftState, &opts); err != nil {
+		return nil, err
 	}
 	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID, opts.RaftBootstrap, localRaftState)
 	if err != nil {
@@ -2367,10 +2564,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	if opts.PagingPolicy.TransferBytes < pgalloc.SparseChunkBytes {
 		return nil, fmt.Errorf("cluster transfer size %d is smaller than TTC's %d-byte atomic memory chunk", opts.PagingPolicy.TransferBytes, pgalloc.SparseChunkBytes)
 	}
-	tlsConfig, err := cluster.LoadServerTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile)
-	if err != nil {
-		return nil, err
-	}
 	capabilities := cluster.Capabilities{
 		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
 		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
@@ -2386,7 +2579,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	}
 	clients := make(map[string]*cluster.Client, len(opts.Peers))
 	for _, peerSpec := range opts.Peers {
-		nodeID, baseURL, serverName, err := parseClusterPeer(peerSpec)
+		nodeID, baseURL, _, err := parseClusterPeer(peerSpec)
 		if err != nil {
 			return nil, err
 		}
@@ -2396,28 +2589,20 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		if _, ok := clients[nodeID]; ok {
 			return nil, fmt.Errorf("cluster peer %q is configured more than once", nodeID)
 		}
-		clientTLS, err := cluster.LoadClientTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile, serverName)
-		if err != nil {
-			return nil, fmt.Errorf("configuring cluster peer %q TLS: %w", nodeID, err)
-		}
-		client, err := cluster.NewClient(baseURL, clientTLS, 2*time.Minute)
+		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
 		if err != nil {
 			return nil, fmt.Errorf("configuring cluster peer %q: %w", nodeID, err)
 		}
 		clients[nodeID] = client
 	}
-	raftHost, raftServerName, err := parseClusterRaftAdvertise(opts.RaftAdvertise)
+	raftHost, _, err := parseClusterRaftAdvertise(opts.RaftAdvertise)
 	if err != nil {
 		return nil, err
 	}
-	raftClientTLS, err := cluster.LoadClientTLSConfig(opts.CertFile, opts.KeyFile, opts.CAFile, raftServerName)
-	if err != nil {
-		return nil, fmt.Errorf("configuring Raft client TLS: %w", err)
-	}
 	raftNode, err := cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
 		NodeID: opts.NodeID, LocalDir: raftLocalDir,
-		ListenAddress: opts.RaftListen, AdvertiseHost: raftHost, ServerName: raftServerName,
-		ServerTLS: tlsConfig, ClientTLS: raftClientTLS, Bootstrap: opts.RaftBootstrap,
+		ListenAddress: opts.RaftListen, AdvertiseHost: raftHost,
+		AuthToken: opts.AuthToken, Bootstrap: opts.RaftBootstrap,
 	})
 	if err != nil {
 		return nil, err
@@ -2450,7 +2635,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
 		for _, peer := range clients {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			joinErr = joinAuthorityThroughSeed(ctx, peer, request, opts.CertFile, opts.KeyFile, opts.CAFile)
+			joinErr = joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken)
 			cancel()
 			if joinErr == nil {
 				joined = true
@@ -2492,7 +2677,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	source := &distributedSourceRuntime{
 		capabilities: capabilities, peers: clients,
 		directory: catalog, placements: placements, transactions: transactions, authority: catalog,
-		certFile: opts.CertFile, keyFile: opts.KeyFile, caFile: opts.CAFile,
+		authToken:    opts.AuthToken,
 		dynamicPeers: make(map[string]dynamicClusterPeer),
 		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 	}
@@ -2515,10 +2700,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	})
 	closeRaft = false
 	return &daemonClusterRuntime{
-		listen: opts.Listen, tlsConfig: tlsConfig,
+		listen: opts.Listen, authToken: opts.AuthToken,
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
-			Authority: &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID},
+			Authority: &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID}, AuthToken: opts.AuthToken,
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
 		raft: raftNode, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
@@ -2526,10 +2711,78 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	}, nil
 }
 
+const daemonImmutableClusterConfigVersion = 1
+
+// daemonImmutableClusterConfig contains only cluster-wide policy. Addresses,
+// node names, local capacity and provisioning hooks are deliberately absent:
+// they belong to one node and may change as elastic workers join and leave.
+type daemonImmutableClusterConfig struct {
+	Version         int              `json:"version"`
+	PagingPolicy    ttcpolicy.Policy `json:"paging_policy"`
+	LeaseDuration   time.Duration    `json:"lease_duration_ns"`
+	MaxTransactions int              `json:"max_transactions"`
+	AutoRebalance   bool             `json:"auto_rebalance"`
+}
+
+func immutableClusterConfigFromOptions(opts daemonClusterOptions) daemonImmutableClusterConfig {
+	return daemonImmutableClusterConfig{
+		Version: daemonImmutableClusterConfigVersion, PagingPolicy: opts.PagingPolicy,
+		LeaseDuration: opts.LeaseDuration, MaxTransactions: opts.MaxTransactions,
+		AutoRebalance: opts.AutoRebalance,
+	}
+}
+
+// applyImmutableClusterConfig creates the cluster policy once on bootstrap.
+// Joining nodes adopt it from the common repository, so operators do not have
+// to repeat transport and paging knobs on every daemon command line.
+func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, opts *daemonClusterOptions) error {
+	path := filepath.Join(sharedRoot, ".ttc-cluster-config.json")
+	want := immutableClusterConfigFromOptions(*opts)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if !bootstrap || localState {
+			return errors.New("shared TTC_ROOT has no immutable cluster configuration; only a fresh first node may create it")
+		}
+		encoded, err := json.Marshal(want)
+		if err != nil {
+			return err
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("creating immutable cluster configuration: %w", err)
+		}
+		_, writeErr := file.Write(append(encoded, '\n'))
+		closeErr := errors.Join(file.Sync(), file.Close())
+		if writeErr != nil || closeErr != nil {
+			_ = os.Remove(path)
+			return errors.Join(writeErr, closeErr)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var got daemonImmutableClusterConfig
+	if err := json.Unmarshal(data, &got); err != nil {
+		return fmt.Errorf("decoding immutable cluster configuration: %w", err)
+	}
+	if got.Version != daemonImmutableClusterConfigVersion {
+		return fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
+	}
+	if bootstrap && got != want {
+		return errors.New("cluster-wide paging, lease, transaction, or rebalance policy differs from the initialized cluster")
+	}
+	opts.PagingPolicy = got.PagingPolicy
+	opts.LeaseDuration = got.LeaseDuration
+	opts.MaxTransactions = got.MaxTransactions
+	opts.AutoRebalance = got.AutoRebalance
+	return nil
+}
+
 // joinAuthorityThroughSeed follows Raft-leader redirects at the control-plane
 // layer. A deployment only needs to configure one reachable seed; the seed
 // need not currently be the leader.
-func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityJoinRequest, certFile, keyFile, caFile string) error {
+func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityJoinRequest, nodeID, authToken string) error {
 	peer := seed
 	seen := make(map[string]bool)
 	for redirects := 0; redirects < 5; redirects++ {
@@ -2541,7 +2794,7 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 		if !errors.As(err, &redirect) {
 			return err
 		}
-		if redirect.LeaderControlURL == "" || redirect.LeaderServerName == "" {
+		if redirect.LeaderControlURL == "" {
 			return fmt.Errorf("joining through a follower that cannot resolve its Raft leader: %w", err)
 		}
 		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
@@ -2549,13 +2802,10 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			return fmt.Errorf("Raft leader redirect loop through %q", redirect.LeaderID)
 		}
 		seen[key] = true
-		clientTLS, tlsErr := cluster.LoadClientTLSConfig(certFile, keyFile, caFile, redirect.LeaderServerName)
-		if tlsErr != nil {
-			return fmt.Errorf("configuring redirected Raft leader %q TLS: %w", redirect.LeaderID, tlsErr)
-		}
-		peer, tlsErr = cluster.NewClient(redirect.LeaderControlURL, clientTLS, 2*time.Minute)
-		if tlsErr != nil {
-			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, tlsErr)
+		var clientErr error
+		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
+		if clientErr != nil {
+			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
 		}
 	}
 	return errors.New("too many Raft leader redirects while joining cluster")
@@ -2643,18 +2893,10 @@ func transactionIDPatternForDaemon(value string) bool {
 }
 
 func parseClusterRaftAdvertise(value string) (host, serverName string, err error) {
-	comma := strings.LastIndexByte(value, ',')
-	if comma <= 0 || comma == len(value)-1 {
-		return "", "", fmt.Errorf("invalid --cluster-raft-advertise %q; want HOST:PORT,SERVER_NAME", value)
+	if _, _, err := net.SplitHostPort(value); err != nil {
+		return "", "", fmt.Errorf("invalid Raft advertise address %q: %w", value, err)
 	}
-	host, serverName = value[:comma], value[comma+1:]
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		return "", "", fmt.Errorf("invalid Raft advertise address %q: %w", host, err)
-	}
-	if strings.TrimSpace(serverName) != serverName || serverName == "" {
-		return "", "", errors.New("invalid Raft TLS server name")
-	}
-	return host, serverName, nil
+	return value, "", nil
 }
 
 func requireEphemeralClusterPagePort(option, address string) error {
@@ -2670,17 +2912,18 @@ func requireEphemeralClusterPagePort(option, address string) error {
 
 func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err error) {
 	equals := strings.IndexByte(value, '=')
-	comma := strings.LastIndexByte(value, ',')
-	if equals <= 0 || comma <= equals+1 || comma == len(value)-1 {
-		return "", "", "", fmt.Errorf("invalid --cluster-peer %q; want NODE=https://HOST:PORT,SERVER_NAME", value)
+	if equals <= 0 || equals == len(value)-1 {
+		return "", "", "", fmt.Errorf("invalid --cluster-peer %q; want NODE=HOST:PORT", value)
 	}
 	nodeID = value[:equals]
-	baseURL = value[equals+1 : comma]
-	serverName = value[comma+1:]
-	if strings.TrimSpace(nodeID) != nodeID || strings.TrimSpace(serverName) != serverName {
+	host := value[equals+1:]
+	if strings.TrimSpace(nodeID) != nodeID || strings.TrimSpace(host) != host {
 		return "", "", "", fmt.Errorf("invalid whitespace in --cluster-peer %q", value)
 	}
-	return nodeID, baseURL, serverName, nil
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		return "", "", "", fmt.Errorf("invalid --cluster-peer address %q: %w", host, err)
+	}
+	return nodeID, "http://" + host, "", nil
 }
 
 func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
@@ -2929,16 +3172,15 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
 				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
 			}
-			tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
 			go func() {
-				err := clusterServer.Serve(tlsListener)
+				err := clusterServer.Serve(clusterListener)
 				if errors.Is(err, http.ErrServerClosed) {
 					err = nil
 				}
 				clusterErr <- err
 				listener.Close()
 			}()
-			defer clusterServer.Close()
+			defer shutdownClusterServer(clusterServer)
 			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
 			drainIntent, err := loadElasticDrainIntent(dataRoot, clusterRuntime.nodeRecord.NodeID)
 			if err != nil {
@@ -3003,16 +3245,15 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
 				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
 			}
-			tlsListener := tls.NewListener(clusterListener, clusterRuntime.tlsConfig)
 			go func() {
-				err := clusterServer.Serve(tlsListener)
+				err := clusterServer.Serve(clusterListener)
 				if errors.Is(err, http.ErrServerClosed) {
 					err = nil
 				}
 				clusterErr <- err
 				listener.Close()
 			}()
-			defer clusterServer.Close()
+			defer shutdownClusterServer(clusterServer)
 		}
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
@@ -3104,6 +3345,18 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		go server.handle(conn, stderr)
+	}
+}
+
+// shutdownClusterServer lets an in-flight proxied node-stop response drain
+// after that command closes the local daemon listener. Closing the HTTP server
+// immediately races the final daemon status frame and presents a successful
+// remote stop to its caller as EOF.
+func shutdownClusterServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
 	}
 }
 
@@ -3279,6 +3532,21 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(fmt.Errorf("client build %q does not match daemon build %q; only 'ttc daemon stop' is allowed across versions", request.ClientBuildID, version.Version()))
 		return
 	}
+	if request.Action == "command" {
+		cleanArgs, placementNode, err := extractPlacementNode(request.Args)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		request.Args = cleanArgs
+		if placementNode != "" {
+			if request.PlacementNode != "" && request.PlacementNode != placementNode {
+				writeError(fmt.Errorf("routed placement changed from node %q to %q", request.PlacementNode, placementNode))
+				return
+			}
+			request.PlacementNode = placementNode
+		}
+	}
 	switch request.Action {
 	case "ping":
 		status := map[string]any{
@@ -3327,11 +3595,18 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 			unlock := s.lockDataRoot(opts.dataRoot)
 			var err error
-			if s.clusterCapabilities != nil {
+			migrateAll := slices.Contains(request.Args, "--migrate-all")
+			if s.clusterCapabilities != nil && !migrateAll {
 				err = drainSourceDependencies(backend, s.distributedSource, s.clusterStore, s.clusterCapabilities.NodeID)
 			}
 			if err == nil {
 				switch {
+				case migrateAll:
+					if s.clusterCapabilities == nil {
+						err = errors.New("--migrate-all requires distributed mode")
+					} else {
+						_, err = backend.stopNode(s.clusterCapabilities.NodeID, "migrate", true)
+					}
 				case slices.Contains(request.Args, "--dehydrate-all"):
 					err = dehydrateDaemonContainers(backend)
 				case slices.Contains(request.Args, "--stop-all"):
@@ -3407,6 +3682,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		if err != nil {
 			writeError(err)
+			return
+		}
+		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode {
+			writeError(fmt.Errorf("branch is already placed on node %q, not requested node %q", owner, request.PlacementNode))
 			return
 		}
 		if owner == "" && daemonCommandNeedsPlacementAdmission(request.Args) {
@@ -3611,6 +3890,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		} else {
 			writeDaemonBufferedResult(conn, &writeMu, mutationStdout.Bytes(), mutationStderr.Bytes(), status)
 		}
+		if status == 0 && mutationBackend.daemonStopRequested {
+			s.cleanStop.Store(true)
+			s.stopOnce.Do(func() { _ = s.listener.Close() })
+		}
 		return
 	}
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
@@ -3626,6 +3909,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	unlock()
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
+	if status == 0 && backend.daemonStopRequested {
+		s.cleanStop.Store(true)
+		s.stopOnce.Do(func() { _ = s.listener.Close() })
+	}
 }
 
 func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stderr []byte, status int) {
@@ -4317,9 +4604,6 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, a
 			"--cluster-listen", clusterOpts.Listen,
 			"--cluster-node-id", clusterOpts.NodeID,
 			"--cluster-repository-id", clusterOpts.RepositoryID,
-			"--cluster-cert", clusterOpts.CertFile,
-			"--cluster-key", clusterOpts.KeyFile,
-			"--cluster-ca", clusterOpts.CAFile,
 			"--cluster-lease", clusterOpts.LeaseDuration.String(),
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 			"--cluster-page-listen", clusterOpts.PageListen,
@@ -4474,7 +4758,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		return status
 	}
 	stopMode := ""
-	if len(args) == 2 && args[0] == "stop" && (args[1] == "--dehydrate-all" || args[1] == "--stop-all") {
+	if len(args) == 2 && args[0] == "stop" && (args[1] == "--dehydrate-all" || args[1] == "--stop-all" || args[1] == "--migrate-all") {
 		stopMode = args[1]
 		args = args[:1]
 	}

@@ -191,14 +191,15 @@ node-local scratch directory:
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
-ttc daemon start --cluster-node-id node-a ...
+ttc daemon start --cluster-init --node node-a \
+  --listen 0.0.0.0:7443 --advertise node-a.example:7443
 ```
 
 `TTC_LOCAL_ROOT` is required in cluster mode, must differ from `TTC_ROOT`, and
 is exclusively locked to one daemon. Active filesystems, runtime state,
 console/exec buffers, caches, and publication staging remain local. Sealed
 generations publish asynchronously as immutable indexed packs; after a clean
-node drain, remaining local files are disposable caches or staging residue.
+node stop, remaining local files are disposable caches or staging residue.
 
 The client locates the daemon through `TTC_SOCKET`, then
 `$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
@@ -376,42 +377,42 @@ fenced live source while immutable copies are published to shared storage;
 target writes always create target-local data. Once every required range is
 local or durable, the target no longer depends on the source process.
 
-The nodes must use the same shared TTC data root and repository ID, have the
-same image content available, and be able to reach each other's control and
-page-transfer listeners. Give every daemon a certificate issued by one cluster
-CA whose identity matches its node ID. Cluster authority is one Raft group;
-its WAL and snapshots live in each node's local root, never on the shared
-filesystem. For example, bootstrap node A with:
+The nodes must use the same shared TTC data root, run the exact same TTC build
+and architecture, and be able to reach each other's cluster addresses. TTC's
+cluster transport is plaintext because the cluster assumes an OpenMPI-style
+trusted private network. Set the same `TTC_CLUSTER_TOKEN` on every node when a
+shared bearer secret is useful; omit it only when every process that can reach
+the cluster network is trusted as a cluster administrator.
+
+Cluster authority is one Raft group. Its WAL and snapshots live in each node's
+local root, never on the shared filesystem. Bootstrap node A with:
 
 ```shell
-ttc daemon start \
-  --cluster-node-id node-a \
-  --cluster-repository-id team-repository \
-  --cluster-listen 0.0.0.0:7443 \
-  --cluster-advertise https://node-a.example:7443,node-a.example \
-  --cluster-raft-bootstrap \
-  --cluster-raft-listen 0.0.0.0:7453 \
-  --cluster-raft-advertise node-a.example:7453,node-a.example \
-  --cluster-page-listen 0.0.0.0:0 \
-  --cluster-cert /shared/cluster/node-a.pem \
-  --cluster-key /shared/cluster/node-a.key \
-  --cluster-ca /shared/cluster/ca.pem \
-  --cluster-memory-target 64GiB \
-  --cluster-auto-rebalance \
-  --cluster-capacity-webhook https://scheduler.example/v1/ttc-capacity
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # optional
+ttc daemon start --cluster-init --node node-a \
+  --listen 0.0.0.0:7443 --advertise node-a.example:7443 \
+  --memory-target 64GiB
 ```
 
-Start node B with its own node ID, control and Raft advertised addresses, and
-certificate. Omit `--cluster-raft-bootstrap` and give it at least one existing
-seed such as
-`--cluster-peer node-a=https://node-a.example:7443,node-a.example`.
-After admission, node and leader discovery comes from Raft, so every peer does
-not need to appear on every command line. `TTC_ROOT` names the same shared
-repository on both hosts, while each node's `TTC_LOCAL_ROOT` names fast local
-scratch. `ttc daemon status` reports the active cluster
-identity and negotiated capabilities. Both page-transfer addresses must use
-port `0`: TTC assigns an independent ephemeral listener to every concurrent
-remote fork.
+Start node B by naming any live seed:
+
+```shell
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-b
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
+ttc daemon start --cluster-join node-a.example:7443 --node node-b \
+  --listen 0.0.0.0:7443 --advertise node-b.example:7443 \
+  --memory-target 64GiB
+```
+
+Only one seed is needed. Membership and leader discovery come from Raft after
+admission. TTC derives its internal Raft listener automatically; page-transfer
+listeners are ephemeral per operation. Cluster-wide paging, lease,
+transaction, and automatic-rebalance policy is created once by the bootstrap
+node and adopted by joiners. Node names, addresses, local memory targets, and
+capacity-provider hooks remain node-local settings.
 
 The first three admitted members are voting replicas; further elastic compute
 nodes remain non-voting replicas. Thus a large worker fleet does not enlarge
@@ -423,15 +424,14 @@ guest reads and writes perform no consensus operation.
 From node A, create one child on node B:
 
 ```shell
-ttc fork --target node-b web@main remote-web@main
+ttc fork --node node-b web@main remote-web
 ```
 
 Create several siblings from one source pause and one metadata capture by
 listing all destinations in a single command:
 
 ```shell
-ttc fork --target node-b web@main \
-  remote-web@candidate-a remote-web@candidate-b remote-web@candidate-c
+ttc fork --node node-b web@main candidate-a candidate-b candidate-c
 ```
 
 Using one destination family lets compatible branches share one Sentry and
@@ -455,16 +455,22 @@ ttc node ls
 ```
 
 New containers are admitted on the compatible ready node with the lowest
-normalized memory load, including outstanding placement reservations. You may
-therefore send `ttc run`, `ttc create`, and restore commands to any ready
-daemon; the chosen node is transparent in the normal CLI view.
+normalized memory load, including outstanding placement reservations. `run`,
+`start`, `restore`, `rehydrate`, and `fork` accept an optional `--node`; without
+it, TTC chooses a compatible ready node. Commands naming an existing branch
+are routed to its current owner.
+
+```shell
+ttc run --node node-b -d --name build ubuntu:26.04 sleep infinity
+ttc rehydrate --node node-c build@main
+```
 
 Commands naming `CONTAINER@BRANCH` are routed to the recorded owner. Move a
 branch without changing its family, branch name, filesystem identity, or
 process state with:
 
 ```shell
-ttc migrate --target node-b web@candidate-a
+ttc migrate --node node-b web@candidate-a
 ```
 
 Family-wide `ttc stop FAMILY`, `ttc dehydrate FAMILY`, and `ttc rm FAMILY`
@@ -479,23 +485,27 @@ sealed snapshot remains available until all target dependencies are local or
 shared-durable. External connections are interrupted according to the same
 policy as remote fork.
 
-To remove a compute node, drain it from any TTC client:
+To remove a compute node, stop it from any TTC client. Exactly one policy is
+chosen when it still owns active branches:
 
 ```shell
-ttc node drain node-a
-ttc daemon stop                 # run against node-a after drain succeeds
+ttc node stop --migrate-all node-a
+ttc node stop --dehydrate-all node-b
+ttc node stop --stop-all node-c
 ```
 
-Drain first changes the node to `draining`, which rejects new runs, forks,
-rehydrations, and incoming migrations. It migrates running/paused branches,
-transfers cold branch placement without waking them, and makes remote page
-dependencies durable. If a step fails, the node stays cordoned and the same
-command can be retried. The intent is durable: after an abnormal `ttcd` exit,
-the same node ID rejoins as `draining` and automatically resumes remaining
-work. A retry may supply a different `--target node-b`; already transferred
-branches remain where they are. A clean `ttc daemon stop` consumes a completed
-intent so the node ID can later join normally. Without `--target`, TTC selects
-ready nodes by reported load.
+Node stop first changes the node to `draining`, which rejects new runs, forks,
+rehydrations, and incoming migrations. `--migrate-all` partitions and moves
+running and paused branches to scheduler-selected ready nodes.
+`--dehydrate-all` durably captures them as unplaced cold branches;
+`--stop-all` terminates them and publishes their filesystems. With no policy,
+the operation rejects while active branches remain. After dependencies and
+publications are durable, `ttcd` stops automatically and retires its cluster
+membership. If a step fails, the node stays cordoned and the same command can
+be retried; the durable stop intent resumes after a daemon restart.
+
+`ttc daemon stop --migrate-all` applies the same scheduler-selected evacuation
+to the daemon reached by `TTC_SOCKET`. It is rejected outside distributed mode.
 
 If a daemon disappears during an individual migration, TTC reconciles the
 fenced transaction automatically. A branch still owned by the source waits for

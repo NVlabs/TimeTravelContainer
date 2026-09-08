@@ -52,9 +52,7 @@ type distributedSourceRuntime struct {
 	placements    cluster.PlacementCatalog
 	transactions  cluster.TransactionCatalog
 	authority     *cluster.RaftCatalog
-	certFile      string
-	keyFile       string
-	caFile        string
+	authToken     string
 	peerMu        sync.Mutex
 	dynamicPeers  map[string]dynamicClusterPeer
 	pageListen    string
@@ -136,11 +134,7 @@ func (r *distributedSourceRuntime) peerForRecord(record cluster.NodeRecord) (*cl
 		cached.controlURL == record.ControlURL && cached.serverName == record.ControlServerName {
 		return cached.client, nil
 	}
-	clientTLS, err := cluster.LoadClientTLSConfig(r.certFile, r.keyFile, r.caFile, record.ControlServerName)
-	if err != nil {
-		return nil, fmt.Errorf("configuring discovered cluster peer %q TLS: %w", nodeID, err)
-	}
-	client, err := cluster.NewClient(record.ControlURL, clientTLS, 2*time.Minute)
+	client, err := cluster.NewPlainClient(record.ControlURL, r.capabilities.NodeID, r.authToken, 2*time.Minute)
 	if err != nil {
 		return nil, fmt.Errorf("configuring discovered cluster peer %q: %w", nodeID, err)
 	}
@@ -154,6 +148,60 @@ func (r *distributedSourceRuntime) peerForRecord(record cluster.NodeRecord) (*cl
 type distributedForkBackend interface {
 	forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error)
 	forkRemoteMany(source selector, targetNode string, targetContainers []string, paused bool) ([]selector, error)
+}
+
+// distributedForkPlacementBackend selects where a fork should execute. An
+// empty requested node gives the scheduler authority to choose. Keeping a
+// fork local while the source node accepts work preserves resident CoW
+// sharing; a pressured or draining source is placed on the least-loaded
+// compatible node instead.
+type distributedForkPlacementBackend interface {
+	selectForkNode(requested string) (node string, remote bool, err error)
+}
+
+func (b *runtimeBackend) selectForkNode(requested string) (string, bool, error) {
+	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		if requested == "" {
+			return "", false, nil
+		}
+		return "", false, errors.New("distributed node placement is not configured")
+	}
+	now := time.Now()
+	if requested != "" {
+		record, err := b.distributedSource.directory.Lookup(requested)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", false, fmt.Errorf("cluster node %q is not registered", requested)
+			}
+			return "", false, fmt.Errorf("looking up cluster node %q: %w", requested, err)
+		}
+		if !record.AcceptsPlacement(now) {
+			return "", false, fmt.Errorf("cluster node %q is not accepting placement (state=%s)", requested, record.State)
+		}
+		if record.NodeID != b.nodeID {
+			if _, err := cluster.Negotiate(b.distributedSource.capabilities, record.Capabilities); err != nil {
+				return "", false, fmt.Errorf("cluster node %q is incompatible: %w", requested, err)
+			}
+		}
+		return record.NodeID, record.NodeID != b.nodeID, nil
+	}
+
+	local, err := b.distributedSource.directory.Lookup(b.nodeID)
+	if err == nil && local.AcceptsPlacement(now) {
+		return local.NodeID, false, nil
+	}
+	records, listErr := b.distributedSource.directory.List()
+	if listErr != nil {
+		return "", false, fmt.Errorf("listing cluster nodes for fork placement: %w", listErr)
+	}
+	selected, selectErr := selectAdmissionNode(records, b.distributedSource.capabilities, now)
+	if selectErr != nil {
+		if err != nil {
+			return "", false, fmt.Errorf("local node lookup failed (%v) and automatic fork placement failed: %w", err, selectErr)
+		}
+		return "", false, fmt.Errorf("automatic fork placement: %w", selectErr)
+	}
+	return selected.NodeID, selected.NodeID != b.nodeID, nil
 }
 
 type distributedPageRelay struct {

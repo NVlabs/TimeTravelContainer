@@ -85,12 +85,31 @@ moves. All 13 placements finished stable on one node and routed `exec true`
 succeeded for every branch.
 
 This test also exposed a distributed lifecycle-lock inversion: a client entry
-daemon proxied `node drain` while holding its own mutation lock, and the source
+daemon proxied `node stop --migrate-all` while holding its own mutation lock, and the source
 called that daemon back to rehydrate a target. Node-wide mutations are now
 routed to their source before any local mutation lock is taken. A final
 13-branch reverse drain invoked through the destination completed in 25.932
 seconds. Cleanup removed the family, both daemons, Sentries, gofers, console
 followers, durable intents, and the test root.
+
+### Plaintext cluster interface and two-node retirement
+
+On 2026-09-08, a fresh two-node cluster was bootstrapped through the simplified
+`--cluster-init` / `--cluster-join` interface with one shared root, independent
+local roots, and `TTC_CLUSTER_TOKEN`. A join using the wrong token was rejected.
+BusyBox was then placed explicitly on node B, forked locally through automatic
+placement, and both live branches were evacuated by running `ttc node stop
+node-b --migrate-all` through node A. Both branches retained a guest-written
+file, node B became offline, its socket disappeared, and node A retained Raft
+quorum and served both branches.
+
+This run exposed and fixed three shutdown-path defects: plaintext Raft join
+still required the old TLS address encoding; closing the local daemon listener
+could race the final proxied response and return EOF; and a completed capacity
+reservation incorrectly prevented the source voter from retiring. The test
+was repeated from a fresh root after all three fixes. The surviving daemon was
+then stopped with `ttc node stop node-a --stop-all`, and all temporary runtimes
+and storage were removed.
 
 ## Pressure placement and cleanup
 

@@ -49,7 +49,11 @@ wait, and removal. A coordinated local fan-out uses one source pause:
 (await ttc.migrate("demo@candidate-a", "node-b")).check();
 console.log(await ttc.nodes());
 console.log(await ttc.rebalanceNode("node-a", "node-b"));
+(await ttc.stopNode("node-a", "migrate")).check();
 ```
+
+`run`, `start`, `fork`, `rehydrate`, and `restore` accept an optional node.
+Omit it to let TTC select a compatible ready node.
 
 Harness-oriented helpers are available directly:
 

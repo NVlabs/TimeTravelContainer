@@ -126,6 +126,7 @@ func normalizeCheckpointCommandArgs(args []string) ([]string, error) {
 	}
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	_ = fs.String("name", "", "")
+	_ = fs.String("node", "", "")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args[1:]); err != nil {
 		return nil, err

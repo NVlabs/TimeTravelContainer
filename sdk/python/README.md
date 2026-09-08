@@ -64,8 +64,12 @@ ttc.fork_many(
 ).check()
 ttc.migrate("demo@candidate-a", "node-b").check()
 print(ttc.nodes())
-print(ttc.rebalance_node("node-a", target_node="node-b"))
+print(ttc.rebalance_node("node-a", destination_node="node-b"))
+ttc.stop_node("node-a", policy="migrate").check()
 ```
+
+Pass `node="node-b"` to `run`, `start`, `fork`, `rehydrate`, or `restore` to
+request a particular cluster node. Omit it to let TTC select a ready node.
 
 Harness-oriented helpers return structured JSON or ordinary command results:
 

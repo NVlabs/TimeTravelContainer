@@ -102,7 +102,10 @@ local deadline remain valid.
 ## Node admission and membership
 
 The first node is explicitly bootstrapped. A joining daemon contacts any
-configured seed over mutual TLS and is redirected to the leader. Admission
+configured seed over plaintext TCP on the trusted cluster network and is
+redirected to the leader. An optional `TTC_CLUSTER_TOKEN` authenticates both
+HTTP control requests and Raft streams; without it, reachability implies
+cluster-administrator trust. Admission
 checks repository identity, exact TTC build, architecture, base-page size, and
 required protocol features.
 
@@ -118,6 +121,11 @@ The shared repository contains a small immutable cluster identity. A fresh
 local WAL must either create that identity as the explicit first bootstrap or
 join the group named by it. The same shared root cannot silently host two Raft
 groups, and a local WAL from another cluster is rejected.
+
+The bootstrap node also creates one immutable cluster-policy record. Joining
+nodes adopt its paging, lease, transaction-limit, and automatic-rebalance
+settings instead of repeating them. Node IDs, advertised addresses, local
+memory targets, and capacity-provider hooks remain per-node configuration.
 
 Restarting a daemon creates a new random incarnation. The old incarnation's
 commands and leases remain stale even when the human node ID is reused.

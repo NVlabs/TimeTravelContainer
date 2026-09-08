@@ -149,7 +149,7 @@ class ClientTest(unittest.TestCase):
                 [
                     "fork",
                     "--paused",
-                    "--target",
+                    "--node",
                     "node-b",
                     "demo@main",
                     "remote@one",
@@ -165,7 +165,7 @@ class ClientTest(unittest.TestCase):
                     "demo@main",
                     ["remote@one", "remote@two"],
                     paused=True,
-                    target_node="node-b",
+                    node="node-b",
                 )
                 self.assertTrue(result.ok)
             finally:
@@ -175,7 +175,7 @@ class ClientTest(unittest.TestCase):
         def migrate_handler(conn, request):
             self.assertEqual(
                 request["args"],
-                ["migrate", "--target", "node-b", "demo@main"],
+                ["migrate", "--node", "node-b", "demo@main"],
             )
             conn.sendall(frame(b"X", struct.pack(">I", 0)))
 
@@ -195,6 +195,22 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", nodes_handler)
             try:
                 self.assertEqual(Client(daemon.path).nodes()[0]["node_id"], "node-a")
+            finally:
+                daemon.close()
+
+        def stop_handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["node", "stop", "--migrate-all", "node-a"],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", stop_handler)
+            try:
+                self.assertTrue(
+                    Client(daemon.path).stop_node("node-a", policy="migrate").ok
+                )
             finally:
                 daemon.close()
 

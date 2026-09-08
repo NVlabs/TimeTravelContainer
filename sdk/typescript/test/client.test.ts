@@ -156,7 +156,7 @@ test("batch remote fork uses the current CLI shape", async () => {
       assert.deepEqual(request.args, [
         "fork",
         "--paused",
-        "--target",
+        "--node",
         "node-b",
         "demo@main",
         "remote@one",
@@ -168,7 +168,7 @@ test("batch remote fork uses the current CLI shape", async () => {
       const result = await new Client(path).forkMany(
         "demo@main",
         ["remote@one", "remote@two"],
-        { paused: true, targetNode: "node-b" },
+        { paused: true, node: "node-b" },
       );
       assert.equal(result.ok, true);
     },
@@ -178,7 +178,7 @@ test("batch remote fork uses the current CLI shape", async () => {
 test("elastic cluster helpers use the current CLI shape", async () => {
   await withServer(
     (socket, request) => {
-      assert.deepEqual(request.args, ["migrate", "--target", "node-b", "demo@main"]);
+      assert.deepEqual(request.args, ["migrate", "--node", "node-b", "demo@main"]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
     async (path) => {
@@ -194,6 +194,17 @@ test("elastic cluster helpers use the current CLI shape", async () => {
     async (path) => {
       const nodes = await new Client(path).nodes<Array<{ node_id: string }>>();
       assert.equal(nodes[0]?.node_id, "node-a");
+    },
+  );
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "node", "stop", "--migrate-all", "node-a",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      assert.equal((await new Client(path).stopNode("node-a", "migrate")).ok, true);
     },
   );
 });

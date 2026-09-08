@@ -43,10 +43,11 @@ its own paths, data root, isolation mode, and runtime platform.
 `request_id` makes supported mutating commands idempotent when a caller
 deliberately retries the same request.
 
-Existing branches use full `CONTAINER@BRANCH` selectors. A local fork
-destination is a branch name; a remote fork destination is a
-`CONTAINER@BRANCH` selector on the target node. The protocol does not add
-implicit `main` selection beyond what the CLI command itself documents.
+Existing branches use full `CONTAINER@BRANCH` selectors. A fork destination is
+a new branch name in the source family; `--node NODE` selects where it runs.
+`run`, `start`, `restore`, `rehydrate`, and `fork` accept this optional
+placement constraint and otherwise use scheduler placement. The protocol does
+not add implicit `main` selection beyond what the CLI command itself documents.
 
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
 Inspection and statistics also expose storage placement (`local`,

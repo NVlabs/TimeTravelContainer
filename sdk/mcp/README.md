@@ -40,7 +40,7 @@ not need access to the daemon's storage roots.
 
 The server provides tools for daemon status, listing and inspection, image
 pull, run/start/exec, durable named exec sessions, local or remote batch fork,
-elastic node listing/migration/drain/rebalance, pause/resume,
+elastic node listing/migration/stop/rebalance, pause/resume,
 quarantine/unquarantine, dehydrate/rehydrate, Docker-style image load/save and commit,
 resource accounting, filesystem diff, copy, synchronous terminal observation, checkpoint/restore,
 stop/restart, signal, wait, and removal. Tool names use the `ttc_` prefix, for
@@ -54,6 +54,9 @@ running `ttcd`; the MCP transport does not copy image archives through JSON.
 `ttc_run` creates a live-fork-eligible family by default. Set
 `waiveLiveFork: true` only when also requesting a deliberately incompatible
 feature such as host networking; the resulting family can never be forked.
+The run, start, fork, rehydrate, and restore tools accept an optional `node`;
+omitting it delegates placement to TTC. `ttc_stop_node` requires an explicit
+`stop`, `dehydrate`, or `migrate` policy when the node still owns live work.
 
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may

@@ -199,23 +199,23 @@ TTC_LOCAL_ROOT.
 }
 
 var commandHelp = map[string]string{
-	"run": "Usage: ttc run [OPTIONS] IMAGE [COMMAND] [ARG...]", "create": "Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]",
-	"start": "Usage: ttc start [OPTIONS] CONTAINER@BRANCH", "stop": "Usage: ttc stop [OPTIONS] TARGET...",
+	"run": "Usage: ttc run [--node NODE] [OPTIONS] IMAGE [COMMAND] [ARG...]", "create": "Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]",
+	"start": "Usage: ttc start [--node NODE] [OPTIONS] CONTAINER@BRANCH", "stop": "Usage: ttc stop [OPTIONS] TARGET...",
 	"restart": "Usage: ttc restart [OPTIONS] TARGET...", "rm": "Usage: ttc rm [OPTIONS] TARGET...",
 	"exec": "Usage: ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND [ARG...]", "attach": "Usage: ttc attach [OPTIONS] CONTAINER@BRANCH",
 	"logs": "Usage: ttc logs [OPTIONS] CONTAINER@BRANCH", "cp": "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 	"pull": "Usage: ttc pull [OPTIONS] IMAGE", "load": "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
 	"save": "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]", "commit": "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
-	"fork": "Usage: ttc fork [--paused] [--quarantine] [--target NODE] CONTAINER@BRANCH DEST...", "migrate": "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
+	"fork": "Usage: ttc fork [--paused] [--quarantine] [--node NODE] CONTAINER@BRANCH DEST...", "migrate": "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
 	"pause": "Usage: ttc pause TARGET...", "resume": "Usage: ttc resume TARGET...", "unpause": "Usage: ttc unpause TARGET...",
 	"quarantine": "Usage: ttc quarantine CONTAINER@BRANCH...", "unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
-	"dehydrate": "Usage: ttc dehydrate TARGET...", "rehydrate": "Usage: ttc rehydrate TARGET...",
-	"checkpoint": "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE", "restore": "Usage: ttc restore [--name NAME] FILE",
+	"dehydrate": "Usage: ttc dehydrate TARGET...", "rehydrate": "Usage: ttc rehydrate [--node NODE] TARGET...",
+	"checkpoint": "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE", "restore": "Usage: ttc restore [--node NODE] [--name NAME] FILE",
 	"ls": "Usage: ttc ls [--tree|--json]", "ps": "Usage: ttc ps [OPTIONS]", "inspect": "Usage: ttc inspect [OPTIONS] CONTAINER...",
 	"top": "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]", "stats": "Usage: ttc stats [--json] CONTAINER@BRANCH",
 	"diff": "Usage: ttc diff [--json] CONTAINER@BRANCH", "events": "Usage: ttc events [OPTIONS]",
 	"wait": "Usage: ttc wait [--condition not-running|durable] TARGET...", "port": "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-	"volume": "Usage: ttc volume create|ls|inspect|rm [OPTIONS]", "node": "Usage: ttc node ls|drain|rebalance [OPTIONS]",
+	"volume": "Usage: ttc volume create|ls|inspect|rm [OPTIONS]", "node": "Usage: ttc node ls|stop|rebalance [OPTIONS]",
 	"tty": "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]", "rename": "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
 	"kill": "Usage: ttc kill [OPTIONS] TARGET...", "image": "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
 	"images": "Usage: ttc images [OPTIONS]", "rmi": "Usage: ttc rmi [OPTIONS] IMAGE...", "container": "Usage: ttc container COMMAND",
@@ -315,8 +315,8 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 		}
 		return exchangeControl(opts.socket, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, stdout, stderr)
 	case "stop":
-		if len(args) > 2 || (len(args) == 2 && args[1] != "--dehydrate-all" && args[1] != "--stop-all") {
-			fmt.Fprintln(stderr, "ttc: usage: ttc daemon stop [--dehydrate-all|--stop-all]")
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--dehydrate-all" && args[1] != "--stop-all" && args[1] != "--migrate-all") {
+			fmt.Fprintln(stderr, "ttc: usage: ttc daemon stop [--dehydrate-all|--stop-all|--migrate-all]")
 			return 2
 		}
 		return exchangeControl(opts.socket, request{Action: "stop", ManageStop: true, Args: args[1:]}, stdout, stderr)

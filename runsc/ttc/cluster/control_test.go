@@ -535,3 +535,36 @@ func TestControlPlaneRejectsCertificateNodeMismatch(t *testing.T) {
 		t.Fatalf("certificate mismatch error=%v", err)
 	}
 }
+
+func TestPlainControlPlaneOptionalToken(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 2,
+		Now: time.Now, AuthToken: "cluster-secret", TargetRuntime: &testTargetRuntime{},
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	good, err := NewPlainClient(server.URL, "source", "cluster-secret", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := good.Reserve(context.Background(), ReserveRequest{
+		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(),
+	}); err != nil {
+		t.Fatalf("authenticated plaintext request: %v", err)
+	}
+	bad, err := NewPlainClient(server.URL, "source", "wrong", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testForkIdentity()
+	identity.TransactionID = "tx-rejected-token"
+	if _, err := bad.Reserve(context.Background(), ReserveRequest{
+		SourceCapabilities: testCapabilities("source"), Identity: identity,
+	}); err == nil || !strings.Contains(err.Error(), "authentication token") {
+		t.Fatalf("wrong token error=%v", err)
+	}
+}
